@@ -1,5 +1,6 @@
 use alms_core::config::{
-    ContextConfig, ShellClassificationMode, ShellPermissions, ShellSpillConfig,
+    ContextConfig, DEFAULT_AGENT_MAX_TOKENS, ShellClassificationMode, ShellPermissions,
+    ShellSpillConfig,
 };
 
 /// Execution posture: controls whether tools require approval before running.
@@ -186,8 +187,10 @@ impl Default for AgentConfig {
             // of agent turns (most finish under 8K), reasoning models'
             // hidden-thinking budgets, and long code-gen flows.
             // Operators can override per-agent for code-gen or long-form
-            // writing workflows that need more headroom.
-            max_tokens: 32_000,
+            // writing workflows that need more headroom. Sourced from
+            // `alms-core` so the config crate's #919 token-budget
+            // validator can reuse the same default at load time.
+            max_tokens: DEFAULT_AGENT_MAX_TOKENS,
             context_config: ContextConfig::default(),
             posture: Posture::default(),
             sandbox_root: ".".into(),

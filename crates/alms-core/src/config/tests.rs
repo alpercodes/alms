@@ -31,6 +31,23 @@ pub(crate) fn select_llm_api_key(
     }
 }
 
+// Test-only env-var mutexes — disjointness contract.
+//
+// `ENV_LOCK` and `BUDGET_ENV_LOCK` (defined further down) each guard a
+// disjoint var-set so a test holding one mutex cannot observe a partial
+// mutation guarded by the other. The contract is:
+//
+//   - `ENV_LOCK`         covers `LLM_ENV_VARS` (LLM API keys + provider tag).
+//   - `BUDGET_ENV_LOCK`  covers `ALMS_LLM_BUDGET_VALIDATION` only.
+//
+// The same disjointness rule applies cross-crate: the gateway's
+// `BUDGET_VALIDATION_ENV_LOCK` (in `crates/alms-gateway/src/lib.rs::test_env_locks`)
+// guards the same `ALMS_LLM_BUDGET_VALIDATION` var but a different test
+// process (each crate's `cargo test` runs in its own process), so the
+// two never need to interlock — just stay disjoint with their respective
+// `ENV_LOCK`s. A future test that needs to span both var-sets in one
+// crate must acquire the locks in a fixed order (e.g. `ENV_LOCK` first,
+// then `BUDGET_ENV_LOCK`) to avoid deadlock; today no such test exists.
 static ENV_LOCK: Mutex<()> = Mutex::new(());
 const LLM_ENV_VARS: [&str; 4] = [
     "OPENROUTER_API_KEY",
@@ -330,6 +347,229 @@ fn test_default_max_context_tokens_larger_than_max_input_tokens() {
         "default max_context_tokens ({}) should be >= max_input_tokens ({})",
         config.session.max_context_tokens,
         config.context.max_input_tokens,
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Token-budget cross-validation (#919)
+// ---------------------------------------------------------------------------
+
+const ALMS_LLM_BUDGET_VALIDATION: &str = "ALMS_LLM_BUDGET_VALIDATION";
+
+/// Test-only mutex serialising every token-budget validation test that
+/// reads `ALMS_LLM_BUDGET_VALIDATION`. `SingleEnvGuard` is per-var (no
+/// cross-test mutual exclusion); without this lock parallel tests would
+/// race each other's env-var mutations and produce flaky results.
+///
+/// **Disjointness contract:** `BUDGET_ENV_LOCK` guards
+/// `ALMS_LLM_BUDGET_VALIDATION` only — its var-set is disjoint from
+/// `ENV_LOCK` (`LLM_ENV_VARS`). See the module-level comment near
+/// `ENV_LOCK` for the full disjointness story (including the
+/// cross-crate sibling in `alms-gateway::test_env_locks`).
+static BUDGET_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+#[test]
+fn test_token_budget_default_config_passes() {
+    // Default config: provider=openrouter, model=moonshotai/kimi-k2.5.
+    // The table doesn't know that pair → validator must skip → ok.
+    let _lock = BUDGET_ENV_LOCK.lock().unwrap();
+    let _guard = SingleEnvGuard::remove(ALMS_LLM_BUDGET_VALIDATION);
+    let config = AlmsConfig::default();
+    assert!(
+        config.validate().is_ok(),
+        "default config (unknown openrouter model) must pass token-budget validation"
+    );
+}
+
+#[test]
+fn test_token_budget_strict_rejects_overshoot_anthropic() {
+    // Anthropic Claude Haiku 4.5 caps at 200K (Opus 4.7 / Sonnet 4.6 are
+    // 1M post-2026-05-09 verification round). 250K input + 32K default
+    // output = 282K > 200K → overshoots.
+    let _lock = BUDGET_ENV_LOCK.lock().unwrap();
+    let _guard = SingleEnvGuard::remove(ALMS_LLM_BUDGET_VALIDATION);
+    let mut config = AlmsConfig::default();
+    config.llm.provider = "anthropic".into();
+    config.llm.model = "claude-haiku-4-5".into();
+    config.context.max_input_tokens = 250_000;
+    config.session.max_context_tokens = 250_000;
+
+    let err = config.validate().unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("max_input_tokens"),
+        "error must mention max_input_tokens: {msg}"
+    );
+    assert!(
+        msg.contains("max_tokens"),
+        "error must mention max_tokens: {msg}"
+    );
+    assert!(
+        msg.contains("anthropic"),
+        "error must mention provider: {msg}"
+    );
+    assert!(
+        msg.contains("200000"),
+        "error must mention provider cap: {msg}"
+    );
+}
+
+#[test]
+fn test_token_budget_strict_accepts_fitting_anthropic() {
+    let _lock = BUDGET_ENV_LOCK.lock().unwrap();
+    let _guard = SingleEnvGuard::remove(ALMS_LLM_BUDGET_VALIDATION);
+    let mut config = AlmsConfig::default();
+    config.llm.provider = "anthropic".into();
+    config.llm.model = "claude-haiku-4-5".into();
+    // 128K input + 32K default output = 160K — fits 200K cap.
+    config.context.max_input_tokens = 128_000;
+    assert!(config.validate().is_ok());
+}
+
+#[test]
+fn test_token_budget_strict_rejects_overshoot_gemini() {
+    // gemini-2.5-pro publishes a 1,048,576-token cap. 1.5M input + 32K
+    // default output = ~1.532M → overshoots.
+    //
+    // Replaces the prior deepseek_v3_64k overshoot fixture: under the
+    // 2026-05-09 verification round DeepSeek V4 Flash sits at 1M, so the
+    // old 64K / 128K aliases no longer exist in the table.
+    let _lock = BUDGET_ENV_LOCK.lock().unwrap();
+    let _guard = SingleEnvGuard::remove(ALMS_LLM_BUDGET_VALIDATION);
+    let mut config = AlmsConfig::default();
+    config.llm.provider = "gemini".into();
+    config.llm.model = "gemini-2.5-pro".into();
+    config.context.max_input_tokens = 1_500_000;
+    // session.max_context_tokens has its own ≥ max_input_tokens validator
+    // — bump it to keep that check satisfied so the budget validator
+    // gets to run.
+    config.session.max_context_tokens = 1_500_000;
+    // The default provider table has no `gemini` entry — register one so
+    // `validate()`'s "provider must be defined" check passes and the
+    // budget validator runs.
+    config.llm.providers.insert(
+        "gemini".into(),
+        ProviderEntry {
+            kind: ProviderKind::Gemini,
+            base_url: "https://generativelanguage.googleapis.com/v1beta".into(),
+            api_key_env: None,
+            api_key: None,
+            model: None,
+            auth_scheme: AuthScheme::Bearer,
+            quirks: ProviderQuirks::default(),
+        },
+    );
+    let err = config.validate().unwrap_err();
+    assert!(
+        err.to_string().contains("1048576"),
+        "error must mention provider cap: {err}"
+    );
+}
+
+#[test]
+fn test_token_budget_warn_mode_accepts_overshoot() {
+    let _lock = BUDGET_ENV_LOCK.lock().unwrap();
+    let _guard = SingleEnvGuard::set(ALMS_LLM_BUDGET_VALIDATION, "warn");
+    let mut config = AlmsConfig::default();
+    config.llm.provider = "anthropic".into();
+    config.llm.model = "claude-haiku-4-5".into();
+    config.context.max_input_tokens = 250_000;
+    config.session.max_context_tokens = 250_000;
+    assert!(
+        config.validate().is_ok(),
+        "warn mode must accept overshooting configs"
+    );
+}
+
+#[test]
+fn test_token_budget_unknown_pair_skips() {
+    // Provider in the table but model unknown → skip silently regardless
+    // of size. Pre-#919 this was the entire validation surface.
+    let _lock = BUDGET_ENV_LOCK.lock().unwrap();
+    let _guard = SingleEnvGuard::remove(ALMS_LLM_BUDGET_VALIDATION);
+    let mut config = AlmsConfig::default();
+    config.llm.provider = "anthropic".into();
+    config.llm.model = "claude-2.1".into(); // not in the table
+    config.context.max_input_tokens = 1_000_000;
+    config.session.max_context_tokens = 1_000_000;
+    assert!(
+        config.validate().is_ok(),
+        "unknown model must skip the budget check rather than false-positive"
+    );
+}
+
+#[test]
+fn test_token_budget_skipped_for_mock_mode() {
+    let _lock = BUDGET_ENV_LOCK.lock().unwrap();
+    let _guard = SingleEnvGuard::remove(ALMS_LLM_BUDGET_VALIDATION);
+    let mut config = AlmsConfig::default();
+    config.llm.mock = true;
+    config.llm.provider = "anthropic".into();
+    config.llm.model = "claude-opus-4-7".into();
+    config.context.max_input_tokens = 200_000;
+    config.session.max_context_tokens = 200_000;
+    assert!(
+        config.validate().is_ok(),
+        "mock mode must bypass token-budget validation entirely"
+    );
+}
+
+#[test]
+fn test_token_budget_provider_entry_model_override_wins() {
+    // The validator must use the resolved per-provider-entry model
+    // (`[llm.providers.<name>].model`) when set, mirroring the runtime
+    // adapter's resolution. With anthropic/claude-opus-4-7 + 200K input
+    // the budget overshoots, but if the entry overrides to a non-table
+    // model id the check should fall through to the unknown-model skip.
+    let _lock = BUDGET_ENV_LOCK.lock().unwrap();
+    let _guard = SingleEnvGuard::remove(ALMS_LLM_BUDGET_VALIDATION);
+    let mut config = AlmsConfig::default();
+    config.llm.provider = "anthropic".into();
+    config.llm.model = "claude-opus-4-7".into();
+    config.context.max_input_tokens = 200_000;
+    config.session.max_context_tokens = 200_000;
+    config.llm.ensure_builtin_providers();
+    if let Some(entry) = config.llm.providers.get_mut("anthropic") {
+        // Override to an unknown model so the table lookup misses and
+        // the validator skips.
+        entry.model = Some("claude-99-future-model".into());
+    }
+    assert!(
+        config.validate().is_ok(),
+        "provider-entry model override must take precedence at the validator"
+    );
+}
+
+#[test]
+fn test_validation_mode_from_env_default_strict() {
+    let _lock = BUDGET_ENV_LOCK.lock().unwrap();
+    let _guard = SingleEnvGuard::remove(ALMS_LLM_BUDGET_VALIDATION);
+    assert_eq!(ValidationMode::from_env(), ValidationMode::Strict);
+}
+
+#[test]
+fn test_validation_mode_from_env_warn() {
+    let _lock = BUDGET_ENV_LOCK.lock().unwrap();
+    let _guard = SingleEnvGuard::set(ALMS_LLM_BUDGET_VALIDATION, "warn");
+    assert_eq!(ValidationMode::from_env(), ValidationMode::Warn);
+}
+
+#[test]
+fn test_validation_mode_from_env_warn_case_insensitive() {
+    let _lock = BUDGET_ENV_LOCK.lock().unwrap();
+    let _guard = SingleEnvGuard::set(ALMS_LLM_BUDGET_VALIDATION, "WARN");
+    assert_eq!(ValidationMode::from_env(), ValidationMode::Warn);
+}
+
+#[test]
+fn test_validation_mode_from_env_unknown_falls_back_to_strict() {
+    let _lock = BUDGET_ENV_LOCK.lock().unwrap();
+    let _guard = SingleEnvGuard::set(ALMS_LLM_BUDGET_VALIDATION, "yolo");
+    assert_eq!(
+        ValidationMode::from_env(),
+        ValidationMode::Strict,
+        "unknown values must fall back to strict so a typoed opt-out doesn't \
+         silently disable enforcement"
     );
 }
 

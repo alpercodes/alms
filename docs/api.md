@@ -376,6 +376,23 @@ Notes:
 }
 ```
 
+**Response 400** (resolved per-agent + server budget overshoots provider cap, #919):
+```json
+{
+  "error_code": "INVALID_TOKEN_BUDGET_FOR_PROVIDER",
+  "message": "configured token budget exceeds provider cap: context.max_input_tokens (250000) + agent.max_tokens (32000) = 282000 > anthropic claude-haiku-4-5 context window (200000). Lower one or both knobs, or set ALMS_LLM_BUDGET_VALIDATION=warn to bypass.",
+  "agent_id": "<uuid>",
+  "provider": "anthropic",
+  "model": "claude-haiku-4-5",
+  "max_input_tokens": 250000,
+  "max_tokens": 32000,
+  "effective_total": 282000,
+  "provider_cap": 200000
+}
+```
+
+The gateway pre-flights every `POST /runs` against the published context window for the resolved `(provider, model)` pair (per-agent override > server default). If the sum `[context].max_input_tokens + agent.max_tokens` overshoots the cap, the run is rejected before any LLM call is made. The body carries every datum the operator needs to fix the config (provider, resolved model, both knobs, computed total, table-published cap). Pairs the cap table doesn't know about (e.g. user-declared OpenRouter models, fine-tunes) skip the check silently. The `ALMS_LLM_BUDGET_VALIDATION=warn` env var downgrades the 400 to a structured WARN log; see [`docs/config.md`](config.md#alms_llm_budget_validation--provider-context-window-enforcement-919). The same error envelope is returned by `PATCH /settings` when the candidate `[context].max_input_tokens` would create the overshoot — see § 10.2.
+
 Why not `POST /agent/run`?
 - ALMS is about runs as first-class entities (auditable, cancellable, streamable).
 
@@ -1239,6 +1256,31 @@ Any `PATCH /settings` body that contains a top-level `security` key — includin
 ```
 
 `PATCH /settings` rejects any context block containing `recent_window` or `summary_interval` with `400 CONTEXT_LEGACY_FIELD_DEPRECATED` before structural deserialisation runs. The threshold-based `compact_trigger_pct` (range 0.50–0.95, default 0.80) and `compact_retain_pct` (range 0.20–0.60, default 0.40) replace them — the cross-field invariant `compact_retain_pct + 0.10 <= compact_trigger_pct` is enforced at PATCH time and on TOML load. The `strategy = "sliding-summary"` value is accepted as a deprecated alias for `"compact"` (rewritten on commit, scheduled for removal in v0.3.0).
+
+**Response 400** (candidate `context.max_input_tokens` overshoots the boot-time provider cap, #919):
+```json
+{
+  "error_code": "INVALID_TOKEN_BUDGET_FOR_PROVIDER",
+  "message": "configured token budget exceeds provider cap: ...",
+  "provider": "anthropic",
+  "model": "claude-haiku-4-5",
+  "max_input_tokens": 250000,
+  "max_tokens": 32000,
+  "effective_total": 282000,
+  "provider_cap": 200000,
+  "agents": [
+    {
+      "name": "tight-budget-agent",
+      "provider": "anthropic",
+      "model": "claude-haiku-4-5",
+      "agent_cap": 200000,
+      "would_be_total": 282000
+    }
+  ]
+}
+```
+
+Mirrors the `POST /runs` envelope from § 5.1 (`agent_id` is omitted on the PATCH path because the budget is server-level, not agent-scoped). The validator runs against the candidate `[context].max_input_tokens` plus the live `max_tokens` in TWO layers: first against the boot-time server-default `(provider, model)`, then against every registered agent's per-agent provider/model override (PR #1020 Codex P2 #2 follow-up). On strict-mode overshoot the entire PATCH is rejected with no partial commits and the persistence file is not written; the response body's `agents` array names every offender so the operator sees the full fleet impact in one response (single-offender layouts also populate the top-level `provider` / `model` / `effective_total` / `provider_cap` for back-compat with clients that only read those fields). Warn-mode (`ALMS_LLM_BUDGET_VALIDATION=warn`) downgrades the 400 to a structured WARN log per offending agent and lets the PATCH proceed.
 
 ---
 

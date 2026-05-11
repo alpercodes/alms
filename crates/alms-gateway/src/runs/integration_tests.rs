@@ -4477,3 +4477,687 @@ async fn http_run_sees_pending_telegram_style_work_in_queued_behind() {
          got {queued_behind}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// #919: per-run token-budget validation against provider context window
+//
+// `POST /runs` must reject requests where the resolved per-agent
+// `(provider, model, max_input_tokens, max_tokens)` quadruple overshoots
+// the provider's published context window. The validator runs inside
+// `pre_flight_token_budget` after `resolve_agent_config` succeeds, so a
+// per-agent provider/model override that lands on a too-small cap is
+// caught BEFORE the run is enqueued.
+// ---------------------------------------------------------------------------
+
+// The `ALMS_LLM_BUDGET_VALIDATION` env-var mutex and RAII guard live in
+// `crate::test_env_locks` so they are shared with `settings.rs::tests`
+// (which also exercises the validator on the PATCH path). Both files are
+// compiled into the same `cargo test -p alms-gateway` process — without a
+// single shared mutex, a strict-mode PATCH test could race a concurrent
+// warn-mode `POST /runs` test on the same env var. The lock guards a
+// single var-set (`ALMS_LLM_BUDGET_VALIDATION` only) and is disjoint by
+// construction from any other env-var mutex in the workspace.
+use crate::test_env_locks::BudgetValidationEnvGuard;
+
+/// Per-agent override pinning provider+model whose published context
+/// window is smaller than `max_input_tokens + max_tokens` -> structured
+/// 400 INVALID_TOKEN_BUDGET_FOR_PROVIDER.
+///
+/// Setup:
+/// - Server-default `[context].max_input_tokens` is 128_000 (default).
+/// - `agent.max_tokens` defaults to 32_000 (DEFAULT_AGENT_MAX_TOKENS).
+/// - Per-agent override pins provider=`anthropic` and model=`claude-haiku-4-5`,
+///   whose 200K cap fits the default 128K + 32K = 160K budget.
+/// - Bumping `[context].max_input_tokens` to 250_000 pushes the effective
+///   total to 282_000, which overshoots the 200K cap → validator fires.
+///
+/// Note: post-2026-05-09 verification round Opus 4.7 / Sonnet 4.6 moved to
+/// 1M caps. Haiku 4.5 stays at 200K and is the natural overshoot fixture.
+#[tokio::test]
+async fn create_run_rejects_per_agent_override_that_blows_provider_cap() {
+    use alms_core::registry::AgentRecord;
+    use alms_core::{CreateRunRequest, RunInput};
+    use axum::Json;
+    use axum::extract::State;
+    use chrono::Utc;
+
+    // Pin strict mode for this test so a concurrent warn-mode test
+    // can't make us silently accept the overbudget config.
+    let _env = BudgetValidationEnvGuard::unset();
+
+    let (state, _shutdown_token, _cr, _tr, _dr) = test_app_state_with_sqlite();
+
+    // Bump the server-level input budget so 250K input + 32K output
+    // overshoots Haiku 4.5's 200K cap.
+    {
+        let mut cfg = state.agent_config.write();
+        cfg.context_config.max_input_tokens = 250_000;
+    }
+
+    let agent_id = AgentId::new();
+    let now = Utc::now();
+    let agent = AgentRecord {
+        id: agent_id,
+        name: "overbudget-agent".into(),
+        description: String::new(),
+        // Pin a model whose 200K cap is smaller than the 282K effective
+        // total once we bump max_input_tokens above.
+        model: Some("claude-haiku-4-5".into()),
+        posture: None,
+        provider: Some("anthropic".into()),
+        telegram_token: None,
+        thinking_budget_tokens: None,
+        reasoning_effort: None,
+        gemini_thinking_budget: None,
+        summary_provider: None,
+        summary_model: None,
+        worktree_mode: alms_core::WorktreeMode::Off,
+        debug_mode: false,
+        is_default: false,
+        created_at: now,
+        last_active: now,
+    };
+    state
+        .session_manager
+        .store()
+        .expect("SQLite-backed state should have a store")
+        .create_agent(&agent)
+        .expect("agent seed should succeed");
+
+    let session = state.session_manager.get_or_create(agent_id, "web");
+    let req = CreateRunRequest {
+        session_id: session.id,
+        agent_id: Some(agent_id),
+        input: RunInput::Text {
+            text: "hello".into(),
+        },
+    };
+
+    let Err((status, body)) = super::lifecycle::create_run(State(state.clone()), Json(req)).await
+    else {
+        panic!(
+            "create_run must reject when the resolved budget overshoots the provider cap (#919)"
+        );
+    };
+
+    // 1. 400 status code BEFORE any LLM call.
+    assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+    // 2. Structured error code so clients can branch on it.
+    assert_eq!(
+        body.0["error_code"], "INVALID_TOKEN_BUDGET_FOR_PROVIDER",
+        "body must carry the structured error_code so clients can branch on it"
+    );
+    // 3. Body carries every datum the operator needs to fix the config.
+    assert_eq!(body.0["agent_id"], agent_id.0.to_string());
+    assert_eq!(body.0["provider"], "anthropic");
+    assert_eq!(body.0["model"], "claude-haiku-4-5");
+    assert_eq!(body.0["max_input_tokens"], 250_000);
+    assert_eq!(body.0["max_tokens"], 32_000);
+    assert_eq!(body.0["effective_total"], 282_000);
+    assert_eq!(body.0["provider_cap"], 200_000);
+    // 4. Human-readable message points at both knobs and the cap.
+    let message = body.0["message"]
+        .as_str()
+        .expect("message must be a string");
+    assert!(
+        message.contains("max_input_tokens") && message.contains("max_tokens"),
+        "message must name both budget knobs: {message}"
+    );
+    assert!(
+        message.contains("anthropic") && message.contains("claude-haiku-4-5"),
+        "message must identify the provider and resolved model: {message}"
+    );
+    // 5. No run was enqueued.
+    let runs = state.run_manager.list_by_agent(agent_id, 10);
+    assert!(
+        runs.is_empty(),
+        "no run should have been created when the gateway rejects pre-flight"
+    );
+}
+
+/// Same overbudget config + `ALMS_LLM_BUDGET_VALIDATION=warn` -> run is
+/// accepted (the env var downgrades the strict reject to a structured
+/// WARN log).
+///
+/// Pins the warn opt-out behaviour for the per-run path. Uses a process-
+/// global env-var mutex via `parking_lot` to avoid races with parallel
+/// tests that read the same env var.
+#[tokio::test]
+async fn create_run_warn_mode_accepts_overbudget_config() {
+    use alms_core::registry::AgentRecord;
+    use alms_core::{CreateRunRequest, RunInput};
+    use axum::Json;
+    use axum::extract::State;
+    use chrono::Utc;
+
+    // Pin warn mode for this test, holding the global env-var lock so
+    // concurrent strict-mode tests can't see the warn value.
+    let _env = BudgetValidationEnvGuard::set("warn");
+
+    let (state, shutdown_token, _cr, _tr, _dr) = test_app_state_with_sqlite();
+    {
+        let mut cfg = state.agent_config.write();
+        cfg.context_config.max_input_tokens = 250_000;
+    }
+
+    let agent_id = AgentId::new();
+    let now = Utc::now();
+    let agent = AgentRecord {
+        id: agent_id,
+        name: "overbudget-warn-agent".into(),
+        description: String::new(),
+        model: Some("claude-haiku-4-5".into()),
+        posture: None,
+        provider: Some("anthropic".into()),
+        telegram_token: None,
+        thinking_budget_tokens: None,
+        reasoning_effort: None,
+        gemini_thinking_budget: None,
+        summary_provider: None,
+        summary_model: None,
+        worktree_mode: alms_core::WorktreeMode::Off,
+        debug_mode: false,
+        is_default: false,
+        created_at: now,
+        last_active: now,
+    };
+    state
+        .session_manager
+        .store()
+        .expect("SQLite-backed state should have a store")
+        .create_agent(&agent)
+        .expect("agent seed should succeed");
+
+    let session = state.session_manager.get_or_create(agent_id, "web");
+    let req = CreateRunRequest {
+        session_id: session.id,
+        agent_id: Some(agent_id),
+        input: RunInput::Text {
+            text: "hello".into(),
+        },
+    };
+
+    let (status, _resp) = super::lifecycle::create_run(State(state), Json(req))
+        .await
+        .expect("warn mode must accept overshooting configs (#919)");
+    assert_eq!(status, axum::http::StatusCode::CREATED);
+    shutdown_token.cancel();
+}
+
+/// Per-agent override that resolves to a model whose `(provider, model)`
+/// pair the budget table doesn't know about -> run is accepted regardless
+/// of size. Mirrors the unknown-pair-skips contract pinned in the
+/// alms-core unit tests, exercised end-to-end through `pre_flight_token_budget`.
+#[tokio::test]
+async fn create_run_accepts_unknown_model_regardless_of_budget() {
+    use alms_core::registry::AgentRecord;
+    use alms_core::{CreateRunRequest, RunInput};
+    use axum::Json;
+    use axum::extract::State;
+    use chrono::Utc;
+
+    // Pin strict mode — the unknown-pair branch must skip the check
+    // regardless of mode, but we hold the lock so a concurrent warn-mode
+    // test doesn't make this assertion vacuous.
+    let _env = BudgetValidationEnvGuard::unset();
+
+    let (state, shutdown_token, _cr, _tr, _dr) = test_app_state_with_sqlite();
+    // 10M input + 32K output overshoots every published cap, but with an
+    // unknown model the validator returns Ok(()) and the run proceeds.
+    {
+        let mut cfg = state.agent_config.write();
+        cfg.context_config.max_input_tokens = 10_000_000;
+        cfg.max_tokens = 32_000;
+    }
+
+    let agent_id = AgentId::new();
+    let now = Utc::now();
+    let agent = AgentRecord {
+        id: agent_id,
+        name: "unknown-model-agent".into(),
+        description: String::new(),
+        // Per-agent provider override to anthropic with a model NOT in
+        // the table — falls through to None at lookup time, validator
+        // skips silently.
+        model: Some("claude-2.1".into()),
+        posture: None,
+        provider: Some("anthropic".into()),
+        telegram_token: None,
+        thinking_budget_tokens: None,
+        reasoning_effort: None,
+        gemini_thinking_budget: None,
+        summary_provider: None,
+        summary_model: None,
+        worktree_mode: alms_core::WorktreeMode::Off,
+        debug_mode: false,
+        is_default: false,
+        created_at: now,
+        last_active: now,
+    };
+    // Bump session storage to match so the cross-section validator is
+    // satisfied.
+    state
+        .session_manager
+        .store()
+        .expect("SQLite-backed state should have a store")
+        .create_agent(&agent)
+        .expect("agent seed should succeed");
+
+    let session = state.session_manager.get_or_create(agent_id, "web");
+    let req = CreateRunRequest {
+        session_id: session.id,
+        agent_id: Some(agent_id),
+        input: RunInput::Text {
+            text: "hello".into(),
+        },
+    };
+
+    let (status, _resp) = super::lifecycle::create_run(State(state), Json(req))
+        .await
+        .expect("unknown (provider, model) pair must skip the budget check");
+    assert_eq!(status, axum::http::StatusCode::CREATED);
+    shutdown_token.cancel();
+}
+
+/// Mock mode bypasses the per-run pre-flight budget guard, mirroring the
+/// boot-time skip in `AlmsConfig::validate` (Codex P2 #1 follow-up on PR
+/// #1020). A mock-mode run with an intentionally-overshooting budget for
+/// a known `(provider, model)` pair must land cleanly — the mock client
+/// will not call the real provider, so refusing it is a false positive
+/// that blocks otherwise-valid local/dev test setups.
+#[tokio::test]
+async fn create_run_mock_mode_bypasses_budget_validation() {
+    use alms_core::registry::AgentRecord;
+    use alms_core::{CreateRunRequest, RunInput};
+    use axum::Json;
+    use axum::extract::State;
+    use chrono::Utc;
+
+    // Pin strict mode — the mock-mode bypass must take effect regardless
+    // of `ALMS_LLM_BUDGET_VALIDATION`. Hold the global env-var lock so a
+    // concurrent warn-mode test can't make this assertion vacuous.
+    let _env = BudgetValidationEnvGuard::unset();
+
+    // Build state with a mock-mode LLM client. We can't mutate
+    // `state.llm.config.mock` after construction (no public setter — the
+    // flag travels through `LlmClient::new`), so we route through a
+    // `GatewayConfig` whose `llm_config.mock = true`.
+    let llm_config = alms_runtime::LlmConfig {
+        mock: true,
+        ..alms_runtime::LlmConfig::default()
+    };
+    let gateway_config = crate::gateway::GatewayConfig {
+        db_path: Some(":memory:".to_string()),
+        llm_config,
+        ..crate::gateway::GatewayConfig::default()
+    };
+    let gateway = crate::gateway::Gateway::new(gateway_config).unwrap();
+    let scheduler = std::sync::Arc::new(alms_runtime::Scheduler::new());
+    let shutdown_token = CancellationToken::new();
+    let (completion_tx, _cr) = mpsc::unbounded_channel();
+    let (trigger_tx, _tr) = mpsc::unbounded_channel();
+    let (dm_event_tx, _dr) = mpsc::unbounded_channel();
+    let state = AppState::new(
+        gateway,
+        scheduler,
+        shutdown_token.clone(),
+        completion_tx,
+        trigger_tx,
+        dm_event_tx,
+    )
+    .unwrap();
+
+    // 250K input + 32K output = 282K — overshoots Haiku 4.5's 200K cap.
+    // Without the mock-mode bypass the per-run validator would reject
+    // this with `400 INVALID_TOKEN_BUDGET_FOR_PROVIDER`.
+    {
+        let mut cfg = state.agent_config.write();
+        cfg.context_config.max_input_tokens = 250_000;
+        cfg.max_tokens = 32_000;
+    }
+
+    let agent_id = AgentId::new();
+    let now = Utc::now();
+    let agent = AgentRecord {
+        id: agent_id,
+        name: "mock-mode-agent".into(),
+        description: String::new(),
+        // A known table-row whose 200K cap is smaller than the 282K
+        // effective total — without the mock bypass the validator would
+        // fire here.
+        model: Some("claude-haiku-4-5".into()),
+        posture: None,
+        provider: Some("anthropic".into()),
+        telegram_token: None,
+        thinking_budget_tokens: None,
+        reasoning_effort: None,
+        gemini_thinking_budget: None,
+        summary_provider: None,
+        summary_model: None,
+        worktree_mode: alms_core::WorktreeMode::Off,
+        debug_mode: false,
+        is_default: false,
+        created_at: now,
+        last_active: now,
+    };
+    state
+        .session_manager
+        .store()
+        .expect("SQLite-backed state should have a store")
+        .create_agent(&agent)
+        .expect("agent seed should succeed");
+
+    let session = state.session_manager.get_or_create(agent_id, "web");
+    let req = CreateRunRequest {
+        session_id: session.id,
+        agent_id: Some(agent_id),
+        input: RunInput::Text {
+            text: "hello".into(),
+        },
+    };
+
+    let (status, _resp) = super::lifecycle::create_run(State(state), Json(req))
+        .await
+        .expect("mock-mode run with overshooting budget must be accepted (#1020 P2 #1)");
+    assert_eq!(
+        status,
+        axum::http::StatusCode::CREATED,
+        "mock mode must bypass token-budget pre-flight, mirroring `AlmsConfig::validate`"
+    );
+    shutdown_token.cancel();
+}
+
+// ---------------------------------------------------------------------------
+// #919: per-run token-budget validation INSIDE `execute_run` (non-HTTP path)
+//
+// `pre_flight_token_budget` originally only fired on the HTTP `POST /runs`
+// path. Runs created via `enqueue_triggered_run` (peer DMs, scheduler
+// triggers, notification runs, subagent completion runs) skip `create_run`
+// entirely and land directly in `execute_run`, so the create-time guard
+// did not protect them — the exact opaque-downstream-4xx symptom the
+// validator is meant to prevent. Codex P2 follow-up on PR #1020 moved the
+// guard into `execute_run` so every run-creation path inherits it.
+// ---------------------------------------------------------------------------
+
+/// Non-HTTP path: bypass `create_run` and call `execute_run` directly with
+/// an over-budget agent config. `execute_run` must reject the run before
+/// any LLM call by marking it `Failed` with the structured
+/// `INVALID_TOKEN_BUDGET_FOR_PROVIDER` message.
+///
+/// Setup mirrors `create_run_rejects_per_agent_override_that_blows_provider_cap`
+/// — same overbudget shape, same expected message structure. The
+/// distinction is the call site: this test enqueues the run shape used by
+/// the scheduler / Telegram / peer-DM / subagent completion paths and
+/// confirms the `execute_run`-side guard fires identically. Pins the
+/// "queued runs whose agent config changed after `POST /runs`" leak too,
+/// because the second resolve inside `execute_run` is what catches both
+/// the never-validated and the re-validated case.
+#[tokio::test]
+async fn execute_run_rejects_overbudget_resolved_config_on_non_http_path() {
+    use alms_core::registry::AgentRecord;
+    use chrono::Utc;
+
+    // Pin strict mode so a concurrent warn-mode test can't make us silently
+    // accept the overbudget config.
+    let _env = BudgetValidationEnvGuard::unset();
+
+    let (state, shutdown_token, _cr, _tr, _dr) = test_app_state_with_sqlite();
+    {
+        let mut cfg = state.agent_config.write();
+        cfg.context_config.max_input_tokens = 250_000;
+        cfg.max_tokens = 32_000;
+    }
+
+    let agent_id = AgentId::new();
+    let now = Utc::now();
+    let agent = AgentRecord {
+        id: agent_id,
+        name: "overbudget-non-http-agent".into(),
+        description: String::new(),
+        // 250K + 32K = 282K overshoots Haiku 4.5's 200K cap — same fixture
+        // as the create_run-side test, exercised from the non-HTTP path.
+        model: Some("claude-haiku-4-5".into()),
+        posture: None,
+        provider: Some("anthropic".into()),
+        telegram_token: None,
+        thinking_budget_tokens: None,
+        reasoning_effort: None,
+        gemini_thinking_budget: None,
+        summary_provider: None,
+        summary_model: None,
+        worktree_mode: alms_core::WorktreeMode::Off,
+        debug_mode: false,
+        is_default: false,
+        created_at: now,
+        last_active: now,
+    };
+    state
+        .session_manager
+        .store()
+        .expect("SQLite-backed state should have a store")
+        .create_agent(&agent)
+        .expect("agent seed should succeed");
+
+    let session = state
+        .session_manager
+        .get_or_create(agent_id, "non-http-context");
+    let session_id = session.id;
+
+    // Bypass `create_run` (which would reject pre-flight on the HTTP path)
+    // and enqueue the run directly — this is the shape the Telegram /
+    // scheduler / peer-DM / subagent paths use.
+    let run = Run::new(session_id, agent_id, "over-budget non-http trigger".into());
+    let run_id = run.run_id;
+    state.run_manager.insert_run(run.clone());
+
+    let cancel_token = CancellationToken::new();
+    state
+        .run_manager
+        .register_cancel_token(run_id, cancel_token.clone());
+
+    let in_flight_before = state.run_manager.in_flight_count();
+
+    super::lifecycle::execute_run(
+        state.clone(),
+        super::RunParams {
+            run_id,
+            session_id,
+            agent_id,
+            input: run.input,
+            context_id: "non-http-context".to_string(),
+            cancel_token,
+            // System-triggered shape (scheduler / notification / subagent
+            // completion). The budget check is independent of these flags
+            // — it runs immediately after `resolve_agent_config` succeeds,
+            // before the posture / bootstrap / debug-mode transforms.
+            is_peer_message: false,
+            is_system_triggered: true,
+            input_pre_persisted: false,
+        },
+    )
+    .await;
+
+    // 1. Terminal status is Failed — the budget arm fired before any LLM
+    //    call. NOT Cancelled (would mean the cancel-token early-exit fired
+    //    instead) and NOT Completed (would mean the guard didn't trip).
+    let final_run = state
+        .run_manager
+        .get_run(run_id)
+        .expect("run must still exist after execute_run returns");
+    assert_eq!(
+        final_run.status,
+        RunStatus::Failed,
+        "run must reach Failed via the budget arm; got {:?}",
+        final_run.status,
+    );
+
+    // 2. The persisted error carries the structured message — same shape
+    //    operators see on `GET /runs/{id}` for the HTTP path's 400 body.
+    let error_msg = final_run
+        .error
+        .as_ref()
+        .expect("Failed run must carry a structured error message");
+    assert!(
+        error_msg.contains("anthropic") && error_msg.contains("claude-haiku-4-5"),
+        "error must name the provider and resolved model (got: {error_msg})"
+    );
+    assert!(
+        error_msg.contains("max_input_tokens") && error_msg.contains("max_tokens"),
+        "error must name both budget knobs (got: {error_msg})"
+    );
+    assert!(
+        error_msg.contains("200000") || error_msg.contains("200_000"),
+        "error must name the provider cap (got: {error_msg})"
+    );
+
+    // 3. The RAII `_in_flight_guard` decrements back to baseline on the
+    //    new failure arm too, mirroring the contract pinned in
+    //    `execute_run_failure_arm_marks_run_failed_with_structured_error_on_provider_switch_without_model`.
+    assert_eq!(
+        state.run_manager.in_flight_count(),
+        in_flight_before,
+        "in_flight counter must return to baseline ({}) after the budget failure arm; got {}",
+        in_flight_before,
+        state.run_manager.in_flight_count(),
+    );
+
+    // 4. The run never transitioned to `Running` — the guard fires
+    //    BEFORE `mark_run_as_running_with_config`, so the resolved-config
+    //    snapshot is never persisted and the run isn't visible in the
+    //    running set.
+    assert!(
+        final_run.resolved_config.is_none(),
+        "Failed-before-running runs must not have a resolved_config snapshot; got {:?}",
+        final_run.resolved_config,
+    );
+
+    shutdown_token.cancel();
+}
+
+/// Mock-mode skip on the non-HTTP path: mirrors the create_run-side mock
+/// bypass test. When the LLM client is in mock mode, `execute_run`'s
+/// budget guard must skip regardless of strict-mode env var.
+///
+/// (We don't test the warn-mode opt-out on the non-HTTP path explicitly —
+/// `evaluate_pre_flight_token_budget` is the shared helper exercised by
+/// both surfaces, so the strict/warn dispatch is pinned by the HTTP-side
+/// `create_run_warn_mode_accepts_overbudget_config` test. The mock-mode
+/// branch lives at the top of the helper and short-circuits before the
+/// strict/warn split, so we pin it on both surfaces.)
+#[tokio::test]
+async fn execute_run_mock_mode_skips_budget_validation_on_non_http_path() {
+    use alms_core::registry::AgentRecord;
+    use chrono::Utc;
+
+    let _env = BudgetValidationEnvGuard::unset();
+
+    // Build state with a mock-mode LLM client.
+    let llm_config = alms_runtime::LlmConfig {
+        mock: true,
+        ..alms_runtime::LlmConfig::default()
+    };
+    let gateway_config = crate::gateway::GatewayConfig {
+        db_path: Some(":memory:".to_string()),
+        llm_config,
+        ..crate::gateway::GatewayConfig::default()
+    };
+    let gateway = crate::gateway::Gateway::new(gateway_config).unwrap();
+    let scheduler = std::sync::Arc::new(alms_runtime::Scheduler::new());
+    let shutdown_token = CancellationToken::new();
+    let (completion_tx, _cr) = mpsc::unbounded_channel();
+    let (trigger_tx, _tr) = mpsc::unbounded_channel();
+    let (dm_event_tx, _dr) = mpsc::unbounded_channel();
+    let state = AppState::new(
+        gateway,
+        scheduler,
+        shutdown_token.clone(),
+        completion_tx,
+        trigger_tx,
+        dm_event_tx,
+    )
+    .unwrap();
+
+    {
+        let mut cfg = state.agent_config.write();
+        cfg.context_config.max_input_tokens = 250_000;
+        cfg.max_tokens = 32_000;
+    }
+
+    let agent_id = AgentId::new();
+    let now = Utc::now();
+    let agent = AgentRecord {
+        id: agent_id,
+        name: "mock-mode-non-http-agent".into(),
+        description: String::new(),
+        model: Some("claude-haiku-4-5".into()),
+        posture: None,
+        provider: Some("anthropic".into()),
+        telegram_token: None,
+        thinking_budget_tokens: None,
+        reasoning_effort: None,
+        gemini_thinking_budget: None,
+        summary_provider: None,
+        summary_model: None,
+        worktree_mode: alms_core::WorktreeMode::Off,
+        debug_mode: false,
+        is_default: false,
+        created_at: now,
+        last_active: now,
+    };
+    state
+        .session_manager
+        .store()
+        .expect("SQLite-backed state should have a store")
+        .create_agent(&agent)
+        .expect("agent seed should succeed");
+
+    let session = state
+        .session_manager
+        .get_or_create(agent_id, "non-http-context");
+    let session_id = session.id;
+
+    let run = Run::new(
+        session_id,
+        agent_id,
+        "mock-mode overbudget non-http trigger".into(),
+    );
+    let run_id = run.run_id;
+    state.run_manager.insert_run(run.clone());
+
+    let cancel_token = CancellationToken::new();
+    state
+        .run_manager
+        .register_cancel_token(run_id, cancel_token.clone());
+
+    super::lifecycle::execute_run(
+        state.clone(),
+        super::RunParams {
+            run_id,
+            session_id,
+            agent_id,
+            input: run.input,
+            context_id: "non-http-context".to_string(),
+            cancel_token,
+            is_peer_message: false,
+            is_system_triggered: true,
+            input_pre_persisted: false,
+        },
+    )
+    .await;
+
+    // The run must NOT carry the budget-failure signature — mock mode
+    // bypassed the guard, mirroring `AlmsConfig::validate`'s boot-time
+    // skip and the HTTP-path test.
+    let final_run = state
+        .run_manager
+        .get_run(run_id)
+        .expect("run must still exist after execute_run returns");
+    if let Some(error_msg) = final_run.error.as_ref() {
+        assert!(
+            !error_msg.contains("context.max_input_tokens"),
+            "mock mode must NOT produce the budget-failure signature; got: {error_msg}"
+        );
+    }
+
+    shutdown_token.cancel();
+}

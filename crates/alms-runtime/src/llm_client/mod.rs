@@ -820,6 +820,30 @@ impl LlmClient {
         &self.config.default_model
     }
 
+    /// Borrow the `[llm.providers]` snapshot the client carries.
+    ///
+    /// The map is the same one consulted by [`Self::provider_kind`] and
+    /// `apply_provider` — exposing it as a borrowed accessor lets gateway
+    /// helpers (notably the shared raw-string model resolver used by
+    /// `resolve_agent_config` and `validate_patch_budget`'s fleet check)
+    /// reach the per-provider entries (`kind`, `model`, etc.) without
+    /// duplicating the configuration plumbing.
+    pub fn providers_snapshot(
+        &self,
+    ) -> &std::collections::BTreeMap<String, alms_core::config::ProviderEntry> {
+        &self.config.providers
+    }
+
+    /// Whether this client is configured for mock mode (no real provider
+    /// HTTP calls). Mirrors the `[llm].mock` flag the boot-time
+    /// `AlmsConfig::validate` reads — gateway pre-flight paths consult this
+    /// to skip provider-cap enforcement that would otherwise reject
+    /// otherwise-valid mock test setups (per-run pre-flight #919, P2 #1
+    /// follow-up).
+    pub fn is_mock(&self) -> bool {
+        self.config.mock
+    }
+
     /// Get the current API key (test-only).
     #[cfg(test)]
     pub fn api_key(&self) -> &str {

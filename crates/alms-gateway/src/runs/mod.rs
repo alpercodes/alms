@@ -36,6 +36,10 @@ pub use streaming::{
 // Public struct and function used by gateway.rs
 pub use self::config::{ResolveAgentConfigError, ResolvedAgentConfig, resolve_agent_config};
 
+// Used by `settings::validate_patch_budget` to mirror the runtime's per-agent
+// model resolution (Codex P2 follow-up on #1020 / fleet evaluation #2).
+pub(crate) use self::config::{ResolveEffectiveModelError, resolve_effective_provider_and_model};
+
 // ---------------------------------------------------------------------------
 // Shared types (used by multiple submodules)
 // ---------------------------------------------------------------------------
@@ -140,7 +144,7 @@ mod config {
     /// lowercase today, but a user-typed config with mixed case shouldn't
     /// silently drop). Mirrors the lowercase sugar-name handling in
     /// `apply_provider`.
-    pub(super) fn model_belongs_to_kind(model: &str, kind: ProviderKind) -> bool {
+    pub(crate) fn model_belongs_to_kind(model: &str, kind: ProviderKind) -> bool {
         let model = model.to_ascii_lowercase();
         match kind {
             ProviderKind::OpenAiCompatible => true,
@@ -149,6 +153,129 @@ mod config {
                 model.starts_with("gemini-") || model.starts_with("models/gemini-")
             }
         }
+    }
+
+    /// Resolve the [`ProviderKind`] for `provider` from a `[llm.providers]`
+    /// snapshot, falling back to the same sugar-name mapping
+    /// `LlmClient::provider_kind` and `LlmClient::apply_provider` use.
+    ///
+    /// Mirrors the lookup used inside `LlmClient::provider_kind` so that the
+    /// raw-string helpers below produce the same `ProviderKind` decision as
+    /// the runtime path.
+    pub(super) fn provider_kind_for_name(
+        provider: &str,
+        providers: &std::collections::BTreeMap<String, alms_core::config::ProviderEntry>,
+    ) -> ProviderKind {
+        if let Some(entry) = providers.get(provider) {
+            return entry.kind;
+        }
+        match provider {
+            "anthropic" => ProviderKind::Anthropic,
+            "gemini" => ProviderKind::Gemini,
+            _ => ProviderKind::OpenAiCompatible,
+        }
+    }
+
+    /// Failure modes from [`resolve_effective_provider_and_model`].
+    ///
+    /// Mirrors [`ResolveAgentConfigError`] but on a raw-string surface
+    /// without an `AgentId` — callers that need the full error envelope wrap
+    /// this with their own `agent_id`. Exists as a distinct type so the
+    /// helper is callable from `settings::validate_patch_budget`, which
+    /// validates a fleet of records and does not have a single `AgentId` to
+    /// attach.
+    #[derive(Debug, Clone)]
+    pub enum ResolveEffectiveModelError {
+        /// Per-agent provider override switched the effective provider AND
+        /// no model was supplied at any layer for the new provider — same
+        /// shape as [`ResolveAgentConfigError::MissingModelAfterProviderSwitch`].
+        MissingModelAfterProviderSwitch {
+            new_provider: String,
+            prev_provider: String,
+        },
+    }
+
+    /// Mirrors [`resolve_agent_config`]'s per-agent model resolution from
+    /// raw strings rather than an [`alms_runtime::LlmClient`].
+    ///
+    /// Returns the effective `(provider, model)` pair the runtime would land
+    /// on for an agent record, applying the same precedence:
+    ///
+    /// 1. **Effective provider.** `record.provider` if set, otherwise the
+    ///    server-default `provider`.
+    /// 2. **Cross-namespace drop (#942).** When the per-agent provider
+    ///    override changes the effective wire kind AND the per-agent model
+    ///    belongs to the OLD provider's namespace (see
+    ///    [`model_belongs_to_kind`]), drop the per-agent model so the run
+    ///    does not 404 on the new provider's wire.
+    /// 3. **Effective model.** The per-agent model that survived the
+    ///    namespace check, otherwise `[llm.providers.<effective>].model`,
+    ///    otherwise the server-default model — but the server-default model
+    ///    is reused only when the provider did NOT change. When the
+    ///    provider changed AND no per-agent / provider-entry model is
+    ///    available, return [`ResolveEffectiveModelError::MissingModelAfterProviderSwitch`]
+    ///    rather than letting the OLD provider's default model leak onto
+    ///    the new provider's wire (#860 / #863).
+    ///
+    /// Used by [`resolve_agent_config`] (where it is the single source of
+    /// truth for the model decision; the LlmClient side-effects layer on
+    /// top) and by `settings::validate_patch_budget` (where the fleet check
+    /// validates each agent's effective `(provider, model)` against the
+    /// candidate `max_input_tokens` cap — the bare-record path skipped the
+    /// namespace drop pre-fix and silently green-lit PATCHes that the
+    /// runtime would later reject with `INVALID_TOKEN_BUDGET_FOR_PROVIDER`).
+    pub fn resolve_effective_provider_and_model(
+        record_provider: Option<&str>,
+        record_model: Option<&str>,
+        server_provider: &str,
+        server_default_model: &str,
+        providers: &std::collections::BTreeMap<String, alms_core::config::ProviderEntry>,
+    ) -> Result<(String, String), ResolveEffectiveModelError> {
+        let prev_provider = server_provider.to_string();
+        let effective_provider = record_provider
+            .map(str::to_string)
+            .unwrap_or_else(|| prev_provider.clone());
+        let provider_changed = effective_provider != prev_provider;
+        let effective_kind = provider_kind_for_name(&effective_provider, providers);
+
+        // Mirror the per-agent model arm in `resolve_agent_config`: keep
+        // the per-agent model when no provider switch fired, when the
+        // namespace matches, or drop it (#942) when the wire kind would
+        // reject it.
+        let surviving_per_agent_model: Option<String> = match record_model {
+            None => None,
+            Some(m) if !provider_changed => Some(m.to_string()),
+            Some(m) if model_belongs_to_kind(m, effective_kind) => Some(m.to_string()),
+            Some(_) => None,
+        };
+
+        if let Some(model) = surviving_per_agent_model {
+            return Ok((effective_provider, model));
+        }
+
+        // No surviving per-agent model: fall back to the new provider's
+        // entry-level model override, then the server-default model.
+        // The server-default model can ONLY be reused when the provider
+        // did not change — reusing it across a provider switch is the #860
+        // leak shape that `resolve_agent_config` rejects with
+        // `MissingModelAfterProviderSwitch`.
+        if let Some(entry_model) = providers
+            .get(&effective_provider)
+            .and_then(|e| e.model.clone())
+        {
+            return Ok((effective_provider, entry_model));
+        }
+
+        if provider_changed {
+            return Err(
+                ResolveEffectiveModelError::MissingModelAfterProviderSwitch {
+                    new_provider: effective_provider,
+                    prev_provider,
+                },
+            );
+        }
+
+        Ok((effective_provider, server_default_model.to_string()))
     }
 
     /// Result of resolving per-agent config from the agent registry.
@@ -351,20 +478,80 @@ mod config {
             }
         }
 
+        // Resolve the effective `(provider, model)` for this record up-front
+        // via the shared helper so the per-run path and the PATCH /settings
+        // fleet-evaluation path (`settings::validate_patch_budget`) consult
+        // the same source of truth. The helper encapsulates the #942
+        // cross-namespace drop and the #863 missing-model decision; the
+        // LlmClient side-effects (`with_provider_and_secrets` / `with_model`)
+        // layer on top.
+        let server_provider = llm.provider().to_string();
+        let server_default_model = llm.default_model().to_string();
+        let record_provider = agent_record.as_ref().and_then(|r| r.provider.as_deref());
+        let (effective_provider, effective_model) = match resolve_effective_provider_and_model(
+            record_provider,
+            per_agent_model.as_deref(),
+            &server_provider,
+            &server_default_model,
+            llm.providers_snapshot(),
+        ) {
+            Ok(pair) => pair,
+            Err(ResolveEffectiveModelError::MissingModelAfterProviderSwitch {
+                new_provider,
+                prev_provider,
+            }) => {
+                // #863 structured rejection (subsumes the old #860 empty-clear
+                // fail-fast). The helper returned the missing-model decision;
+                // map it onto the public `ResolveAgentConfigError` so the
+                // gateway emits a clean `400 MISSING_MODEL_AFTER_PROVIDER_SWITCH`
+                // before any LLM call.
+                warn!(
+                    agent_id = %agent_id,
+                    old_provider = %prev_provider,
+                    new_provider = %new_provider,
+                    stale_model = %server_default_model,
+                    "Per-agent provider switch with no per-agent model and no \
+                     provider-entry model -- rejecting before LLM call so the \
+                     user sees a clean 400 instead of an opaque downstream 4xx \
+                     (#863)"
+                );
+                return Err(ResolveAgentConfigError::MissingModelAfterProviderSwitch {
+                    agent_id,
+                    new_provider,
+                    prev_provider,
+                });
+            }
+        };
+
+        // Log the cross-namespace drop here for runtime observability — the
+        // helper itself is silent because it is also called from the PATCH
+        // fleet-evaluation path (which has its own per-agent log line). The
+        // drop fires when a per-agent provider override changed the
+        // effective wire kind AND the per-agent model belongs to the OLD
+        // provider's namespace.
+        if let Some(stale) = per_agent_model.as_deref()
+            && effective_provider != server_provider
+            && !model_belongs_to_kind(
+                stale,
+                provider_kind_for_name(&effective_provider, llm.providers_snapshot()),
+            )
+        {
+            warn!(
+                agent_id = %agent_id,
+                old_provider = %server_provider,
+                new_provider = %effective_provider,
+                stale_per_agent_model = %stale,
+                "Per-agent provider switch with cross-namespace per-agent model -- \
+                 dropping the stale model so the run does not 404 on the new \
+                 provider's wire with a previous-namespace model name (#942)"
+            );
+        }
+
         // Apply per-agent provider override first (changes base_url +
         // api_key), then ALWAYS re-resolve the API key from secrets for the
         // effective provider. This ensures keys set at runtime (via UI or
         // CLI) are picked up even for the default agent which has no
         // per-agent provider field.
-        //
-        // Snapshot the previous provider AND model so the leak guard below
-        // can detect a per-agent provider switch where neither layer
-        // (per-agent model nor provider-entry model) supplies a model for
-        // the new provider. In that case `apply_provider` leaves
-        // `default_model` unchanged from the OLD provider's default — and
-        // that wrong-provider model name reaches the wire (#860).
-        let previous_provider = llm.provider().to_string();
-        let previous_default_model = llm.default_model().to_string();
         let mut llm = llm.clone();
         if let Some(ref record) = agent_record
             && let Some(ref provider) = record.provider
@@ -400,65 +587,14 @@ mod config {
             );
         }
 
-        // Apply the per-agent model. When set this overrides any value
-        // `apply_provider` left on `default_model` — the per-agent override
-        // is the user's explicit choice and must reach the wire.
-        //
-        // Cross-namespace drop (#942): if the per-agent provider override
-        // changed the effective wire kind AND the per-agent model belongs
-        // to the OLD provider's namespace, drop it on the floor. Falling
-        // through to the #860 leak-guard branch lets `[llm.providers.<new>]
-        // .model` (if any) supply a fallback or clears `default_model` to
-        // `""` for fail-fast.
-        let provider_changed = llm.provider() != previous_provider;
-        let effective_per_agent_model = match per_agent_model {
-            None => None,
-            Some(ref model) if !provider_changed => Some(model.clone()),
-            Some(ref model) if model_belongs_to_kind(model, llm.provider_kind()) => {
-                Some(model.clone())
-            }
-            Some(stale) => {
-                warn!(
-                    agent_id = %agent_id,
-                    old_provider = %previous_provider,
-                    new_provider = %llm.provider(),
-                    stale_per_agent_model = %stale,
-                    "Per-agent provider switch with cross-namespace per-agent model -- \
-                     dropping the stale model so the run does not 404 on the new \
-                     provider's wire with a previous-namespace model name (#942)"
-                );
-                None
-            }
-        };
-
-        if let Some(model) = effective_per_agent_model {
-            llm = llm.with_model(model);
-        } else if provider_changed && llm.default_model() == previous_default_model {
-            // #863 structured rejection (subsumes the old #860 empty-clear
-            // fail-fast). Per-agent provider switch fired AND neither a
-            // per-agent model nor a `[llm.providers.<new_provider>].model`
-            // entry supplied a model for the new provider, so `default_model`
-            // is still the OLD provider's default. Returning an error here
-            // lets the gateway emit a clean `400 MISSING_MODEL_AFTER_PROVIDER_SWITCH`
-            // before any LLM call rather than letting the agent loop send
-            // the previous provider's default model on the new provider's
-            // wire (the #860 leak shape).
-            warn!(
-                agent_id = %agent_id,
-                old_provider = %previous_provider,
-                new_provider = %llm.provider(),
-                stale_model = %previous_default_model,
-                "Per-agent provider switch with no per-agent model and no \
-                 provider-entry model -- rejecting before LLM call so the \
-                 user sees a clean 400 instead of an opaque downstream 4xx \
-                 (#863)"
-            );
-            return Err(ResolveAgentConfigError::MissingModelAfterProviderSwitch {
-                agent_id,
-                new_provider: llm.provider().to_string(),
-                prev_provider: previous_provider,
-            });
-        }
+        // Apply the effective model decided by the helper. The per-agent
+        // model (when it survived the namespace check) or the
+        // `[llm.providers.<effective>].model` fallback wins over the value
+        // `apply_provider` left on `default_model`. When the helper picked
+        // the server-default model (no per-agent override and no provider
+        // switch), the `with_model` is a no-op assignment of the same
+        // string, kept here for symmetry rather than a special case.
+        llm = llm.with_model(effective_model);
 
         // Per-agent worktree-isolation mode (#946). Unnamed agents
         // and agents not in the registry get `Off` — there is no

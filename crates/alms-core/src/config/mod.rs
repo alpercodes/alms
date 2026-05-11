@@ -9,17 +9,21 @@
 //! via `alms auth set`. Environment variable fallback has been removed for
 //! security — agents can read env vars via `shell_exec`.
 
+mod budget;
 mod types;
 
 #[cfg(test)]
 mod tests;
 
+pub use budget::{
+    TokenBudgetError, ValidationMode, provider_context_window, validate_token_budget,
+};
 pub use types::{
-    AnthropicConfig, AuthScheme, ChannelsConfig, ContextConfig, FsEditConfig, GeminiConfig,
-    LlmConfig, LoggingConfig, OpenAiConfig, ProviderEntry, ProviderKind, ProviderQuirks,
-    ReasoningEffort, RunSummaryMode, SecurityConfig, ServerConfig, SessionConfig,
-    ShellClassificationMode, ShellPermissions, ShellSpillConfig, ToolOutputTruncateConfig,
-    ToolsConfig,
+    AnthropicConfig, AuthScheme, ChannelsConfig, ContextConfig, DEFAULT_AGENT_MAX_TOKENS,
+    FsEditConfig, GeminiConfig, LlmConfig, LoggingConfig, OpenAiConfig, ProviderEntry,
+    ProviderKind, ProviderQuirks, ReasoningEffort, RunSummaryMode, SecurityConfig, ServerConfig,
+    SessionConfig, ShellClassificationMode, ShellPermissions, ShellSpillConfig,
+    ToolOutputTruncateConfig, ToolsConfig,
 };
 
 use crate::{AlmsError, AlmsResult};
@@ -582,7 +586,79 @@ impl AlmsConfig {
             }
         }
 
+        // Token-budget cross-validation against the provider's published
+        // context window (#919). Pre-#919 a misconfigured budget surfaced
+        // as an opaque downstream 4xx mid-run; this catches it at load
+        // time using the runtime's default `agent.max_tokens` as the
+        // output reservation. Per-agent overrides are re-validated at
+        // run-create time in the gateway.
+        //
+        // Skipped for `mock = true` since the mock client does not enforce
+        // a real provider's cap.
+        if !self.llm.mock {
+            self.validate_token_budget()?;
+        }
+
         Ok(())
+    }
+
+    /// Cross-validate `[context].max_input_tokens + DEFAULT_AGENT_MAX_TOKENS`
+    /// against the published context window for the configured
+    /// `(llm.provider, llm.model)` pair (#919).
+    ///
+    /// At config-load time the per-agent `max_tokens` override is unknown
+    /// (it lives in [`crate::registry::AgentRecord`] and only flows in at
+    /// run-create time), so the load-time check uses the runtime's default
+    /// of 32K. The gateway re-runs the same validator at per-run
+    /// model-resolve time with the resolved per-agent value so a `PATCH
+    /// /agents/{id}` that lowers `max_tokens` below the load-time default
+    /// is still caught downstream.
+    ///
+    /// Returns `Ok(())` when:
+    /// - the table has no entry for the `(provider, model)` pair (we don't
+    ///   know the cap → can't enforce without false positives), OR
+    /// - the sum fits the published cap, OR
+    /// - the operator opted out via `ALMS_LLM_BUDGET_VALIDATION=warn`
+    ///   (warn-logged at `target = "alms.config"` and accepted).
+    ///
+    /// Returns `Err(AlmsError::InvalidConfig)` only when strict mode is
+    /// active AND the table-known cap is exceeded.
+    fn validate_token_budget(&self) -> AlmsResult<()> {
+        // Resolve the effective model the same way the runtime adapter
+        // does: prefer the resolved provider entry's `model` override,
+        // fall through to the flat `llm.model`. Mirrors the precedence
+        // baked into `From<LlmConfig> for runtime::LlmConfig`.
+        let effective_model = self
+            .llm
+            .resolved_provider()
+            .and_then(|e| e.model.as_deref())
+            .unwrap_or(self.llm.model.as_str());
+
+        match budget::validate_token_budget(
+            &self.llm.provider,
+            effective_model,
+            self.context.max_input_tokens,
+            types::DEFAULT_AGENT_MAX_TOKENS,
+        ) {
+            Ok(()) => Ok(()),
+            Err(err) => match budget::ValidationMode::from_env() {
+                budget::ValidationMode::Strict => Err(AlmsError::InvalidConfig(err.message())),
+                budget::ValidationMode::Warn => {
+                    warn!(
+                        target: "alms.config",
+                        provider = %err.provider,
+                        model = %err.model,
+                        max_input_tokens = err.max_input_tokens,
+                        max_tokens = err.max_tokens,
+                        effective_total = err.effective_total,
+                        provider_cap = err.provider_cap,
+                        "{}",
+                        err.message()
+                    );
+                    Ok(())
+                }
+            },
+        }
     }
 
     /// Warn if a legacy `./data` directory exists but the new `.alms/`

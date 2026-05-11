@@ -10,6 +10,22 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use tracing::warn;
 
+/// Default per-agent output-token reservation (`agent.max_tokens`).
+///
+/// 32K matches prevailing agent-tool defaults — covers ~95-99% of agent turns
+/// (most finish under 8K), reasoning models' hidden-thinking budgets, and
+/// long code-gen flows. Operators can override per-agent for code-gen or
+/// long-form writing workflows that need more headroom (#918).
+///
+/// Lifted out of `alms-runtime`'s `AgentConfig::default()` so the config
+/// crate can reuse the same value during config-load-time token-budget
+/// validation (#919) — the budget validator there cross-checks
+/// `[context].max_input_tokens + agent.max_tokens` against the provider's
+/// published context window. Importing the constant from
+/// `alms-runtime` would invert the dependency graph (`alms-core` cannot
+/// depend on `alms-runtime`), so the source of truth lives here.
+pub const DEFAULT_AGENT_MAX_TOKENS: u32 = 32_000;
+
 // ---------------------------------------------------------------------------
 // RunSummaryMode enum
 // ---------------------------------------------------------------------------

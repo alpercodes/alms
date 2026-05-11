@@ -229,6 +229,24 @@ impl SqliteStore {
         Ok(rows)
     }
 
+    /// Test-only: drop the `agents` table so subsequent agent-CRUD calls
+    /// fail at the `prepare()` step with `no such table: agents`.
+    ///
+    /// Used by `alms-gateway` integration tests to simulate the
+    /// "SQLite temporarily failing" condition and verify the PATCH
+    /// `/settings` fleet-budget validator fails closed (Codex P2 #1020).
+    /// Marked `#[doc(hidden)]` because the method is a cross-crate test
+    /// affordance — `#[cfg(test)]` would scope it to this crate's own
+    /// test target only, and `alms-session` has no `test-helpers`
+    /// feature surface to gate it behind.
+    #[doc(hidden)]
+    pub fn drop_agents_table_for_test(&self) -> AlmsResult<()> {
+        let conn = self.conn.lock();
+        conn.execute_batch("DROP TABLE agents;")
+            .map_err(|e| AlmsError::Runtime(format!("SQLite drop agents (test): {e}")))?;
+        Ok(())
+    }
+
     /// Load all agents that have a Telegram bot token configured.
     ///
     /// Used by the gateway to spawn per-agent polling loops at startup.

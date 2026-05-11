@@ -275,6 +275,124 @@ pub async fn cancel_run(
     })))
 }
 
+/// Cross-validate the resolved per-run `(provider, model, max_input_tokens,
+/// max_tokens)` quadruple against the provider's published context window
+/// (#919).
+///
+/// Returns:
+/// - `Ok(())` when the budget fits, when the table doesn't know the
+///   `(provider, model)` pair, when the agent is on the mock LLM, or when
+///   the validator is in `warn` mode (in which case the overshoot is
+///   downgraded to a structured WARN log).
+/// - `Err(TokenBudgetError)` when strict mode is active and the
+///   table-known cap is exceeded. The caller (HTTP `create_run` or non-HTTP
+///   `execute_run`) maps the structured error onto its own surface — a
+///   400 JSON body for the synchronous request path or a `run_error` SSE
+///   event + `mark_run_as_failed` for the queued path.
+///
+/// Centralising the mock-skip, env-mode dispatch, and structured-WARN log
+/// in one helper means every run-creation path — HTTP `POST /runs`,
+/// scheduler triggers, peer DMs, notification runs, and subagent
+/// completion runs — sees the same enforcement contract. The Codex P2
+/// follow-up that motivated the `execute_run` call site flagged that the
+/// HTTP-only guard left the non-HTTP paths exposed to the same opaque
+/// downstream 4xx the validator is meant to prevent.
+fn evaluate_pre_flight_token_budget(
+    agent_id: AgentId,
+    agent_config: &alms_runtime::AgentConfig,
+    llm: &alms_runtime::LlmClient,
+    rejection_log_message: &str,
+) -> Result<(), alms_core::config::TokenBudgetError> {
+    // Mock mode: never enforce the cap. Mirrors `AlmsConfig::validate`'s
+    // boot-time skip — the mock client does not enforce a real provider's
+    // cap, so refusing an intentionally-overshoot budget here would block
+    // local/dev mock runs that pass at boot. Same policy in both skip
+    // paths (Codex P2 #1 follow-up on PR #1020).
+    if llm.is_mock() {
+        return Ok(());
+    }
+
+    let provider = llm.provider();
+    let model = llm.default_model();
+    let max_input_tokens = agent_config.context_config.max_input_tokens;
+    let max_tokens = agent_config.max_tokens;
+
+    let Err(err) =
+        alms_core::config::validate_token_budget(provider, model, max_input_tokens, max_tokens)
+    else {
+        return Ok(());
+    };
+
+    match alms_core::config::ValidationMode::from_env() {
+        alms_core::config::ValidationMode::Strict => {
+            warn!(
+                target: "alms.config",
+                agent_id = %agent_id,
+                provider = %err.provider,
+                model = %err.model,
+                max_input_tokens = err.max_input_tokens,
+                max_tokens = err.max_tokens,
+                effective_total = err.effective_total,
+                provider_cap = err.provider_cap,
+                "{}",
+                rejection_log_message,
+            );
+            Err(err)
+        }
+        alms_core::config::ValidationMode::Warn => {
+            warn!(
+                target: "alms.config",
+                agent_id = %agent_id,
+                provider = %err.provider,
+                model = %err.model,
+                max_input_tokens = err.max_input_tokens,
+                max_tokens = err.max_tokens,
+                effective_total = err.effective_total,
+                provider_cap = err.provider_cap,
+                "{}",
+                err.message()
+            );
+            Ok(())
+        }
+    }
+}
+
+/// HTTP-shaped wrapper around [`evaluate_pre_flight_token_budget`].
+///
+/// Mirrors the `MissingModelAfterProviderSwitch` 400 error envelope so
+/// every gateway-side budget rejection lands with a consistent shape on
+/// the wire. Used only by the synchronous `POST /runs` handler; the
+/// queued / non-HTTP path uses
+/// [`fail_run_with_token_budget_error`] instead.
+fn pre_flight_token_budget(
+    agent_id: AgentId,
+    agent_config: &alms_runtime::AgentConfig,
+    llm: &alms_runtime::LlmClient,
+) -> Result<(), (StatusCode, axum::Json<serde_json::Value>)> {
+    match evaluate_pre_flight_token_budget(
+        agent_id,
+        agent_config,
+        llm,
+        "Rejecting POST /runs with INVALID_TOKEN_BUDGET_FOR_PROVIDER (#919)",
+    ) {
+        Ok(()) => Ok(()),
+        Err(err) => Err((
+            StatusCode::BAD_REQUEST,
+            axum::Json(serde_json::json!({
+                "error_code": "INVALID_TOKEN_BUDGET_FOR_PROVIDER",
+                "message": err.message(),
+                "agent_id": agent_id.0.to_string(),
+                "provider": err.provider,
+                "model": err.model,
+                "max_input_tokens": err.max_input_tokens,
+                "max_tokens": err.max_tokens,
+                "effective_total": err.effective_total,
+                "provider_cap": err.provider_cap,
+            })),
+        )),
+    }
+}
+
 /// POST /runs - Create a new run
 ///
 /// Per API spec: Returns 201 Created with { run_id, session_id, status: "queued", ts }
@@ -343,39 +461,53 @@ pub async fn create_run(
     // side-effects) and `execute_run` will resolve again under the live
     // secrets / agent_config locks at run time — this pre-flight only
     // catches the deterministic config-shape failure mode.
+    //
+    // #919: when the resolve succeeds, also cross-validate the resulting
+    // `(provider, model, max_input_tokens, max_tokens)` quadruple against
+    // the provider's published context window. Per-agent overrides
+    // (model, provider) can change the effective cap relative to the
+    // load-time default, so re-running the validator here catches
+    // configurations that pass at boot but blow the cap on a specific
+    // agent's resolved shape.
     {
         let base_agent_config = state.agent_config.read().clone();
-        if let Err(super::ResolveAgentConfigError::MissingModelAfterProviderSwitch {
-            agent_id: ag,
-            new_provider,
-            prev_provider,
-        }) = super::resolve_agent_config(
+        match super::resolve_agent_config(
             agent_id,
             &state.session_manager,
             &base_agent_config,
             &state.llm,
             Some(&state.secrets.read()),
         ) {
-            warn!(
-                agent_id = %ag,
-                new_provider = %new_provider,
-                prev_provider = %prev_provider,
-                "Rejecting POST /runs with MISSING_MODEL_AFTER_PROVIDER_SWITCH (#863)"
-            );
-            return Err((
-                StatusCode::BAD_REQUEST,
-                axum::Json(serde_json::json!({
-                    "error_code": "MISSING_MODEL_AFTER_PROVIDER_SWITCH",
-                    "message": format!(
-                        "agent {ag} overrides provider to {new_provider} but no \
-                         model was supplied; previous provider {prev_provider}'s \
-                         default cannot be reused"
-                    ),
-                    "agent_id": ag.0.to_string(),
-                    "new_provider": new_provider,
-                    "prev_provider": prev_provider,
-                })),
-            ));
+            Err(super::ResolveAgentConfigError::MissingModelAfterProviderSwitch {
+                agent_id: ag,
+                new_provider,
+                prev_provider,
+            }) => {
+                warn!(
+                    agent_id = %ag,
+                    new_provider = %new_provider,
+                    prev_provider = %prev_provider,
+                    "Rejecting POST /runs with MISSING_MODEL_AFTER_PROVIDER_SWITCH (#863)"
+                );
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    axum::Json(serde_json::json!({
+                        "error_code": "MISSING_MODEL_AFTER_PROVIDER_SWITCH",
+                        "message": format!(
+                            "agent {ag} overrides provider to {new_provider} but no \
+                             model was supplied; previous provider {prev_provider}'s \
+                             default cannot be reused"
+                        ),
+                        "agent_id": ag.0.to_string(),
+                        "new_provider": new_provider,
+                        "prev_provider": prev_provider,
+                    })),
+                ));
+            }
+            Ok(resolved) => {
+                // #919 per-run token-budget validation.
+                pre_flight_token_budget(agent_id, &resolved.agent_config, &resolved.llm)?;
+            }
         }
     }
 
@@ -819,6 +951,68 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
 
     let mut agent_config = resolved.agent_config;
     let llm = resolved.llm;
+
+    // #919 per-run token-budget validation — non-HTTP path mirror of the
+    // `create_run` pre-flight check above (Codex P2 follow-up on PR #1020).
+    // The HTTP path validates at `POST /runs` time and returns a structured
+    // 400 to the caller. Runs enqueued via `enqueue_triggered_run` (peer
+    // DMs, scheduler triggers, notification runs, subagent completion runs)
+    // skip that path entirely and land here. We also re-validate HTTP runs
+    // that were created earlier and sat in the queue while `PATCH /settings`
+    // or `PATCH /agents/{id}` mutated their effective budget — the
+    // create-time pre-flight is no longer authoritative by the time
+    // `execute_run` resolves the live snapshot, and without this second
+    // check we would still reach the provider with an over-budget request
+    // (the exact opaque-downstream-4xx symptom #919 is meant to prevent).
+    //
+    // On a strict-mode reject we emit a structured `run_error` SSE event
+    // with the same `INVALID_TOKEN_BUDGET_FOR_PROVIDER` code the HTTP 400
+    // body carries (clients branch on the same code regardless of which
+    // surface delivered the failure), mark the run as `Failed` with the
+    // human-readable message, and broadcast queue advance so any
+    // queued-behind runs see their positions decrement. The `Queued` →
+    // `Failed` transition fires here BEFORE `mark_run_as_running_with_config`,
+    // so the run never enters the running set — same shape as the
+    // `MissingModelAfterProviderSwitch` failure arm immediately above.
+    if let Err(budget_err) = evaluate_pre_flight_token_budget(
+        agent_id,
+        &agent_config,
+        &llm,
+        "Failing queued run with INVALID_TOKEN_BUDGET_FOR_PROVIDER (#919)",
+    ) {
+        let message = budget_err.message();
+        error!(
+            "Run {} rejected by token-budget validator before LLM call: {}",
+            run_id.0, message
+        );
+        state
+            .run_manager
+            .send_event(
+                run_id,
+                session_id,
+                SseEventData::run_error_with_code(
+                    run_id,
+                    "INVALID_TOKEN_BUDGET_FOR_PROVIDER",
+                    &message,
+                ),
+            )
+            .await;
+        state
+            .run_manager
+            .send_agent_event(
+                agent_id,
+                run_id,
+                session_id,
+                SseEventData::session_activity_ended(session_id, run_id, agent_id),
+            )
+            .await;
+        state.run_manager.mark_run_as_failed(run_id, message);
+        state.run_manager.remove_senders(run_id);
+        state.run_manager.remove_cancel_token(run_id);
+        state.approval_store.clear_for_run(run_id);
+        broadcast_queue_advance(&state, agent_id).await;
+        return;
+    }
 
     // System-triggered runs (peer DMs, notifications, subagent completions)
     // have no human in the loop, so Guarded posture would hang forever

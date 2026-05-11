@@ -600,7 +600,14 @@ pub(crate) fn to_anthropic_request(req: &CompletionRequest) -> AnthropicRequest 
         messages,
         system,
         tools,
-        max_tokens: req.max_tokens.unwrap_or(32_000),
+        // PR #1020 (Tim review): use the lifted `DEFAULT_AGENT_MAX_TOKENS`
+        // constant from `alms_core::config` so this site cannot drift from
+        // `AgentConfig::default().max_tokens`. The value is the same 32_000
+        // it has always been; the change is just to keep a single source
+        // of truth now that the constant exists.
+        max_tokens: req
+            .max_tokens
+            .unwrap_or(alms_core::config::DEFAULT_AGENT_MAX_TOKENS),
         stream: req.stream,
         thinking,
     }

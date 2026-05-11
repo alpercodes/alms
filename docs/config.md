@@ -417,8 +417,17 @@ Non-secret `ALMS_*` variables are applied on top of the parsed config file. The 
 | `ALMS_LLM_MODEL` / `DEFAULT_MODEL` | `llm.model` |
 | `ALMS_LLM_MOCK` | `llm.mock` |
 | `ALMS_LLM_STREAM_CHUNK_TIMEOUT` | `llm.stream_chunk_timeout_secs` |
+| `ALMS_LLM_BUDGET_VALIDATION` | (no TOML equivalent; `strict` default, `warn` opts out) |
 
 `ALMS_LLM_PROVIDER` can reference any entry in `[llm.providers.*]`, including user-declared ones — so you can keep Grok, DeepSeek, Groq, and Mistral all configured in the same file and switch between them with a single env var.
+
+### `ALMS_LLM_BUDGET_VALIDATION` — provider context-window enforcement (#919)
+
+ALMS cross-validates `[context].max_input_tokens + agent.max_tokens` against the published context window for the resolved `(provider, model)` pair on every gateway boot AND on every `POST /runs` / `PATCH /settings`. Default behaviour is **strict**: a configured budget that overshoots the provider cap fails fast — the daemon refuses to boot, the run is rejected with a structured `400 INVALID_TOKEN_BUDGET_FOR_PROVIDER`, and the PATCH is rejected with the same error envelope before any field commits.
+
+Strict mode catches typos (`max_input_tokens = 1_000_000` paired with a model whose cap is 200K) at the earliest possible moment instead of letting a doomed request reach the provider. The published cap table lives in [`crates/alms-core/src/config/budget.rs`](../crates/alms-core/src/config/budget.rs) and is verified against the official model-overview pages each release; rows the table doesn't know about are skipped silently (the validator never false-positives on an unknown pair).
+
+Setting `ALMS_LLM_BUDGET_VALIDATION=warn` downgrades every strict reject to a structured WARN log (`target = "alms.config"`) and lets the boot / run / PATCH proceed. Use this when the table is wrong for a model you know is fine — the operator opts out at their own risk. Any unknown or empty value falls back to **strict** so a typoed opt-out (`ALMS_LLM_BUDGET_VALIDATION=yolo`) doesn't silently disable enforcement. The variable has no TOML equivalent on purpose: a single boot-time env var is the only opt-out surface so cap enforcement cannot be silently flipped via a `PATCH /settings` mutation.
 
 ---
 

@@ -8,7 +8,7 @@ use crate::server::AppState;
 use axum::{Json, extract::State, http::StatusCode, response::IntoResponse};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-use tracing::info;
+use tracing::{info, warn};
 
 /// GET /settings — returns current server defaults for UI pre-population.
 pub async fn get_settings(State(state): State<AppState>) -> impl IntoResponse {
@@ -390,6 +390,35 @@ pub async fn patch_settings(
             );
         }
     };
+
+    // ── Token-budget pre-validation (#919, PR #1020 Tim review item 3) ──
+    //
+    // If the patch carries a positive `context.max_input_tokens`, run the
+    // same budget validator the per-run path uses (`pre_flight_token_budget`
+    // in `runs/lifecycle.rs`) BEFORE any commit lands. Computes a candidate
+    // next-state from the patched value plus the live `max_tokens` and
+    // boot-time `(provider, model)`. On strict-mode overshoot the whole
+    // PATCH is rejected with a structured `400 INVALID_TOKEN_BUDGET_FOR_PROVIDER`
+    // — no partial commits in any other section. On warn-mode the same
+    // structured WARN log fires and the PATCH proceeds.
+    //
+    // Without this guard an operator could PATCH `[context].max_input_tokens`
+    // upward, get a 200, and only discover the overshoot on the next
+    // `POST /runs` rejection — the run-side validator would catch it but
+    // the PATCH-time UX would already have led the operator to believe
+    // the value was accepted. Mirroring the per-run shape closes that
+    // trap.
+    // Codex P2 #1020 follow-up: `validate_patch_budget` now returns a
+    // `Result` so the fleet layer can fail CLOSED on `list_agents()`
+    // errors instead of silently bypassing the per-agent check. `Err`
+    // carries an explicit `(StatusCode, envelope)` pair (503 with
+    // `AGENT_STORE_UNAVAILABLE`) which we forward verbatim, before any
+    // mutation lands or `settings.json` is rewritten.
+    match validate_patch_budget(&state, &body) {
+        Ok(Some(rejection)) => return (StatusCode::BAD_REQUEST, Json(rejection)),
+        Ok(None) => {}
+        Err((status, envelope)) => return (status, Json(envelope)),
+    }
 
     let mut errors: Vec<String> = Vec::new();
 
@@ -830,6 +859,320 @@ fn reject_legacy_context_fields(body: &serde_json::Value) -> Option<String> {
          new fields. See #869.",
         offenders.join(" / context.")
     ))
+}
+
+/// Pre-validate a `PATCH /settings` body's candidate `context.max_input_tokens`
+/// against the boot-time server-default `(provider, model)` AND every
+/// registered agent's per-agent `(provider, model)` override (#919,
+/// PR #1020 Tim review item 3 + Codex P2 #2 follow-up).
+///
+/// Mirrors `pre_flight_token_budget` in `runs/lifecycle.rs` — same validator
+/// (`alms_core::config::validate_token_budget`), same `ValidationMode::from_env`
+/// gating, same response envelope shape (`error_code` /
+/// `INVALID_TOKEN_BUDGET_FOR_PROVIDER` / provider / model / both knobs /
+/// effective total / cap).
+///
+/// The PATCH guard does TWO things:
+///
+/// 1. Server-default check. The candidate `max_input_tokens` is validated
+///    against `state.llm_config.provider` / `state.llm_config.default_model`
+///    (which already reflect any `[llm.providers.<provider>].model` override
+///    applied at gateway boot — see `LlmConfig::From<alms_core::config::LlmConfig>`).
+///    Same shape as the boot-time `validate_at_config_load`.
+///
+/// 2. Fleet evaluation (Codex P2 #2). For every registered agent, resolve
+///    the effective `(provider, model)` using the same precedence
+///    `resolve_agent_config` applies (`record.provider ?? server-default`,
+///    `record.model ?? [llm.providers.<effective_provider>].model ?? server-default-model`)
+///    and re-run the validator. Without this, a PATCH could land on the
+///    server-default and immediately make some existing agents unrunnable —
+///    the operator would only see the per-run 400 on the next `POST /runs`.
+///    The fleet check refuses the entire PATCH if any agent overshoots and
+///    names every offender so the operator sees the full picture in one
+///    response.
+///
+/// Mock mode (`state.llm_config.mock = true`) bypasses both layers, same
+/// as `validate_at_config_load` and the per-run pre-flight.
+///
+/// ## Return shape
+///
+/// - `Ok(None)` — patch does NOT touch `max_input_tokens` (or touches it
+///   with a `0` sentinel rejected later by the structural handler), mock
+///   mode is active, warn-mode is active, or the budget fits every cap.
+///   The PATCH proceeds.
+/// - `Ok(Some(envelope))` — strict-mode caught a known overshoot at
+///   either layer. Caller emits the envelope as a `400 Bad Request`.
+/// - `Err((status, envelope))` — fleet evaluation could not run because
+///   `store.list_agents()` failed (Codex P2 #1020 follow-up). The PATCH
+///   guard fails CLOSED rather than silently bypassing the per-agent
+///   layer: an in-budget-against-server-default PATCH could otherwise
+///   commit a higher `context.max_input_tokens` while SQLite is
+///   temporarily failing, leaving every agent with a tighter resolved
+///   cap unrunnable until the next `POST /runs`. Caller emits the
+///   envelope verbatim with the supplied 503 status.
+fn validate_patch_budget(
+    state: &AppState,
+    body: &PatchSettingsRequest,
+) -> Result<Option<serde_json::Value>, (StatusCode, serde_json::Value)> {
+    // Only fire if the patch actually carries a `max_input_tokens`. The
+    // `0` sentinel is rejected by the structural handler with a 422 below;
+    // we skip it here so the PATCH path's per-knob validation still owns
+    // the "must be > 0" message.
+    let Some(candidate_input) = body
+        .context
+        .as_ref()
+        .and_then(|c| c.max_input_tokens)
+        .filter(|v| *v > 0)
+    else {
+        return Ok(None);
+    };
+
+    // Mock mode: never enforce the cap. Mirrors `validate_at_config_load`.
+    if state.llm_config.mock {
+        return Ok(None);
+    }
+
+    // Live `max_tokens` is read under the AgentConfig RwLock — drop the
+    // guard before the validator runs so the strict-mode early-return
+    // doesn't risk lock contention with another handler.
+    let max_tokens = state.agent_config.read().max_tokens;
+    let mode = alms_core::config::ValidationMode::from_env();
+
+    // ── Layer 1: server-default check ─────────────────────────────────
+    let server_provider = state.llm_config.provider.as_str();
+    let server_model = state.llm_config.default_model.as_str();
+    if let Err(err) = alms_core::config::validate_token_budget(
+        server_provider,
+        server_model,
+        candidate_input,
+        max_tokens,
+    ) {
+        match mode {
+            alms_core::config::ValidationMode::Strict => {
+                warn!(
+                    target: "alms.config",
+                    provider = %err.provider,
+                    model = %err.model,
+                    max_input_tokens = err.max_input_tokens,
+                    max_tokens = err.max_tokens,
+                    effective_total = err.effective_total,
+                    provider_cap = err.provider_cap,
+                    "Rejecting PATCH /settings with INVALID_TOKEN_BUDGET_FOR_PROVIDER (#919)"
+                );
+                return Ok(Some(serde_json::json!({
+                    "error_code": "INVALID_TOKEN_BUDGET_FOR_PROVIDER",
+                    "message": err.message(),
+                    "provider": err.provider,
+                    "model": err.model,
+                    "max_input_tokens": err.max_input_tokens,
+                    "max_tokens": err.max_tokens,
+                    "effective_total": err.effective_total,
+                    "provider_cap": err.provider_cap,
+                })));
+            }
+            alms_core::config::ValidationMode::Warn => {
+                warn!(
+                    target: "alms.config",
+                    provider = %err.provider,
+                    model = %err.model,
+                    max_input_tokens = err.max_input_tokens,
+                    max_tokens = err.max_tokens,
+                    effective_total = err.effective_total,
+                    provider_cap = err.provider_cap,
+                    "{}",
+                    err.message()
+                );
+            }
+        }
+    }
+
+    // ── Layer 2: fleet evaluation (Codex P2 #2) ────────────────────────
+    //
+    // Iterate over every registered agent and re-run the validator
+    // against the same effective `(provider, model)` that the runtime's
+    // `runs::resolve_agent_config` would resolve to. The shared helper
+    // `runs::resolve_effective_provider_and_model` is the single source
+    // of truth for the resolution rules:
+    //
+    // 1. `record.provider` ?? server-default provider.
+    // 2. Cross-namespace drop (#942): when the per-agent provider override
+    //    changed the effective wire kind AND the per-agent model belongs
+    //    to the OLD provider's namespace, drop the per-agent model so the
+    //    fleet check validates against the SAME model the runtime will
+    //    actually pick. Pre-fix this layer trusted `record.model`
+    //    verbatim and silently green-lit PATCHes whose post-fallback
+    //    `(provider, model)` would immediately fail
+    //    `INVALID_TOKEN_BUDGET_FOR_PROVIDER` on the next `POST /runs`.
+    // 3. `record.model` (after the namespace drop) ??
+    //    `[llm.providers.<effective_provider>].model` ?? server-default model.
+    //
+    // When the helper returns `MissingModelAfterProviderSwitch`, the
+    // runtime would reject the run with `400 MISSING_MODEL_AFTER_PROVIDER_SWITCH`
+    // before any LLM call, so there is no effective model to validate
+    // against. That row is silently skipped — the budget guard's
+    // contract is "fail fast on KNOWN-overshoot configs", and a
+    // missing-model row is unrunnable for orthogonal reasons.
+    let Some(store) = state.session_manager.store() else {
+        // No SQLite-backed store → no per-agent overrides to evaluate.
+        // The server-default check above is the whole guard.
+        return Ok(None);
+    };
+    // Codex P2 #1020 follow-up — fail CLOSED on `list_agents()` errors.
+    //
+    // The earlier shape soft-skipped here (warn + `return None`) so a
+    // PATCH could return 200 and commit a higher
+    // `context.max_input_tokens` whenever SQLite was temporarily failing.
+    // In that state, agents whose resolved `(provider, model)` had a
+    // tighter cap would become silently unrunnable and only fail later
+    // at `POST /runs` with `INVALID_TOKEN_BUDGET_FOR_PROVIDER`, which
+    // defeats the PATCH-time safety guarantee the fleet layer is here
+    // to provide. Surface a 503 with a structured `AGENT_STORE_UNAVAILABLE`
+    // code so the operator sees the failure synchronously and the
+    // candidate-then-commit gate prevents any partial mutation: live
+    // config stays untouched and `settings.json` is not rewritten.
+    let agents = match store.list_agents() {
+        Ok(a) => a,
+        Err(e) => {
+            warn!(
+                target: "alms.config",
+                error = %e,
+                "PATCH /settings fleet budget evaluation could not load \
+                 agents from SQLite; failing closed with 503 \
+                 AGENT_STORE_UNAVAILABLE rather than skipping the \
+                 per-agent layer (Codex P2 #1020 follow-up)"
+            );
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                serde_json::json!({
+                    "error_code": "AGENT_STORE_UNAVAILABLE",
+                    "message": format!(
+                        "could not validate PATCH /settings against per-agent \
+                         token budgets: failed to list agents from the \
+                         registry ({e}). The PATCH was REJECTED to avoid \
+                         silently accepting a budget that some agents would \
+                         overshoot — retry once the agent store is reachable."
+                    ),
+                }),
+            ));
+        }
+    };
+
+    let mut offenders: Vec<serde_json::Value> = Vec::new();
+    let mut last_message: Option<String> = None;
+    for record in agents {
+        let (effective_provider, effective_model) =
+            match crate::runs::resolve_effective_provider_and_model(
+                record.provider.as_deref(),
+                record.model.as_deref(),
+                server_provider,
+                server_model,
+                &state.llm_config.providers,
+            ) {
+                Ok(pair) => pair,
+                Err(crate::runs::ResolveEffectiveModelError::MissingModelAfterProviderSwitch {
+                    new_provider,
+                    prev_provider,
+                }) => {
+                    // Runtime would reject this agent's next run with
+                    // `400 MISSING_MODEL_AFTER_PROVIDER_SWITCH` regardless
+                    // of the candidate budget; skip the budget check so
+                    // we don't surface a misleading error code from the
+                    // fleet layer. The runtime's per-run pre-flight is
+                    // the right place for this diagnostic.
+                    warn!(
+                        target: "alms.config",
+                        agent = %record.name,
+                        old_provider = %prev_provider,
+                        new_provider = %new_provider,
+                        "Skipping fleet budget check for agent — runtime would \
+                         reject with MISSING_MODEL_AFTER_PROVIDER_SWITCH on next run"
+                    );
+                    continue;
+                }
+            };
+        if let Err(err) = alms_core::config::validate_token_budget(
+            &effective_provider,
+            &effective_model,
+            candidate_input,
+            max_tokens,
+        ) {
+            warn!(
+                target: "alms.config",
+                agent = %record.name,
+                provider = %err.provider,
+                model = %err.model,
+                max_input_tokens = err.max_input_tokens,
+                max_tokens = err.max_tokens,
+                effective_total = err.effective_total,
+                provider_cap = err.provider_cap,
+                "Per-agent budget overshoot under candidate PATCH /settings \
+                 (Codex P2 #2 — agent would become unrunnable)"
+            );
+            last_message = Some(err.message());
+            offenders.push(serde_json::json!({
+                "name": record.name,
+                "provider": err.provider,
+                "model": err.model,
+                "agent_cap": err.provider_cap,
+                "would_be_total": err.effective_total,
+            }));
+        }
+    }
+
+    if offenders.is_empty() {
+        return Ok(None);
+    }
+
+    match mode {
+        alms_core::config::ValidationMode::Strict => {
+            // Surface a single structured envelope listing every offending
+            // agent — the operator sees the full fleet impact in one
+            // response rather than discovering it agent-by-agent on the
+            // next `POST /runs`. The top-level `provider` / `model` /
+            // `provider_cap` / `effective_total` fields point at the FIRST
+            // offender so existing clients that only read those fields
+            // still get a usable error surface; the new `agents` array
+            // carries the complete list.
+            let first = &offenders[0];
+            let message = format!(
+                "configured token budget would exceed the provider cap for \
+                 {n} registered agent(s) under this PATCH; lower \
+                 context.max_input_tokens or update the affected agents \
+                 (offenders: {names})",
+                n = offenders.len(),
+                names = offenders
+                    .iter()
+                    .filter_map(|o| o["name"].as_str())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            );
+            // Prefer the per-agent `TokenBudgetError::message()` when only
+            // one agent is affected — it carries the full diagnostic
+            // (both knobs, total, cap, and the env-var bypass hint).
+            let message = if offenders.len() == 1 {
+                last_message.unwrap_or(message)
+            } else {
+                message
+            };
+            Ok(Some(serde_json::json!({
+                "error_code": "INVALID_TOKEN_BUDGET_FOR_PROVIDER",
+                "message": message,
+                "provider": first["provider"].clone(),
+                "model": first["model"].clone(),
+                "max_input_tokens": candidate_input,
+                "max_tokens": max_tokens,
+                "effective_total": first["would_be_total"].clone(),
+                "provider_cap": first["agent_cap"].clone(),
+                "agents": offenders,
+            })))
+        }
+        alms_core::config::ValidationMode::Warn => {
+            // Warn mode: per-agent overshoots already logged in the loop
+            // above. Let the PATCH proceed — same opt-out semantics as
+            // the server-default warn branch and the per-run pre-flight.
+            Ok(None)
+        }
+    }
 }
 
 fn reject_security_knob(body: &serde_json::Value) -> Option<String> {
@@ -2877,6 +3220,734 @@ mod tests {
         assert!(
             !json.contains("allow_full_os_access"),
             "Persisted JSON must not contain `allow_full_os_access` either: {json}"
+        );
+    }
+
+    // ── #919 / PR #1020 Tim review item 3: PATCH /settings budget validation ──
+    //
+    // Mirror the per-run `pre_flight_token_budget` guard at PATCH time so
+    // an operator can't bump `[context].max_input_tokens` past the
+    // boot-time `(provider, model)` cap, get a 200, and then hit a 400
+    // on the next `POST /runs`. Strict-mode overshoot is a structured
+    // 400 rejection (whole PATCH never lands); warn-mode logs and lets
+    // the patch proceed.
+
+    /// Pin a known overshoot config (anthropic + claude-haiku-4-5, 200K cap)
+    /// so the same fixture works for both strict and warn tests below.
+    fn settings_test_app_state_with_anthropic_haiku() -> crate::server::AppState {
+        let mut state = settings_test_app_state();
+        // Boot-time provider/model — the PATCH validator reads these and
+        // they cannot be mutated via PATCH, only via TOML / `alms auth`.
+        state.llm_config.provider = "anthropic".into();
+        state.llm_config.default_model = "claude-haiku-4-5".into();
+        state.llm_config.mock = false;
+        // Live `max_tokens` — the second budget knob; combined with the
+        // `max_input_tokens` candidate to compute the effective total.
+        // Default is `DEFAULT_AGENT_MAX_TOKENS = 32_000`; pin it explicitly
+        // here so the assertions below carry self-documenting numbers.
+        {
+            let mut cfg = state.agent_config.write();
+            cfg.max_tokens = alms_core::config::DEFAULT_AGENT_MAX_TOKENS;
+        }
+        state
+    }
+
+    /// Strict mode (default): a PATCH that pushes `max_input_tokens`
+    /// past the boot-time provider cap is rejected with a structured
+    /// `400 INVALID_TOKEN_BUDGET_FOR_PROVIDER`. Live config must be
+    /// untouched, persistence file must not be written, the response
+    /// body must carry every datum the operator needs to fix the config
+    /// (provider, model, both knobs, effective_total, provider_cap).
+    #[tokio::test]
+    async fn test_patch_settings_rejects_budget_overshoot_in_strict_mode() {
+        use axum::body::to_bytes;
+        use axum::response::IntoResponse;
+
+        // Pin strict mode for this test; concurrent warn-mode tests share
+        // the same env-var via the shared `BUDGET_VALIDATION_ENV_LOCK`.
+        let _env = crate::test_env_locks::BudgetValidationEnvGuard::unset();
+
+        let mut state = settings_test_app_state_with_anthropic_haiku();
+        let tmp = tempfile::tempdir().unwrap();
+        state.data_dir = tmp.path().to_path_buf();
+        // Seed a baseline well below the cap so we can assert the live
+        // config did NOT mutate to the overshooting candidate.
+        {
+            let mut cfg = state.agent_config.write();
+            cfg.context_config.max_input_tokens = 128_000;
+        }
+
+        // Candidate: 250_000 + 32_000 = 282_000 > 200_000 (Haiku 4.5 cap).
+        let body = PatchSettingsRequest {
+            context: Some(PatchContext {
+                max_input_tokens: Some(250_000),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let resp = patch_settings(
+            axum::extract::State(state.clone()),
+            Json(serde_json::to_value(&body).unwrap()),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "PATCH overshoot must be a structured 400, not 422 — same envelope as the per-run guard (#919)"
+        );
+
+        let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let body_json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            body_json["error_code"], "INVALID_TOKEN_BUDGET_FOR_PROVIDER",
+            "body must carry the structured error_code so clients can branch on it"
+        );
+        assert_eq!(body_json["provider"], "anthropic");
+        assert_eq!(body_json["model"], "claude-haiku-4-5");
+        assert_eq!(body_json["max_input_tokens"], 250_000);
+        assert_eq!(body_json["max_tokens"], 32_000);
+        assert_eq!(body_json["effective_total"], 282_000);
+        assert_eq!(body_json["provider_cap"], 200_000);
+        let message = body_json["message"]
+            .as_str()
+            .expect("message must be a string");
+        assert!(
+            message.contains("max_input_tokens") && message.contains("max_tokens"),
+            "message must name both budget knobs: {message}"
+        );
+
+        // Live config UNCHANGED — strict-mode PATCH-budget rejection is
+        // whole-payload, not per-section. The 250K candidate did not
+        // commit to `state.agent_config`.
+        assert_eq!(
+            state.agent_config.read().context_config.max_input_tokens,
+            128_000,
+            "rejected PATCH must not mutate live max_input_tokens"
+        );
+
+        // Persistence file must NOT have been written — a rejected PATCH
+        // is side-effect-free at the persistence layer (mirrors the
+        // existing 422 -> no-persist contract from #810).
+        let settings_path = tmp.path().join("settings.json");
+        assert!(
+            !settings_path.exists(),
+            "rejected PATCH must not write settings.json — found {}",
+            settings_path.display()
+        );
+    }
+
+    /// Warn mode: the same overshoot config is accepted (the env-var
+    /// downgrades the strict reject to a structured WARN log). Live
+    /// config commits the new `max_input_tokens` value.
+    #[tokio::test]
+    async fn test_patch_settings_warn_mode_accepts_budget_overshoot() {
+        use axum::response::IntoResponse;
+
+        // Pin warn mode for this test so a concurrent strict-mode test
+        // can't make us silently reject the overbudget config.
+        let _env = crate::test_env_locks::BudgetValidationEnvGuard::set("warn");
+
+        let mut state = settings_test_app_state_with_anthropic_haiku();
+        let tmp = tempfile::tempdir().unwrap();
+        state.data_dir = tmp.path().to_path_buf();
+        {
+            let mut cfg = state.agent_config.write();
+            cfg.context_config.max_input_tokens = 128_000;
+        }
+
+        let body = PatchSettingsRequest {
+            context: Some(PatchContext {
+                max_input_tokens: Some(250_000),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let resp = patch_settings(
+            axum::extract::State(state.clone()),
+            Json(serde_json::to_value(&body).unwrap()),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "warn-mode PATCH must accept the same overshoot config that strict-mode rejects"
+        );
+        assert_eq!(
+            state.agent_config.read().context_config.max_input_tokens,
+            250_000,
+            "warn-mode PATCH must commit the candidate value to live config"
+        );
+    }
+
+    /// Unknown `(provider, model)` pair: validator skips the cap check
+    /// regardless of budget size, just like the per-run path. PATCH
+    /// proceeds with normal 200 / commit semantics.
+    #[tokio::test]
+    async fn test_patch_settings_skips_validation_for_unknown_model() {
+        use axum::response::IntoResponse;
+
+        let _env = crate::test_env_locks::BudgetValidationEnvGuard::unset();
+
+        let mut state = settings_test_app_state();
+        // Default test state already uses provider=openrouter,
+        // model=moonshotai/kimi-k2.5 — both unknown to the budget table.
+        // Bump the candidate to a wildly large value to prove "unknown"
+        // really does mean "skip" (not "fail open accidentally because
+        // the test fixture is small").
+        let tmp = tempfile::tempdir().unwrap();
+        state.data_dir = tmp.path().to_path_buf();
+        {
+            let mut sess = state.session_config.write();
+            sess.max_context_tokens = 10_000_000;
+        }
+
+        let body = PatchSettingsRequest {
+            context: Some(PatchContext {
+                max_input_tokens: Some(10_000_000),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let resp = patch_settings(
+            axum::extract::State(state.clone()),
+            Json(serde_json::to_value(&body).unwrap()),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "unknown (provider, model) must skip the budget check, mirroring the per-run validator's contract"
+        );
+        assert_eq!(
+            state.agent_config.read().context_config.max_input_tokens,
+            10_000_000,
+        );
+    }
+
+    /// Mock mode: the validator is bypassed entirely (mirrors
+    /// `validate_at_config_load`). A PATCH that would overshoot a real
+    /// provider's cap lands cleanly when the daemon is in mock mode.
+    #[tokio::test]
+    async fn test_patch_settings_skips_validation_in_mock_mode() {
+        use axum::response::IntoResponse;
+
+        let _env = crate::test_env_locks::BudgetValidationEnvGuard::unset();
+
+        let mut state = settings_test_app_state_with_anthropic_haiku();
+        // Flip mock on — the validator must skip even though the
+        // candidate budget overshoots Haiku 4.5's cap.
+        state.llm_config.mock = true;
+        let tmp = tempfile::tempdir().unwrap();
+        state.data_dir = tmp.path().to_path_buf();
+
+        let body = PatchSettingsRequest {
+            context: Some(PatchContext {
+                max_input_tokens: Some(250_000),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let resp = patch_settings(
+            axum::extract::State(state.clone()),
+            Json(serde_json::to_value(&body).unwrap()),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "mock mode must bypass token-budget validation entirely (matches load-time behaviour)"
+        );
+    }
+
+    // ── #919 / Codex P2 #2: PATCH /settings fleet evaluation ──────────
+    //
+    // The PATCH guard's first iteration only validated the candidate
+    // `max_input_tokens` against the boot-time server-default
+    // `(provider, model)`. Per-agent overrides bypass it: an agent
+    // whose `record.provider`/`record.model` resolve to a smaller cap
+    // could become unrunnable under the new server-default while the
+    // PATCH still returns 200, deferring the failure to the next
+    // `POST /runs` 400. The Codex follow-up extends `validate_patch_budget`
+    // to iterate every registered agent and reject the entire PATCH if
+    // any agent overshoots, naming each offender in the response body.
+
+    /// SQLite-backed app state — needed for the fleet evaluation tests
+    /// because `state.session_manager.store()` returns `None` on the
+    /// in-memory default helper above. Mirrors
+    /// `runs::integration_tests::test_app_state_with_sqlite`.
+    fn settings_test_app_state_with_sqlite() -> crate::server::AppState {
+        let gateway_config = crate::gateway::GatewayConfig {
+            db_path: Some(":memory:".to_string()),
+            ..crate::gateway::GatewayConfig::default()
+        };
+        let gateway = crate::gateway::Gateway::new(gateway_config).unwrap();
+        let scheduler = std::sync::Arc::new(alms_runtime::Scheduler::new());
+        let shutdown_token = tokio_util::sync::CancellationToken::new();
+        let (completion_tx, _cr) = tokio::sync::mpsc::unbounded_channel();
+        let (trigger_tx, _tr) = tokio::sync::mpsc::unbounded_channel();
+        let (dm_event_tx, _dr) = tokio::sync::mpsc::unbounded_channel();
+        crate::server::AppState::new(
+            gateway,
+            scheduler,
+            shutdown_token,
+            completion_tx,
+            trigger_tx,
+            dm_event_tx,
+        )
+        .unwrap()
+    }
+
+    /// Seed an `AgentRecord` with the given per-agent provider/model pair.
+    /// All other fields default — the fleet check only looks at provider
+    /// and model.
+    fn seed_agent(
+        state: &crate::server::AppState,
+        name: &str,
+        provider: Option<&str>,
+        model: Option<&str>,
+    ) {
+        use alms_core::registry::AgentRecord;
+        use chrono::Utc;
+        let now = Utc::now();
+        let record = AgentRecord {
+            id: alms_core::AgentId::new(),
+            name: name.to_string(),
+            description: String::new(),
+            model: model.map(|s| s.to_string()),
+            posture: None,
+            provider: provider.map(|s| s.to_string()),
+            telegram_token: None,
+            thinking_budget_tokens: None,
+            reasoning_effort: None,
+            gemini_thinking_budget: None,
+            summary_provider: None,
+            summary_model: None,
+            worktree_mode: alms_core::WorktreeMode::Off,
+            debug_mode: false,
+            is_default: false,
+            created_at: now,
+            last_active: now,
+        };
+        state
+            .session_manager
+            .store()
+            .expect("SQLite-backed state must have a store")
+            .create_agent(&record)
+            .expect("agent seed should succeed");
+    }
+
+    /// Two agents on the same server-default provider, but one pinned
+    /// to a tight-cap model (Haiku 4.5, 200K) and one pinned to a loose
+    /// model (Opus 4.7, 1M). The PATCH bumps `max_input_tokens` to a
+    /// value that fits Opus's 1M but overshoots Haiku's 200K. The fleet
+    /// guard must reject the PATCH and name the tight-cap agent.
+    #[tokio::test]
+    async fn test_patch_settings_fleet_rejects_when_only_one_agent_overshoots() {
+        use axum::body::to_bytes;
+        use axum::response::IntoResponse;
+
+        let _env = crate::test_env_locks::BudgetValidationEnvGuard::unset();
+
+        let mut state = settings_test_app_state_with_sqlite();
+        // Server default lands on Sonnet 4.6 (1M cap) so the layer-1
+        // server-default check passes; the fleet layer is the one that
+        // must catch the tight-cap agent.
+        state.llm_config.provider = "anthropic".into();
+        state.llm_config.default_model = "claude-sonnet-4-6".into();
+        state.llm_config.mock = false;
+        {
+            let mut cfg = state.agent_config.write();
+            cfg.max_tokens = 32_000;
+            cfg.context_config.max_input_tokens = 128_000;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        state.data_dir = tmp.path().to_path_buf();
+
+        // Agent A: tight cap (Haiku 4.5, 200K). Will overshoot.
+        seed_agent(&state, "tight", Some("anthropic"), Some("claude-haiku-4-5"));
+        // Agent B: loose cap (Opus 4.7, 1M). Will fit.
+        seed_agent(&state, "loose", Some("anthropic"), Some("claude-opus-4-7"));
+
+        // Candidate: 250K input + 32K output = 282K.
+        // - Sonnet 4.6 (1M)        → fits, server-default layer passes
+        // - Haiku 4.5 (200K)       → overshoots, fleet layer fires
+        // - Opus 4.7 (1M)          → fits
+        let body = PatchSettingsRequest {
+            context: Some(PatchContext {
+                max_input_tokens: Some(250_000),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let resp = patch_settings(
+            axum::extract::State(state.clone()),
+            Json(serde_json::to_value(&body).unwrap()),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "fleet evaluation must reject the PATCH when ANY agent overshoots"
+        );
+
+        let body_bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(body["error_code"], "INVALID_TOKEN_BUDGET_FOR_PROVIDER");
+
+        // The `agents` array must list the offenders, naming each one
+        // so the operator sees the per-agent impact at a glance.
+        let agents = body["agents"]
+            .as_array()
+            .expect("response body must carry an `agents` array of offenders");
+        assert_eq!(
+            agents.len(),
+            1,
+            "exactly one agent should overshoot in this fixture; got: {body}",
+        );
+        assert_eq!(
+            agents[0]["name"], "tight",
+            "offender array must name the tight-cap agent"
+        );
+        assert_eq!(agents[0]["provider"], "anthropic");
+        assert_eq!(agents[0]["model"], "claude-haiku-4-5");
+        assert_eq!(agents[0]["agent_cap"], 200_000);
+        assert_eq!(agents[0]["would_be_total"], 282_000);
+
+        // Live config must not have mutated — the PATCH never landed.
+        assert_eq!(
+            state.agent_config.read().context_config.max_input_tokens,
+            128_000,
+            "rejected PATCH must not commit any mutation"
+        );
+    }
+
+    /// Two agents both fit the new cap (one on the loose server default,
+    /// one on a per-agent override that happens to also fit). The PATCH
+    /// commits and lands on live config.
+    #[tokio::test]
+    async fn test_patch_settings_fleet_commits_when_all_agents_fit() {
+        use axum::response::IntoResponse;
+
+        let _env = crate::test_env_locks::BudgetValidationEnvGuard::unset();
+
+        let mut state = settings_test_app_state_with_sqlite();
+        state.llm_config.provider = "anthropic".into();
+        state.llm_config.default_model = "claude-sonnet-4-6".into();
+        state.llm_config.mock = false;
+        {
+            let mut cfg = state.agent_config.write();
+            cfg.max_tokens = 32_000;
+            cfg.context_config.max_input_tokens = 128_000;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        state.data_dir = tmp.path().to_path_buf();
+
+        // Both agents land on a 1M cap.
+        seed_agent(&state, "alpha", Some("anthropic"), Some("claude-opus-4-7"));
+        seed_agent(&state, "beta", Some("anthropic"), Some("claude-sonnet-4-6"));
+
+        // Candidate: 250K + 32K = 282K — fits 1M comfortably for every
+        // agent. Fleet layer must accept and the PATCH must commit.
+        let body = PatchSettingsRequest {
+            context: Some(PatchContext {
+                max_input_tokens: Some(250_000),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let resp = patch_settings(
+            axum::extract::State(state.clone()),
+            Json(serde_json::to_value(&body).unwrap()),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "fleet evaluation must accept when every registered agent fits the new cap"
+        );
+        assert_eq!(
+            state.agent_config.read().context_config.max_input_tokens,
+            250_000,
+            "accepted PATCH must commit through to live agent_config"
+        );
+    }
+
+    /// Regression for the Codex P2 follow-up on PR #1020 — fleet evaluation
+    /// must mirror the runtime's #942 cross-namespace drop before validating
+    /// the budget. Pre-fix, an agent with a stale cross-namespace `model`
+    /// (e.g. `record.provider = "anthropic"`, `record.model = "gpt-5.5"`)
+    /// validated against the stale `(anthropic, gpt-5.5)` pair, which the
+    /// budget table does not know about — `validate_token_budget` returned
+    /// `Ok(())` (silent skip), and the PATCH committed even though the
+    /// runtime would resolve to a model with a tighter cap and immediately
+    /// fail `INVALID_TOKEN_BUDGET_FOR_PROVIDER` on the next `POST /runs`.
+    ///
+    /// Fixture: server default is `(openai, gpt-5.5)` (1.05M cap). The
+    /// `[llm.providers.anthropic]` entry pins its own `model` to
+    /// `claude-haiku-4-5` (200K cap) so the runtime fallback chain has
+    /// somewhere to land after the stale per-agent model is dropped. Agent
+    /// A carries the cross-namespace pair `(anthropic, gpt-5.5)`. The
+    /// candidate `max_input_tokens` is 200K — server-default check passes
+    /// (232K < 1.05M) but the post-fallback fleet pair `(anthropic,
+    /// claude-haiku-4-5)` overshoots the 200K Haiku cap (232K > 200K).
+    /// Pre-fix this returns 200; post-fix it must return 400.
+    #[tokio::test]
+    async fn test_patch_settings_fleet_drops_cross_namespace_stale_model_before_validating() {
+        use axum::body::to_bytes;
+        use axum::response::IntoResponse;
+
+        let _env = crate::test_env_locks::BudgetValidationEnvGuard::unset();
+
+        let mut state = settings_test_app_state_with_sqlite();
+        state.llm_config.provider = "openai".into();
+        state.llm_config.default_model = "gpt-5.5".into();
+        state.llm_config.mock = false;
+        // Anthropic provider entry pins its own model to a tight-cap value
+        // — this is the model the runtime falls back to after the
+        // cross-namespace drop fires on the per-agent stale `gpt-5.5`.
+        state.llm_config.providers.insert(
+            "anthropic".into(),
+            alms_core::config::ProviderEntry {
+                kind: alms_core::config::ProviderKind::Anthropic,
+                base_url: "https://api.anthropic.com/v1".into(),
+                api_key_env: None,
+                api_key: None,
+                model: Some("claude-haiku-4-5".into()),
+                auth_scheme: alms_core::config::AuthScheme::Header {
+                    name: "x-api-key".into(),
+                },
+                quirks: alms_core::config::ProviderQuirks::default(),
+            },
+        );
+        state.llm_config.providers.insert(
+            "openai".into(),
+            alms_core::config::ProviderEntry {
+                kind: alms_core::config::ProviderKind::OpenAiCompatible,
+                base_url: "https://api.openai.com/v1".into(),
+                api_key_env: None,
+                api_key: None,
+                model: None,
+                auth_scheme: alms_core::config::AuthScheme::Bearer,
+                quirks: alms_core::config::ProviderQuirks::default(),
+            },
+        );
+        {
+            let mut cfg = state.agent_config.write();
+            cfg.max_tokens = 32_000;
+            cfg.context_config.max_input_tokens = 128_000;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        state.data_dir = tmp.path().to_path_buf();
+
+        // Cross-namespace stale: agent's per-agent provider override
+        // switched to anthropic but the per-agent model is still the
+        // openai-namespace `gpt-5.5`. Runtime drops the model and falls
+        // back to the anthropic entry's `claude-haiku-4-5`.
+        seed_agent(&state, "stale", Some("anthropic"), Some("gpt-5.5"));
+
+        // Candidate 200K + 32K = 232K. Caps:
+        // - openai gpt-5.5      → 1_050_000 (server-default check: 232K fits)
+        // - anthropic gpt-5.5   → unknown   (pre-fix path: skipped → green)
+        // - anthropic haiku-4-5 → 200_000   (post-fix path: 232K overshoots)
+        let body = PatchSettingsRequest {
+            context: Some(PatchContext {
+                max_input_tokens: Some(200_000),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let resp = patch_settings(
+            axum::extract::State(state.clone()),
+            Json(serde_json::to_value(&body).unwrap()),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "fleet evaluation must drop the cross-namespace stale model and \
+             validate against the runtime's effective `(provider, model)` \
+             — Codex P2 follow-up on PR #1020"
+        );
+
+        let body_bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(body["error_code"], "INVALID_TOKEN_BUDGET_FOR_PROVIDER");
+
+        let agents = body["agents"]
+            .as_array()
+            .expect("response body must carry an `agents` array of offenders");
+        assert_eq!(
+            agents.len(),
+            1,
+            "exactly one agent should overshoot in this fixture; got: {body}",
+        );
+        assert_eq!(agents[0]["name"], "stale");
+        assert_eq!(
+            agents[0]["provider"], "anthropic",
+            "fleet check must report the runtime's effective provider"
+        );
+        assert_eq!(
+            agents[0]["model"], "claude-haiku-4-5",
+            "fleet check must report the runtime's effective model after the \
+             #942 cross-namespace drop, not the stale per-agent `gpt-5.5`"
+        );
+        assert_eq!(agents[0]["agent_cap"], 200_000);
+        assert_eq!(agents[0]["would_be_total"], 232_000);
+
+        // Live config must not have mutated — the PATCH never landed.
+        assert_eq!(
+            state.agent_config.read().context_config.max_input_tokens,
+            128_000,
+            "rejected PATCH must not commit any mutation"
+        );
+    }
+
+    /// Codex P2 follow-up on PR #1020 — fail PATCH budget validation
+    /// CLOSED when the agent registry cannot be listed.
+    ///
+    /// Pre-fix shape: `validate_patch_budget` swallowed `list_agents()`
+    /// errors with `warn! + return None`, so a PATCH that fit the
+    /// boot-time server default but would have made some per-agent
+    /// resolved cap unrunnable could return 200 and commit while
+    /// SQLite was temporarily failing — defeating the entire fleet
+    /// guarantee. The runtime would then 400 every subsequent
+    /// `POST /runs` for the affected agents until the operator
+    /// rolled the PATCH back.
+    ///
+    /// Post-fix shape: the validator returns `Err((503, envelope))`
+    /// with `error_code = AGENT_STORE_UNAVAILABLE`. The candidate-then-
+    /// commit gate guarantees the live `AgentConfig` and the on-disk
+    /// `settings.json` are both untouched — same persistence contract
+    /// as the existing per-agent overshoot rejection.
+    ///
+    /// Fixture: drop the underlying `agents` table after
+    /// `settings_test_app_state_with_sqlite()` builds the store, so
+    /// `list_agents()` fails at the `prepare()` step with
+    /// `no such table: agents`. The PATCH carries a candidate that
+    /// fits the server-default `(anthropic, claude-sonnet-4-6)` 1M
+    /// cap, so layer 1 passes — only the fleet layer can fail this
+    /// request.
+    #[tokio::test]
+    async fn test_patch_settings_fleet_fails_closed_when_agent_store_unavailable() {
+        use axum::body::to_bytes;
+        use axum::response::IntoResponse;
+
+        let _env = crate::test_env_locks::BudgetValidationEnvGuard::unset();
+
+        let mut state = settings_test_app_state_with_sqlite();
+        state.llm_config.provider = "anthropic".into();
+        state.llm_config.default_model = "claude-sonnet-4-6".into();
+        state.llm_config.mock = false;
+        {
+            let mut cfg = state.agent_config.write();
+            cfg.max_tokens = 32_000;
+            cfg.context_config.max_input_tokens = 128_000;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        state.data_dir = tmp.path().to_path_buf();
+        let path = settings_path(&state.data_dir);
+        assert!(
+            !path.exists(),
+            "precondition: settings.json must not exist before the rejected PATCH"
+        );
+
+        // Simulate "SQLite temporarily failing" by dropping the agents
+        // table. `list_agents()` then fails at `prepare()` with
+        // `no such table: agents`. The doc-hidden `_for_test` method
+        // is the cross-crate test affordance — `#[cfg(test)]` would
+        // be scoped to alms-session's own test target only.
+        state
+            .session_manager
+            .store()
+            .expect("SQLite-backed state must have a store")
+            .drop_agents_table_for_test()
+            .expect("dropping agents table should succeed");
+
+        // Candidate: 250K + 32K = 282K. Sonnet 4.6 has a 1M cap, so
+        // the layer-1 server-default check passes cleanly. The fleet
+        // layer is the only thing that could refuse this request —
+        // and it can't run because list_agents() now fails.
+        let body = PatchSettingsRequest {
+            context: Some(PatchContext {
+                max_input_tokens: Some(250_000),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let resp = patch_settings(
+            axum::extract::State(state.clone()),
+            Json(serde_json::to_value(&body).unwrap()),
+        )
+        .await
+        .into_response();
+
+        // Core assertion: 503 (not 200, not 400). Pre-fix this returned
+        // 200 with a silently-skipped fleet check.
+        assert_eq!(
+            resp.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "PATCH must fail closed with 503 when list_agents() errors — \
+             silently skipping the fleet check would defeat the per-agent \
+             budget guarantee"
+        );
+
+        let body_bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let resp_body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(
+            resp_body["error_code"], "AGENT_STORE_UNAVAILABLE",
+            "wire body must carry the structured failure code so \
+             clients can distinguish this from a routing 503; got: {resp_body}",
+        );
+        assert!(
+            resp_body["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("REJECTED")),
+            "message must explicitly state the PATCH was rejected (not a \
+             warning) so operators know to retry; got: {resp_body}",
+        );
+
+        // Live config must NOT have mutated — the candidate-then-commit
+        // gate ran before any inline write. Pre-fix, layer 1 would have
+        // returned `None`, the early-return at the handler would not
+        // fire, and `context.max_input_tokens` would have committed to
+        // 250_000 even though the fleet layer could not vouch for it.
+        assert_eq!(
+            state.agent_config.read().context_config.max_input_tokens,
+            128_000,
+            "rejected PATCH must not commit any mutation to live config",
+        );
+
+        // settings.json must NOT have been written — `persist_settings`
+        // sits behind both the budget early-return and the
+        // `errors.is_empty()` gate, so a 503 here is side-effect-free
+        // at the persistence layer (same contract as the rejected_llm
+        // and rejected_context tests above).
+        assert!(
+            !path.exists(),
+            "rejected 503 PATCH must not persist settings.json — found at {}",
+            path.display(),
         );
     }
 }
