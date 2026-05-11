@@ -9,6 +9,7 @@ use super::AppState;
 use crate::agents;
 use crate::api_error;
 use crate::approvals::{list_approvals, resolve_approval};
+use crate::auth::SSE_ENDPOINT_SEGMENTS;
 use crate::auth_keys;
 use crate::jobs::{cancel_job, create_job, get_job, list_jobs};
 use crate::runs::{
@@ -25,7 +26,7 @@ use axum::{
     extract::{Path, Query, State, WebSocketUpgrade},
     http::{StatusCode, header},
     response::IntoResponse,
-    routing::{delete, get, post},
+    routing::{MethodRouter, delete, get, post},
 };
 use rust_embed::Embed;
 use serde::Deserialize;
@@ -109,9 +110,59 @@ fn serve_embedded_file(path: &str) -> axum::response::Response {
     }
 }
 
+/// Returns the canonical list of SSE route specs registered on the protected
+/// router, derived from [`SSE_ENDPOINT_SEGMENTS`].
+///
+/// Each entry is `(axum_path, handler)` where `axum_path` is the full path
+/// string with the `{id}` placeholder (e.g. `"/runs/{id}/events"`).  The
+/// path is constructed from the segment, so adding a new SSE endpoint is a
+/// two-line change: append a segment to [`SSE_ENDPOINT_SEGMENTS`] and add a
+/// matching `match` arm here for the handler.
+///
+/// This is the single source of truth for:
+/// - [`protected_router`] (production route registration), and
+/// - the in-test `Router` in [`crate::auth::tests`] (regression guard).
+///
+/// If an entry is added to [`SSE_ENDPOINT_SEGMENTS`] without a matching arm
+/// below, the server panics at startup — a loud failure that catches the
+/// drift bug #905 / PR #904 closed.
+pub(crate) fn sse_route_specs() -> Vec<(String, MethodRouter<AppState>)> {
+    SSE_ENDPOINT_SEGMENTS
+        .iter()
+        .map(|seg| {
+            let path = format!("/{seg}/{{id}}/events");
+            let handler: MethodRouter<AppState> = match *seg {
+                "runs" => get(stream_run_events),
+                "sessions" => get(crate::runs::stream_session_events),
+                "agents" => get(crate::runs::stream_agent_events),
+                other => panic!(
+                    "SSE_ENDPOINT_SEGMENTS contains \"{other}\" with no handler mapping in \
+                     sse_route_specs(); add a match arm in crates/alms-gateway/src/server/routes.rs"
+                ),
+            };
+            (path, handler)
+        })
+        .collect()
+}
+
+/// Returns just the axum path strings for the SSE routes, derived from
+/// [`SSE_ENDPOINT_SEGMENTS`].
+///
+/// Stateless helper used by the auth test app, where the production
+/// handlers (which require `AppState`) can't be wired up.  Test-only —
+/// production code paths go through [`sse_route_specs`] which carries
+/// the handler alongside the path.
+#[cfg(test)]
+pub(crate) fn sse_route_paths() -> Vec<String> {
+    SSE_ENDPOINT_SEGMENTS
+        .iter()
+        .map(|seg| format!("/{seg}/{{id}}/events"))
+        .collect()
+}
+
 /// Routes that require authentication (all except /health)
 pub(crate) fn protected_router() -> Router<AppState> {
-    Router::new()
+    let mut router = Router::new()
         // Web UI
         .route("/", get(serve_ui))
         // Sessions
@@ -122,16 +173,11 @@ pub(crate) fn protected_router() -> Router<AppState> {
             "/sessions/{session_id}/tool-calls",
             get(get_session_tool_calls),
         )
-        .route(
-            "/sessions/{session_id}/events",
-            get(crate::runs::stream_session_events),
-        )
         .route("/sessions/{session_id}/cancel-dm", post(cancel_dm))
         .route("/sessions/{agent_id}/{context_id}", get(get_session))
         // Runs (canonical API per spec)
         .route("/runs", get(list_runs).post(create_run))
         .route("/runs/{run_id}", get(get_run_status))
-        .route("/runs/{run_id}/events", get(stream_run_events))
         .route("/runs/{run_id}/cancel", post(cancel_run))
         .route("/runs/{run_id}/tool-calls", get(get_run_tool_calls))
         // Approvals
@@ -164,16 +210,6 @@ pub(crate) fn protected_router() -> Router<AppState> {
             "/agents/{id_or_name}/workspace/{file}",
             axum::routing::put(update_workspace_file),
         )
-        // Agent-scoped SSE feed (#856) — emits
-        // `session_activity_started` / `session_activity_ended` events for
-        // runs across all of the agent's sessions, so the sidebar can
-        // surface activity on sessions other than the currently-viewed one.
-        // Future per-agent events (e.g. DM activity in #886) will share
-        // this same feed.
-        .route(
-            "/agents/{agent_id}/events",
-            get(crate::runs::stream_agent_events),
-        )
         // Settings (server defaults for UI pre-population + partial update)
         .route("/settings", get(get_settings).patch(patch_settings))
         // Jobs (scheduled agent runs)
@@ -193,7 +229,21 @@ pub(crate) fn protected_router() -> Router<AppState> {
             "/agents/{id_or_name}/timeline",
             get(crate::timeline::get_agent_timeline),
         )
-        .route("/ws", get(websocket_handler))
+        .route("/ws", get(websocket_handler));
+
+    // SSE streaming endpoints — registered from the canonical
+    // SSE_ENDPOINT_SEGMENTS list via sse_route_specs() so the auth
+    // middleware's is_sse_endpoint() matcher and the production route
+    // table cannot drift (#905).  Each entry contributes one route:
+    //   /runs/{id}/events     -> stream_run_events
+    //   /sessions/{id}/events -> stream_session_events
+    //   /agents/{id}/events   -> stream_agent_events  (#856 — emits
+    //                            session_activity_started/_ended for
+    //                            runs across all of the agent's sessions)
+    for (path, handler) in sse_route_specs() {
+        router = router.route(&path, handler);
+    }
+    router
 }
 
 /// Serve the embedded web UI (the `/` route behind auth).

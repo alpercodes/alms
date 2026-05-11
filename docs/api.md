@@ -1444,7 +1444,7 @@ Path parameter `{id_or_name}` accepts either a UUID or a name slug (same as othe
 Bearer token authentication. Enabled when `ALMS_AUTH_TOKEN` is set.
 
 - `Authorization: Bearer <token>` header required on all endpoints except `GET /health`
-- SSE endpoints (`/runs/{id}/events`, `/sessions/{id}/events`) also accept `?token=<token>` query parameter, since the browser `EventSource` API cannot set custom headers
+- SSE endpoints (`/runs/{id}/events`, `/sessions/{id}/events`, `/agents/{id}/events`) also accept `?token=<token>` query parameter, since the browser `EventSource` API cannot set custom headers
 - Query-string auth is rejected on all non-SSE routes to prevent credential leakage into server logs, browser history, and HTTP `Referer` headers
 - Single shared token configured via env var (never in config files)
 

@@ -12,22 +12,38 @@ use tracing::warn;
 #[derive(Clone, Debug)]
 pub struct AuthToken(pub Option<String>);
 
+/// Canonical source of truth for SSE streaming endpoints.
+///
+/// Each entry is the first path segment of an SSE route whose full shape is
+/// `/<segment>/{id}/events`.  Used by:
+///
+/// - [`is_sse_endpoint`] (the auth-middleware matcher that decides whether
+///   `?token=<token>` query-string auth is accepted for a request),
+/// - `crate::server::routes::sse_route_specs` (the production route-table
+///   builder, where the same list is turned into axum path + handler
+///   pairs and registered on the protected router), and
+/// - `crate::server::routes::sse_route_paths` (the stateless path-only
+///   helper, consumed by the auth tests' in-test `Router`).
+///
+/// Adding a new SSE endpoint = appending one entry here plus a matching
+/// handler arm in `sse_route_specs()`.  No other matcher / test app
+/// needs to be kept in sync, which is the bug #905 / PR #904 closed.
+pub(crate) const SSE_ENDPOINT_SEGMENTS: &[&str] = &["runs", "sessions", "agents"];
+
 /// Returns `true` if `path` is an SSE streaming endpoint where the browser's
 /// `EventSource` API cannot send custom headers, so query-string auth is the
 /// only viable option.
 ///
-/// Recognised SSE paths:
-///   - `/runs/{run_id}/events`
-///   - `/sessions/{session_id}/events`
-///   - `/agents/{agent_id}/events`
+/// Derived from [`SSE_ENDPOINT_SEGMENTS`] — to register a new SSE endpoint,
+/// add a segment there and the matcher picks it up automatically.
 fn is_sse_endpoint(path: &str) -> bool {
     let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
-    // Pattern: ["runs", <id>, "events"] | ["sessions", <id>, "events"] |
-    //          ["agents", <id>, "events"]
-    matches!(
-        segments.as_slice(),
-        ["runs", _, "events"] | ["sessions", _, "events"] | ["agents", _, "events"],
-    )
+    // Pattern: ["<segment>", <id>, "events"] where <segment> is in the
+    // canonical SSE list.
+    match segments.as_slice() {
+        [first, _id, "events"] => SSE_ENDPOINT_SEGMENTS.contains(first),
+        _ => false,
+    }
 }
 
 /// Axum middleware that enforces Bearer token authentication.
@@ -112,12 +128,17 @@ mod tests {
     }
 
     /// Build a test router with both a regular route and SSE-like routes.
+    ///
+    /// The SSE routes are derived from
+    /// [`crate::server::routes::sse_route_paths`] rather than hand-mirrored,
+    /// so adding a new SSE endpoint in production picks up the auth-middleware
+    /// test coverage automatically (#905).
     fn app(token: Option<&str>) -> Router {
-        Router::new()
-            .route("/test", get(dummy))
-            .route("/runs/{run_id}/events", get(dummy))
-            .route("/sessions/{session_id}/events", get(dummy))
-            .route("/agents/{agent_id}/events", get(dummy))
+        let mut router = Router::new().route("/test", get(dummy));
+        for path in crate::server::routes::sse_route_paths() {
+            router = router.route(&path, get(dummy));
+        }
+        router
             .layer(middleware::from_fn(require_auth))
             .layer(Extension(AuthToken(token.map(String::from))))
     }
@@ -316,6 +337,36 @@ mod tests {
         assert!(!is_sse_endpoint("/agents/abc"));
         assert!(!is_sse_endpoint("/agents/abc/sessions"));
         assert!(!is_sse_endpoint("/health"));
+    }
+
+    // --- Structural regression guard for #905 ---
+
+    /// Every route returned by the production SSE route-table helper
+    /// must be accepted by `is_sse_endpoint()`.  If anyone ever adds a
+    /// new entry to `SSE_ENDPOINT_SEGMENTS` (or to the route table
+    /// directly via some other path) without keeping the matcher in
+    /// sync, this test trips before the silent-401 regression that
+    /// caused #885 / #900 can ship.
+    ///
+    /// The axum `{id}` placeholder is substituted with a concrete UUID
+    /// before calling `is_sse_endpoint()` because the matcher operates
+    /// on real request paths, not route templates.
+    #[test]
+    fn test_sse_route_paths_match_is_sse_endpoint() {
+        let paths = crate::server::routes::sse_route_paths();
+        assert!(
+            !paths.is_empty(),
+            "sse_route_paths() returned an empty list — at minimum runs/sessions/agents are expected"
+        );
+        for template in paths {
+            let concrete = template.replace("{id}", "00000000-0000-0000-0000-000000000000");
+            assert!(
+                is_sse_endpoint(&concrete),
+                "is_sse_endpoint() rejects \"{concrete}\" (template \"{template}\") — \
+                 SSE_ENDPOINT_SEGMENTS and is_sse_endpoint() have drifted; \
+                 see crates/alms-gateway/src/auth.rs and issue #905"
+            );
+        }
     }
 
     // --- no_cache middleware tests ---

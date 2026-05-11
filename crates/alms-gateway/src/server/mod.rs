@@ -7,7 +7,7 @@
 //! - [`state`] — [`AppState`] construction and initialization
 //! - [`routes`] — Axum router setup and HTTP handler functions
 
-mod routes;
+pub(crate) mod routes;
 mod run_manager;
 mod state;
 
