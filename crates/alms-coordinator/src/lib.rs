@@ -773,7 +773,11 @@ async fn run_subagent(
         match new_status {
             TaskStatus::Completed => {
                 if let Some(ref output) = run_output {
-                    run.mark_completed(
+                    // Intentional discard: the coordinator persists the
+                    // updated run via `registrar.update_run(run)` below
+                    // and does not broadcast an SSE event, so the #1046
+                    // duplicate-broadcast guard does not apply here.
+                    let _ = run.mark_completed(
                         output.response.clone(),
                         alms_core::TokenUsage {
                             prompt_tokens: output.usage.prompt_tokens,
@@ -790,10 +794,14 @@ async fn run_subagent(
                     .as_str()
                     .unwrap_or("unknown error")
                     .to_string();
-                run.mark_failed(error);
+                // Intentional discard: same coordinator-persistence-only
+                // path as the `Completed` branch above.
+                let _ = run.mark_failed(error);
             }
             TaskStatus::Cancelled => {
-                run.mark_cancelled();
+                // Intentional discard: same coordinator-persistence-only
+                // path as the `Completed` / `Failed` branches above.
+                let _ = run.mark_cancelled();
             }
             _ => {}
         }

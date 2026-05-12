@@ -342,7 +342,7 @@ mod tests {
 
         let mut run = Run::new(session_id, agent_id, "hello".to_string());
         run.mark_running();
-        run.mark_completed(
+        let _ = run.mark_completed(
             "world".to_string(),
             TokenUsage {
                 prompt_tokens: 100,
@@ -403,7 +403,7 @@ mod tests {
         for _ in 0..5 {
             let mut run = Run::new(session_id, agent_id, "test".to_string());
             run.mark_running();
-            run.mark_completed(
+            let _ = run.mark_completed(
                 "ok".to_string(),
                 TokenUsage {
                     prompt_tokens: 10,
@@ -427,7 +427,7 @@ mod tests {
         for _ in 0..3 {
             let mut run = Run::new(session_id, agent_id, "test".to_string());
             run.mark_running();
-            run.mark_completed(
+            let _ = run.mark_completed(
                 "ok".to_string(),
                 TokenUsage {
                     prompt_tokens: 10,
@@ -536,7 +536,7 @@ mod tests {
 
         let mut run = Run::new(session_id, agent_id, "will fail".to_string());
         run.mark_running();
-        run.mark_failed("LLM timeout".to_string());
+        let _ = run.mark_failed("LLM timeout".to_string());
         store.save_run(&run).unwrap();
 
         let page = store.load_timeline_events(agent_id, None, 50).unwrap();
@@ -557,7 +557,7 @@ mod tests {
         for _ in 0..2 {
             let mut run = Run::new(session_id, agent_id, "test".to_string());
             run.mark_running();
-            run.mark_completed(
+            let _ = run.mark_completed(
                 "ok".to_string(),
                 TokenUsage {
                     prompt_tokens: 10,
@@ -765,7 +765,7 @@ mod tests {
         for _ in 0..2 {
             let mut run = Run::new(session_id, agent_id, "test".to_string());
             run.mark_running();
-            run.mark_completed(
+            let _ = run.mark_completed(
                 "ok".to_string(),
                 TokenUsage {
                     prompt_tokens: 10,
@@ -808,7 +808,7 @@ mod tests {
         // Create a run.
         let mut run = Run::new(session_id, agent_id, "Start a task".to_string());
         run.mark_running();
-        run.mark_completed(
+        let _ = run.mark_completed(
             "Done".to_string(),
             TokenUsage {
                 prompt_tokens: 50,

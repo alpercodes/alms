@@ -847,7 +847,12 @@ async fn completed_run_is_not_cancellable() {
         .run_manager
         .register_cancel_token(run_id, cancel_token);
 
-    // Mark the run as completed.
+    // Mark the run as running, then completed — mirrors the production
+    // lifecycle. Post-#1046 `mark_run_as_completed` enforces a
+    // `Running → Completed` transition contract; the historical pattern
+    // of calling it on a Queued run silently no-ops and would leave the
+    // run as Queued, breaking the assertion below.
+    state.run_manager.mark_run_as_running(run_id);
     state.run_manager.mark_run_as_completed(
         run_id,
         "done".to_string(),
@@ -5313,6 +5318,507 @@ async fn execute_run_mock_mode_skips_budget_validation_on_non_http_path() {
             "mock mode must NOT produce the budget-failure signature; got: {error_msg}"
         );
     }
+
+    shutdown_token.cancel();
+}
+
+// ---------------------------------------------------------------------------
+// #1046 — HTTP cancel must flip state authoritatively
+// ---------------------------------------------------------------------------
+
+/// #1046 regression — `POST /runs/{id}/cancel` flips the run state to
+/// `Cancelled` SYNCHRONOUSLY in the HTTP handler and broadcasts exactly
+/// one `run_cancelled` SSE event before the response returns.
+///
+/// Pre-#1046 the state flip + SSE broadcast only happened inside
+/// `execute_run`'s terminal arm, AFTER `drop(runtime)` and
+/// `forwarder_handle.await` had completed. With an in-flight LLM HTTP
+/// request being aborted (Windows + TLS connection drop), that cleanup
+/// window was observed to stretch to ~8 seconds during which
+/// `GET /runs/{id}` still reported `Running` and the SSE feed had
+/// emitted no terminal event. The user-visible symptom matched the
+/// issue report ("cancel doesn't work — agent keeps running").
+///
+/// This test pins the synchronous flip on the HTTP boundary: after
+/// `cancel_run` returns OK, the run's status MUST be `Cancelled` and
+/// the session SSE feed MUST have received exactly one `run_cancelled`
+/// event.
+#[tokio::test]
+async fn http_cancel_flips_state_synchronously() {
+    use axum::extract::{Path, State};
+
+    let (state, shutdown_token, _cr, _tr, _dr) = test_app_state();
+    let agent_id = AgentId::new();
+    let session = state
+        .session_manager
+        .get_or_create(agent_id, "test-1046-http-cancel-flip");
+    let session_id = session.id;
+
+    // Set up a run in the Running state (the common case for cancel).
+    let run = Run::new(session_id, agent_id, "test".into());
+    let run_id = run.run_id;
+    state.run_manager.insert_run(run);
+    state.run_manager.mark_run_as_running(run_id);
+
+    // Register a cancel token so `cancel_run` finds it.
+    let cancel_token = CancellationToken::new();
+    state
+        .run_manager
+        .register_cancel_token(run_id, cancel_token.clone());
+
+    let mut session_rx = subscribe_session(&state, session_id);
+
+    // Invoke the HTTP cancel handler directly.
+    let cancel_state = state.clone();
+    let response = super::lifecycle::cancel_run(State(cancel_state), Path(run_id))
+        .await
+        .expect("cancel_run should succeed for a Running run");
+
+    // The response shape matches the existing contract.
+    assert_eq!(response.0["status"], "cancelled");
+
+    // SYNCHRONOUS state flip: the moment the HTTP handler returns OK,
+    // `GET /runs/{id}` must report `Cancelled`. No await between the
+    // handler returning and this read, so any pre-#1046 deferred-flip
+    // regression surfaces here.
+    let run_after = state
+        .run_manager
+        .get_run(run_id)
+        .expect("run must still exist after cancel");
+    assert_eq!(
+        run_after.status,
+        RunStatus::Cancelled,
+        "run.status MUST be Cancelled immediately after `cancel_run` \
+         returns (#1046). Pre-fix: status stayed `Running` until \
+         `execute_run`'s terminal arm completed."
+    );
+
+    // The cancel token was also cancelled (existing behaviour).
+    assert!(
+        cancel_token.is_cancelled(),
+        "cancel token must be cancelled after `cancel_run`"
+    );
+
+    // The session feed must have received exactly one `run_cancelled`
+    // event for this run.
+    let events = drain_events(&mut session_rx);
+    let cancelled_events: Vec<_> = events
+        .iter()
+        .filter(|e| e.event_type == "run_cancelled")
+        .collect();
+    assert_eq!(
+        cancelled_events.len(),
+        1,
+        "HTTP cancel must emit exactly one `run_cancelled` event; got \
+         {} events: {:?}",
+        cancelled_events.len(),
+        events
+            .iter()
+            .map(|e| e.event_type.as_str())
+            .collect::<Vec<_>>()
+    );
+
+    shutdown_token.cancel();
+}
+
+/// #1046 regression — race between the HTTP `cancel_run` handler and
+/// `execute_run`'s terminal `Cancelled` arm produces EXACTLY ONE
+/// `run_cancelled` SSE event for the same run.
+///
+/// The HTTP handler now flips state + broadcasts. When `execute_run`
+/// later reaches its `Err(CancelledWithToolCalls)` arm (after the agent
+/// loop unwound and the runtime was dropped), it calls
+/// `mark_run_as_cancelled` again. The bool-returning contract makes
+/// that second call a no-op for the broadcast: the state is already
+/// `Cancelled` so `mark_run_as_cancelled` returns `false` and the SSE
+/// branch is skipped. Without the gate, the UI's session feed would
+/// see two `run_cancelled` events for the same run and append two
+/// `(run cancelled)` system bubbles to the transcript.
+///
+/// Uses the hanging-LLM helper so `execute_run` gets far enough to
+/// reach the terminal arm via a real `Err(Cancelled)` propagation
+/// through `agent_loop`'s LLM-call `select!` rather than the pre-cancel
+/// early-exit branch.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn http_cancel_and_execute_run_emit_single_event() {
+    use axum::extract::{Path, State};
+
+    let (state, shutdown_token, _cr, _tr, _dr) = test_app_state_with_hanging_llm().await;
+    let agent_id = AgentId::new();
+    let session = state
+        .session_manager
+        .get_or_create(agent_id, "test-1046-race-single-event");
+    let session_id = session.id;
+
+    let run = Run::new(session_id, agent_id, "trigger LLM hang".into());
+    let run_id = run.run_id;
+    state.run_manager.insert_run(run.clone());
+
+    let cancel_token = CancellationToken::new();
+    state
+        .run_manager
+        .register_cancel_token(run_id, cancel_token.clone());
+
+    let mut session_rx = subscribe_session(&state, session_id);
+
+    // Spawn `execute_run` so we can interleave the HTTP cancel with
+    // its in-flight loop.
+    let exec_state = state.clone();
+    let exec_input = run.input.clone();
+    let exec_cancel_token = cancel_token.clone();
+    let exec_handle = tokio::spawn(async move {
+        super::lifecycle::execute_run(
+            exec_state,
+            super::RunParams {
+                run_id,
+                session_id,
+                agent_id,
+                input: exec_input,
+                context_id: "test-1046-race-single-event".to_string(),
+                cancel_token: exec_cancel_token,
+                is_peer_message: false,
+                is_system_triggered: false,
+                input_pre_persisted: false,
+            },
+        )
+        .await
+    });
+
+    // Wait for `run_started` so we know the loop has crossed
+    // `mark_run_as_running` and is parked on the LLM HTTP request
+    // (the hanging-LLM helper).
+    let started_deadline = tokio::time::sleep(std::time::Duration::from_secs(3));
+    tokio::pin!(started_deadline);
+    let mut saw_started = false;
+    loop {
+        tokio::select! {
+            biased;
+            _ = &mut started_deadline => break,
+            event = session_rx.recv() => {
+                match event {
+                    Some(e) if e.event_type == "run_started" => {
+                        saw_started = true;
+                        break;
+                    }
+                    Some(_) => continue,
+                    None => break,
+                }
+            }
+        }
+    }
+    assert!(
+        saw_started,
+        "expected `run_started` SSE event before HTTP cancel"
+    );
+
+    // Fire the HTTP cancel handler. With the #1046 fix this both
+    // cancels the token AND broadcasts `run_cancelled` synchronously.
+    let _ = super::lifecycle::cancel_run(State(state.clone()), Path(run_id))
+        .await
+        .expect("cancel_run should succeed for a Running run");
+
+    // Let `execute_run` finish unwinding — agent_loop's `select!` will
+    // wake on the cancelled token, unwind through `finish_run`'s
+    // `Err(Cancelled)` arm, and reach the terminal
+    // `CancelledWithToolCalls` arm in `execute_run`. With the #1046
+    // gate, that arm sees `mark_run_as_cancelled` return `false` and
+    // skips the duplicate broadcast.
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(15), exec_handle)
+        .await
+        .expect("execute_run must complete within 15s after cancel");
+
+    // Drain all remaining session events and count `run_cancelled`s.
+    let events = drain_events(&mut session_rx);
+    let cancelled_count = events
+        .iter()
+        .filter(|e| e.event_type == "run_cancelled")
+        .count();
+    assert_eq!(
+        cancelled_count,
+        1,
+        "exactly one `run_cancelled` event must be emitted per run \
+         even when the HTTP handler and `execute_run`'s terminal arm \
+         both call `mark_run_as_cancelled` (#1046); got {cancelled_count} \
+         events: {:?}",
+        events
+            .iter()
+            .map(|e| e.event_type.as_str())
+            .collect::<Vec<_>>()
+    );
+
+    // Final state is still Cancelled (idempotent re-mark in the
+    // terminal arm does not regress the run to some other status).
+    let final_run = state
+        .run_manager
+        .get_run(run_id)
+        .expect("run must exist after execute_run");
+    assert_eq!(
+        final_run.status,
+        RunStatus::Cancelled,
+        "run must remain `Cancelled` after `execute_run` completes its cleanup"
+    );
+
+    shutdown_token.cancel();
+}
+
+/// #1046 regression — `Run::mark_cancelled` returns `false` and does
+/// NOT mutate `ended_at` when the run is already in a terminal state.
+///
+/// The idempotency contract is what makes the gateway-side
+/// "first-writer-wins" broadcast gate work. Without it the cleanup
+/// pass in `execute_run` would re-stamp `ended_at` to a later
+/// (cleanup-time) timestamp, masking when the cancel actually
+/// happened, and the bool return would always be `true` so the
+/// duplicate-broadcast guard would not fire.
+#[test]
+fn run_mark_cancelled_is_idempotent_and_returns_transition_bool() {
+    let session_id = SessionId::new();
+    let agent_id = AgentId::new();
+    let mut run = Run::new(session_id, agent_id, "test".into());
+
+    // Queued → Cancelled transitions and reports true.
+    assert!(matches!(run.status, RunStatus::Queued));
+    assert!(
+        run.mark_cancelled(),
+        "Queued → Cancelled must report transition=true"
+    );
+    assert!(matches!(run.status, RunStatus::Cancelled));
+    let first_ended_at = run.ended_at.expect("ended_at must be stamped");
+
+    // Second call on an already-Cancelled run reports false and does
+    // NOT update ended_at.
+    std::thread::sleep(std::time::Duration::from_millis(2));
+    assert!(
+        !run.mark_cancelled(),
+        "second mark_cancelled on already-Cancelled run must report false"
+    );
+    assert_eq!(
+        run.ended_at,
+        Some(first_ended_at),
+        "ended_at must NOT be updated by a no-op second mark_cancelled — \
+         it should reflect when the cancel actually happened, not when \
+         cleanup re-marked the run"
+    );
+
+    // Failed → mark_cancelled must NOT overwrite the terminal Failed
+    // status (defense-in-depth; not a path the gateway exercises today,
+    // but the idempotency invariant should hold for all terminal
+    // states).
+    let mut failed_run = Run::new(session_id, agent_id, "test".into());
+    failed_run.mark_running();
+    let _ = failed_run.mark_failed("boom".into());
+    assert!(matches!(failed_run.status, RunStatus::Failed));
+    assert!(
+        !failed_run.mark_cancelled(),
+        "mark_cancelled on a Failed run must report false (no transition)"
+    );
+    assert!(
+        matches!(failed_run.status, RunStatus::Failed),
+        "mark_cancelled on a Failed run must NOT overwrite the terminal status"
+    );
+}
+
+/// #1046 — Codex P1 — `http_cancel_wins_against_natural_completion`.
+///
+/// **Bug shape (symmetric to the original #1046 fix):** the first
+/// #1046 PR closed "cancel doesn't flip until `execute_run` finishes"
+/// by making the HTTP handler flip state + broadcast `run_cancelled`
+/// synchronously. That introduced a symmetric hole in the opposite
+/// direction: `execute_run`'s terminal arms (`Ok` / `FailedWithToolCalls`
+/// / generic `Err`) called `mark_run_as_completed` / `mark_run_as_failed`
+/// UNCONDITIONALLY and emitted `run_finished` / `run_error`. If a near-
+/// complete run had its state flipped to `Cancelled` by the HTTP handler
+/// in the narrow window between `agent_loop` returning a non-cancel
+/// outcome and `execute_run`'s terminal arm running, the terminal arm
+/// would silently regress the state from `Cancelled` back to
+/// `Completed` / `Failed` and emit a duplicate terminal SSE event on
+/// top of the already-delivered `run_cancelled`. From the user's
+/// perspective: they clicked cancel, saw it land, then the agent
+/// "finished" anyway.
+///
+/// **Why a RunManager-boundary test rather than an end-to-end
+/// interposer:** the bug requires `agent_loop` to return a NON-cancel
+/// terminal outcome (`Ok` or non-cancel `Err`) BEFORE the HTTP cancel
+/// arrives, then for the HTTP cancel to flip state to `Cancelled`,
+/// then for `execute_run`'s terminal arm to run `mark_run_as_completed`
+/// / `mark_run_as_failed`. Driving this end-to-end requires either (a)
+/// a custom LLM helper that signals back through a channel before
+/// returning `Ok` (so the test can fire HTTP cancel in the gap between
+/// the signal and `execute_run`'s terminal arm dispatching), or (b) a
+/// DashMap-barrier interposer that blocks the producer at
+/// `mark_run_as_failed` — but the HTTP `cancel_run` handler ALSO
+/// contends on the same DashMap shard via `mark_run_as_cancelled`, so
+/// the barrier would deadlock the cancel path. Neither approach is
+/// clean without adding test-only hooks into production code, and the
+/// existing hanging-LLM helper drives the cancel through `agent_loop`'s
+/// `select!` (producing `Err(CancelledWithToolCalls)` rather than a
+/// non-cancel `Err`), so the failing-arm race path is unreachable
+/// via that fixture.
+///
+/// Instead, this test pins the contract at the `RunManager` boundary
+/// directly. The terminal-arm broadcast gates in `execute_run` are
+/// trivial bool checks on the return value of `mark_run_as_*`; the
+/// load-bearing invariant is the `RunManager`-side idempotency
+/// contract that produces `false` when a cancelled run is later
+/// re-marked. If that contract holds, the gates in `lifecycle.rs`
+/// trivially follow. The pre-cancel-state simulation here is exactly
+/// what the HTTP handler does in production
+/// (`mark_run_as_cancelled` + `send_event(run_cancelled)`); the
+/// subsequent `mark_run_as_completed` / `mark_run_as_failed` calls
+/// are exactly what `execute_run`'s Ok / FailedWithToolCalls / generic
+/// Err arms do.
+///
+/// **Contract pinned by this test:**
+/// 1. `mark_run_as_completed` / `mark_run_as_failed` on a run whose
+///    state is already `Cancelled` return `false`.
+/// 2. The run's status remains `Cancelled` (no regression to
+///    `Completed` / `Failed`).
+/// 3. The `output` / `error` fields are NOT mutated by the no-op
+///    flip — preserving the run's actual end-state for triage via
+///    `GET /runs/{id}`.
+/// 4. Using the bool gate, the gateway broadcasts EXACTLY ONE
+///    terminal SSE event (`run_cancelled`) — no `run_finished` or
+///    `run_error` follows.
+#[tokio::test]
+async fn http_cancel_wins_against_natural_completion() {
+    let (state, shutdown_token, _cr, _tr, _dr) = test_app_state();
+    let agent_id = AgentId::new();
+    let session = state
+        .session_manager
+        .get_or_create(agent_id, "test-1046-cancel-wins-vs-completion");
+    let session_id = session.id;
+
+    // Set up a run that has crossed `mark_run_as_running` — i.e. the
+    // production state at the moment the LLM call is in flight.
+    let run = Run::new(session_id, agent_id, "race fixture".into());
+    let run_id = run.run_id;
+    state.run_manager.insert_run(run);
+    state.run_manager.mark_run_as_running(run_id);
+
+    let mut session_rx = subscribe_session(&state, session_id);
+
+    // Step 1 — simulate the HTTP `cancel_run` handler winning the
+    // race: it flips the state to `Cancelled` and broadcasts
+    // `run_cancelled` synchronously. This is exactly what the
+    // post-original-#1046 handler does (see `cancel_run` in
+    // lifecycle.rs).
+    let http_cancel_transitioned = state.run_manager.mark_run_as_cancelled(run_id);
+    assert!(
+        http_cancel_transitioned,
+        "Running → Cancelled must transition (sanity check on the test fixture)"
+    );
+    state
+        .run_manager
+        .send_event(run_id, session_id, SseEventData::run_cancelled(run_id))
+        .await;
+
+    // Step 2 — simulate `execute_run`'s Ok arm running AFTER the
+    // HTTP cancel won the race: `agent_loop` returned `Ok(_)`, the
+    // terminal arm calls `mark_run_as_completed`. Post-fix this
+    // returns false (Codex P1 gate: `mark_completed` requires Running,
+    // run is Cancelled). The `lifecycle.rs` broadcast gate uses this
+    // bool to skip the duplicate `run_finished` event.
+    let completed_transitioned = state.run_manager.mark_run_as_completed(
+        run_id,
+        "the agent finished its work".to_string(),
+        TokenUsage {
+            prompt_tokens: 42,
+            completion_tokens: 7,
+            ..TokenUsage::default()
+        },
+    );
+    assert!(
+        !completed_transitioned,
+        "mark_run_as_completed on a Cancelled run MUST return false. \
+         Pre-#1046 symmetric-fix, this would return true (or have no \
+         return at all) and the lifecycle would silently regress the \
+         state to Completed and emit a duplicate `run_finished` SSE \
+         event after `run_cancelled`."
+    );
+    // Production gate (mirrors the lifecycle.rs Ok arm post-fix). If
+    // the gate were missing or inverted, this would fire a duplicate
+    // `run_finished` event after `run_cancelled`.
+    if completed_transitioned {
+        state
+            .run_manager
+            .send_event(
+                run_id,
+                session_id,
+                SseEventData::run_finished(run_id, true, TokenUsage::default()),
+            )
+            .await;
+    }
+
+    // Step 3 — simulate `execute_run`'s FailedWithToolCalls / generic
+    // Err arm. Same shape on the failure side: `mark_run_as_failed`
+    // on a Cancelled run must return false and not regress state.
+    let failed_transitioned = state
+        .run_manager
+        .mark_run_as_failed(run_id, "post-cancel LLM 500".to_string());
+    assert!(
+        !failed_transitioned,
+        "mark_run_as_failed on a Cancelled run MUST return false. \
+         Pre-#1046 symmetric-fix, this would have overwritten the \
+         state to Failed."
+    );
+    if failed_transitioned {
+        state
+            .run_manager
+            .send_event(
+                run_id,
+                session_id,
+                SseEventData::run_error(run_id, "post-cancel LLM 500"),
+            )
+            .await;
+    }
+
+    // Contract assertion: the run's stored state remains Cancelled,
+    // and neither `output` nor `error` was mutated by the no-op
+    // terminal flips.
+    let final_run = state
+        .run_manager
+        .get_run(run_id)
+        .expect("run must exist after the race");
+    assert_eq!(
+        final_run.status,
+        RunStatus::Cancelled,
+        "run state must remain Cancelled — `mark_completed` / \
+         `mark_failed` must NOT regress an already-Cancelled run. \
+         Pre-#1046 symmetric-fix (Codex P1), the terminal arm \
+         overwrote the state."
+    );
+    assert!(
+        final_run.output.is_none(),
+        "output field must NOT be populated by a no-op \
+         mark_completed — got {:?}",
+        final_run.output
+    );
+    assert!(
+        final_run.error.is_none(),
+        "error field must NOT be populated by a no-op mark_failed — \
+         got {:?}",
+        final_run.error
+    );
+
+    // Wire-contract assertion: exactly ONE terminal SSE event fired
+    // on the session feed, and it is `run_cancelled`. Pre-fix code
+    // emits two: `run_cancelled` followed by `run_finished` (or
+    // `run_error`), breaking the single-terminal-event contract that
+    // clients rely on.
+    let events = drain_events(&mut session_rx);
+    let terminal: Vec<&str> = events
+        .iter()
+        .map(|e| e.event_type.as_str())
+        .filter(|t| matches!(*t, "run_cancelled" | "run_finished" | "run_error"))
+        .collect();
+    assert_eq!(
+        terminal,
+        vec!["run_cancelled"],
+        "exactly one terminal SSE event must fire per run, and it \
+         must be `run_cancelled` (cancel won the race against natural \
+         completion); got {terminal:?}. Pre-fix code emits \
+         `run_cancelled` followed by a regression event."
+    );
 
     shutdown_token.cancel();
 }

@@ -348,22 +348,93 @@ impl Run {
         self.resolved_config = Some(config);
     }
 
-    pub fn mark_completed(&mut self, output: String, usage: TokenUsage) {
-        self.status = RunStatus::Completed;
-        self.output = Some(output);
-        self.usage = Some(usage);
-        self.ended_at = Some(Utc::now());
+    /// Transition the run to `Completed` and stamp `ended_at`.
+    ///
+    /// Returns `true` if the run was actually transitioned from `Running`
+    /// to `Completed`, `false` if the run was already in a terminal state
+    /// (`Cancelled`, `Completed`, or `Failed`) or was still `Queued`. The
+    /// returned bool is used by `RunManager::mark_run_as_completed` to
+    /// gate duplicate `run_finished` SSE broadcasts when an HTTP cancel
+    /// races against natural completion (issue #1046 — symmetric hole in
+    /// the original cancel-flip fix).
+    ///
+    /// `Queued → Completed` is rejected (returns `false`) because in
+    /// practice `execute_run`'s `Ok(_)` arm only fires after
+    /// `mark_run_as_running_with_config` has flipped the run to
+    /// `Running`. Allowing `Queued → Completed` would silently mask a
+    /// bug in the run lifecycle if that invariant ever broke.
+    ///
+    /// Idempotent for the run state: `ended_at` is only stamped on the
+    /// first transition so it reflects when completion actually
+    /// happened, not when a later cleanup pass re-marked the run.
+    #[must_use = "callers that broadcast a terminal SSE event must gate the broadcast on this bool — discarding it regresses the #1046 duplicate-broadcast guard. If the discard is intentional (e.g. coordinator persistence, test setup), bind to `let _ =` to make it explicit."]
+    pub fn mark_completed(&mut self, output: String, usage: TokenUsage) -> bool {
+        if matches!(self.status, RunStatus::Running) {
+            self.status = RunStatus::Completed;
+            self.output = Some(output);
+            self.usage = Some(usage);
+            self.ended_at = Some(Utc::now());
+            true
+        } else {
+            false
+        }
     }
 
-    pub fn mark_failed(&mut self, error: String) {
-        self.status = RunStatus::Failed;
-        self.error = Some(error);
-        self.ended_at = Some(Utc::now());
+    /// Transition the run to `Failed` and stamp `ended_at`.
+    ///
+    /// Returns `true` if the run was actually transitioned to `Failed`,
+    /// `false` if it was already in a terminal state. Mirrors the
+    /// idempotency contract of [`Self::mark_completed`] and
+    /// [`Self::mark_cancelled`] so the gateway's three terminal-arm
+    /// broadcasts can share a single first-writer-wins shape (issue
+    /// #1046).
+    ///
+    /// Allows both `Running → Failed` AND `Queued → Failed`. The
+    /// `Queued → Failed` transition is the legitimate setup-error path:
+    /// `execute_run` runs `resolve_agent_config` and `AgentRuntime::new`
+    /// BEFORE `mark_run_as_running_with_config`, and both can fail. In
+    /// those early-failure branches the run never reaches `Running` —
+    /// rejecting `Queued → Failed` would leave the run stuck in
+    /// `Queued` after the early-error broadcast and the queue head
+    /// advance, which is observably worse than the duplicate-event hole
+    /// being closed here.
+    ///
+    /// Idempotent for the run state: `ended_at` is only stamped on the
+    /// first transition.
+    #[must_use = "callers that broadcast a terminal SSE event must gate the broadcast on this bool — discarding it regresses the #1046 duplicate-broadcast guard. If the discard is intentional (e.g. coordinator persistence, test setup), bind to `let _ =` to make it explicit."]
+    pub fn mark_failed(&mut self, error: String) -> bool {
+        if matches!(self.status, RunStatus::Queued | RunStatus::Running) {
+            self.status = RunStatus::Failed;
+            self.error = Some(error);
+            self.ended_at = Some(Utc::now());
+            true
+        } else {
+            false
+        }
     }
 
-    pub fn mark_cancelled(&mut self) {
-        self.status = RunStatus::Cancelled;
-        self.ended_at = Some(Utc::now());
+    /// Transition the run to `Cancelled` and stamp `ended_at`.
+    ///
+    /// Returns `true` if the run was actually transitioned (i.e. it was
+    /// `Queued` or `Running` and is now `Cancelled`), `false` if it was
+    /// already in a terminal state and no transition occurred. The
+    /// returned bool is used by `RunManager::mark_run_as_cancelled` to
+    /// gate duplicate `run_cancelled` SSE broadcasts when the cancel
+    /// arrives concurrently from both the HTTP handler and the
+    /// `execute_run` terminal arm (issue #1046).
+    ///
+    /// Idempotent for the run state: `ended_at` is only stamped on the
+    /// first transition so it reflects when cancellation actually
+    /// happened, not when a later cleanup pass re-marked the run.
+    #[must_use = "callers that broadcast a terminal SSE event must gate the broadcast on this bool — discarding it regresses the #1046 duplicate-broadcast guard. If the discard is intentional (e.g. coordinator persistence, test setup), bind to `let _ =` to make it explicit."]
+    pub fn mark_cancelled(&mut self) -> bool {
+        if matches!(self.status, RunStatus::Queued | RunStatus::Running) {
+            self.status = RunStatus::Cancelled;
+            self.ended_at = Some(Utc::now());
+            true
+        } else {
+            false
+        }
     }
 }
 
@@ -958,6 +1029,183 @@ mod tests {
         );
         let parsed: ResolvedRunConfig = serde_json::from_value(value).unwrap();
         assert_eq!(parsed, cfg);
+    }
+
+    /// #1046 regression — `Run::mark_completed` returns `false` and does
+    /// NOT mutate the run when the run is already in a terminal state
+    /// (Cancelled / Completed / Failed) or is still Queued. Mirrors the
+    /// `mark_cancelled` idempotency contract at the gateway level so the
+    /// `execute_run` Ok-arm broadcast gate can rely on first-writer-wins
+    /// semantics: a near-complete run whose state was already flipped to
+    /// `Cancelled` by the HTTP cancel handler must not regress to
+    /// `Completed` here and emit a duplicate terminal SSE event.
+    #[test]
+    fn test_run_mark_completed_is_idempotent_and_returns_transition_bool() {
+        let session_id = SessionId::new();
+        let agent_id = AgentId::new();
+
+        // Queued → Completed is REJECTED: in production `execute_run`'s
+        // Ok arm only fires after `mark_run_as_running_with_config`, so
+        // hitting this branch would indicate a lifecycle bug. The
+        // contract makes that bug detectable rather than silently
+        // committing.
+        let mut queued_run = Run::new(session_id, agent_id, "test".into());
+        assert!(matches!(queued_run.status, RunStatus::Queued));
+        assert!(
+            !queued_run.mark_completed("out".into(), TokenUsage::default()),
+            "Queued → Completed must report false (lifecycle invariant: \
+             mark_completed requires Running)"
+        );
+        assert!(
+            matches!(queued_run.status, RunStatus::Queued),
+            "Queued run must remain Queued when mark_completed is rejected"
+        );
+
+        // Happy path: Running → Completed transitions and returns true.
+        let mut run = Run::new(session_id, agent_id, "test".into());
+        run.mark_running();
+        assert!(matches!(run.status, RunStatus::Running));
+        assert!(
+            run.mark_completed("out".into(), TokenUsage::default()),
+            "Running → Completed must report transition=true"
+        );
+        assert!(matches!(run.status, RunStatus::Completed));
+        let first_ended_at = run.ended_at.expect("ended_at must be stamped");
+        let first_output = run.output.clone();
+
+        // Second call on an already-Completed run reports false and does
+        // NOT update ended_at, output, or usage.
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        assert!(
+            !run.mark_completed("second-write".into(), TokenUsage::default()),
+            "second mark_completed on already-Completed run must report false"
+        );
+        assert_eq!(
+            run.ended_at,
+            Some(first_ended_at),
+            "ended_at must NOT be updated by a no-op second mark_completed"
+        );
+        assert_eq!(
+            run.output, first_output,
+            "output must NOT be overwritten by a no-op second mark_completed"
+        );
+
+        // Cancelled → mark_completed must NOT overwrite the terminal
+        // status. This is the #1046 symmetric-hole regression: a run
+        // whose state has been flipped to Cancelled by the HTTP cancel
+        // handler must not regress to Completed when execute_run's Ok
+        // arm reaches its terminal flip.
+        let mut cancelled_run = Run::new(session_id, agent_id, "test".into());
+        cancelled_run.mark_running();
+        assert!(cancelled_run.mark_cancelled());
+        assert!(matches!(cancelled_run.status, RunStatus::Cancelled));
+        assert!(
+            !cancelled_run.mark_completed("ok".into(), TokenUsage::default()),
+            "mark_completed on a Cancelled run must report false (no transition)"
+        );
+        assert!(
+            matches!(cancelled_run.status, RunStatus::Cancelled),
+            "mark_completed on a Cancelled run must NOT overwrite the terminal status"
+        );
+
+        // Failed → mark_completed must NOT overwrite the terminal status.
+        let mut failed_run = Run::new(session_id, agent_id, "test".into());
+        failed_run.mark_running();
+        let _ = failed_run.mark_failed("boom".into());
+        assert!(matches!(failed_run.status, RunStatus::Failed));
+        assert!(
+            !failed_run.mark_completed("ok".into(), TokenUsage::default()),
+            "mark_completed on a Failed run must report false"
+        );
+        assert!(matches!(failed_run.status, RunStatus::Failed));
+    }
+
+    /// #1046 regression — `Run::mark_failed` returns `false` and does
+    /// NOT mutate when the run is already in a terminal state, but does
+    /// allow `Queued → Failed` for the legitimate setup-error paths
+    /// (`resolve_agent_config` / `AgentRuntime::new` failure before
+    /// `mark_run_as_running_with_config`). Mirrors `mark_completed`'s
+    /// shape so the gateway's three terminal-arm broadcasts share a
+    /// single first-writer-wins gate.
+    #[test]
+    fn test_run_mark_failed_is_idempotent_and_returns_transition_bool() {
+        let session_id = SessionId::new();
+        let agent_id = AgentId::new();
+
+        // Queued → Failed is ALLOWED — covers the setup-error path
+        // (resolve_agent_config / runtime init fails before
+        // mark_run_as_running_with_config). Different from
+        // `mark_completed`, which rejects Queued because the Ok arm of
+        // execute_run is unreachable for a never-started run.
+        let mut queued_run = Run::new(session_id, agent_id, "test".into());
+        assert!(matches!(queued_run.status, RunStatus::Queued));
+        assert!(
+            queued_run.mark_failed("setup error".into()),
+            "Queued → Failed must report transition=true (setup-error path)"
+        );
+        assert!(matches!(queued_run.status, RunStatus::Failed));
+        assert_eq!(queued_run.error.as_deref(), Some("setup error"));
+        assert!(queued_run.ended_at.is_some());
+
+        // Happy path: Running → Failed transitions and returns true.
+        let mut run = Run::new(session_id, agent_id, "test".into());
+        run.mark_running();
+        assert!(
+            run.mark_failed("boom".into()),
+            "Running → Failed must report transition=true"
+        );
+        assert!(matches!(run.status, RunStatus::Failed));
+        let first_ended_at = run.ended_at.expect("ended_at must be stamped");
+        let first_error = run.error.clone();
+
+        // Second call on an already-Failed run reports false and does
+        // NOT update ended_at or error.
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        assert!(
+            !run.mark_failed("second-write".into()),
+            "second mark_failed on already-Failed run must report false"
+        );
+        assert_eq!(
+            run.ended_at,
+            Some(first_ended_at),
+            "ended_at must NOT be updated by a no-op second mark_failed"
+        );
+        assert_eq!(
+            run.error, first_error,
+            "error must NOT be overwritten by a no-op second mark_failed"
+        );
+
+        // Cancelled → mark_failed must NOT overwrite the terminal status.
+        // This is the #1046 symmetric-hole regression on the failure
+        // side: a run whose state has been flipped to Cancelled by the
+        // HTTP cancel handler must not regress to Failed when
+        // execute_run's FailedWithToolCalls / generic Err arm reaches
+        // its terminal flip.
+        let mut cancelled_run = Run::new(session_id, agent_id, "test".into());
+        cancelled_run.mark_running();
+        assert!(cancelled_run.mark_cancelled());
+        assert!(matches!(cancelled_run.status, RunStatus::Cancelled));
+        assert!(
+            !cancelled_run.mark_failed("boom".into()),
+            "mark_failed on a Cancelled run must report false (no transition)"
+        );
+        assert!(
+            matches!(cancelled_run.status, RunStatus::Cancelled),
+            "mark_failed on a Cancelled run must NOT overwrite the terminal status"
+        );
+
+        // Completed → mark_failed must NOT overwrite the terminal
+        // status either (defense-in-depth; not a path the gateway
+        // exercises today, but the invariant should hold).
+        let mut completed_run = Run::new(session_id, agent_id, "test".into());
+        completed_run.mark_running();
+        let _ = completed_run.mark_completed("ok".into(), TokenUsage::default());
+        assert!(matches!(completed_run.status, RunStatus::Completed));
+        assert!(
+            !completed_run.mark_failed("boom".into()),
+            "mark_failed on a Completed run must report false"
+        );
+        assert!(matches!(completed_run.status, RunStatus::Completed));
     }
 
     /// Any `"Error:"` prefix in the tool result should prevent the call

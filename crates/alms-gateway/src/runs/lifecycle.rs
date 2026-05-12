@@ -267,6 +267,37 @@ pub async fn cancel_run(
         return Err(already_finished());
     }
 
+    // #1046: flip the run state to `Cancelled` and broadcast `run_cancelled`
+    // SYNCHRONOUSLY from the HTTP handler so the user-visible cancel is
+    // authoritative within a single HTTP round trip. Pre-#1046, the state
+    // flip only happened in `execute_run`'s terminal arm AFTER `drop(runtime)`
+    // and `forwarder_handle.await` had completed (typically several seconds
+    // of cleanup latency on Windows with an in-flight LLM HTTP connection),
+    // during which `GET /runs/{id}` still reported `Running` and the SSE
+    // feed had not emitted `run_cancelled`. Operators perceived this as
+    // "cancel didn't work — agent kept running" because the UI's
+    // "Cancel" button had no immediate observable effect.
+    //
+    // The `mark_run_as_cancelled` return-value contract guarantees that
+    // the SSE event fires exactly once per run: whichever caller wins the
+    // race (this HTTP handler or `execute_run`'s terminal arm) does the
+    // broadcast, the loser sees `false` and skips. The race is rare in
+    // practice because the cleanup window where both can fire is bounded
+    // by `forwarder_handle.await` (~milliseconds without network LLM
+    // calls, seconds with) — but the contract closes the window entirely.
+    //
+    // The state flip also closes a #895-class consistency window: between
+    // this point and `execute_run`'s terminal arm, any concurrent
+    // `GET /sessions` snapshot or `GET /runs/{id}` query now sees
+    // `Cancelled` instead of `Running`, matching the SSE feed.
+    let transitioned = state.run_manager.mark_run_as_cancelled(run_id);
+    if transitioned {
+        state
+            .run_manager
+            .send_event(run_id, run.session_id, SseEventData::run_cancelled(run_id))
+            .await;
+    }
+
     info!("Cancel requested for run {}", run_id.0);
 
     Ok(Json(serde_json::json!({
@@ -830,11 +861,22 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
         // "a client that has the started event but not the ended event,"
         // closing the race. The change is internal to the gateway lock
         // window — the SSE event ordering visible to clients is identical.
-        state.run_manager.mark_run_as_cancelled(run_id);
-        state
-            .run_manager
-            .send_event(run_id, session_id, SseEventData::run_cancelled(run_id))
-            .await;
+        //
+        // #1046: gate the broadcast on the transition bool. The HTTP
+        // `cancel_run` handler may have already flipped the state and
+        // emitted the SSE event before this `execute_run` task was
+        // dispatched (queued-then-cancelled-via-HTTP). In that case the
+        // state is already `Cancelled` so the `mark_*` returns false and
+        // we skip the duplicate broadcast. The synthetic
+        // `session_activity_ended` below still fires because it serves a
+        // separate sidebar-indicator-clearing purpose.
+        let transitioned = state.run_manager.mark_run_as_cancelled(run_id);
+        if transitioned {
+            state
+                .run_manager
+                .send_event(run_id, session_id, SseEventData::run_cancelled(run_id))
+                .await;
+        }
         // Emit a synthetic `session_activity_ended` on the agent-scoped
         // feed (#888). The pre-cancel branch never emits a paired
         // `session_activity_started`, so this is asymmetric — but the run
@@ -923,14 +965,35 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
         Ok(resolved) => resolved,
         Err(e) => {
             error!("Run {} failed to resolve agent config: {}", run_id.0, e);
-            state
-                .run_manager
-                .send_event(
-                    run_id,
-                    session_id,
-                    SseEventData::run_error(run_id, &e.to_string()),
-                )
-                .await;
+            // #1046: flip state FIRST (matching the #895 ordering on
+            // all started/ended boundaries) and gate the `run_error`
+            // SSE broadcast on the transition bool. The HTTP
+            // `cancel_run` handler may have flipped the queued run to
+            // `Cancelled` while `execute_run` was sitting in the agent
+            // queue; in that case `mark_run_as_failed` returns false
+            // and we skip the duplicate `run_error` event — the cancel
+            // handler's `run_cancelled` already filled the terminal
+            // slot.
+            //
+            // The `session_activity_ended` agent-feed fan-out fires
+            // unconditionally here. This branch is reached BEFORE
+            // `mark_run_as_running_with_config` and so no
+            // `session_activity_started` has been emitted yet — the
+            // extra `ended` is harmless (consumers ignore ended events
+            // for sessions whose indicator was never lit) and matches
+            // the pre-#1046 behaviour.
+            let failed_transitioned = state.run_manager.mark_run_as_failed(run_id, e.to_string());
+
+            if failed_transitioned {
+                state
+                    .run_manager
+                    .send_event(
+                        run_id,
+                        session_id,
+                        SseEventData::run_error(run_id, &e.to_string()),
+                    )
+                    .await;
+            }
             state
                 .run_manager
                 .send_agent_event(
@@ -940,7 +1003,6 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
                     SseEventData::session_activity_ended(session_id, run_id, agent_id),
                 )
                 .await;
-            state.run_manager.mark_run_as_failed(run_id, e.to_string());
             state.run_manager.remove_senders(run_id);
             state.run_manager.remove_cancel_token(run_id);
             state.approval_store.clear_for_run(run_id);
@@ -1195,17 +1257,36 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
         Ok(rt) => rt,
         Err(e) => {
             error!("Run {} failed to create runtime: {}", run_id.0, e);
-            state
-                .run_manager
-                .send_event(
-                    run_id,
-                    session_id,
-                    SseEventData::run_error(run_id, &e.to_string()),
-                )
-                .await;
-            // Pair the earlier `session_activity_started` so the agent feed
-            // sees a clean started/ended cycle even when the runtime fails
-            // to initialise (#856).
+            // #1046: flip state FIRST and gate the `run_error` SSE
+            // broadcast on the transition bool. By this point the run
+            // is already `Running` (mark_run_as_running_with_config
+            // fired above), so the HTTP `cancel_run` handler may have
+            // raced and flipped the state to `Cancelled` between then
+            // and this point — in that case `mark_run_as_failed`
+            // returns false and we skip the duplicate `run_error`
+            // event, since the cancel handler's `run_cancelled`
+            // already filled the terminal slot.
+            //
+            // The `session_activity_ended` agent-feed fan-out fires
+            // unconditionally to pair the earlier
+            // `session_activity_started` (#856), regardless of who
+            // won the cancel-vs-init-fail race. The HTTP cancel handler
+            // does NOT emit `session_activity_ended`, so suppressing
+            // it here would leave the agent feed with an unpaired
+            // `started` and a sidebar indicator stuck on until the
+            // next unrelated event clears it.
+            let failed_transitioned = state.run_manager.mark_run_as_failed(run_id, e.to_string());
+
+            if failed_transitioned {
+                state
+                    .run_manager
+                    .send_event(
+                        run_id,
+                        session_id,
+                        SseEventData::run_error(run_id, &e.to_string()),
+                    )
+                    .await;
+            }
             state
                 .run_manager
                 .send_agent_event(
@@ -1215,7 +1296,6 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
                     SseEventData::session_activity_ended(session_id, run_id, agent_id),
                 )
                 .await;
-            state.run_manager.mark_run_as_failed(run_id, e.to_string());
 
             // Persist the runtime-construction failure so a follow-up
             // turn ("why did that fail?") gives the agent the error in
@@ -1779,21 +1859,43 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
             // consumes the original via `mark_run_as_completed`. We
             // capture it here for clarity and to avoid relying on a
             // post-move value.
+            //
+            // #1046 (symmetric to the cancel-arm gate): gate the
+            // broadcast on the transition bool. The HTTP `cancel_run`
+            // handler now flips the run state to `Cancelled` and
+            // broadcasts `run_cancelled` synchronously, which races
+            // against natural completion in a narrow window: if the
+            // agent loop returned `Ok(_)` just before the cancel arrived,
+            // `mark_run_as_completed` would silently regress the state
+            // from `Cancelled` to `Completed` and emit `run_finished`
+            // on top of the already-delivered `run_cancelled`. The
+            // first-writer-wins contract on `Run::mark_completed`
+            // (Running-only, idempotent) makes the second flip a no-op
+            // and the bool gate suppresses the duplicate terminal SSE
+            // event. The post-completion DM lifecycle / episodic
+            // summary fan-out below still fires — they are independent
+            // side effects, and the run's stored output / usage was
+            // never persisted (the cancel won the race), so those
+            // helpers operate on the in-flight result they were handed
+            // by the runtime regardless of the final stored state.
             let usage_for_broadcast = output.usage;
 
-            state
-                .run_manager
-                .mark_run_as_completed(run_id, output.response, output.usage);
+            let completed_transitioned =
+                state
+                    .run_manager
+                    .mark_run_as_completed(run_id, output.response, output.usage);
 
             // token_delta events already emitted during streaming in the agent loop
-            state
-                .run_manager
-                .send_event(
-                    run_id,
-                    session_id,
-                    SseEventData::run_finished(run_id, true, usage_for_broadcast),
-                )
-                .await;
+            if completed_transitioned {
+                state
+                    .run_manager
+                    .send_event(
+                        run_id,
+                        session_id,
+                        SseEventData::run_finished(run_id, true, usage_for_broadcast),
+                    )
+                    .await;
+            }
 
             // Fire-and-forget episodic summary generation.
             // Runs in a separate task so it never blocks the SSE cleanup path.
@@ -1852,12 +1954,23 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
             // See the pre-cancel branch at the top of this function for the
             // full rationale; the same race applies to every started/ended
             // boundary that uses `mark_run_as_*` to drive `has_active_run`.
-            state.run_manager.mark_run_as_cancelled(run_id);
+            //
+            // #1046: gate the broadcast on the `mark_run_as_cancelled`
+            // return value. When the HTTP `cancel_run` handler has already
+            // flipped the state and fired the SSE event (the common case
+            // for user-initiated cancels — see the rationale on the
+            // handler), this match arm sees `false` and skips the
+            // duplicate broadcast. The downstream `handle_dm_run_failure`
+            // and `session_activity_ended` emissions still fire — they
+            // are NOT duplicated by the HTTP handler.
+            let transitioned = state.run_manager.mark_run_as_cancelled(run_id);
 
-            state
-                .run_manager
-                .send_event(run_id, session_id, SseEventData::run_cancelled(run_id))
-                .await;
+            if transitioned {
+                state
+                    .run_manager
+                    .send_event(run_id, session_id, SseEventData::run_cancelled(run_id))
+                    .await;
+            }
 
             // Issue #912 — DO NOT persist a lifecycle-layer
             // `(run cancelled)` error marker here.  The runtime layer
@@ -1905,12 +2018,18 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
             // #895: flip the run state BEFORE broadcasting `run_cancelled`.
             // See the pre-cancel branch at the top of this function for the
             // full rationale.
-            state.run_manager.mark_run_as_cancelled(run_id);
+            //
+            // #1046: gate the broadcast — see the `Cancelled` arm above
+            // for the full rationale on first-writer-wins semantics
+            // between this arm and the HTTP `cancel_run` handler.
+            let transitioned = state.run_manager.mark_run_as_cancelled(run_id);
 
-            state
-                .run_manager
-                .send_event(run_id, session_id, SseEventData::run_cancelled(run_id))
-                .await;
+            if transitioned {
+                state
+                    .run_manager
+                    .send_event(run_id, session_id, SseEventData::run_cancelled(run_id))
+                    .await;
+            }
 
             // Issue #912 — see the `Cancelled` arm above.  The
             // runtime-layer `[Run cancelled by user]` write is the
@@ -1950,18 +2069,33 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
             // pre-cancel branch at the top of this function for the full
             // rationale; the same race applies to every started/ended
             // boundary that uses `mark_run_as_*` to drive `has_active_run`.
-            state
+            //
+            // #1046 (symmetric to the cancel-arm gate): gate the
+            // broadcast on the transition bool. The HTTP `cancel_run`
+            // handler may have already flipped the state to `Cancelled`
+            // and emitted `run_cancelled` in the window between
+            // `agent_loop` returning `Err(FailedWithToolCalls { ... })`
+            // (which can happen for non-cancel reasons —
+            // `AgentRuntime::finish_run` wraps any non-Cancelled error
+            // in this variant) and this terminal arm running. The
+            // first-writer-wins contract on `Run::mark_failed`
+            // (Queued/Running only, idempotent) makes the second flip a
+            // no-op and the bool gate suppresses the duplicate terminal
+            // SSE event.
+            let failed_transitioned = state
                 .run_manager
                 .mark_run_as_failed(run_id, source.to_string());
 
-            state
-                .run_manager
-                .send_event(
-                    run_id,
-                    session_id,
-                    SseEventData::run_error(run_id, &source.to_string()),
-                )
-                .await;
+            if failed_transitioned {
+                state
+                    .run_manager
+                    .send_event(
+                        run_id,
+                        session_id,
+                        SseEventData::run_error(run_id, &source.to_string()),
+                    )
+                    .await;
+            }
 
             // Issue #912 — DO NOT persist a lifecycle-layer
             // `(run failed) ...` error marker here.  The runtime layer
@@ -2015,16 +2149,27 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
             // #927 (extends #895): flip the run state to `Failed` BEFORE
             // broadcasting `run_error`. See the `Ok` and
             // `FailedWithToolCalls` arms for the full rationale.
-            state.run_manager.mark_run_as_failed(run_id, e.to_string());
+            //
+            // #1046: gate the broadcast — see the `FailedWithToolCalls`
+            // arm above for the full rationale on first-writer-wins
+            // semantics between this arm and the HTTP `cancel_run`
+            // handler. This generic arm is unreachable through
+            // `runtime.run()` in practice (`AgentRuntime::finish_run`
+            // re-wraps every non-Cancelled error into
+            // `FailedWithToolCalls`), but is kept defensively for
+            // synthetic test inputs and direct-runtime-bypass paths.
+            let failed_transitioned = state.run_manager.mark_run_as_failed(run_id, e.to_string());
 
-            state
-                .run_manager
-                .send_event(
-                    run_id,
-                    session_id,
-                    SseEventData::run_error(run_id, &e.to_string()),
-                )
-                .await;
+            if failed_transitioned {
+                state
+                    .run_manager
+                    .send_event(
+                        run_id,
+                        session_id,
+                        SseEventData::run_error(run_id, &e.to_string()),
+                    )
+                    .await;
+            }
 
             // Issue #912 — see the `FailedWithToolCalls` arm above.
             // This generic-error arm covers LLM 4xx/5xx, rate-limit,

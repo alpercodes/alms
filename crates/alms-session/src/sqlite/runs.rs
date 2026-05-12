@@ -207,7 +207,7 @@ mod tests {
         let session = new_session();
         let mut run = new_run(session.id, session.agent_id);
         run.mark_running();
-        run.mark_completed(
+        let _ = run.mark_completed(
             "I am a response".to_string(),
             TokenUsage {
                 prompt_tokens: 100,
@@ -235,7 +235,7 @@ mod tests {
         let session = new_session();
         let mut run = new_run(session.id, session.agent_id);
         run.mark_running();
-        run.mark_failed("LLM error".to_string());
+        let _ = run.mark_failed("LLM error".to_string());
 
         store.save_run(&run).unwrap();
 
@@ -251,7 +251,7 @@ mod tests {
         let session = new_session();
         let mut run = new_run(session.id, session.agent_id);
         run.mark_running();
-        run.mark_cancelled();
+        let _ = run.mark_cancelled();
 
         store.save_run(&run).unwrap();
 
@@ -282,7 +282,7 @@ mod tests {
         // Insert a completed run (should not be affected).
         let mut completed_run = new_run(session.id, session.agent_id);
         completed_run.mark_running();
-        completed_run.mark_completed(
+        let _ = completed_run.mark_completed(
             "done".to_string(),
             TokenUsage {
                 prompt_tokens: 1,
@@ -356,7 +356,7 @@ mod tests {
 
         // Transition to completed
         run.mark_running();
-        run.mark_completed(
+        let _ = run.mark_completed(
             "done".to_string(),
             TokenUsage {
                 prompt_tokens: 10,

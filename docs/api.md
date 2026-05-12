@@ -708,12 +708,28 @@ Notes:
 ### 5.5 Cancel a run
 `POST /runs/{run_id}/cancel`
 
-Cancels a running or queued run. Returns 200 with `{"run_id":"...","status":"cancelling"}`.
+Cancels a running or queued run. Returns 200 with `{"run_id":"...","status":"cancelled"}`.
 Returns 404 if run not found, 409 if already finished.
 
-Cancellation is cooperative — the agent loop checks a `CancellationToken` at four points
-(iteration boundary, LLM call, tool execution, approval wait). The run transitions to
-`cancelled` status and emits a `run_cancelled` SSE event.
+By the time `POST /runs/{run_id}/cancel` returns 200, EITHER the run state has
+flipped to `Cancelled` and the `run_cancelled` SSE event has been broadcast
+(the overwhelmingly common case), OR `execute_run`'s terminal arm won the race
+inside the handler's tiny `get_run` → `mark_run_as_cancelled` window and the
+run is in its natural terminal state (`Completed` / `Failed`) with the matching
+SSE event already on the feed. The SSE feed is the authoritative source of
+which terminal event fired; the response body's `"status": "cancelled"` string
+reflects the request that was made, not the final state. Exactly one terminal
+SSE event fires per run: when an HTTP cancel races against natural completion,
+the first writer wins and the loser's `mark_*` returns `false`, suppressing
+the duplicate broadcast (#1046).
+
+Cancellation is cooperative for the in-flight agent loop — the loop checks a
+`CancellationToken` at four points (iteration boundary, LLM call, tool execution,
+approval wait) and unwinds at the next check-point, which can take several seconds
+on platforms where an in-flight TLS-bearing LLM HTTP connection is being aborted.
+The state flip + SSE broadcast on the HTTP boundary is independent of that
+cooperative unwind: the user-visible cancel lands synchronously on the HTTP
+response and on every subscribed SSE feed; the loop's actual exit follows.
 
 ### 5.6 List runs
 `GET /runs?session_id=<uuid>&limit=<n>` — list runs for a session (original behaviour).

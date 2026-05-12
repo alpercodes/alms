@@ -232,26 +232,64 @@ impl RunManager {
     }
 
     /// Atomically transition a run to Completed state and persist the snapshot.
+    ///
+    /// Returns `true` if the run was actually transitioned from `Running`
+    /// to `Completed`, `false` if the run was already in a terminal state
+    /// or had not yet been marked `Running` (or did not exist). Callers
+    /// that need to fan out a `run_finished` SSE event should gate the
+    /// broadcast on this return value so the event fires exactly once
+    /// per run, even when an HTTP `cancel_run` races against natural
+    /// completion. See issue #1046 for the race motivation — this is the
+    /// symmetric counterpart to [`Self::mark_run_as_cancelled`]'s gate
+    /// on the Ok-arm side.
     pub fn mark_run_as_completed(
         &self,
         run_id: RunId,
         output: String,
         usage: alms_core::TokenUsage,
-    ) {
-        let snapshot = self.modify_and_snapshot(run_id, |r| r.mark_completed(output, usage));
+    ) -> bool {
+        let mut transitioned = false;
+        let snapshot = self.modify_and_snapshot(run_id, |r| {
+            transitioned = r.mark_completed(output, usage);
+        });
         self.persist_snapshot(run_id, snapshot);
+        transitioned
     }
 
     /// Atomically transition a run to Failed state and persist the snapshot.
-    pub fn mark_run_as_failed(&self, run_id: RunId, error: String) {
-        let snapshot = self.modify_and_snapshot(run_id, |r| r.mark_failed(error));
+    ///
+    /// Returns `true` if the run was actually transitioned to `Failed`
+    /// from `Queued` or `Running`, `false` if the run was already in a
+    /// terminal state (or did not exist). Callers that need to fan out
+    /// a `run_error` SSE event should gate the broadcast on this return
+    /// value — same first-writer-wins shape as
+    /// [`Self::mark_run_as_cancelled`] and [`Self::mark_run_as_completed`].
+    /// See issue #1046.
+    pub fn mark_run_as_failed(&self, run_id: RunId, error: String) -> bool {
+        let mut transitioned = false;
+        let snapshot = self.modify_and_snapshot(run_id, |r| {
+            transitioned = r.mark_failed(error);
+        });
         self.persist_snapshot(run_id, snapshot);
+        transitioned
     }
 
     /// Atomically transition a run to Cancelled state and persist the snapshot.
-    pub fn mark_run_as_cancelled(&self, run_id: RunId) {
-        let snapshot = self.modify_and_snapshot(run_id, |r| r.mark_cancelled());
+    ///
+    /// Returns `true` if the run was actually transitioned from a non-terminal
+    /// state (`Queued`/`Running`) to `Cancelled`, `false` if the run was
+    /// already in a terminal state (or did not exist). Callers that need to
+    /// fan out a `run_cancelled` SSE event should gate the broadcast on this
+    /// return value so the event fires exactly once per run, even when the
+    /// HTTP `cancel_run` handler races against `execute_run`'s terminal arm
+    /// for the same `(run_id)`. See issue #1046 for the race motivation.
+    pub fn mark_run_as_cancelled(&self, run_id: RunId) -> bool {
+        let mut transitioned = false;
+        let snapshot = self.modify_and_snapshot(run_id, |r| {
+            transitioned = r.mark_cancelled();
+        });
         self.persist_snapshot(run_id, snapshot);
+        transitioned
     }
 
     /// Modify a run in the DashMap and return a clone while still under lock.
