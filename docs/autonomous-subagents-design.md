@@ -269,6 +269,8 @@ let session = session_manager.get_or_create(stable_id, &stable_ctx);
 let messages = session_manager.get_history(session.id)?;
 ```
 
+> **Note:** `parent_session_id` here is the **spawning chat session**, not the parent agent's identity. The named subagent's persistent session is therefore keyed per-conversation, not per-agent — opening a new chat with the same parent agent yields a different `session_id` and will not resolve a subagent session spawned in a previous chat. This is the current intended model; whether to add an agent-scoped fallback is tracked as a v0.2.4 design question.
+
 This is cheap — no LLM call, just a session read. The parent's LLM decides when it needs context from a subagent and pulls it in.
 
 #### C. Context flow diagram

@@ -25,5 +25,6 @@ tracing.workspace = true
 async-trait.workspace = true
 
 [dev-dependencies]
+alms-sandbox = { path = "../alms-sandbox" }
 tokio-test.workspace = true
 tempfile = "3"

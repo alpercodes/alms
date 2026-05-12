@@ -2455,6 +2455,206 @@ mod tests {
         // workspace_tmp drops here — automatic cleanup even on panic
     }
 
+    // -- (k2) parent can read subagent session after invocation (#1042 repro) ----
+
+    /// Repro for #1042: after a parent agent invokes a named subagent via the
+    /// real coordinator path, the parent (using the same `parent_session_id`)
+    /// must be able to read the subagent's session via `ReadSubagentSessionTool`.
+    ///
+    /// This is the round-trip the existing tests in `read_subagent_session.rs`
+    /// don't cover — they populate the session manually with the same
+    /// derivation the read tool uses, so they can't catch a divergence between
+    /// the invoke-side and read-side keys.
+    #[tokio::test]
+    async fn test_parent_can_read_named_subagent_session_after_dispatch() {
+        use alms_sandbox::Tool;
+        use alms_tools::ReadSubagentSessionTool;
+
+        let workspace_tmp = tempfile::TempDir::new().unwrap();
+        let coord = test_coordinator().with_workspace_dir(workspace_tmp.path().to_path_buf());
+        let parent_session = test_session_id();
+
+        // Parent invokes the named subagent.
+        let (_response, sub_session_id) = coord
+            .dispatch(
+                "Investigate topic X".to_string(),
+                parent_session,
+                None,
+                None,
+                Some("researcher".to_string()),
+                None,
+            )
+            .await
+            .expect("dispatch should succeed");
+
+        // Parent reads the subagent session using its own session_id and the
+        // subagent's name. This is the exact path the runtime wires when it
+        // registers `ReadSubagentSessionTool` for the parent run.
+        let read_tool = ReadSubagentSessionTool::new(coord.session_manager.clone(), parent_session);
+        let result = read_tool
+            .execute(serde_json::json!({ "name": "researcher" }))
+            .await
+            .expect("read_subagent_session should not error");
+
+        // Diagnostic dump so failures are debuggable from CI logs.
+        debug!(?result, "parent read of named subagent session");
+
+        assert!(
+            result.get("error").is_none(),
+            "parent should be able to read its own subagent's session, got error: {result}"
+        );
+        assert_eq!(result["subagent"], "researcher");
+        assert!(
+            result["message_count"].as_u64().unwrap_or(0) > 0,
+            "subagent session should have at least one message after dispatch"
+        );
+
+        // Sanity-check: the subagent session ID returned by dispatch matches
+        // the session ID the read tool resolved to (via the deterministic
+        // (parent_session_id, name) key).
+        let parent_as_agent = AgentId(parent_session.0);
+        let derived_id = AgentId::deterministic(parent_as_agent, "researcher");
+        let derived_ctx = format!("subagent_{}_{}", parent_session.0, "researcher");
+        let session = coord
+            .session_manager
+            .get_or_create(derived_id, &derived_ctx);
+        assert_eq!(
+            session.id, sub_session_id,
+            "derived session ID should match the one returned by dispatch"
+        );
+    }
+
+    /// Repro for #1042 / persistence path: after a daemon restart
+    /// (`SessionManager` reloaded from disk), the parent can still read
+    /// the subagent session it spawned in a previous run.
+    #[tokio::test]
+    async fn test_parent_can_read_named_subagent_session_after_reload() {
+        use alms_sandbox::Tool;
+        use alms_session::SessionConfig;
+        use alms_tools::ReadSubagentSessionTool;
+
+        let workspace_tmp = tempfile::TempDir::new().unwrap();
+        let db_tmp = tempfile::TempDir::new().unwrap();
+        let db_path = db_tmp.path().join("alms.db");
+
+        // First daemon lifetime: parent invokes a named subagent against a
+        // SQLite-backed session manager.
+        let parent_session = test_session_id();
+        let sub_session_id_first;
+        {
+            let session_manager = Arc::new(
+                SessionManager::with_sqlite(SessionConfig::default(), db_path.to_str().unwrap())
+                    .expect("open SQLite session manager"),
+            );
+            let llm_config = LlmConfig {
+                mock: true,
+                ..LlmConfig::default()
+            };
+            let llm = LlmClient::new(llm_config).unwrap();
+            let coord = Coordinator::new(AgentId::new(), session_manager.clone(), llm)
+                .with_workspace_dir(workspace_tmp.path().to_path_buf());
+
+            let (_response, sub_session_id) = coord
+                .dispatch(
+                    "Investigate topic X".to_string(),
+                    parent_session,
+                    None,
+                    None,
+                    Some("researcher".to_string()),
+                    None,
+                )
+                .await
+                .expect("dispatch should succeed");
+            sub_session_id_first = sub_session_id;
+
+            // Flush WAL so the second SessionManager sees the writes.
+            session_manager.flush_wal().ok();
+        }
+
+        // Second daemon lifetime: fresh SessionManager loads from disk.
+        // The parent's read_subagent_session must still find the subagent's
+        // session — proves the link survives restart.
+        {
+            let session_manager = Arc::new(
+                SessionManager::with_sqlite(SessionConfig::default(), db_path.to_str().unwrap())
+                    .expect("reopen SQLite session manager"),
+            );
+
+            let read_tool = ReadSubagentSessionTool::new(session_manager.clone(), parent_session);
+            let result = read_tool
+                .execute(serde_json::json!({ "name": "researcher" }))
+                .await
+                .expect("read_subagent_session should not error after reload");
+
+            debug!(
+                ?result,
+                "parent read of named subagent session after reload"
+            );
+
+            assert!(
+                result.get("error").is_none(),
+                "after reload, parent should still be able to read subagent session, got: {result}"
+            );
+            assert_eq!(result["subagent"], "researcher");
+
+            // The session ID resolved by the read tool must match the one
+            // dispatch returned in the first daemon lifetime.
+            let parent_as_agent = AgentId(parent_session.0);
+            let derived_id = AgentId::deterministic(parent_as_agent, "researcher");
+            let derived_ctx = format!("subagent_{}_{}", parent_session.0, "researcher");
+            let session = session_manager.get_or_create(derived_id, &derived_ctx);
+            assert_eq!(
+                session.id, sub_session_id_first,
+                "derived session ID should match the one dispatched in the first lifetime"
+            );
+        }
+    }
+
+    /// Repro for #1042 / unauthorized-third-party path: an unrelated agent
+    /// (different session_id) calling `read_subagent_session` against the
+    /// same subagent name must NOT see the original parent's subagent
+    /// session. This is enforced today by the per-parent-session derivation
+    /// — the unrelated agent's derived (agent_id, context_id) key is
+    /// different, so `has_session` returns false.
+    #[tokio::test]
+    async fn test_unrelated_agent_cannot_read_subagent_session() {
+        use alms_sandbox::Tool;
+        use alms_tools::ReadSubagentSessionTool;
+
+        let workspace_tmp = tempfile::TempDir::new().unwrap();
+        let coord = test_coordinator().with_workspace_dir(workspace_tmp.path().to_path_buf());
+
+        let parent_session = test_session_id();
+        coord
+            .dispatch(
+                "Investigate topic X".to_string(),
+                parent_session,
+                None,
+                None,
+                Some("researcher".to_string()),
+                None,
+            )
+            .await
+            .expect("dispatch should succeed");
+
+        // Unrelated agent: different session_id, attempts to read.
+        let unrelated_session = SessionId::new();
+        let read_tool =
+            ReadSubagentSessionTool::new(coord.session_manager.clone(), unrelated_session);
+        let result = read_tool
+            .execute(serde_json::json!({ "name": "researcher" }))
+            .await
+            .expect("read_subagent_session should not panic for unrelated agent");
+
+        assert!(
+            result["error"]
+                .as_str()
+                .unwrap_or("")
+                .contains("No session found"),
+            "unrelated agent must see 'No session found', got: {result}"
+        );
+    }
+
     // -- (l) concurrent named subagent invocations are rejected -----------------
 
     #[tokio::test]
