@@ -391,23 +391,6 @@ impl ContextBuilder {
             .map(|m| estimate_llm_message_tokens(m) + 4) // 4 tokens overhead per message
             .sum()
     }
-
-    // ----- Test-only thin wrappers ------------------------------------------
-    //
-    // These exist so test modules in sibling files (`error_markers.rs`,
-    // `perspective.rs`, `rebuild.rs`) can keep their existing
-    // `builder.session_msg_to_llm(&msg)` / `builder.apply_perspective(&msg, ...)`
-    // call sites unchanged after the refactor — the test bodies were not
-    // touched, only their physical location.
-    #[cfg(test)]
-    pub(super) fn apply_perspective(&self, msg: &Message, perspective_agent: &str) -> Message {
-        perspective::apply_perspective(msg, perspective_agent)
-    }
-
-    #[cfg(test)]
-    pub(super) fn session_msg_to_llm(&self, msg: &Message) -> LlmMessage {
-        rebuild::session_msg_to_llm(msg, self.workspace_root.as_deref())
-    }
 }
 
 /// Rough token estimate for mixed content (natural language, JSON, code).
@@ -517,15 +500,6 @@ mod tests {
             timestamp: Timestamp::now(),
             metadata: Some(metadata),
         }
-    }
-
-    pub(super) fn default_builder() -> ContextBuilder {
-        ContextBuilder::new(ContextConfig {
-            strategy: "truncate".into(),
-            max_input_tokens: 32000,
-            summary_model: None,
-            ..Default::default()
-        })
     }
 
     #[test]

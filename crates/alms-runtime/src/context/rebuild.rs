@@ -188,7 +188,8 @@ fn rewrite_hint_as_expired(original: &str, rel: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::super::ContextBuilder;
-    use super::super::tests::{default_builder, make_msg};
+    use super::super::tests::make_msg;
+    use super::session_msg_to_llm;
     use alms_core::{Timestamp, config::ContextConfig};
     use alms_session::{Content, Message, Role};
 
@@ -442,7 +443,6 @@ mod tests {
     /// the recovery instructions.
     #[test]
     fn session_msg_to_llm_skips_re_truncation_when_in_loop_flag_set() {
-        let builder = default_builder();
         let preview = format!("preview head\n{}\npreview tail", "x".repeat(3000));
         // Sanity: the preview is well above 2000 bytes so the legacy path
         // would trigger.
@@ -466,7 +466,7 @@ mod tests {
             })),
         };
 
-        let llm = builder.session_msg_to_llm(&msg);
+        let llm = session_msg_to_llm(&msg, None);
         // The serialised tool-result string must contain the full preview
         // body — no `... [truncated, N bytes total]` suffix.
         assert!(
@@ -486,7 +486,6 @@ mod tests {
     /// disabled in `alms.toml`).
     #[test]
     fn session_msg_to_llm_still_truncates_when_flag_absent() {
-        let builder = default_builder();
         let big = "x".repeat(5000);
 
         let msg = Message {
@@ -503,7 +502,7 @@ mod tests {
             })),
         };
 
-        let llm = builder.session_msg_to_llm(&msg);
+        let llm = session_msg_to_llm(&msg, None);
         let body = llm.content_str();
         assert!(
             body.contains("[truncated,"),
@@ -526,8 +525,6 @@ mod tests {
     #[test]
     fn session_msg_to_llm_rewrites_hint_when_spill_file_missing() {
         let workspace_dir = tempfile::tempdir().unwrap();
-        let builder =
-            default_builder().with_workspace_root(Some(workspace_dir.path().to_path_buf()));
 
         // Persisted preview with the full hint text from `build_preview`.
         let preview = format!(
@@ -557,7 +554,7 @@ mod tests {
             })),
         };
 
-        let llm = builder.session_msg_to_llm(&msg);
+        let llm = session_msg_to_llm(&msg, Some(workspace_dir.path()));
         let body = llm.content_str();
         // The original "Use `fs_grep`..." hint must be gone.
         assert!(
@@ -587,9 +584,6 @@ mod tests {
         let spill_file = spill_dir.join("tool_call_abc.txt");
         std::fs::write(&spill_file, b"original payload").unwrap();
 
-        let builder =
-            default_builder().with_workspace_root(Some(workspace_dir.path().to_path_buf()));
-
         let preview = format!(
             "head data\n\n... omitted ...\n\ntail data\n\n[The tool output was truncated to 32 KB. \
              Full output saved to: `{rel}` (50000 bytes, 1 lines). Use `fs_grep` to search the full \
@@ -615,7 +609,7 @@ mod tests {
             })),
         };
 
-        let llm = builder.session_msg_to_llm(&msg);
+        let llm = session_msg_to_llm(&msg, Some(workspace_dir.path()));
         let body = llm.content_str();
         // The recovery hint must be intact.
         assert!(
@@ -632,8 +626,6 @@ mod tests {
     /// not given an inaccurate "expired" notice).
     #[test]
     fn session_msg_to_llm_leaves_hint_alone_without_workspace_root() {
-        let builder = default_builder(); // no workspace_root
-
         let preview =
             "head\n\n... omitted ...\n\ntail\n\n[The tool output was truncated to 32 KB. \
              Full output saved to: `tool-output/run1/tool_call_abc.txt` (50000 bytes, 1 lines). \
@@ -659,7 +651,7 @@ mod tests {
             })),
         };
 
-        let llm = builder.session_msg_to_llm(&msg);
+        let llm = session_msg_to_llm(&msg, None);
         // Without a workspace root the existence check is skipped, so the
         // hint must survive intact — including the spill path reference
         // and the `Use \`fs_grep\`` recovery instruction. (The session

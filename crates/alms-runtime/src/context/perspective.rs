@@ -133,17 +133,15 @@ pub(super) fn apply_perspective(msg: &Message, perspective_agent: &str) -> Messa
 #[cfg(test)]
 mod tests {
     use super::super::ContextBuilder;
-    use super::super::tests::{
-        default_builder, make_msg, make_msg_with_meta, make_msg_with_metadata,
-    };
+    use super::super::tests::{make_msg, make_msg_with_meta, make_msg_with_metadata};
+    use super::apply_perspective;
     use alms_core::config::ContextConfig;
     use alms_session::{Content, Message, Role};
 
     #[test]
     fn test_apply_perspective_no_metadata_stays_user() {
-        let builder = default_builder();
         let msg = make_msg(Role::User, "hello from nowhere");
-        let mapped = builder.apply_perspective(&msg, "agent-alpha");
+        let mapped = apply_perspective(&msg, "agent-alpha");
         assert_eq!(mapped.role, Role::User);
         assert_eq!(
             match &mapped.content {
@@ -156,13 +154,12 @@ mod tests {
 
     #[test]
     fn test_apply_perspective_matching_agent_becomes_assistant() {
-        let builder = default_builder();
         let msg = make_msg_with_metadata(
             Role::User,
             "I said this",
             Some(serde_json::json!({"from_agent": "agent-alpha"})),
         );
-        let mapped = builder.apply_perspective(&msg, "agent-alpha");
+        let mapped = apply_perspective(&msg, "agent-alpha");
         assert_eq!(
             mapped.role,
             Role::Assistant,
@@ -172,13 +169,12 @@ mod tests {
 
     #[test]
     fn test_apply_perspective_different_agent_stays_user() {
-        let builder = default_builder();
         let msg = make_msg_with_metadata(
             Role::User,
             "someone else said this",
             Some(serde_json::json!({"from_agent": "agent-beta"})),
         );
-        let mapped = builder.apply_perspective(&msg, "agent-alpha");
+        let mapped = apply_perspective(&msg, "agent-alpha");
         assert_eq!(
             mapped.role,
             Role::User,
@@ -188,13 +184,12 @@ mod tests {
 
     #[test]
     fn test_apply_perspective_metadata_without_from_agent_stays_user() {
-        let builder = default_builder();
         let msg = make_msg_with_metadata(
             Role::User,
             "some random metadata",
             Some(serde_json::json!({"other_key": "other_value"})),
         );
-        let mapped = builder.apply_perspective(&msg, "agent-alpha");
+        let mapped = apply_perspective(&msg, "agent-alpha");
         assert_eq!(
             mapped.role,
             Role::User,
@@ -208,11 +203,10 @@ mod tests {
         // metadata, because the function only checks from_agent == perspective_agent
         // to map to Assistant. A matching from_agent on a System message is an
         // unusual edge case but documents the current behavior.
-        let builder = default_builder();
 
         // System message without metadata -> stays System
         let msg = make_msg_with_metadata(Role::System, "system prompt text", None);
-        let mapped = builder.apply_perspective(&msg, "agent-alpha");
+        let mapped = apply_perspective(&msg, "agent-alpha");
         assert_eq!(
             mapped.role,
             Role::System,
@@ -232,7 +226,7 @@ mod tests {
         let metadata = serde_json::json!({"from_agent": "agent-beta"});
         let msg =
             make_msg_with_metadata(Role::System, "system instructions", Some(metadata.clone()));
-        let mapped = builder.apply_perspective(&msg, "agent-alpha");
+        let mapped = apply_perspective(&msg, "agent-alpha");
         assert_eq!(
             mapped.role,
             Role::System,
@@ -257,11 +251,10 @@ mod tests {
     fn test_apply_perspective_tool_role_unchanged() {
         // Tool-result messages should pass through unchanged when from_agent
         // does not match the perspective agent (the common case).
-        let builder = default_builder();
 
         // Tool message without metadata -> stays Tool
         let msg = make_msg_with_metadata(Role::Tool, "tool output", None);
-        let mapped = builder.apply_perspective(&msg, "agent-alpha");
+        let mapped = apply_perspective(&msg, "agent-alpha");
         assert_eq!(
             mapped.role,
             Role::Tool,
@@ -280,7 +273,7 @@ mod tests {
         // Tool message with non-matching from_agent -> stays Tool
         let metadata = serde_json::json!({"from_agent": "agent-beta"});
         let msg = make_msg_with_metadata(Role::Tool, "tool result payload", Some(metadata.clone()));
-        let mapped = builder.apply_perspective(&msg, "agent-alpha");
+        let mapped = apply_perspective(&msg, "agent-alpha");
         assert_eq!(
             mapped.role,
             Role::Tool,
@@ -307,12 +300,11 @@ mod tests {
         // keep its role. This can happen when an Assistant message from one
         // agent is loaded into a DM session that is then viewed from a
         // different agent's perspective.
-        let builder = default_builder();
 
         let metadata = serde_json::json!({"from_agent": "agent-beta"});
         let msg =
             make_msg_with_metadata(Role::Assistant, "I replied earlier", Some(metadata.clone()));
-        let mapped = builder.apply_perspective(&msg, "agent-alpha");
+        let mapped = apply_perspective(&msg, "agent-alpha");
         assert_eq!(
             mapped.role,
             Role::Assistant,
@@ -339,12 +331,11 @@ mod tests {
         // perspective agent should remain Assistant. The match arm unconditionally
         // sets role = Assistant, so this is a no-op, but the test documents
         // completeness across the role matrix.
-        let builder = default_builder();
 
         let metadata = serde_json::json!({"from_agent": "agent-alpha"});
         let msg =
             make_msg_with_metadata(Role::Assistant, "I already replied", Some(metadata.clone()));
-        let mapped = builder.apply_perspective(&msg, "agent-alpha");
+        let mapped = apply_perspective(&msg, "agent-alpha");
         assert_eq!(
             mapped.role,
             Role::Assistant,
@@ -372,12 +363,11 @@ mod tests {
         // regardless of the original role. This is an edge case -- in practice
         // DM messages are always stored as Role::User -- but the test locks
         // down the behavior so any future change is intentional.
-        let builder = default_builder();
 
         // System message with matching from_agent -> mapped to Assistant
         let metadata = serde_json::json!({"from_agent": "agent-alpha"});
         let msg = make_msg_with_metadata(Role::System, "system from self", Some(metadata.clone()));
-        let mapped = builder.apply_perspective(&msg, "agent-alpha");
+        let mapped = apply_perspective(&msg, "agent-alpha");
         assert_eq!(
             mapped.role,
             Role::Assistant,
@@ -400,7 +390,7 @@ mod tests {
         // Tool message with matching from_agent -> mapped to Assistant
         let metadata = serde_json::json!({"from_agent": "agent-alpha"});
         let msg = make_msg_with_metadata(Role::Tool, "tool from self", Some(metadata.clone()));
-        let mapped = builder.apply_perspective(&msg, "agent-alpha");
+        let mapped = apply_perspective(&msg, "agent-alpha");
         assert_eq!(
             mapped.role,
             Role::Assistant,
