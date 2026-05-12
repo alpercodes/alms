@@ -6,6 +6,42 @@
 
 ALMS requires Rust nightly (specified in `rust-toolchain.toml`). The toolchain will be automatically installed when you run cargo commands.
 
+### First-time identity setup
+
+Three independent pieces. Set them up once after cloning; they make sure `git blame`, PR authorship, and comment attribution all point at you.
+
+**1. Git author identity** (what `git blame` reads):
+
+```bash
+git config user.name "Your Name"
+git config user.email "you@example.com"
+```
+
+Per-repo. Add `--global` if you want it for all your repos. Sanity-check after your first commit: `git log -1 --format='%an <%ae>'` should show you.
+
+**2. GitHub identity** (what shows on PRs, issues, comments):
+
+```bash
+gh auth login
+```
+
+Interactive flow — sign in to your own GitHub account. Every `gh pr create`, `gh issue comment`, `gh pr merge`, etc. will be attributed to whoever `gh auth status` reports. If you use Claude Code or another agent, it inherits this identity automatically — there's no separate agent account.
+
+**3. (Optional) Tell your AI coding agent to not add Co-Authored-By trailers**
+
+Claude Code and similar tools add a `Co-Authored-By: <agent> <noreply@anthropic.com>` trailer to commits by default. If you'd prefer commits to be solely authored by you (clean blame, no agent disclosure), create your own `CLAUDE.local.md` (gitignored) at the repo root with:
+
+```markdown
+# My local Claude Code instructions
+
+## Git identity
+- Commits in this repo should be authored solely by me (whatever `git config user.name` reports)
+- Do NOT add `Co-Authored-By` trailers for AI agents
+- Do NOT add agent-identification footers like "🤖 Generated with Claude Code" to commits, PR bodies, or issue comments
+```
+
+Note: the `Co-Authored-By` trailer does NOT affect `git blame` — blame only reads the primary author from your git config. The trailer is purely additive metadata visible on the GitHub commit page. So the "no trailer" choice is about commit cosmetics, not blame correctness.
+
 ### Running CI Checks Locally
 
 Before pushing, run the full CI pipeline locally:
