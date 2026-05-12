@@ -1837,28 +1837,89 @@ async fn create_run_pre_persists_user_input_to_session() {
 /// "ignore" semantics by deserializing a request payload that carries
 /// every removed field and confirming the gateway accepts it and
 /// produces a queued run with the agent's resolved config.
-#[tokio::test]
+///
+/// **#943 extension.** The test also pins that the stale fields had **no
+/// effect on the resolved config** — every per-run-overridable knob on the
+/// `ResolvedRunConfig` snapshot `create_run` actually produced through its
+/// enqueue -> `execute_run` -> `mark_run_as_running_with_config` chain
+/// matches the seeded agent record, NOT the value that was in the stale
+/// payload. A future reintroduction of any per-run override path that
+/// leaked back into the persisted snapshot would fail these assertions.
+///
+/// Codex P2 follow-up on the first cut: we wait for the run to transition
+/// to `Running` (which guarantees `mark_run_as_running_with_config` has
+/// fired and the layered snapshot is now on the run record) and assert
+/// against `run.resolved_config` from the persisted run, NOT against a
+/// fresh `resolve_agent_config` call. A separate-helper assertion is
+/// independent of the request body and would still pass even if a
+/// regression reintroduced `body.merge_into(resolved)` somewhere inside
+/// `create_run`; asserting against the run-path snapshot pins the actual
+/// produced output. Same SSE-then-cancel-then-join teardown shape as
+/// `happy_path_start_flips_state_before_broadcasting`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn create_run_ignores_stale_per_run_override_fields() {
     use alms_core::CreateRunRequest;
+    use alms_core::config::ReasoningEffort;
+    use alms_core::registry::AgentRecord;
     use axum::Json;
     use axum::extract::State;
+    use chrono::Utc;
 
-    let (state, shutdown_token, _cr, _tr, _dr) = test_app_state();
+    let (state, shutdown_token, _cr, _tr, _dr) = test_app_state_with_sqlite();
     let agent_id = AgentId::new();
+    let now = Utc::now();
+
+    // Seed an agent record whose per-agent overrides differ on every
+    // assertable knob from the stale payload below. The resolved config
+    // post-#941 must reflect THESE values, never the payload's.
+    let agent = AgentRecord {
+        id: agent_id,
+        name: "stale-payload-victim".into(),
+        description: String::new(),
+        model: Some("claude-sonnet-4-6".into()),
+        posture: Some("autonomous".into()),
+        provider: Some("anthropic".into()),
+        telegram_token: None,
+        thinking_budget_tokens: Some(2048),
+        reasoning_effort: Some(ReasoningEffort::Low),
+        gemini_thinking_budget: Some(4096),
+        summary_provider: None,
+        summary_model: None,
+        worktree_mode: alms_core::WorktreeMode::Off,
+        debug_mode: false,
+        is_default: false,
+        created_at: now,
+        last_active: now,
+    };
+    state
+        .session_manager
+        .store()
+        .expect("SQLite-backed state should have a store")
+        .create_agent(&agent)
+        .expect("agent seed should succeed");
+
     let session = state.session_manager.get_or_create(agent_id, "web");
     let session_id = session.id;
 
+    // Subscribe BEFORE `create_run` so we don't miss `run_started`. The
+    // producer flips the run to `Running` and persists the resolved
+    // snapshot via `mark_run_as_running_with_config` immediately before
+    // broadcasting `run_started` (#895 ordering), so observing the event
+    // is sufficient to know the snapshot is queryable on the run record.
+    let mut session_rx = subscribe_session(&state, session_id);
+
     // Build a JSON payload with every removed per-run override field set
-    // to a value that would have been honoured pre-#941. The gateway
-    // must deserialize this into the new (knob-less) `CreateRunRequest`
-    // and drop the extra fields without error.
+    // to a value that DIFFERS from the seeded agent record above. The
+    // gateway must deserialize this into the new (knob-less)
+    // `CreateRunRequest`, drop the extra fields without error, and
+    // resolve config from per-agent + server-default only.
     let stale_payload = serde_json::json!({
         "session_id": session_id.0.to_string(),
         "input": { "type": "text", "text": "stale per-run fields" },
         "model": "definitely-not-the-agent-model",
         "max_tokens": 1234,
-        "posture": "autonomous",
-        "provider": "anthropic",
+        "posture": "full_control",
+        "provider": "openai",
         "debug_mode": true,
         "thinking_budget_tokens": 9999,
         "reasoning_effort": "high",
@@ -1871,12 +1932,106 @@ async fn create_run_ignores_stale_per_run_override_fields() {
     // Sanity: the parsed request only has the new fields.
     assert_eq!(req.session_id, session_id);
 
-    let (status, _resp) = match super::lifecycle::create_run(State(state.clone()), Json(req)).await
-    {
+    let (status, resp) = match super::lifecycle::create_run(State(state.clone()), Json(req)).await {
         Ok(ok) => ok,
         Err((code, body)) => panic!("create_run failed: status={code:?} body={:?}", body.0),
     };
     assert_eq!(status, axum::http::StatusCode::CREATED);
+    let run_id = resp.0.run_id;
+
+    // Wait for `run_started` — the producer reaches it AFTER
+    // `mark_run_as_running_with_config` persists the snapshot. The 10s
+    // ceiling is loose; the actual latency is bounded by the spawned
+    // queue handler's startup, which is in single-digit milliseconds on a
+    // healthy runtime. The deadline only matters if the producer never
+    // reaches `run_started` at all (e.g. an early-failure regression in
+    // `execute_run`), in which case we want a clear timeout panic rather
+    // than a hung test.
+    loop {
+        let event = tokio::time::timeout(std::time::Duration::from_secs(10), session_rx.recv())
+            .await
+            .expect("test must observe run_started within 10s")
+            .expect("session sender must not close before run_started");
+        if event.event_type == "run_started" {
+            break;
+        }
+    }
+
+    // #943: pin that the stale payload had ZERO influence on the snapshot
+    // `create_run` actually produced through its enqueue chain. Read the
+    // persisted run record — `resolved_config` is populated in
+    // `mark_run_as_running_with_config` (lifecycle.rs:~1096), which fires
+    // BEFORE the `run_started` broadcast we just observed. Asserting
+    // against this snapshot pins the produced output of the run path,
+    // unlike a fresh `resolve_agent_config` helper call which is
+    // independent of the request body and would not catch a regression
+    // that reintroduced `body.merge_into(resolved)` inside `create_run`.
+    let run = state
+        .run_manager
+        .get_run(run_id)
+        .expect("run must exist after create_run enqueued it");
+    let snapshot = run
+        .resolved_config
+        .as_ref()
+        .expect("resolved_config must be populated once the run reaches Running");
+
+    // Provider + model: agent's anthropic/claude-sonnet-4-6, NOT the
+    // payload's openai/definitely-not-the-agent-model.
+    assert_eq!(
+        snapshot.provider, "anthropic",
+        "resolved provider must come from the agent record, not the stale payload"
+    );
+    assert_eq!(
+        snapshot.model, "claude-sonnet-4-6",
+        "resolved model must come from the agent record, not the stale payload"
+    );
+
+    // Posture: agent's autonomous, NOT the payload's full_control.
+    // `ResolvedRunConfig.posture` is the stringified `Posture` enum.
+    assert_eq!(
+        snapshot.posture, "autonomous",
+        "resolved posture must come from the agent record, not the stale payload"
+    );
+
+    // Anthropic extended thinking budget: agent's 2048, NOT the
+    // payload's 9999.
+    assert_eq!(
+        snapshot.thinking_budget_tokens, 2048,
+        "resolved thinking_budget_tokens must come from the agent record, not the stale payload"
+    );
+
+    // OpenAI reasoning effort: agent's Low, NOT the payload's "high".
+    assert_eq!(
+        snapshot.reasoning_effort,
+        Some(ReasoningEffort::Low),
+        "resolved reasoning_effort must come from the agent record, not the stale payload"
+    );
+
+    // Gemini thinking budget: agent's 4096, NOT the payload's 8888.
+    assert_eq!(
+        snapshot.gemini_thinking_budget,
+        Some(4096),
+        "resolved gemini_thinking_budget must come from the agent record, not the stale payload"
+    );
+
+    // debug_mode: agent's false, NOT the payload's true. The agent record
+    // is the single source of truth for debug_mode post-#1003; the stale
+    // payload's `debug_mode: true` must not flip the resolved knob on.
+    // (This test seeds a non-system-triggered web session, so the #546
+    // notification-flip does not apply — the snapshot value here is
+    // exactly the agent record's `debug_mode`.)
+    assert!(
+        !snapshot.debug_mode,
+        "resolved debug_mode must come from the agent record, not the stale payload"
+    );
+
+    // Tear down the spawned execute_run task. The default LLM in
+    // `test_app_state_with_sqlite` points at the openrouter URL with no
+    // API key, so `runtime.run()` would eventually fail on its own, but
+    // cancelling here keeps test runtime tight and deterministic. The
+    // post-#895 sequencing means the snapshot we just asserted on is
+    // already persisted and will not be mutated by the cancel arm.
+    state.run_manager.cancel_run(run_id);
 
     shutdown_token.cancel();
 }
