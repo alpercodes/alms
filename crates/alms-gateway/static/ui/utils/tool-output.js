@@ -497,15 +497,18 @@ export function renderFsListOutput(result) {
 /**
  * Render http_get output: status badge, content-type, body in monospace
  * with a JSON pretty-print path when content_type is application/json.
+ * Per-#956 the result also carries a `headers` map; we render it as a
+ * native `<details>` block that is collapsed by default so it doesn't
+ * dominate the panel when the operator is looking at the body.
  *
  * Payload shape (from `crates/alms-sandbox/src/builtin/http_get.rs`):
- *   { status, content_type, body }
+ *   { status, content_type, headers, body }
  *
- * Note: the runtime does NOT return response headers (it folds them down
- * to `content_type` only). The issue's "response headers folded by default"
- * spec is approximated by the content-type row — surfacing fuller headers
- * would be a backend change and is flagged in the PR description rather
- * than implemented here.
+ * `headers` is a `{ name: [value, ...] }` map, with lowercased keys and
+ * a `Vec<String>` per name so multi-value headers (`Set-Cookie`, `Vary`)
+ * keep their structure. Pre-#956 results without the field render
+ * exactly as before — the show-more toggle is hidden when the map is
+ * missing or empty.
  */
 export function renderHttpGetOutput(result, _params, opts) {
     const showFull = opts && opts.showFull;
@@ -552,6 +555,30 @@ export function renderHttpGetOutput(result, _params, opts) {
     const statusOk = status != null && status >= 200 && status < 400;
     const statusCls = statusOk ? 'tc-kv-badge' : 'tc-kv-badge tc-kv-badge-fail';
 
+    // Normalise the headers field into a flat list of [key, value] rows
+    // for rendering. The backend returns `{ key: [value, ...] }` already
+    // sorted by key (BTreeMap server-side), but we re-sort defensively in
+    // case the order is lost in transit / a future provider returns a
+    // plain object. Multi-value headers expand to one row per value so
+    // `Set-Cookie: a=1` / `Set-Cookie: b=2` render as two separate rows.
+    const headerRows = [];
+    if (result.headers && typeof result.headers === 'object'
+        && !Array.isArray(result.headers)) {
+        const keys = Object.keys(result.headers).sort();
+        for (const k of keys) {
+            const v = result.headers[k];
+            if (Array.isArray(v)) {
+                for (const item of v) {
+                    headerRows.push([k, typeof item === 'string' ? item : String(item)]);
+                }
+            } else if (typeof v === 'string') {
+                // Pre-#956 / non-array shape — fold through verbatim.
+                headerRows.push([k, v]);
+            }
+        }
+    }
+    const headerCount = headerRows.length;
+
     return html`
         <div class="tc-detail-section">
             <div class="tc-detail-label">Response</div>
@@ -576,6 +603,21 @@ export function renderHttpGetOutput(result, _params, opts) {
                     </button>
                 `}
             </div>
+        `}
+        ${headerCount > 0 && html`
+            <details class="tc-detail-section tc-http-headers">
+                <summary class="tc-detail-label tc-http-headers-summary">
+                    Headers (${headerCount})
+                </summary>
+                <ul class="tc-record-list tc-http-headers-list">
+                    ${headerRows.map(([k, v]) => html`
+                        <li class="tc-record-row tc-http-header-row">
+                            <span class="tc-kv-mono tc-http-header-key">${k}</span>
+                            <span class="tc-kv-meta tc-http-header-value">${v}</span>
+                        </li>
+                    `)}
+                </ul>
+            </details>
         `}
     `;
 }

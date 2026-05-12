@@ -1109,15 +1109,142 @@ test('#969 shape contract: invoke_agent foreground (crates/alms-tools/src/invoke
 });
 
 test('#969 shape contract: http_get (crates/alms-sandbox/src/builtin/http_get.rs)', () => {
-    // Pinned from the http_get json!({...}) — status, body, headers.
+    // Pinned from the http_get json!({...}) post-#956 — status,
+    // content_type, headers (as { key: [value, ...] }), body.
     const result = {
         status: 200,
+        content_type: 'application/json',
+        headers: { 'content-type': ['application/json'] },
         body: '{"hello": "world"}',
-        headers: { 'content-type': 'application/json' },
     };
     const tree = renderToolOutput('http_get', result,
         { url: 'https://example.com/api' });
     assert.ok(tree, 'http_get shape must render structured output');
+});
+
+// =========================================================================
+// #956 — http_get response headers in a collapsible block
+// =========================================================================
+
+test('#956 http_get: response headers render in a <details> block when non-empty', () => {
+    const result = {
+        status: 200,
+        content_type: 'application/json',
+        headers: {
+            'content-type': ['application/json'],
+            'etag': ['"abc123"'],
+            'set-cookie': ['a=1; Path=/', 'b=2; Path=/'],
+        },
+        body: { ok: true },
+    };
+    const tree = renderToolOutput('http_get', result, { url: 'https://x/y' });
+    assert.ok(tree);
+
+    const classes = collectClasses(tree);
+    const text = collectText(tree);
+
+    // Collapsible block markers — both the wrapper class and the summary
+    // class must appear so the operator can spot the toggle.
+    assert.ok(classes.has('tc-http-headers'),
+        'headers section must use the tc-http-headers class\n' + dump(tree));
+    assert.ok(classes.has('tc-http-headers-summary'),
+        'headers summary row must use tc-http-headers-summary\n' + dump(tree));
+
+    // The summary label includes the header count. Three keys but
+    // four rows (set-cookie has two values), so the count should be 4.
+    // Sibling text nodes in the stubbed harness are joined with a space,
+    // so normalise before substring-matching (same pattern as the #873
+    // "Body (JSON)" assertion above).
+    const normalized = text.replace(/\s+/g, ' ');
+    assert.ok(normalized.includes('Headers ( 4 )')
+        || normalized.includes('Headers (4)'),
+        'summary must show the total row count including multi-value\n' + dump(tree));
+
+    // Every key and value should appear in the expanded view.
+    assert.ok(text.includes('etag'));
+    assert.ok(text.includes('"abc123"'));
+    assert.ok(text.includes('set-cookie'));
+    assert.ok(text.includes('a=1; Path=/'));
+    assert.ok(text.includes('b=2; Path=/'));
+});
+
+test('#956 http_get: rows sorted alphabetically by header key', () => {
+    const result = {
+        status: 200,
+        // Intentionally out of order.
+        headers: {
+            'x-zulu': ['z'],
+            'a-alpha': ['a'],
+            'm-mike': ['m'],
+        },
+        body: 'ok',
+    };
+    const tree = renderToolOutput('http_get', result, { url: 'https://x/y' });
+    assert.ok(tree);
+    const text = collectText(tree);
+
+    // The collected text walks children in render order, so checking
+    // the index of each key relative to the others pins ordering.
+    const aIdx = text.indexOf('a-alpha');
+    const mIdx = text.indexOf('m-mike');
+    const zIdx = text.indexOf('x-zulu');
+    assert.ok(aIdx !== -1 && mIdx !== -1 && zIdx !== -1,
+        'every header key must appear\n' + dump(tree));
+    assert.ok(aIdx < mIdx && mIdx < zIdx,
+        `keys must render alphabetically: got a@${aIdx} < m@${mIdx} < z@${zIdx}\n`
+        + dump(tree));
+});
+
+test('#956 http_get: no headers field → no <details> toggle (backward compat)', () => {
+    // Pre-#956 payloads omit the `headers` field entirely.
+    const result = {
+        status: 200,
+        content_type: 'text/plain',
+        body: 'hello',
+    };
+    const tree = renderToolOutput('http_get', result, { url: 'https://x/y' });
+    assert.ok(tree, 'pre-#956 payload must still render successfully');
+    const classes = collectClasses(tree);
+    assert.ok(!classes.has('tc-http-headers'),
+        'no <details> toggle when headers field is absent\n' + dump(tree));
+    const normalized = collectText(tree).replace(/\s+/g, ' ');
+    assert.ok(!normalized.includes('Headers ('),
+        'no "Headers (N)" label when headers field is absent\n' + dump(tree));
+});
+
+test('#956 http_get: empty headers map → no <details> toggle', () => {
+    const result = {
+        status: 200,
+        content_type: 'text/plain',
+        headers: {},
+        body: 'hello',
+    };
+    const tree = renderToolOutput('http_get', result, { url: 'https://x/y' });
+    assert.ok(tree);
+    const classes = collectClasses(tree);
+    assert.ok(!classes.has('tc-http-headers'),
+        'no <details> toggle when headers map is empty\n' + dump(tree));
+});
+
+test('#956 http_get: non-array (legacy/string) header values fold through verbatim', () => {
+    // Defensive — older or alternate-shape backends might send strings
+    // rather than `[string]`. The renderer should still produce one row.
+    const result = {
+        status: 200,
+        headers: {
+            'x-legacy': 'plain-string-value',
+        },
+        body: 'ok',
+    };
+    const tree = renderToolOutput('http_get', result, { url: 'https://x/y' });
+    assert.ok(tree);
+    const text = collectText(tree);
+    const normalized = text.replace(/\s+/g, ' ');
+    assert.ok(normalized.includes('Headers ( 1 )')
+        || normalized.includes('Headers (1)'),
+        'string-shaped header must still count toward the row count\n' + dump(tree));
+    assert.ok(text.includes('x-legacy'));
+    assert.ok(text.includes('plain-string-value'));
 });
 
 // =========================================================================

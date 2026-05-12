@@ -33,3 +33,6 @@ landlock = "0.4"
 [dev-dependencies]
 tokio-test.workspace = true
 tempfile = "3"
+# Used by http_get unit tests (#956) to mock HTTP responses with
+# multi-value headers and the long-value truncation path.
+wiremock = "0.6"
