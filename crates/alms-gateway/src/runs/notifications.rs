@@ -408,35 +408,30 @@ pub(crate) async fn completion_notification_loop(
             }
         };
 
-        // Notify session subscribers that a subagent completed.
-        // This updates the SubagentBar and shows a system message BEFORE
-        // the notification run starts.
         let status_str = match completion.status {
             alms_coordinator::TaskStatus::Completed => "done",
             alms_coordinator::TaskStatus::Failed => "fail",
             alms_coordinator::TaskStatus::Cancelled => "cancelled",
             _ => "done",
         };
-        state
-            .run_manager
-            .send_session_event(
-                session_id,
-                alms_core::RunId::new(), // no run yet
-                SseEventData::subagent_completed(
-                    session_id,
-                    completion.subagent_name.clone(),
-                    status_str,
-                    &completion.summary,
-                    completion.subagent_session_id,
-                ),
-            )
-            .await;
 
-        // Persist the subagent completion marker to session history so it
-        // survives page refreshes and appears in the chat on reload.
-        // Include rich metadata so the frontend can reconstruct the full
-        // SubagentCompletionCard (session_id, task, tool_count, duration,
-        // summary, token_usage) instead of a plain system message.
+        // ORDERING INVARIANT — DO NOT REORDER (issue #1041, codex P2 on PR #1049):
+        // The history marker MUST be persisted BEFORE the SSE
+        // `subagent_completed` event is dispatched. `send_session_event`
+        // advances the per-session SSE event log (`last_event_id`), and
+        // `GET /sessions/{id}/messages` reads `last_event_id` BEFORE it
+        // reads message history (see `routes.rs::get_session_messages`
+        // comment around the `latest_session_event_id` call). If we fired
+        // the SSE event first, a reload landing between the two writes
+        // would observe an `last_event_id` past the completion event
+        // alongside a history snapshot that lacks the marker. The reconnect
+        // would then skip the completion event on replay and Iris's chip
+        // rehydration logic would leave the subagent stuck in "running"
+        // until another full reload. Persisting the marker first ensures
+        // that whenever the SSE event is visible to a reloader, the marker
+        // is already in history; live SSE subscribers tolerate the duplicate
+        // (they may briefly see the marker before the event, which the
+        // frontend dedupes by subagent session id).
         {
             let name = completion.subagent_name.as_deref().unwrap_or("subagent");
             let label = match status_str {
@@ -445,7 +440,10 @@ pub(crate) async fn completion_notification_loop(
                 _ => "completed",
             };
 
-            // Build the metadata object with all fields the frontend needs.
+            // Build the metadata object with all fields the frontend needs
+            // so it can reconstruct the full SubagentCompletionCard
+            // (session_id, task, tool_count, duration, summary, token_usage)
+            // instead of a plain system message.
             let mut meta = serde_json::json!({
                 "subagent_name": name,
                 "status": status_str,
@@ -493,6 +491,25 @@ pub(crate) async fn completion_notification_loop(
                 meta,
             );
         }
+
+        // Notify session subscribers that a subagent completed. This
+        // updates the SubagentBar and shows a system message BEFORE the
+        // notification run starts. Must run AFTER the history marker is
+        // persisted — see the ORDERING INVARIANT block above.
+        state
+            .run_manager
+            .send_session_event(
+                session_id,
+                alms_core::RunId::new(), // no run yet
+                SseEventData::subagent_completed(
+                    session_id,
+                    completion.subagent_name.clone(),
+                    status_str,
+                    &completion.summary,
+                    completion.subagent_session_id,
+                ),
+            )
+            .await;
 
         let notification = format_completion_notification(&completion);
 
@@ -1159,6 +1176,125 @@ mod tests {
             runs[0].agent_id, agent_id,
             "run should belong to the target agent"
         );
+
+        // Clean up: cancel the shutdown token so background tasks (if any) stop.
+        shutdown_token.cancel();
+    }
+
+    /// Regression test for the codex P2 finding on PR #1049 / issue #1041.
+    ///
+    /// `completion_notification_loop` MUST persist the
+    /// `subagent_completion` history marker BEFORE it dispatches the SSE
+    /// `subagent_completed` event. Otherwise a page reload landing between
+    /// the two writes would observe `last_event_id` advanced past the SSE
+    /// event paired with a history snapshot that still lacks the marker —
+    /// Iris's chip rehydration would then see an unpaired `invoke_agent`
+    /// row and the chip would be stuck "running" until another full reload.
+    ///
+    /// This test verifies the end state after the loop drains: both the
+    /// history marker AND the SSE event must be present. Because the SSE
+    /// log write is what closes the race window, observing it as `Some(_)`
+    /// proves the loop reached past the marker block, so seeing the marker
+    /// in history at that point locks in the ordering invariant. The
+    /// ordering itself is guarded by the inline comment in
+    /// `completion_notification_loop`; this test catches regressions where
+    /// the marker is dropped, moved to a fire-and-forget task, or otherwise
+    /// stops being written before the SSE event log advances.
+    #[tokio::test]
+    async fn test_subagent_completion_marker_persisted_before_sse_event() {
+        // -- Build a minimal AppState --
+        let gateway_config = crate::gateway::GatewayConfig::default();
+        let gateway = crate::gateway::Gateway::new(gateway_config).unwrap();
+        let scheduler = std::sync::Arc::new(alms_runtime::Scheduler::new());
+        let shutdown_token = CancellationToken::new();
+        let (completion_tx, _completion_rx) = mpsc::unbounded_channel();
+        let (trigger_tx, _bus_rx) = mpsc::unbounded_channel();
+        let (dm_event_tx, _dm_event_rx) = mpsc::unbounded_channel();
+        let state = AppState::new(
+            gateway,
+            scheduler,
+            shutdown_token.clone(),
+            completion_tx,
+            trigger_tx,
+            dm_event_tx,
+        )
+        .unwrap();
+
+        let parent_agent_id = AgentId::new();
+        let parent_session = state.session_manager.get_or_create(parent_agent_id, "web");
+        let parent_session_id = parent_session.id;
+        let subagent_session_id = state
+            .session_manager
+            .get_or_create(AgentId::new(), "subagent")
+            .id;
+
+        // Baseline: no SSE events on the parent session yet.
+        assert!(
+            state
+                .run_manager
+                .latest_session_event_id(parent_session_id)
+                .await
+                .is_none(),
+            "no SSE events should exist before the completion is fed"
+        );
+
+        // -- Feed one completion and drain the loop synchronously --
+        // Mirrors the pattern in `runs::integration_tests` — a side channel
+        // owned by the test feeds the loop, and dropping the sender causes
+        // the receiver to return None so the loop exits on its own.
+        let (test_tx, test_rx) = mpsc::unbounded_channel();
+        test_tx
+            .send(alms_coordinator::SubagentCompletion {
+                task_id: alms_coordinator::TaskId::new(),
+                subagent_name: Some("researcher".to_string()),
+                status: alms_coordinator::TaskStatus::Completed,
+                summary: "All done.".to_string(),
+                parent_session_id,
+                parent_agent_id,
+                subagent_session_id,
+                task_description: Some("investigate the thing".to_string()),
+                tool_count: Some(3),
+                duration_ms: Some(1200),
+                token_usage: None,
+            })
+            .unwrap();
+        drop(test_tx);
+        completion_notification_loop(test_rx, state.clone()).await;
+
+        // -- Assert: the SSE event log advanced (the second write fired)
+        // AND the history marker is present (the first write fired before
+        // the second). The two together prove the ordering invariant for
+        // this run. --
+        let last_event_id = state
+            .run_manager
+            .latest_session_event_id(parent_session_id)
+            .await;
+        assert!(
+            last_event_id.is_some(),
+            "SSE event log should have at least one subagent_completed entry"
+        );
+
+        let history = state
+            .session_manager
+            .get_history(parent_session_id)
+            .unwrap();
+        let marker = history
+            .iter()
+            .find(|m| {
+                m.metadata
+                    .as_ref()
+                    .and_then(|meta| meta.get("type"))
+                    .and_then(|v| v.as_str())
+                    == Some("subagent_completion")
+            })
+            .expect(
+                "subagent_completion marker missing from history — the ordering invariant in \
+                 completion_notification_loop has regressed (codex P2 on PR #1049 / issue #1041)",
+            );
+        let meta = marker.metadata.as_ref().unwrap();
+        assert_eq!(meta["subagent_name"], "researcher");
+        assert_eq!(meta["status"], "done");
+        assert_eq!(meta["session_id"], subagent_session_id.0.to_string());
 
         // Clean up: cancel the shutdown token so background tasks (if any) stop.
         shutdown_token.cancel();

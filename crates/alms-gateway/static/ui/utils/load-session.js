@@ -30,6 +30,7 @@ import { setAgentPhase, clearAgentPhase, setDmContext } from '../state/agent-sta
 import { sessions } from '../state/sessions.js';
 import { activeAgent } from '../state/agents.js';
 import { getPendingMessage, clearPendingMessage } from '../state/pending-messages.js';
+import { rehydrateSubagentsFromHistory } from '../state/subagents.js';
 
 /**
  * Maximum number of session runs to fetch when restoring active-run state.
@@ -210,6 +211,24 @@ export async function loadSession(sessionId, opts) {
         // For DM sessions, group reasoning entries into collapsible blocks.
         const grouped = isDmSession ? groupDmReasoningBlocks(mapped) : mapped;
         replaceMessages(grouped);
+        // Rehydrate the SubagentBar from any still-in-flight invoke_agent
+        // tool rows in the freshly-loaded history (#1041). Pass the
+        // PRE-grouping `mapped` array, not the post-grouping `grouped`
+        // array: in DM sessions, `groupDmReasoningBlocks` folds tool rows
+        // flagged with `isReasoning: true` (which includes every
+        // session-tool-call-record-merged invoke_agent row in DM history —
+        // see `history.js::mapHistoryMessages` line 522) into a single
+        // `dm_reasoning` block entry, hiding the underlying tool row from
+        // any consumer that filters by `type === 'tool'`. Without this
+        // change, `rehydrateSubagentsFromHistory` (which looks for
+        // `m.type === 'tool' && m.tool === 'invoke_agent'`) sees zero
+        // invoke_agent rows in DM sessions and the SubagentBar chip never
+        // re-appears after reload. Found by codex P2 + Tim on PR #1049.
+        // The function only reads `type`, `tool`, `id`, `ts`, `status`,
+        // `params`, and `result`, all of which live on the pre-grouping
+        // entries; the chronological-order invariant the function depends
+        // on is preserved by `mapHistoryMessages` itself.
+        rehydrateSubagentsFromHistory(mapped);
         lastEventId = historyData.last_event_id ?? null;
     } catch (err) {
         if (isStale()) return;

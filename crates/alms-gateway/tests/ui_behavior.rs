@@ -264,3 +264,29 @@ fn sidebar_grouping_js_behaviour() {
 fn agent_events_timer_js_behaviour() {
     run_node_test("agent-events-timer.test.mjs");
 }
+
+/// Pinned regression for issue #1041: the SubagentBar live status panel
+/// disappears on page reload or session switch while a subagent is still
+/// in flight server-side. The fix adds
+/// `rehydrateSubagentsFromHistory` in `static/ui/state/subagents.js`,
+/// called from `loadSession` after `replaceMessages`, that rebuilds the
+/// `activeSubagents` signal from any `invoke_agent` tool rows in the
+/// freshly-loaded history that are still running (foreground:
+/// `status === 'running'`; background: result has `task_id` but no
+/// matching `subagent_completed` marker). The JS-side test pins:
+///   - foreground in-flight: re-adds named and unnamed entries with the
+///     correct synthetic key shape so `findSubagentByToolInvocationId`
+///     and `trackSubagentEnd` keep matching post-reload
+///   - foreground completed: skipped (already in chat history)
+///   - background in-flight: re-added with `sessionId` from the parent
+///     result
+///   - background completed (matching marker in history): skipped
+///   - live SSE-populated entries: preserved (no clobber)
+///   - non-tool / non-invoke_agent messages: ignored
+///   - empty / non-array input: no-op
+///   - startedAt: prefers the persisted message timestamp, falls back to
+///     `Date.now()` when missing
+#[test]
+fn subagents_rehydrate_js_behaviour() {
+    run_node_test("subagents-rehydrate.test.mjs");
+}
