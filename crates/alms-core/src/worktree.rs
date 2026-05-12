@@ -636,7 +636,20 @@ pub fn remove_worktree(
         // know NOT to recreate a fresh worktree+branch on a
         // downstream persist failure — this PATCH did not remove
         // anything, so there is nothing to undo.
-        let _ = delete_branch(project_root, agent_name, force);
+        //
+        // Surface `delete_branch` failures via WARN at
+        // `target = "alms.worktree"` to match the happy-path arm
+        // below — "best-effort" doesn't mean "silent". An operator
+        // chasing a stale `alms/<name>` ref needs the audit trail
+        // to find the silent-discard event. See #1025.
+        if let Err(e) = delete_branch(project_root, agent_name, force) {
+            tracing::warn!(
+                target: "alms.worktree",
+                agent_name = %agent_name,
+                error = %e,
+                "delete_branch failed on AlreadyAbsent path — branch may be orphaned"
+            );
+        }
         return Ok(WorktreeRemove::AlreadyAbsent);
     }
 
@@ -1450,6 +1463,124 @@ mod tests {
         assert!(
             !stdout.contains(".alms/worktrees/atlas"),
             "git status on parent must not list the worktree dir, got:\n{stdout}"
+        );
+    }
+
+    // ── #1025: AlreadyAbsent arm must WARN-log delete_branch failures ──
+
+    /// In-memory captured-log harness mirrored from the existing
+    /// `alms-gateway::agents::tests::CapturedLogs` setup used by the
+    /// #1029 compensation tests. Writes every `tracing` event the
+    /// scoped subscriber receives into an `Arc<Mutex<Vec<u8>>>` so
+    /// the test body can grep for structured fields after the
+    /// `with_default` scope closes.
+    ///
+    /// Scoped to a single `with_default(...)` block per test invocation
+    /// so parallel `cargo test` jobs don't race on a shared global
+    /// subscriber. (`with_default` is known to flake under heavy
+    /// parallelism — see #1033 — but the harness is good enough for
+    /// a single-call assertion like this one.)
+    #[derive(Clone, Default)]
+    struct CapturedLogs(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
+        type Writer = LogWriter;
+        fn make_writer(&'a self) -> Self::Writer {
+            LogWriter(self.0.clone())
+        }
+    }
+
+    struct LogWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl CapturedLogs {
+        fn captured(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+        }
+    }
+
+    fn capture_logs<F: FnOnce()>(level: tracing::Level, f: F) -> String {
+        let logs = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(logs.clone())
+            .with_max_level(level)
+            .with_target(true)
+            .without_time()
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(subscriber, f);
+        logs.captured()
+    }
+
+    /// #1025 regression guard: `remove_worktree` on a missing worktree
+    /// directory still tries `git branch -D alms/<name>` as best-effort
+    /// cleanup. Pre-fix the failure was silently discarded via
+    /// `let _ = delete_branch(...)`, leaving the operator with no
+    /// audit trail when the branch was left orphaned. Post-fix the
+    /// failure surfaces as a structured WARN at
+    /// `target = "alms.worktree"` with the agent name and underlying
+    /// error.
+    ///
+    /// Failure injection: run against a non-git directory. The
+    /// `AlreadyAbsent` arm fires (target path doesn't exist), then
+    /// `git branch -D` rejects with `fatal: not a git repository`
+    /// — stderr doesn't match `delete_branch`'s `not found` / `No such`
+    /// success-passthrough, so it returns `Err(WorktreeError::GitFailed(_))`.
+    /// Behavior unchanged: the call still returns
+    /// `Ok(WorktreeRemove::AlreadyAbsent)`.
+    #[test]
+    fn remove_worktree_already_absent_warns_on_delete_branch_failure() {
+        // Non-git dir: the target worktree path doesn't exist (no
+        // `.alms/worktrees/ghost/`) AND `git branch -D` will fail
+        // with "not a git repository" inside delete_branch. Both
+        // halves of the test setup come for free.
+        let tmp = TempDir::new().unwrap();
+
+        let mut outcome: Option<WorktreeResult<WorktreeRemove>> = None;
+        let captured = capture_logs(tracing::Level::WARN, || {
+            outcome = Some(remove_worktree(tmp.path(), "ghost", false));
+        });
+
+        // Behavior unchanged: AlreadyAbsent is still returned, the
+        // remove_worktree contract is best-effort on branch cleanup.
+        let outcome = outcome
+            .expect("test set outcome")
+            .expect("remove_worktree must not error");
+        assert!(
+            matches!(outcome, WorktreeRemove::AlreadyAbsent),
+            "remove_worktree on a missing worktree must still return AlreadyAbsent, got {outcome:?}"
+        );
+
+        // Audit trail: structured WARN at the alms.worktree target,
+        // carrying the agent name and the underlying error message.
+        assert!(
+            captured.contains("WARN"),
+            "expected WARN-level log, got:\n{captured}"
+        );
+        assert!(
+            captured.contains("alms.worktree"),
+            "expected target=alms.worktree, got:\n{captured}"
+        );
+        assert!(
+            captured.contains("agent_name=\"ghost\"") || captured.contains("agent_name=ghost"),
+            "expected agent_name=ghost field, got:\n{captured}"
+        );
+        assert!(
+            captured.contains("error="),
+            "expected error= field, got:\n{captured}"
+        );
+        assert!(
+            captured.contains("AlreadyAbsent"),
+            "expected message to identify the AlreadyAbsent path, got:\n{captured}"
         );
     }
 }
