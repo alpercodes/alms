@@ -89,44 +89,11 @@ alms-cli → alms-gateway → alms-runtime      → alms-core
 - **IDs**: Newtype wrappers (`AgentId`, `SessionId`, `RunId`, etc.) — never raw strings
 - **Tests**: `#[cfg(test)] mod tests` in each file. Golden tests for SSE in `alms-gateway/tests/`
 
-## Claude Code Agent Team
-
-Internal agents (under Atlas's control, use git worktree isolation):
-
-| Agent | Role | Worktree | Co-Authored-By | Can Edit Code |
-|-------|------|----------|----------------|---------------|
-| **Atlas** | Main developer | Main repo | `Atlas <noreply@anthropic.com>` | Yes |
-| **Heph** (`heph-dev`) | Feature dev | Isolated | `Heph <noreply@anthropic.com>` | Yes |
-| **Tim** (`alms-dev-guardian`) | Code reviewer | Isolated | `Tim <noreply@anthropic.com>` | No (read-only) |
-| **Larry** (`larry-bug-fix`) | Bug fixer | Isolated | `Larry <noreply@anthropic.com>` | Yes |
-
-External agents (not under Atlas's control):
-
-| Agent | Role |
-|-------|------|
-| **Argus** | External — independent agent |
-| **Tesla** | External — independent agent |
-
-- All internal agents use `isolation: "worktree"` so they never interfere with each other
-- Tim posts reviews as GitHub PR comments with `## Review by Tim (automated)` header
-- Larry creates branches, fixes bugs, pushes, creates PRs, and comments on GitHub issues
-- Atlas coordinates, plans, implements features, and posts Tim's reviews when Bash is blocked in worktrees
-
 ## Git Workflow
 
 - Feature branches: `fix/<name>` or `feature/<name>`
 - PRs target `main` — always use branches + PRs, never commit directly to main
 - Run `make ci` before pushing
-
-### VPS & Remotes
-
-> **Note**: VPS deployment is not in scope right now. Will be picked up later.
-
-- **VPS**: `root@<vps-host>` (Ubuntu 24.04, 4GB RAM)
-- **Canonical repo on VPS**: `</srv/alms` (has `main` checked out)
-- **Git remote `atlas`**: points to the VPS canonical repo
-- **Pushing to VPS**: The VPS repo has `main` checked out, so direct pushes are refused by default. To push: temporarily set `receive.denyCurrentBranch=updateInstead` on VPS, push, then reset to `refuse`.
-- **Agent workspace repos**: `</srv/workspace-atlas/alms`, `</srv/workspace-mustafa/alms`
 
 ## Current State (as of 2026-05-06)
 
