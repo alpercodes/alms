@@ -147,6 +147,7 @@ fn append_exclude_idempotent(project_root: &Path, agent_name: &str) -> AlmsResul
         // .git is a file). Skip — not worth a hard failure; the only
         // downside is `git status` shows the worktree dir as untracked.
         tracing::warn!(
+            target: "alms.worktree",
             project_root = %project_root.display(),
             "Skipping .git/info/exclude append — directory not found (probably a non-standard .git layout)"
         );
@@ -679,8 +680,15 @@ pub fn remove_worktree(
     // Best-effort branch cleanup. Failures here are non-fatal — the
     // worktree is gone, which is what the caller asked for. A
     // dangling branch is recoverable manually.
+    //
+    // Surface failures via WARN at `target = "alms.worktree"` to
+    // match the AlreadyAbsent arm above and every other structured
+    // trace in this module (see #1025 / #1039). An operator chasing
+    // a stale `alms/<name>` ref needs a consistent audit trail to
+    // find the silent-discard event.
     if let Err(e) = delete_branch(project_root, agent_name, force) {
         tracing::warn!(
+            target: "alms.worktree",
             agent_name = %agent_name,
             error = %e,
             "Failed to delete branch alms/{} after worktree removal — manual cleanup may be required",
