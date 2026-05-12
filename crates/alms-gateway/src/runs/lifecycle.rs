@@ -362,8 +362,15 @@ fn evaluate_pre_flight_token_budget(
 /// Mirrors the `MissingModelAfterProviderSwitch` 400 error envelope so
 /// every gateway-side budget rejection lands with a consistent shape on
 /// the wire. Used only by the synchronous `POST /runs` handler; the
-/// queued / non-HTTP path uses
-/// [`fail_run_with_token_budget_error`] instead.
+/// queued / non-HTTP path runs the same `evaluate_pre_flight_token_budget`
+/// check inline inside `execute_run` (peer-DM, scheduler, notification,
+/// subagent-completion runs, and HTTP runs whose effective budget was
+/// mutated by `PATCH /settings` or `PATCH /agents` while they sat in the
+/// queue) and emits a `run_error` SSE event with the same
+/// `INVALID_TOKEN_BUDGET_FOR_PROVIDER` code instead of a synchronous 400,
+/// then marks the run `Failed` and broadcasts queue advance — same shape
+/// as the `MissingModelAfterProviderSwitch` failure arm immediately above
+/// it in `execute_run`.
 fn pre_flight_token_budget(
     agent_id: AgentId,
     agent_config: &alms_runtime::AgentConfig,

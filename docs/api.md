@@ -393,6 +393,8 @@ Notes:
 
 The gateway pre-flights every `POST /runs` against the published context window for the resolved `(provider, model)` pair (per-agent override > server default). If the sum `[context].max_input_tokens + agent.max_tokens` overshoots the cap, the run is rejected before any LLM call is made. The body carries every datum the operator needs to fix the config (provider, resolved model, both knobs, computed total, table-published cap). Pairs the cap table doesn't know about (e.g. user-declared OpenRouter models, fine-tunes) skip the check silently. The `ALMS_LLM_BUDGET_VALIDATION=warn` env var downgrades the 400 to a structured WARN log; see [`docs/config.md`](config.md#alms_llm_budget_validation--provider-context-window-enforcement-919). The same error envelope is returned by `PATCH /settings` when the candidate `[context].max_input_tokens` would create the overshoot — see § 10.2.
 
+**Non-HTTP run failure mode (`run_error` SSE).** Triggered or queued runs that have no synchronous caller — peer DMs initiated via the `send_message` tool, scheduler / cron jobs, notification runs, subagent-completion runs, and HTTP runs whose effective budget was mutated by `PATCH /settings` or `PATCH /agents/{id}` while they sat in the queue — cannot receive a synchronous 400. The same pre-flight check fires inside `execute_run` for these paths and emits a `run_error` SSE event instead. The event uses the standard `run_error` shape documented in § 6.3 (`{ "run_id": "<uuid>", "error": { "code": "INVALID_TOKEN_BUDGET_FOR_PROVIDER", "message": "..." } }`) — no extra structured fields are added beyond `error.code` and `error.message`. The same budget detail the 400 envelope spreads across `provider` / `model` / `max_input_tokens` / `max_tokens` / `effective_total` / `provider_cap` keys is folded into the human-readable `error.message` string (e.g. `"configured token budget exceeds provider cap: context.max_input_tokens (250000) + agent.max_tokens (32000) = 282000 > anthropic claude-haiku-4-5 context window (200000). ..."`). The run is marked `Failed` before it ever enters the running set, and queue advance is broadcast so queued-behind runs see their positions decrement. Clients that already branch on `error.code` will pick this up without code changes; clients that want structured budget detail on the SSE surface should treat the 400 envelope from § 5.1 as the canonical field shape and either parse `error.message` or correlate by `run_id` to a separate `GET /runs/{run_id}` lookup.
+
 Why not `POST /agent/run`?
 - ALMS is about runs as first-class entities (auditable, cancellable, streamable).
 
@@ -1281,6 +1283,16 @@ Any `PATCH /settings` body that contains a top-level `security` key — includin
 ```
 
 Mirrors the `POST /runs` envelope from § 5.1 (`agent_id` is omitted on the PATCH path because the budget is server-level, not agent-scoped). The validator runs against the candidate `[context].max_input_tokens` plus the live `max_tokens` in TWO layers: first against the boot-time server-default `(provider, model)`, then against every registered agent's per-agent provider/model override (PR #1020 Codex P2 #2 follow-up). On strict-mode overshoot the entire PATCH is rejected with no partial commits and the persistence file is not written; the response body's `agents` array names every offender so the operator sees the full fleet impact in one response (single-offender layouts also populate the top-level `provider` / `model` / `effective_total` / `provider_cap` for back-compat with clients that only read those fields). Warn-mode (`ALMS_LLM_BUDGET_VALIDATION=warn`) downgrades the 400 to a structured WARN log per offending agent and lets the PATCH proceed.
+
+**Response 503** (agent store unavailable during fleet budget evaluation, #1020 follow-up):
+```json
+{
+  "error_code": "AGENT_STORE_UNAVAILABLE",
+  "message": "could not validate PATCH /settings against per-agent token budgets: failed to list agents from the registry (<sqlite error>). The PATCH was REJECTED to avoid silently accepting a budget that some agents would overshoot — retry once the agent store is reachable."
+}
+```
+
+The per-agent layer of the fleet budget check loads every registered agent via `store.list_agents()`. If that call errors (typically SQLite contention or a temporary outage), the PATCH **fails closed** with a `503 AGENT_STORE_UNAVAILABLE` rather than soft-skipping the per-agent layer and committing a budget that some agents would silently overshoot. No partial mutation occurs — live config stays untouched and `settings.json` is not rewritten. Retry semantics match the existing 503 surface on `agents.rs::get_store` (registry temporarily unreachable) and the `runs/lifecycle.rs` budget path (same `store.list_agents()` failure mode on the run side): the same request body is safe to replay once the agent store is reachable again. The envelope shape is the same structured-error JSON as the 400, just with the different `error_code` and no `provider` / `model` / `agents` fields (the fleet evaluation never got far enough to populate them).
 
 ---
 
