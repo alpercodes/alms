@@ -50,9 +50,9 @@ You are Heph, the primary development agent.
 3. Read relevant source files, plan the change
 4. Implement the change
 5. Run your project's CI checks (tests, linter, formatter)
-6. **Set git identity** (worktrees inherit the main repo's git config, which may point to a different name or email — set yours explicitly every run):
-   - `git config user.name "Heph"`
-   - `git config user.email "noreply@anthropic.com"`
+6. **Set per-worktree git identity** (use `--worktree`; plain `git config` writes to the shared `.git/config` and pollutes every other worktree — see Operational Rule #7):
+   - `git config --worktree user.name "Heph"`
+   - `git config --worktree user.email "noreply@anthropic.com"`
 7. Commit with Co-Authored-By trailer
 8. Push: `git push -u github <branch>`
 9. Create PR: `gh pr create --base main --title "..." --body "..."`
@@ -87,9 +87,9 @@ You are Larry, an autonomous bug-fix agent.
 2. Create a branch: `git fetch github main && git checkout -b fix/<name> github/main`
 3. Investigate and fix the bug — minimal changes only
 4. Run CI checks (tests, linter, formatter)
-5. **Set git identity** (worktrees inherit the main repo's git config, which may point to a different name or email — set yours explicitly every run):
-   - `git config user.name "Larry"`
-   - `git config user.email "noreply@anthropic.com"`
+5. **Set per-worktree git identity** (use `--worktree`; plain `git config` writes to the shared `.git/config` and pollutes every other worktree — see Operational Rule #7):
+   - `git config --worktree user.name "Larry"`
+   - `git config --worktree user.email "noreply@anthropic.com"`
 6. Commit, push, create PR with `Fixes #<number>` in body
 7. Comment on the issue with what you did
 
@@ -415,27 +415,39 @@ Clean up regularly. A session with 10+ agent runs can consume 40+ GB.
 
 Agents should not run tests or linters back-to-back if nothing changed since the last passing run. One pass is enough.
 
-### 7. Git author identity (name AND email)
+### 7. Git author identity — use `--worktree`, not plain `git config`
 
-Each agent sets its OWN git identity in its worktree, every run. Worktrees inherit the main repo's config by default, so if Atlas's main repo is set to `Atlas` and a worktree is created for Heph, Heph's commits will land as `Atlas` unless Heph re-sets it. Both `user.name` AND `user.email` matter — `user.email` drives GitHub avatar/account-linking on the commit page and shapes the `Co-Authored-By: Name <email>` trailer in squash-merge commits.
+Each agent sets its OWN git identity in its worktree, every run — and the `--worktree` scope flag is **load-bearing**, not optional.
 
-Set both, explicitly, before committing:
+**Why `--worktree` matters.** Linked worktrees share `.git/config` with the main repo by default. So `git config user.name "Heph"` (no scope flag — defaults to `--local`) inside Heph's worktree writes to the SHARED config and silently rewrites Atlas's main-repo identity AND every other concurrent worktree's identity. Whichever agent runs the config command last wins, and the others (including Atlas committing in main) inherit the wrong identity. The failure mode is invisible because everyone's commits collapse to a single agent's name, which looks consistent rather than broken.
+
+**One-time setup** (already done for this repo): enable per-worktree config in the main repo:
+
+```bash
+git config extensions.worktreeConfig true
+```
+
+This makes `git config --worktree key value` write to a separate per-worktree config file (`.git/config.worktree` for the main worktree, `.git/worktrees/<id>/config.worktree` for linked worktrees) that overrides the shared `.git/config` for the current worktree only.
+
+**Per-worktree usage** (every agent, every run, before committing):
 
 ```bash
 # Heph
-git config user.name "Heph"
-git config user.email "noreply@anthropic.com"
+git config --worktree user.name "Heph"
+git config --worktree user.email "noreply@anthropic.com"
 
 # Larry
-git config user.name "Larry"
-git config user.email "noreply@anthropic.com"
+git config --worktree user.name "Larry"
+git config --worktree user.email "noreply@anthropic.com"
 
-# Atlas (main repo)
-git config user.name "Atlas"
-git config user.email "noreply@anthropic.com"
+# Atlas (main worktree, also via --worktree)
+git config --worktree user.name "Atlas"
+git config --worktree user.email "noreply@anthropic.com"
 ```
 
-Put this BEFORE the commit step in each agent's workflow (not just buried in the Identity section), so the agent can't accidentally skip it. Without this, `git blame` and squash-merge `Co-Authored-By` trailers all collapse to whichever identity the main repo happened to have when the worktree was forked — a pattern that's easy to miss because the symptom (everyone showing up as one identity) looks consistent rather than broken.
+Both `user.name` AND `user.email` matter — `user.email` drives GitHub avatar/account-linking on the commit page and shapes the `Co-Authored-By: Name <email>` trailer in squash-merge commits.
+
+Put this BEFORE the commit step in each agent's workflow (not just buried in the Identity section), so the agent can't accidentally skip it. Without `--worktree`, the symptom is everyone's commits authored under one name (whoever set their config last) — which looks consistent rather than broken, so it's easy to miss until you audit.
 
 ## Scaling Patterns
 
