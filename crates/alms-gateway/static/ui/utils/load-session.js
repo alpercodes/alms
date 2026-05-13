@@ -19,7 +19,7 @@
  */
 
 import { getSessionMessages, getSessionToolCalls } from '../api/sessions.js';
-import { listRuns, listApprovals, listAgentRuns, getRun } from '../api/runs.js';
+import { listRuns, listApprovals, listAgentRuns, getRun, getRunReasoning } from '../api/runs.js';
 import { mapHistoryMessages, groupDmReasoningBlocks } from './history.js';
 import { normalizeApproval } from './approvals.js';
 import { chatMessages, nextMsgId } from '../state/chat.js';
@@ -115,6 +115,9 @@ export async function loadSession(sessionId, opts) {
     // where tool calls are stored only in run_tool_calls, not in
     // session_messages.  (#609, #632, #634)
     let lastEventId = null;
+    // Hoisted so step 3 (in-flight reasoning rehydration for #1043) can
+    // branch on session type without re-deriving it.
+    let isDmSession = false;
     try {
         const [historyData, toolCallData] = await Promise.all([
             getSessionMessages(sessionId),
@@ -131,7 +134,7 @@ export async function loadSession(sessionId, opts) {
         // Resolve DM flag early so mapHistoryMessages can annotate
         // merged tool entries with isReasoning for DM sessions.
         const sessionObj = sessions.value.find(s => s.id === sessionId);
-        const isDmSession = sessionObj?.session_type === 'dm';
+        isDmSession = sessionObj?.session_type === 'dm';
 
         const mapped = mapHistoryMessages(rawMsgs, {
             hasActiveRun: !!activeRunId.value,
@@ -303,6 +306,70 @@ export async function loadSession(sessionId, opts) {
             }
         } catch (err) {
             console.warn(`[${logPrefix}] Failed to load pending approvals:`, err);
+        }
+
+        // Rehydrate accumulated extended-thinking text for the in-flight
+        // run (#1043). This block MUST stay after the thinking-indicator
+        // and pending-approval appends above: the live `reasoning_delta`
+        // SSE handler attaches each incoming chunk to the most recent
+        // unsealed assistant entry at the tail of `chatMessages`, so the
+        // rehydrated seed must be the last append before `openSessionStream`
+        // fires. Inserting it earlier would let the thinking / approval
+        // rows land after it and break the handler's tail lookup.
+        //
+        // Reasoning is streamed via `reasoning_delta` SSE events but
+        // only persisted to the message store at end-of-turn,
+        // so a mid-turn reload would otherwise miss every delta that
+        // fired before the reload. The dedicated endpoint reads the
+        // session event log and returns both the concatenated text and
+        // the maximum event_id of any included event; advancing
+        // `lastEventId` past that mark makes the subsequent SSE replay
+        // skip exactly the events already reflected in the rehydrated
+        // text, so the live append in the `reasoning_delta` handler does
+        // not double-count. Skipped for DM sessions — those route
+        // reasoning through `dmThinkingBuffers` and a separate
+        // dm_reasoning block layout (out of scope for #1043).
+        //
+        // Race mitigation: re-check the run status from the listRuns
+        // snapshot before seeding. If the run terminated between step 1
+        // (listRuns) and this fetch (e.g. it finished while the page was
+        // mid-load), the messages GET in step 2 has already picked up the
+        // final assistant message with sealed reasoning_blocks. Seeding an
+        // additional unsealed assistant entry on top would render the
+        // reasoning twice briefly until the run_finished SSE event arrives
+        // and the live handler stops appending. Skip the seed in that
+        // case — the persisted message is the authoritative record. The
+        // event-id handoff is still safe to apply because it only
+        // advances the SSE cursor past events the UI no longer needs to
+        // replay.
+        if (!isDmSession) {
+            const activeRunForReasoning = runs.value.find(
+                r => r.run_id === activeRunId.value
+            );
+            const runStillLive = activeRunForReasoning
+                && (activeRunForReasoning.status === 'running'
+                    || activeRunForReasoning.status === 'queued');
+            try {
+                const reasoningData = await getRunReasoning(activeRunId.value);
+                if (isStale()) return;
+                if (runStillLive && reasoningData?.text) {
+                    appendMessage({
+                        id: nextMsgId(),
+                        type: 'agent',
+                        role: 'assistant',
+                        text: '',
+                        reasoning: reasoningData.text,
+                        sealed: false,
+                        ts: new Date().toISOString(),
+                    });
+                }
+                if (reasoningData?.last_event_id != null
+                    && (lastEventId == null || reasoningData.last_event_id > lastEventId)) {
+                    lastEventId = reasoningData.last_event_id;
+                }
+            } catch (err) {
+                console.warn(`[${logPrefix}] Failed to load in-flight reasoning:`, err);
+            }
         }
     }
 

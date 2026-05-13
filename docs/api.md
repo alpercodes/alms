@@ -180,7 +180,7 @@ subagent, job) are excluded by default.
 | `session_type` | string | Session type derived from the `context_id`. Always present. See table below. |
 | `participants` | string[] | Participant names parsed from the DM context ID (e.g. `["alice", "bob"]`). Only present when `session_type` is `"dm"`. |
 | `agent_name` | string | Agent name extracted from the notification context ID (e.g. `"alice"` from `"notifications:alice"`). Only present when `session_type` is `"notification"`. |
-| `has_active_run` | bool | `true` if any queued or running run is currently tied to this session, `false` otherwise. Drives the sidebar's "active" indicator on the initial load and after SSE reconnect. Always present. Pairs with the agent-scoped SSE feed (`GET /agents/{agent_id}/events`, section 5.7) which emits live `session_activity_started` / `session_activity_ended` transitions between calls to this endpoint. See #856. |
+| `has_active_run` | bool | `true` if any queued or running run is currently tied to this session, `false` otherwise. Drives the sidebar's "active" indicator on the initial load and after SSE reconnect. Always present. Pairs with the agent-scoped SSE feed (`GET /agents/{agent_id}/events`, section 5.8) which emits live `session_activity_started` / `session_activity_ended` transitions between calls to this endpoint. See #856. |
 
 **`session_type` values**
 
@@ -705,7 +705,31 @@ Notes:
 - `from_agent` (optional string) is set whenever the runtime has a resolved agent name — that is, for any named agent (resolved via the agent registry). Unnamed-agent records omit the field. The DM UI fallback merge path uses this value to attribute reasoning blocks to the correct agent; non-DM clients can ignore the field.
 - For DM sessions, tool calls are stored per-run only (not in the session history).
 
-### 5.5 Cancel a run
+### 5.5 Get in-flight reasoning text
+`GET /runs/{run_id}/reasoning`
+
+Returns the concatenated extended-thinking ("reasoning") text accumulated for a run so far, plus the maximum SSE event_id covered by that text. Used by the web UI's `loadSession` flow to rehydrate the collapsible reasoning panel after a mid-turn page reload (#1043).
+
+Reasoning text is streamed as `reasoning_delta` SSE events while a turn is in flight and only persisted to the session-messages store (as `reasoning_blocks` metadata on the final assistant message) at end-of-turn. The standard messages GET therefore returns nothing for an in-progress turn, and the default SSE replay cursor sits at the session HWM — past every `reasoning_delta` that has already fired. This endpoint plugs that gap by reading the per-session SSE event log directly.
+
+**Response 200**
+```json
+{
+  "run_id": "<uuid>",
+  "text": "Let me think about this step by step...",
+  "last_event_id": 142
+}
+```
+
+**Response 404** — run not found.
+
+Notes:
+- `text` is an empty string and `last_event_id` is `null` when the run has not emitted any `reasoning_delta` events yet. The endpoint is safe to call on every page load regardless of run state.
+- `last_event_id` is sampled during the same snapshot the text is built from, so the rehydrate→reconnect handoff is race-free: every event reflected in `text` has an id ≤ `last_event_id`. The client should pass it as `?last_event_id=<n>` on the subsequent SSE open call so the live stream replays only events not yet reflected in `text`, and the per-delta append in the UI's `reasoning_delta` handler appends to (not duplicates) the rehydrated text.
+- `reasoning_delta` events emitted with a non-null `source_agent` (subagent reasoning) are filtered out to mirror the UI's main-panel suppression of subagent deltas. Subagent reasoning is rendered separately.
+- For DM sessions, reasoning is routed through a distinct `dm_reasoning` block layout and this endpoint is not used by the DM rehydration path.
+
+### 5.6 Cancel a run
 `POST /runs/{run_id}/cancel`
 
 Cancels a running or queued run. Returns 200 with `{"run_id":"...","status":"cancelled"}`.
@@ -731,7 +755,7 @@ The state flip + SSE broadcast on the HTTP boundary is independent of that
 cooperative unwind: the user-visible cancel lands synchronously on the HTTP
 response and on every subscribed SSE feed; the loop's actual exit follows.
 
-### 5.6 List runs
+### 5.7 List runs
 `GET /runs?session_id=<uuid>&limit=<n>` — list runs for a session (original behaviour).
 `GET /runs?agent_id=<uuid>&limit=<n>` — list runs across all sessions for an agent.
 
@@ -802,7 +826,7 @@ Notes:
 { "error": { "code": "AMBIGUOUS_FILTER", "message": "..." } }
 ```
 
-### 5.7 Stream agent-scoped events (SSE)
+### 5.8 Stream agent-scoped events (SSE)
 `GET /agents/{agent_id}/events`
 
 Persistent SSE feed scoped to a single agent, carrying activity events

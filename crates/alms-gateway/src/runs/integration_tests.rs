@@ -5822,3 +5822,222 @@ async fn http_cancel_wins_against_natural_completion() {
 
     shutdown_token.cancel();
 }
+
+// ---------------------------------------------------------------------------
+// #1043 — GET /runs/{run_id}/reasoning rehydration endpoint
+// ---------------------------------------------------------------------------
+
+/// Reasoning text streams as `reasoning_delta` SSE events but is only
+/// persisted to the message store at end-of-turn. On a mid-turn reload
+/// the messages GET returns no reasoning yet and the default SSE replay
+/// cursor (session HWM) sits past every fired delta, so the reasoning
+/// panel would otherwise show nothing until the next post-reload delta
+/// arrives. The new endpoint reconstructs the accumulated text from the
+/// session event log and returns the maximum included event_id so the
+/// client can bump its SSE `last_event_id` past the rehydrated events
+/// and avoid a double-emit on reconnect (see acceptance criteria in
+/// issue #1043: "No double-emission").
+#[tokio::test]
+async fn get_run_reasoning_returns_concatenated_text_and_max_event_id() {
+    use axum::extract::{Path, State};
+    let (state, shutdown_token, _cr, _tr, _dr) = test_app_state();
+    let agent_id = AgentId::new();
+    let session = state
+        .session_manager
+        .get_or_create(agent_id, "test-reasoning-rehydrate");
+    let session_id = session.id;
+
+    let run = Run::new(session_id, agent_id, "go think".into());
+    let run_id = run.run_id;
+    state.run_manager.insert_run(run);
+
+    // Fire three reasoning_delta events; concatenation must equal the joined
+    // text in event-emission order. An unrelated tool_start event in between
+    // exercises the per-event-type filter so we know we are not lifting the
+    // wrong frames out of the log.
+    state
+        .run_manager
+        .send_event(
+            run_id,
+            session_id,
+            SseEventData::reasoning_delta(run_id, "Let me ", None),
+        )
+        .await;
+    state
+        .run_manager
+        .send_event(
+            run_id,
+            session_id,
+            SseEventData::tool_start(
+                run_id,
+                crate::sse::ToolInvocationId(uuid::Uuid::new_v4()),
+                "echo",
+                serde_json::json!({}),
+                None,
+                None,
+            ),
+        )
+        .await;
+    state
+        .run_manager
+        .send_event(
+            run_id,
+            session_id,
+            SseEventData::reasoning_delta(run_id, "think ", None),
+        )
+        .await;
+    state
+        .run_manager
+        .send_event(
+            run_id,
+            session_id,
+            SseEventData::reasoning_delta(run_id, "carefully.", None),
+        )
+        .await;
+
+    let response = super::lifecycle::get_run_reasoning(State(state.clone()), Path(run_id))
+        .await
+        .expect("get_run_reasoning should succeed for a known run");
+    let body = response.0;
+
+    assert_eq!(
+        body["text"].as_str().unwrap(),
+        "Let me think carefully.",
+        "rehydrated reasoning must equal the concatenation of every \
+         reasoning_delta text field in event-emission order"
+    );
+
+    let returned_id = body["last_event_id"]
+        .as_u64()
+        .expect("last_event_id must be present when reasoning events exist");
+    let session_hwm = state
+        .run_manager
+        .latest_session_event_id(session_id)
+        .await
+        .expect("session must have logged events");
+    assert!(
+        returned_id <= session_hwm,
+        "returned last_event_id {returned_id} must not exceed session HWM \
+         {session_hwm}; otherwise SSE replay would skip events that fired \
+         after the snapshot"
+    );
+
+    // Subagent reasoning (source_agent set) is suppressed in the main
+    // panel — the UI's reasoning_delta handler early-returns on
+    // source_agent, so the rehydration path must mirror that filter,
+    // otherwise reload would briefly surface subagent thinking text on
+    // the parent agent's panel and then have it vanish on the next
+    // re-render.
+    state
+        .run_manager
+        .send_event(
+            run_id,
+            session_id,
+            SseEventData::reasoning_delta(run_id, "<subagent>", Some("worker-1".into())),
+        )
+        .await;
+    let response2 = super::lifecycle::get_run_reasoning(State(state.clone()), Path(run_id))
+        .await
+        .expect("get_run_reasoning should succeed after subagent delta");
+    assert_eq!(
+        response2.0["text"].as_str().unwrap(),
+        "Let me think carefully.",
+        "subagent reasoning_delta entries (source_agent set) must be \
+         filtered out of the rehydrated text"
+    );
+
+    shutdown_token.cancel();
+}
+
+/// When the run has not emitted any reasoning_delta yet (e.g. a fresh
+/// queued run, or a model that never emits extended-thinking text), the
+/// endpoint returns an empty `text` and a null `last_event_id`. The
+/// client calls this endpoint unconditionally on every reload that has
+/// an active run, so an empty-result case must be well-formed rather
+/// than 404 / error.
+#[tokio::test]
+async fn get_run_reasoning_returns_empty_when_no_reasoning_events_logged() {
+    use axum::extract::{Path, State};
+    let (state, shutdown_token, _cr, _tr, _dr) = test_app_state();
+    let agent_id = AgentId::new();
+    let session = state
+        .session_manager
+        .get_or_create(agent_id, "test-reasoning-empty");
+    let session_id = session.id;
+
+    let run = Run::new(session_id, agent_id, "no reasoning yet".into());
+    let run_id = run.run_id;
+    state.run_manager.insert_run(run);
+
+    let response = super::lifecycle::get_run_reasoning(State(state.clone()), Path(run_id))
+        .await
+        .expect("get_run_reasoning should succeed even with no events");
+    let body = response.0;
+    assert_eq!(body["text"].as_str().unwrap(), "");
+    assert!(
+        body["last_event_id"].is_null(),
+        "last_event_id must be null when no reasoning_delta has been \
+         logged, so the client leaves its SSE replay cursor untouched"
+    );
+
+    shutdown_token.cancel();
+}
+
+/// Reasoning events emitted on one run must not contaminate the
+/// rehydrated text returned for a sibling run on the same session.
+/// Background subagent runs share their parent session's event log, so
+/// without per-run filtering the parent's `/reasoning` endpoint would
+/// pick up subagent reasoning text and vice versa.
+#[tokio::test]
+async fn get_run_reasoning_isolates_text_by_run_id() {
+    use axum::extract::{Path, State};
+    let (state, shutdown_token, _cr, _tr, _dr) = test_app_state();
+    let agent_id = AgentId::new();
+    let session = state
+        .session_manager
+        .get_or_create(agent_id, "test-reasoning-isolation");
+    let session_id = session.id;
+
+    let run_a = Run::new(session_id, agent_id, "a".into());
+    let run_a_id = run_a.run_id;
+    state.run_manager.insert_run(run_a);
+    let run_b = Run::new(session_id, agent_id, "b".into());
+    let run_b_id = run_b.run_id;
+    state.run_manager.insert_run(run_b);
+
+    state
+        .run_manager
+        .send_event(
+            run_a_id,
+            session_id,
+            SseEventData::reasoning_delta(run_a_id, "A1 ", None),
+        )
+        .await;
+    state
+        .run_manager
+        .send_event(
+            run_b_id,
+            session_id,
+            SseEventData::reasoning_delta(run_b_id, "B1 ", None),
+        )
+        .await;
+    state
+        .run_manager
+        .send_event(
+            run_a_id,
+            session_id,
+            SseEventData::reasoning_delta(run_a_id, "A2", None),
+        )
+        .await;
+
+    let resp_a = super::lifecycle::get_run_reasoning(State(state.clone()), Path(run_a_id))
+        .await
+        .expect("get_run_reasoning should succeed for run A");
+    let resp_b = super::lifecycle::get_run_reasoning(State(state.clone()), Path(run_b_id))
+        .await
+        .expect("get_run_reasoning should succeed for run B");
+    assert_eq!(resp_a.0["text"].as_str().unwrap(), "A1 A2");
+    assert_eq!(resp_b.0["text"].as_str().unwrap(), "B1 ");
+
+    shutdown_token.cancel();
+}

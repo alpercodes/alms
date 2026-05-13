@@ -24,7 +24,8 @@ mod tools;
 
 pub use dm_lifecycle::cancel_dm;
 pub use lifecycle::{
-    ListRunsQuery, cancel_run, create_run, get_run_status, get_run_tool_calls, list_runs,
+    ListRunsQuery, cancel_run, create_run, get_run_reasoning, get_run_status, get_run_tool_calls,
+    list_runs,
 };
 pub(crate) use notifications::{
     completion_notification_loop, dm_event_loop, run_trigger_loop, scheduler_fire_loop,

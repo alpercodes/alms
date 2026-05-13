@@ -236,6 +236,86 @@ pub async fn get_run_tool_calls(
     })))
 }
 
+/// GET /runs/{run_id}/reasoning — rehydrate accumulated extended-thinking
+/// (reasoning) text for an in-flight run (#1043).
+///
+/// Reasoning text is streamed as `reasoning_delta` SSE events and only
+/// persisted to the session-messages store as `reasoning_blocks` metadata
+/// **at end-of-turn** via `persist_assistant_tool_calls`. While a turn is
+/// in flight, the only authoritative record lives in the per-session SSE
+/// event log. If an operator reloads the page mid-turn, the messages GET
+/// returns no reasoning yet, and the default SSE replay cursor sits at
+/// the session HWM — past every reasoning_delta that has already fired.
+/// The reasoning panel would therefore show only whatever streams in
+/// after the reload, throwing away potentially the bulk of the model's
+/// thinking trace (see issue #1043 acceptance criteria).
+///
+/// This endpoint reads the per-session SSE event log, filters to
+/// `reasoning_delta` events for the given run (skipping `source_agent`
+/// entries, which the UI suppresses — they belong to subagent reasoning
+/// panels rendered elsewhere), and concatenates the `text` fields in
+/// event-id order. The response carries the maximum `event_id` of any
+/// included event so the client can pass it as `?last_event_id=<n>` on
+/// the subsequent SSE open call. Sampling the event-id during the same
+/// snapshot the text is built from makes the rehydrate→reconnect handoff
+/// race-free: every event reflected in the returned text has an id ≤ the
+/// returned `last_event_id`, so the SSE stream replays only events that
+/// were NOT included, and the per-delta append in the UI's
+/// `reasoning_delta` handler appends to (not duplicates) the rehydrated
+/// text.
+///
+/// Returns an empty `text` and `last_event_id: null` when the run has no
+/// recorded reasoning yet — the client can safely call this on every
+/// reload regardless of run state.
+#[instrument(level = "info", skip(state), fields(run_id = %run_id.0))]
+pub async fn get_run_reasoning(
+    State(state): State<AppState>,
+    Path(run_id): Path<RunId>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let run = state
+        .run_manager
+        .get_run(run_id)
+        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "NOT_FOUND", "Run not found"))?;
+
+    let events = state
+        .run_manager
+        .session_events_from(run.session_id, 0)
+        .await;
+
+    let mut text = String::new();
+    let mut last_event_id: Option<u64> = None;
+    for ev in events {
+        if ev.run_id != run_id {
+            continue;
+        }
+        if ev.event_type != "reasoning_delta" {
+            continue;
+        }
+        // Subagent reasoning is suppressed in the main panel — the UI's
+        // `reasoning_delta` handler in `use-session-stream.js` early-returns
+        // on `source_agent` set. Mirror that filter here so rehydration
+        // doesn't surface text the live stream would have dropped.
+        let is_subagent = ev
+            .data
+            .get("source_agent")
+            .map(|v| !v.is_null())
+            .unwrap_or(false);
+        if is_subagent {
+            continue;
+        }
+        if let Some(t) = ev.data.get("text").and_then(|v| v.as_str()) {
+            text.push_str(t);
+        }
+        last_event_id = Some(ev.event_id);
+    }
+
+    Ok(Json(serde_json::json!({
+        "run_id": run_id.0.to_string(),
+        "text": text,
+        "last_event_id": last_event_id,
+    })))
+}
+
 /// POST /runs/{run_id}/cancel — cancel a running or queued run.
 #[instrument(level = "info", skip(state), fields(run_id = %run_id.0))]
 pub async fn cancel_run(
