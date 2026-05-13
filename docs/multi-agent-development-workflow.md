@@ -43,7 +43,6 @@ You are Heph, the primary development agent.
 ## Identity
 - Your name is **Heph**
 - All commits must end with: `Co-Authored-By: Heph <noreply@anthropic.com>`
-- Set git author: `git config user.name "Heph"` before committing
 
 ## Workflow
 1. Read the GitHub issue if one exists
@@ -51,10 +50,13 @@ You are Heph, the primary development agent.
 3. Read relevant source files, plan the change
 4. Implement the change
 5. Run your project's CI checks (tests, linter, formatter)
-6. Commit with Co-Authored-By trailer
-7. Push: `git push -u github <branch>`
-8. Create PR: `gh pr create --base main --title "..." --body "..."`
-9. Report back with PR URL and summary
+6. **Set git identity** (worktrees inherit the main repo's git config, which may point to a different name or email — set yours explicitly every run):
+   - `git config user.name "Heph"`
+   - `git config user.email "noreply@anthropic.com"`
+7. Commit with Co-Authored-By trailer
+8. Push: `git push -u github <branch>`
+9. Create PR: `gh pr create --base main --title "..." --body "..."`
+10. Report back with PR URL and summary
 
 ## Rules
 - Branch from `github/main`, never commit directly to main
@@ -79,15 +81,17 @@ You are Larry, an autonomous bug-fix agent.
 ## Identity
 - Your name is **Larry**
 - All commits must end with: `Co-Authored-By: Larry <noreply@anthropic.com>`
-- Set git author: `git config user.name "Larry"` before committing
 
 ## Workflow
 1. Read the GitHub issue
 2. Create a branch: `git fetch github main && git checkout -b fix/<name> github/main`
 3. Investigate and fix the bug — minimal changes only
 4. Run CI checks (tests, linter, formatter)
-5. Commit, push, create PR with `Fixes #<number>` in body
-6. Comment on the issue with what you did
+5. **Set git identity** (worktrees inherit the main repo's git config, which may point to a different name or email — set yours explicitly every run):
+   - `git config user.name "Larry"`
+   - `git config user.email "noreply@anthropic.com"`
+6. Commit, push, create PR with `Fixes #<number>` in body
+7. Comment on the issue with what you did
 
 ## Rules
 - Minimal changes only — fix the bug, nothing else
@@ -411,12 +415,27 @@ Clean up regularly. A session with 10+ agent runs can consume 40+ GB.
 
 Agents should not run tests or linters back-to-back if nothing changed since the last passing run. One pass is enough.
 
-### 7. Git author names
+### 7. Git author identity (name AND email)
 
-Each agent sets its own git author name for `git blame` visibility:
-- Heph: `git config user.name "Heph"`
-- Larry: `git config user.name "Larry"`
-- Atlas: `git config user.name "Atlas"`
+Each agent sets its OWN git identity in its worktree, every run. Worktrees inherit the main repo's config by default, so if Atlas's main repo is set to `Atlas` and a worktree is created for Heph, Heph's commits will land as `Atlas` unless Heph re-sets it. Both `user.name` AND `user.email` matter — `user.email` drives GitHub avatar/account-linking on the commit page and shapes the `Co-Authored-By: Name <email>` trailer in squash-merge commits.
+
+Set both, explicitly, before committing:
+
+```bash
+# Heph
+git config user.name "Heph"
+git config user.email "noreply@anthropic.com"
+
+# Larry
+git config user.name "Larry"
+git config user.email "noreply@anthropic.com"
+
+# Atlas (main repo)
+git config user.name "Atlas"
+git config user.email "noreply@anthropic.com"
+```
+
+Put this BEFORE the commit step in each agent's workflow (not just buried in the Identity section), so the agent can't accidentally skip it. Without this, `git blame` and squash-merge `Co-Authored-By` trailers all collapse to whichever identity the main repo happened to have when the worktree was forked — a pattern that's easy to miss because the symptom (everyone showing up as one identity) looks consistent rather than broken.
 
 ## Scaling Patterns
 
