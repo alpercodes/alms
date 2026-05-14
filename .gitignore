@@ -10,9 +10,9 @@ secrets.json
 .env
 .env.local
 
-# Claude Code local state
-.claude/worktrees/
-.claude/scheduled_tasks.lock
+# Claude Code local state (agents, settings, scratch, memory — everything personal)
+.claude/
+CLAUDE.local.md
 
 # IDE
 .idea/
