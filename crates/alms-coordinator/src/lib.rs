@@ -2526,12 +2526,14 @@ mod tests {
         let workspace_tmp = tempfile::TempDir::new().unwrap();
         let coord = test_coordinator().with_workspace_dir(workspace_tmp.path().to_path_buf());
         let parent_session = test_session_id();
+        let parent_agent_id = test_parent_agent_id();
 
         // Parent invokes the named subagent.
         let (_response, sub_session_id) = coord
             .dispatch(
                 "Investigate topic X".to_string(),
                 parent_session,
+                parent_agent_id,
                 None,
                 None,
                 Some("researcher".to_string()),
@@ -2540,10 +2542,11 @@ mod tests {
             .await
             .expect("dispatch should succeed");
 
-        // Parent reads the subagent session using its own session_id and the
+        // Parent reads the subagent session using its agent identity and the
         // subagent's name. This is the exact path the runtime wires when it
         // registers `ReadSubagentSessionTool` for the parent run.
-        let read_tool = ReadSubagentSessionTool::new(coord.session_manager.clone(), parent_session);
+        let read_tool =
+            ReadSubagentSessionTool::new(coord.session_manager.clone(), parent_agent_id);
         let result = read_tool
             .execute(serde_json::json!({ "name": "researcher" }))
             .await
@@ -2564,10 +2567,9 @@ mod tests {
 
         // Sanity-check: the subagent session ID returned by dispatch matches
         // the session ID the read tool resolved to (via the deterministic
-        // (parent_session_id, name) key).
-        let parent_as_agent = AgentId(parent_session.0);
-        let derived_id = AgentId::deterministic(parent_as_agent, "researcher");
-        let derived_ctx = format!("subagent_{}_{}", parent_session.0, "researcher");
+        // (parent_agent_id, name) key — #1051 / #1068).
+        let derived_id = AgentId::deterministic(parent_agent_id, "researcher");
+        let derived_ctx = format!("subagent_{}_{}", parent_agent_id.0, "researcher");
         let session = coord
             .session_manager
             .get_or_create(derived_id, &derived_ctx);
@@ -2593,6 +2595,7 @@ mod tests {
         // First daemon lifetime: parent invokes a named subagent against a
         // SQLite-backed session manager.
         let parent_session = test_session_id();
+        let parent_agent_id = test_parent_agent_id();
         let sub_session_id_first;
         {
             let session_manager = Arc::new(
@@ -2611,6 +2614,7 @@ mod tests {
                 .dispatch(
                     "Investigate topic X".to_string(),
                     parent_session,
+                    parent_agent_id,
                     None,
                     None,
                     Some("researcher".to_string()),
@@ -2633,7 +2637,7 @@ mod tests {
                     .expect("reopen SQLite session manager"),
             );
 
-            let read_tool = ReadSubagentSessionTool::new(session_manager.clone(), parent_session);
+            let read_tool = ReadSubagentSessionTool::new(session_manager.clone(), parent_agent_id);
             let result = read_tool
                 .execute(serde_json::json!({ "name": "researcher" }))
                 .await
@@ -2651,10 +2655,10 @@ mod tests {
             assert_eq!(result["subagent"], "researcher");
 
             // The session ID resolved by the read tool must match the one
-            // dispatch returned in the first daemon lifetime.
-            let parent_as_agent = AgentId(parent_session.0);
-            let derived_id = AgentId::deterministic(parent_as_agent, "researcher");
-            let derived_ctx = format!("subagent_{}_{}", parent_session.0, "researcher");
+            // dispatch returned in the first daemon lifetime — keyed on
+            // `(parent_agent_id, name)` (#1051 / #1068).
+            let derived_id = AgentId::deterministic(parent_agent_id, "researcher");
+            let derived_ctx = format!("subagent_{}_{}", parent_agent_id.0, "researcher");
             let session = session_manager.get_or_create(derived_id, &derived_ctx);
             assert_eq!(
                 session.id, sub_session_id_first,
@@ -2664,11 +2668,12 @@ mod tests {
     }
 
     /// Repro for #1042 / unauthorized-third-party path: an unrelated agent
-    /// (different session_id) calling `read_subagent_session` against the
-    /// same subagent name must NOT see the original parent's subagent
-    /// session. This is enforced today by the per-parent-session derivation
-    /// — the unrelated agent's derived (agent_id, context_id) key is
-    /// different, so `has_session` returns false.
+    /// (different `parent_agent_id`) calling `read_subagent_session` against
+    /// the same subagent name must NOT see the original parent's subagent
+    /// session. Post-#1068, named subagent sessions are keyed on
+    /// `(parent_agent_id, name)` — the unrelated agent's derived
+    /// `(agent_id, context_id)` key is different, so `has_session` returns
+    /// false.
     #[tokio::test]
     async fn test_unrelated_agent_cannot_read_subagent_session() {
         use alms_sandbox::Tool;
@@ -2678,10 +2683,12 @@ mod tests {
         let coord = test_coordinator().with_workspace_dir(workspace_tmp.path().to_path_buf());
 
         let parent_session = test_session_id();
+        let parent_agent_id = test_parent_agent_id();
         coord
             .dispatch(
                 "Investigate topic X".to_string(),
                 parent_session,
+                parent_agent_id,
                 None,
                 None,
                 Some("researcher".to_string()),
@@ -2690,10 +2697,11 @@ mod tests {
             .await
             .expect("dispatch should succeed");
 
-        // Unrelated agent: different session_id, attempts to read.
-        let unrelated_session = SessionId::new();
+        // Unrelated agent: different parent_agent_id, attempts to read.
+        let unrelated_agent_id = AgentId::new();
+        assert_ne!(unrelated_agent_id, parent_agent_id);
         let read_tool =
-            ReadSubagentSessionTool::new(coord.session_manager.clone(), unrelated_session);
+            ReadSubagentSessionTool::new(coord.session_manager.clone(), unrelated_agent_id);
         let result = read_tool
             .execute(serde_json::json!({ "name": "researcher" }))
             .await

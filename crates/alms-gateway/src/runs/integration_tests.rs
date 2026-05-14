@@ -6557,17 +6557,19 @@ async fn subagent_session_messages_endpoint_returns_transcript() {
     let (state, shutdown_token, _cr, _tr, _dr) = test_app_state_with_mock_llm();
 
     // Drive a real subagent dispatch through the Coordinator that lives
-    // inside AppState. The parent_session_id is synthetic — `dispatch`
-    // doesn't require the parent session to exist in the manager (it
-    // only uses it as a key to derive the subagent's deterministic
-    // identity, mirroring `derive_subagent_identity`).
+    // inside AppState. The parent_session_id and parent_agent_id are
+    // synthetic — `dispatch` doesn't require either to exist anywhere;
+    // they are only used as keys to derive the subagent's deterministic
+    // identity (#1051 / #1068: keyed on `(parent_agent_id, name)`).
     let parent_session = SessionId::new();
+    let parent_agent_id = AgentId::new();
     let task: &str = "Investigate topic X";
     let (response, sub_session_id) = state
         .coordinator
         .dispatch(
             task.to_string(),
             parent_session,
+            parent_agent_id,
             None,
             None,
             Some("researcher".to_string()),

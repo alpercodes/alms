@@ -317,6 +317,7 @@ mod tests {
                 &self,
                 _task: String,
                 _parent_session_id: SessionId,
+                _parent_agent_id: AgentId,
                 _parent_run_id: Option<RunId>,
                 _parent_event_tx: Option<Arc<dyn EventForwarder>>,
                 _subagent_name: Option<String>,
@@ -330,6 +331,7 @@ mod tests {
         let tool = InvokeAgentTool::new(
             Arc::new(GenericFailDispatcher),
             SessionId::new(),
+            AgentId::new(),
             None,
             None,
         );
