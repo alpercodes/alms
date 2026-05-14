@@ -107,6 +107,52 @@ fn test_app_state_with_sqlite() -> (
     )
 }
 
+/// Build an `AppState` whose LLM client runs in mock mode and is backed
+/// by an in-memory SQLite store. Used by the #1045 HTTP-layer regression
+/// test which needs (a) a real `Coordinator` capable of dispatching a
+/// subagent to completion (mock LLM avoids the network) and (b) the full
+/// gateway router so `GET /sessions/{id}/messages` exercises the actual
+/// JSON serialization path the UI sees.
+fn test_app_state_with_mock_llm() -> (
+    AppState,
+    CancellationToken,
+    mpsc::UnboundedReceiver<SubagentCompletion>,
+    mpsc::UnboundedReceiver<RunTrigger>,
+    mpsc::UnboundedReceiver<DmEvent>,
+) {
+    let llm_config = alms_runtime::LlmConfig {
+        mock: true,
+        ..alms_runtime::LlmConfig::default()
+    };
+    let gateway_config = GatewayConfig {
+        db_path: Some(":memory:".to_string()),
+        llm_config,
+        ..GatewayConfig::default()
+    };
+    let gateway = crate::gateway::Gateway::new(gateway_config).unwrap();
+    let scheduler = Arc::new(alms_runtime::Scheduler::new());
+    let shutdown_token = CancellationToken::new();
+    let (completion_tx, completion_rx) = mpsc::unbounded_channel();
+    let (trigger_tx, trigger_rx) = mpsc::unbounded_channel();
+    let (dm_event_tx, dm_event_rx) = mpsc::unbounded_channel();
+    let state = AppState::new(
+        gateway,
+        scheduler,
+        shutdown_token.clone(),
+        completion_tx,
+        trigger_tx,
+        dm_event_tx,
+    )
+    .unwrap();
+    (
+        state,
+        shutdown_token,
+        completion_rx,
+        trigger_rx,
+        dm_event_rx,
+    )
+}
+
 /// Build an `AppState` whose LLM client points at an unreachable local
 /// address with a 1-second timeout, so any `execute_run` that reaches the
 /// runtime LLM call fails quickly and deterministically through the
@@ -6038,6 +6084,157 @@ async fn get_run_reasoning_isolates_text_by_run_id() {
         .expect("get_run_reasoning should succeed for run B");
     assert_eq!(resp_a.0["text"].as_str().unwrap(), "A1 A2");
     assert_eq!(resp_b.0["text"].as_str().unwrap(), "B1 ");
+
+    shutdown_token.cancel();
+}
+
+// ---------------------------------------------------------------------------
+// #1045 — GET /sessions/{id}/messages must return the subagent's transcript
+// ---------------------------------------------------------------------------
+
+/// Regression test for #1045.
+///
+/// The UI's "View session" drill-down (SubagentBar / SubagentCompletionCard)
+/// loads the subagent session by id via `loadSession` → `getSessionMessages`,
+/// which hits this exact HTTP endpoint. If the response body's `messages`
+/// array is empty or shaped wrong, the chat pane renders blank — the
+/// #1045 symptom.
+///
+/// Coverage: dispatches a named subagent through the real `Coordinator`
+/// path in an `AppState` whose LLM is mock-backed (so the agent loop
+/// runs to completion without network), then invokes
+/// `GET /sessions/{sub_session_id}/messages` over the production router
+/// via `tower::ServiceExt::oneshot` and asserts the JSON wire shape.
+///
+/// What is exercised end-to-end against the mock LLM:
+///   - `Role::User`     → `"user"`      with `Content::Text` → `"type": "text"`
+///   - `Role::Assistant`→ `"assistant"` with `Content::Text` → `"type": "text"`
+///   - the trailing `timestamp` field on each text message
+///
+/// What is intentionally *not* covered here (because the mock LLM emits
+/// plain-text only and the dispatch path produces no synthetic markers):
+///   - `Content::ToolCall` / `Content::ToolResult` shape mapping
+///   - the `Role::System` synthetic-vs-internal filter
+///   - the `notification_input` metadata filter
+///   - the UI's `mapHistoryMessages` (in `static/ui/utils/history.js`) is
+///     *not* loaded by this test; field-additive regressions there are
+///     not caught — only wire-level regressions that drop or rename the
+///     `role` / `type` / `content` / `timestamp` fields on text messages.
+///
+/// Covering the tool-call and synthetic-system paths would require an
+/// integration harness that can drive a real `invoke_agent` tool call
+/// (or emit a synthetic `Role::System` message into the session). For
+/// the #1045 regression specifically, the user/assistant text path is
+/// the load-bearing surface — that is what the UI's chat pane reads.
+#[tokio::test]
+async fn subagent_session_messages_endpoint_returns_transcript() {
+    use alms_tools::subagent::SubagentDispatcher;
+    use axum::body::Body;
+    use axum::http::Request as HttpRequest;
+    use tower::ServiceExt;
+
+    let (state, shutdown_token, _cr, _tr, _dr) = test_app_state_with_mock_llm();
+
+    // Drive a real subagent dispatch through the Coordinator that lives
+    // inside AppState. The parent_session_id is synthetic — `dispatch`
+    // doesn't require the parent session to exist in the manager (it
+    // only uses it as a key to derive the subagent's deterministic
+    // identity, mirroring `derive_subagent_identity`).
+    let parent_session = SessionId::new();
+    let task: &str = "Investigate topic X";
+    let (response, sub_session_id) = state
+        .coordinator
+        .dispatch(
+            task.to_string(),
+            parent_session,
+            None,
+            None,
+            Some("researcher".to_string()),
+            None,
+        )
+        .await
+        .expect("subagent dispatch should succeed against mock LLM");
+    // The mock LLM at crates/alms-runtime/src/llm_client/mod.rs:577 always
+    // prepends `[mock] ` to the assistant reply. If `dispatch` returns Ok
+    // with an empty / garbled string, the wire-shape assertions below would
+    // still pass (an empty assistant message would just not match) but the
+    // failure mode would be opaque. This guards the upstream contract.
+    assert!(
+        response.contains("mock"),
+        "dispatch returned a response that does not contain the mock marker; \
+         got {response:?}"
+    );
+
+    // Build the production router (with state) and issue the exact GET
+    // the UI fires when `loadSession` hits `getSessionMessages`.
+    // Note: `protected_router()` here omits the `require_auth` middleware
+    // that `server::mod::serve_with_gateway` layers on top in production
+    // (crates/alms-gateway/src/server/mod.rs:171-178) — consistent with
+    // the rest of this test file, which doesn't carry bearer tokens.
+    let router = crate::server::routes::protected_router().with_state(state);
+    let uri = format!("/sessions/{}/messages", sub_session_id.0);
+    let http_response = router
+        .oneshot(HttpRequest::get(&uri).body(Body::empty()).unwrap())
+        .await
+        .expect("router oneshot should not fail");
+    assert_eq!(
+        http_response.status(),
+        axum::http::StatusCode::OK,
+        "expected 200 OK from {uri}, got {}",
+        http_response.status()
+    );
+
+    let body_bytes = axum::body::to_bytes(http_response.into_body(), 1024 * 1024)
+        .await
+        .expect("read response body");
+    let json: serde_json::Value =
+        serde_json::from_slice(&body_bytes).expect("response body should be JSON");
+
+    let messages = json["messages"]
+        .as_array()
+        .expect("response should carry a `messages` array");
+    assert!(
+        !messages.is_empty(),
+        "GET /sessions/{sub_session_id}/messages must return a non-empty \
+         `messages` array for a subagent session that has run — \
+         empty array is the #1045 symptom. Body: {json}",
+        sub_session_id = sub_session_id.0
+    );
+
+    // Shape assertions match the UI's `mapHistoryMessages` expectations
+    // (crates/alms-gateway/static/ui/utils/history.js): user task as a
+    // text message under `role: "user"`, assistant reply as a text
+    // message under `role: "assistant"`. Both must carry non-empty
+    // `content` so the chat pane has something to render.
+    let user_msg = messages
+        .iter()
+        .find(|m| {
+            m["role"] == "user"
+                && m["type"] == "text"
+                && m["content"].as_str().is_some_and(|c| c.contains(task))
+        })
+        .unwrap_or_else(|| {
+            panic!("expected a user text message containing the task; got {messages:?}")
+        });
+
+    let assistant_msg = messages
+        .iter()
+        .find(|m| {
+            m["role"] == "assistant"
+                && m["type"] == "text"
+                && m["content"].as_str().is_some_and(|c| !c.is_empty())
+        })
+        .unwrap_or_else(|| panic!("expected a non-empty assistant text reply; got {messages:?}"));
+
+    // Each text message must carry a `timestamp` field. This is what
+    // `mapHistoryMessages` (and the chat-pane ordering logic) consume —
+    // dropping or renaming it would resurface a #1045-flavored bug.
+    for (label, msg) in [("user", user_msg), ("assistant", assistant_msg)] {
+        assert!(
+            msg["timestamp"].is_string(),
+            "{label} message must carry a string `timestamp` field; got {msg:?}"
+        );
+    }
 
     shutdown_token.cancel();
 }
