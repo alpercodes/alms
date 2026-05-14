@@ -1,4 +1,5 @@
 mod cache_retry;
+mod diagnostic;
 mod request;
 mod sse_parsers;
 mod streaming;
@@ -10,6 +11,7 @@ use crate::llm_types::*;
 use alms_core::config::{AuthScheme, ProviderKind};
 use alms_core::{AlmsError, AlmsResult};
 use cache_retry::{CacheRetryDecision, decide_cache_retry};
+use diagnostic::{DecodeDiagnostic, flatten_error_chain, format_decode_error};
 use request::{apply_auth, apply_quirks, is_openai_reasoning_model};
 use reqwest::{Client, RequestBuilder};
 use streaming::stream_response;
@@ -355,7 +357,9 @@ impl LlmClient {
                         retry_err,
                     ));
                 }
-                return self.parse_completion_response(retry_response).await;
+                return self
+                    .parse_completion_response(retry_response, &request)
+                    .await;
             }
             error!("LLM API error: {} - {}", status, error_text);
             // #920: structured variant (see cache-retry branch above for
@@ -367,7 +371,7 @@ impl LlmClient {
             ));
         }
 
-        self.parse_completion_response(response).await
+        self.parse_completion_response(response, &request).await
     }
 
     /// Parse a successful HTTP response into a `CompletionResponse`.
@@ -376,42 +380,99 @@ impl LlmClient {
     /// same body-read + provider-dispatch + warn-on-null-content logic
     /// as the primary success path. Only called when `response.status()`
     /// is already a success — error handling lives on the caller.
+    ///
+    /// On body-read or parse failure, the bubbled `AlmsError::Runtime`
+    /// carries a structured diagnostic — provider, model, HTTP status,
+    /// content-type, and (on parse failure) a 512-byte body prefix plus
+    /// the full reqwest/serde error chain — produced by [`diagnostic`]
+    /// (#1044). The coordinator's subagent path forwards `e.to_string()`
+    /// verbatim through the parent's tool-call result, so the enriched
+    /// diagnostic surfaces in the daemon log, the parent's tool-call
+    /// payload, and the UI's subagent error block from this single site.
     async fn parse_completion_response(
         &self,
         response: reqwest::Response,
+        request: &CompletionRequest,
     ) -> AlmsResult<CompletionResponse> {
+        // Capture response metadata BEFORE `.text()` consumes the
+        // response. Status, headers, and URL all live on `reqwest::Response`
+        // and become inaccessible once the body is consumed (#1044).
+        let status = response.status().as_u16();
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
+        let content_length = response.content_length();
+        let provider_name = self.config.provider.as_str();
+
         // Read the raw body first so we can log it for diagnostics, then
         // parse from the text.  This is essential for debugging models that
         // return content in unexpected fields (e.g. `reasoning_content`).
-        let body_text = response
-            .text()
-            .await
-            .map_err(|e| AlmsError::Runtime(format!("Failed to read response body: {}", e)))?;
+        let body_text = match response.text().await {
+            Ok(t) => t,
+            Err(e) => {
+                // `response.text()` decodes the buffered body into a String;
+                // the reqwest error here means the body bytes themselves
+                // couldn't be read (connection reset mid-body, malformed
+                // chunked transfer, H2 stream reset, gzip decompression
+                // failure, etc.). reqwest's bare `Display` renders this as
+                // "error decoding response body" with no further context —
+                // we walk the source chain to recover the underlying
+                // hyper/IO cause and bake the response metadata we already
+                // captured into the bubbled error. See #1044.
+                let chain = flatten_error_chain(&e);
+                let diag = DecodeDiagnostic {
+                    provider: provider_name,
+                    model: &request.model,
+                    status: Some(status),
+                    content_type: content_type.as_deref(),
+                    content_length,
+                    bytes_read: None,
+                    body_prefix: None,
+                };
+                let msg = format_decode_error("LLM response decode failed", &diag, &chain);
+                error!("{msg}");
+                return Err(AlmsError::Runtime(msg));
+            }
+        };
 
         debug!(raw_body_len = body_text.len(), "LLM response body received");
 
+        // Shared formatter for `serde_json::from_str` failures. Centralises
+        // the diagnostic construction so the three provider arms below
+        // produce byte-identical error shapes (#1044). The `context` arg
+        // keeps the provider name in the human-readable prefix
+        // ("...Anthropic..." vs "...Gemini..." etc.) for at-a-glance
+        // categorisation in log output.
+        let parse_err = |context: &str, e: serde_json::Error| -> AlmsError {
+            let diag = DecodeDiagnostic {
+                provider: provider_name,
+                model: &request.model,
+                status: Some(status),
+                content_type: content_type.as_deref(),
+                content_length,
+                bytes_read: None,
+                body_prefix: Some(body_text.as_str()),
+            };
+            let msg = format_decode_error(context, &diag, &e);
+            error!("{msg}");
+            AlmsError::Runtime(msg)
+        };
+
         let completion: CompletionResponse = match self.provider {
-            Provider::OpenAi => serde_json::from_str(&body_text).map_err(|e| {
-                error!(body = body_text.as_str(), "Failed to parse OpenAI response");
-                AlmsError::Runtime(format!("Failed to parse response: {}", e))
-            })?,
+            Provider::OpenAi => serde_json::from_str(&body_text)
+                .map_err(|e| parse_err("LLM response parse failed (OpenAI)", e))?,
             Provider::Anthropic => {
                 let anthropic_resp: crate::anthropic::AnthropicResponse =
-                    serde_json::from_str(&body_text).map_err(|e| {
-                        error!(
-                            body = body_text.as_str(),
-                            "Failed to parse Anthropic response"
-                        );
-                        AlmsError::Runtime(format!("Failed to parse Anthropic response: {}", e))
-                    })?;
+                    serde_json::from_str(&body_text)
+                        .map_err(|e| parse_err("LLM response parse failed (Anthropic)", e))?;
                 crate::anthropic::from_anthropic_response(anthropic_resp)
             }
             Provider::Gemini => {
-                let gemini_resp: crate::gemini::GeminiResponse = serde_json::from_str(&body_text)
-                    .map_err(|e| {
-                    error!(body = body_text.as_str(), "Failed to parse Gemini response");
-                    AlmsError::Runtime(format!("Failed to parse Gemini response: {}", e))
-                })?;
+                let gemini_resp: crate::gemini::GeminiResponse =
+                    serde_json::from_str(&body_text)
+                        .map_err(|e| parse_err("LLM response parse failed (Gemini)", e))?;
                 crate::gemini::from_gemini_response(gemini_resp)
             }
         };
@@ -539,6 +600,8 @@ impl LlmClient {
                     retry_response,
                     self.provider,
                     self.config.stream_chunk_timeout_secs,
+                    self.config.provider.clone(),
+                    request.model.clone(),
                 ));
             }
             error!("LLM API error: {} - {}", status, error_text);
@@ -555,6 +618,8 @@ impl LlmClient {
             response,
             self.provider,
             self.config.stream_chunk_timeout_secs,
+            self.config.provider.clone(),
+            request.model.clone(),
         ))
     }
 
@@ -896,7 +961,7 @@ impl LlmClient {
 #[cfg(test)]
 mod tests {
     use super::sse_parsers::{parse_gemini_sse_block, parse_openai_sse};
-    use super::test_responder::spawn_sequential_responder;
+    use super::test_responder::{spawn_sequential_responder, spawn_truncated_body_responder};
     use super::*;
 
     #[test]
@@ -2284,6 +2349,322 @@ mod tests {
             msg.contains("Subagent LLM error (gemini 500)"),
             "expected structured Display, got: {msg}"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // #1044 regression: enriched diagnostic on adapter decode/parse
+    // failures.
+    //
+    // Before #1044, every decode/parse failure in the LLM client
+    // collapsed into one of two opaque strings — "Failed to read response
+    // body: error decoding response body" or "Failed to parse response:
+    // <serde>". Neither carried provider, model, HTTP status,
+    // content-type, or a body prefix, so operators couldn't tell HTML
+    // error pages from schema drift from mid-stream truncation. These
+    // tests pin the structured-diagnostic shape so the bubbled
+    // `AlmsError::Runtime` always carries the provider+model+status
+    // bracket and (when the body was readable) a 512-byte body prefix.
+    //
+    // The coordinator's subagent path forwards `e.to_string()` verbatim
+    // through the parent's tool-call result payload — see
+    // `crates/alms-coordinator/src/lib.rs:693`. Pinning the runtime-side
+    // shape implicitly pins the subagent/UI surface, since the bubbled
+    // error string IS the subagent error block contents.
+    // ------------------------------------------------------------------
+
+    fn openai_client_with_base_url(base_url: String) -> LlmClient {
+        let mut core_cfg = alms_core::config::LlmConfig::default();
+        core_cfg.ensure_builtin_providers();
+        core_cfg.provider = "openai".into();
+        let mut runtime_cfg: LlmConfig = core_cfg.into();
+        runtime_cfg.api_key = "openai-test-key".into();
+        runtime_cfg.base_url = base_url;
+        runtime_cfg.timeout_secs = 10;
+        LlmClient::new(runtime_cfg).unwrap()
+    }
+
+    fn anthropic_client_with_base_url(base_url: String) -> LlmClient {
+        let mut core_cfg = alms_core::config::LlmConfig::default();
+        core_cfg.ensure_builtin_providers();
+        core_cfg.provider = "anthropic".into();
+        let mut runtime_cfg: LlmConfig = core_cfg.into();
+        runtime_cfg.api_key = "anthropic-test-key".into();
+        runtime_cfg.base_url = base_url;
+        runtime_cfg.timeout_secs = 10;
+        LlmClient::new(runtime_cfg).unwrap()
+    }
+
+    /// A 200-OK body that's not valid JSON (HTML error page shape — the
+    /// canonical "Cloudflare returned an HTML challenge in front of the
+    /// API endpoint" failure mode mentioned in #1044). The OpenAI
+    /// adapter's `serde_json::from_str::<CompletionResponse>` must reject
+    /// this and the bubbled error must carry provider, model, status,
+    /// and a body prefix the operator can recognise as HTML.
+    #[tokio::test]
+    async fn decode_diagnostic_openai_html_body_includes_provider_model_status_and_prefix() {
+        let html_body = "<!DOCTYPE html><html><head><title>Cloudflare \
+                         challenge</title></head><body><h1>Just a \
+                         moment...</h1></body></html>";
+        // Tim's review on #1064 (P2): hand the responder an explicit
+        // `text/html` content-type so the test actually exercises the
+        // "operator can recognise an HTML page from the content_type
+        // field" claim in the diagnostic. The original fixture
+        // hardcoded `application/json` regardless of body, which made
+        // this assertion mildly dishonest about real upstream behaviour.
+        let base_url =
+            spawn_sequential_responder(vec![(200, "text/html; charset=utf-8", html_body)]).await;
+        let client = openai_client_with_base_url(base_url);
+        let request =
+            CompletionRequest::new("gpt-4o-mini").with_messages(vec![LlmMessage::user("hi")]);
+
+        let err = client
+            .complete(request)
+            .await
+            .expect_err("HTML body must fail to deserialize");
+        let msg = err.to_string();
+
+        assert!(
+            msg.contains("LLM response parse failed"),
+            "diagnostic context missing, got: {msg}"
+        );
+        assert!(
+            msg.contains("provider=openai"),
+            "provider field missing, got: {msg}"
+        );
+        assert!(
+            msg.contains("model=gpt-4o-mini"),
+            "model field missing, got: {msg}"
+        );
+        assert!(
+            msg.contains("status=200"),
+            "status field missing, got: {msg}"
+        );
+        // The `content_type=text/html` field is the operator's first
+        // breadcrumb that an upstream edge proxy returned an HTML page
+        // rather than the expected JSON envelope. Pin it so a future
+        // fixture regression that drops the content-type doesn't fail
+        // silently — the prefix-only check below would still pass.
+        assert!(
+            msg.contains("content_type=text/html"),
+            "content_type field missing or wrong, got: {msg}"
+        );
+        // The HTML prefix must surface so the operator can recognise the
+        // failure mode at a glance (no need to crank tracing to trace
+        // level and re-trigger the bug).
+        assert!(
+            msg.contains("body_prefix="),
+            "body_prefix field missing, got: {msg}"
+        );
+        assert!(
+            msg.contains("DOCTYPE html") || msg.contains("Cloudflare"),
+            "body prefix doesn't include HTML marker, got: {msg}"
+        );
+    }
+
+    /// Schema-drift case for the Anthropic adapter: response is valid
+    /// JSON but doesn't match `AnthropicResponse`. The bubbled error
+    /// must carry the Anthropic-specific context label, status=200, and
+    /// the body prefix showing the unexpected shape.
+    #[tokio::test]
+    async fn decode_diagnostic_anthropic_schema_drift_includes_body_prefix() {
+        // Anthropic real response shape has `id`, `type`, `role`,
+        // `content`, `model`, etc. This is a parseable JSON object but
+        // missing every required field — schema drift / partial
+        // response.
+        let drift_body = r#"{"unexpected":"shape","no_content":true}"#;
+        let base_url = spawn_sequential_responder(vec![(200, drift_body)]).await;
+        let client = anthropic_client_with_base_url(base_url);
+        let request =
+            CompletionRequest::new("claude-sonnet-4-5").with_messages(vec![LlmMessage::user("hi")]);
+
+        let err = client
+            .complete(request)
+            .await
+            .expect_err("schema-drift body must fail to deserialize");
+        let msg = err.to_string();
+
+        assert!(
+            msg.contains("LLM response parse failed (Anthropic)"),
+            "diagnostic context missing, got: {msg}"
+        );
+        assert!(
+            msg.contains("provider=anthropic"),
+            "provider field missing, got: {msg}"
+        );
+        assert!(
+            msg.contains("model=claude-sonnet-4-5"),
+            "model field missing, got: {msg}"
+        );
+        assert!(
+            msg.contains("status=200"),
+            "status field missing, got: {msg}"
+        );
+        assert!(
+            msg.contains("content_type=application/json"),
+            "content_type field missing, got: {msg}"
+        );
+        assert!(
+            msg.contains(r#"body_prefix="{\"unexpected\":\"shape\""#),
+            "body prefix doesn't include the drift JSON, got: {msg}"
+        );
+    }
+
+    /// The diagnostic body prefix is bounded — a 10 KB JSON body that
+    /// fails to parse must NOT bake the entire payload into the bubbled
+    /// error. The bound keeps the tool-call result payload (and any
+    /// downstream session-history persistence) bounded regardless of
+    /// upstream response size.
+    #[tokio::test]
+    async fn decode_diagnostic_body_prefix_is_truncated() {
+        // 10 KB of malformed JSON. The first character is `{` so the
+        // serde parser starts, then fails on the garbage filler.
+        let mut huge_body = String::from(r#"{"truncated":"yes","filler":""#);
+        huge_body.push_str(&"abc".repeat(4000)); // ~12 KB of filler
+        // Don't close the JSON — let serde fail mid-parse on the cap.
+        // Static body lifetime for the responder helper:
+        let leaked: &'static str = Box::leak(huge_body.into_boxed_str());
+        let base_url = spawn_sequential_responder(vec![(200, leaked)]).await;
+        let client = openai_client_with_base_url(base_url);
+        let request =
+            CompletionRequest::new("gpt-4o-mini").with_messages(vec![LlmMessage::user("hi")]);
+
+        let err = client
+            .complete(request)
+            .await
+            .expect_err("malformed huge body must fail to deserialize");
+        let msg = err.to_string();
+
+        // The bubbled error must still be a sane size. With a 512-byte
+        // body-prefix cap plus a fixed header, the total stays under a
+        // few KB regardless of upstream body size — the test asserts
+        // a generous ceiling so we catch a regression that drops the cap
+        // entirely without being brittle about the exact diagnostic
+        // bytes the helper produces today.
+        assert!(
+            msg.len() < 4096,
+            "diagnostic should be bounded; got {} bytes",
+            msg.len()
+        );
+        assert!(
+            msg.contains("body_prefix="),
+            "body_prefix field missing, got: {msg}"
+        );
+        // The ellipsis marker confirms the truncator actually fired —
+        // pinning this guarantees the body prefix didn't accidentally
+        // grow to absorb the full body via a future "let's show more
+        // context" refactor.
+        assert!(
+            msg.contains('…'),
+            "truncation ellipsis missing from body prefix, got first 200 chars: {}",
+            &msg[..msg.len().min(200)]
+        );
+    }
+
+    /// #1064 review (Tim, P1): drive `stream_response` through a real
+    /// mid-stream `bytes_stream()` error end-to-end. Until this test
+    /// landed, the streaming branch of the enriched diagnostic was
+    /// pinned only by the formatter unit test
+    /// (`formats_streaming_bytes_read`) — the wiring that threads
+    /// `provider_name`, `model`, and `total_bytes_read` from
+    /// `complete_stream` through `stream_response` into the bubbled
+    /// `AlmsError::Runtime` had no end-to-end coverage. Streaming is
+    /// the most likely site for the next #1044-class incident
+    /// (HTTP/2 RST_STREAM, mid-body connection reset, malformed chunked
+    /// transfer), so plugging this gap is load-bearing.
+    ///
+    /// Fixture: [`spawn_truncated_body_responder`] writes valid HTTP
+    /// headers advertising `Content-Length: N` strictly greater than
+    /// the body it actually sends, then drops the socket. reqwest sees
+    /// the premature EOF on the body stream and surfaces a
+    /// `BodyDecodeError` on the next `bytes_stream()` poll — exactly
+    /// what we want to drive through the `Ok(Some(Err(e)))` arm.
+    #[tokio::test]
+    async fn complete_stream_mid_stream_decode_failure_carries_enriched_diagnostic() {
+        use futures::StreamExt;
+
+        // Write some valid-looking SSE-shaped prefix bytes so the
+        // `bytes_read` counter advances past zero before reqwest sees
+        // the premature EOF. The trailing SSE event terminator (two
+        // consecutive newlines) is intentionally missing — the SSE
+        // parser won't dispatch a chunk, so the byte pull stays in the
+        // `Need more data` branch until the stream errors out.
+        let partial_body =
+            "data: {\"id\":\"chatcmpl-1\",\"choices\":[{\"delta\":{\"content\":\"hel";
+        let base_url = spawn_truncated_body_responder(
+            200,
+            "text/event-stream",
+            partial_body,
+            // Advertise far more bytes than we send — reqwest will fault
+            // on the close because the body stream ends short of the
+            // advertised length.
+            4096,
+        )
+        .await;
+        let client = openai_client_with_base_url(base_url);
+        let request =
+            CompletionRequest::new("gpt-4o-mini").with_messages(vec![LlmMessage::user("hi")]);
+
+        // `BoxStream` isn't `Debug`, so hand-match instead of `expect_err`.
+        let mut stream = match client.complete_stream(request).await {
+            Ok(s) => s,
+            Err(e) => panic!(
+                "complete_stream itself returned Err — wanted the error to surface inside the stream, got: {e}"
+            ),
+        };
+
+        // Pump the stream. We expect at most a handful of `Skip` cycles
+        // and then a single `Err` carrying the enriched diagnostic.
+        // The loop runs with a bounded iteration cap so a future
+        // regression that yields a non-erroring infinite stream still
+        // fails cleanly instead of hanging.
+        let mut err_msg = None;
+        for _ in 0..32 {
+            match stream.next().await {
+                Some(Ok(_)) => continue,
+                Some(Err(e)) => {
+                    err_msg = Some(e.to_string());
+                    break;
+                }
+                None => break,
+            }
+        }
+        let msg = err_msg.expect(
+            "stream must yield a mid-stream decode error before completing —              the truncated-body responder closes the socket before the              advertised Content-Length is satisfied",
+        );
+
+        assert!(
+            msg.contains("LLM stream decode failed"),
+            "diagnostic context missing, got: {msg}"
+        );
+        assert!(
+            msg.contains("provider=openai"),
+            "provider field missing, got: {msg}"
+        );
+        assert!(
+            msg.contains("model=gpt-4o-mini"),
+            "model field missing, got: {msg}"
+        );
+        // `bytes_read=N` must be present. The exact N depends on how
+        // many body bytes reqwest delivered before noticing the early
+        // close — pinning the field shape, not the value, keeps the
+        // test robust across reqwest/hyper version bumps.
+        assert!(
+            msg.contains("bytes_read="),
+            "bytes_read field missing, got: {msg}"
+        );
+        // The partial buffer capture from P2 on #1064 (review): if any
+        // bytes flowed through before the connection-reset, the
+        // `body_prefix=` field should surface the SSE prefix so an
+        // operator can see exactly where the upstream tore off.
+        // Asserted as a shape check — the exact prefix depends on how
+        // many bytes reqwest delivered before noticing the early close,
+        // which is timing-sensitive.
+        if msg.contains("body_prefix=") {
+            assert!(
+                msg.contains("data:"),
+                "body_prefix present but doesn't include SSE prefix, got: {msg}"
+            );
+        }
     }
 
     /// Wire invariant (#773): an outbound OpenAI request built by the
