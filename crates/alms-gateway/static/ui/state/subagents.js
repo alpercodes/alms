@@ -219,13 +219,24 @@ export function setSubagentSessionId(name, sessionId) {
  * imported by session-list.js which imports these same modules).
  */
 async function loadNavDeps() {
-    const [loadMod, sseMod, chatMod, runsMod, genMod, loadingMod] = await Promise.all([
+    const [loadMod, sseMod, chatMod, runsMod, genMod, loadingMod, bootMod, agentsMod] = await Promise.all([
         import('../utils/load-session.js'),
         import('../hooks/use-session-stream.js'),
         import('../state/chat-actions.js'),
         import('../state/runs.js'),
         import('../state/select-generation.js'),
         import('../state/loading.js'),
+        // `saveActiveSession` lives in use-boot.js. We pull it in here so
+        // the subagent drill-down path persists the active session id to
+        // localStorage the same way the sidebar / runs-tab navigation
+        // does. Without this, the operator clicks "View session" on a
+        // subagent chip, lands on the subagent transcript, then reloads
+        // and falls back to the parent agent's first chat — the #1045
+        // symptom. Dynamic import is used because the static one would
+        // create the circular subagents.js <-> use-boot.js dependency
+        // the rest of this helper is already designed to avoid.
+        import('../hooks/use-boot.js'),
+        import('../state/agents.js'),
     ]);
     return {
         loadSession: loadMod.loadSession,
@@ -236,6 +247,8 @@ async function loadNavDeps() {
         bumpSelectGeneration: genMod.bumpSelectGeneration,
         selectGeneration: genMod,
         sessionSwitchLoading: loadingMod.sessionSwitchLoading,
+        saveActiveSession: bootMod.saveActiveSession,
+        activeAgentId: agentsMod.activeAgentId,
     };
 }
 
@@ -254,6 +267,18 @@ async function doSessionSwitch(targetSessionId, logPrefix) {
     deps.selectedRunId.value = null;
     deps.replaceMessages([]);
     clearAllSubagents();
+    // Persist the new active session so a subsequent reload lands the
+    // operator back on this subagent / parent session rather than on
+    // the agent's stale first-visible-chat fallback. The sidebar /
+    // runs-tab navigation paths already do this via `navigate-session.
+    // js`, but the subagent drill-down path in this file historically
+    // didn't, which is the immediate cause of #1045's reload-loss.
+    // Pair this with `resolveStoredSessionId` in `use-boot.js` so the
+    // pointer remains useful even when the target is a hidden session
+    // type (subagent / job / episodic).
+    if (deps.activeAgentId.value) {
+        deps.saveActiveSession(deps.activeAgentId.value, targetSessionId);
+    }
     deps.sessionSwitchLoading.value = true;
 
     try {
