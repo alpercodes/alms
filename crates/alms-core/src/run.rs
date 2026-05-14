@@ -263,6 +263,21 @@ pub enum RunStatus {
     Cancelled,
 }
 
+impl RunStatus {
+    /// Returns `true` when the status is one of the absorbing terminal
+    /// states (`Completed`, `Failed`, `Cancelled`).
+    ///
+    /// Used by [`Run::mark_completed`] / [`Run::mark_failed`] /
+    /// [`Run::mark_cancelled`] to make terminal transitions idempotent —
+    /// callers receive `false` and know to skip the terminal-arm
+    /// bookkeeping (#1052: DM `dm_conversation_ended` emission, episodic
+    /// summary spawn, `run_finished`/`run_cancelled`/`run_error`
+    /// broadcasts).
+    pub fn is_terminal(self) -> bool {
+        matches!(self, Self::Completed | Self::Failed | Self::Cancelled)
+    }
+}
+
 /// A run represents a single agent execution
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Run {
@@ -356,7 +371,9 @@ impl Run {
     /// returned bool is used by `RunManager::mark_run_as_completed` to
     /// gate duplicate `run_finished` SSE broadcasts when an HTTP cancel
     /// races against natural completion (issue #1046 — symmetric hole in
-    /// the original cancel-flip fix).
+    /// the original cancel-flip fix; refined in #1052 to also gate
+    /// terminal-arm bookkeeping such as `dm_conversation_ended` and
+    /// episodic-summary writes).
     ///
     /// `Queued → Completed` is rejected (returns `false`) because in
     /// practice `execute_run`'s `Ok(_)` arm only fires after
@@ -387,7 +404,7 @@ impl Run {
     /// idempotency contract of [`Self::mark_completed`] and
     /// [`Self::mark_cancelled`] so the gateway's three terminal-arm
     /// broadcasts can share a single first-writer-wins shape (issue
-    /// #1046).
+    /// #1046; gated terminal-arm bookkeeping added in #1052).
     ///
     /// Allows both `Running → Failed` AND `Queued → Failed`. The
     /// `Queued → Failed` transition is the legitimate setup-error path:

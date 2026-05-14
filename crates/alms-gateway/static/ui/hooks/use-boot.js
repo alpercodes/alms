@@ -1,5 +1,5 @@
 import { fetchSettings } from '../api/settings.js';
-import { listSessions, createSession } from '../api/sessions.js';
+import { listSessions, createSession, getSessionMessages } from '../api/sessions.js';
 import { agents, activeAgentId } from '../state/agents.js';
 import { sessions, activeSessionId, showNotifications, crossAgentSessions, expandedAgentId } from '../state/sessions.js';
 import { activeRunId, selectedRunId, runs } from '../state/runs.js';
@@ -50,6 +50,68 @@ function loadActiveSession(agentId, agentSessions, preferred) {
         if (match) return match;
     }
     return agentSessions[0] || null;
+}
+
+/**
+ * Resolve a stored session id to a usable id, even when the session is
+ * intentionally hidden from `GET /sessions` (subagent / job / episodic
+ * sessions — see `is_internal_context_id` in
+ * `crates/alms-gateway/src/runs/mod.rs`). Returns the stored id if a
+ * lightweight existence check succeeds, otherwise `null` so the caller
+ * falls back to the agent's visible session list. (#1045)
+ *
+ * Subagent sessions are reached via SubagentBar's "View session" button,
+ * the SubagentCompletionCard, or the Runs tab — all paths persist the
+ * subagent session id in `alms_active_session_<agentId>` via
+ * `saveActiveSession`. Without this resolver, a page reload that finds
+ * a subagent (or job / episodic) session id in localStorage falls
+ * straight through to `agentSessions[0]` because the id isn't in the
+ * per-agent visible list, and the operator lands on the parent's first
+ * chat session with the subagent transcript silently dropped. When the
+ * parent agent has no chat sessions at all, `loadAgentSessions` enters
+ * the `agentSessions.length === 0` branch and creates an empty new chat
+ * — which is the exact "empty chat pane" the issue reports.
+ *
+ * The existence probe uses `GET /sessions/{id}/messages` because:
+ * - It is the same endpoint `loadSession` calls on success, so the
+ *   payload becomes warm in the browser's HTTP cache for the subsequent
+ *   load (no `cache-control: no-store` on this endpoint, unlike the
+ *   embedded UI assets — but this is still cheap regardless).
+ * - There is no dedicated `GET /sessions/{id}` metadata endpoint to
+ *   probe more cheaply (added complexity not justified for one extra
+ *   round-trip on boot).
+ *
+ * A 404 (deleted or never-existed session) returns `null`, which falls
+ * back to the previous behaviour: pick the first visible session, or
+ * create one if none exist. Any other error (network / 5xx) is also
+ * treated as `null` so a transient backend hiccup never strands the
+ * operator on an error chat-pane — they get the agent's first session
+ * instead and can retry navigation manually.
+ *
+ * @param {string} agentId
+ * @param {Array} agentSessions Visible session list (post-filter).
+ * @returns {Promise<string|null>} The resolved session id, or null.
+ */
+async function resolveStoredSessionId(agentId, agentSessions) {
+    const stored = localStorage.getItem(sessionStorageKey(agentId));
+    if (!stored) return null;
+    // Already covered by the standard `loadActiveSession` path.
+    if (agentSessions.some(s => s.id === stored)) return null;
+    try {
+        await getSessionMessages(stored);
+        return stored;
+    } catch (err) {
+        // 404 -> session is genuinely gone; clear the stale pointer so
+        // future reloads stop probing it. Other errors (network blip,
+        // 5xx) leave the pointer in place; the operator can navigate
+        // manually and the value may resolve on a later boot.
+        // `apiFetch` (api/client.js) attaches `status` to the thrown
+        // error envelope, so checking that field directly is sufficient.
+        if (err && err.status === 404) {
+            localStorage.removeItem(sessionStorageKey(agentId));
+        }
+        return null;
+    }
 }
 
 /**
@@ -166,7 +228,34 @@ async function loadAgentSessions(agentId, preferredSessionId) {
         // update bgRuns live.  Closes any previously open stream.
         openAgentEventsStream(agentId);
 
-        if (agentSessions.length > 0) {
+        // If a caller-supplied `preferredSessionId` was passed (cross-agent
+        // `navigateToSession`), that takes precedence — `loadActiveSession`
+        // honours it below. Otherwise: if localStorage points at a hidden
+        // session (subagent / job / episodic — these are intentionally
+        // excluded from `/sessions` by `is_internal_context_id`), the
+        // standard `loadActiveSession` path can't find a match and would
+        // either fall back to the first visible session OR — when the agent
+        // has no visible chats — drop into the `else` branch and silently
+        // create a brand-new empty chat. That's the #1045 "subagent renders
+        // empty" symptom: the operator reloaded while viewing a subagent
+        // and got either the parent's chat (wrong content) or a freshly
+        // minted empty chat (the literal blank pane). Probe the stored id
+        // first so the navigation survives reload.
+        const hiddenSessionId = preferredSessionId
+            ? null
+            : await resolveStoredSessionId(agentId, agentSessions);
+        if (gen !== switchGeneration) return; // stale — discard
+        if (hiddenSessionId) {
+            activeSessionId.value = hiddenSessionId;
+            // `saveActiveSession` is a no-op when the stored value is
+            // already the same — keeping it explicit so the persistence
+            // contract is obvious here too.
+            saveActiveSession(agentId, hiddenSessionId);
+            await loadSession(hiddenSessionId, {
+                isStale: () => gen !== switchGeneration,
+                logPrefix: 'loadAgentSessions:hidden',
+            });
+        } else if (agentSessions.length > 0) {
             const selected = loadActiveSession(agentId, agentSessions, preferredSessionId);
             activeSessionId.value = selected.id;
             // Re-persist in case the session list changed
