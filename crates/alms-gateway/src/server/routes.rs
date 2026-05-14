@@ -19,7 +19,7 @@ use crate::runs::{
 use crate::settings::{get_settings, patch_settings};
 use crate::workspace::{get_workspace, open_workspace, update_workspace_file};
 use alms_core::{AgentId, SessionId, dm_participants};
-use alms_session::{Content, Role};
+use alms_session::{Content, Role, Session};
 use axum::{
     Json, Router,
     body::Bytes,
@@ -167,6 +167,19 @@ pub(crate) fn protected_router() -> Router<AppState> {
         .route("/", get(serve_ui))
         // Sessions
         .route("/sessions", get(list_sessions).post(create_session))
+        // Single-session metadata probe (#1065). Singular path is a
+        // deliberate visual-separation choice — `matchit` (axum's path
+        // matcher) distinguishes routes by segment count first, so a
+        // single-segment `GET /sessions/<uuid>` would NOT collide with
+        // the two-segment `GET /sessions/{agent_id}/{context_id}` route
+        // below; both already coexist (see the `/sessions/{session_id}`
+        // `delete` and `/messages`/`/tool-calls` routes). The singular
+        // path is kept because `GET /sessions/<uuid>` returning a single
+        // envelope vs `GET /sessions` returning a list-of-envelopes
+        // reads as visually similar and tripped up frontend code during
+        // the #1065 review; the different segment name removes that
+        // ambiguity for human readers.
+        .route("/session/{session_id}", get(get_session_metadata))
         .route("/sessions/{session_id}", delete(delete_session_by_id))
         .route("/sessions/{session_id}/messages", get(get_session_messages))
         .route(
@@ -338,33 +351,148 @@ async fn list_sessions(
             }
         }
 
-        // Build the enriched JSON object
-        let mut obj = serde_json::to_value(&session).unwrap_or_default();
-        obj["session_type"] = serde_json::json!(session_type);
-        // `has_active_run` powers the sidebar's "active" indicator on
-        // initial load / SSE reconnect (#856).
-        obj["has_active_run"] = serde_json::json!(state.run_manager.has_active_runs(session.id));
-
-        // Type-specific enrichments
-        match session_type {
-            "dm" => {
-                if let Some((a, b)) = dm_participants(&session.context_id) {
-                    obj["participants"] = serde_json::json!([a, b]);
-                }
-            }
-            "notification" => {
-                // Extract agent name from "notifications:{agent}" context_id
-                if let Some(agent_name) = session.context_id.strip_prefix("notifications:") {
-                    obj["agent_name"] = serde_json::json!(agent_name);
-                }
-            }
-            _ => {}
-        }
+        // Build the enriched JSON object.
+        //
+        // `include_parent_session_id = false` here: the per-subagent-session
+        // `parent_run_id` -> parent `session_id` walk would be an N x lookup
+        // across all subagent rows in `runs`, and the sidebar does not need
+        // it (subagent sessions are filtered out of `list_sessions` entirely
+        // unless an inclusion flag is added later). The new
+        // `GET /session/{session_id}` endpoint (Iris's spec for #1065) is
+        // the cheap one-shot probe path that pays for it.
+        let obj = enrich_session_json(&state, &session, session_type, false);
 
         result.push(obj);
     }
 
     Json(serde_json::json!({ "sessions": result }))
+}
+
+/// Build the enriched JSON object for a single session, used both by the
+/// `GET /sessions` list endpoint and the `GET /session/{session_id}`
+/// single-session lookup.
+///
+/// Adds the same fields list_sessions has always exposed
+/// (`session_type`, `has_active_run`, `participants` for DM,
+/// `agent_name` for notification sessions), plus — when
+/// `include_parent_session_id` is true — a `parent_session_id` field
+/// for sessions whose `session_type` is `"subagent"`.
+///
+/// `parent_session_id` derivation:
+///
+/// 1. Walk ALL runs on this session and pick the first one whose
+///    `parent_run_id` is `Some(_)`. Walking every run (not just the
+///    newest) matters because a later run on the same `subagent_*`
+///    session may carry `parent_run_id: None` — e.g. a manual
+///    `POST /runs` that goes through `Run::new` instead of
+///    `Run::for_subagent`, or a system-triggered notification run.
+///    The original spawning run (which by construction goes through
+///    `Run::for_subagent`) is the breadcrumb we need to surface.
+/// 2. Look up that parent run by id and return its `session_id`.
+/// 3. Return `null` if either lookup misses — the parent run may no
+///    longer be resident in memory (`run_manager` is in-process), and
+///    a missing parent should never fail this read-only probe.
+///
+/// Memory cost: subagent sessions are typically small (a handful of
+/// runs each), and `list_by_session` already clones a `Vec<Run>` of
+/// the full session today regardless of `limit` (it filters, collects,
+/// sorts, then truncates), so passing `usize::MAX` here is no more
+/// expensive than the previous `1`. The `find` short-circuits on the
+/// first parent-linked match.
+///
+/// `parent_session_id` is omitted from non-subagent sessions because
+/// the field is meaningless there; the field is always emitted (as
+/// `null`) for subagent sessions so the frontend can branch on its
+/// presence without checking `session_type` first.
+fn enrich_session_json(
+    state: &AppState,
+    session: &Session,
+    session_type: &'static str,
+    include_parent_session_id: bool,
+) -> serde_json::Value {
+    let mut obj = serde_json::to_value(session).unwrap_or_default();
+    obj["session_type"] = serde_json::json!(session_type);
+    // `has_active_run` powers the sidebar's "active" indicator on
+    // initial load / SSE reconnect (#856).
+    obj["has_active_run"] = serde_json::json!(state.run_manager.has_active_runs(session.id));
+
+    // Type-specific enrichments.
+    match session_type {
+        "dm" => {
+            if let Some((a, b)) = dm_participants(&session.context_id) {
+                obj["participants"] = serde_json::json!([a, b]);
+            }
+        }
+        "notification" => {
+            // Extract agent name from "notifications:{agent}" context_id.
+            if let Some(agent_name) = session.context_id.strip_prefix("notifications:") {
+                obj["agent_name"] = serde_json::json!(agent_name);
+            }
+        }
+        _ => {}
+    }
+
+    // Parent-session breadcrumb derivation (#1065). Only meaningful for
+    // subagent sessions; emitted as `null` when the parent run is no
+    // longer resident (defensive — `run_manager` is in-memory).
+    //
+    // Walk ALL runs on the session and pick the first one carrying
+    // `parent_run_id`. Looking at only the newest run (as the initial
+    // shipping of #1065 did) would miss the breadcrumb if a later
+    // parent-less run was added to the same subagent session — e.g. a
+    // manual `POST /runs` going through `Run::new` instead of
+    // `Run::for_subagent`, or a system-triggered notification run.
+    if include_parent_session_id && session_type == "subagent" {
+        let parent_session_id = state
+            .run_manager
+            .list_by_session(session.id, usize::MAX)
+            .into_iter()
+            .find_map(|run| run.parent_run_id)
+            .and_then(|parent_run_id| state.run_manager.get_run(parent_run_id))
+            .map(|parent_run| parent_run.session_id);
+        obj["parent_session_id"] = match parent_session_id {
+            Some(id) => serde_json::json!(id),
+            None => serde_json::Value::Null,
+        };
+    }
+
+    obj
+}
+
+/// GET /session/{session_id} — return the enriched session envelope for a
+/// single session (#1065).
+///
+/// Singular `/session/` (not plural `/sessions/`) is a deliberate
+/// visual-separation choice — `matchit` (axum's path matcher)
+/// distinguishes routes by segment count first, so a one-segment
+/// `GET /sessions/<uuid>` would NOT collide with the two-segment
+/// `GET /sessions/{agent_id}/{context_id}` handler. The singular form
+/// is preferred because `GET /sessions/<uuid>` (single envelope) and
+/// `GET /sessions` (list of envelopes) read as visually similar and
+/// tripped up frontend code during the #1065 review; the different
+/// segment name removes that ambiguity for human readers.
+///
+/// Returns the same fields as a single entry from `GET /sessions`
+/// (`id`, `agent_id`, `context_id`, `created_at`, `last_activity`,
+/// `status`, `session_type`, `has_active_run`, plus `participants` /
+/// `agent_name` for the DM / notification cases) and additionally
+/// surfaces `parent_session_id` for subagent sessions so the frontend
+/// can render the "← Back to parent session" breadcrumb and the
+/// "Subagent session — read-only" header on resolver-led boot.
+async fn get_session_metadata(
+    State(state): State<AppState>,
+    Path(session_id): Path<SessionId>,
+) -> impl IntoResponse {
+    match state.session_manager.get(session_id) {
+        Ok(session) => {
+            let session_type = classify_session_type(&session.context_id);
+            let body = enrich_session_json(&state, &session, session_type, true);
+            Json(body).into_response()
+        }
+        Err(_) => {
+            api_error(StatusCode::NOT_FOUND, "NOT_FOUND", "Session not found").into_response()
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -675,4 +803,337 @@ pub(crate) struct CreateSessionResponse {
 struct AuditQuery {
     session_id: alms_core::SessionId,
     limit: Option<usize>,
+}
+
+// ---------------------------------------------------------------------------
+// Tests — `GET /session/{session_id}` (#1065)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    //! Tests for the `GET /session/{session_id}` single-session metadata
+    //! endpoint added for #1065 (subagent breadcrumb + read-only banner on
+    //! resolver-led boot).
+    //!
+    //! The tests exercise the four cases called out in Iris's spec:
+    //!
+    //! - 200 for a regular chat session (`session_type: "chat"`,
+    //!   `parent_session_id` omitted)
+    //! - 200 for a subagent session whose parent run is resident
+    //!   (`session_type: "subagent"`, `parent_session_id` = parent's
+    //!   `session_id`)
+    //! - 200 for a subagent session whose parent run is no longer resident
+    //!   (`parent_session_id: null` — defensive case)
+    //! - 404 for a non-existent session id
+    //! - 200 for a DM session — exercises the `participants` enrichment
+    //!   reused from `list_sessions`.
+    //! - 200 for a notification session — exercises the `agent_name`
+    //!   enrichment reused from `list_sessions`.
+    use super::*;
+    use crate::server::AppState;
+    use alms_core::Run;
+
+    /// Build a minimal `AppState` with in-memory session storage. Matches
+    /// `runs::integration_tests::test_app_state` but lives here so the
+    /// `routes` test module is self-contained.
+    fn test_app_state() -> AppState {
+        let gateway = crate::gateway::Gateway::new(crate::gateway::GatewayConfig::default())
+            .expect("gateway construction");
+        let scheduler = std::sync::Arc::new(alms_runtime::Scheduler::new());
+        let shutdown_token = tokio_util::sync::CancellationToken::new();
+        let (completion_tx, _completion_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (trigger_tx, _trigger_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (dm_event_tx, _dm_event_rx) = tokio::sync::mpsc::unbounded_channel();
+        AppState::new(
+            gateway,
+            scheduler,
+            shutdown_token,
+            completion_tx,
+            trigger_tx,
+            dm_event_tx,
+        )
+        .expect("AppState::new")
+    }
+
+    /// Drive the handler through axum's `IntoResponse` and return
+    /// `(StatusCode, JSON body)`. Mirrors the `invoke_open` helper in
+    /// `crate::workspace::tests`.
+    async fn invoke_get_session_metadata(
+        state: AppState,
+        session_id: SessionId,
+    ) -> (StatusCode, serde_json::Value) {
+        use axum::body::to_bytes;
+        let resp =
+            get_session_metadata(axum::extract::State(state), axum::extract::Path(session_id))
+                .await
+                .into_response();
+        let status = resp.status();
+        let bytes = to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .expect("body to bytes");
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
+        (status, body)
+    }
+
+    #[tokio::test]
+    async fn get_session_metadata_returns_chat_envelope() {
+        let state = test_app_state();
+        let agent_id = AgentId::new();
+        let session = state
+            .session_manager
+            .get_or_create(agent_id, "regular-chat");
+        let session_id = session.id;
+
+        let (status, body) = invoke_get_session_metadata(state, session_id).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["id"], serde_json::json!(session_id));
+        assert_eq!(body["agent_id"], serde_json::json!(agent_id));
+        assert_eq!(body["context_id"], "regular-chat");
+        assert_eq!(body["session_type"], "chat");
+        assert_eq!(body["has_active_run"], false);
+        // `parent_session_id` is only added for subagent sessions — confirm
+        // it is absent (not present-as-null) on the chat path so callers
+        // can use field presence as a shortcut to "is this a subagent
+        // session" if they want to.
+        assert!(
+            body.get("parent_session_id").is_none(),
+            "parent_session_id should be omitted for non-subagent sessions; \
+             got body = {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_session_metadata_returns_404_for_unknown_session() {
+        let state = test_app_state();
+        let unknown = SessionId::new();
+
+        let (status, body) = invoke_get_session_metadata(state, unknown).await;
+
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["error"]["code"], "NOT_FOUND");
+    }
+
+    #[tokio::test]
+    async fn get_session_metadata_subagent_resolves_parent_session_id() {
+        let state = test_app_state();
+        let parent_agent_id = AgentId::new();
+        let sub_agent_id = AgentId::new();
+
+        // Parent session + a single Run on it — this Run is what the
+        // subagent run's `parent_run_id` will point at.
+        let parent_session = state
+            .session_manager
+            .get_or_create(parent_agent_id, "parent-chat");
+        let parent_session_id = parent_session.id;
+        let parent_run = Run::new(parent_session_id, parent_agent_id, "user input".into());
+        let parent_run_id = parent_run.run_id;
+        state.run_manager.insert_run(parent_run);
+
+        // Subagent session (context_id must start with `subagent_` so
+        // `classify_session_type` returns `"subagent"`), plus a run on
+        // that session whose `parent_run_id` is set.
+        let sub_context_id = format!("subagent_{}", uuid::Uuid::new_v4());
+        let sub_session = state
+            .session_manager
+            .get_or_create(sub_agent_id, sub_context_id);
+        let sub_session_id = sub_session.id;
+        let sub_run = Run::for_subagent(
+            sub_session_id,
+            sub_agent_id,
+            "subagent input".into(),
+            parent_run_id,
+        );
+        state.run_manager.insert_run(sub_run);
+
+        let (status, body) = invoke_get_session_metadata(state, sub_session_id).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["session_type"], "subagent");
+        assert_eq!(
+            body["parent_session_id"],
+            serde_json::json!(parent_session_id)
+        );
+    }
+
+    #[tokio::test]
+    async fn get_session_metadata_subagent_missing_parent_run_returns_null() {
+        // Defensive case from Iris's spec: subagent session exists, but
+        // the parent run is no longer resident in `run_manager`. Endpoint
+        // must return 200 with `parent_session_id: null` rather than
+        // surfacing the lookup miss as an error.
+        let state = test_app_state();
+        let sub_agent_id = AgentId::new();
+
+        let sub_context_id = format!("subagent_{}", uuid::Uuid::new_v4());
+        let sub_session = state
+            .session_manager
+            .get_or_create(sub_agent_id, sub_context_id);
+        let sub_session_id = sub_session.id;
+
+        // Subagent run points at a parent_run_id whose Run is NOT in
+        // run_manager (simulating "parent run evicted from memory").
+        let phantom_parent_run_id = alms_core::RunId::new();
+        let sub_run = Run::for_subagent(
+            sub_session_id,
+            sub_agent_id,
+            "subagent input".into(),
+            phantom_parent_run_id,
+        );
+        state.run_manager.insert_run(sub_run);
+
+        let (status, body) = invoke_get_session_metadata(state, sub_session_id).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["session_type"], "subagent");
+        assert!(
+            body["parent_session_id"].is_null(),
+            "expected null parent_session_id when parent run is not resident; \
+             got body = {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_session_metadata_subagent_later_parentless_run_does_not_blind_lookup() {
+        // Codex follow-up on #1067: if a later run on the same subagent
+        // session lands without `parent_run_id` (e.g. a manual
+        // `POST /runs` going through `Run::new`, or a system-triggered
+        // notification run), the endpoint must still surface the
+        // original parent breadcrumb from the older parent-linked run.
+        //
+        // `list_by_session` returns newest-first, so before the fix the
+        // initial `next()` would have picked the parent-less run and
+        // returned `null`. After the fix, the walk runs `find_map` over
+        // all runs on the session and short-circuits on the first
+        // `parent_run_id.is_some()` match.
+        let state = test_app_state();
+        let parent_agent_id = AgentId::new();
+        let sub_agent_id = AgentId::new();
+
+        // Parent session + the run the subagent's `parent_run_id` points at.
+        let parent_session = state
+            .session_manager
+            .get_or_create(parent_agent_id, "parent-chat");
+        let parent_session_id = parent_session.id;
+        let parent_run = Run::new(parent_session_id, parent_agent_id, "user input".into());
+        let parent_run_id = parent_run.run_id;
+        state.run_manager.insert_run(parent_run);
+
+        // Subagent session — first run goes through `Run::for_subagent`
+        // and carries the breadcrumb.
+        let sub_context_id = format!("subagent_{}", uuid::Uuid::new_v4());
+        let sub_session = state
+            .session_manager
+            .get_or_create(sub_agent_id, sub_context_id);
+        let sub_session_id = sub_session.id;
+        let original_sub_run = Run::for_subagent(
+            sub_session_id,
+            sub_agent_id,
+            "subagent input".into(),
+            parent_run_id,
+        );
+        state.run_manager.insert_run(original_sub_run);
+
+        // ...then a LATER run lands on the same session without a
+        // parent breadcrumb. Use a strictly-later `created_at` so the
+        // newest-first sort in `list_by_session` puts this run ahead of
+        // the original parent-linked one — otherwise the lookup could
+        // pass for the wrong reason (the original ordering happens to
+        // keep the breadcrumb first).
+        let mut parentless_later_run =
+            Run::new(sub_session_id, sub_agent_id, "follow-up input".into());
+        parentless_later_run.created_at = chrono::Utc::now() + chrono::Duration::seconds(60);
+        state.run_manager.insert_run(parentless_later_run);
+
+        // Sanity: the newest-first ordering really does put the
+        // parent-less run ahead of the parent-linked one. If this
+        // assert ever fires the test below is no longer exercising
+        // the path it's named after.
+        let ordered = state
+            .run_manager
+            .list_by_session(sub_session_id, usize::MAX);
+        assert!(
+            ordered
+                .first()
+                .map(|r| r.parent_run_id.is_none())
+                .unwrap_or(false),
+            "test precondition: newest-first should put the parent-less run first; got: {ordered:?}"
+        );
+
+        let (status, body) = invoke_get_session_metadata(state, sub_session_id).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["session_type"], "subagent");
+        assert_eq!(
+            body["parent_session_id"],
+            serde_json::json!(parent_session_id),
+            "newer parent-less run must not shadow an older parent-linked breadcrumb; \
+             got body = {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_session_metadata_subagent_no_runs_returns_null() {
+        // Edge case: subagent session exists but has no runs at all in
+        // memory yet (or all runs have been evicted). `list_by_session`
+        // returns empty; `parent_session_id` must still be `null`, not
+        // missing.
+        let state = test_app_state();
+        let sub_agent_id = AgentId::new();
+        let sub_context_id = format!("subagent_{}", uuid::Uuid::new_v4());
+        let sub_session = state
+            .session_manager
+            .get_or_create(sub_agent_id, sub_context_id);
+        let sub_session_id = sub_session.id;
+
+        let (status, body) = invoke_get_session_metadata(state, sub_session_id).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["session_type"], "subagent");
+        assert!(
+            body["parent_session_id"].is_null(),
+            "expected null parent_session_id for subagent session with no runs; \
+             got body = {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_session_metadata_dm_envelope_includes_participants() {
+        let state = test_app_state();
+        // DM sessions are created under the AgentId::nil() sentinel.
+        let session = state
+            .session_manager
+            .get_or_create(AgentId::nil(), "dm:alice:bob");
+        let session_id = session.id;
+
+        let (status, body) = invoke_get_session_metadata(state, session_id).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["session_type"], "dm");
+        assert_eq!(body["participants"], serde_json::json!(["alice", "bob"]));
+        assert!(
+            body.get("parent_session_id").is_none(),
+            "parent_session_id should be omitted for DM sessions"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_session_metadata_notification_envelope_includes_agent_name() {
+        let state = test_app_state();
+        let agent_id = AgentId::new();
+        let session = state
+            .session_manager
+            .get_or_create(agent_id, "notifications:my-agent");
+        let session_id = session.id;
+
+        let (status, body) = invoke_get_session_metadata(state, session_id).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["session_type"], "notification");
+        assert_eq!(body["agent_name"], "my-agent");
+        assert!(
+            body.get("parent_session_id").is_none(),
+            "parent_session_id should be omitted for notification sessions"
+        );
+    }
 }
