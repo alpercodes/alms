@@ -18,7 +18,7 @@
  *      bar shows "Chatting with {peer}..." via an async agent-runs check.
  */
 
-import { getSessionMessages, getSessionToolCalls } from '../api/sessions.js';
+import { getSession, getSessionMessages, getSessionToolCalls } from '../api/sessions.js';
 import { listRuns, listApprovals, listAgentRuns, getRun, getRunReasoning } from '../api/runs.js';
 import { mapHistoryMessages, groupDmReasoningBlocks } from './history.js';
 import { normalizeApproval } from './approvals.js';
@@ -30,7 +30,15 @@ import { setAgentPhase, clearAgentPhase, setDmContext } from '../state/agent-sta
 import { sessions } from '../state/sessions.js';
 import { activeAgent } from '../state/agents.js';
 import { getPendingMessage, clearPendingMessage } from '../state/pending-messages.js';
-import { rehydrateSubagentsFromHistory } from '../state/subagents.js';
+import { rehydrateSubagentsFromHistory, parentSessionId } from '../state/subagents.js';
+
+/** Internal session types that `/sessions` (list) deliberately filters out
+ *  via `is_internal_context_id`. When the resolver-led boot path lands on
+ *  one of these as the active session, the envelope must be injected into
+ *  `sessions.value` directly so `activeSession` / `isInternalSession`
+ *  resolve correctly — `loadSession` is the single chokepoint where that
+ *  happens. (#1065) */
+const INTERNAL_SESSION_TYPES = new Set(['subagent', 'job', 'episodic', 'notification']);
 
 /**
  * Maximum number of session runs to fetch when restoring active-run state.
@@ -81,6 +89,57 @@ const AGENT_RUNS_RESTORE_LIMIT = 100;
 export async function loadSession(sessionId, opts) {
     const isStale = opts.isStale;
     const logPrefix = opts.logPrefix || 'loadSession';
+
+    // Step 0: Fetch the single-session metadata envelope (#1065).
+    //
+    // Two reasons this has to come before step 1:
+    //  - For internal session types (subagent / job / episodic /
+    //    notification) the active session is intentionally filtered out
+    //    of `/sessions` by `is_internal_context_id`, so the sidebar's
+    //    `sessions.value` does not contain it. Injecting the envelope
+    //    here is what lets `activeSession` / `isInternalSession` resolve
+    //    on the resolver-led boot path (reload while a subagent session
+    //    is active) — without it the read-only banner stays suppressed.
+    //  - `parent_session_id` is the backend's authoritative parent
+    //    pointer for subagent sessions. Populating `parentSessionId.value`
+    //    from it here is what renders the "← Back to parent session"
+    //    breadcrumb after reload (the drill-down path sets this via
+    //    `navigateToSubagentSession`; the boot path had no equivalent
+    //    until the backend exposed `parent_session_id` in #1067).
+    //
+    // Non-fatal: if the envelope fetch fails we fall through to existing
+    // behaviour. Older backends without `GET /session/{id}` will 404 here
+    // and the rest of the load proceeds normally.
+    try {
+        const session = await getSession(sessionId);
+        if (isStale()) return;
+
+        // Inject the active session into `sessions.value` when it is an
+        // internal type that the `/sessions` filter excludes. Bypasses
+        // the filter for this single envelope only — the sidebar still
+        // hides internal sessions from its list.
+        if (session
+            && INTERNAL_SESSION_TYPES.has(session.session_type)
+            && !sessions.value.some(s => s.id === session.id)) {
+            sessions.value = [...sessions.value, session];
+        }
+
+        // Populate the breadcrumb pointer from the backend. `parent_session_id`
+        // is only emitted on subagent envelopes (uuid-or-null); for non-
+        // subagent sessions the field is omitted, so reset to null so a
+        // stale breadcrumb from a previous subagent view doesn't linger.
+        if (session && Object.prototype.hasOwnProperty.call(session, 'parent_session_id')) {
+            parentSessionId.value = session.parent_session_id ?? null;
+        } else {
+            parentSessionId.value = null;
+        }
+    } catch (err) {
+        if (isStale()) return;
+        // Non-fatal — log and continue. The read-only banner / breadcrumb
+        // may not render, but the session itself still loads via the
+        // existing messages / runs / SSE path below.
+        console.warn(`[${logPrefix}] Failed to fetch session metadata:`, err);
+    }
 
     // Step 1: Fetch runs and restore activeRunId for any in-progress run.
     // This must happen before history loading so that mapHistoryMessages
