@@ -236,42 +236,36 @@ impl RunManager {
     /// Returns `true` if the run was actually transitioned from `Running`
     /// to `Completed`, `false` if the run was already in a terminal state
     /// or had not yet been marked `Running` (or did not exist). Callers
-    /// that need to fan out a `run_finished` SSE event should gate the
-    /// broadcast on this return value so the event fires exactly once
-    /// per run, even when an HTTP `cancel_run` races against natural
-    /// completion. See issue #1046 for the race motivation — this is the
-    /// symmetric counterpart to [`Self::mark_run_as_cancelled`]'s gate
-    /// on the Ok-arm side.
+    /// that need to fan out a `run_finished` SSE event (or any other
+    /// post-completion bookkeeping — episodic summary, DM lifecycle
+    /// handler) MUST gate on this return value so the side effects fire
+    /// exactly once per run, even when an HTTP `cancel_run` races against
+    /// natural completion. See issues #1046 and #1052 for the race
+    /// motivation. Skips the SQLite write when no transition occurred so
+    /// a stale `Completed` snapshot can't clobber an existing
+    /// `Cancelled`/`Failed` row.
+    #[must_use]
     pub fn mark_run_as_completed(
         &self,
         run_id: RunId,
         output: String,
         usage: alms_core::TokenUsage,
     ) -> bool {
-        let mut transitioned = false;
-        let snapshot = self.modify_and_snapshot(run_id, |r| {
-            transitioned = r.mark_completed(output, usage);
-        });
-        self.persist_snapshot(run_id, snapshot);
-        transitioned
+        self.modify_and_persist_if(run_id, |r| r.mark_completed(output, usage))
     }
 
     /// Atomically transition a run to Failed state and persist the snapshot.
     ///
     /// Returns `true` if the run was actually transitioned to `Failed`
     /// from `Queued` or `Running`, `false` if the run was already in a
-    /// terminal state (or did not exist). Callers that need to fan out
-    /// a `run_error` SSE event should gate the broadcast on this return
+    /// terminal state (or did not exist). Callers that need to fan out a
+    /// `run_error` SSE event should gate the broadcast on this return
     /// value — same first-writer-wins shape as
     /// [`Self::mark_run_as_cancelled`] and [`Self::mark_run_as_completed`].
-    /// See issue #1046.
+    /// See issues #1046 / #1052.
+    #[must_use]
     pub fn mark_run_as_failed(&self, run_id: RunId, error: String) -> bool {
-        let mut transitioned = false;
-        let snapshot = self.modify_and_snapshot(run_id, |r| {
-            transitioned = r.mark_failed(error);
-        });
-        self.persist_snapshot(run_id, snapshot);
-        transitioned
+        self.modify_and_persist_if(run_id, |r| r.mark_failed(error))
     }
 
     /// Atomically transition a run to Cancelled state and persist the snapshot.
@@ -281,14 +275,40 @@ impl RunManager {
     /// already in a terminal state (or did not exist). Callers that need to
     /// fan out a `run_cancelled` SSE event should gate the broadcast on this
     /// return value so the event fires exactly once per run, even when the
-    /// HTTP `cancel_run` handler races against `execute_run`'s terminal arm
-    /// for the same `(run_id)`. See issue #1046 for the race motivation.
+    /// synchronous HTTP `cancel_run` handler (#1050) races against
+    /// `execute_run`'s terminal arm for the same `(run_id)`. See issues
+    /// #1046 / #1052 for the race motivation.
+    #[must_use]
     pub fn mark_run_as_cancelled(&self, run_id: RunId) -> bool {
-        let mut transitioned = false;
-        let snapshot = self.modify_and_snapshot(run_id, |r| {
-            transitioned = r.mark_cancelled();
-        });
-        self.persist_snapshot(run_id, snapshot);
+        self.modify_and_persist_if(run_id, |r| r.mark_cancelled())
+    }
+
+    /// Modify a run under DashMap lock; persist the snapshot only when the
+    /// closure reports a real transition.
+    ///
+    /// Used by the three [`alms_core::Run::mark_completed`] /
+    /// [`alms_core::Run::mark_failed`] / [`alms_core::Run::mark_cancelled`]
+    /// terminal transitions, all of which return `bool` (#1052). If the
+    /// run was already terminal the closure returns `false`, we skip the
+    /// SQLite write to avoid clobbering the existing terminal row, and we
+    /// propagate `false` to the caller so it can skip its post-flip side
+    /// effects (DM lifecycle, SSE broadcast, episodic summary).
+    fn modify_and_persist_if(&self, run_id: RunId, f: impl FnOnce(&mut Run) -> bool) -> bool {
+        let Some(mut entry) = self.runs.get_mut(&run_id) else {
+            return false;
+        };
+        let transitioned = f(entry.value_mut());
+        let snapshot = if transitioned {
+            Some(entry.clone())
+        } else {
+            None
+        };
+        // Drop the DashMap lock before the SQLite write to keep the
+        // critical section short.
+        drop(entry);
+        if transitioned {
+            self.persist_snapshot(run_id, snapshot);
+        }
         transitioned
     }
 
@@ -881,7 +901,7 @@ mod tests {
         assert!(rm.agent_has_running_run(agent_id));
 
         // Mark it Completed — back to false.
-        rm.mark_run_as_completed(queued_id, "output".into(), Default::default());
+        assert!(rm.mark_run_as_completed(queued_id, "output".into(), Default::default()));
         assert!(!rm.agent_has_running_run(agent_id));
     }
 
@@ -908,11 +928,65 @@ mod tests {
         let run_id = run.run_id;
         rm.insert_run(run);
         rm.mark_run_as_running(run_id);
-        rm.mark_run_as_cancelled(run_id);
+        assert!(rm.mark_run_as_cancelled(run_id));
 
         let r = rm.get_run(run_id).unwrap();
         assert_eq!(r.status, alms_core::RunStatus::Cancelled);
         assert!(r.ended_at.is_some());
+    }
+
+    /// #1052 — terminal transitions are idempotent and return `false` on
+    /// the second call. The lifecycle layer reads this bool to decide
+    /// whether to fire `dm_conversation_ended` / `run_finished` /
+    /// `run_error` SSE events; an already-terminal run must yield a
+    /// `false` so the racing arm doesn't double-broadcast or strand the
+    /// DM peer's conversation-state model.
+    #[tokio::test]
+    async fn test_mark_run_terminal_is_idempotent() {
+        let rm = RunManager::new();
+        let run = Run::new(SessionId::new(), AgentId::new(), "test".to_string());
+        let run_id = run.run_id;
+        rm.insert_run(run);
+        rm.mark_run_as_running(run_id);
+
+        // First cancel wins.
+        assert!(
+            rm.mark_run_as_cancelled(run_id),
+            "first mark_run_as_cancelled must return true"
+        );
+
+        // Second cancel is a no-op — the bool gate is what
+        // `execute_run`'s terminal arms rely on (#1052).
+        assert!(
+            !rm.mark_run_as_cancelled(run_id),
+            "second mark_run_as_cancelled on an already-Cancelled run must return false"
+        );
+
+        // A racing `mark_run_as_completed` must NOT overwrite the
+        // Cancelled status — this is the actual #1052 wart at the data
+        // layer.
+        assert!(
+            !rm.mark_run_as_completed(run_id, "output".into(), Default::default()),
+            "mark_run_as_completed on an already-Cancelled run must return false"
+        );
+        let r = rm.get_run(run_id).unwrap();
+        assert_eq!(
+            r.status,
+            alms_core::RunStatus::Cancelled,
+            "Cancelled must not be clobbered by a racing Completed flip"
+        );
+
+        // Mirror for the failed path.
+        assert!(
+            !rm.mark_run_as_failed(run_id, "ignored".into()),
+            "mark_run_as_failed on an already-Cancelled run must return false"
+        );
+        let r = rm.get_run(run_id).unwrap();
+        assert_eq!(
+            r.status,
+            alms_core::RunStatus::Cancelled,
+            "Cancelled must not be clobbered by a racing Failed flip"
+        );
     }
 
     #[tokio::test]
@@ -932,7 +1006,7 @@ mod tests {
         rm.insert_run(done_run);
         rm.mark_run_as_running(active_id);
         rm.mark_run_as_running(done_id);
-        rm.mark_run_as_completed(done_id, "output".into(), Default::default());
+        assert!(rm.mark_run_as_completed(done_id, "output".into(), Default::default()));
 
         // Register senders for both.
         let (tx1, _rx1) = mpsc::unbounded_channel();
@@ -1006,7 +1080,7 @@ mod tests {
         let run_id = run.run_id;
         rm.insert_run(run);
         rm.mark_run_as_running(run_id);
-        rm.mark_run_as_completed(run_id, "output".into(), Default::default());
+        assert!(rm.mark_run_as_completed(run_id, "output".into(), Default::default()));
 
         let token = CancellationToken::new();
         rm.register_cancel_token(run_id, token.clone());
@@ -1383,7 +1457,7 @@ mod tests {
         assert!(rm.has_active_runs(session_id));
 
         // Mark completed -> no longer active.
-        rm.mark_run_as_completed(run_id, "ok".into(), Default::default());
+        assert!(rm.mark_run_as_completed(run_id, "ok".into(), Default::default()));
         assert!(!rm.has_active_runs(session_id));
     }
 
