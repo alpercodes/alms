@@ -1724,6 +1724,184 @@ fn test_tool_result_ok_null_value() {
     assert!(helpers::tool_result_ok(&val));
 }
 
+// #1048 — additional in-band error conventions the runtime now treats
+// as failure so the operator's at-a-glance row colour matches the
+// tool's semantic outcome.
+
+#[test]
+fn test_tool_result_ok_in_band_error_field() {
+    // `send_message`, `read_session`, `read_subagent_session`, and
+    // `read_messages` all emit `{"error": "<message>", ...}` on the
+    // `Ok(...)` path for in-band failures (agent-not-found, no DM
+    // session, depth exceeded, access denied, etc.). Pre-#1048 the
+    // runtime classified these as success because there was no
+    // `exit_code` — fix should now flag them.
+    let val = serde_json::json!({"error": "Agent 'X' not found. Use list_agents to see available agents."});
+    assert!(!helpers::tool_result_ok(&val));
+}
+
+#[test]
+fn test_tool_result_ok_in_band_error_empty_string_ignored() {
+    // Defensive: empty-string error fields shouldn't trigger a
+    // failure classification — they don't carry an actual error.
+    let val = serde_json::json!({"error": "", "ok": true});
+    assert!(helpers::tool_result_ok(&val));
+}
+
+#[test]
+fn test_tool_result_ok_in_band_error_non_string_ignored() {
+    // A non-string `error` field (e.g. an HTTP `error` integer code,
+    // or an `error` boolean) isn't the in-band-error convention this
+    // helper targets — fall through to the other checks.
+    let val = serde_json::json!({"error": 0});
+    assert!(helpers::tool_result_ok(&val));
+    let val2 = serde_json::json!({"error": null});
+    assert!(helpers::tool_result_ok(&val2));
+}
+
+#[test]
+fn test_tool_result_ok_http_status_5xx() {
+    // `http_get` returns `Ok({"status": 503, "body": ...})` for an
+    // upstream 5xx response — the transport succeeded but the job
+    // failed. The UI should render this red.
+    let val = serde_json::json!({
+        "status": 503,
+        "content_type": "text/plain",
+        "headers": {},
+        "body": "Service Unavailable",
+    });
+    assert!(!helpers::tool_result_ok(&val));
+}
+
+#[test]
+fn test_tool_result_ok_http_status_4xx() {
+    let val = serde_json::json!({
+        "status": 404,
+        "content_type": "text/plain",
+        "headers": {},
+        "body": "Not Found",
+    });
+    assert!(!helpers::tool_result_ok(&val));
+}
+
+#[test]
+fn test_tool_result_ok_http_status_2xx_success() {
+    let val = serde_json::json!({
+        "status": 200,
+        "content_type": "application/json",
+        "headers": {},
+        "body": {"ok": true},
+    });
+    assert!(helpers::tool_result_ok(&val));
+}
+
+#[test]
+fn test_tool_result_ok_http_status_3xx_success() {
+    // 3xx redirects classify as success — `http_get` doesn't follow
+    // them by default and a 301/302 is informational, not a failure
+    // of the operator's job.
+    let val = serde_json::json!({"status": 301, "body": ""});
+    assert!(helpers::tool_result_ok(&val));
+}
+
+#[test]
+fn test_tool_result_ok_background_shell_failed_status() {
+    // Background `shell` tasks that fail to spawn emit
+    // `{status: "failed", error: "...", task_id: ...}` (no
+    // `exit_code`). The in-band `error` check catches this; the
+    // status-string check is the defensive fallback.
+    let val = serde_json::json!({
+        "task_id": "bg_3",
+        "status": "failed",
+        "command": "foo",
+        "error": "spawn error",
+    });
+    assert!(!helpers::tool_result_ok(&val));
+}
+
+#[test]
+fn test_tool_result_ok_background_shell_failed_without_error_field() {
+    // Defensive fallback: a future caller that emits `status: "failed"`
+    // without an `error` field should still classify as failure.
+    let val = serde_json::json!({"task_id": "bg_4", "status": "failed"});
+    assert!(!helpers::tool_result_ok(&val));
+}
+
+#[test]
+fn test_tool_result_ok_background_shell_submitted_status() {
+    // Background submission is a success — the operator initiated the
+    // task successfully even though it hasn't completed yet.
+    let val = serde_json::json!({
+        "task_id": "bg_1",
+        "status": "submitted",
+        "message": "Task started",
+    });
+    assert!(helpers::tool_result_ok(&val));
+}
+
+#[test]
+fn test_tool_result_ok_background_shell_completed_with_exit_code() {
+    // Background task that completed cleanly — `exit_code: 0` plus
+    // `status: "completed"`. Treated as success.
+    let val = serde_json::json!({
+        "task_id": "bg_2",
+        "status": "completed",
+        "command": "echo hi",
+        "exit_code": 0,
+        "stdout": "hi\n",
+        "stderr": "",
+    });
+    assert!(helpers::tool_result_ok(&val));
+}
+
+#[test]
+fn test_tool_result_ok_background_shell_completed_with_nonzero_exit() {
+    // Background task that completed with non-zero exit — the
+    // `exit_code` discriminator wins over the success-flavoured
+    // `status: "completed"` because the underlying command failed.
+    let val = serde_json::json!({
+        "task_id": "bg_2",
+        "status": "completed",
+        "command": "false",
+        "exit_code": 1,
+        "stdout": "",
+        "stderr": "",
+    });
+    assert!(!helpers::tool_result_ok(&val));
+}
+
+#[test]
+fn test_tool_result_ok_status_string_unrecognised() {
+    // String statuses other than "failed" / "error" don't flip the
+    // classifier — `submitted`, `unknown`, `not_found_or_still_running`,
+    // and `completed` all carry no failure signal on their own.
+    for status in [
+        "submitted",
+        "unknown",
+        "not_found_or_still_running",
+        "completed",
+        "in_progress",
+    ] {
+        let val = serde_json::json!({"status": status});
+        assert!(
+            helpers::tool_result_ok(&val),
+            "status={status:?} should not flip the classifier"
+        );
+    }
+}
+
+#[test]
+fn test_tool_result_ok_status_string_error_case_insensitive() {
+    // Defensive: case shouldn't matter for the status-string check.
+    for s in ["error", "ERROR", "Error", "failed", "FAILED", "Failed"] {
+        let val = serde_json::json!({"status": s});
+        assert!(
+            !helpers::tool_result_ok(&val),
+            "status={s:?} should classify as failure"
+        );
+    }
+}
+
 #[test]
 fn test_dm_addendum_contains_peer_name() {
     let addendum = AgentRuntime::dm_addendum("alice");
