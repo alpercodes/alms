@@ -805,9 +805,11 @@ async fn partial_tool_call_failure_preserves_error_in_run_record() {
     // Simulate what execute_run does on FailedWithToolCalls: mark as failed
     // with the error message while tool calls are persisted separately.
     let error_msg = "LLM API error after 2 tool calls".to_string();
-    state
-        .run_manager
-        .mark_run_as_failed(run_id, error_msg.clone());
+    assert!(
+        state
+            .run_manager
+            .mark_run_as_failed(run_id, error_msg.clone())
+    );
 
     let run = state.run_manager.get_run(run_id).expect("run should exist");
     assert_eq!(run.status, RunStatus::Failed);
@@ -847,7 +849,7 @@ async fn completed_run_is_not_cancellable() {
         .register_cancel_token(run_id, cancel_token);
 
     // Mark the run as completed.
-    state.run_manager.mark_run_as_completed(
+    assert!(state.run_manager.mark_run_as_completed(
         run_id,
         "done".to_string(),
         TokenUsage {
@@ -855,7 +857,7 @@ async fn completed_run_is_not_cancellable() {
             completion_tokens: 5,
             ..TokenUsage::default()
         },
-    );
+    ));
 
     // Remove the cancel token (as execute_run does after completion).
     state.run_manager.remove_cancel_token(run_id);
@@ -2837,6 +2839,418 @@ async fn handle_dm_run_failure_double_end_is_idempotent() {
     shutdown_token.cancel();
 }
 
+/// #1052 regression: when a DM run is cancelled mid-`ignore_message`-unwind,
+/// the post-`Ok`-arm bookkeeping in `execute_run` must NOT fire — the peer
+/// already received `run_cancelled` (or will receive it from the cancel
+/// arm), and emitting `dm_conversation_ended` with reason `"ignored"`
+/// (the `Display`-format of `ConversationEndReason::Ignored`) here would
+/// conflate an operator-driven cancel with an agent-driven ignore,
+/// corrupting the peer's conversation-state model. (The issue body
+/// paraphrased the reason as `"ignore_message"`; the wire-format reason
+/// is `"ignored"` per `ConversationEndReason::Display`. The conflation
+/// concern is identical regardless of the spelling.)
+///
+/// The contract this test pins:
+///
+/// 1. `mark_run_as_completed` is now bool-returning. When the run is
+///    already `Cancelled` (because a racing cancel path drove it there),
+///    the call returns `false` and the existing `Cancelled` status is
+///    preserved (the transition is idempotent — see
+///    `test_mark_run_terminal_is_idempotent` in `run_manager.rs` for the
+///    data-layer contract).
+///
+/// 2. The lifecycle layer's `Ok` arm in `execute_run` reads that bool
+///    and gates `handle_dm_run_completion` on it. This test exercises
+///    the gate at the call site: we drive the exact ordering the racing
+///    `Ok` arm sees (`mark_run_as_cancelled` already won, then
+///    `mark_run_as_completed` runs), and verifies that:
+///
+///    - `mark_run_as_completed` returns `false`.
+///    - When the caller honours the gate (skips
+///      `handle_dm_run_completion`), no `dm_conversation_ended` SSE
+///      event is emitted on the DM session feed.
+///    - For contrast, if we ignored the gate and called
+///      `handle_dm_run_completion` anyway with `ignore_message` in the
+///      tool-call record set, it WOULD emit `dm_conversation_ended` —
+///      proving the gate is what prevents the double-emit, not some
+///      other coincidence in the test setup.
+///
+/// Driving the full `execute_run` race deterministically would require an
+/// LLM stub that returns `Ok` carrying an `ignore_message` tool-call
+/// record while a sibling task races a cancel in between the loop's
+/// return and `execute_run`'s `Ok` arm — feasible but flaky. The
+/// gate-at-the-call-site test pins the contract just as tightly with
+/// zero scheduling sensitivity. The full-flow scenario is covered
+/// indirectly by code review of the `Ok` arm: the only path to
+/// `handle_dm_run_completion` is gated on `completed_transitioned`,
+/// which is `false` in this test.
+#[tokio::test]
+async fn handle_dm_run_completion_gated_when_cancel_wins_race() {
+    use alms_core::ToolCallRole;
+
+    let (state, shutdown_token, _cr, mut tr, _dr) = test_app_state_with_sqlite();
+    let (alice_id, bob_id) = seed_alice_bob(&state);
+
+    // Open a DM conversation: alice → bob. This creates the shared DM
+    // session and bumps the depth counter, so the subsequent
+    // `end_conversation` path has something to remove (and so the
+    // `dm_ended` marker write is reachable — `end_conversation` aborts
+    // early if the session doesn't exist).
+    let _receipt = state
+        .message_bus
+        .send("alice", alice_id, "bob", bob_id, "ping", None)
+        .await
+        .unwrap();
+    // Drain the trigger emitted by `send` so subsequent assertions are
+    // scoped to the post-cancel side effects only.
+    let _initial_trigger = tr.try_recv().expect("send should emit a trigger");
+
+    let dm_context = "dm:alice:bob";
+    let dm_session_id = SessionId::deterministic_dm("alice", "bob");
+
+    // Insert bob's peer-triggered run (the run that races the cancel).
+    let run = Run::new(dm_session_id, bob_id, "received a DM".into());
+    let run_id = run.run_id;
+    state.run_manager.insert_run(run);
+    state.run_manager.mark_run_as_running(run_id);
+
+    // Simulate the race: a concurrent path (cancel handler, shutdown
+    // drain, `cancel_runs_for_session`, ...) drives the run to
+    // `Cancelled` BEFORE the Ok arm processes the loop result.
+    assert!(
+        state.run_manager.mark_run_as_cancelled(run_id),
+        "first mark_run_as_cancelled must transition the run"
+    );
+
+    // Subscribe to the DM session AFTER the cancel transition so we can
+    // pin "no `dm_conversation_ended` SSE on the gated path." A
+    // pre-fix run would emit one here.
+    let mut dm_rx = subscribe_session(&state, dm_session_id);
+
+    // Now the racing Ok arm tries to mark Completed — the bool gate must
+    // return `false`, the status must stay `Cancelled`, and the caller
+    // must skip `handle_dm_run_completion` (the lifecycle layer in
+    // `lifecycle.rs` does this; we replicate the contract here).
+    let completed_transitioned = state.run_manager.mark_run_as_completed(
+        run_id,
+        String::new(),
+        alms_core::TokenUsage::default(),
+    );
+    assert!(
+        !completed_transitioned,
+        "mark_run_as_completed must return false when state is already terminal"
+    );
+    assert_eq!(
+        state.run_manager.get_run(run_id).unwrap().status,
+        RunStatus::Cancelled,
+        "Cancelled status must NOT be clobbered to Completed"
+    );
+
+    // Build the same tool-call record set the cancelled `ignore_message`
+    // run would have produced. `should_signal_dm_end` is satisfied by
+    // this shape — if we were to call `handle_dm_run_completion` here,
+    // it would emit `dm_conversation_ended` with reason
+    // `"ignore_message"`. The gate must prevent the call.
+    let ignore_records = vec![
+        alms_core::ToolCallRecord {
+            seq: 0,
+            role: ToolCallRole::Assistant,
+            tool_name: Some("ignore_message".to_string()),
+            tool_id: Some("call_1".to_string()),
+            params: None,
+            result: None,
+            timestamp: chrono::Utc::now(),
+            from_agent: None,
+        },
+        alms_core::ToolCallRecord {
+            seq: 1,
+            role: ToolCallRole::Tool,
+            tool_name: Some("ignore_message".to_string()),
+            tool_id: Some("call_1".to_string()),
+            params: None,
+            result: Some(r#"{"ok":true}"#.to_string()),
+            timestamp: chrono::Utc::now(),
+            from_agent: None,
+        },
+    ];
+    // Pin the contrast: these records WOULD satisfy
+    // `should_signal_dm_end` if the gate weren't there. The
+    // `should_signal_dm_end` function is the gating logic inside
+    // `handle_dm_run_completion` itself — and it returns `true` for
+    // this shape, which is exactly why the call-site gate is necessary.
+    assert!(
+        super::dm_lifecycle::should_signal_dm_end(true, &ignore_records, dm_context),
+        "tool-call record set must trigger `dm_conversation_ended` if \
+         `handle_dm_run_completion` is called — proving the gate is what \
+         prevents the double-emit, not some other accident in this setup"
+    );
+
+    // The Ok arm honours the gate: when `completed_transitioned` is
+    // false, `handle_dm_run_completion` is NOT called. We do not call
+    // it here either — this is the contract being verified.
+
+    // Assert: no `dm_conversation_ended` SSE landed on the DM session
+    // feed. Any other events that flowed through (e.g. from the depth
+    // bookkeeping triggered by the `send` above) are allowed; only the
+    // post-Ok-arm `dm_conversation_ended` is forbidden.
+    tokio::task::yield_now().await;
+    let events = drain_events(&mut dm_rx);
+    assert!(
+        !events
+            .iter()
+            .any(|e| e.event_type == "dm_conversation_ended"),
+        "no `dm_conversation_ended` SSE event must be emitted when the cancel \
+         path wins the race against an `ignore_message`-emitting `Ok` arm; \
+         got events: {:?}",
+        events.iter().map(|e| &e.event_type).collect::<Vec<_>>(),
+    );
+
+    shutdown_token.cancel();
+}
+
+/// Companion test to `handle_dm_run_completion_gated_when_cancel_wins_race`:
+/// when the `Ok` arm transitions cleanly (no racing cancel), the gate
+/// passes and `handle_dm_run_completion` DOES emit
+/// `dm_conversation_ended`. Pins the happy-path side of the gate so a
+/// future refactor that "simplifies" the gate by inverting the
+/// condition gets caught by both tests.
+#[tokio::test]
+async fn handle_dm_run_completion_fires_when_completed_transition_wins() {
+    use alms_core::ToolCallRole;
+
+    let (state, shutdown_token, _cr, mut tr, _dr) = test_app_state_with_sqlite();
+    let (alice_id, bob_id) = seed_alice_bob(&state);
+
+    let _receipt = state
+        .message_bus
+        .send("alice", alice_id, "bob", bob_id, "ping", None)
+        .await
+        .unwrap();
+    let _initial_trigger = tr.try_recv().expect("send should emit a trigger");
+
+    let dm_context = "dm:alice:bob";
+    let dm_session_id = SessionId::deterministic_dm("alice", "bob");
+
+    let run = Run::new(dm_session_id, bob_id, "received a DM".into());
+    let run_id = run.run_id;
+    state.run_manager.insert_run(run);
+    state.run_manager.mark_run_as_running(run_id);
+
+    let mut dm_rx = subscribe_session(&state, dm_session_id);
+
+    // No racing cancel — the Ok arm wins.
+    let completed_transitioned = state.run_manager.mark_run_as_completed(
+        run_id,
+        String::new(),
+        alms_core::TokenUsage::default(),
+    );
+    assert!(
+        completed_transitioned,
+        "mark_run_as_completed must return true on the first call from Running"
+    );
+
+    let ignore_records = vec![
+        alms_core::ToolCallRecord {
+            seq: 0,
+            role: ToolCallRole::Assistant,
+            tool_name: Some("ignore_message".to_string()),
+            tool_id: Some("call_1".to_string()),
+            params: None,
+            result: None,
+            timestamp: chrono::Utc::now(),
+            from_agent: None,
+        },
+        alms_core::ToolCallRecord {
+            seq: 1,
+            role: ToolCallRole::Tool,
+            tool_name: Some("ignore_message".to_string()),
+            tool_id: Some("call_1".to_string()),
+            params: None,
+            result: Some(r#"{"ok":true}"#.to_string()),
+            timestamp: chrono::Utc::now(),
+            from_agent: None,
+        },
+    ];
+
+    // Mirror the lifecycle layer's behaviour: gate passes, so call
+    // `handle_dm_run_completion`.
+    let signalled = super::dm_lifecycle::handle_dm_run_completion(
+        super::dm_lifecycle::DmRunCompletionContext {
+            state: &state,
+            run_id,
+            session_id: dm_session_id,
+            agent_id: bob_id,
+            agent_name: Some("bob"),
+            context_id: dm_context,
+            is_peer_message: true,
+            tool_calls: &ignore_records,
+        },
+    )
+    .await;
+    assert!(
+        signalled,
+        "handle_dm_run_completion must return true for a peer-DM run \
+         that called ignore_message"
+    );
+
+    tokio::task::yield_now().await;
+    let events = drain_events(&mut dm_rx);
+    let dm_ended = events
+        .iter()
+        .find(|e| e.event_type == "dm_conversation_ended")
+        .unwrap_or_else(|| {
+            panic!(
+                "happy path must emit dm_conversation_ended; got events: {:?}",
+                events.iter().map(|e| &e.event_type).collect::<Vec<_>>(),
+            )
+        });
+    // `ConversationEndReason::Ignored` serialises to `"ignored"` (see
+    // `alms-tools/src/message_sender.rs`); the SSE event renders the
+    // `Display`-format string.
+    assert_eq!(
+        dm_ended
+            .data
+            .get("reason")
+            .and_then(|v| v.as_str())
+            .unwrap_or(""),
+        "ignored",
+        "reason must be `ignored` (Display of ConversationEndReason::Ignored) \
+         on the happy path"
+    );
+
+    shutdown_token.cancel();
+}
+
+/// #1052 review (Tim): pin the contract that `handle_dm_run_failure`
+/// fires from the terminal Err arm REGARDLESS of whether
+/// `mark_run_as_cancelled` returned `true` or `false`.
+///
+/// Per #1050's design, `handle_dm_run_failure` is an independent side
+/// effect: the synchronous HTTP cancel handler from #1050 flips state
+/// and broadcasts `run_cancelled` itself, but it does NOT call
+/// `handle_dm_run_failure` — it relies on the terminal Err(Cancelled)
+/// arm in `execute_run` to do that. If the terminal arm were to gate
+/// the call on `cancelled_transitioned`, then when the HTTP cancel
+/// won the race the bool would be `false` and the DM peer would
+/// never receive the `ConversationEnded` peer notification, the depth
+/// counter would never be reset, and no `dm_ended` marker would land.
+///
+/// This test simulates the race: a concurrent path drives the run to
+/// `Cancelled` first (so the subsequent `mark_run_as_cancelled` call
+/// returns `false`), then calls `handle_dm_run_failure` directly (as
+/// the terminal arm does, post-fix). The peer-notification side
+/// effects (`ConversationEnded` `RunTrigger`, `dm_ended` marker,
+/// `dm_conversation_ended` SSE) MUST all land.
+#[tokio::test]
+async fn handle_dm_run_failure_fires_when_cancel_transition_already_lost() {
+    let (state, shutdown_token, _cr, mut tr, _dr) = test_app_state_with_sqlite();
+    let (alice_id, bob_id) = seed_alice_bob(&state);
+
+    // Open the DM and drain the initial trigger from `send`.
+    let _ = state
+        .message_bus
+        .send("alice", alice_id, "bob", bob_id, "ping", None)
+        .await
+        .unwrap();
+    let _ = tr.try_recv();
+
+    let dm_context = "dm:alice:bob";
+    let dm_session_id = SessionId::deterministic_dm("alice", "bob");
+
+    // Insert bob's peer-triggered run.
+    let run = Run::new(dm_session_id, bob_id, "received a DM".into());
+    let run_id = run.run_id;
+    state.run_manager.insert_run(run);
+    state.run_manager.mark_run_as_running(run_id);
+
+    // Simulate the race: an external path (the synchronous HTTP cancel
+    // handler from #1050, a sibling shutdown drain, etc.) has already
+    // driven the run to `Cancelled` before the terminal Err arm runs.
+    assert!(
+        state.run_manager.mark_run_as_cancelled(run_id),
+        "first mark_run_as_cancelled must transition"
+    );
+
+    // Subscribe AFTER the racing cancel so the test only observes the
+    // post-terminal-arm side effects.
+    let mut dm_rx = subscribe_session(&state, dm_session_id);
+
+    // The terminal Err(Cancelled) arm now runs. Its `mark_run_as_cancelled`
+    // call returns `false` — the SSE broadcast is correctly skipped (the
+    // external path already emitted `run_cancelled`).
+    let cancelled_transitioned = state.run_manager.mark_run_as_cancelled(run_id);
+    assert!(
+        !cancelled_transitioned,
+        "second mark_run_as_cancelled must return false when state is already terminal"
+    );
+
+    // CONTRACT: `handle_dm_run_failure` MUST still fire. The terminal arm
+    // calls it unconditionally — it is an independent side effect per
+    // #1050, NOT something to skip when the state-flip lost the race.
+    super::dm_lifecycle::handle_dm_run_failure(
+        &state,
+        &run_id,
+        &dm_session_id,
+        bob_id,
+        Some("bob"),
+        dm_context,
+        true,
+        ConversationEndReason::UserCancelled,
+    )
+    .await
+    .expect("handle_dm_run_failure must succeed even when cancel transition was lost");
+
+    // Assert: dm_ended marker landed. Without this, Alice's session UI
+    // shows the DM as still open until the 1800s `DEPTH_EXPIRY_SECS`
+    // sweep clears the depth counter.
+    let history = state.session_manager.get_history(dm_session_id).unwrap();
+    assert!(
+        history.iter().any(|m| {
+            m.metadata
+                .as_ref()
+                .and_then(|meta| meta.get("reason"))
+                .and_then(|v| v.as_str())
+                == Some("user_cancelled")
+        }),
+        "dm_ended marker with reason=user_cancelled MUST be persisted even when \
+         the state-flip race was lost — this is the contract that prevents \
+         stranded DM peers when the HTTP cancel handler wins"
+    );
+
+    // Assert: ConversationEnded RunTrigger fired so Alice's notifications
+    // session learns about the end.
+    let trigger = tr
+        .try_recv()
+        .expect("ConversationEnded RunTrigger MUST fire even on lost cancel race");
+    match trigger.source {
+        MessageSource::ConversationEnded { reason, .. } => {
+            assert!(
+                matches!(reason, ConversationEndReason::UserCancelled),
+                "trigger reason must be UserCancelled; got {reason:?}"
+            );
+        }
+        other => panic!("expected ConversationEnded source, got {other:?}"),
+    }
+
+    // Assert: dm_conversation_ended SSE landed on the DM session feed.
+    tokio::task::yield_now().await;
+    let events = drain_events(&mut dm_rx);
+    let dm_ended = events
+        .iter()
+        .find(|e| e.event_type == "dm_conversation_ended")
+        .expect("dm_conversation_ended SSE MUST fire even when the state-flip race was lost");
+    assert_eq!(
+        dm_ended
+            .data
+            .get("reason")
+            .and_then(|v| v.as_str())
+            .unwrap_or(""),
+        "user_cancelled",
+    );
+
+    shutdown_token.cancel();
+}
+
 // ---------------------------------------------------------------------------
 // Agent-scoped session-activity SSE feed (#856)
 // ---------------------------------------------------------------------------
@@ -2906,9 +3320,11 @@ async fn agent_session_activity_started_and_ended_arrive_on_feed() {
     assert_eq!(started.data["agent_id"], agent_id.0.to_string());
 
     // Complete the run and emit the ended event.
-    state
-        .run_manager
-        .mark_run_as_completed(run_id, "ok".into(), Default::default());
+    assert!(
+        state
+            .run_manager
+            .mark_run_as_completed(run_id, "ok".into(), Default::default())
+    );
     state
         .run_manager
         .send_agent_event(
@@ -3365,7 +3781,7 @@ async fn smoke_post_execute_cancel_flips_state_at_run_manager_boundary() {
     let mut session_rx = subscribe_session(&state, session_id);
 
     // Mirror the post-#895 ordering: flip state first, broadcast second.
-    state.run_manager.mark_run_as_cancelled(run_id);
+    assert!(state.run_manager.mark_run_as_cancelled(run_id));
     state
         .run_manager
         .send_event(run_id, session_id, SseEventData::run_cancelled(run_id))
@@ -3713,9 +4129,11 @@ async fn smoke_ok_arm_flips_state_at_run_manager_boundary() {
     let mut session_rx = subscribe_session(&state, session_id);
 
     // Mirror the post-#927 ordering: flip state first, broadcast second.
-    state
-        .run_manager
-        .mark_run_as_completed(run_id, "ok".to_string(), TokenUsage::default());
+    assert!(state.run_manager.mark_run_as_completed(
+        run_id,
+        "ok".to_string(),
+        TokenUsage::default()
+    ));
     state
         .run_manager
         .send_event(
@@ -3797,9 +4215,11 @@ async fn smoke_err_arm_flips_state_at_run_manager_boundary() {
     let mut session_rx = subscribe_session(&state, session_id);
 
     // Mirror the post-#927 ordering: flip state first, broadcast second.
-    state
-        .run_manager
-        .mark_run_as_failed(run_id, "synthetic generic failure".to_string());
+    assert!(
+        state
+            .run_manager
+            .mark_run_as_failed(run_id, "synthetic generic failure".to_string())
+    );
     state
         .run_manager
         .send_event(

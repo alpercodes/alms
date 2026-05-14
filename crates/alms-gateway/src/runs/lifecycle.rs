@@ -691,11 +691,21 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
         // "a client that has the started event but not the ended event,"
         // closing the race. The change is internal to the gateway lock
         // window — the SSE event ordering visible to clients is identical.
-        state.run_manager.mark_run_as_cancelled(run_id);
-        state
-            .run_manager
-            .send_event(run_id, session_id, SseEventData::run_cancelled(run_id))
-            .await;
+        //
+        // #1052: gate the broadcast on the transition bool. The pre-cancel
+        // branch fires for a run that was just inserted as `Queued` — under
+        // normal flow `mark_run_as_cancelled` always returns `true` here, so
+        // the gate is a no-op. But if a concurrent path (graceful shutdown's
+        // cancel_all_in_flight, cancel_runs_for_session, ...) already drove
+        // the run terminal before this branch ran, the gate prevents a
+        // duplicate `run_cancelled` SSE event from racing onto the feed.
+        let cancelled_transitioned = state.run_manager.mark_run_as_cancelled(run_id);
+        if cancelled_transitioned {
+            state
+                .run_manager
+                .send_event(run_id, session_id, SseEventData::run_cancelled(run_id))
+                .await;
+        }
         // Emit a synthetic `session_activity_ended` on the agent-scoped
         // feed (#888). The pre-cancel branch never emits a paired
         // `session_activity_started`, so this is asymmetric — but the run
@@ -801,7 +811,13 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
                     SseEventData::session_activity_ended(session_id, run_id, agent_id),
                 )
                 .await;
-            state.run_manager.mark_run_as_failed(run_id, e.to_string());
+            // #1052: bool ignored intentionally — this is the
+            // agent-config resolution failure path, fires before the run
+            // has any chance of being concurrently terminated. The
+            // surrounding `run_error` SSE has already been broadcast above
+            // (a pre-existing #895 violation, documented elsewhere), so
+            // there is nothing to gate here even if we wanted to.
+            let _ = state.run_manager.mark_run_as_failed(run_id, e.to_string());
             state.run_manager.remove_senders(run_id);
             state.run_manager.remove_cancel_token(run_id);
             state.approval_store.clear_for_run(run_id);
@@ -1012,7 +1028,12 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
                     SseEventData::session_activity_ended(session_id, run_id, agent_id),
                 )
                 .await;
-            state.run_manager.mark_run_as_failed(run_id, e.to_string());
+            // #1052: bool ignored intentionally — runtime construction
+            // failure fires before the cancel token can have been observed
+            // by any other path, and the SSE broadcast above is the
+            // pre-existing #895 violation already noted in the
+            // resolve_agent_config branch above.
+            let _ = state.run_manager.mark_run_as_failed(run_id, e.to_string());
 
             // Persist the runtime-construction failure so a follow-up
             // turn ("why did that fail?") gives the agent the error in
@@ -1577,83 +1598,145 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
             // post-move value.
             let usage_for_broadcast = output.usage;
 
-            state
-                .run_manager
-                .mark_run_as_completed(run_id, output.response, output.usage);
+            // #1052: `mark_run_as_completed` now returns `bool` indicating
+            // whether the transition actually happened. The previous
+            // contract unconditionally overwrote the `status` field, so a
+            // run that had already been driven terminal by a racing path
+            // (cancel token, shutdown drain, cancel_runs_for_session) would
+            // silently flip back to `Completed` here — and the
+            // `run_finished` broadcast / episodic summary spawn / DM
+            // lifecycle handler below would all fire as if the run had
+            // completed naturally. With the bool gate in place, every
+            // post-flip side effect in this arm is conditional on
+            // `completed_transitioned`: if a cancel won the race, the
+            // `Cancelled` arm (or the pre-cancel branch above) already
+            // emitted the canonical `run_cancelled` SSE and called
+            // `handle_dm_run_failure`, and we now stay silent here.
+            let completed_transitioned =
+                state
+                    .run_manager
+                    .mark_run_as_completed(run_id, output.response, output.usage);
 
-            // token_delta events already emitted during streaming in the agent loop
-            state
-                .run_manager
-                .send_event(
-                    run_id,
-                    session_id,
-                    SseEventData::run_finished(run_id, true, usage_for_broadcast),
+            if completed_transitioned {
+                // token_delta events already emitted during streaming in the agent loop
+                state
+                    .run_manager
+                    .send_event(
+                        run_id,
+                        session_id,
+                        SseEventData::run_finished(run_id, true, usage_for_broadcast),
+                    )
+                    .await;
+
+                // Fire-and-forget episodic summary generation.
+                // Runs in a separate task so it never blocks the SSE cleanup path.
+                // S4: tracked by `in_flight` so graceful shutdown waits for it.
+                if let (Some(run_input), Some(run_output)) =
+                    (run_input_for_summary, run_output_for_summary)
+                {
+                    let sm = state.session_manager.clone();
+                    let llm_clone = llm_for_summary.clone();
+                    let ctx_id = context_id.clone();
+                    let run_mgr = state.run_manager.clone();
+                    let req = alms_runtime::episodic::PersistSummaryRequest {
+                        mode: run_summary_mode.clone(),
+                        agent_id,
+                        session_id,
+                        run_id,
+                        run_input,
+                        run_output,
+                        context_id: ctx_id,
+                        summary_model: summary_model_resolved.clone(),
+                        agent_name: agent_name_for_summary.clone(),
+                        summary_max_tokens,
+                    };
+                    run_mgr.track_in_flight();
+                    tokio::spawn(async move {
+                        let _guard = InFlightGuard {
+                            run_manager: run_mgr,
+                        };
+                        alms_runtime::episodic::generate_and_persist_summary(&sm, &llm_clone, req)
+                            .await;
+                    });
+                }
+
+                // -- DM post-run lifecycle (consolidated in #628) --
+                //
+                // Detect ignore_message, signal conversation end, emit SSE events.
+                // All logic lives in `dm_lifecycle::handle_dm_run_completion()`.
+                //
+                // #1052: gated on `completed_transitioned` together with
+                // the `run_finished` broadcast and episodic-summary spawn.
+                // Pre-fix, this fired unconditionally — when a cancel
+                // raced an `ignore_message`-emitting run, the peer
+                // received both `run_cancelled` (from the cancel path)
+                // AND `dm_conversation_ended` with reason
+                // `"ignore_message"` (from this call), conflating an
+                // operator-driven cancel with an agent-driven ignore.
+                // Cancel-side conversation bookkeeping is handled
+                // unconditionally by `handle_dm_run_failure(UserCancelled)`
+                // in the `Cancelled` / `CancelledWithToolCalls` arms (see
+                // the comments there — per #1050's design, that call
+                // fires regardless of who wins the state-flip race). The
+                // `MessageBus::end_conversation` depth-remove there is
+                // the atomicity guard, so skipping the
+                // `handle_dm_run_completion` call here cannot strand
+                // depth-counter state.
+                super::dm_lifecycle::handle_dm_run_completion(
+                    super::dm_lifecycle::DmRunCompletionContext {
+                        state: &state,
+                        run_id,
+                        session_id,
+                        agent_id,
+                        agent_name: agent_name.as_deref(),
+                        context_id: &context_id,
+                        is_peer_message,
+                        tool_calls: &output.tool_calls,
+                    },
                 )
                 .await;
 
-            // Fire-and-forget episodic summary generation.
-            // Runs in a separate task so it never blocks the SSE cleanup path.
-            // S4: tracked by `in_flight` so graceful shutdown waits for it.
-            if let (Some(run_input), Some(run_output)) =
-                (run_input_for_summary, run_output_for_summary)
-            {
-                let sm = state.session_manager.clone();
-                let llm_clone = llm_for_summary.clone();
-                let ctx_id = context_id.clone();
-                let run_mgr = state.run_manager.clone();
-                let req = alms_runtime::episodic::PersistSummaryRequest {
-                    mode: run_summary_mode.clone(),
-                    agent_id,
-                    session_id,
-                    run_id,
-                    run_input,
-                    run_output,
-                    context_id: ctx_id,
-                    summary_model: summary_model_resolved.clone(),
-                    agent_name: agent_name_for_summary.clone(),
-                    summary_max_tokens,
-                };
-                run_mgr.track_in_flight();
-                tokio::spawn(async move {
-                    let _guard = InFlightGuard {
-                        run_manager: run_mgr,
-                    };
-                    alms_runtime::episodic::generate_and_persist_summary(&sm, &llm_clone, req)
-                        .await;
-                });
+                info!("Run {} completed successfully", run_id.0);
+            } else {
+                // The cancel / shutdown path won the race. The terminal
+                // arm that actually flipped the state has already emitted
+                // its SSE event and signalled the DM peer (via
+                // `handle_dm_run_failure`). All we owe here is a
+                // diagnostic log — the partial tool-call records and the
+                // run-boundary marker have already been persisted above
+                // (those are diagnostic and idempotent, so they fire
+                // regardless of who wins the race).
+                info!(
+                    "Run {} returned Ok but was already terminal — \
+                     terminal-arm bookkeeping skipped (cancel / shutdown won)",
+                    run_id.0
+                );
             }
-
-            // -- DM post-run lifecycle (consolidated in #628) --
-            //
-            // Detect ignore_message, signal conversation end, emit SSE events.
-            // All logic lives in `dm_lifecycle::handle_dm_run_completion()`.
-            super::dm_lifecycle::handle_dm_run_completion(
-                super::dm_lifecycle::DmRunCompletionContext {
-                    state: &state,
-                    run_id,
-                    session_id,
-                    agent_id,
-                    agent_name: agent_name.as_deref(),
-                    context_id: &context_id,
-                    is_peer_message,
-                    tool_calls: &output.tool_calls,
-                },
-            )
-            .await;
-
-            info!("Run {} completed successfully", run_id.0);
         }
         Err(alms_core::AlmsError::Cancelled) => {
             // #895: flip the run state BEFORE broadcasting `run_cancelled`.
             // See the pre-cancel branch at the top of this function for the
             // full rationale; the same race applies to every started/ended
             // boundary that uses `mark_run_as_*` to drive `has_active_run`.
-            state.run_manager.mark_run_as_cancelled(run_id);
+            //
+            // #1052: `mark_run_as_cancelled` now returns `bool` so that a
+            // racing concurrent path (a future synchronous HTTP cancel
+            // handler — PR #1050 on develop — or a sibling cancel route
+            // that has already driven the run terminal) doesn't get a
+            // second `run_cancelled` SSE here or a redundant
+            // `handle_dm_run_failure` call. Today on `main` the HTTP
+            // cancel handler is async and doesn't flip state itself, so
+            // the bool will always be `true` here — the gate is forward
+            // compatible with #1050 and closes the race on the
+            // shutdown-drain / `cancel_runs_for_session` cleanup paths.
+            let cancelled_transitioned = state.run_manager.mark_run_as_cancelled(run_id);
 
-            state
-                .run_manager
-                .send_event(run_id, session_id, SseEventData::run_cancelled(run_id))
-                .await;
+            if cancelled_transitioned {
+                state
+                    .run_manager
+                    .send_event(run_id, session_id, SseEventData::run_cancelled(run_id))
+                    .await;
+            }
 
             // Issue #912 — DO NOT persist a lifecycle-layer
             // `(run cancelled)` error marker here.  The runtime layer
@@ -1674,6 +1757,20 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
             // because this run was cancelled mid-flight. Without this, the
             // peer thinks the DM is still open until the 1800s
             // `DEPTH_EXPIRY_SECS` sweep clears the depth counter.
+            //
+            // #1052 review (Tim): NOT gated on `cancelled_transitioned`.
+            // Per #1050's explicit design, `handle_dm_run_failure` fires
+            // from the terminal arm as an independent side effect — the
+            // synchronous HTTP cancel handler in #1050 does NOT call it
+            // itself, and gating here would strand the DM peer whenever
+            // the HTTP cancel wins the race (Alice never receives the
+            // `ConversationEnded` peer notification, the depth counter
+            // for `dm:alice:bob` is never reset, no `dm_ended` marker is
+            // written). The depth-remove inside
+            // `MessageBus::end_conversation` is idempotent (see
+            // `handle_dm_run_failure_double_end_is_idempotent`), so a
+            // duplicate call after some other path already ended the
+            // conversation is safe.
             if let Err(e) = super::dm_lifecycle::handle_dm_run_failure(
                 &state,
                 &run_id,
@@ -1692,27 +1789,44 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
                 );
             }
 
-            info!("Run {} cancelled", run_id.0);
+            if cancelled_transitioned {
+                info!("Run {} cancelled", run_id.0);
+            } else {
+                info!(
+                    "Run {} loop returned Cancelled but state was already terminal — \
+                     SSE broadcast skipped (DM peer notification fired unconditionally)",
+                    run_id.0
+                );
+            }
         }
         Err(alms_core::AlmsError::CancelledWithToolCalls { tool_calls }) => {
             // Persist partial tool call records even though the run was cancelled.
+            // Persisted regardless of who wins the race — these are diagnostic
+            // and the per-run `run_tool_calls` table is keyed on `run_id`, so a
+            // double-write is a no-op overwrite of the same rows.
             persist_tool_calls(&tool_calls);
 
-            // #895: flip the run state BEFORE broadcasting `run_cancelled`.
-            // See the pre-cancel branch at the top of this function for the
-            // full rationale.
-            state.run_manager.mark_run_as_cancelled(run_id);
+            // #895 / #1052: see the `Cancelled` arm above for the rationale
+            // on gating the broadcast + DM lifecycle on the transition bool.
+            let cancelled_transitioned = state.run_manager.mark_run_as_cancelled(run_id);
 
-            state
-                .run_manager
-                .send_event(run_id, session_id, SseEventData::run_cancelled(run_id))
-                .await;
+            if cancelled_transitioned {
+                state
+                    .run_manager
+                    .send_event(run_id, session_id, SseEventData::run_cancelled(run_id))
+                    .await;
+            }
 
             // Issue #912 — see the `Cancelled` arm above.  The
             // runtime-layer `[Run cancelled by user]` write is the
             // canonical record; no lifecycle-layer marker is persisted.
 
-            // Best-effort: see comment in the `Cancelled` arm.
+            // Best-effort: see comment in the `Cancelled` arm. NOT gated
+            // on `cancelled_transitioned` — `handle_dm_run_failure` is an
+            // independent side effect per #1050's design, and gating it
+            // would strand the DM peer when an external path (e.g. the
+            // synchronous HTTP cancel handler from #1050) won the
+            // state-flip race.
             if let Err(e) = super::dm_lifecycle::handle_dm_run_failure(
                 &state,
                 &run_id,
@@ -1731,11 +1845,21 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
                 );
             }
 
-            info!(
-                "Run {} cancelled ({} tool calls persisted)",
-                run_id.0,
-                tool_calls.len()
-            );
+            if cancelled_transitioned {
+                info!(
+                    "Run {} cancelled ({} tool calls persisted)",
+                    run_id.0,
+                    tool_calls.len()
+                );
+            } else {
+                info!(
+                    "Run {} loop returned CancelledWithToolCalls but state was already \
+                     terminal — SSE broadcast skipped ({} tool calls persisted; \
+                     DM peer notification fired unconditionally)",
+                    run_id.0,
+                    tool_calls.len()
+                );
+            }
         }
         Err(alms_core::AlmsError::FailedWithToolCalls { source, tool_calls }) => {
             // Persist partial tool call records even though the run failed.
@@ -1746,18 +1870,24 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
             // pre-cancel branch at the top of this function for the full
             // rationale; the same race applies to every started/ended
             // boundary that uses `mark_run_as_*` to drive `has_active_run`.
-            state
+            //
+            // #1052: `mark_run_as_failed` now returns `bool` and we gate
+            // both the SSE broadcast and the DM-peer notification on it,
+            // for the same reason as the cancel arms above.
+            let failed_transitioned = state
                 .run_manager
                 .mark_run_as_failed(run_id, source.to_string());
 
-            state
-                .run_manager
-                .send_event(
-                    run_id,
-                    session_id,
-                    SseEventData::run_error(run_id, &source.to_string()),
-                )
-                .await;
+            if failed_transitioned {
+                state
+                    .run_manager
+                    .send_event(
+                        run_id,
+                        session_id,
+                        SseEventData::run_error(run_id, &source.to_string()),
+                    )
+                    .await;
+            }
 
             // Issue #912 — DO NOT persist a lifecycle-layer
             // `(run failed) ...` error marker here.  The runtime layer
@@ -1780,6 +1910,10 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
             // surfaced in the peer's `dm_ended` notification so the peer
             // (and human user watching the DM) sees a useful reason instead
             // of a stale "in-flight" indicator until the 1800s sweep.
+            //
+            // NOT gated on `failed_transitioned` — `handle_dm_run_failure`
+            // is an independent side effect per #1050's design (see the
+            // `Cancelled` arm above for the full rationale).
             if let Err(e) = super::dm_lifecycle::handle_dm_run_failure(
                 &state,
                 &run_id,
@@ -1800,27 +1934,42 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
                 );
             }
 
-            error!(
-                "Run {} failed ({} tool calls persisted): {}",
-                run_id.0,
-                tool_calls.len(),
-                source
-            );
+            if failed_transitioned {
+                error!(
+                    "Run {} failed ({} tool calls persisted): {}",
+                    run_id.0,
+                    tool_calls.len(),
+                    source
+                );
+            } else {
+                error!(
+                    "Run {} loop returned FailedWithToolCalls but state was already \
+                     terminal — SSE broadcast skipped ({} tool calls persisted; \
+                     DM peer notification fired unconditionally): {}",
+                    run_id.0,
+                    tool_calls.len(),
+                    source
+                );
+            }
         }
         Err(e) => {
             // #927 (extends #895): flip the run state to `Failed` BEFORE
             // broadcasting `run_error`. See the `Ok` and
             // `FailedWithToolCalls` arms for the full rationale.
-            state.run_manager.mark_run_as_failed(run_id, e.to_string());
+            // #1052: gated on the transition bool — see the
+            // `FailedWithToolCalls` arm above.
+            let failed_transitioned = state.run_manager.mark_run_as_failed(run_id, e.to_string());
 
-            state
-                .run_manager
-                .send_event(
-                    run_id,
-                    session_id,
-                    SseEventData::run_error(run_id, &e.to_string()),
-                )
-                .await;
+            if failed_transitioned {
+                state
+                    .run_manager
+                    .send_event(
+                        run_id,
+                        session_id,
+                        SseEventData::run_error(run_id, &e.to_string()),
+                    )
+                    .await;
+            }
 
             // Issue #912 — see the `FailedWithToolCalls` arm above.
             // This generic-error arm covers LLM 4xx/5xx, rate-limit,
@@ -1832,6 +1981,8 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
             // marker would be a duplicate.
 
             // Best-effort: see comment in the `FailedWithToolCalls` arm.
+            // NOT gated on `failed_transitioned` — `handle_dm_run_failure`
+            // is an independent side effect per #1050's design.
             if let Err(end_err) = super::dm_lifecycle::handle_dm_run_failure(
                 &state,
                 &run_id,
@@ -1852,7 +2003,15 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
                 );
             }
 
-            error!("Run {} failed: {}", run_id.0, e);
+            if failed_transitioned {
+                error!("Run {} failed: {}", run_id.0, e);
+            } else {
+                error!(
+                    "Run {} loop returned Err but state was already terminal — \
+                     SSE broadcast skipped (DM peer notification fired unconditionally): {}",
+                    run_id.0, e
+                );
+            }
         }
     }
 

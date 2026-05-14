@@ -259,6 +259,21 @@ pub enum RunStatus {
     Cancelled,
 }
 
+impl RunStatus {
+    /// Returns `true` when the status is one of the absorbing terminal
+    /// states (`Completed`, `Failed`, `Cancelled`).
+    ///
+    /// Used by [`Run::mark_completed`] / [`Run::mark_failed`] /
+    /// [`Run::mark_cancelled`] to make terminal transitions idempotent —
+    /// callers receive `false` and know to skip the terminal-arm
+    /// bookkeeping (#1052: DM `dm_conversation_ended` emission, episodic
+    /// summary spawn, `run_finished`/`run_cancelled`/`run_error`
+    /// broadcasts).
+    pub fn is_terminal(self) -> bool {
+        matches!(self, Self::Completed | Self::Failed | Self::Cancelled)
+    }
+}
+
 /// A run represents a single agent execution
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Run {
@@ -344,22 +359,64 @@ impl Run {
         self.resolved_config = Some(config);
     }
 
-    pub fn mark_completed(&mut self, output: String, usage: TokenUsage) {
+    /// Transition the run to [`RunStatus::Completed`].
+    ///
+    /// Returns `true` only when the run was actually transitioned from
+    /// `Queued`/`Running` to `Completed` (the caller is responsible for the
+    /// terminal-arm bookkeeping in that case — `run_finished` SSE, episodic
+    /// summary, DM lifecycle bookkeeping, etc.). Returns `false` and is a
+    /// no-op when the run was already in a terminal state (`Completed` /
+    /// `Failed` / `Cancelled`) — typically because a concurrent path
+    /// (cancel token, shutdown drain) won the race. `output`, `usage`, and
+    /// `ended_at` are only stamped on the first transition.
+    ///
+    /// This is the no-op-on-already-terminal half of #1052's gating
+    /// contract: the lifecycle layer reads the bool to decide whether to
+    /// fire DM `dm_conversation_ended` and other "this run completed
+    /// naturally" side effects, so the latent wart of broadcasting
+    /// `run_finished` on a state that was already `Cancelled` (and
+    /// emitting `dm_conversation_ended` with reason `ignore_message` on
+    /// top of a `run_cancelled`) closes regardless of who wins the race.
+    pub fn mark_completed(&mut self, output: String, usage: TokenUsage) -> bool {
+        if self.status.is_terminal() {
+            return false;
+        }
         self.status = RunStatus::Completed;
         self.output = Some(output);
         self.usage = Some(usage);
         self.ended_at = Some(Utc::now());
+        true
     }
 
-    pub fn mark_failed(&mut self, error: String) {
+    /// Transition the run to [`RunStatus::Failed`].
+    ///
+    /// Returns `true` only when the run was actually transitioned from
+    /// `Queued`/`Running` to `Failed`. Returns `false` and is a no-op when
+    /// the run was already in a terminal state. See [`Self::mark_completed`]
+    /// for the rationale (#1052).
+    pub fn mark_failed(&mut self, error: String) -> bool {
+        if self.status.is_terminal() {
+            return false;
+        }
         self.status = RunStatus::Failed;
         self.error = Some(error);
         self.ended_at = Some(Utc::now());
+        true
     }
 
-    pub fn mark_cancelled(&mut self) {
+    /// Transition the run to [`RunStatus::Cancelled`].
+    ///
+    /// Returns `true` only when the run was actually transitioned from
+    /// `Queued`/`Running` to `Cancelled`. Returns `false` and is a no-op
+    /// when the run was already in a terminal state. See
+    /// [`Self::mark_completed`] for the rationale (#1052).
+    pub fn mark_cancelled(&mut self) -> bool {
+        if self.status.is_terminal() {
+            return false;
+        }
         self.status = RunStatus::Cancelled;
         self.ended_at = Some(Utc::now());
+        true
     }
 }
 
