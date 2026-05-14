@@ -6,7 +6,7 @@
 //! alms-tools and alms-coordinator.
 
 use crate::event_forwarder::EventForwarder;
-use alms_core::{AlmsError, AlmsResult, RunId, SessionId};
+use alms_core::{AgentId, AlmsError, AlmsResult, RunId, SessionId};
 use async_trait::async_trait;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
@@ -20,17 +20,22 @@ pub trait SubagentDispatcher: Send + Sync + std::fmt::Debug {
     ///
     /// Named subagents (`subagent_name` = Some) must be pre-registered in the
     /// agent registry via `alms agent create`. Their config (model, posture)
-    /// and workspace files are loaded from the registry.
+    /// and workspace files are loaded from the registry. Their persistent
+    /// session is keyed on `(parent_agent_id, name)` (#1051) — so the same
+    /// named subagent resolves to the same session across every chat the
+    /// parent agent participates in.
     ///
     /// `parent_event_fwd` is a type-erased event forwarder. When provided,
     /// the subagent's tool events are forwarded into the parent run's SSE
     /// stream so the UI can show subagent activity inline.
     ///
     /// Returns `(response_text, subagent_session_id)`.
+    #[allow(clippy::too_many_arguments)]
     async fn dispatch(
         &self,
         task: String,
         parent_session_id: SessionId,
+        parent_agent_id: AgentId,
         parent_run_id: Option<RunId>,
         parent_event_fwd: Option<Arc<dyn EventForwarder>>,
         subagent_name: Option<String>,
@@ -46,10 +51,12 @@ pub trait SubagentDispatcher: Send + Sync + std::fmt::Debug {
     /// when provided.
     ///
     /// Returns `(task_uuid, subagent_session_id)`.
+    #[allow(clippy::too_many_arguments)]
     async fn dispatch_background(
         &self,
         _task: String,
         _parent_session_id: SessionId,
+        _parent_agent_id: AgentId,
         _parent_run_id: Option<RunId>,
         _parent_event_fwd: Option<Arc<dyn EventForwarder>>,
         _subagent_name: Option<String>,

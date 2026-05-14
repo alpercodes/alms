@@ -6,7 +6,7 @@
 //! subagent's session. The tool derives the subagent's deterministic session
 //! ID (same UUID v5 logic as invoke_agent) and reads from SessionManager.
 
-use alms_core::{AgentId, SessionId};
+use alms_core::AgentId;
 use alms_sandbox::{SandboxError, Tool, error::SandboxResult};
 use alms_session::SessionManager;
 use serde_json::Value;
@@ -15,19 +15,24 @@ use std::sync::Arc;
 /// Built-in tool that reads conversation history from a named subagent's session.
 ///
 /// Named subagents (created via `invoke_agent(name=...)`) have persistent
-/// sessions. This tool lets the parent agent selectively read their
-/// conversation history without carrying it all in its own context window.
+/// sessions keyed on `(parent_agent_id, name)` (#1051). This tool lets the
+/// parent agent selectively read their conversation history without carrying
+/// it all in its own context window — and the same subagent name resolves
+/// to the same session no matter which of the parent's chat sessions is
+/// active.
 #[derive(Debug)]
 pub struct ReadSubagentSessionTool {
     session_manager: Arc<SessionManager>,
-    parent_session_id: SessionId,
+    /// Parent agent's persistent ID — drives the `(parent_agent_id, name)`
+    /// keying that mirrors `invoke_agent` (#1051).
+    parent_agent_id: AgentId,
 }
 
 impl ReadSubagentSessionTool {
-    pub fn new(session_manager: Arc<SessionManager>, parent_session_id: SessionId) -> Self {
+    pub fn new(session_manager: Arc<SessionManager>, parent_agent_id: AgentId) -> Self {
         Self {
             session_manager,
-            parent_session_id,
+            parent_agent_id,
         }
     }
 }
@@ -86,9 +91,11 @@ impl Tool for ReadSubagentSessionTool {
             .unwrap_or(false);
 
         // Derive the same deterministic identity that invoke_agent uses
-        let parent_as_agent = AgentId(self.parent_session_id.0);
-        let stable_id = AgentId::deterministic(parent_as_agent, name);
-        let stable_ctx = format!("subagent_{}_{}", self.parent_session_id.0, name);
+        // (#1051): keyed on `(parent_agent_id, name)`, so the same named
+        // subagent resolves to the same session across every chat the
+        // parent agent participates in.
+        let stable_id = AgentId::deterministic(self.parent_agent_id, name);
+        let stable_ctx = format!("subagent_{}_{}", self.parent_agent_id.0, name);
 
         // Check if the session exists without creating it
         let key = (stable_id, stable_ctx);
@@ -197,8 +204,8 @@ mod tests {
 
     fn make_tool() -> (ReadSubagentSessionTool, Arc<SessionManager>) {
         let mgr = Arc::new(SessionManager::new(SessionConfig::default()));
-        let parent_session_id = SessionId::new();
-        let tool = ReadSubagentSessionTool::new(mgr.clone(), parent_session_id);
+        let parent_agent_id = AgentId::new();
+        let tool = ReadSubagentSessionTool::new(mgr.clone(), parent_agent_id);
         (tool, mgr)
     }
 
@@ -213,16 +220,16 @@ mod tests {
     }
 
     /// Populate a named subagent's session with messages, using the same
-    /// deterministic derivation that invoke_agent uses.
+    /// deterministic derivation that invoke_agent uses (#1051: keyed on
+    /// `(parent_agent_id, name)`).
     fn populate_subagent(
         tool: &ReadSubagentSessionTool,
         mgr: &SessionManager,
         name: &str,
         messages: Vec<Message>,
     ) {
-        let parent_as_agent = AgentId(tool.parent_session_id.0);
-        let stable_id = AgentId::deterministic(parent_as_agent, name);
-        let stable_ctx = format!("subagent_{}_{}", tool.parent_session_id.0, name);
+        let stable_id = AgentId::deterministic(tool.parent_agent_id, name);
+        let stable_ctx = format!("subagent_{}_{}", tool.parent_agent_id.0, name);
         let session = mgr.get_or_create(stable_id, &stable_ctx);
         for msg in messages {
             mgr.append_message(session.id, msg).unwrap();
@@ -314,9 +321,8 @@ mod tests {
     #[tokio::test]
     async fn test_summary_only_with_real_summary() {
         let (tool, mgr) = make_tool();
-        let parent_as_agent = AgentId(tool.parent_session_id.0);
-        let stable_id = AgentId::deterministic(parent_as_agent, "summarized-sub");
-        let stable_ctx = format!("subagent_{}_{}", tool.parent_session_id.0, "summarized-sub");
+        let stable_id = AgentId::deterministic(tool.parent_agent_id, "summarized-sub");
+        let stable_ctx = format!("subagent_{}_{}", tool.parent_agent_id.0, "summarized-sub");
         let session = mgr.get_or_create(stable_id, &stable_ctx);
         mgr.append_message(session.id, make_msg(Role::User, "hello"))
             .unwrap();
@@ -378,9 +384,8 @@ mod tests {
     async fn test_summary_only_zero_messages_fallback() {
         let (tool, mgr) = make_tool();
         // Create a session with zero messages (session exists but nothing appended)
-        let parent_as_agent = AgentId(tool.parent_session_id.0);
-        let stable_id = AgentId::deterministic(parent_as_agent, "empty-sub");
-        let stable_ctx = format!("subagent_{}_{}", tool.parent_session_id.0, "empty-sub");
+        let stable_id = AgentId::deterministic(tool.parent_agent_id, "empty-sub");
+        let stable_ctx = format!("subagent_{}_{}", tool.parent_agent_id.0, "empty-sub");
         let _session = mgr.get_or_create(stable_id, &stable_ctx);
 
         // No summary, no messages — should return empty fallback without panicking
@@ -422,9 +427,8 @@ mod tests {
     #[tokio::test]
     async fn test_summary_included_with_messages() {
         let (tool, mgr) = make_tool();
-        let parent_as_agent = AgentId(tool.parent_session_id.0);
-        let stable_id = AgentId::deterministic(parent_as_agent, "summarized");
-        let stable_ctx = format!("subagent_{}_{}", tool.parent_session_id.0, "summarized");
+        let stable_id = AgentId::deterministic(tool.parent_agent_id, "summarized");
+        let stable_ctx = format!("subagent_{}_{}", tool.parent_agent_id.0, "summarized");
         let session = mgr.get_or_create(stable_id, &stable_ctx);
         mgr.append_message(session.id, make_msg(Role::User, "hello"))
             .unwrap();
@@ -455,5 +459,62 @@ mod tests {
         let schema = tool.parameters();
         let required = schema["required"].as_array().unwrap();
         assert!(required.iter().any(|v| v == "name"));
+    }
+
+    /// Regression for #1051 — named subagent sessions are keyed on
+    /// `(parent_agent_id, name)`, so two tool instances built for the same
+    /// parent agent (registered separately into two different runtime
+    /// instances backing two different chat sessions) must resolve
+    /// `read_subagent_session("reviewer")` to the SAME subagent session.
+    ///
+    /// Since #1068 dropped the unused `parent_session_id` field, the two
+    /// tool instances are constructed identically here — the test still
+    /// pins the cross-chat-session contract because `parent_agent_id` is
+    /// now the sole driver.
+    #[tokio::test]
+    async fn test_cross_session_same_parent_agent_resolves_to_same_session() {
+        let mgr = Arc::new(SessionManager::new(SessionConfig::default()));
+        let parent_agent_id = AgentId::new();
+
+        // Both tools share the same parent_agent_id — they stand in for two
+        // separate runtimes (e.g., one per chat session) backed by the same
+        // parent agent. Both must land on the same `(parent_agent_id, name)`
+        // subagent session.
+        let tool_a = ReadSubagentSessionTool::new(mgr.clone(), parent_agent_id);
+        let tool_b = ReadSubagentSessionTool::new(mgr.clone(), parent_agent_id);
+
+        // Populate via tool A — message arrives in the shared session.
+        populate_subagent(
+            &tool_a,
+            &mgr,
+            "reviewer",
+            vec![make_msg(Role::User, "from chat A")],
+        );
+
+        // Tool B (separate instance, same parent agent) must see it.
+        let result_b = tool_b
+            .execute(serde_json::json!({ "name": "reviewer" }))
+            .await
+            .unwrap();
+        assert_eq!(result_b["message_count"], 1);
+        let msgs_b = result_b["messages"].as_array().unwrap();
+        assert_eq!(msgs_b[0]["content"], "from chat A");
+
+        // Sanity: a tool bound to a DIFFERENT parent agent must NOT see it.
+        let other_parent = AgentId::new();
+        assert_ne!(other_parent, parent_agent_id);
+        let tool_c = ReadSubagentSessionTool::new(mgr.clone(), other_parent);
+        let result_c = tool_c
+            .execute(serde_json::json!({ "name": "reviewer" }))
+            .await
+            .unwrap();
+        assert!(
+            result_c["error"]
+                .as_str()
+                .unwrap_or("")
+                .contains("No session found"),
+            "different parent agent must not resolve to the same subagent \
+             session (got: {result_c})"
+        );
     }
 }

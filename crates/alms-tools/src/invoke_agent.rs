@@ -2,7 +2,7 @@
 
 use crate::event_forwarder::EventForwarder;
 use crate::subagent::SubagentDispatcher;
-use alms_core::{RunId, SessionId};
+use alms_core::{AgentId, RunId, SessionId};
 use alms_sandbox::{SandboxError, Tool, error::SandboxResult};
 use serde_json::Value;
 use std::sync::Arc;
@@ -16,6 +16,9 @@ use tokio_util::sync::CancellationToken;
 pub struct InvokeAgentTool {
     dispatcher: Arc<dyn SubagentDispatcher>,
     parent_session_id: SessionId,
+    /// Parent agent's persistent ID — drives the `(parent_agent_id, name)`
+    /// keying for named subagent sessions (#1051).
+    parent_agent_id: AgentId,
     parent_run_id: Option<RunId>,
     /// Clone of the parent run's event sender so subagent tool events
     /// are forwarded into the parent's SSE stream.
@@ -33,12 +36,14 @@ impl InvokeAgentTool {
     pub fn new(
         dispatcher: Arc<dyn SubagentDispatcher>,
         parent_session_id: SessionId,
+        parent_agent_id: AgentId,
         parent_run_id: Option<RunId>,
         parent_event_tx: Option<Arc<dyn EventForwarder>>,
     ) -> Self {
         Self {
             dispatcher,
             parent_session_id,
+            parent_agent_id,
             parent_run_id,
             parent_event_tx,
             parent_cancel_token: None,
@@ -136,6 +141,7 @@ impl Tool for InvokeAgentTool {
                 .dispatch_background(
                     task,
                     self.parent_session_id,
+                    self.parent_agent_id,
                     self.parent_run_id,
                     self.background_event_tx.clone(),
                     subagent_name,
@@ -155,6 +161,7 @@ impl Tool for InvokeAgentTool {
             .dispatch(
                 task,
                 self.parent_session_id,
+                self.parent_agent_id,
                 self.parent_run_id,
                 self.parent_event_tx.clone(),
                 subagent_name,
@@ -177,7 +184,7 @@ impl Tool for InvokeAgentTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alms_core::{AlmsResult, RunId, SessionId};
+    use alms_core::{AgentId, AlmsResult, RunId, SessionId};
     use async_trait::async_trait;
     use tokio_util::sync::CancellationToken;
     use uuid::Uuid;
@@ -191,6 +198,7 @@ mod tests {
             &self,
             _task: String,
             _parent_session_id: SessionId,
+            _parent_agent_id: AgentId,
             _parent_run_id: Option<RunId>,
             _parent_event_tx: Option<Arc<dyn EventForwarder>>,
             _subagent_name: Option<String>,
@@ -204,6 +212,7 @@ mod tests {
         InvokeAgentTool::new(
             Arc::new(MockDispatcher(response.to_string())),
             SessionId::new(),
+            AgentId::new(),
             None,
             None,
         )
@@ -247,6 +256,7 @@ mod tests {
                 &self,
                 _task: String,
                 _parent_session_id: SessionId,
+                _parent_agent_id: AgentId,
                 _parent_run_id: Option<RunId>,
                 _parent_event_tx: Option<Arc<dyn EventForwarder>>,
                 _subagent_name: Option<String>,
@@ -259,7 +269,13 @@ mod tests {
                 })
             }
         }
-        let tool = InvokeAgentTool::new(Arc::new(FailDispatcher), SessionId::new(), None, None);
+        let tool = InvokeAgentTool::new(
+            Arc::new(FailDispatcher),
+            SessionId::new(),
+            AgentId::new(),
+            None,
+            None,
+        );
         let err = tool
             .execute(serde_json::json!({ "task": "fail" }))
             .await
@@ -358,6 +374,7 @@ mod tests {
             &self,
             _task: String,
             _parent_session_id: SessionId,
+            _parent_agent_id: AgentId,
             _parent_run_id: Option<RunId>,
             _parent_event_tx: Option<Arc<dyn EventForwarder>>,
             _subagent_name: Option<String>,
@@ -370,6 +387,7 @@ mod tests {
             &self,
             _task: String,
             _parent_session_id: SessionId,
+            _parent_agent_id: AgentId,
             _parent_run_id: Option<RunId>,
             _parent_event_tx: Option<Arc<dyn EventForwarder>>,
             _subagent_name: Option<String>,
@@ -383,6 +401,7 @@ mod tests {
         InvokeAgentTool::new(
             Arc::new(BackgroundDispatcher(task_id)),
             SessionId::new(),
+            AgentId::new(),
             None,
             None,
         )
@@ -444,6 +463,7 @@ mod tests {
             &self,
             _task: String,
             _parent_session_id: SessionId,
+            _parent_agent_id: AgentId,
             _parent_run_id: Option<RunId>,
             _parent_event_tx: Option<Arc<dyn EventForwarder>>,
             subagent_name: Option<String>,
@@ -457,7 +477,13 @@ mod tests {
     #[tokio::test]
     async fn test_name_passed_to_dispatcher() {
         let dispatcher = Arc::new(NameCapturingDispatcher(std::sync::Mutex::new(None)));
-        let tool = InvokeAgentTool::new(dispatcher.clone(), SessionId::new(), None, None);
+        let tool = InvokeAgentTool::new(
+            dispatcher.clone(),
+            SessionId::new(),
+            AgentId::new(),
+            None,
+            None,
+        );
         tool.execute(serde_json::json!({ "task": "x", "name": "reviewer" }))
             .await
             .unwrap();
@@ -468,7 +494,13 @@ mod tests {
     #[tokio::test]
     async fn test_empty_name_treated_as_none() {
         let dispatcher = Arc::new(NameCapturingDispatcher(std::sync::Mutex::new(None)));
-        let tool = InvokeAgentTool::new(dispatcher.clone(), SessionId::new(), None, None);
+        let tool = InvokeAgentTool::new(
+            dispatcher.clone(),
+            SessionId::new(),
+            AgentId::new(),
+            None,
+            None,
+        );
         tool.execute(serde_json::json!({ "task": "x", "name": "" }))
             .await
             .unwrap();
@@ -482,7 +514,13 @@ mod tests {
     #[tokio::test]
     async fn test_missing_name_is_none() {
         let dispatcher = Arc::new(NameCapturingDispatcher(std::sync::Mutex::new(None)));
-        let tool = InvokeAgentTool::new(dispatcher.clone(), SessionId::new(), None, None);
+        let tool = InvokeAgentTool::new(
+            dispatcher.clone(),
+            SessionId::new(),
+            AgentId::new(),
+            None,
+            None,
+        );
         tool.execute(serde_json::json!({ "task": "x" }))
             .await
             .unwrap();

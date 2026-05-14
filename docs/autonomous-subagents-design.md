@@ -80,6 +80,7 @@ Wire `invoke_agent` and `get_task_result` tools into the subagent's runtime, exa
 let invoke_tool = InvokeAgentTool::new(
     coordinator.clone(),  // self as Arc<Coordinator>
     session_id,           // subagent's own session as parent
+    agent_id,             // subagent's own agent id as parent_agent_id (#1051)
     Some(run_id),
     Some(sub_tx.clone()),
 );
@@ -259,12 +260,11 @@ useful context instead of an empty response.
 }
 ```
 
-**Implementation:** The tool derives the subagent's deterministic session ID (same UUID v5 logic as `invoke_agent`), then reads from `SessionManager`:
+**Implementation:** The tool derives the subagent's deterministic session ID (same UUID v5 logic as `invoke_agent`), then reads from `SessionManager`. Per #1051 the derivation is keyed on `(parent_agent_id, name)` — not `(parent_session, name)` — so the same named subagent resolves to the same persistent session no matter which of the parent agent's chat sessions invoked it:
 
 ```rust
-let parent_as_agent = AgentId(parent_session_id.0);
-let stable_id = AgentId::deterministic(parent_as_agent, &name);
-let stable_ctx = format!("subagent_{}_{}", parent_session_id.0, name);
+let stable_id = AgentId::deterministic(parent_agent_id, &name);
+let stable_ctx = format!("subagent_{}_{}", parent_agent_id.0, name);
 let session = session_manager.get_or_create(stable_id, &stable_ctx);
 let messages = session_manager.get_history(session.id)?;
 ```
@@ -272,6 +272,10 @@ let messages = session_manager.get_history(session.id)?;
 > **Note:** `parent_session_id` here is the **spawning chat session**, not the parent agent's identity. The named subagent's persistent session is therefore keyed per-conversation, not per-agent — opening a new chat with the same parent agent yields a different `session_id` and will not resolve a subagent session spawned in a previous chat. This is the current intended model; whether to add an agent-scoped fallback is tracked as a v0.2.4 design question.
 
 This is cheap — no LLM call, just a session read. The parent's LLM decides when it needs context from a subagent and pulls it in.
+
+> **Orphan policy on upgrade (#1051):** Subagent sessions created *before* the #1051 re-key were derived from `(parent_session, name)` and remain in the SQLite session store after the upgrade, but they are no longer reachable by name — both `invoke_agent` and `read_subagent_session` now resolve under the new `(parent_agent_id, name)` derivation. The old rows are orphaned but harmless: they consume some disk and show up in `alms session list`, and operators can `alms session delete <id>` to reclaim space. We chose orphaning over an in-place migration because the parent-session-keyed rows weren't durably useful (they reset every chat session anyway), so a rename would have moved the wrong history into the new persistent slot.
+>
+> **Concurrency scope:** The same per-parent-agent scope applies to the in-process active-subagent guard — two different parent agents can spawn a same-named subagent concurrently, since their sessions are disjoint. Only a single invocation of the same name *under the same parent agent* is rejected.
 
 #### C. Context flow diagram
 

@@ -1658,13 +1658,14 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
         let invoke_tool = alms_tools::InvokeAgentTool::new(
             dispatcher,
             session_id,
+            agent_id,
             Some(run_id),
             Some(invoke_agent_fwd),
         )
         .with_cancel_token(cancel_token)
         .with_background_event_fwd(bg_event_fwd);
         let read_session_tool =
-            alms_tools::ReadSubagentSessionTool::new(state.session_manager.clone(), session_id);
+            alms_tools::ReadSubagentSessionTool::new(state.session_manager.clone(), agent_id);
         runtime.tools().register(std::sync::Arc::new(invoke_tool));
         runtime
             .tools()

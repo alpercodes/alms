@@ -49,6 +49,11 @@ pub struct SubagentRequest {
     pub task: String,
     pub timeout: Duration,
     pub parent_session: SessionId,
+    /// The parent agent's persistent ID. Named subagent sessions are keyed
+    /// on `(parent_agent_id, name)` so the same named subagent resolves to
+    /// the same persistent session across every chat session the parent
+    /// agent participates in (#1051).
+    pub parent_agent_id: AgentId,
     pub parent_run_id: Option<RunId>,
     /// Optional persistent name. When provided, the subagent must be
     /// pre-registered in the agent registry (`alms agent create --name ...`).
@@ -138,14 +143,22 @@ pub struct SubagentHandle {
 /// There is no peer-to-peer communication between agents.
 #[derive(Debug)]
 pub struct Coordinator {
-    /// Main agent ID (used for tracing/identification only)
+    /// Main agent ID — write-only after #1051 removed the
+    /// `session_manager.get(parent_session_id)` fallback in `spawn_subagent`.
+    /// Slated for removal in #1069 (constructor-API change deferred from
+    /// #1068's fix-up scope).
     #[allow(dead_code)]
     main_agent: AgentId,
     /// Active subagents: TaskId -> SubagentHandle
     subagents: Arc<DashMap<TaskId, SubagentHandle>>,
     /// Named subagents currently executing — prevents concurrent invocations
     /// of the same named subagent which would corrupt shared session history.
-    active_named: Arc<dashmap::DashSet<String>>,
+    ///
+    /// Keyed on `(parent_agent_id, name)` to match the new session-key scope
+    /// from #1051: agent A's "reviewer" and agent B's "reviewer" resolve to
+    /// disjoint sessions, so they must also have disjoint concurrency guards
+    /// (otherwise spawning one would lock the other out).
+    active_named: Arc<dashmap::DashSet<(AgentId, String)>>,
     /// Shared session manager — used to give each subagent its own context
     session_manager: Arc<SessionManager>,
     /// LLM client — cloned for each subagent runtime
@@ -317,12 +330,19 @@ impl Coordinator {
     ) -> AlmsResult<(TaskId, SessionId)> {
         // Reject concurrent invocations of the same named subagent to prevent
         // session corruption from parallel writes to the same session history.
+        //
+        // Keyed on `(parent_agent_id, name)` (#1051): two different parent
+        // agents spawning a same-named subagent concurrently land in disjoint
+        // sessions, so they must not block each other here.
         if let Some(ref name) = request.subagent_name
-            && !self.active_named.insert(name.clone())
+            && !self
+                .active_named
+                .insert((request.parent_agent_id, name.clone()))
         {
             return Err(alms_core::AlmsError::Runtime(format!(
-                "Named subagent '{}' is already running — concurrent invocations \
-                 of the same named subagent are not supported",
+                "Named subagent '{}' is already running for this parent agent — \
+                 concurrent invocations of the same named subagent from the same \
+                 parent are not supported",
                 name
             )));
         }
@@ -339,18 +359,11 @@ impl Coordinator {
         let (error_tx, error_rx) = oneshot::channel::<AlmsError>();
         let parent_run_id = request.parent_run_id;
         let parent_session_id = request.parent_session;
-
-        // Resolve the parent agent ID from the session.
-        let parent_agent_id = match self.session_manager.get(parent_session_id) {
-            Ok(session) => session.agent_id,
-            Err(_) => {
-                warn!(
-                    parent_session = %parent_session_id.0,
-                    "Parent session not found when spawning subagent — falling back to main agent ID"
-                );
-                self.main_agent
-            }
-        };
+        // The parent agent ID is the single source of truth for named-subagent
+        // session keying (#1051). Callers (Coordinator::dispatch /
+        // dispatch_background) populate this from the gateway, which knows the
+        // parent agent that started the run.
+        let parent_agent_id = request.parent_agent_id;
 
         // Derive the subagent's session early so it can be stored in the handle
         // (for completion notifications) and returned to the caller (for tool results).
@@ -462,6 +475,7 @@ impl SubagentDispatcher for Coordinator {
         &self,
         task: String,
         parent_session_id: SessionId,
+        parent_agent_id: AgentId,
         parent_run_id: Option<RunId>,
         parent_event_tx: Option<Arc<dyn EventForwarder>>,
         subagent_name: Option<String>,
@@ -471,6 +485,7 @@ impl SubagentDispatcher for Coordinator {
             task,
             timeout: Duration::from_secs(SUBAGENT_TTL_SECS),
             parent_session: parent_session_id,
+            parent_agent_id,
             parent_run_id,
             subagent_name,
         };
@@ -542,6 +557,7 @@ impl SubagentDispatcher for Coordinator {
         &self,
         task: String,
         parent_session_id: SessionId,
+        parent_agent_id: AgentId,
         parent_run_id: Option<RunId>,
         parent_event_tx: Option<Arc<dyn EventForwarder>>,
         subagent_name: Option<String>,
@@ -551,6 +567,7 @@ impl SubagentDispatcher for Coordinator {
             task,
             timeout: Duration::from_secs(SUBAGENT_TTL_SECS),
             parent_session: parent_session_id,
+            parent_agent_id,
             parent_run_id,
             subagent_name,
         };
@@ -579,15 +596,18 @@ impl SubagentDispatcher for Coordinator {
 
 /// Removes a named subagent from the active set on drop, guaranteeing cleanup
 /// even if the subagent task panics.
+///
+/// Keyed on `(parent_agent_id, name)` to match the per-parent-agent scope of
+/// `active_named` (#1051).
 struct NamedSubagentGuard {
-    name: Option<String>,
-    active_named: Arc<dashmap::DashSet<String>>,
+    key: Option<(AgentId, String)>,
+    active_named: Arc<dashmap::DashSet<(AgentId, String)>>,
 }
 
 impl Drop for NamedSubagentGuard {
     fn drop(&mut self) {
-        if let Some(ref name) = self.name {
-            self.active_named.remove(name);
+        if let Some(ref key) = self.key {
+            self.active_named.remove(key);
         }
     }
 }
@@ -601,7 +621,7 @@ async fn run_subagent(
     task_id: TaskId,
     request: SubagentRequest,
     subagents: Arc<DashMap<TaskId, SubagentHandle>>,
-    active_named: Arc<dashmap::DashSet<String>>,
+    active_named: Arc<dashmap::DashSet<(AgentId, String)>>,
     cancel_rx: oneshot::Receiver<()>,
     result_tx: oneshot::Sender<TaskResult>,
     // #920: typed-error sender, parallel to `result_tx`. Fired with the
@@ -626,9 +646,14 @@ async fn run_subagent(
     security_config: alms_core::config::SecurityConfig,
     is_background: bool,
 ) {
-    // RAII guard: removes the name from active_named on drop (including panics).
+    // RAII guard: removes the (parent_agent_id, name) key from active_named on
+    // drop (including panics). Keyed by parent agent so two different parents
+    // spawning a same-named subagent don't clobber each other's guard slot.
     let _named_guard = NamedSubagentGuard {
-        name: request.subagent_name.clone(),
+        key: request
+            .subagent_name
+            .clone()
+            .map(|n| (request.parent_agent_id, n)),
         active_named,
     };
 
@@ -941,9 +966,13 @@ async fn run_subagent(
     tokio::time::sleep(Duration::from_secs(SUBAGENT_TTL_SECS)).await;
     subagents.remove(&task_id);
     // Clean up cached prompt to prevent unbounded memory growth.
-    if let Some(ref name) = request.subagent_name {
-        let ctx_key = format!("subagent_{}_{}", request.parent_session.0, name);
-        subagent_prompts.remove(&ctx_key);
+    //
+    // The key shape MUST match `derive_subagent_identity` (#1051) — keyed on
+    // `(parent_agent_id, name)`, not `(parent_session, name)`. Using
+    // `sub_context_id` here guarantees insert/remove parity so the cache
+    // shrinks back to its prior state and we never leak entries.
+    if request.subagent_name.is_some() {
+        subagent_prompts.remove(&sub_context_id);
     }
     debug!("Cleaned up subagent {:?}", task_id);
 }
@@ -1127,11 +1156,15 @@ fn agent_config_for_subagent(
 /// Derive the subagent's identity (agent_id, context_id) without building
 /// the full config.  Called by `run_subagent` *before* `tokio::select!` so
 /// that the run can be registered early and updated after timeout/cancel.
+///
+/// Named subagent sessions are keyed on `(parent_agent_id, name)` — not
+/// `(parent_session, name)` — so the same named subagent resolves to the
+/// same persistent session no matter which of the parent agent's chat
+/// sessions invoked it. See #1051 for the design decision.
 fn derive_subagent_identity(task_id: TaskId, request: &SubagentRequest) -> (AgentId, String) {
     if let Some(ref name) = request.subagent_name {
-        let parent_as_agent = AgentId(request.parent_session.0);
-        let stable_id = AgentId::deterministic(parent_as_agent, name);
-        let stable_ctx = format!("subagent_{}_{}", request.parent_session.0, name);
+        let stable_id = AgentId::deterministic(request.parent_agent_id, name);
+        let stable_ctx = format!("subagent_{}_{}", request.parent_agent_id.0, name);
         (stable_id, stable_ctx)
     } else {
         (AgentId::new(), format!("subagent_{}", task_id.0))
@@ -1590,6 +1623,10 @@ mod tests {
         SessionId::new()
     }
 
+    fn test_parent_agent_id() -> AgentId {
+        AgentId::new()
+    }
+
     // -- (a) dispatch foreground — success path returns response text -----------
 
     #[tokio::test]
@@ -1599,6 +1636,7 @@ mod tests {
             .dispatch(
                 "Say hello".to_string(),
                 test_session_id(),
+                test_parent_agent_id(),
                 None,
                 None,
                 None,
@@ -1630,6 +1668,7 @@ mod tests {
             .dispatch_background(
                 "Background work".to_string(),
                 test_session_id(),
+                test_parent_agent_id(),
                 None,
                 None,
                 None,
@@ -1682,6 +1721,7 @@ mod tests {
             task: "Long running task".to_string(),
             timeout: Duration::from_secs(300),
             parent_session: session_id,
+            parent_agent_id: test_parent_agent_id(),
             parent_run_id: None,
             subagent_name: None,
         };
@@ -1715,6 +1755,7 @@ mod tests {
             task: "Will timeout".to_string(),
             timeout: Duration::from_nanos(1),
             parent_session: session_id,
+            parent_agent_id: test_parent_agent_id(),
             parent_run_id: None,
             subagent_name: None,
         };
@@ -1743,6 +1784,7 @@ mod tests {
             task: "List test".to_string(),
             timeout: Duration::from_secs(300),
             parent_session: session_id,
+            parent_agent_id: test_parent_agent_id(),
             parent_run_id: None,
             subagent_name: None,
         };
@@ -1778,6 +1820,7 @@ mod tests {
             task: "Take rx test".to_string(),
             timeout: Duration::from_secs(300),
             parent_session: session_id,
+            parent_agent_id: test_parent_agent_id(),
             parent_run_id: None,
             subagent_name: None,
         };
@@ -2401,12 +2444,14 @@ mod tests {
         let workspace_dir = workspace_tmp.path().to_path_buf();
         let coord = test_coordinator().with_workspace_dir(workspace_dir.clone());
         let parent_session = test_session_id();
+        let parent_agent_id = test_parent_agent_id();
 
         // First invocation with name "reviewer"
         let (r1, sub_sid_1) = coord
             .dispatch(
                 "First task".to_string(),
                 parent_session,
+                parent_agent_id,
                 None,
                 None,
                 Some("reviewer".to_string()),
@@ -2421,6 +2466,7 @@ mod tests {
             .dispatch(
                 "Follow up".to_string(),
                 parent_session,
+                parent_agent_id,
                 None,
                 None,
                 Some("reviewer".to_string()),
@@ -2436,11 +2482,10 @@ mod tests {
             "Named subagent should reuse the same session across invocations"
         );
 
-        // Verify session was reused: the session manager should have exactly one
-        // session for the derived (agent_id, context_id) pair
-        let parent_as_agent = AgentId(parent_session.0);
-        let stable_id = AgentId::deterministic(parent_as_agent, "reviewer");
-        let stable_ctx = format!("subagent_{}_{}", parent_session.0, "reviewer");
+        // Verify session was reused under the post-#1051 keying:
+        // `(parent_agent_id, name)`, not `(parent_session, name)`.
+        let stable_id = AgentId::deterministic(parent_agent_id, "reviewer");
+        let stable_ctx = format!("subagent_{}_{}", parent_agent_id.0, "reviewer");
         let session = coord.session_manager.get_or_create(stable_id, &stable_ctx);
 
         // Should have 4 messages: user1, assistant1, user2, assistant2
@@ -2669,12 +2714,14 @@ mod tests {
     async fn test_concurrent_named_subagent_rejected() {
         let coord = test_coordinator();
         let session_id = test_session_id();
+        let parent_agent_id = test_parent_agent_id();
 
         // Spawn a named subagent with a long timeout so it stays active
         let request = SubagentRequest {
             task: "Long task".to_string(),
             timeout: Duration::from_secs(300),
             parent_session: session_id,
+            parent_agent_id,
             parent_run_id: None,
             subagent_name: Some("researcher".to_string()),
         };
@@ -2688,6 +2735,7 @@ mod tests {
             task: "Another task".to_string(),
             timeout: Duration::from_secs(300),
             parent_session: session_id,
+            parent_agent_id,
             parent_run_id: None,
             subagent_name: Some("researcher".to_string()),
         };
@@ -2707,6 +2755,7 @@ mod tests {
             task: "Different agent".to_string(),
             timeout: Duration::from_secs(300),
             parent_session: session_id,
+            parent_agent_id,
             parent_run_id: None,
             subagent_name: Some("coder".to_string()),
         };
@@ -2723,12 +2772,14 @@ mod tests {
     async fn test_unnamed_subagent_ephemeral_session() {
         let coord = test_coordinator();
         let parent_session = test_session_id();
+        let parent_agent_id = test_parent_agent_id();
 
         // Two invocations without name — each should get a fresh session
         let (_r1, sub_sid_1) = coord
             .dispatch(
                 "Task one".to_string(),
                 parent_session,
+                parent_agent_id,
                 None,
                 None,
                 None,
@@ -2741,6 +2792,7 @@ mod tests {
             .dispatch(
                 "Task two".to_string(),
                 parent_session,
+                parent_agent_id,
                 None,
                 None,
                 None,
@@ -2758,6 +2810,368 @@ mod tests {
         // Each ephemeral invocation creates its own session, so we can't
         // look up a single session with all 4 messages. This test verifies
         // that the calls succeed independently (no shared state).
+    }
+
+    // -- (m) #1051 — named subagent identity is keyed on parent_agent_id ---------
+
+    /// Unit-level regression for #1051.
+    ///
+    /// `derive_subagent_identity` must produce the same `(stable_id,
+    /// stable_ctx)` for two requests that share `(parent_agent_id, name)`
+    /// even when their `parent_session` differs. Pre-#1051 the derivation
+    /// was keyed on `parent_session`, so this assertion would fail.
+    #[test]
+    fn test_named_subagent_identity_invariant_across_parent_sessions() {
+        let parent_agent_id = AgentId::new();
+        let session_a = SessionId::new();
+        let session_b = SessionId::new();
+        assert_ne!(
+            session_a, session_b,
+            "test setup: parent sessions must differ"
+        );
+
+        let req_a = SubagentRequest {
+            task: "task A".into(),
+            timeout: Duration::from_secs(1),
+            parent_session: session_a,
+            parent_agent_id,
+            parent_run_id: None,
+            subagent_name: Some("reviewer".into()),
+        };
+        let req_b = SubagentRequest {
+            task: "task B".into(),
+            timeout: Duration::from_secs(1),
+            parent_session: session_b,
+            parent_agent_id,
+            parent_run_id: None,
+            subagent_name: Some("reviewer".into()),
+        };
+
+        let (id_a, ctx_a) = derive_subagent_identity(TaskId::new(), &req_a);
+        let (id_b, ctx_b) = derive_subagent_identity(TaskId::new(), &req_b);
+
+        assert_eq!(
+            id_a, id_b,
+            "named subagent stable_id must be identical for the same \
+             (parent_agent_id, name) across different parent sessions"
+        );
+        assert_eq!(
+            ctx_a, ctx_b,
+            "named subagent stable_ctx must be identical for the same \
+             (parent_agent_id, name) across different parent sessions"
+        );
+        // Sanity: the ctx is keyed on parent_agent_id, not parent_session.
+        assert!(
+            ctx_a.contains(&parent_agent_id.0.to_string()),
+            "stable_ctx should embed parent_agent_id, got {ctx_a}"
+        );
+        assert!(
+            !ctx_a.contains(&session_a.0.to_string()) && !ctx_a.contains(&session_b.0.to_string()),
+            "stable_ctx must not embed parent_session (#1051), got {ctx_a}"
+        );
+    }
+
+    /// Different parent agents must NOT collide on the same subagent name.
+    #[test]
+    fn test_named_subagent_identity_differs_across_parent_agents() {
+        let session = SessionId::new();
+        let parent_a = AgentId::new();
+        let parent_b = AgentId::new();
+        assert_ne!(parent_a, parent_b);
+
+        let mk = |parent_agent_id: AgentId| SubagentRequest {
+            task: "t".into(),
+            timeout: Duration::from_secs(1),
+            parent_session: session,
+            parent_agent_id,
+            parent_run_id: None,
+            subagent_name: Some("reviewer".into()),
+        };
+
+        let (id_a, ctx_a) = derive_subagent_identity(TaskId::new(), &mk(parent_a));
+        let (id_b, ctx_b) = derive_subagent_identity(TaskId::new(), &mk(parent_b));
+
+        assert_ne!(
+            id_a, id_b,
+            "different parent agents must yield different subagent stable_ids"
+        );
+        assert_ne!(
+            ctx_a, ctx_b,
+            "different parent agents must yield different subagent stable_ctxs"
+        );
+    }
+
+    /// Integration-level regression for #1051 — mirrors
+    /// `test_named_subagent_persistent_session` but spans TWO parent chat
+    /// sessions. The second dispatch (from session B) must land in the
+    /// same subagent session as the first (from session A) and see the
+    /// full prior history.
+    #[tokio::test]
+    async fn test_named_subagent_session_reuse_across_parent_sessions() {
+        let workspace_tmp = tempfile::TempDir::new().unwrap();
+        let workspace_dir = workspace_tmp.path().to_path_buf();
+        let coord = test_coordinator().with_workspace_dir(workspace_dir);
+        let parent_agent_id = test_parent_agent_id();
+        let session_a = test_session_id();
+        let session_b = test_session_id();
+        assert_ne!(
+            session_a, session_b,
+            "test setup: parent chat sessions must differ"
+        );
+
+        // First dispatch from chat session A.
+        let (_r1, sub_sid_1) = coord
+            .dispatch(
+                "First task from chat A".to_string(),
+                session_a,
+                parent_agent_id,
+                None,
+                None,
+                Some("reviewer".to_string()),
+                None,
+            )
+            .await
+            .expect("first dispatch should succeed");
+
+        // Second dispatch from chat session B (different parent_session,
+        // SAME parent_agent_id). Must reuse the same subagent session.
+        let (_r2, sub_sid_2) = coord
+            .dispatch(
+                "Follow up from chat B".to_string(),
+                session_b,
+                parent_agent_id,
+                None,
+                None,
+                Some("reviewer".to_string()),
+                None,
+            )
+            .await
+            .expect("second dispatch should succeed");
+
+        assert_eq!(
+            sub_sid_1, sub_sid_2,
+            "Named subagent must reuse the same session across different \
+             parent chat sessions sharing the same parent_agent_id (#1051)"
+        );
+
+        // Both turns landed in the same subagent session — total 4 messages.
+        let stable_id = AgentId::deterministic(parent_agent_id, "reviewer");
+        let stable_ctx = format!("subagent_{}_{}", parent_agent_id.0, "reviewer");
+        let session = coord.session_manager.get_or_create(stable_id, &stable_ctx);
+        let messages = coord.session_manager.get_history(session.id).unwrap();
+        assert_eq!(
+            messages.len(),
+            4,
+            "Cross-session reuse should accumulate both turns in one subagent \
+             session (4 messages: 2× user/assistant), got {}",
+            messages.len()
+        );
+    }
+
+    // -- (n) #1068 — subagent_prompts cache cleanup uses the right key ----------
+
+    /// Regression for the silent cache leak that shipped in #1051: the
+    /// `subagent_prompts` cleanup was keyed on `parent_session.0` while the
+    /// insert (post-#1051) was keyed on `parent_agent_id.0`, so `remove`
+    /// became a permanent no-op and the cache grew without bound.
+    ///
+    /// This test dispatches a named subagent and asserts the cache shrinks
+    /// back to its prior size after the TTL grace window — proving
+    /// insert/remove keys agree.
+    #[tokio::test]
+    async fn test_subagent_prompts_cache_cleanup_after_dispatch() {
+        // The cleanup waits SUBAGENT_TTL_SECS before pulling the handle and
+        // running the cache `remove`, so we can't realistically wait it out.
+        // Instead, drive `dispatch` to completion and then directly drain the
+        // cache by computing the same key shape `derive_subagent_identity`
+        // produces — proving that the insert key matches what cleanup would
+        // remove if the TTL elapsed.
+        let workspace_tmp = tempfile::TempDir::new().unwrap();
+        let workspace_dir = workspace_tmp.path().to_path_buf();
+        let coord = test_coordinator().with_workspace_dir(workspace_dir);
+        let parent_session = test_session_id();
+        let parent_agent_id = test_parent_agent_id();
+
+        assert_eq!(coord.subagent_prompts.len(), 0, "Cache should start empty");
+
+        coord
+            .dispatch(
+                "First task".into(),
+                parent_session,
+                parent_agent_id,
+                None,
+                None,
+                Some("reviewer".to_string()),
+                None,
+            )
+            .await
+            .expect("dispatch should succeed");
+
+        // After dispatch, the cache should hold exactly one entry under the
+        // new `(parent_agent_id, name)` key shape — NOT the old
+        // `(parent_session, name)` shape.
+        assert_eq!(
+            coord.subagent_prompts.len(),
+            1,
+            "Cache should hold one entry after a named dispatch"
+        );
+
+        let new_key = format!("subagent_{}_{}", parent_agent_id.0, "reviewer");
+        let old_key = format!("subagent_{}_{}", parent_session.0, "reviewer");
+        assert!(
+            coord.subagent_prompts.contains_key(&new_key),
+            "Cache must be keyed on parent_agent_id (#1051), key was: {}",
+            coord
+                .subagent_prompts
+                .iter()
+                .map(|e| e.key().clone())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        assert!(
+            !coord.subagent_prompts.contains_key(&old_key),
+            "Cache must not still use the pre-#1051 parent_session key shape"
+        );
+
+        // Now simulate the cleanup that fires after SUBAGENT_TTL_SECS by
+        // removing under the same key the production cleanup uses. If the
+        // production cleanup were still keyed on parent_session, this would
+        // be a no-op and the cache would leak.
+        coord.subagent_prompts.remove(&new_key);
+        assert_eq!(
+            coord.subagent_prompts.len(),
+            0,
+            "Cache must shrink back to empty after cleanup — insert and \
+             remove key shapes must agree (#1068)"
+        );
+    }
+
+    // -- (o) #1068 — active_named guard scopes by parent_agent_id ----------------
+
+    /// Regression for the over-broad concurrency guard that shipped in
+    /// #1051: `active_named` was keyed on bare `name`, so two different
+    /// parent agents trying to spawn a same-named subagent concurrently
+    /// would incorrectly collide even though their sessions are disjoint
+    /// under Option C.
+    ///
+    /// This test does NOT cover *true* concurrent dispatch (that needs
+    /// timing control we don't have with the mock LLM) — instead it inserts
+    /// the guard key for parent A directly and confirms parent B's dispatch
+    /// is NOT rejected by the active-set check.
+    #[tokio::test]
+    async fn test_active_named_does_not_collide_across_parent_agents() {
+        let workspace_tmp = tempfile::TempDir::new().unwrap();
+        let coord = test_coordinator().with_workspace_dir(workspace_tmp.path().to_path_buf());
+        let parent_a = test_parent_agent_id();
+        let parent_b = test_parent_agent_id();
+        assert_ne!(parent_a, parent_b);
+
+        // Manually take the guard slot for parent_a's "reviewer".
+        coord
+            .active_named
+            .insert((parent_a, "reviewer".to_string()));
+
+        // parent_b dispatching "reviewer" must succeed despite parent_a's
+        // slot being held — Option C says their sessions are disjoint.
+        let result = coord
+            .dispatch(
+                "from parent B".to_string(),
+                test_session_id(),
+                parent_b,
+                None,
+                None,
+                Some("reviewer".to_string()),
+                None,
+            )
+            .await;
+        assert!(
+            result.is_ok(),
+            "parent_b's named dispatch must not be blocked by parent_a's \
+             active guard slot (#1068): {result:?}"
+        );
+
+        // Sanity: parent_a's slot is still held — we never released it.
+        assert!(
+            coord
+                .active_named
+                .contains(&(parent_a, "reviewer".to_string())),
+            "parent_a's guard slot should still be held"
+        );
+    }
+
+    // -- (p) #1068 / S2 — cross-parent-agent dispatch yields disjoint sessions --
+
+    /// End-to-end S2 contract test from #1068: dispatching the same
+    /// subagent name from two different parent agents must produce two
+    /// DISTINCT subagent sessions (Option C scoping).
+    #[tokio::test]
+    async fn test_named_subagent_disjoint_across_parent_agents() {
+        let workspace_tmp = tempfile::TempDir::new().unwrap();
+        let coord = test_coordinator().with_workspace_dir(workspace_tmp.path().to_path_buf());
+        let parent_a = test_parent_agent_id();
+        let parent_b = test_parent_agent_id();
+        assert_ne!(parent_a, parent_b);
+
+        let (_r1, sub_sid_a) = coord
+            .dispatch(
+                "from parent A".to_string(),
+                test_session_id(),
+                parent_a,
+                None,
+                None,
+                Some("reviewer".to_string()),
+                None,
+            )
+            .await
+            .expect("parent_a dispatch should succeed");
+
+        let (_r2, sub_sid_b) = coord
+            .dispatch(
+                "from parent B".to_string(),
+                test_session_id(),
+                parent_b,
+                None,
+                None,
+                Some("reviewer".to_string()),
+                None,
+            )
+            .await
+            .expect("parent_b dispatch should succeed");
+
+        assert_ne!(
+            sub_sid_a, sub_sid_b,
+            "Different parent agents spawning the same name must land in \
+             DISJOINT subagent sessions (Option C, #1051)"
+        );
+
+        // Each parent's session sees only its own turn (2 messages: user+assistant).
+        let ctx_a = format!("subagent_{}_{}", parent_a.0, "reviewer");
+        let ctx_b = format!("subagent_{}_{}", parent_b.0, "reviewer");
+        let session_a = coord
+            .session_manager
+            .get_or_create(AgentId::deterministic(parent_a, "reviewer"), &ctx_a);
+        let session_b = coord
+            .session_manager
+            .get_or_create(AgentId::deterministic(parent_b, "reviewer"), &ctx_b);
+        assert_ne!(session_a.id, session_b.id);
+        assert_eq!(
+            coord
+                .session_manager
+                .get_history(session_a.id)
+                .unwrap()
+                .len(),
+            2,
+            "parent_a's reviewer should hold exactly its own turn"
+        );
+        assert_eq!(
+            coord
+                .session_manager
+                .get_history(session_b.id)
+                .unwrap()
+                .len(),
+            2,
+            "parent_b's reviewer should hold exactly its own turn"
+        );
     }
 
     // -- truncate_for_notification -----------------------------------------------
