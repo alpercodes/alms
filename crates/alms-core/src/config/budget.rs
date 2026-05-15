@@ -656,7 +656,7 @@ mod tests {
         // enumerate (moonshotai, z-ai). They must fall through to None so
         // the validator doesn't false-positive on a default-shaped boot.
         assert_eq!(
-            provider_context_window("openrouter", "moonshotai/kimi-k2.5"),
+            provider_context_window("openrouter", "moonshotai/kimi-k2.6"),
             None
         );
         assert_eq!(provider_context_window("openrouter", "z-ai/glm-5.1"), None);

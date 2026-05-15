@@ -263,7 +263,7 @@ impl Default for LlmConfig {
         Self {
             provider: "openrouter".into(),
             base_url: "https://openrouter.ai/api/v1".into(),
-            model: "moonshotai/kimi-k2.5".into(),
+            model: "moonshotai/kimi-k2.6".into(),
             api_key: None,
             timeout_secs: 120,
             max_retries: 2,
@@ -327,7 +327,18 @@ pub struct AnthropicConfig {
 impl Default for AnthropicConfig {
     fn default() -> Self {
         Self {
-            thinking_budget_tokens: 0,
+            // 2048 tokens of extended thinking enabled by default —
+            // sits between Anthropic's minimum (~1024) and the
+            // "noticeable latency" range (8192+). 2048 is enough
+            // headroom for the model to plan a multi-step tool turn
+            // without doubling response latency on short turns where
+            // thinking falls below the wire-budget floor. Operators
+            // who want thinking off can set `thinking_budget_tokens =
+            // 0` in `[llm.anthropic]` (or via `PATCH /settings`'s
+            // `llm.anthropic.thinking_budget_tokens` knob), and per-
+            // agent `Some(0)` still wins per the two-layer precedence
+            // chain from #767/#941.
+            thinking_budget_tokens: 2048,
             // Caching defaults to on — it's free when the prefix is below
             // Anthropic's minimum cacheable size (they silently ignore
             // markers on short prefixes) and saves input tokens on the
@@ -875,14 +886,24 @@ impl Default for ContextConfig {
             // when `strategy == "compact"`.
             compact_trigger_pct: 0.80,
             compact_retain_pct: 0.40,
-            // Default to None for both fields (#872). The pre-#872 default
-            // paired `summary_model = Some("minimax/minimax-m2.7")` with
+            // Default to None for both fields (#872). The pre-#872
+            // default paired `summary_model = Some("minimax/...")` with
             // `summary_provider = None`, which the resolver silently
             // mapped onto the agent's primary provider — the exact
             // misconfiguration that produced the `model: not found` 404
             // in #866. The new pair-only validator rejects that
             // asymmetric state, so the default ships with both fields
             // unset; operators opt in by configuring both at once.
+            //
+            // Atlas's "default summary model = kimi-k2.6" directive is
+            // satisfied implicitly by this both-None default: when both
+            // fields are None, the summary task inherits the agent's
+            // resolved (provider, model) pair, which now defaults to
+            // (`openrouter`, `moonshotai/kimi-k2.6`) — so a fresh boot
+            // summarises with kimi-k2.6 without forcing operators to
+            // opt into the symmetric-pair shape. Setting both fields
+            // to something else explicitly still wins on the per-agent
+            // or per-server level via PATCH /settings.
             summary_model: None,
             summary_provider: None,
             run_summary_mode: RunSummaryMode::Llm,

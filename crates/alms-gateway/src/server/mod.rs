@@ -12,7 +12,7 @@ mod run_manager;
 mod state;
 
 pub use run_manager::RunManager;
-pub use state::AppState;
+pub use state::{AppState, ServerLlmDefault};
 
 use crate::auth::{AuthToken, no_cache, require_auth};
 use crate::cron_utils;

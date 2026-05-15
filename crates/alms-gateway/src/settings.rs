@@ -108,10 +108,19 @@ pub async fn get_settings(State(state): State<AppState>) -> impl IntoResponse {
     let log = &state.logging_config;
     let tools_cfg = state.tools_config.read().clone();
 
+    // Top-level `model` / `provider` are the *live* server-default
+    // `(model, provider)` pair. After a `PATCH /settings` carrying
+    // those keys, this lock holds the patched value even though the
+    // by-value `state.llm` / `state.llm_config` clones still carry
+    // the boot-time value. GET reflects PATCH immediately; the run
+    // path only picks the new pair up after a restart (the wire
+    // surface flags this via `restart_required` in the PATCH
+    // response).
+    let server_llm = state.server_llm_default.read().clone();
     Json(serde_json::json!({
         "version": env!("CARGO_PKG_VERSION"),
-        "provider": llm.provider,
-        "model": llm.default_model,
+        "provider": server_llm.provider,
+        "model": server_llm.model,
         "base_url": llm.base_url,
         "max_tokens": agent.max_tokens,
         "posture": posture_str,
@@ -302,6 +311,21 @@ pub struct PatchLlm {
 }
 
 /// Top-level PATCH /settings request body.
+///
+/// `model` and `provider` are the server-default LLM model / provider — the
+/// values new agents inherit when they don't carry a per-agent override.
+/// Both are persistence-only on this surface: mutating them rewrites
+/// `settings.json` but does NOT live-mutate the in-memory `state.llm` /
+/// `state.llm_config` clones (which are by-value, not behind an
+/// `Arc<RwLock>`), so the change takes effect on the next daemon restart.
+/// This mirrors the Logging section's restart-required contract; the UI
+/// label calls it out explicitly so operators aren't surprised when a
+/// fresh `GET /settings` keeps reporting the old value until restart.
+///
+/// Per-agent model / provider overrides on the agent registry (`PATCH
+/// /agents/{id}`) continue to win over the server default — operators
+/// who need a hot model switch for a specific agent should use that
+/// surface instead.
 #[derive(Debug, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct PatchSettingsRequest {
@@ -309,6 +333,13 @@ pub struct PatchSettingsRequest {
     pub session: Option<PatchSession>,
     pub tools: Option<PatchTools>,
     pub llm: Option<PatchLlm>,
+    /// Server-default LLM model. `Some("")` is rejected (restart-required
+    /// surface — no clear sentinel). Persisted into `PersistedSettings.model`
+    /// and re-applied on next boot.
+    pub model: Option<String>,
+    /// Server-default LLM provider. Must be a key in `state.llm_config.providers`.
+    /// `Some("")` is rejected. Persisted into `PersistedSettings.provider`.
+    pub provider: Option<String>,
 }
 
 /// PATCH /settings — apply partial config updates to the running server.
@@ -414,7 +445,82 @@ pub async fn patch_settings(
     // carries an explicit `(StatusCode, envelope)` pair (503 with
     // `AGENT_STORE_UNAVAILABLE`) which we forward verbatim, before any
     // mutation lands or `settings.json` is rewritten.
-    match validate_patch_budget(&state, &body) {
+    // Codex follow-up on #1081 (P1): compute the would-be post-PATCH server
+    // default `(provider, model)` and pass it into `validate_patch_budget`
+    // so the budget check sees the *post-PATCH* pair rather than the
+    // boot-time `state.llm_config.*` clone. Without this, a PATCH that
+    // raises `context.max_input_tokens` while also switching to a stricter
+    // provider/model could return 200 and persist an over-budget pair
+    // that later rejects every run after restart.
+    //
+    // Codex follow-up on #1081 (P1 #3): the candidate-model resolution here
+    // must mirror the commit-path resolution at the `provider_to_commit` /
+    // `model_to_commit_with_provider` block below — namely
+    // `body.model -> entry_model -> live_default.model`. Without the
+    // `entry_model` step, a PATCH like
+    // `{provider: "anthropic", max_input_tokens: 500_000}` (no `model` in
+    // the body) is budget-validated against
+    // `(anthropic, <stale_cross_namespace_live_default>)` — a pair the
+    // budget table doesn't recognise, so the validator silently passes —
+    // while the commit path later writes
+    // `(anthropic, <entry_model>)` (e.g. `claude-haiku-4-5`, 200K cap) to
+    // `server_llm_default`. The PATCH returns 200, persistence carries the
+    // coherent pair across restart, and every subsequent run rejects with
+    // `INVALID_TOKEN_BUDGET_FOR_PROVIDER` because 500K > 200K.
+    let live_default = state.server_llm_default.read().clone();
+    // Snapshot `live_default.provider` separately so it stays available
+    // for the `entry_model_for_candidate` no-op guard below — the
+    // `candidate_provider` builder moves the field out via `unwrap_or`.
+    let live_default_provider = live_default.provider.clone();
+    let candidate_provider = body
+        .provider
+        .as_deref()
+        .filter(|p| !p.is_empty())
+        .and_then(|p| {
+            state
+                .llm_config
+                .providers
+                .contains_key(p)
+                .then(|| p.to_string())
+        })
+        .unwrap_or(live_default.provider);
+    // Entry-level model fallback for the provider the PATCH would commit.
+    // Only consulted when the body omits `model` AND the body actually
+    // *switches* provider (i.e. `body.provider != live_default.provider`).
+    // When the provider is unchanged we keep the live default model,
+    // mirroring the commit-path guard at lines ~988-989 below
+    // (`if body_model.is_none() && provider != current_provider`).
+    //
+    // Codex follow-up on #1081 (P1, Finding 5, refs issue #1086 Item 2):
+    // the pre-fix overlay computed `entry_model_for_candidate` whenever
+    // `body.provider` was present, even if it matched the live default.
+    // The commit path, however, only adopts `entry_model` when the
+    // provider *changes*, so an idempotent `{provider: "openrouter", ...}`
+    // payload against a live `(openrouter, Y)` default would budget-check
+    // against `(openrouter, X)` (the `[llm.providers.openrouter].model`
+    // entry) while the commit path kept `Y`. False-positive rejections
+    // followed whenever X had a tighter cap than Y. Gating the overlay on
+    // the same `body.provider != live.provider` predicate that the commit
+    // path uses restores symmetry.
+    //
+    // The compat check at lines ~879+ enforces wire compatibility
+    // separately; here we only care about feeding the right (provider,
+    // model) pair into the budget validator.
+    let entry_model_for_candidate = body
+        .provider
+        .as_deref()
+        .filter(|p| !p.is_empty())
+        .filter(|p| *p != live_default_provider.as_str())
+        .and_then(|p| state.llm_config.providers.get(p))
+        .and_then(|e| e.model.clone());
+    let candidate_model = body
+        .model
+        .as_deref()
+        .filter(|m| !m.is_empty())
+        .map(str::to_string)
+        .or(entry_model_for_candidate)
+        .unwrap_or(live_default.model);
+    match validate_patch_budget(&state, &body, &candidate_provider, &candidate_model) {
         Ok(Some(rejection)) => return (StatusCode::BAD_REQUEST, Json(rejection)),
         Ok(None) => {}
         Err((status, envelope)) => return (status, Json(envelope)),
@@ -775,6 +881,188 @@ pub async fn patch_settings(
         );
     }
 
+    // ── Server-default LLM model / provider ──────────────────────────────
+    //
+    // These are the top-level `llm.model` / `llm.provider` knobs from
+    // `alms.toml` — the values new agents inherit when they have no
+    // per-agent override. PATCH mutations land on the live
+    // `server_llm_default` lock and are persisted into `settings.json`;
+    // **they do NOT live-mutate `state.llm` / `state.llm_config`**
+    // because those are by-value clones held in `AppState` and are
+    // not exposed as `Arc<RwLock>` for a hot swap. The persisted
+    // value is re-applied on the next daemon restart (see
+    // `AppState::new`). The wire response carries this caveat via
+    // `restart_required: true` so the UI can surface a banner.
+    //
+    // Codex follow-up on #1081 (P1): a provider-only PATCH (`{"provider":
+    // "anthropic"}` without `model`) used to silently keep the old default
+    // model — e.g. `moonshotai/kimi-k2.6` on OpenRouter — and persist a
+    // post-restart pair that immediately fails on the wire (Anthropic
+    // would 4xx the OpenRouter model slug). Mirror the runtime's
+    // `resolve_effective_provider_and_model` decision at PATCH time:
+    // when only the provider changes, the post-patch model is either the
+    // new provider's `[llm.providers.<name>].model` entry (if set) or the
+    // live server-default model — and we require that model to wire-match
+    // the new provider's kind via `model_belongs_to_kind`. Operators who
+    // genuinely want a cross-namespace switch supply both `model` and
+    // `provider` in the same PATCH.
+    let mut llm_default_restart_required = false;
+    let mut provider_accepted_for_compat_check: Option<String> = None;
+    if let Some(ref provider) = body.provider {
+        if provider.is_empty() {
+            errors.push(
+                "provider: empty string not accepted — set a concrete provider name or omit the field"
+                    .into(),
+            );
+        } else if !state.llm_config.providers.contains_key(provider) {
+            let mut known: Vec<&str> = state
+                .llm_config
+                .providers
+                .keys()
+                .map(|s| s.as_str())
+                .collect();
+            known.sort();
+            errors.push(format!(
+                "provider '{provider}' is not configured — known providers: {known:?}. \
+                 Add an `[llm.providers.{provider}]` entry to alms.toml first."
+            ));
+        } else {
+            provider_accepted_for_compat_check = Some(provider.clone());
+        }
+    }
+
+    // Cross-field wire-compatibility check (Codex #1081 P1).
+    //
+    // If only `provider` is being patched (no `model` in this body), the
+    // would-be post-PATCH model is the new provider's entry-level model
+    // override (if any) or the live server-default model. We reject the
+    // PATCH up front when neither candidate is wire-compatible with the
+    // new provider's kind — same failure-fast shape the runtime's
+    // `resolve_effective_provider_and_model` enforces for per-agent
+    // provider switches (#860 / #863 / #942).
+    //
+    // Codex follow-up on #1081 (P1 #B): when compat passes via the new
+    // provider's entry-level `model` rather than the live default, we
+    // must ALSO update `server_llm_default.model` to that entry model.
+    // Pre-fix: only `provider` was committed; `server_llm_default.model`
+    // kept the old cross-namespace value (e.g. `moonshotai/kimi-k2.6`).
+    // `persist_settings` then serialised the bad pair to `settings.json`,
+    // and `AppState::new`'s boot path reapplies both fields verbatim
+    // (provider first via `with_provider_and_secrets`, then model via
+    // `with_model`), so after restart the LlmClient lands on
+    // `(anthropic, moonshotai/kimi-k2.6)` — every subsequent run sends an
+    // OpenRouter slug to Anthropic's wire and 4xxs on the model-id shape.
+    // Mirror the candidate-then-commit pattern: track the model that the
+    // compat check approved and commit it alongside the provider.
+    let mut provider_to_commit: Option<String> = None;
+    let mut model_to_commit_with_provider: Option<String> = None;
+    if let Some(provider) = provider_accepted_for_compat_check {
+        let body_model = body.model.as_deref().filter(|m| !m.is_empty());
+        let entry_model = state
+            .llm_config
+            .providers
+            .get(&provider)
+            .and_then(|e| e.model.clone());
+        let current_provider = state.server_llm_default.read().provider.clone();
+        let current_default_model = state.server_llm_default.read().model.clone();
+        let candidate_model: Option<&str> = body_model
+            .or(entry_model.as_deref())
+            .or(Some(current_default_model.as_str()));
+        let new_kind = crate::runs::provider_kind_for_name(&provider, &state.llm_config.providers);
+        let model_ok = match candidate_model {
+            Some(m) => crate::runs::model_belongs_to_kind(m, new_kind),
+            // No candidate model at all (entry has no model, live default
+            // is empty). Reject — the post-patch state is unrunnable.
+            None => false,
+        };
+        if !model_ok {
+            let candidate_display = candidate_model.unwrap_or("<unset>").to_string();
+            errors.push(format!(
+                "INCOMPATIBLE_MODEL_FOR_PROVIDER: switching server-default provider to \
+                 '{provider}' but the post-patch model '{candidate_display}' does not belong \
+                 to that provider's wire kind ({new_kind:?}). Supply a compatible `model` \
+                 in the same PATCH body, or set `[llm.providers.{provider}].model` in \
+                 alms.toml before switching."
+            ));
+        } else {
+            // The body-supplied model wins via the body.model branch below,
+            // so we only need to fall back here when the operator did NOT
+            // supply one. In that case we commit whichever candidate the
+            // compat check actually approved (entry_model > current
+            // default). Without this, a provider-only PATCH whose live
+            // default is cross-namespace persists a pair that fails on
+            // the wire after restart even though the same compat logic
+            // accepted the request via the entry-level model.
+            //
+            // Codex follow-up on #1081 (P2 #4): only consult the entry-model
+            // fallback when the PATCH actually *changes* the provider.
+            // An idempotent `{provider: "anthropic"}` against a live
+            // `(anthropic, <some-current-model>)` default is a no-op as far
+            // as the operator is concerned — overwriting `model` with the
+            // provider entry's `[llm.providers.anthropic].model` (and
+            // flipping `restart_required: true` on the response) is an
+            // unexpected behaviour change for a payload that did not
+            // request a model swap. Gate the fallback on
+            // `provider != current_provider` so a same-provider PATCH
+            // becomes a true no-op at the `(provider, model)` layer.
+            if body_model.is_none() && provider != current_provider {
+                model_to_commit_with_provider = entry_model.or(Some(current_default_model));
+            }
+            provider_to_commit = Some(provider);
+        }
+    }
+    if let Some(provider) = provider_to_commit {
+        // Codex follow-up on #1081 (P2 #4): mirror the model-mutation
+        // guard below — only flip `restart_required` when the provider
+        // actually changes. An idempotent `{provider: <same>}` PATCH is a
+        // genuine no-op and must not surface the restart banner.
+        let mut snap = state.server_llm_default.write();
+        if snap.provider != provider {
+            snap.provider = provider;
+            llm_default_restart_required = true;
+        }
+    }
+    if let Some(model) = model_to_commit_with_provider {
+        // Only mutate when the value actually changes — avoids spurious
+        // log noise and a no-op write when the live default already
+        // matched the candidate (i.e. compat passed via
+        // `current_default_model`, not the provider entry).
+        let mut snap = state.server_llm_default.write();
+        if snap.model != model {
+            snap.model = model;
+            llm_default_restart_required = true;
+        }
+    }
+
+    if let Some(ref model) = body.model {
+        if model.is_empty() {
+            errors.push(
+                "model: empty string not accepted — set a concrete model id or omit the field"
+                    .into(),
+            );
+        } else {
+            // Tim follow-up on #1081: mirror the symmetric provider no-op
+            // guard at lines 994-1004 — only flip `restart_required` when
+            // the model actually changes. An idempotent
+            // `{model: <same-as-current>}` PATCH is a genuine no-op and
+            // must not surface the yellow restart banner nor emit the
+            // "restart required for in-flight runs" info log line.
+            let mut snap = state.server_llm_default.write();
+            if snap.model != *model {
+                snap.model = model.clone();
+                llm_default_restart_required = true;
+            }
+        }
+    }
+    if llm_default_restart_required {
+        let snap = state.server_llm_default.read().clone();
+        info!(
+            model = %snap.model,
+            provider = %snap.provider,
+            "Updated server-default LLM model/provider via PATCH /settings — restart required for in-flight runs"
+        );
+    }
+
     // Persist current settings to disk so they survive restarts — but only
     // when the request validates cleanly. A rejected PATCH (handler returns
     // 422) must be side-effect-free at the persistence layer: otherwise an
@@ -794,7 +1082,16 @@ pub async fn patch_settings(
     // See PR #810 for context.
     if errors.is_empty() {
         persist_settings(&state);
-        (StatusCode::OK, Json(serde_json::json!({ "status": "ok" })))
+        let body = if llm_default_restart_required {
+            serde_json::json!({
+                "status": "ok",
+                "restart_required": true,
+                "restart_reason": "server-default model/provider changes take effect on the next daemon restart",
+            })
+        } else {
+            serde_json::json!({ "status": "ok" })
+        };
+        (StatusCode::OK, Json(body))
     } else {
         (
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -913,6 +1210,8 @@ fn reject_legacy_context_fields(body: &serde_json::Value) -> Option<String> {
 fn validate_patch_budget(
     state: &AppState,
     body: &PatchSettingsRequest,
+    candidate_provider: &str,
+    candidate_model: &str,
 ) -> Result<Option<serde_json::Value>, (StatusCode, serde_json::Value)> {
     // Only fire if the patch actually carries a `max_input_tokens`. The
     // `0` sentinel is rejected by the structural handler with a 422 below;
@@ -939,8 +1238,15 @@ fn validate_patch_budget(
     let mode = alms_core::config::ValidationMode::from_env();
 
     // ── Layer 1: server-default check ─────────────────────────────────
-    let server_provider = state.llm_config.provider.as_str();
-    let server_model = state.llm_config.default_model.as_str();
+    //
+    // Codex follow-up on #1081 (P1): `candidate_provider` / `candidate_model`
+    // reflect the would-be POST-patch server default, not the boot-time
+    // `state.llm_config.*` clone. Without this overlay, a PATCH that
+    // simultaneously raised `context.max_input_tokens` and switched the
+    // default to a stricter provider/model could return 200 and persist
+    // an over-budget pair that later rejected every run after restart.
+    let server_provider = candidate_provider;
+    let server_model = candidate_model;
     if let Err(err) = alms_core::config::validate_token_budget(
         server_provider,
         server_model,
@@ -1460,6 +1766,18 @@ pub struct PersistedSettings {
     pub tools: Option<PersistedToolsOverrides>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub llm: Option<PersistedLlmOverrides>,
+    /// Server-default LLM model from a previous PATCH /settings.
+    /// `Some(value)` overrides the boot-time `llm.model` from TOML / env
+    /// on the next daemon start; `None` leaves it alone. Persisted
+    /// top-level (not nested) because it shadows the top-level
+    /// `llm.model` knob exposed by `alms.toml`, not any per-provider
+    /// reasoning knob.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Server-default LLM provider from a previous PATCH /settings.
+    /// Shadows `llm.provider` from TOML / env on the next daemon start.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
 }
 
 /// Return the canonical path for the persisted settings file.
@@ -1540,6 +1858,15 @@ fn persist_settings(state: &AppState) {
                 cache_ttl_seconds: Some(agent.gemini_cache_ttl_seconds),
             }),
         }),
+        // Server-default `(model, provider)`. Snapshotted from the live
+        // `server_llm_default` lock the PATCH handler mutates. Persisting
+        // unconditionally on every successful PATCH ensures the operator's
+        // last intent survives restart, mirroring the context / session /
+        // tools / llm-family pattern. On restart, `AppState::new` reads
+        // these back and re-applies them to `llm_config` + the `LlmClient`
+        // snapshot before the AppState is published to handlers.
+        model: Some(state.server_llm_default.read().model.clone()),
+        provider: Some(state.server_llm_default.read().provider.clone()),
     };
 
     let path = settings_path(&state.data_dir);
@@ -1780,6 +2107,8 @@ mod tests {
             session: None,
             tools: None,
             llm: None,
+            model: None,
+            provider: None,
         };
         let json = serde_json::to_string_pretty(&persisted).unwrap();
         assert!(
@@ -1828,6 +2157,8 @@ mod tests {
                 max_output_bytes: Some(1_000_000),
             }),
             llm: None,
+            model: None,
+            provider: None,
         };
         let json = serde_json::to_string_pretty(&original).unwrap();
         let deserialized: PersistedSettings = serde_json::from_str(&json).unwrap();
@@ -1905,11 +2236,23 @@ mod tests {
             session: None,
             tools: None,
             llm: None,
+            model: None,
+            provider: None,
         };
         let json = serde_json::to_string_pretty(&persisted).unwrap();
         assert!(
             !json.contains("\"llm\""),
             "JSON should not contain llm key when it is None: {json}"
+        );
+        // Top-level model/provider follow the same `skip_serializing_if`
+        // pattern — absent on the wire when `None`.
+        assert!(
+            !json.contains("\"model\""),
+            "JSON should not contain model key when it is None: {json}"
+        );
+        assert!(
+            !json.contains("\"provider\""),
+            "JSON should not contain provider key when it is None: {json}"
         );
     }
 
@@ -2059,6 +2402,8 @@ mod tests {
                     cache_ttl_seconds: Some(1800),
                 }),
             }),
+            model: None,
+            provider: None,
         };
         let json = serde_json::to_string_pretty(&original).unwrap();
         let round_tripped: PersistedSettings = serde_json::from_str(&json).unwrap();
@@ -2242,6 +2587,1192 @@ mod tests {
             Some(0),
             "gemini.thinking_budget = Some(0) is disable, not clear — \
              must round-trip through the handler verbatim"
+        );
+    }
+
+    // ==================================================================
+    // PATCH /settings — top-level `model` / `provider` (restoration of
+    // the missing server-default-model UI surface, post-#941). These
+    // fields persist but do NOT live-mutate `state.llm` / `state.llm_config`
+    // (by-value clones, no `Arc<RwLock>` hot-swap). Tests pin: the
+    // happy-path mutates `server_llm_default`, the empty-string and
+    // unknown-provider rejections fire, and `PATCH /settings` carrying
+    // either field flags `restart_required: true` on the wire.
+    // ==================================================================
+
+    #[tokio::test]
+    async fn patch_top_level_model_provider_updates_server_llm_default() {
+        let state = settings_test_app_state();
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = state;
+        state.data_dir = tmp.path().to_path_buf();
+
+        // `settings_test_app_state()` builds an `AppState` from
+        // `GatewayConfig::default()` which uses `LlmConfig::default()` —
+        // and that default constructs an EMPTY `providers` map. The
+        // gateway's production boot path eventually fills the map via
+        // `ensure_builtin_providers()` on the unified `AlmsConfig`, but
+        // that step is not exercised by the bare test fixture, so the
+        // PATCH `provider` validator (which checks
+        // `state.llm_config.providers.contains_key(provider)`) rejects
+        // `openrouter` as unknown. Seed the entry inline — same shape
+        // `settings_test_app_state_with_openrouter()` uses below.
+        state.llm_config.providers.insert(
+            "openrouter".into(),
+            alms_core::config::ProviderEntry {
+                kind: alms_core::config::ProviderKind::OpenAiCompatible,
+                base_url: "https://openrouter.ai/api/v1".into(),
+                api_key_env: None,
+                api_key: None,
+                model: None,
+                auth_scheme: alms_core::config::AuthScheme::Bearer,
+                quirks: alms_core::config::ProviderQuirks::default(),
+            },
+        );
+        // `AppState::new` seeds `server_llm_default` from
+        // `LlmConfig::default()`, which post-PR #1081 already carries
+        // `(openrouter, moonshotai/kimi-k2.6)` — i.e. the same pair this
+        // test PATCHes. Force the baseline to a different pair so the
+        // "PATCH actually mutated something" sanity check below is
+        // meaningful instead of vacuously true.
+        {
+            let mut snap = state.server_llm_default.write();
+            snap.model = "openai/gpt-4o-mini".into();
+            snap.provider = "openrouter".into();
+        }
+
+        // Baseline visible to the rest of the test.
+        let before = state.server_llm_default.read().clone();
+        // PATCH both fields. With `openrouter` seeded above the provider
+        // validator passes and both knobs land on `server_llm_default`.
+        let body = PatchSettingsRequest {
+            model: Some("moonshotai/kimi-k2.6".into()),
+            provider: Some("openrouter".into()),
+            ..Default::default()
+        };
+        let resp = patch_settings(
+            axum::extract::State(state.clone()),
+            Json(serde_json::to_value(&body).unwrap()),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let live = state.server_llm_default.read().clone();
+        assert_eq!(live.model, "moonshotai/kimi-k2.6");
+        assert_eq!(live.provider, "openrouter");
+        // The baseline should differ from the post-PATCH snapshot in at
+        // least one knob — sanity check that the mutation actually
+        // landed rather than the test echoing the seeded value.
+        assert!(
+            live.model != before.model || live.provider != before.provider,
+            "PATCH should have mutated at least one of model/provider"
+        );
+
+        // settings.json on disk carries the new pair so a daemon restart
+        // re-applies it on the next boot.
+        let on_disk = std::fs::read_to_string(settings_path(&state.data_dir)).unwrap();
+        let parsed: PersistedSettings = serde_json::from_str(&on_disk).unwrap();
+        assert_eq!(parsed.model.as_deref(), Some("moonshotai/kimi-k2.6"));
+        assert_eq!(parsed.provider.as_deref(), Some("openrouter"));
+    }
+
+    #[tokio::test]
+    async fn patch_top_level_model_provider_flags_restart_required() {
+        use axum::body::to_bytes;
+
+        let state = settings_test_app_state();
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = state;
+        state.data_dir = tmp.path().to_path_buf();
+
+        // Tim follow-up on #1081: the no-op model guard added in this
+        // commit makes `restart_required` conditional on an actual
+        // value change. `settings_test_app_state` boots `AppState::new`
+        // which seeds `server_llm_default.model = "moonshotai/kimi-k2.6"`
+        // (the post-#1081 compiled default). PATCHing the same value
+        // back is now a true no-op and would not flip
+        // `restart_required` — pick a model that differs from the live
+        // default so the wire flag is observably set.
+        let body = PatchSettingsRequest {
+            model: Some("moonshotai/kimi-k2.5".into()),
+            ..Default::default()
+        };
+        let resp = patch_settings(
+            axum::extract::State(state.clone()),
+            Json(serde_json::to_value(&body).unwrap()),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body_bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(json["status"], "ok");
+        assert_eq!(
+            json["restart_required"], true,
+            "wire response must flag restart_required when model/provider changed"
+        );
+    }
+
+    #[tokio::test]
+    async fn patch_top_level_model_rejects_empty_string() {
+        use axum::body::to_bytes;
+
+        let state = settings_test_app_state();
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = state;
+        state.data_dir = tmp.path().to_path_buf();
+
+        let body = PatchSettingsRequest {
+            model: Some(String::new()),
+            ..Default::default()
+        };
+        let resp = patch_settings(
+            axum::extract::State(state.clone()),
+            Json(serde_json::to_value(&body).unwrap()),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body_bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        let errors = json["errors"].as_array().unwrap();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.as_str().unwrap_or("").contains("model: empty string")),
+            "expected empty-model rejection, got: {errors:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn patch_top_level_provider_rejects_unknown() {
+        use axum::body::to_bytes;
+
+        let state = settings_test_app_state();
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = state;
+        state.data_dir = tmp.path().to_path_buf();
+
+        let body = PatchSettingsRequest {
+            provider: Some("totally-not-a-provider".into()),
+            ..Default::default()
+        };
+        let resp = patch_settings(
+            axum::extract::State(state.clone()),
+            Json(serde_json::to_value(&body).unwrap()),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body_bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        let errors = json["errors"].as_array().unwrap();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.as_str().unwrap_or("").contains("totally-not-a-provider")),
+            "expected unknown-provider rejection, got: {errors:?}"
+        );
+    }
+
+    // ==================================================================
+    // Codex follow-up on #1081 (P1 #1) — server-default provider switch
+    // must enforce wire-compatibility against the post-patch model.
+    //
+    // Pre-fix: PATCHing only `{"provider": "anthropic"}` kept the previous
+    // default model (e.g. `moonshotai/kimi-k2.6` on OpenRouter), persisted
+    // the bad pair, and after restart every run sent an OpenRouter slug
+    // to Anthropic's wire and failed authentication / model-id-shape.
+    //
+    // Post-fix: a provider-only PATCH is rejected with
+    // `INCOMPATIBLE_MODEL_FOR_PROVIDER` unless the post-patch candidate
+    // model (which is either the provider entry's `model` field or the
+    // current server-default model) is wire-compatible with the new
+    // provider's kind. Tests cover:
+    //  - (a) provider-only PATCH where the existing default is from a
+    //    different namespace → 422 with INCOMPATIBLE_MODEL_FOR_PROVIDER
+    //  - (b) provider + model PATCH where the new model is compatible
+    //    → 200, both knobs land
+    //  - (c) model-only PATCH (no provider) → 200, model lands
+    //  - (d) provider switch where the new provider has its own entry
+    //    `model` field that matches the new kind → 200
+    // ==================================================================
+
+    /// (a) Provider-only PATCH switching from openrouter→anthropic while
+    /// the live default model is `moonshotai/kimi-k2.6` is rejected. The
+    /// post-patch pair would be `(anthropic, moonshotai/kimi-k2.6)` and
+    /// `moonshotai/...` is not a `claude-*` prefix, so the runtime would
+    /// fail on the wire after restart.
+    #[tokio::test]
+    async fn patch_provider_only_rejects_cross_namespace_default_model() {
+        let mut state = settings_test_app_state();
+        // Seed `[llm.providers.anthropic]` so the providers-map check
+        // passes — the wire-compat check is what we want to exercise.
+        state.llm_config.providers.insert(
+            "anthropic".into(),
+            alms_core::config::ProviderEntry {
+                kind: alms_core::config::ProviderKind::Anthropic,
+                base_url: "https://api.anthropic.com/v1".into(),
+                api_key_env: None,
+                api_key: None,
+                // Crucially: no entry-level model override. The candidate
+                // model falls through to the live server default
+                // (`moonshotai/kimi-k2.6`), which is NOT a `claude-*`.
+                model: None,
+                auth_scheme: alms_core::config::AuthScheme::Header {
+                    name: "x-api-key".into(),
+                },
+                quirks: alms_core::config::ProviderQuirks::default(),
+            },
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        state.data_dir = tmp.path().to_path_buf();
+        // Force the baseline to a non-claude model so the compat check
+        // sees something concrete to reject.
+        {
+            let mut snap = state.server_llm_default.write();
+            snap.model = "moonshotai/kimi-k2.6".into();
+            snap.provider = "openrouter".into();
+        }
+
+        let body = PatchSettingsRequest {
+            provider: Some("anthropic".into()),
+            ..Default::default()
+        };
+        let (status, errors) = patch_and_read_errors(state.clone(), body).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("INCOMPATIBLE_MODEL_FOR_PROVIDER")),
+            "expected INCOMPATIBLE_MODEL_FOR_PROVIDER, got: {errors:?}"
+        );
+        // The provider field MUST NOT have landed on `server_llm_default`
+        // — the whole switch is rejected.
+        let live = state.server_llm_default.read().clone();
+        assert_eq!(live.provider, "openrouter");
+        assert_eq!(live.model, "moonshotai/kimi-k2.6");
+    }
+
+    /// (b) Provider + model PATCH where the new model wire-matches the
+    /// new provider's kind succeeds.
+    #[tokio::test]
+    async fn patch_provider_with_compatible_model_succeeds() {
+        let mut state = settings_test_app_state();
+        state.llm_config.providers.insert(
+            "anthropic".into(),
+            alms_core::config::ProviderEntry {
+                kind: alms_core::config::ProviderKind::Anthropic,
+                base_url: "https://api.anthropic.com/v1".into(),
+                api_key_env: None,
+                api_key: None,
+                model: None,
+                auth_scheme: alms_core::config::AuthScheme::Header {
+                    name: "x-api-key".into(),
+                },
+                quirks: alms_core::config::ProviderQuirks::default(),
+            },
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        state.data_dir = tmp.path().to_path_buf();
+        {
+            let mut snap = state.server_llm_default.write();
+            snap.model = "moonshotai/kimi-k2.6".into();
+            snap.provider = "openrouter".into();
+        }
+
+        let body = PatchSettingsRequest {
+            provider: Some("anthropic".into()),
+            model: Some("claude-sonnet-4-5".into()),
+            ..Default::default()
+        };
+        let resp = patch_settings(
+            axum::extract::State(state.clone()),
+            Json(serde_json::to_value(&body).unwrap()),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let live = state.server_llm_default.read().clone();
+        assert_eq!(live.provider, "anthropic");
+        assert_eq!(live.model, "claude-sonnet-4-5");
+    }
+
+    /// (c) Model-only PATCH (no provider) succeeds — the provider stays
+    /// on the live default and the model lands. The compat check is
+    /// guarded behind a provider switch so this path is untouched.
+    #[tokio::test]
+    async fn patch_model_only_succeeds() {
+        let mut state = settings_test_app_state();
+        let tmp = tempfile::tempdir().unwrap();
+        state.data_dir = tmp.path().to_path_buf();
+        {
+            let mut snap = state.server_llm_default.write();
+            snap.model = "moonshotai/kimi-k2.6".into();
+            snap.provider = "openrouter".into();
+        }
+
+        let body = PatchSettingsRequest {
+            model: Some("openai/gpt-4o-mini".into()),
+            ..Default::default()
+        };
+        let resp = patch_settings(
+            axum::extract::State(state.clone()),
+            Json(serde_json::to_value(&body).unwrap()),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let live = state.server_llm_default.read().clone();
+        assert_eq!(live.provider, "openrouter");
+        assert_eq!(live.model, "openai/gpt-4o-mini");
+    }
+
+    /// (d) Provider-only PATCH where the new provider's entry carries
+    /// its own compatible `model` succeeds — the entry model is the
+    /// candidate that satisfies the compat check, exactly like the
+    /// runtime's `resolve_effective_provider_and_model` decision.
+    ///
+    /// Codex follow-up on #1081 (P1 #B): the entry model is ALSO
+    /// committed to `server_llm_default.model` so the persisted pair is
+    /// coherent. Pre-fix the live default model kept the old
+    /// cross-namespace value (`moonshotai/kimi-k2.6`), `persist_settings`
+    /// serialised the bad pair, and the boot path reapplied both fields
+    /// verbatim — the LlmClient landed on `(anthropic,
+    /// moonshotai/kimi-k2.6)` and every run 4xxed on the model-id shape.
+    #[tokio::test]
+    async fn patch_provider_only_succeeds_when_provider_entry_has_compatible_model() {
+        let mut state = settings_test_app_state();
+        state.llm_config.providers.insert(
+            "anthropic".into(),
+            alms_core::config::ProviderEntry {
+                kind: alms_core::config::ProviderKind::Anthropic,
+                base_url: "https://api.anthropic.com/v1".into(),
+                api_key_env: None,
+                api_key: None,
+                // Entry-level model override — satisfies the compat check
+                // even when the live default model is cross-namespace.
+                model: Some("claude-haiku-4-5".into()),
+                auth_scheme: alms_core::config::AuthScheme::Header {
+                    name: "x-api-key".into(),
+                },
+                quirks: alms_core::config::ProviderQuirks::default(),
+            },
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        state.data_dir = tmp.path().to_path_buf();
+        {
+            let mut snap = state.server_llm_default.write();
+            snap.model = "moonshotai/kimi-k2.6".into();
+            snap.provider = "openrouter".into();
+        }
+
+        let body = PatchSettingsRequest {
+            provider: Some("anthropic".into()),
+            ..Default::default()
+        };
+        let resp = patch_settings(
+            axum::extract::State(state.clone()),
+            Json(serde_json::to_value(&body).unwrap()),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let live = state.server_llm_default.read().clone();
+        assert_eq!(live.provider, "anthropic");
+        // The entry-level model is the candidate that satisfied the
+        // compat check, so it lands on `server_llm_default.model` too —
+        // this is what keeps the persisted pair coherent across a
+        // restart (see the round-trip test below for the boot half).
+        assert_eq!(live.model, "claude-haiku-4-5");
+    }
+
+    /// Codex follow-up on #1081 (P1 #B): end-to-end round-trip
+    /// confirming the boot path is clean.
+    ///
+    /// Pre-fix: provider-only PATCH committed `provider = "anthropic"`
+    /// but left `server_llm_default.model = "moonshotai/kimi-k2.6"`.
+    /// `persist_settings` serialised both fields, so `settings.json`
+    /// carried `{provider: "anthropic", model: "moonshotai/kimi-k2.6"}`.
+    /// `AppState::new` then reapplies them verbatim and the LlmClient
+    /// boots on `(anthropic, moonshotai/kimi-k2.6)` — every run 4xxs.
+    ///
+    /// Post-fix: PATCH commits the entry-level candidate that passed
+    /// the compat check, persistence reflects the coherent pair, and
+    /// the boot path lands on `(anthropic, claude-haiku-4-5)`.
+    #[tokio::test]
+    async fn patch_provider_only_persists_coherent_pair_across_restart() {
+        // ── 1. PATCH ────────────────────────────────────────────────────
+        // First half: drive the PATCH handler with the attack body and
+        // confirm `persist_settings` writes the COHERENT pair to disk.
+        let mut state = settings_test_app_state();
+        state.llm_config.providers.insert(
+            "anthropic".into(),
+            alms_core::config::ProviderEntry {
+                kind: alms_core::config::ProviderKind::Anthropic,
+                base_url: "https://api.anthropic.com/v1".into(),
+                api_key_env: None,
+                api_key: None,
+                model: Some("claude-haiku-4-5".into()),
+                auth_scheme: alms_core::config::AuthScheme::Header {
+                    name: "x-api-key".into(),
+                },
+                quirks: alms_core::config::ProviderQuirks::default(),
+            },
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        state.data_dir = tmp.path().to_path_buf();
+        {
+            let mut snap = state.server_llm_default.write();
+            snap.model = "moonshotai/kimi-k2.6".into();
+            snap.provider = "openrouter".into();
+        }
+
+        let body = PatchSettingsRequest {
+            provider: Some("anthropic".into()),
+            ..Default::default()
+        };
+        let resp = patch_settings(
+            axum::extract::State(state.clone()),
+            Json(serde_json::to_value(&body).unwrap()),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // ── 2. PERSIST ─────────────────────────────────────────────────
+        // Read `settings.json` directly off disk — `persist_settings` is
+        // called inline by `patch_settings` on the success path. Confirm
+        // the on-disk pair matches the post-PATCH live default.
+        let path = settings_path(&state.data_dir);
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let persisted: PersistedSettings = serde_json::from_str(&raw).unwrap();
+        assert_eq!(persisted.provider.as_deref(), Some("anthropic"));
+        assert_eq!(
+            persisted.model.as_deref(),
+            Some("claude-haiku-4-5"),
+            "persisted model must be the entry-level candidate that satisfied the \
+             compat check, NOT the stale cross-namespace default that would otherwise \
+             override the provider on the next boot"
+        );
+
+        // ── 3. (sanity) Live default mirrors the persisted pair ───────
+        // No separate restart simulation needed: `AppState::new` reads
+        // `persisted.model` / `persisted.provider` and calls the same
+        // `with_provider_and_secrets` + `with_model` setters that we
+        // already exercise from the live default. The persisted-pair
+        // assertion above is the boot-path-equivalent check.
+        let live = state.server_llm_default.read().clone();
+        assert_eq!(live.provider, "anthropic");
+        assert_eq!(live.model, "claude-haiku-4-5");
+    }
+
+    // ==================================================================
+    // Codex follow-up on #1081 (P1 #3) — boot-path API key resolution
+    // for a persisted server-default provider switch.
+    //
+    // Pre-fix: `AppState::new` applied a persisted `provider` via
+    // `llm.with_provider(provider)`, which never resolves keys from
+    // `[llm.providers.<name>].api_key_env / api_key` or `SecretsStore`.
+    // `apply_provider` then cleared the previous provider's key, leaving
+    // an empty `api_key` on the LlmClient. A later `resolve_agent_config`
+    // call for the default agent only refreshes from `SecretsStore`
+    // (`with_secrets`), never the provider entry. Deployments configuring
+    // keys exclusively via `[llm.providers.<name>].api_key_env / api_key`
+    // (no `alms auth set`) would silently boot with an empty key every
+    // restart after a persisted provider switch.
+    //
+    // Post-fix: `AppState::new` calls `with_provider_and_secrets` so
+    // both the SecretsStore AND the provider entry are consulted.
+    // ==================================================================
+
+    /// Persisted provider switch + provider-entry `api_key` (no
+    /// SecretsStore key for the new provider) must result in a non-empty
+    /// `LlmClient::api_key()` on boot.
+    #[tokio::test]
+    async fn boot_resolves_provider_entry_api_key_after_persisted_provider_switch() {
+        // 1. Build a `GatewayConfig` whose providers map carries an
+        //    `anthropic` entry with an inline `api_key`. The SecretsStore
+        //    is left empty so the entry is the only source of truth.
+        let mut gateway_config = crate::gateway::GatewayConfig::default();
+        gateway_config.llm_config.providers.insert(
+            "anthropic".into(),
+            alms_core::config::ProviderEntry {
+                kind: alms_core::config::ProviderKind::Anthropic,
+                base_url: "https://api.anthropic.com/v1".into(),
+                api_key_env: None,
+                api_key: Some("sk-ant-from-provider-entry".into()),
+                model: Some("claude-haiku-4-5".into()),
+                auth_scheme: alms_core::config::AuthScheme::Header {
+                    name: "x-api-key".into(),
+                },
+                quirks: alms_core::config::ProviderQuirks::default(),
+            },
+        );
+        // The boot path's persisted-settings load lives under
+        // `data_dir`. Point at a tempdir so the persisted shape we plant
+        // below is what `AppState::new` actually reads.
+        let tmp = tempfile::tempdir().unwrap();
+        gateway_config.data_dir = Some(tmp.path().to_path_buf());
+
+        // 2. Plant a `settings.json` recording a previous PATCH that
+        //    flipped the server-default provider to `anthropic`.
+        let persisted = PersistedSettings {
+            context: None,
+            session: None,
+            tools: None,
+            llm: None,
+            model: None,
+            provider: Some("anthropic".into()),
+        };
+        std::fs::write(
+            settings_path(tmp.path()),
+            serde_json::to_string_pretty(&persisted).unwrap(),
+        )
+        .unwrap();
+
+        // 3. Construct the AppState — this exercises the boot path that
+        //    Finding #3 targets.
+        let gateway = crate::gateway::Gateway::new(gateway_config).unwrap();
+        let scheduler = std::sync::Arc::new(alms_runtime::Scheduler::new());
+        let shutdown_token = tokio_util::sync::CancellationToken::new();
+        let (completion_tx, _cr) = tokio::sync::mpsc::unbounded_channel();
+        let (trigger_tx, _tr) = tokio::sync::mpsc::unbounded_channel();
+        let (dm_event_tx, _dr) = tokio::sync::mpsc::unbounded_channel();
+        let state = crate::server::AppState::new(
+            gateway,
+            scheduler,
+            shutdown_token,
+            completion_tx,
+            trigger_tx,
+            dm_event_tx,
+        )
+        .unwrap();
+
+        // 4. Assertions. The LlmClient must have switched to Anthropic
+        //    and the persisted-settings load must have flowed through to
+        //    `server_llm_default`.
+        //
+        // We can't assert `state.llm.api_key()` from outside the runtime
+        // crate (the accessor is `#[cfg(test)]`-gated). The companion
+        // unit test
+        // `llm_client::tests::test_with_provider_and_secrets_resolves_provider_entry_api_key`
+        // in `alms-runtime` covers the actual key-resolution contract
+        // this boot path now relies on — i.e. that
+        // `with_provider_and_secrets` consults the provider entry's
+        // `api_key` / `api_key_env` when the SecretsStore is empty.
+        // Together the two tests pin both halves: wiring (here) and
+        // resolution semantics (in `alms-runtime`).
+        assert_eq!(state.llm.provider(), "anthropic");
+        let default = state.server_llm_default.read().clone();
+        assert_eq!(default.provider, "anthropic");
+    }
+
+    // ==================================================================
+    // Codex follow-up on #1081 (P1, Finding 6) — boot path must revalidate
+    // the persisted provider against the live `[llm.providers]` map before
+    // applying it. An operator who PATCH-switched the server default to
+    // `anthropic` and later removed `[llm.providers.anthropic]` from
+    // `alms.toml` (or renamed it) would otherwise still force the stale
+    // provider on every restart, and `with_provider_and_secrets` would
+    // clear the previously active provider's API key without populating a
+    // new one — leaving default runs failing with opaque 401s the operator
+    // can't correlate back to the persisted PATCH.
+    //
+    // Post-fix: the boot path calls `providers.contains_key(&persisted)`
+    // before mutating `llm_config.provider` / the LlmClient. On miss it
+    // emits a structured WARN under `alms.config` and skips the override
+    // — the boot path falls through to the `alms.toml` default provider.
+    // ==================================================================
+
+    /// Persisted server-default provider that is no longer present in
+    /// `alms.toml` must be silently ignored on the next restart. The boot
+    /// path keeps the in-file default, and the LlmClient retains the
+    /// `alms.toml`-configured credentials instead of being cleared by
+    /// `apply_provider`.
+    #[tokio::test]
+    async fn boot_skips_persisted_provider_when_no_longer_configured() {
+        // 1. Build a `GatewayConfig` whose providers map intentionally
+        //    OMITS the persisted provider name. The in-file default is
+        //    `openrouter` (LlmConfig::default), and we add an openrouter
+        //    entry with a usable inline key so the post-skip state has
+        //    something to fall through to.
+        let mut gateway_config = crate::gateway::GatewayConfig::default();
+        // Confirm the default-provider invariant we rely on for the
+        // assertion below — this test pins the regression even if the
+        // default changes, but make the dependency explicit so a future
+        // default flip surfaces here.
+        assert_eq!(
+            gateway_config.llm_config.provider, "openrouter",
+            "test relies on LlmConfig::default().provider being openrouter; \
+             update the assertion below if that changes"
+        );
+        gateway_config.llm_config.providers.insert(
+            "openrouter".into(),
+            alms_core::config::ProviderEntry {
+                kind: alms_core::config::ProviderKind::OpenAiCompatible,
+                base_url: "https://openrouter.ai/api/v1".into(),
+                api_key_env: None,
+                // Inline `api_key` so the boot path's
+                // `with_provider_and_secrets` (when it runs) would
+                // populate non-empty credentials. We assert below that
+                // the openrouter key survives because the persisted
+                // override was skipped — if the guard regressed and
+                // `apply_provider("anthropic-removed")` ran, this key
+                // would be cleared.
+                api_key: Some("sk-or-from-provider-entry".into()),
+                model: None,
+                auth_scheme: alms_core::config::AuthScheme::Bearer,
+                quirks: alms_core::config::ProviderQuirks::default(),
+            },
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        gateway_config.data_dir = Some(tmp.path().to_path_buf());
+
+        // 2. Plant a `settings.json` recording a previous PATCH that
+        //    flipped the server-default provider to `anthropic` — which
+        //    is no longer in the providers map (simulates operator
+        //    removing the `[llm.providers.anthropic]` entry between
+        //    boots).
+        let persisted = PersistedSettings {
+            context: None,
+            session: None,
+            tools: None,
+            llm: None,
+            model: None,
+            provider: Some("anthropic-removed".into()),
+        };
+        std::fs::write(
+            settings_path(tmp.path()),
+            serde_json::to_string_pretty(&persisted).unwrap(),
+        )
+        .unwrap();
+
+        // 3. Construct AppState — exercises the boot path with the
+        //    stale persisted provider.
+        let gateway = crate::gateway::Gateway::new(gateway_config).unwrap();
+        let scheduler = std::sync::Arc::new(alms_runtime::Scheduler::new());
+        let shutdown_token = tokio_util::sync::CancellationToken::new();
+        let (completion_tx, _cr) = tokio::sync::mpsc::unbounded_channel();
+        let (trigger_tx, _tr) = tokio::sync::mpsc::unbounded_channel();
+        let (dm_event_tx, _dr) = tokio::sync::mpsc::unbounded_channel();
+        let state = crate::server::AppState::new(
+            gateway,
+            scheduler,
+            shutdown_token,
+            completion_tx,
+            trigger_tx,
+            dm_event_tx,
+        )
+        .unwrap();
+
+        // 4. Assertions. The boot path must have ignored the persisted
+        //    `anthropic-removed` value and kept the in-file default
+        //    (`openrouter`).
+        assert_eq!(
+            state.llm.provider(),
+            "openrouter",
+            "boot must skip persisted provider when no longer configured \
+             in `[llm.providers]` and keep the in-file default"
+        );
+        let default = state.server_llm_default.read().clone();
+        assert_eq!(
+            default.provider, "openrouter",
+            "server_llm_default must mirror the in-file provider, not \
+             the skipped persisted value"
+        );
+
+        // 5. Provider-kind cross-check: the LlmClient's wire-kind
+        //    must still match the in-file openrouter entry
+        //    (`OpenAiCompatible`). If the pre-fix path had invoked
+        //    `with_provider_and_secrets("anthropic-removed", ...)`,
+        //    `apply_provider` would have fallen through to the
+        //    `_ => OpenAiCompatible` arm of `provider_kind_for_name`
+        //    (which would still be `OpenAiCompatible`, so this is not
+        //    a sharp discriminator on its own). The combined assertions
+        //    above — `provider() == "openrouter"` and
+        //    `server_llm_default.provider == "openrouter"` — are the
+        //    load-bearing signal: any pre-fix regression flips both.
+        assert_eq!(
+            state.llm.provider_kind(),
+            alms_core::config::ProviderKind::OpenAiCompatible,
+            "openrouter entry was provisioned with OpenAiCompatible kind \
+             — the skipped persisted-provider path must leave that wire \
+             shape intact"
+        );
+    }
+
+    // ==================================================================
+    // Codex follow-up on #1081 (P1 #2) — budget revalidation against
+    // the post-patch default LLM pair.
+    //
+    // Pre-fix: `validate_patch_budget` consulted
+    // `state.llm_config.provider` / `state.llm_config.default_model`
+    // (the boot-time clone) regardless of any `model` / `provider` in
+    // the same PATCH body. A PATCH that simultaneously raised
+    // `context.max_input_tokens` AND switched to a stricter pair would
+    // pass the boot-time check and persist an over-budget pair that
+    // later rejected runs on restart.
+    //
+    // Post-fix: the caller computes the candidate `(provider, model)`
+    // (body value with live `server_llm_default` as fallback) and
+    // passes it into `validate_patch_budget`, which uses it as
+    // `server_provider` / `server_model` for the layer-1 budget check.
+    // ==================================================================
+
+    /// PATCH that raises `max_input_tokens` to a value that fits the
+    /// CURRENT default but overshoots a stricter provider/model in the
+    /// SAME PATCH body is rejected with `INVALID_TOKEN_BUDGET_FOR_PROVIDER`
+    /// against the POST-patch pair.
+    #[tokio::test]
+    async fn patch_revalidates_budget_against_post_patch_default_pair() {
+        let mut state = settings_test_app_state();
+        // Seed Anthropic provider (kind matters for the compat check
+        // and for budget-validator wire-cap lookup).
+        state.llm_config.providers.insert(
+            "anthropic".into(),
+            alms_core::config::ProviderEntry {
+                kind: alms_core::config::ProviderKind::Anthropic,
+                base_url: "https://api.anthropic.com/v1".into(),
+                api_key_env: None,
+                api_key: None,
+                model: None,
+                auth_scheme: alms_core::config::AuthScheme::Header {
+                    name: "x-api-key".into(),
+                },
+                quirks: alms_core::config::ProviderQuirks::default(),
+            },
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        state.data_dir = tmp.path().to_path_buf();
+        // Force strict mode so the validator returns a 400 envelope (it
+        // also respects ALMS_TOKEN_BUDGET_VALIDATION env, but we want a
+        // deterministic test).
+        // SAFETY: tests in this module are not run concurrently across
+        // env writes in practice; this matches the existing budget-test
+        // pattern in this file.
+        unsafe { std::env::set_var("ALMS_TOKEN_BUDGET_VALIDATION", "strict") };
+        // Seed live default to a permissive (provider, model) pair that
+        // would pass any reasonable budget at 1_000_000 input tokens —
+        // OpenRouter caps are sourced from the slug's underlying model;
+        // we use a small explicit `max_tokens` instead so the math is
+        // tight enough to differentiate.
+        {
+            let mut snap = state.server_llm_default.write();
+            snap.model = "moonshotai/kimi-k2.6".into();
+            snap.provider = "openrouter".into();
+        }
+
+        // Use a candidate input token count that overshoots Anthropic
+        // haiku's 200K cap but fits OpenRouter (the budget validator
+        // skips unknown (provider, model) silently, so the pre-fix path
+        // would have green-lit this). `claude-haiku-4-5` is in the
+        // budget table at 200_000; pick a value strictly above it.
+        let body = PatchSettingsRequest {
+            context: Some(PatchContext {
+                max_input_tokens: Some(500_000),
+                ..Default::default()
+            }),
+            model: Some("claude-haiku-4-5".into()),
+            provider: Some("anthropic".into()),
+            ..Default::default()
+        };
+        let resp = patch_settings(
+            axum::extract::State(state.clone()),
+            Json(serde_json::to_value(&body).unwrap()),
+        )
+        .await
+        .into_response();
+        // Layer-1 budget validator returns 400 (not 422) for
+        // INVALID_TOKEN_BUDGET_FOR_PROVIDER. The pre-fix behaviour
+        // would have returned 200 because the boot-time pair
+        // (openrouter, kimi-k2.6) is not in the budget table and the
+        // validator silently skips unknown pairs.
+        unsafe { std::env::remove_var("ALMS_TOKEN_BUDGET_VALIDATION") };
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "PATCH must be rejected by the budget validator against the \
+             post-patch (anthropic, claude-haiku-4-5) pair, not the \
+             boot-time (openrouter, kimi-k2.6) pair"
+        );
+        let body_bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(json["error_code"], "INVALID_TOKEN_BUDGET_FOR_PROVIDER");
+        // The validator should have looked at the POST-patch pair.
+        assert_eq!(json["provider"], "anthropic");
+        assert_eq!(json["model"], "claude-haiku-4-5");
+    }
+
+    /// Codex follow-up on #1081 (P1 #3): the budget validator overlay
+    /// must mirror the commit-path resolution. When a PATCH carries
+    /// `provider` (but not `model`) plus `context.max_input_tokens`, the
+    /// candidate-model resolution at lines ~455-490 must consult the
+    /// provider entry's `model` BEFORE falling back to the live default —
+    /// otherwise the validator runs against
+    /// `(new_provider, stale_cross_namespace_default)` (an unknown pair
+    /// the budget table silently passes) while the commit path later
+    /// writes `(new_provider, entry_model)` to `server_llm_default`.
+    /// The PATCH returns 200, persistence carries the coherent pair
+    /// across restart, and every subsequent run rejects with
+    /// `INVALID_TOKEN_BUDGET_FOR_PROVIDER` because the entry model's
+    /// real cap was below the budget all along.
+    #[tokio::test]
+    async fn patch_revalidates_budget_against_provider_entry_fallback_model() {
+        let mut state = settings_test_app_state();
+        // Seed Anthropic provider WITH an entry-level `model`. This is
+        // the same setup the Finding #B commit-path test uses — the
+        // entry-model fallback is what makes the budget validator see
+        // the post-patch (anthropic, claude-haiku-4-5) pair instead of
+        // the stale openrouter slug.
+        state.llm_config.providers.insert(
+            "anthropic".into(),
+            alms_core::config::ProviderEntry {
+                kind: alms_core::config::ProviderKind::Anthropic,
+                base_url: "https://api.anthropic.com/v1".into(),
+                api_key_env: None,
+                api_key: None,
+                model: Some("claude-haiku-4-5".into()),
+                auth_scheme: alms_core::config::AuthScheme::Header {
+                    name: "x-api-key".into(),
+                },
+                quirks: alms_core::config::ProviderQuirks::default(),
+            },
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        state.data_dir = tmp.path().to_path_buf();
+        // Force strict mode so the validator returns a 400 envelope.
+        // SAFETY: tests in this module are not run concurrently across
+        // env writes in practice; this matches the existing budget-test
+        // pattern in this file (see
+        // `patch_revalidates_budget_against_post_patch_default_pair`).
+        unsafe { std::env::set_var("ALMS_TOKEN_BUDGET_VALIDATION", "strict") };
+        // Seed live default to a cross-namespace pair the budget table
+        // does not recognise (so the pre-fix validator silently passes).
+        {
+            let mut snap = state.server_llm_default.write();
+            snap.model = "moonshotai/kimi-k2.6".into();
+            snap.provider = "openrouter".into();
+        }
+
+        // Provider-only switch plus an over-budget `max_input_tokens` —
+        // 500K overshoots Anthropic haiku's 200K cap. The PATCH body
+        // intentionally omits `model` so we can verify the overlay
+        // consults the entry-level fallback. Without the fix the
+        // validator runs against `(anthropic, moonshotai/kimi-k2.6)`,
+        // doesn't find that pair in the budget table, and silently
+        // green-lights the request.
+        let body = PatchSettingsRequest {
+            context: Some(PatchContext {
+                max_input_tokens: Some(500_000),
+                ..Default::default()
+            }),
+            provider: Some("anthropic".into()),
+            ..Default::default()
+        };
+        let resp = patch_settings(
+            axum::extract::State(state.clone()),
+            Json(serde_json::to_value(&body).unwrap()),
+        )
+        .await
+        .into_response();
+        unsafe { std::env::remove_var("ALMS_TOKEN_BUDGET_VALIDATION") };
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "PATCH must be rejected by the budget validator against the \
+             post-patch (anthropic, claude-haiku-4-5) pair the commit path \
+             would later persist via the provider-entry fallback, NOT the \
+             boot-time (openrouter, kimi-k2.6) live default"
+        );
+        let body_bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(json["error_code"], "INVALID_TOKEN_BUDGET_FOR_PROVIDER");
+        // The validator should have looked at the POST-patch pair
+        // resolved via the entry fallback.
+        assert_eq!(json["provider"], "anthropic");
+        assert_eq!(json["model"], "claude-haiku-4-5");
+    }
+
+    /// Codex follow-up on #1081 (P1, Finding 5, refs issue #1086 Item 2):
+    /// the budget-overlay entry-model fallback must mirror the commit
+    /// path's same-provider no-op guard. When `body.provider` matches the
+    /// live default provider, the overlay must NOT consult
+    /// `[llm.providers.<body.provider>].model` — because the commit path
+    /// won't either (it keeps the live default model). Validating the
+    /// budget against a tighter entry-model that won't be persisted yields
+    /// a false-positive rejection.
+    ///
+    /// Setup: live default `(anthropic, claude-sonnet-4-6)` (a permissive
+    /// 1M-token cap pair); `[llm.providers.anthropic].model =
+    /// claude-haiku-4-5` (200K cap — what operators typically pin in
+    /// `alms.toml` as a per-provider default). PATCH
+    /// `{provider: "anthropic", max_input_tokens: 500_000}` carries a
+    /// budget that fits the live default but overshoots the entry model.
+    ///
+    /// Pre-fix: overlay resolves candidate model to `claude-haiku-4-5`
+    /// (entry fallback fires unconditionally on `body.provider`). Budget
+    /// validator rejects 500K > 200K with
+    /// `INVALID_TOKEN_BUDGET_FOR_PROVIDER`. The PATCH returns 400 even
+    /// though the commit path would have kept `claude-sonnet-4-6`
+    /// (fitting 500K fine) — a false-positive rejection.
+    ///
+    /// Post-fix: overlay's entry-model fallback is gated on
+    /// `body.provider != live.provider`. Same-provider PATCH keeps the
+    /// live default model in the overlay; validator sees
+    /// `(anthropic, claude-sonnet-4-6)` (the same pair the commit path
+    /// would persist) and passes the request through to the structural
+    /// validation layer. PATCH returns 200.
+    #[tokio::test]
+    async fn patch_same_provider_does_not_use_entry_model_for_budget_overlay() {
+        let mut state = settings_test_app_state();
+        // Seed an anthropic entry whose `model` field is INTENTIONALLY
+        // tighter (haiku — 200K cap) than the live default model (sonnet
+        // — 1M cap). This is the asymmetry trap the symmetry fix closes:
+        // the entry-model fallback would budget-check against haiku even
+        // though the commit path will keep sonnet (same-provider no-op).
+        state.llm_config.providers.insert(
+            "anthropic".into(),
+            alms_core::config::ProviderEntry {
+                kind: alms_core::config::ProviderKind::Anthropic,
+                base_url: "https://api.anthropic.com/v1".into(),
+                api_key_env: None,
+                api_key: None,
+                // Entry-level model: haiku 200K. The live default below
+                // is sonnet 1M. 500K fits sonnet but overshoots haiku.
+                model: Some("claude-haiku-4-5".into()),
+                auth_scheme: alms_core::config::AuthScheme::Header {
+                    name: "x-api-key".into(),
+                },
+                quirks: alms_core::config::ProviderQuirks::default(),
+            },
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        state.data_dir = tmp.path().to_path_buf();
+        // Force strict mode so a budget overshoot would surface as 400
+        // (pre-fix observable failure mode).
+        // SAFETY: tests in this module are not run concurrently across
+        // env writes in practice; matches the existing budget-test
+        // pattern (see other `patch_revalidates_budget_*` tests).
+        unsafe { std::env::set_var("ALMS_TOKEN_BUDGET_VALIDATION", "strict") };
+        // Live default `(anthropic, claude-sonnet-4-6)` — same provider
+        // as the PATCH body, but a different (permissive) model. The
+        // commit path will keep this model because the provider is
+        // unchanged.
+        {
+            let mut snap = state.server_llm_default.write();
+            snap.model = "claude-sonnet-4-6".into();
+            snap.provider = "anthropic".into();
+        }
+
+        // Same-provider idempotent PATCH with a budget that:
+        //   - fits claude-sonnet-4-6 (1M — the live default, what the
+        //     commit path keeps)
+        //   - overshoots claude-haiku-4-5 (200K — the entry-model trap)
+        // 500K is the canonical "fits live, overshoots entry" probe.
+        let body = PatchSettingsRequest {
+            context: Some(PatchContext {
+                max_input_tokens: Some(500_000),
+                ..Default::default()
+            }),
+            provider: Some("anthropic".into()),
+            ..Default::default()
+        };
+        let resp = patch_settings(
+            axum::extract::State(state.clone()),
+            Json(serde_json::to_value(&body).unwrap()),
+        )
+        .await
+        .into_response();
+        unsafe { std::env::remove_var("ALMS_TOKEN_BUDGET_VALIDATION") };
+
+        // Pre-fix this would have been 400 with
+        // `INVALID_TOKEN_BUDGET_FOR_PROVIDER` against
+        // `(anthropic, claude-haiku-4-5)`. Post-fix the overlay matches
+        // the commit-path resolution and the PATCH passes.
+        let status = resp.status();
+        let body_bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "same-provider PATCH must not use entry-model fallback for \
+             budget overlay — the commit path keeps the live default \
+             model, so the overlay must too. Mismatched overlay yields a \
+             false-positive rejection. Got status {status} with body {:?}",
+            String::from_utf8_lossy(&body_bytes),
+        );
+
+        // Confirm the live default `model` was NOT rewritten to the
+        // entry-model — the same-provider commit-path no-op guard
+        // (`patch_provider_only_noop_does_not_mutate_default_or_set_restart_required`
+        // pins this separately, but we double-check here so a regression
+        // that breaks both guards is caught by either test).
+        let live = state.server_llm_default.read().clone();
+        assert_eq!(live.provider, "anthropic");
+        assert_eq!(
+            live.model, "claude-sonnet-4-6",
+            "same-provider PATCH must leave the live default model \
+             untouched"
+        );
+
+        // Confirm the context.max_input_tokens did commit (200 status
+        // means the partial-update contract proceeded; the budget knob
+        // is the only mutation in this body).
+        let agent = state.agent_config.read();
+        assert_eq!(agent.context_config.max_input_tokens, 500_000);
+    }
+
+    /// Codex follow-up on #1081 (P2 #4): a no-op provider PATCH
+    /// (`{provider: <same-as-current>}`) must NOT mutate the live
+    /// default `(provider, model)` pair and must NOT flip
+    /// `restart_required: true`. Pre-fix, the commit path unconditionally
+    /// fell back to `entry_model` when `body.model` was absent, so an
+    /// idempotent `{provider: "anthropic"}` against a live
+    /// `(anthropic, claude-sonnet-4-6)` default silently rewrote the
+    /// model to the entry's `claude-haiku-4-5` and surfaced a restart
+    /// banner the caller had no reason to expect.
+    #[tokio::test]
+    async fn patch_provider_only_noop_does_not_mutate_default_or_set_restart_required() {
+        let mut state = settings_test_app_state();
+        state.llm_config.providers.insert(
+            "anthropic".into(),
+            alms_core::config::ProviderEntry {
+                kind: alms_core::config::ProviderKind::Anthropic,
+                base_url: "https://api.anthropic.com/v1".into(),
+                api_key_env: None,
+                api_key: None,
+                // Entry-level default model is intentionally DIFFERENT
+                // from the live `server_llm_default.model` so the pre-fix
+                // fallback would observably overwrite it — making this
+                // test fail loudly without the guard.
+                model: Some("claude-haiku-4-5".into()),
+                auth_scheme: alms_core::config::AuthScheme::Header {
+                    name: "x-api-key".into(),
+                },
+                quirks: alms_core::config::ProviderQuirks::default(),
+            },
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        state.data_dir = tmp.path().to_path_buf();
+        // Seed live default to `(anthropic, claude-sonnet-4-6)` — same
+        // provider as the PATCH body, but a different model than the
+        // entry-level fallback.
+        {
+            let mut snap = state.server_llm_default.write();
+            snap.model = "claude-sonnet-4-6".into();
+            snap.provider = "anthropic".into();
+        }
+
+        let body = PatchSettingsRequest {
+            provider: Some("anthropic".into()),
+            ..Default::default()
+        };
+        let resp = patch_settings(
+            axum::extract::State(state.clone()),
+            Json(serde_json::to_value(&body).unwrap()),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Core assertion: the live default `(provider, model)` pair is
+        // byte-identical to its pre-PATCH state.
+        let live = state.server_llm_default.read().clone();
+        assert_eq!(
+            live.provider, "anthropic",
+            "no-op provider PATCH must leave `provider` unchanged"
+        );
+        assert_eq!(
+            live.model, "claude-sonnet-4-6",
+            "no-op provider PATCH must NOT overwrite `model` with the \
+             provider-entry fallback — that fallback is reserved for \
+             actual provider switches (Finding #B)"
+        );
+
+        // Bonus: the response body must not surface `restart_required:
+        // true` because nothing actually changed. The pre-fix path
+        // unconditionally set `llm_default_restart_required = true` on
+        // every provider write, so this assertion would fail without
+        // the same-provider guard.
+        let body_bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert!(
+            json.get("restart_required").is_none()
+                || json["restart_required"] == serde_json::Value::Bool(false),
+            "no-op provider PATCH must not surface restart_required: true. \
+             Got body: {json}",
+        );
+    }
+
+    /// Tim follow-up on #1081: the reverse symmetry of the provider-only
+    /// no-op guard. A `{model: <same-as-current>}` PATCH must NOT flip
+    /// `restart_required: true` nor emit the restart-required info log
+    /// line. Pre-fix, the standalone `body.model` branch wrote the value
+    /// unconditionally and set `llm_default_restart_required = true` on
+    /// every model PATCH — including the no-op case where the operator
+    /// re-submitted the live default value (an idempotent payload that
+    /// is observably a no-op should behave like one on the wire).
+    #[tokio::test]
+    async fn patch_model_only_noop_does_not_set_restart_required() {
+        let mut state = settings_test_app_state();
+        let tmp = tempfile::tempdir().unwrap();
+        state.data_dir = tmp.path().to_path_buf();
+        // Seed live default to a known model and capture the pre-PATCH
+        // pair for the byte-identical assertion below.
+        {
+            let mut snap = state.server_llm_default.write();
+            snap.model = "moonshotai/kimi-k2.6".into();
+            snap.provider = "openrouter".into();
+        }
+        let before = state.server_llm_default.read().clone();
+
+        // PATCH with the same model value already live.
+        let body = PatchSettingsRequest {
+            model: Some("moonshotai/kimi-k2.6".into()),
+            ..Default::default()
+        };
+        let resp = patch_settings(
+            axum::extract::State(state.clone()),
+            Json(serde_json::to_value(&body).unwrap()),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Core assertion: the live default `(provider, model)` pair is
+        // byte-identical to its pre-PATCH state.
+        let after = state.server_llm_default.read().clone();
+        assert_eq!(
+            after.model, before.model,
+            "no-op model PATCH must not mutate `model`"
+        );
+        assert_eq!(
+            after.provider, before.provider,
+            "no-op model PATCH must not touch `provider`"
+        );
+
+        // Wire-response assertion: `restart_required` must be absent or
+        // false. Pre-fix the model branch unconditionally set
+        // `llm_default_restart_required = true`, so this assertion fails
+        // without the symmetric no-op guard added in this commit.
+        let body_bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert!(
+            json.get("restart_required").is_none()
+                || json["restart_required"] == serde_json::Value::Bool(false),
+            "no-op model PATCH must not surface restart_required: true. \
+             Got body: {json}",
         );
     }
 
@@ -3209,6 +4740,8 @@ mod tests {
             session: Some(PersistedSessionOverrides::default()),
             tools: Some(PersistedToolsOverrides::default()),
             llm: Some(PersistedLlmOverrides::default()),
+            model: Some("test-model".to_string()),
+            provider: Some("openrouter".to_string()),
         };
         let json = serde_json::to_string(&persisted).expect("serialize PersistedSettings");
         assert!(
@@ -3241,6 +4774,18 @@ mod tests {
         state.llm_config.provider = "anthropic".into();
         state.llm_config.default_model = "claude-haiku-4-5".into();
         state.llm_config.mock = false;
+        // Codex follow-up on #1081 (P1 #2): the PATCH-time budget
+        // validator now consults `server_llm_default` (overlaid with any
+        // body-supplied `provider` / `model`) rather than the boot-time
+        // `state.llm_config` clone, so that a same-PATCH default-pair
+        // switch revalidates against the post-PATCH wire. Mirror the
+        // baseline pair onto `server_llm_default` here so the existing
+        // budget tests continue to exercise the (anthropic, haiku) cap.
+        {
+            let mut snap = state.server_llm_default.write();
+            snap.provider = "anthropic".into();
+            snap.model = "claude-haiku-4-5".into();
+        }
         // Live `max_tokens` — the second budget knob; combined with the
         // `max_input_tokens` candidate to compute the effective total.
         // Default is `DEFAULT_AGENT_MAX_TOKENS = 32_000`; pin it explicitly
@@ -3396,7 +4941,7 @@ mod tests {
 
         let mut state = settings_test_app_state();
         // Default test state already uses provider=openrouter,
-        // model=moonshotai/kimi-k2.5 — both unknown to the budget table.
+        // model=moonshotai/kimi-k2.6 — both unknown to the budget table.
         // Bump the candidate to a wildly large value to prove "unknown"
         // really does mean "skip" (not "fail open accidentally because
         // the test fixture is small").

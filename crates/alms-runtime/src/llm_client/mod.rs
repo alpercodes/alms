@@ -963,6 +963,16 @@ mod tests {
     use super::sse_parsers::{parse_gemini_sse_block, parse_openai_sse};
     use super::test_responder::{spawn_sequential_responder, spawn_truncated_body_responder};
     use super::*;
+    use std::sync::Mutex;
+
+    /// Module-local env-var serialization mutex. `cargo test` runs unit
+    /// tests in this module on a parallel thread-pool by default, and
+    /// concurrent `std::env::set_var` calls are unsound in Rust 1.79+
+    /// (the writes race against any other thread reading env). Every
+    /// test in this mod that touches the process env via `set_var` /
+    /// `remove_var` must take this lock first. Mirrors the
+    /// `llm_types::tests::ENV_LOCK` sibling pattern.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn test_llm_config_from_env() {
@@ -1120,7 +1130,7 @@ mod tests {
         // Provider should not change
         assert_eq!(updated.provider(), "openrouter");
         // The default model should not change either
-        assert_eq!(updated.default_model(), "moonshotai/kimi-k2.5");
+        assert_eq!(updated.default_model(), "moonshotai/kimi-k2.6");
         // The key must have been updated to the new value
         assert_eq!(updated.api_key(), "new-runtime-key");
     }
@@ -1232,6 +1242,106 @@ mod tests {
         assert_eq!(same.provider(), "openrouter");
         // Same provider, no new key found -- existing key preserved
         assert_eq!(same.api_key(), "sk-or-existing");
+    }
+
+    /// Codex follow-up on #1081 (P1 #3): when an `SecretsStore` carries
+    /// no key for the new provider but the `[llm.providers.<name>]`
+    /// entry exposes one via `api_key` (or `api_key_env`),
+    /// `with_provider_and_secrets` must resolve the entry key rather
+    /// than clearing.
+    ///
+    /// This is the contract `AppState::new` now relies on when applying
+    /// a persisted server-default provider switch on boot. Pre-fix, the
+    /// boot path used `with_provider` (no resolver) and then the
+    /// `runs::resolve_agent_config` path only re-checked `SecretsStore`
+    /// via `with_secrets` — deployments configuring keys exclusively in
+    /// the provider entry would silently boot with an empty key.
+    #[test]
+    fn test_with_provider_and_secrets_resolves_provider_entry_api_key() {
+        // Build a config that mirrors the boot-time shape: starting on
+        // OpenRouter with a key, with an `anthropic` provider entry that
+        // carries an inline `api_key`. The SecretsStore is empty.
+        let mut providers = std::collections::BTreeMap::new();
+        providers.insert(
+            "anthropic".into(),
+            alms_core::config::ProviderEntry {
+                kind: alms_core::config::ProviderKind::Anthropic,
+                base_url: "https://api.anthropic.com/v1".into(),
+                api_key_env: None,
+                api_key: Some("sk-ant-from-entry".into()),
+                model: Some("claude-haiku-4-5".into()),
+                auth_scheme: AuthScheme::Header {
+                    name: "x-api-key".into(),
+                },
+                quirks: alms_core::config::ProviderQuirks::default(),
+            },
+        );
+        let config = LlmConfig {
+            provider: "openrouter".into(),
+            api_key: "sk-or-existing".into(),
+            base_url: "https://openrouter.ai/api/v1".into(),
+            providers,
+            ..LlmConfig::default()
+        };
+        let client = LlmClient::new(config).unwrap();
+
+        let secrets = alms_core::secrets::SecretsStore::empty();
+        let switched = client.with_provider_and_secrets("anthropic", &secrets);
+        assert_eq!(switched.provider(), "anthropic");
+        assert_eq!(switched.base_url(), "https://api.anthropic.com/v1");
+        // Key MUST resolve from the provider entry's `api_key`, not be
+        // cleared (the pre-fix `with_provider` boot path would have
+        // ended up with an empty key here).
+        assert_eq!(switched.api_key(), "sk-ant-from-entry");
+    }
+
+    /// Variant of the above using `api_key_env` to confirm the env-var
+    /// resolver path also flows through `with_provider_and_secrets`.
+    #[test]
+    fn test_with_provider_and_secrets_resolves_provider_entry_api_key_env() {
+        const ENV_VAR: &str = "ALMS_TEST_LARRY_1081_ANTHROPIC_KEY";
+        // Serialize against any other env-touching test in this mod —
+        // concurrent `set_var` racing with another thread reading any
+        // env is UB in Rust 1.79+. The unique key prevents value
+        // collisions across tests but does not serialize the writes;
+        // the lock does. Held until the matching `remove_var` below.
+        let _env_guard = ENV_LOCK.lock().unwrap();
+        // SAFETY: the lock above serializes the write against every
+        // other test in this mod that touches the process env. Other
+        // threads in the process may still observe the env mid-write
+        // (this is the genuine UB hole `set_var` carries), but no
+        // such reader exists in this test setup.
+        unsafe { std::env::set_var(ENV_VAR, "sk-ant-from-env") };
+
+        let mut providers = std::collections::BTreeMap::new();
+        providers.insert(
+            "anthropic".into(),
+            alms_core::config::ProviderEntry {
+                kind: alms_core::config::ProviderKind::Anthropic,
+                base_url: "https://api.anthropic.com/v1".into(),
+                api_key_env: Some(ENV_VAR.into()),
+                api_key: None,
+                model: Some("claude-haiku-4-5".into()),
+                auth_scheme: AuthScheme::Header {
+                    name: "x-api-key".into(),
+                },
+                quirks: alms_core::config::ProviderQuirks::default(),
+            },
+        );
+        let config = LlmConfig {
+            provider: "openrouter".into(),
+            api_key: "sk-or-existing".into(),
+            base_url: "https://openrouter.ai/api/v1".into(),
+            providers,
+            ..LlmConfig::default()
+        };
+        let client = LlmClient::new(config).unwrap();
+
+        let secrets = alms_core::secrets::SecretsStore::empty();
+        let switched = client.with_provider_and_secrets("anthropic", &secrets);
+        unsafe { std::env::remove_var(ENV_VAR) };
+        assert_eq!(switched.provider(), "anthropic");
+        assert_eq!(switched.api_key(), "sk-ant-from-env");
     }
 
     // ------------------------------------------------------------------

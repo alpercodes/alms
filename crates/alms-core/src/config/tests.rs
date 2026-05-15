@@ -370,7 +370,7 @@ static BUDGET_ENV_LOCK: Mutex<()> = Mutex::new(());
 
 #[test]
 fn test_token_budget_default_config_passes() {
-    // Default config: provider=openrouter, model=moonshotai/kimi-k2.5.
+    // Default config: provider=openrouter, model=moonshotai/kimi-k2.6.
     // The table doesn't know that pair → validator must skip → ok.
     let _lock = BUDGET_ENV_LOCK.lock().unwrap();
     let _guard = SingleEnvGuard::remove(ALMS_LLM_BUDGET_VALIDATION);
@@ -1117,11 +1117,17 @@ fn test_context_config_defaults_episodic() {
     // asymmetric (model-only) shape that the new pair-only validator
     // would otherwise reject. Operators opt into a dedicated summary
     // task by setting both fields together.
+    //
+    // Atlas's "default summary model = kimi-k2.6" directive is
+    // satisfied implicitly: when both are None, the summary task
+    // inherits the agent's (provider, model) — and the chat default
+    // is now `(openrouter, moonshotai/kimi-k2.6)`, so summarisation
+    // hits kimi-k2.6 on a fresh boot without an explicit summary pair.
     assert_eq!(
         config.summary_model, None,
-        "summary_model now defaults to None — the pre-#872 default \
-         (Some(\"minimax/...\") + None) was the asymmetric shape the \
-         validator rejects"
+        "summary_model defaults to None — when unset, the summary task \
+         inherits the agent's primary (provider, model), which is now \
+         kimi-k2.6 on openrouter by default"
     );
     assert_eq!(
         config.summary_provider, None,
@@ -1893,17 +1899,26 @@ thinking_budget_tokens = 8192
     assert_eq!(cfg2.llm.anthropic.thinking_budget_tokens, 8192);
 }
 
-/// Omitted `[llm.anthropic]` section defaults to `thinking_budget_tokens = 0`
-/// (disabled), preserving behaviour for existing configs.
+/// Omitted `[llm.anthropic]` section defaults to the compiled
+/// `AnthropicConfig::default()` value for `thinking_budget_tokens`.
+/// The default flipped from 0 to 2048 (extended thinking enabled
+/// out of the box) — this test pins the new default so a regression
+/// back to 0 surfaces here.
 #[test]
-fn test_anthropic_thinking_budget_default_zero() {
+fn test_anthropic_thinking_budget_default_matches_compiled() {
     let toml_str = r#"
 [llm]
 provider = "anthropic"
 model = "claude-sonnet-4-20250514"
 "#;
     let cfg: AlmsConfig = toml::from_str(toml_str).expect("valid TOML");
-    assert_eq!(cfg.llm.anthropic.thinking_budget_tokens, 0);
+    assert_eq!(
+        cfg.llm.anthropic.thinking_budget_tokens,
+        crate::config::AnthropicConfig::default().thinking_budget_tokens,
+    );
+    // And the chosen default is 2048 — pinned so a silent flip to a
+    // different non-zero value (e.g. 1024) also surfaces here.
+    assert_eq!(cfg.llm.anthropic.thinking_budget_tokens, 2048);
 }
 
 // --------------------------------------------------------------------------

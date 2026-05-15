@@ -721,7 +721,7 @@ impl Default for LlmConfig {
             provider: "openrouter".to_string(),
             api_key: String::new(),
             base_url: "https://openrouter.ai/api/v1".to_string(),
-            default_model: "moonshotai/kimi-k2.5".to_string(),
+            default_model: "moonshotai/kimi-k2.6".to_string(),
             timeout_secs: 120,
             mock: false,
             stream_chunk_timeout_secs: 60,

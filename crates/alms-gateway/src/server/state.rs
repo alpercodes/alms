@@ -14,6 +14,18 @@ use alms_session::{JobStore, SessionManager};
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
+/// Live server-default LLM `(model, provider)` pair surfaced via
+/// `GET /settings` and mutated via `PATCH /settings`'s top-level
+/// `model` / `provider` keys. See
+/// [`AppState::server_llm_default`] for lifetime / propagation rules.
+#[derive(Debug, Clone)]
+pub struct ServerLlmDefault {
+    /// Server-default model id (e.g. `"moonshotai/kimi-k2.6"`).
+    pub model: String,
+    /// Server-default provider name (must be a key in `llm_config.providers`).
+    pub provider: String,
+}
+
 /// Shared application state for HTTP server
 #[derive(Debug, Clone)]
 pub struct AppState {
@@ -44,7 +56,28 @@ pub struct AppState {
     /// of the Layer 2 design: no parallel agent instances).
     pub agent_queue: Arc<SessionQueue<AgentId>>,
     /// Snapshot of LLM config — read once at startup so handlers avoid locking the gateway.
+    ///
+    /// `default_model` and `provider` here are seeded from the boot config
+    /// (TOML / env / compiled defaults) merged with any persisted
+    /// `model` / `provider` PATCHes from a previous run. The handler
+    /// snapshot itself is by-value clone — PATCHing those two fields
+    /// updates the persisted state and the live `Arc<RwLock<String>>`
+    /// next to this field, but **does not** propagate to in-flight runs
+    /// until the daemon restarts (the run path reads `state.llm` and
+    /// this snapshot, both of which are clones taken at handler entry).
+    /// Same restart-required contract as the Logging block.
     pub llm_config: alms_runtime::LlmConfig,
+    /// Live source of truth for the server-default LLM `(model, provider)` —
+    /// PATCH /settings writes here, GET /settings reads here, and
+    /// `persist_settings` snapshots from here into `settings.json`.
+    ///
+    /// Wrapped in `Arc<RwLock>` so the PATCH handler can see its own
+    /// write reflected on the next GET without round-tripping through the
+    /// `state.llm_config` clone (which is by-value and not mutable from
+    /// inside a handler). Restart is still required for the value to
+    /// reach `state.llm` and downstream run paths, but the operator-facing
+    /// settings surface stays consistent in the meantime.
+    pub server_llm_default: Arc<parking_lot::RwLock<ServerLlmDefault>>,
     /// Agent config — mutable via PATCH /settings (context, llm provider
     /// defaults, and the `sandbox_root` / `shell_policy` mirrors of the
     /// tools section). Shared with the Coordinator (`Arc::clone`) so all
@@ -110,10 +143,10 @@ impl AppState {
                 std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
             });
         let session_manager = gateway.session_manager().clone();
-        let llm = gateway.llm().clone();
+        let mut llm = gateway.llm().clone();
         let agent_id = gateway.agent_id();
         let default_agent_id = gateway.agent_id_handle();
-        let llm_config = gateway.llm_config().clone();
+        let mut llm_config = gateway.llm_config().clone();
         let mut agent_config_val = gateway.agent_config().clone();
         let auth_token_value = gateway.auth_token().map(String::from);
         let mut session_config = gateway.session_config().clone();
@@ -151,6 +184,77 @@ impl AppState {
             // every `POST /runs`.
             if let Some(llm_overrides) = persisted.llm {
                 llm_overrides.apply_to(&mut agent_config_val);
+            }
+            // Server-default LLM `(model, provider)` from a previous
+            // PATCH /settings. Persisted top-level rather than nested
+            // because these fields shadow `llm.model` / `llm.provider`
+            // in `alms.toml` (the same wire shape `GET /settings`
+            // exposes), not any per-provider reasoning knob. Apply to
+            // the `LlmConfig` snapshot first so `GET /settings` shows
+            // the patched value immediately on next boot, then push to
+            // the `LlmClient` so the next run actually uses the new
+            // wire identity.
+            //
+            // Codex follow-up on #1081 (P1): switch to
+            // `with_provider_and_secrets` so the API key for the new
+            // provider is resolved from `SecretsStore` and
+            // `[llm.providers.<name>].api_key_env / api_key` (the same
+            // resolution path `resolve_agent_config` uses for per-agent
+            // provider switches). With the old `with_provider`-only
+            // call, `apply_provider` would clear the previous provider's
+            // key and never repopulate from the env-based provider entry
+            // — and later `resolve_agent_config` only re-checks
+            // `SecretsStore` via `with_secrets`, never the provider
+            // entry's env/static fields. Deployments configuring keys
+            // exclusively via `[llm.providers.<name>].api_key_env` (no
+            // `alms auth set`) would silently boot with an empty key
+            // after a persisted provider switch.
+            //
+            // Codex follow-up on #1081 (P1, Finding 6): an operator who
+            // PATCH-switched the server-default provider to `anthropic`
+            // and later removed `[llm.providers.anthropic]` from
+            // `alms.toml` (or renamed it) would otherwise still force the
+            // stale provider on every restart. `with_provider_and_secrets`
+            // would then run `apply_provider` against an unconfigured
+            // name — clearing the previously active provider's API key
+            // without populating a new one, leaving the LlmClient with
+            // empty credentials. Default runs after boot would then fail
+            // with an opaque 401 / "no API key" error that the operator
+            // has no way to correlate back to the persisted PATCH.
+            //
+            // Guard the apply with a `providers.contains_key` check.
+            // On miss, log a structured WARN under `alms.config` and
+            // skip the override — the boot path falls through to the
+            // `alms.toml` default provider, which is the operator's
+            // most recent in-file configuration and the documented
+            // recovery surface.
+            if let Some(ref provider) = persisted.provider
+                && !provider.is_empty()
+            {
+                if llm_config.providers.contains_key(provider) {
+                    llm_config.provider = provider.clone();
+                    let secrets_handle = gateway.secrets_handle();
+                    let secrets_guard = secrets_handle.read();
+                    llm = llm.with_provider_and_secrets(provider, &secrets_guard);
+                } else {
+                    tracing::warn!(
+                        target: "alms.config",
+                        persisted_provider = %provider,
+                        active_provider = %llm_config.provider,
+                        "ignoring persisted server-default provider — \
+                         `[llm.providers.{provider}]` is no longer configured \
+                         in alms.toml; falling back to the in-file default. \
+                         PATCH /settings with a configured provider to clear \
+                         the persisted override, or restore the entry in \
+                         alms.toml."
+                    );
+                }
+            }
+            if let Some(ref model) = persisted.model
+                && !model.is_empty()
+            {
+                llm_config.default_model = model.clone();
+                llm = llm.with_model(model);
             }
         }
 
@@ -239,6 +343,15 @@ impl AppState {
             }
         }
 
+        // Seed the live `server_llm_default` from whatever ended up on the
+        // post-persisted-apply `llm_config` snapshot. This is the
+        // single read-write surface the PATCH /settings handler mutates;
+        // GET /settings and persist_settings both consult it.
+        let server_llm_default = Arc::new(parking_lot::RwLock::new(ServerLlmDefault {
+            model: llm_config.default_model.clone(),
+            provider: llm_config.provider.clone(),
+        }));
+
         Ok(Self {
             session_manager,
             gateway: Arc::new(tokio::sync::Mutex::new(gateway)),
@@ -253,6 +366,7 @@ impl AppState {
             shutdown_token: shutdown_token.clone(),
             agent_queue: Arc::new(SessionQueue::new(shutdown_token)),
             llm_config,
+            server_llm_default,
             agent_config,
             default_agent_id,
             llm,

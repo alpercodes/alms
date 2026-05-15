@@ -41,6 +41,11 @@ pub use self::config::{ResolveAgentConfigError, ResolvedAgentConfig, resolve_age
 // model resolution (Codex P2 follow-up on #1020 / fleet evaluation #2).
 pub(crate) use self::config::{ResolveEffectiveModelError, resolve_effective_provider_and_model};
 
+// Used by `settings::patch_settings` to wire-validate a server-default provider
+// switch against the post-PATCH model (Codex follow-up on #1081 P1 — see
+// `INCOMPATIBLE_MODEL_FOR_PROVIDER` in settings.rs).
+pub(crate) use self::config::{model_belongs_to_kind, provider_kind_for_name};
+
 // ---------------------------------------------------------------------------
 // Shared types (used by multiple submodules)
 // ---------------------------------------------------------------------------
@@ -163,7 +168,7 @@ mod config {
     /// Mirrors the lookup used inside `LlmClient::provider_kind` so that the
     /// raw-string helpers below produce the same `ProviderKind` decision as
     /// the runtime path.
-    pub(super) fn provider_kind_for_name(
+    pub(crate) fn provider_kind_for_name(
         provider: &str,
         providers: &std::collections::BTreeMap<String, alms_core::config::ProviderEntry>,
     ) -> ProviderKind {

@@ -17,7 +17,7 @@ provider = "openrouter"
 # provider base URL
 base_url = "https://openrouter.ai/api/v1"
 # model identifier
-model = "openrouter/moonshotai/kimi-k2.5"
+model = "moonshotai/kimi-k2.6"
 # request timeout
 timeout_secs = 120
 # retry count on transient failures

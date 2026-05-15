@@ -51,7 +51,7 @@ const LLM_CONTEXT_BYTES: usize = 2000;
 /// Set high enough to accommodate reasoning models that consume a large portion
 /// of the budget on internal thinking before producing visible output.  The
 /// actual summary text is typically 50-150 tokens, but reasoning models (e.g.
-/// deepseek-r1, kimi-k2.5) may spend 200-800 tokens on thinking first.
+/// deepseek-r1, kimi-k2.6) may spend 200-800 tokens on thinking first.
 ///
 /// Configurable via [`ContextConfig::summary_max_tokens`].
 ///

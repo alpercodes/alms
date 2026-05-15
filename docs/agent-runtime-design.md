@@ -22,7 +22,7 @@ bind = "127.0.0.1:8080"
 [llm]
 # provider = "openrouter"           # openrouter | openai | anthropic | local
 # base_url = "https://openrouter.ai/api/v1"
-# model = "openrouter/moonshotai/kimi-k2.5"
+# model = "moonshotai/kimi-k2.6"
 # api_key loaded from secrets store via `alms auth set` (never in config file)
 timeout_secs = 120
 max_retries = 2
