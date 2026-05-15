@@ -494,7 +494,29 @@ export function SessionList() {
     // Group the loaded sessions by agent_id so a session that snuck in
     // for a different agent (race during agent-switch, etc.) lands in
     // the correct group rather than under the active agent.
-    const chatSessions = allSessions.filter(s => s.session_type !== 'dm' && s.session_type !== 'notification');
+    //
+    // The filter list mirrors backend `is_internal_context_id`
+    // (`crates/alms-gateway/src/runs/mod.rs`) one-to-one \u2014 `dm`,
+    // `notification`, `job`, `subagent`, `episodic`. `dm` and
+    // `notification` get their own cross-agent sections rendered below;
+    // `job` / `subagent` / `episodic` are internal-context sessions the
+    // operator should never see as ordinary chat rows. The backend
+    // `/sessions` listing excludes those three by default, so historically
+    // a `!== 'dm' && !== 'notification'` filter was sufficient \u2014 but the
+    // #1065 resolver-led-boot fix in `utils/load-session.js` Step 0
+    // injects internal envelopes directly into `sessions.value` so the
+    // active subagent session can be resolved by `activeSession` /
+    // `isInternalSession`. Without listing every internal type here that
+    // injection would leak subagent/job/episodic rows into the sidebar
+    // (Codex P2 on PR #1074). Keep this list in lock-step with the
+    // backend prefix list if a new internal context_id family is added.
+    const chatSessions = allSessions.filter(s =>
+        s.session_type !== 'dm'
+        && s.session_type !== 'notification'
+        && s.session_type !== 'job'
+        && s.session_type !== 'subagent'
+        && s.session_type !== 'episodic'
+    );
     const grouped = groupSessionsByAgent(chatSessions);
 
     // Per-agent session counts for the header badge. The active

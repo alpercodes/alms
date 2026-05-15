@@ -15,6 +15,21 @@ export const createSession = (agentId, contextId) =>
 export const getSessionMessages = (sessionId) =>
     get(`/sessions/${sessionId}/messages`);
 
+/**
+ * Fetch the single-session metadata envelope (#1065).
+ *
+ * Singular path `/session/{id}` — see the route registration in
+ * `crates/alms-gateway/src/server/routes.rs` for the visual-separation
+ * rationale vs the `/sessions/...` cluster.
+ *
+ * Response shape mirrors the per-entry shape of `listSessions`, plus
+ * `parent_session_id` for subagent sessions (uuid or null). Field is
+ * omitted for non-subagent session types — callers can shortcut on
+ * field presence to detect subagent envelopes.
+ */
+export const getSession = (sessionId) =>
+    get(`/session/${sessionId}`);
+
 export const deleteSession = (sessionId) =>
     del(`/sessions/${sessionId}`);
 
