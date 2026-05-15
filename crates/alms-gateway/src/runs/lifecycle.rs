@@ -237,18 +237,18 @@ pub async fn get_run_tool_calls(
 }
 
 /// GET /runs/{run_id}/reasoning — rehydrate accumulated extended-thinking
-/// (reasoning) text for an in-flight run (#1043).
+/// (reasoning) text for the **current in-flight turn** of a run (#1043, #1077).
 ///
 /// Reasoning text is streamed as `reasoning_delta` SSE events and only
 /// persisted to the session-messages store as `reasoning_blocks` metadata
 /// **at end-of-turn** via `persist_assistant_tool_calls`. While a turn is
 /// in flight, the only authoritative record lives in the per-session SSE
 /// event log. If an operator reloads the page mid-turn, the messages GET
-/// returns no reasoning yet, and the default SSE replay cursor sits at
-/// the session HWM — past every reasoning_delta that has already fired.
-/// The reasoning panel would therefore show only whatever streams in
-/// after the reload, throwing away potentially the bulk of the model's
-/// thinking trace (see issue #1043 acceptance criteria).
+/// returns no reasoning yet for that turn, and the default SSE replay
+/// cursor sits at the session HWM — past every `reasoning_delta` that has
+/// already fired. The reasoning panel would therefore show only whatever
+/// streams in after the reload, throwing away potentially the bulk of the
+/// model's current thinking trace (see issue #1043 acceptance criteria).
 ///
 /// This endpoint reads the per-session SSE event log, filters to
 /// `reasoning_delta` events for the given run (skipping `source_agent`
@@ -264,9 +264,27 @@ pub async fn get_run_tool_calls(
 /// `reasoning_delta` handler appends to (not duplicates) the rehydrated
 /// text.
 ///
+/// **Per-turn scoping (#1077)**: a run can span multiple LLM turns, each
+/// ending with one or more `tool_start` / `tool_end` events. Prior turns'
+/// reasoning is already persisted to the message store as
+/// `reasoning_blocks` metadata on the sealed assistant message, and the
+/// UI rehydrates each turn's bubble from that source on reload. Including
+/// past turns' deltas in this response too would double-render them — the
+/// sealed bubble shows them once, then this concatenated blob shows them
+/// again at the bottom in an unsealed bubble. We therefore compute the
+/// latest **parent-agent** `tool_start` / `tool_end` boundary in this run
+/// and drop every `reasoning_delta` whose `event_id` is at or before it.
+/// Subagent tool events (with `source_agent` set) do **not** move the
+/// boundary — the parent's turn frame is independent of subagent activity.
+///
+/// First-turn case: when no parent-agent tool event has fired yet, the
+/// boundary is unset and every `reasoning_delta` in this run is included.
+/// This preserves the original #1043 contract for the first turn of a run
+/// (which is also the only turn for tool-less runs).
+///
 /// Returns an empty `text` and `last_event_id: null` when the run has no
-/// recorded reasoning yet — the client can safely call this on every
-/// reload regardless of run state.
+/// recorded post-boundary reasoning yet — the client can safely call this
+/// on every reload regardless of run state.
 #[instrument(level = "info", skip(state), fields(run_id = %run_id.0))]
 pub async fn get_run_reasoning(
     State(state): State<AppState>,
@@ -282,6 +300,48 @@ pub async fn get_run_reasoning(
         .session_events_from(run.session_id, 0)
         .await;
 
+    // First pass — compute the parent-agent turn boundary for this run.
+    //
+    // A turn boundary is the latest `tool_start` / `tool_end` event in
+    // this run whose `source_agent` is unset (i.e. emitted by the parent
+    // agent itself, not by a subagent). Reasoning deltas at or before
+    // this id belong to a turn whose assistant message has already been
+    // sealed and persisted with `reasoning_blocks` metadata; the UI
+    // rehydrates those from the message store and this endpoint must
+    // NOT return them again, or the prior turn's reasoning renders twice
+    // — once on the sealed bubble, once concatenated into a trailing
+    // unsealed bubble (the #1077 symptom).
+    //
+    // `tool_start` without a matching `tool_end` (approval-paused, or
+    // cancelled mid-call) still moves the boundary correctly — the
+    // unfinished turn's reasoning is by definition older than the next
+    // delta that would belong to a fresh turn.
+    let mut latest_turn_boundary: Option<u64> = None;
+    for ev in &events {
+        if ev.run_id != run_id {
+            continue;
+        }
+        if ev.event_type != "tool_start" && ev.event_type != "tool_end" {
+            continue;
+        }
+        let is_subagent = ev
+            .data
+            .get("source_agent")
+            .map(|v| !v.is_null())
+            .unwrap_or(false);
+        if is_subagent {
+            continue;
+        }
+        // Events are appended in event-id order, but compute max
+        // explicitly rather than assuming iteration order so the contract
+        // is stable against any future event_log reordering.
+        latest_turn_boundary = Some(
+            latest_turn_boundary
+                .map(|b| b.max(ev.event_id))
+                .unwrap_or(ev.event_id),
+        );
+    }
+
     let mut text = String::new();
     let mut last_event_id: Option<u64> = None;
     for ev in events {
@@ -289,6 +349,14 @@ pub async fn get_run_reasoning(
             continue;
         }
         if ev.event_type != "reasoning_delta" {
+            continue;
+        }
+        // Drop deltas from sealed prior turns — their reasoning is
+        // already rehydrated by the messages GET's `reasoning_blocks`
+        // metadata path. See doc comment above for the #1077 rationale.
+        if let Some(boundary) = latest_turn_boundary
+            && ev.event_id <= boundary
+        {
             continue;
         }
         // Subagent reasoning is suppressed in the main panel — the UI's

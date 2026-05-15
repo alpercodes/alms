@@ -367,27 +367,36 @@ export async function loadSession(sessionId, opts) {
             console.warn(`[${logPrefix}] Failed to load pending approvals:`, err);
         }
 
-        // Rehydrate accumulated extended-thinking text for the in-flight
-        // run (#1043). This block MUST stay after the thinking-indicator
-        // and pending-approval appends above: the live `reasoning_delta`
-        // SSE handler attaches each incoming chunk to the most recent
-        // unsealed assistant entry at the tail of `chatMessages`, so the
-        // rehydrated seed must be the last append before `openSessionStream`
-        // fires. Inserting it earlier would let the thinking / approval
-        // rows land after it and break the handler's tail lookup.
+        // Rehydrate the in-flight turn's extended-thinking text (#1043,
+        // refined per-turn under #1077). This block MUST stay after the
+        // thinking-indicator and pending-approval appends above: the live
+        // `reasoning_delta` SSE handler attaches each incoming chunk to
+        // the most recent unsealed assistant entry at the tail of
+        // `chatMessages`, so the rehydrated seed must be the last append
+        // before `openSessionStream` fires. Inserting it earlier would
+        // let the thinking / approval rows land after it and break the
+        // handler's tail lookup.
         //
-        // Reasoning is streamed via `reasoning_delta` SSE events but
-        // only persisted to the message store at end-of-turn,
-        // so a mid-turn reload would otherwise miss every delta that
-        // fired before the reload. The dedicated endpoint reads the
-        // session event log and returns both the concatenated text and
-        // the maximum event_id of any included event; advancing
+        // Reasoning is streamed via `reasoning_delta` SSE events but only
+        // persisted to the message store at end-of-turn (sealed onto the
+        // closing assistant message's `reasoning_blocks` metadata), so a
+        // mid-turn reload would otherwise miss every delta that fired
+        // before the reload. The dedicated endpoint returns the concatenation
+        // of `reasoning_delta` events for the CURRENT TURN ONLY — deltas
+        // belonging to already-sealed prior turns are filtered out by a
+        // per-run turn boundary (the latest parent-agent `tool_start` /
+        // `tool_end` event id; subagent tool events do not move the boundary).
+        // That scoping is what keeps prior-turn reasoning from rendering
+        // twice on reload: once from the sealed assistant message's
+        // `reasoning_blocks` (rehydrated by the messages GET in step 2),
+        // and once from the seed appended below. The endpoint also returns
+        // the maximum event_id of any included delta; advancing
         // `lastEventId` past that mark makes the subsequent SSE replay
         // skip exactly the events already reflected in the rehydrated
         // text, so the live append in the `reasoning_delta` handler does
         // not double-count. Skipped for DM sessions — those route
         // reasoning through `dmThinkingBuffers` and a separate
-        // dm_reasoning block layout (out of scope for #1043).
+        // dm_reasoning block layout (out of scope for #1043 / #1077).
         //
         // Race mitigation: re-check the run status from the listRuns
         // snapshot before seeding. If the run terminated between step 1

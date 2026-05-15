@@ -708,9 +708,11 @@ Notes:
 ### 5.5 Get in-flight reasoning text
 `GET /runs/{run_id}/reasoning`
 
-Returns the concatenated extended-thinking ("reasoning") text accumulated for a run so far, plus the maximum SSE event_id covered by that text. Used by the web UI's `loadSession` flow to rehydrate the collapsible reasoning panel after a mid-turn page reload (#1043).
+Returns the concatenated extended-thinking ("reasoning") text for the **current in-flight turn** of a run, plus the maximum SSE event_id covered by that text. Used by the web UI's `loadSession` flow to rehydrate the collapsible reasoning panel after a mid-turn page reload (#1043).
 
 Reasoning text is streamed as `reasoning_delta` SSE events while a turn is in flight and only persisted to the session-messages store (as `reasoning_blocks` metadata on the final assistant message) at end-of-turn. The standard messages GET therefore returns nothing for an in-progress turn, and the default SSE replay cursor sits at the session HWM — past every `reasoning_delta` that has already fired. This endpoint plugs that gap by reading the per-session SSE event log directly.
+
+**Per-turn scoping (#1077).** A run may span multiple LLM turns, each closed by one or more parent-agent tool calls. Each closed turn's reasoning has already been sealed into the corresponding assistant message's `reasoning_blocks` metadata, which the messages GET (§5.3) already returns. This endpoint must therefore return ONLY reasoning that belongs to the still-open trailing turn — otherwise prior-turn reasoning would render twice on a mid-run reload (once from the sealed bubble, once seeded into a new unsealed bubble by the rehydration path). Concretely, the response includes only `reasoning_delta` events whose `event_id` is strictly greater than the latest parent-agent `tool_start` / `tool_end` event in this run. For tool-less runs and the first turn of any run (no boundary present yet), the response contains every `reasoning_delta` in the run — the original #1043 / #1054 contract.
 
 **Response 200**
 ```json
@@ -724,9 +726,11 @@ Reasoning text is streamed as `reasoning_delta` SSE events while a turn is in fl
 **Response 404** — run not found.
 
 Notes:
-- `text` is an empty string and `last_event_id` is `null` when the run has not emitted any `reasoning_delta` events yet. The endpoint is safe to call on every page load regardless of run state.
+- `text` is an empty string and `last_event_id` is `null` when the run has no post-boundary `reasoning_delta` events yet (either no reasoning has streamed, or every delta seen so far has already been sealed by a subsequent tool boundary). The endpoint is safe to call on every page load regardless of run state.
 - `last_event_id` is sampled during the same snapshot the text is built from, so the rehydrate→reconnect handoff is race-free: every event reflected in `text` has an id ≤ `last_event_id`. The client should pass it as `?last_event_id=<n>` on the subsequent SSE open call so the live stream replays only events not yet reflected in `text`, and the per-delta append in the UI's `reasoning_delta` handler appends to (not duplicates) the rehydrated text.
-- `reasoning_delta` events emitted with a non-null `source_agent` (subagent reasoning) are filtered out to mirror the UI's main-panel suppression of subagent deltas. Subagent reasoning is rendered separately.
+- Only **parent-agent** tool events move the turn boundary. `tool_start` / `tool_end` events emitted with a non-null `source_agent` (subagent activity) are ignored when computing the boundary — subagent tool calls belong to the subagent's own panel and do not seal the parent's reasoning bubble. Similarly, `reasoning_delta` events emitted with a non-null `source_agent` (subagent reasoning) are filtered out of the response to mirror the UI's main-panel suppression of subagent deltas. Subagent reasoning is rendered separately.
+- An unmatched parent-agent `tool_start` (approval-paused or cancelled mid-call) still seals the prior turn correctly: the boundary is the latest `tool_start` **or** `tool_end` id, so an `Inflight` tool invocation with no matching `tool_end` does not regress to the prior turn's slice.
+- The boundary computation is run-scoped: a tool event from a sibling run on the same session never clips the current run's reasoning.
 - For DM sessions, reasoning is routed through a distinct `dm_reasoning` block layout and this endpoint is not used by the DM rehydration path.
 
 ### 5.6 Cancel a run

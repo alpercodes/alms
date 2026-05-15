@@ -6318,10 +6318,16 @@ async fn get_run_reasoning_returns_concatenated_text_and_max_event_id() {
     let run_id = run.run_id;
     state.run_manager.insert_run(run);
 
-    // Fire three reasoning_delta events; concatenation must equal the joined
-    // text in event-emission order. An unrelated tool_start event in between
-    // exercises the per-event-type filter so we know we are not lifting the
-    // wrong frames out of the log.
+    // Fire three reasoning_delta events on a first-turn run (no
+    // parent-agent tool events yet, so the #1077 turn boundary is unset
+    // and every delta is returned). Concatenation must equal the joined
+    // text in event-emission order. An unrelated `run_started` event
+    // (different event_type) is interleaved to exercise the
+    // per-event-type filter so we know we are not lifting the wrong
+    // frames out of the log. We deliberately do not interleave a
+    // `tool_start` here — that would seal the turn under the #1077
+    // semantics and is covered by
+    // `get_run_reasoning_drops_pre_turn_boundary_deltas`.
     state
         .run_manager
         .send_event(
@@ -6335,14 +6341,7 @@ async fn get_run_reasoning_returns_concatenated_text_and_max_event_id() {
         .send_event(
             run_id,
             session_id,
-            SseEventData::tool_start(
-                run_id,
-                crate::sse::ToolInvocationId(uuid::Uuid::new_v4()),
-                "echo",
-                serde_json::json!({}),
-                None,
-                None,
-            ),
+            SseEventData::run_started(run_id, session_id),
         )
         .await;
     state
@@ -6505,6 +6504,412 @@ async fn get_run_reasoning_isolates_text_by_run_id() {
         .expect("get_run_reasoning should succeed for run B");
     assert_eq!(resp_a.0["text"].as_str().unwrap(), "A1 A2");
     assert_eq!(resp_b.0["text"].as_str().unwrap(), "B1 ");
+
+    shutdown_token.cancel();
+}
+
+// ---------------------------------------------------------------------------
+// #1077 — get_run_reasoning must be per-turn scoped to avoid double-render
+// ---------------------------------------------------------------------------
+
+/// Regression test for #1077.
+///
+/// A run can span multiple LLM turns, each closed by one or more tool
+/// calls. Prior turns' reasoning is persisted to the message store as
+/// `reasoning_blocks` on the sealed assistant message and rehydrated by
+/// the UI from there. If `get_run_reasoning` returned the full run-wide
+/// blob, prior-turn reasoning would render twice on reload — once from
+/// the sealed bubble, once from the trailing unsealed bubble seeded by
+/// this endpoint.
+///
+/// The fix scopes the response to deltas emitted strictly **after** the
+/// latest parent-agent `tool_start` / `tool_end` event in this run. This
+/// test fires a Turn-1 → tool boundary → Turn-2 sequence and asserts the
+/// response contains only Turn-2's text.
+#[tokio::test]
+async fn get_run_reasoning_drops_pre_turn_boundary_deltas() {
+    use axum::extract::{Path, State};
+    let (state, shutdown_token, _cr, _tr, _dr) = test_app_state();
+    let agent_id = AgentId::new();
+    let session = state
+        .session_manager
+        .get_or_create(agent_id, "test-reasoning-per-turn");
+    let session_id = session.id;
+
+    let run = Run::new(session_id, agent_id, "multi-turn".into());
+    let run_id = run.run_id;
+    state.run_manager.insert_run(run);
+
+    // Turn 1: reasoning -> tool_start -> tool_end
+    state
+        .run_manager
+        .send_event(
+            run_id,
+            session_id,
+            SseEventData::reasoning_delta(run_id, "Turn1-A ", None),
+        )
+        .await;
+    state
+        .run_manager
+        .send_event(
+            run_id,
+            session_id,
+            SseEventData::reasoning_delta(run_id, "Turn1-B", None),
+        )
+        .await;
+    state
+        .run_manager
+        .send_event(
+            run_id,
+            session_id,
+            SseEventData::tool_start(
+                run_id,
+                crate::sse::ToolInvocationId(uuid::Uuid::new_v4()),
+                "echo",
+                serde_json::json!({}),
+                None,
+                None,
+            ),
+        )
+        .await;
+    state
+        .run_manager
+        .send_event(
+            run_id,
+            session_id,
+            SseEventData::tool_end(
+                run_id,
+                crate::sse::ToolInvocationId(uuid::Uuid::new_v4()),
+                true,
+                serde_json::json!({}),
+                None,
+                None,
+            ),
+        )
+        .await;
+
+    // Turn 2: reasoning only (still in flight — no closing tool yet)
+    state
+        .run_manager
+        .send_event(
+            run_id,
+            session_id,
+            SseEventData::reasoning_delta(run_id, "Turn2-A ", None),
+        )
+        .await;
+    state
+        .run_manager
+        .send_event(
+            run_id,
+            session_id,
+            SseEventData::reasoning_delta(run_id, "Turn2-B", None),
+        )
+        .await;
+
+    let response = super::lifecycle::get_run_reasoning(State(state.clone()), Path(run_id))
+        .await
+        .expect("get_run_reasoning should succeed");
+    let body = response.0;
+    assert_eq!(
+        body["text"].as_str().unwrap(),
+        "Turn2-A Turn2-B",
+        "reasoning rehydration must include ONLY deltas emitted after \
+         the latest parent-agent tool boundary; Turn-1 text is already \
+         persisted to the sealed assistant message's reasoning_blocks \
+         and would otherwise double-render (#1077)"
+    );
+    assert!(
+        body["last_event_id"].as_u64().is_some(),
+        "last_event_id must be present when post-boundary deltas exist"
+    );
+
+    shutdown_token.cancel();
+}
+
+/// First-turn contract pin for #1054 — when no tool events have fired
+/// yet, the endpoint must return every `reasoning_delta` in the run.
+///
+/// This is the original #1043 / #1054 contract that #1077 must not
+/// regress: tool-less runs (or the first turn of any run) have no
+/// boundary marker, and the full delta concatenation is the only way
+/// to rehydrate the live reasoning panel mid-stream.
+#[tokio::test]
+async fn get_run_reasoning_returns_full_text_when_no_tool_events() {
+    use axum::extract::{Path, State};
+    let (state, shutdown_token, _cr, _tr, _dr) = test_app_state();
+    let agent_id = AgentId::new();
+    let session = state
+        .session_manager
+        .get_or_create(agent_id, "test-reasoning-first-turn");
+    let session_id = session.id;
+
+    let run = Run::new(session_id, agent_id, "first turn".into());
+    let run_id = run.run_id;
+    state.run_manager.insert_run(run);
+
+    state
+        .run_manager
+        .send_event(
+            run_id,
+            session_id,
+            SseEventData::reasoning_delta(run_id, "alpha ", None),
+        )
+        .await;
+    state
+        .run_manager
+        .send_event(
+            run_id,
+            session_id,
+            SseEventData::reasoning_delta(run_id, "beta ", None),
+        )
+        .await;
+    state
+        .run_manager
+        .send_event(
+            run_id,
+            session_id,
+            SseEventData::reasoning_delta(run_id, "gamma", None),
+        )
+        .await;
+
+    let response = super::lifecycle::get_run_reasoning(State(state.clone()), Path(run_id))
+        .await
+        .expect("get_run_reasoning should succeed");
+    assert_eq!(
+        response.0["text"].as_str().unwrap(),
+        "alpha beta gamma",
+        "with no tool events present the boundary is unset and ALL \
+         reasoning_delta text must be returned (#1054 contract)"
+    );
+
+    shutdown_token.cancel();
+}
+
+/// A subagent `tool_start` (with `source_agent` set) must not move the
+/// parent agent's turn boundary. Subagent activity is independent of
+/// the parent's turn frame: an `invoke_agent` call kicks off a subagent
+/// whose tool events are scoped to the subagent's own panel, and the
+/// parent's reasoning panel must continue rehydrating the parent's
+/// in-flight turn deltas (which include thinking BEFORE the parent
+/// emits its own tool call).
+#[tokio::test]
+async fn get_run_reasoning_boundary_ignores_subagent_tool_events() {
+    use axum::extract::{Path, State};
+    let (state, shutdown_token, _cr, _tr, _dr) = test_app_state();
+    let agent_id = AgentId::new();
+    let session = state
+        .session_manager
+        .get_or_create(agent_id, "test-reasoning-subagent-boundary");
+    let session_id = session.id;
+
+    let run = Run::new(session_id, agent_id, "subagent boundary".into());
+    let run_id = run.run_id;
+    state.run_manager.insert_run(run);
+
+    state
+        .run_manager
+        .send_event(
+            run_id,
+            session_id,
+            SseEventData::reasoning_delta(run_id, "pre-sub ", None),
+        )
+        .await;
+    // Subagent tool_start — source_agent set. MUST NOT move boundary.
+    state
+        .run_manager
+        .send_event(
+            run_id,
+            session_id,
+            SseEventData::tool_start(
+                run_id,
+                crate::sse::ToolInvocationId(uuid::Uuid::new_v4()),
+                "echo",
+                serde_json::json!({}),
+                Some("worker-1".into()),
+                None,
+            ),
+        )
+        .await;
+    state
+        .run_manager
+        .send_event(
+            run_id,
+            session_id,
+            SseEventData::tool_end(
+                run_id,
+                crate::sse::ToolInvocationId(uuid::Uuid::new_v4()),
+                true,
+                serde_json::json!({}),
+                Some("worker-1".into()),
+                None,
+            ),
+        )
+        .await;
+    state
+        .run_manager
+        .send_event(
+            run_id,
+            session_id,
+            SseEventData::reasoning_delta(run_id, "post-sub", None),
+        )
+        .await;
+
+    let response = super::lifecycle::get_run_reasoning(State(state.clone()), Path(run_id))
+        .await
+        .expect("get_run_reasoning should succeed");
+    assert_eq!(
+        response.0["text"].as_str().unwrap(),
+        "pre-sub post-sub",
+        "subagent tool events (source_agent set) must NOT move the \
+         parent's turn boundary — only the parent's own tool calls \
+         seal the parent's reasoning bubble"
+    );
+
+    shutdown_token.cancel();
+}
+
+/// The turn boundary computation must be run-scoped: a `tool_end` event
+/// from run A on a shared session must not clip run B's reasoning. Two
+/// concurrent or sequential runs on the same session share a single
+/// event log, so without per-run filtering the wrong run's tool event
+/// could swallow legitimate reasoning text on the other run.
+#[tokio::test]
+async fn get_run_reasoning_boundary_is_run_scoped() {
+    use axum::extract::{Path, State};
+    let (state, shutdown_token, _cr, _tr, _dr) = test_app_state();
+    let agent_id = AgentId::new();
+    let session = state
+        .session_manager
+        .get_or_create(agent_id, "test-reasoning-cross-run-boundary");
+    let session_id = session.id;
+
+    let run_a = Run::new(session_id, agent_id, "a".into());
+    let run_a_id = run_a.run_id;
+    state.run_manager.insert_run(run_a);
+    let run_b = Run::new(session_id, agent_id, "b".into());
+    let run_b_id = run_b.run_id;
+    state.run_manager.insert_run(run_b);
+
+    // Run B emits some reasoning first.
+    state
+        .run_manager
+        .send_event(
+            run_b_id,
+            session_id,
+            SseEventData::reasoning_delta(run_b_id, "B-first ", None),
+        )
+        .await;
+    // Run A fires a parent-agent tool boundary (no subagent flag).
+    state
+        .run_manager
+        .send_event(
+            run_a_id,
+            session_id,
+            SseEventData::tool_end(
+                run_a_id,
+                crate::sse::ToolInvocationId(uuid::Uuid::new_v4()),
+                true,
+                serde_json::json!({}),
+                None,
+                None,
+            ),
+        )
+        .await;
+    // Run B continues to emit reasoning that fires AFTER run A's tool
+    // event but is logically part of run B's first turn.
+    state
+        .run_manager
+        .send_event(
+            run_b_id,
+            session_id,
+            SseEventData::reasoning_delta(run_b_id, "B-second", None),
+        )
+        .await;
+
+    let resp_b = super::lifecycle::get_run_reasoning(State(state.clone()), Path(run_b_id))
+        .await
+        .expect("get_run_reasoning should succeed for run B");
+    assert_eq!(
+        resp_b.0["text"].as_str().unwrap(),
+        "B-first B-second",
+        "the turn boundary is per-run: run A's tool_end must not clip \
+         run B's reasoning — run B has emitted no tool events of its \
+         own so its first-turn full-text contract still applies"
+    );
+
+    shutdown_token.cancel();
+}
+
+/// An unmatched parent-agent `tool_start` (approval-paused, or cancelled
+/// mid-call before `tool_end` fired) must still move the turn boundary.
+/// `get_run_reasoning` advertises this contract: "tool_start without a
+/// matching tool_end still moves the boundary correctly — the unfinished
+/// turn's reasoning is by definition older than the next delta that would
+/// belong to a fresh turn." This test pins it so future refactors of the
+/// boundary computation cannot silently regress to an `_end`-only walk.
+///
+/// Scenario: Turn 1 emits reasoning then a parent-agent `tool_start` (no
+/// matching `tool_end` — simulating Guarded posture awaiting approval).
+/// Turn 2 emits fresh reasoning. The response must contain only Turn 2.
+#[tokio::test]
+async fn get_run_reasoning_boundary_uses_unmatched_tool_start() {
+    use axum::extract::{Path, State};
+    let (state, shutdown_token, _cr, _tr, _dr) = test_app_state();
+    let agent_id = AgentId::new();
+    let session = state
+        .session_manager
+        .get_or_create(agent_id, "test-reasoning-approval-paused");
+    let session_id = session.id;
+
+    let run = Run::new(session_id, agent_id, "approval-paused".into());
+    let run_id = run.run_id;
+    state.run_manager.insert_run(run);
+
+    // Turn 1: reasoning -> tool_start (NO matching tool_end — approval-paused).
+    state
+        .run_manager
+        .send_event(
+            run_id,
+            session_id,
+            SseEventData::reasoning_delta(run_id, "Turn1-pre ", None),
+        )
+        .await;
+    state
+        .run_manager
+        .send_event(
+            run_id,
+            session_id,
+            SseEventData::tool_start(
+                run_id,
+                crate::sse::ToolInvocationId(uuid::Uuid::new_v4()),
+                "shell",
+                serde_json::json!({}),
+                None,
+                None,
+            ),
+        )
+        .await;
+
+    // Turn 2: fresh reasoning after the boundary.
+    state
+        .run_manager
+        .send_event(
+            run_id,
+            session_id,
+            SseEventData::reasoning_delta(run_id, "Turn2-only", None),
+        )
+        .await;
+
+    let response = super::lifecycle::get_run_reasoning(State(state.clone()), Path(run_id))
+        .await
+        .expect("get_run_reasoning should succeed");
+    assert_eq!(
+        response.0["text"].as_str().unwrap(),
+        "Turn2-only",
+        "an unmatched parent-agent tool_start (approval-paused / cancelled \
+         mid-call) must still seal the prior turn — the boundary walks \
+         both tool_start AND tool_end, not just tool_end"
+    );
 
     shutdown_token.cancel();
 }
