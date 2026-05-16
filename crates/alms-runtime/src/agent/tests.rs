@@ -3771,6 +3771,244 @@ async fn test_cancel_persists_completed_parallel_results_1078() {
     );
 }
 
+/// #1090 — Guarded sequential cancel arm: a two-tool batch where tool A
+/// completes before the cancel arrives and tool B is still in-flight at
+/// cancel time. Same shape as `test_cancel_persists_completed_parallel_results_1078`
+/// but for the Guarded `Posture::Guarded` posture's sequential cancel
+/// path. Pre-#1090, A's `Tool`-role row was silently dropped because the
+/// Guarded cancel arm bypassed `process_tool_results` — the only
+/// persistence site for completed tool results — and the next run's
+/// rebuild would synthesise `INTERRUPTED_TOOL_RESULT` for A even though
+/// it had succeeded.
+///
+/// Two cancel branches exist in the Guarded arm:
+///
+/// * **Branch 1**: inter-tool `is_cancelled()` check (cancel landed
+///   between iterations). Persists prior `results` entries before
+///   unwinding.
+/// * **Branch 2**: outer `tokio::select!` cancel arm (cancel arrived
+///   mid-tool-execution). Persists prior `results` entries, then
+///   synthesises `ToolEnd`s for the in-flight subset via
+///   `synthesize_cancel_tool_ends`.
+///
+/// Under tokio's single-threaded `#[tokio::test]` executor, this test
+/// deterministically lands in Branch 2: A's tool body completes
+/// synchronously (its release sender is pre-fired so `rx.await` polls
+/// straight through), the runtime task pushes A's Ok to `results` and
+/// proceeds to B's iteration without yielding, B's `execute_tool_call`
+/// emits ToolStart and parks at B's blocking `rx.await`. The watcher
+/// task is finally scheduled, sees A's ToolEnd, fires
+/// `cancel_token.cancel()`. The outer select's cancel arm wins because
+/// B's inner future is parked. Both branches route through the same
+/// `persist_completed_guarded_results_on_cancel` helper, so a Branch 2
+/// test covers the helper for Branch 1 too — the only difference
+/// between branches is which `return Err(Cancelled)` site is reached,
+/// and the persistence pass that precedes them is byte-identical.
+#[tokio::test]
+async fn test_cancel_persists_completed_guarded_results_1090() {
+    use tokio_util::sync::CancellationToken;
+
+    // Bring the trait into scope so `is_auto_approved()` resolves below.
+    use alms_sandbox::Tool as _;
+
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<RuntimeEvent>();
+    let cancel_token = CancellationToken::new();
+
+    let blocking = std::sync::Arc::new(BlockingTestTool::new("block_test"));
+    // Pin the auto-approval invariant: this test deterministically
+    // covers Branch 2 (cancel-during-tool-execution inside the inner
+    // `select!`) only if `BlockingTestTool` bypasses the Guarded
+    // approval gate. If a future maintainer flips
+    // `is_auto_approved()` to `false` (or adds a manual-approval
+    // variant) the runtime would instead park on the approval queue
+    // and the cancel arm in `execute_tool_call`'s approval-wait
+    // branch would fire — a different code path that does not run
+    // `persist_completed_guarded_results_on_cancel`. Failing fast
+    // here is preferable to a green test that exercises the wrong
+    // branch. (Tim's nit on #1090.)
+    debug_assert!(
+        blocking.is_auto_approved(),
+        "BlockingTestTool must be auto-approved for this test to land in \
+         Branch 2 of `run_tool_calls`'s Guarded arm; otherwise the runtime \
+         parks on the approval queue and the cancel persistence path under \
+         test is bypassed."
+    );
+
+    // Two calls — A's release sender is pre-fired so A's `rx.await`
+    // inside `execute()` resolves immediately. B's release sender is
+    // held by the test and never fired, so B's `execute()` parks at its
+    // blocking await forever and the FuturesUnordered drain loop yields
+    // control after collecting A's result. Same pattern as the parallel
+    // test, scaled down to two tools because the Guarded arm runs
+    // sequentially — A must complete before B's iteration even starts.
+    let (release_a_tx, release_a_rx) = tokio::sync::oneshot::channel::<()>();
+    let _ = release_a_tx.send(());
+    blocking.enqueue(release_a_rx).await;
+
+    let (held_b_tx, release_b_rx) = tokio::sync::oneshot::channel::<()>();
+    blocking.enqueue(release_b_rx).await;
+
+    let runtime = make_runtime_for_cancel_test(
+        Posture::Guarded,
+        blocking.clone() as std::sync::Arc<dyn alms_sandbox::Tool>,
+        cancel_token.clone(),
+        tx,
+    );
+
+    let session_config = SessionConfig::default();
+    let session_manager = SessionManager::new(session_config);
+    let session = session_manager.get_or_create(runtime.agent_id, "test");
+
+    // Two distinct tool_call_ids so we can identify A's persisted
+    // `ToolResult` row in the session history afterwards.
+    let tool_calls = vec![
+        ToolCall::new("tc-A", "block_test", "{}"),
+        ToolCall::new("tc-B", "block_test", "{}"),
+    ];
+    let inv_ids: Vec<uuid::Uuid> = (0..2).map(|_| uuid::Uuid::new_v4()).collect();
+
+    // Watcher: fires `cancel_token.cancel()` on the first observed
+    // `ToolEnd` (which is tool A's success — B never completes). Mirrors
+    // the event-driven sequencing pattern from
+    // `test_cancel_persists_completed_parallel_results_1078`.
+    let watcher = {
+        let cancel_token = cancel_token.clone();
+        tokio::spawn(async move {
+            let mut rx = rx;
+            let mut starts = std::collections::HashSet::new();
+            let mut ends: Vec<(uuid::Uuid, bool, serde_json::Value)> = Vec::new();
+            let mut cancelled = false;
+            while let Some(ev) = rx.recv().await {
+                match ev {
+                    RuntimeEvent::ToolStart { invocation_id, .. } => {
+                        starts.insert(invocation_id);
+                    }
+                    RuntimeEvent::ToolEnd {
+                        invocation_id,
+                        ok,
+                        result,
+                        ..
+                    } => {
+                        ends.push((invocation_id, ok, result));
+                        if !cancelled {
+                            cancel_token.cancel();
+                            cancelled = true;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            (starts, ends)
+        })
+    };
+
+    let mut tool_call_records: Vec<alms_core::ToolCallRecord> = Vec::new();
+    let mut tool_seq: u32 = 0;
+    let result = runtime
+        .run_tool_calls(
+            &tool_calls,
+            &inv_ids,
+            &[],
+            &session_manager,
+            session.id,
+            /* is_dm */ false,
+            &mut tool_call_records,
+            &mut tool_seq,
+        )
+        .await;
+
+    // Drop runtime + held sender so the event channel + the still-
+    // parked B inner future clean up and the watcher's loop exits.
+    drop(runtime);
+    drop(held_b_tx);
+    let (_starts, ends) = watcher.await.unwrap();
+
+    // 1) The outer call returns Cancelled — A's persistence happens on
+    //    the cancel arm of the Guarded branch in `run_tool_calls`.
+    assert!(
+        matches!(result, Err(AlmsError::Cancelled)),
+        "expected AlmsError::Cancelled, got {:?}",
+        result
+    );
+
+    // 2) Exactly one of the two `ToolEnd` events must report ok=true
+    //    — the real success event for tool A. The other is the synthetic
+    //    cancel event for B (ok=false, `error: "run cancelled"`).
+    let ok_ends: Vec<_> = ends.iter().filter(|(_, ok, _)| *ok).collect();
+    assert_eq!(
+        ok_ends.len(),
+        1,
+        "expected exactly one ok=true ToolEnd (the completed tool A) \
+         and one synthetic cancel ToolEnd for B, got {:?}",
+        ends
+    );
+
+    // 3) The session message log must contain exactly one `Role::Tool`
+    //    row, and that row's `tool_id` must be tool A's id. Pre-#1090
+    //    this row was missing — `process_tool_results` was bypassed by
+    //    the Guarded cancel arm and A's result was silently dropped.
+    let history = session_manager.get_history(session.id).unwrap();
+    let tool_rows: Vec<&alms_session::Message> = history
+        .iter()
+        .filter(|m| matches!(m.role, alms_session::Role::Tool))
+        .collect();
+    assert_eq!(
+        tool_rows.len(),
+        1,
+        "exactly one Tool-role row must be persisted after Guarded cancel \
+         (tool A — the one that completed before the cancel landed); \
+         tool B must NOT be persisted because it was still in-flight \
+         when the cancel arrived. got {} rows: {:?}",
+        tool_rows.len(),
+        tool_rows
+    );
+
+    let persisted_tool_id = match &tool_rows[0].content {
+        alms_session::Content::ToolResult { tool_id, .. } => tool_id.clone(),
+        other => panic!("unexpected Tool-role content shape: {:?}", other),
+    };
+    assert_eq!(
+        persisted_tool_id, "tc-A",
+        "the persisted tool result must be tool A's (the one that \
+         completed), not B. got tool_id={}",
+        persisted_tool_id
+    );
+
+    // 4) The persisted row's metadata must carry `ok: true` for tool A.
+    let meta = tool_rows[0]
+        .metadata
+        .as_ref()
+        .expect("persisted tool result must have metadata");
+    assert_eq!(
+        meta.get("ok").and_then(|v| v.as_bool()),
+        Some(true),
+        "tool A's persisted ok flag must be true — its execute() returned \
+         Ok before the cancel arm fired. metadata={:?}",
+        meta
+    );
+
+    // 5) `tool_call_records` must include a `ToolCallRole::Tool` entry
+    //    for tool A so the gateway's per-run records surface the
+    //    completed tool to the UI / `GET /runs/{id}/tool-calls`.
+    let tool_records: Vec<&alms_core::ToolCallRecord> = tool_call_records
+        .iter()
+        .filter(|r| matches!(r.role, alms_core::ToolCallRole::Tool))
+        .collect();
+    assert_eq!(
+        tool_records.len(),
+        1,
+        "exactly one Tool-role ToolCallRecord must be appended on the \
+         Guarded cancel arm (for tool A). got {} records: {:?}",
+        tool_records.len(),
+        tool_records
+    );
+    assert_eq!(
+        tool_records[0].tool_id.as_deref(),
+        Some("tc-A"),
+        "the per-run record must reference tool A's tool_id"
+    );
+}
+
 /// #846 — No-double-emission regression: a tool that finishes Ok
 /// followed (in real time) by a cancel arrival must not produce two
 /// `ToolEnd` events for the same invocation. The unregister-before-emit

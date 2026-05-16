@@ -694,7 +694,38 @@ impl AgentRuntime {
                 // Cancellation is checked between tools AND races against each
                 // individual tool execution so that long-running tools (e.g. shell
                 // commands) can be interrupted mid-flight.
-                let mut results = Vec::with_capacity(tool_calls.len());
+                //
+                // Cancel arms in this loop (all unwind through the shared
+                // persistence pass below):
+                //
+                // 1. Inter-tool cancel check (`is_cancelled()` before the next
+                //    iteration's tool fires). Reached when cancel landed
+                //    between tools OR when the prior iteration's
+                //    `execute_tool_call` returned `Err(Cancelled)` via its
+                //    internal approval-wait cancel handler (#816). `inflight`
+                //    is empty at this point — the prior iteration either
+                //    completed normally (removed itself) or unwound through
+                //    the approval-wait handler (also removes itself).
+                //
+                // 2. Outer-`select!` cancel-during-tool-execution arm (#846).
+                //    The inner future was dropped mid-await. `inflight`
+                //    still holds the in-flight tool's entry, so
+                //    `synthesize_cancel_tool_ends` synthesises its `ToolEnd`.
+                //
+                // Both arms must persist whatever is already in `results`
+                // before returning `Err(Cancelled)` — bypassing the
+                // `process_tool_results` persistence site silently drops
+                // completed tool results and the next run's rebuild
+                // synthesises `INTERRUPTED_TOOL_RESULT` markers for tools
+                // that actually succeeded. Same shape as the parallel arm
+                // fix in #1078 / #1089. (#1090)
+                let mut results: Vec<AlmsResult<serde_json::Value>> =
+                    Vec::with_capacity(tool_calls.len());
+                // Resolve workspace root once per batch — matches the Ok
+                // path in `process_tool_results` and the parallel-arm
+                // cancel pass in `run_tool_calls_parallel` (Tim's #1089
+                // review suggestion, carried over for #1090).
+                let workspace_root = self.workspace_root_for_truncate();
                 for (tc, &inv_id) in tool_calls.iter().zip(invocation_ids) {
                     if conflicting_tools.contains(&tc.function.name.as_str()) {
                         results.push(Err(AlmsError::ToolExecution(DM_CONFLICT_MSG.to_string())));
@@ -703,29 +734,51 @@ impl AgentRuntime {
                     if let Some(ref token) = self.cancel_token
                         && token.is_cancelled()
                     {
+                        // Branch 1 above. Persist any tools that completed
+                        // earlier in the loop, then unwind. `inflight` is
+                        // empty here, so `synthesize_cancel_tool_ends`
+                        // would be a no-op — we call it anyway for
+                        // structural parity with the parallel arm and as
+                        // defence-in-depth against future code paths that
+                        // could leave dangling entries. (#1090)
+                        self.persist_completed_guarded_results_on_cancel(
+                            tool_calls,
+                            invocation_ids,
+                            results,
+                            tool_call_records,
+                            tool_seq,
+                            session_manager,
+                            session_id,
+                            is_dm,
+                            workspace_root.as_deref(),
+                        );
+                        synthesize_cancel_tool_ends(self.event_sender.as_ref(), &inflight);
                         return Err(AlmsError::Cancelled);
                     }
                     let result = if let Some(ref token) = self.cancel_token {
                         tokio::select! {
                             r = self.execute_tool_call(tc, inv_id, session_manager, session_id, Some(&inflight)) => r,
                             _ = token.cancelled() => {
-                                // Cancel-during-tool-execution (#846): the
-                                // inner future was dropped at an await point
-                                // inside `execute_tool_call`. Emit synthetic
-                                // `ToolEnd` events for any tool that had
-                                // already fired `ToolStart`, then unwind.
-                                //
-                                // NOTE (#1078, follow-up #1090): the Guarded
-                                // sequential arm has the same silent-data-loss
-                                // shape as the FullControl parallel arm — any
-                                // tool that completed earlier in this loop is
-                                // in the `results` vec but not yet persisted.
-                                // The parallel arm is the only one fixed here
-                                // because the issue scoped to parallel
-                                // batches; the Guarded arm fix is tracked
-                                // separately in #1090 because the approval-
-                                // wait cancel branch has different timing
-                                // semantics that need separate analysis.
+                                // Branch 2 above. Cancel-during-tool-
+                                // execution (#846): the inner future was
+                                // dropped at an await point inside
+                                // `execute_tool_call`. Persist whatever
+                                // completed before this point, then
+                                // synthesise `ToolEnd`s for the in-flight
+                                // subset before unwinding. Persistence
+                                // runs BEFORE synthesis so the on-disk
+                                // ordering matches the Ok path. (#1090)
+                                self.persist_completed_guarded_results_on_cancel(
+                                    tool_calls,
+                                    invocation_ids,
+                                    results,
+                                    tool_call_records,
+                                    tool_seq,
+                                    session_manager,
+                                    session_id,
+                                    is_dm,
+                                    workspace_root.as_deref(),
+                                );
                                 synthesize_cancel_tool_ends(self.event_sender.as_ref(), &inflight);
                                 return Err(AlmsError::Cancelled);
                             }
@@ -1259,6 +1312,53 @@ impl AgentRuntime {
         *tool_seq += 1;
 
         content
+    }
+
+    /// Persist the subset of `results` accumulated by the Guarded
+    /// sequential arm of `run_tool_calls` before unwinding on cancel.
+    ///
+    /// `results` is a positional vec: `results[i]` holds the outcome of
+    /// `tool_calls[i]`. Conflicting tools and tools that ran to
+    /// completion (Ok or tool-execution Err) are persisted via
+    /// [`persist_one_tool_result`] in `tool_calls` order so the on-disk
+    /// `tool_seq` numbering matches the Ok path.
+    ///
+    /// `Err(AlmsError::Cancelled)` entries are skipped: those represent
+    /// approval-wait cancellation inside `execute_tool_call` (#816) — the
+    /// tool body never ran, no real result exists, and the next run's
+    /// rebuild correctly synthesises `INTERRUPTED_TOOL_RESULT` for the
+    /// orphan `tool_use` block. Persisting a fabricated "Error: Cancelled"
+    /// row would mask that and feed the model a misleading "this tool
+    /// errored" signal for work that genuinely never started. (#1090)
+    #[allow(clippy::too_many_arguments)] // Mirrors `persist_one_tool_result`; same rationale.
+    fn persist_completed_guarded_results_on_cancel(
+        &self,
+        tool_calls: &[ToolCall],
+        invocation_ids: &[Uuid],
+        results: Vec<AlmsResult<serde_json::Value>>,
+        tool_call_records: &mut Vec<alms_core::ToolCallRecord>,
+        tool_seq: &mut u32,
+        session_manager: &SessionManager,
+        session_id: alms_core::SessionId,
+        is_dm: bool,
+        workspace_root: Option<&std::path::Path>,
+    ) {
+        for (i, res) in results.into_iter().enumerate() {
+            if matches!(res, Err(AlmsError::Cancelled)) {
+                continue;
+            }
+            let _ = self.persist_one_tool_result(
+                &tool_calls[i],
+                res,
+                invocation_ids[i],
+                tool_call_records,
+                tool_seq,
+                session_manager,
+                session_id,
+                is_dm,
+                workspace_root,
+            );
+        }
     }
 
     /// Resolve the workspace root for spill-path relativisation.
