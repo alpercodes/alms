@@ -172,9 +172,18 @@ fn finalize_content_and_reasoning(
     }
 
     // [Thinking]-only turn (reasoning model hit max_tokens before
-    // emitting visible content). Promote so the run still has an answer.
+    // emitting visible content). Promote so the run still has an answer
+    // for the UI to display and for `mark_run_as_completed` to persist,
+    // but ALSO keep the same trace on the reasoning sideband. The dual
+    // surface is what `RunOutput` carries upstream so the gateway can
+    // detect this case (response == reasoning) and skip feeding the
+    // trace into the episodic summarizer (#1098). Without the sideband
+    // copy, the gateway has no way to distinguish "the agent's visible
+    // answer happens to look like reasoning" from "the agent emitted
+    // reasoning as a stand-in answer" — and the summarizer would
+    // faithfully ingest the trace, polluting `session_summaries.summary`.
     info!("Streaming: content empty, falling back to reasoning_content");
-    (Some(reasoning_content), None)
+    (Some(reasoning_content.clone()), Some(reasoning_content))
 }
 
 impl AgentRuntime {
@@ -2190,13 +2199,20 @@ mod finalize_content_tests {
 
     /// `[Thinking]`-only turn (reasoning model exhausted max_tokens before
     /// emitting visible output): reasoning is promoted into `content` so
-    /// the run still has something to surface.
+    /// the run still has something to surface, AND the same trace is kept
+    /// on the reasoning sideband so the gateway can detect this case (per
+    /// #1098 — the dual surface is the signal that lets the episodic
+    /// summarizer drop the response and avoid ingesting reasoning text).
     #[test]
     fn thinking_only_promotes_reasoning_into_content() {
         let (content, reasoning) =
             finalize_content_and_reasoning(String::new(), "long deliberation".to_string(), false);
         assert_eq!(content.as_deref(), Some("long deliberation"));
-        assert!(reasoning.is_none());
+        assert_eq!(
+            reasoning.as_deref(),
+            Some("long deliberation"),
+            "fallback must also surface reasoning on the sideband so the gateway can identify reasoning-as-response (#1098)"
+        );
     }
 
     /// `[Thinking, ToolUse]` with empty visible text (#776 regression):

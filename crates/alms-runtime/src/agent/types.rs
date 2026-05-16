@@ -228,4 +228,29 @@ pub struct RunOutput {
     pub usage: alms_core::TokenUsage,
     /// Tool call records collected during this run (calls + results).
     pub tool_calls: Vec<alms_core::ToolCallRecord>,
+    /// Extended-thinking trace from the final LLM turn, surfaced verbatim
+    /// from [`crate::agent::loop_impl::AgentLoopOutput::reasoning`].
+    ///
+    /// Carried out of the runtime so the gateway can:
+    /// - Persist it as `reasoning_blocks` metadata on the assistant message
+    ///   (already handled inside `finish_run`).
+    /// - Strip it from any text passed to the episodic-summary generator
+    ///   so the summarizer never ingests reasoning content (#1098).
+    ///
+    /// `Some(s)` when the model emitted any thinking deltas on the final
+    /// turn; `None` otherwise. In the `[Thinking]`-only reasoning-promotion
+    /// fallback (see `finalize_content_and_reasoning`), this field holds
+    /// the same string as `response` — that's the signal the summarizer
+    /// path uses to drop the response when computing the summary input.
+    ///
+    /// **Why `Option<String>` and not `Option<()>` / `bool`:** the equal-string
+    /// reasoning-promotion case alone could be signalled with a flag, but
+    /// `strip_reasoning_from_output` in `crates/alms-runtime/src/episodic.rs`
+    /// also runs a `starts_with` prefix-match branch as defense-in-depth
+    /// against a hypothetical future provider regression that concatenates
+    /// reasoning + visible content on a single channel. That branch needs
+    /// the actual trace text to subtract; a boolean would not be enough.
+    /// Do not "simplify" this to a flag without removing the prefix-match
+    /// branch first.
+    pub reasoning: Option<String>,
 }

@@ -1980,6 +1980,15 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
             // metadata — perspective mapping to `Role::Assistant` only
             // happens at context assembly time.  So we match on
             // `from_agent` + `message_type == "dm"` instead of role.
+            //
+            // Interaction with the #1098 reasoning strip below: when the DM
+            // branch fires it replaces `output.response` with the last
+            // outbound DM message text — a string that by construction
+            // cannot equal or be a prefix of the run's reasoning trace
+            // (it's pulled from a tool-emitted user message, not from the
+            // final LLM turn). So `strip_reasoning_from_output` is a
+            // guaranteed no-op on the DM branch and the rewrite is
+            // safe regardless of `output.reasoning`'s value.
             let run_output_for_summary = run_input_for_summary.as_ref().map(|_| {
                 if context_id.starts_with("dm:")
                     && let Some(ref name) = agent_name
@@ -2005,6 +2014,19 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
                 // Non-DM runs or fallback when no outbound message was found.
                 output.response.clone()
             });
+
+            // #1098: capture the extended-thinking trace from the final
+            // LLM turn so the summarizer path can strip it from the
+            // assistant output before feeding it to the heuristic /
+            // summarizer LLM. In the `[Thinking]`-only reasoning-promotion
+            // fallback (`finalize_content_and_reasoning`), `output.response`
+            // IS the reasoning trace; we need the sideband copy so the
+            // summarizer can identify and drop it. In normal `[Thinking,
+            // Text]` turns the visible response and the reasoning are
+            // distinct strings and the summarizer's prefix-strip is a
+            // no-op — so threading reasoning through is safe in both
+            // cases.
+            let run_reasoning_for_summary = output.reasoning.clone();
 
             // #927 (extends #895): flip the run state to `Completed`
             // BEFORE broadcasting `run_finished`. Pre-fix, a concurrent
@@ -2091,6 +2113,7 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
                         run_id,
                         run_input,
                         run_output,
+                        run_reasoning: run_reasoning_for_summary,
                         context_id: ctx_id,
                         summary_model: summary_model_resolved.clone(),
                         agent_name: agent_name_for_summary.clone(),

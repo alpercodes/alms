@@ -1071,6 +1071,7 @@ impl AgentRuntime {
                     response,
                     usage,
                     tool_calls,
+                    reasoning,
                 })
             }
             Err(AlmsError::Cancelled) => {

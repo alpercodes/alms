@@ -68,6 +68,16 @@ pub struct SummaryParams {
     pub run_id: RunId,
     pub run_input: String,
     pub run_output: String,
+    /// Extended-thinking trace from the final LLM turn, if any.
+    ///
+    /// Stripped from `run_output` before either summarizer mode ingests
+    /// it (#1098). In the `[Thinking]`-only reasoning-promotion fallback
+    /// the runtime surfaces the reasoning trace on BOTH `RunOutput.response`
+    /// (so the UI has something to display) AND `RunOutput.reasoning`
+    /// (so this strip path can drop it). Without this, the summarizer
+    /// would faithfully reproduce the entire thinking trace as the
+    /// session summary — see issue #1098.
+    pub run_reasoning: Option<String>,
     pub context_id: String,
     /// Existing summary for this session (if any), loaded from the DB.
     pub existing_summary: Option<String>,
@@ -78,6 +88,55 @@ pub struct SummaryParams {
     /// Maximum output tokens for the LLM summarizer call.
     /// The gateway always provides this from [`ContextConfig::summary_max_tokens`].
     pub summary_max_tokens: u32,
+}
+
+/// Strip the agent's extended-thinking trace from `run_output` before it is
+/// passed to either summarizer mode (#1098).
+///
+/// **Why:** when the runtime emits a `[Thinking]`-only turn (reasoning model
+/// hit `max_tokens` before producing visible output), the trace is promoted
+/// into `RunOutput.response` so the run still has something to display —
+/// but the same string is ALSO surfaced on `RunOutput.reasoning` precisely
+/// so this strip path can identify and drop it. Without the strip the
+/// summarizer would treat the reasoning trace as the agent's "response"
+/// and faithfully reproduce it in the session summary, polluting
+/// `session_summaries.summary` with multi-paragraph internal deliberation.
+///
+/// **Behavior:**
+///
+/// - `run_reasoning = None` or empty → return `run_output` unchanged
+///   (the common `[Text]` or `[Thinking, Text]` case).
+/// - `run_output` equals `run_reasoning` → return `""` (the reasoning-
+///   promotion fallback case from `finalize_content_and_reasoning`).
+/// - `run_output` starts with the reasoning trace → strip the prefix.
+///   This is **defense-in-depth, not exercised by any current provider**:
+///   it covers a hypothetical future regression where a provider adapter
+///   concatenates `reasoning_content` and `content` instead of keeping
+///   them on separate channels. No regression test reproduces this case
+///   in production today; the branch is here precisely because the cost
+///   of carrying it is negligible and the cost of summary pollution from
+///   a silent provider-side change is not.
+/// - Otherwise → return `run_output` unchanged.
+///
+/// The function is intentionally conservative: it never strips arbitrary
+/// substrings, only exact-equal or prefix matches against the known
+/// reasoning trace. False positives would silently drop legitimate
+/// response text from the summary, which is worse than a too-long
+/// summary.
+fn strip_reasoning_from_output(run_output: &str, run_reasoning: Option<&str>) -> String {
+    let Some(reasoning) = run_reasoning else {
+        return run_output.to_string();
+    };
+    if reasoning.is_empty() {
+        return run_output.to_string();
+    }
+    if run_output == reasoning {
+        return String::new();
+    }
+    if let Some(stripped) = run_output.strip_prefix(reasoning) {
+        return stripped.trim_start().to_string();
+    }
+    run_output.to_string()
 }
 
 /// Generate or update a session summary.
@@ -161,6 +220,9 @@ pub struct PersistSummaryRequest {
     pub run_id: RunId,
     pub run_input: String,
     pub run_output: String,
+    /// Extended-thinking trace from the final LLM turn, if any.  Stripped
+    /// from `run_output` before the summarizer ingests it (#1098).
+    pub run_reasoning: Option<String>,
     pub context_id: String,
     pub summary_model: Option<String>,
     /// Agent name — used to derive the peer in DM sessions.
@@ -229,6 +291,7 @@ pub async fn generate_and_persist_summary(
         run_id: req.run_id,
         run_input: req.run_input,
         run_output: req.run_output,
+        run_reasoning: req.run_reasoning,
         context_id: req.context_id.clone(),
         existing_summary,
         summary_model: req.summary_model,
@@ -310,6 +373,12 @@ fn generate_heuristic(params: &SummaryParams) -> Option<String> {
     // None for excluded session types, triggering early return via `?`).
     let _source = derive_source_label(&params.context_id, &params.agent_name)?;
 
+    // #1098: strip the extended-thinking trace from the run output so
+    // the heuristic summary never quotes reasoning content. See
+    // `strip_reasoning_from_output` for the matching rules.
+    let sanitized_output =
+        strip_reasoning_from_output(&params.run_output, params.run_reasoning.as_deref());
+
     // Build the new entry line.
     let in_snippet = truncate_to_char_boundary(&params.run_input, HEURISTIC_INPUT_BYTES);
     let in_ellipsis = if params.run_input.len() > in_snippet.len() {
@@ -319,9 +388,9 @@ fn generate_heuristic(params: &SummaryParams) -> Option<String> {
     };
 
     // Include the agent's response when available (#434, Bug 2).
-    let entry = if !params.run_output.is_empty() {
-        let out_snippet = truncate_to_char_boundary(&params.run_output, HEURISTIC_OUTPUT_BYTES);
-        let out_ellipsis = if params.run_output.len() > out_snippet.len() {
+    let entry = if !sanitized_output.is_empty() {
+        let out_snippet = truncate_to_char_boundary(&sanitized_output, HEURISTIC_OUTPUT_BYTES);
+        let out_ellipsis = if sanitized_output.len() > out_snippet.len() {
             "..."
         } else {
             ""
@@ -383,7 +452,16 @@ fn extract_dm_peer(context_id: &str, agent_name: &str) -> Option<String> {
 
 /// Generate a summary via a lightweight LLM call.
 async fn generate_llm(llm: &LlmClient, params: &SummaryParams) -> Option<String> {
-    if params.run_input.is_empty() && params.run_output.is_empty() {
+    // #1098: strip the extended-thinking trace from the run output before
+    // anything else so the summarizer LLM never sees reasoning content as
+    // "agent response". The strip happens up front so the early-return
+    // emptiness check below evaluates against the sanitized output and a
+    // reasoning-only run produces no summary (instead of an LLM-rephrased
+    // reasoning dump).
+    let sanitized_output =
+        strip_reasoning_from_output(&params.run_output, params.run_reasoning.as_deref());
+
+    if params.run_input.is_empty() && sanitized_output.is_empty() {
         return None;
     }
 
@@ -429,15 +507,17 @@ async fn generate_llm(llm: &LlmClient, params: &SummaryParams) -> Option<String>
 
     // Truncated run output.
     // For DM sessions, label with this agent's name instead of "Agent".
-    if !params.run_output.is_empty() {
-        let output_snippet = truncate_to_char_boundary(&params.run_output, LLM_CONTEXT_BYTES);
+    // #1098: use the sanitized output (with reasoning stripped) so the
+    // summarizer LLM never quotes thinking traces.
+    if !sanitized_output.is_empty() {
+        let output_snippet = truncate_to_char_boundary(&sanitized_output, LLM_CONTEXT_BYTES);
         let output_label = match &dm_peer {
             Some(_) => format!("{}'s response", params.agent_name),
             None => "Agent response".to_string(),
         };
         user_content.push_str(&format!("\n\n{output_label}:\n"));
         user_content.push_str(output_snippet);
-        if params.run_output.len() > output_snippet.len() {
+        if sanitized_output.len() > output_snippet.len() {
             user_content.push_str("\n[...truncated]");
         }
     }
@@ -639,6 +719,7 @@ mod tests {
             run_id: RunId::new(),
             run_input: input.to_string(),
             run_output: "Some output".to_string(),
+            run_reasoning: None,
             context_id: context_id.to_string(),
             existing_summary: existing.map(|s| s.to_string()),
             summary_model: None,
@@ -808,6 +889,231 @@ mod tests {
         );
     }
 
+    // -- #1098 reasoning-strip regression -----------------------------------
+    //
+    // These tests validate the fix for issue #1098: the episodic summarizer
+    // must NOT ingest extended-thinking traces emitted by reasoning models.
+    //
+    // The leak path: when the runtime takes the `[Thinking]`-only fallback
+    // in `finalize_content_and_reasoning` (reasoning model exhausted
+    // `max_tokens` before producing visible output), the entire reasoning
+    // trace is promoted into `RunOutput.response`. Pre-fix that string
+    // would flow to `run_output` and the summarizer (both heuristic and
+    // LLM modes) would faithfully quote / paraphrase the reasoning into
+    // `session_summaries.summary`. Post-fix the runtime ALSO surfaces
+    // the same trace on `RunOutput.reasoning`, the gateway threads it
+    // through as `SummaryParams.run_reasoning`, and `strip_reasoning_from_output`
+    // drops it before either summarizer mode sees it.
+
+    /// Pure-function unit tests for the strip helper.  Walks every branch.
+    #[test]
+    fn test_strip_reasoning_none_passes_through() {
+        assert_eq!(
+            strip_reasoning_from_output("plain response", None),
+            "plain response"
+        );
+    }
+
+    #[test]
+    fn test_strip_reasoning_empty_passes_through() {
+        // Empty reasoning means the final turn had no thinking deltas.
+        assert_eq!(
+            strip_reasoning_from_output("plain response", Some("")),
+            "plain response"
+        );
+    }
+
+    #[test]
+    fn test_strip_reasoning_exact_match_returns_empty() {
+        // The `[Thinking]`-only fallback case: response IS the reasoning.
+        let trace = "Let me reason about this. Step 1... step 2... step 3...";
+        assert_eq!(strip_reasoning_from_output(trace, Some(trace)), "");
+    }
+
+    #[test]
+    fn test_strip_reasoning_prefix_match_strips_prefix() {
+        // Defense-in-depth: if a future provider regression concatenates
+        // reasoning + visible content into one string, strip the prefix.
+        let response = "Let me think step by step. Final answer is 42.";
+        let reasoning = "Let me think step by step.";
+        assert_eq!(
+            strip_reasoning_from_output(response, Some(reasoning)),
+            "Final answer is 42."
+        );
+    }
+
+    #[test]
+    fn test_strip_reasoning_non_prefix_passes_through() {
+        // Conservative: don't strip arbitrary substrings.
+        assert_eq!(
+            strip_reasoning_from_output(
+                "The final answer is 42.",
+                Some("internal thinking about the problem"),
+            ),
+            "The final answer is 42."
+        );
+    }
+
+    /// Heuristic regression: pre-fix, an assistant turn that fell back to
+    /// reasoning-as-response would put the whole reasoning trace in the
+    /// heuristic summary. Post-fix the heuristic shows the input only.
+    #[test]
+    fn test_heuristic_strips_reasoning_when_response_is_reasoning_fallback() {
+        // Simulate `RunOutput` from the `[Thinking]`-only fallback path:
+        // both response and reasoning carry the same trace.
+        let reasoning_trace = "I need to think carefully. The user is asking \
+            for X. Let me consider Y. Actually wait, maybe Z. \
+            Hmm, let me reconsider — yes, Z is correct because...";
+        let mut params = heuristic_params("What's the answer to my question?", "web-chat-1", None);
+        params.run_output = reasoning_trace.to_string();
+        params.run_reasoning = Some(reasoning_trace.to_string());
+
+        let result = generate_heuristic(&params).expect("should produce a summary");
+
+        assert!(
+            !result.contains("think carefully"),
+            "Heuristic summary must not include reasoning trace text, got: {result}"
+        );
+        assert!(
+            !result.contains("reconsider"),
+            "Heuristic summary must not include reasoning trace text, got: {result}"
+        );
+        // Input is still summarized — only the reasoning-as-output is dropped.
+        assert!(
+            result.contains("What's the answer to my question?"),
+            "Heuristic summary must still include the user input, got: {result}"
+        );
+        // Output side should be empty (no `->` separator).
+        assert!(
+            !result.contains("->"),
+            "Heuristic summary must not include an output arrow when response is reasoning, got: {result}"
+        );
+    }
+
+    /// Heuristic happy path: `[Thinking, Text]` turns where response and
+    /// reasoning differ — the strip must NOT remove legitimate response text.
+    #[test]
+    fn test_heuristic_preserves_response_when_reasoning_is_distinct() {
+        let mut params = heuristic_params("How do I configure CORS?", "web-chat-1", None);
+        params.run_output = "Set the Access-Control-Allow-Origin header.".to_string();
+        params.run_reasoning = Some("The user wants CORS help. CORS is about cross-origin requests. The header is the right answer.".to_string());
+
+        let result = generate_heuristic(&params).expect("should produce a summary");
+
+        assert!(
+            result.contains("Set the Access-Control-Allow-Origin header"),
+            "Heuristic must preserve legitimate response, got: {result}"
+        );
+        // The reasoning text must not leak in.
+        assert!(
+            !result.contains("cross-origin requests"),
+            "Reasoning content must not leak into the heuristic summary, got: {result}"
+        );
+    }
+
+    /// LLM-mode regression: pre-fix, when the runtime emits a `[Thinking]`-
+    /// only fallback the summarizer LLM would see the reasoning trace as
+    /// the "Agent response" and faithfully paraphrase it. Post-fix the
+    /// summarizer prompt omits the response section entirely.
+    #[tokio::test]
+    async fn test_llm_summary_strips_reasoning_when_response_is_reasoning_fallback() {
+        let llm = LlmClient::new(crate::llm_types::LlmConfig {
+            mock: true,
+            ..Default::default()
+        })
+        .unwrap();
+        let reasoning_trace = "Let me think... I'll consider option A vs B vs C. Going with B.";
+        let params = SummaryParams {
+            mode: RunSummaryMode::Llm,
+            agent_id: AgentId::new(),
+            session_id: SessionId::new(),
+            run_id: RunId::new(),
+            run_input: "Pick an option for me".into(),
+            run_output: reasoning_trace.to_string(),
+            run_reasoning: Some(reasoning_trace.to_string()),
+            context_id: "web-chat-1".into(),
+            existing_summary: None,
+            summary_model: None,
+            agent_name: "myagent".into(),
+            summary_max_tokens: 1000,
+        };
+        // The mock LLM echoes back the user_content sent to it. After the
+        // strip the user_content should not contain the reasoning trace
+        // (no "Agent response" section).
+        let result = generate_session_summary(&llm, &params).await;
+        let summary = result.expect("should produce a summary");
+        // The mock prefixes with "[mock] " and returns the assembled user
+        // content verbatim. If the strip did its job, the assembled
+        // content has only the input section, no output section, and
+        // therefore no reasoning text.
+        assert!(
+            !summary.contains("option A vs B vs C"),
+            "LLM summary must not quote reasoning trace, got: {summary}"
+        );
+        assert!(
+            !summary.contains("Agent response"),
+            "LLM summarizer must not emit an Agent response section when response is reasoning, got: {summary}"
+        );
+        // The user input section should still be present.
+        assert!(
+            summary.contains("User input"),
+            "LLM summarizer must still include the user input section, got: {summary}"
+        );
+    }
+
+    /// LLM-mode happy path: distinct response and reasoning — the response
+    /// must reach the summarizer.
+    #[tokio::test]
+    async fn test_llm_summary_preserves_response_when_reasoning_is_distinct() {
+        let llm = LlmClient::new(crate::llm_types::LlmConfig {
+            mock: true,
+            ..Default::default()
+        })
+        .unwrap();
+        let params = SummaryParams {
+            mode: RunSummaryMode::Llm,
+            agent_id: AgentId::new(),
+            session_id: SessionId::new(),
+            run_id: RunId::new(),
+            run_input: "How do I configure CORS?".into(),
+            run_output: "Set the Access-Control-Allow-Origin header.".into(),
+            run_reasoning: Some(
+                "Thinking about CORS — it's about cross-origin requests.".to_string(),
+            ),
+            context_id: "web-chat-1".into(),
+            existing_summary: None,
+            summary_model: None,
+            agent_name: "myagent".into(),
+            summary_max_tokens: 1000,
+        };
+        let summary = generate_session_summary(&llm, &params)
+            .await
+            .expect("should produce a summary");
+        // The legitimate response must reach the summarizer (and the mock
+        // echoes it back).
+        assert!(
+            summary.contains("Set the Access-Control-Allow-Origin header"),
+            "LLM summary must preserve legitimate response, got: {summary}"
+        );
+        // The reasoning text must not leak in.
+        assert!(
+            !summary.contains("cross-origin requests"),
+            "Reasoning content must not leak into the LLM summary, got: {summary}"
+        );
+    }
+
+    /// Heuristic: empty input + reasoning-as-output should produce nothing.
+    /// Pre-fix the heuristic would happily quote the reasoning trace; post-fix
+    /// the run_input check fires first (heuristic returns None on empty
+    /// input) — verify the strip is order-safe.
+    #[test]
+    fn test_heuristic_empty_input_with_reasoning_fallback_returns_none() {
+        let mut params = heuristic_params("", "web-chat-1", None);
+        params.run_output = "internal reasoning trace".to_string();
+        params.run_reasoning = Some("internal reasoning trace".to_string());
+        assert!(generate_heuristic(&params).is_none());
+    }
+
     // -- trim_oldest_lines --------------------------------------------------
 
     #[test]
@@ -851,6 +1157,7 @@ mod tests {
             run_id: RunId::new(),
             run_input: "hello".into(),
             run_output: "world".into(),
+            run_reasoning: None,
             context_id: "web-chat-1".into(),
             existing_summary: None,
             summary_model: None,
@@ -874,6 +1181,7 @@ mod tests {
             run_id: RunId::new(),
             run_input: "How do I set up CORS?".into(),
             run_output: "You need to configure headers...".into(),
+            run_reasoning: None,
             context_id: "web-chat-1".into(),
             existing_summary: None,
             summary_model: None,
@@ -902,6 +1210,7 @@ mod tests {
             run_id: RunId::new(),
             run_input: "Help me debug this error".into(),
             run_output: "The issue is in your config file".into(),
+            run_reasoning: None,
             context_id: "web-chat-1".into(),
             existing_summary: None,
             summary_model: None,
@@ -928,6 +1237,7 @@ mod tests {
             run_id: RunId::new(),
             run_input: "Follow-up question about CORS".into(),
             run_output: "Added the header, should work now".into(),
+            run_reasoning: None,
             context_id: "web-chat-1".into(),
             existing_summary: Some("Debugged CORS issue in gateway.rs.".into()),
             summary_model: None,
@@ -956,6 +1266,7 @@ mod tests {
                 run_id: RunId::new(),
                 run_input: "hello".into(),
                 run_output: "world".into(),
+                run_reasoning: None,
                 context_id: ctx.to_string(),
                 existing_summary: None,
                 summary_model: None,
@@ -983,6 +1294,7 @@ mod tests {
             run_id: RunId::new(),
             run_input: "hello from DM".into(),
             run_output: "hi back".into(),
+            run_reasoning: None,
             context_id: "dm:alice:bob".into(),
             existing_summary: None,
             summary_model: None,
@@ -1012,6 +1324,7 @@ mod tests {
             run_id: RunId::new(),
             run_input: "How do I configure CORS?".into(),
             run_output: "Set Access-Control-Allow-Origin.".into(),
+            run_reasoning: None,
             context_id: "web-chat-1".into(),
             existing_summary: None,
             summary_model: None,
@@ -1041,6 +1354,7 @@ mod tests {
             run_id: RunId::new(),
             run_input: "Help me debug this error".into(),
             run_output: "The issue is in your config file.".into(),
+            run_reasoning: None,
             context_id: "web-chat-1".into(),
             existing_summary: None,
             summary_model: None,
@@ -1070,6 +1384,7 @@ mod tests {
             run_id: RunId::new(),
             run_input: "anything".into(),
             run_output: "anything".into(),
+            run_reasoning: None,
             context_id: "web-chat-1".into(),
             existing_summary: None,
             summary_model: None,
@@ -1094,6 +1409,7 @@ mod tests {
             run_id: RunId::new(),
             run_input: "hello".into(),
             run_output: "world".into(),
+            run_reasoning: None,
             // Subagent context is excluded by derive_source_label, so the
             // heuristic returns None.
             context_id: "subagent_task_1".into(),
@@ -1125,6 +1441,7 @@ mod tests {
             run_id: RunId::new(),
             run_input: "Follow-up question after a failure".into(),
             run_output: "Some new response".into(),
+            run_reasoning: None,
             context_id: "web-chat-1".into(),
             existing_summary: Some(existing.clone()),
             summary_model: None,
