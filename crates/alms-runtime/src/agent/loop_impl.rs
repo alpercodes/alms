@@ -388,6 +388,14 @@ impl AgentRuntime {
                 }
 
                 // Execute tools with posture-aware concurrency and cancellation.
+                //
+                // `tool_call_records` and `tool_seq` are passed mutably so
+                // the cancel arm of the parallel branch can persist any
+                // tools that finished before the cancel landed (#1078) —
+                // without this, already-emitted `tool_end` SSE events and
+                // audit-`Allow` rows have no matching `Tool`-role row on
+                // disk, and the next run's rebuild synthesises a bogus
+                // `INTERRUPTED_TOOL_RESULT` for the completed tools.
                 let results = match self
                     .run_tool_calls(
                         &tool_calls,
@@ -395,6 +403,9 @@ impl AgentRuntime {
                         dm_check.conflicting_tools,
                         session_manager,
                         session_id,
+                        is_dm,
+                        &mut tool_call_records,
+                        &mut tool_seq,
                     )
                     .await
                 {
@@ -637,13 +648,30 @@ impl AgentRuntime {
     /// - **Guarded**: runs tools sequentially so the user sees one approval
     ///   prompt at a time. Cancellation is checked between each tool.
     /// - **FullControl / Autonomous**: runs non-conflicting tools concurrently
-    ///   via `join_all`. Cancellation races against the entire batch.
+    ///   via [`FuturesUnordered`]. Cancellation races against the entire
+    ///   batch.
     ///
     /// Conflicting tools (from DM conflict detection) receive error results
     /// instead of executing.
     ///
+    /// On the cancel arm of the parallel branch, any tool that *had already
+    /// completed* by the time the cancel landed has its result persisted to
+    /// the session message log and added to `tool_call_records` before
+    /// `Err(AlmsError::Cancelled)` propagates — closes the silent-data-loss
+    /// gap from #1078 where already-emitted `tool_end` SSE events and audit-
+    /// `Allow` rows had no matching `Tool`-role row on disk. The next run's
+    /// rebuild now sees real results for the completed subset and only
+    /// synthesises `INTERRUPTED_TOOL_RESULT` markers for tools that were
+    /// genuinely still in-flight when the cancel arrived.
+    ///
+    /// `tool_call_records` and `tool_seq` are mutable so the cancel-arm
+    /// persistence can append in the same shape as `process_tool_results`
+    /// does on the Ok path. `is_dm` flips the persisted message role to
+    /// `Role::User` for DM sessions (preserves the DM invariant).
+    ///
     /// Returns `Err(AlmsError::Cancelled)` if the run is cancelled during
     /// execution; otherwise returns the result vector in tool_calls order.
+    #[allow(clippy::too_many_arguments)] // Private helper; the extra params (#1078) carry the persistence cursor through to the cancel arm without introducing a wrapper struct.
     pub(crate) async fn run_tool_calls(
         &self,
         tool_calls: &[ToolCall],
@@ -651,6 +679,9 @@ impl AgentRuntime {
         conflicting_tools: &[&str],
         session_manager: &SessionManager,
         session_id: alms_core::SessionId,
+        is_dm: bool,
+        tool_call_records: &mut Vec<alms_core::ToolCallRecord>,
+        tool_seq: &mut u32,
     ) -> AlmsResult<Vec<AlmsResult<serde_json::Value>>> {
         // Tracker for in-flight tool calls (#846). Shared with each
         // `execute_tool_call` invocation so the outer cancel arms below can
@@ -683,6 +714,18 @@ impl AgentRuntime {
                                 // inside `execute_tool_call`. Emit synthetic
                                 // `ToolEnd` events for any tool that had
                                 // already fired `ToolStart`, then unwind.
+                                //
+                                // NOTE (#1078, follow-up #1090): the Guarded
+                                // sequential arm has the same silent-data-loss
+                                // shape as the FullControl parallel arm — any
+                                // tool that completed earlier in this loop is
+                                // in the `results` vec but not yet persisted.
+                                // The parallel arm is the only one fixed here
+                                // because the issue scoped to parallel
+                                // batches; the Guarded arm fix is tracked
+                                // separately in #1090 because the approval-
+                                // wait cancel branch has different timing
+                                // semantics that need separate analysis.
                                 synthesize_cancel_tool_ends(self.event_sender.as_ref(), &inflight);
                                 return Err(AlmsError::Cancelled);
                             }
@@ -696,84 +739,197 @@ impl AgentRuntime {
                 Ok(results)
             }
             Posture::FullControl | Posture::Autonomous => {
-                // Indices of non-conflicting tools to execute.
-                let exec_indices: Vec<usize> = tool_calls
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, tc)| !conflicting_tools.contains(&tc.function.name.as_str()))
-                    .map(|(i, _)| i)
-                    .collect();
+                self.run_tool_calls_parallel(
+                    tool_calls,
+                    invocation_ids,
+                    conflicting_tools,
+                    session_manager,
+                    session_id,
+                    is_dm,
+                    tool_call_records,
+                    tool_seq,
+                    &inflight,
+                )
+                .await
+            }
+        }
+    }
 
-                // Execute non-conflicting tools concurrently.
-                let exec_results = if exec_indices.is_empty() {
-                    Vec::new()
-                } else {
-                    let exec_futures = exec_indices.iter().map(|&i| {
-                        self.execute_tool_call(
-                            &tool_calls[i],
-                            invocation_ids[i],
-                            session_manager,
-                            session_id,
-                            Some(&inflight),
-                        )
-                    });
-                    if let Some(ref token) = self.cancel_token {
-                        tokio::select! {
-                            r = futures::future::join_all(exec_futures) => r,
-                            _ = token.cancelled() => {
-                                // Cancel-during-tool-execution (#846): up to
-                                // N inner futures were running concurrently
-                                // when the cancel arm won — each one needs a
-                                // synthetic `ToolEnd` to match its already-
-                                // emitted `ToolStart`. Tools that finished
-                                // before the cancel raced through have
-                                // already removed themselves from the
-                                // tracker, so this only synthesises for
-                                // genuinely in-flight calls.
-                                synthesize_cancel_tool_ends(self.event_sender.as_ref(), &inflight);
-                                return Err(AlmsError::Cancelled);
-                            }
-                        }
-                    } else {
-                        futures::future::join_all(exec_futures).await
+    /// Parallel arm of `run_tool_calls` for `Posture::FullControl` and
+    /// `Posture::Autonomous`. Split out so the cancel-arm bookkeeping
+    /// (collecting completed results, persisting them before returning
+    /// `Err(Cancelled)`) stays readable. (#1078)
+    ///
+    /// Uses [`FuturesUnordered`] rather than `futures::future::join_all`
+    /// because we need to preserve results as they complete — `join_all`
+    /// buffers them inside the `JoinAll` future, which is dropped when the
+    /// outer `select!` cancel arm wins, taking already-completed results
+    /// down with it. With `FuturesUnordered` we push each
+    /// `(slot, result)` pair into an outer `completed_results` vec the
+    /// moment the inner future finishes; if the cancel arm then wins, the
+    /// vec still holds every result the runtime had observed up to that
+    /// point.
+    #[allow(clippy::too_many_arguments)] // Private helper; the params mirror `run_tool_calls`.
+    async fn run_tool_calls_parallel(
+        &self,
+        tool_calls: &[ToolCall],
+        invocation_ids: &[Uuid],
+        conflicting_tools: &[&str],
+        session_manager: &SessionManager,
+        session_id: alms_core::SessionId,
+        is_dm: bool,
+        tool_call_records: &mut Vec<alms_core::ToolCallRecord>,
+        tool_seq: &mut u32,
+        inflight: &InflightTracker,
+    ) -> AlmsResult<Vec<AlmsResult<serde_json::Value>>> {
+        use futures::stream::{FuturesUnordered, StreamExt};
+
+        // Indices (into `tool_calls`) of non-conflicting tools to execute.
+        let exec_indices: Vec<usize> = tool_calls
+            .iter()
+            .enumerate()
+            .filter(|(_, tc)| !conflicting_tools.contains(&tc.function.name.as_str()))
+            .map(|(i, _)| i)
+            .collect();
+        let exec_len = exec_indices.len();
+
+        // Results indexed by *slot* (position within `exec_indices`), not
+        // by position within `tool_calls`. `slot -> tool_calls index` via
+        // `exec_indices[slot]`. `None` = not-yet-completed.
+        let mut completed_results: Vec<Option<AlmsResult<serde_json::Value>>> =
+            (0..exec_len).map(|_| None).collect();
+
+        if exec_len > 0 {
+            let mut fu: FuturesUnordered<_> = exec_indices
+                .iter()
+                .enumerate()
+                .map(|(slot, &i)| {
+                    let fut = self.execute_tool_call(
+                        &tool_calls[i],
+                        invocation_ids[i],
+                        session_manager,
+                        session_id,
+                        Some(inflight),
+                    );
+                    async move { (slot, fut.await) }
+                })
+                .collect();
+
+            // Drain `fu` into `completed_results` as each inner future
+            // resolves. Wrapping the drain loop in a `{ ... }` block scopes
+            // the `&mut completed_results` borrow that the async block
+            // captures: the moment the block returns (either drain
+            // exhausted or cancel arm won), the borrow is released and
+            // `completed_results` is available again for the post-cancel
+            // persistence pass below.
+            //
+            // We use `FuturesUnordered` rather than `futures::future::join_all`
+            // for the parallel batch precisely because we need to recover
+            // partial results on cancel. `join_all` buffers each completed
+            // result inside its own `JoinAll` future; when the outer
+            // `tokio::select!` cancel arm wins and drops that future, the
+            // buffered results are lost. `FuturesUnordered` lets us push
+            // each `(slot, result)` into the outer-scope `completed_results`
+            // vec synchronously as it resolves, so the vec survives the
+            // cancel-arm drop. (#1078)
+            let cancelled = {
+                let drain_fut = async {
+                    while let Some((slot, res)) = fu.next().await {
+                        completed_results[slot] = Some(res);
                     }
                 };
 
-                // Assemble final results: conflict errors for conflicting
-                // tools, execution results for the rest. The exec_iter
-                // produces exactly `exec_indices.len()` items (one per
-                // non-conflicting tool), which is consumed in order.
-                let mut exec_iter = exec_results.into_iter();
-                let non_conflicting_count = exec_indices.len();
-                let results: Vec<_> = tool_calls
-                    .iter()
-                    .map(|tc| {
-                        if conflicting_tools.contains(&tc.function.name.as_str()) {
-                            Err(AlmsError::ToolExecution(DM_CONFLICT_MSG.to_string()))
-                        } else {
-                            exec_iter.next().unwrap_or_else(|| {
-                                // This branch is structurally unreachable: exec_results
-                                // has exactly one entry per non-conflicting tool, and we
-                                // consume them in the same order. If this fires, the
-                                // conflict-filter / exec logic has diverged.
-                                debug_assert!(
-                                    false,
-                                    "exec_iter exhausted prematurely: expected {} results \
-                                     for non-conflicting tools but ran out",
-                                    non_conflicting_count,
-                                );
-                                Err(AlmsError::Runtime(
-                                    "BUG: exec_iter exhausted -- conflicting_tools filter \
-                                     diverged from exec_indices"
-                                        .into(),
-                                ))
-                            })
-                        }
-                    })
-                    .collect();
-                Ok(results)
+                if let Some(ref token) = self.cancel_token {
+                    tokio::select! {
+                        _ = drain_fut => false,
+                        _ = token.cancelled() => true,
+                    }
+                } else {
+                    drain_fut.await;
+                    false
+                }
+            };
+
+            if cancelled {
+                // Persist whatever finished before the cancel landed.
+                // The matching `tool_end` SSE event was already emitted
+                // synchronously inside `execute_tool_call` BEFORE the
+                // future yielded its result — without this persistence
+                // pass the next run's rebuild would synthesise
+                // `INTERRUPTED_TOOL_RESULT` markers for these tools,
+                // silently overwriting real work with "cancelled"
+                // placeholders. (#1078)
+                //
+                // We persist in `tool_calls` order (not completion
+                // order) so the on-disk `tool_seq` numbering matches
+                // what the Ok path would have produced — the rebuild
+                // pipeline assumes tool results are ordered consistently
+                // with their corresponding tool_use blocks.
+                //
+                // Resolve workspace root once per batch — matches the
+                // Ok path in `process_tool_results` (Tim's #1089 review
+                // suggestion).
+                let workspace_root = self.workspace_root_for_truncate();
+                for (slot, slot_result) in completed_results.into_iter().enumerate() {
+                    let Some(res) = slot_result else { continue };
+                    let i = exec_indices[slot];
+                    let _ = self.persist_one_tool_result(
+                        &tool_calls[i],
+                        res,
+                        invocation_ids[i],
+                        tool_call_records,
+                        tool_seq,
+                        session_manager,
+                        session_id,
+                        is_dm,
+                        workspace_root.as_deref(),
+                    );
+                }
+
+                // Synthesise `ToolEnd`s for any inner future that was
+                // dropped mid-flight (#846 protocol). The tracker's
+                // unregister-before-emit invariant means this only
+                // fires for tools that genuinely had not reached their
+                // terminal section yet — completed tools have already
+                // removed themselves and won't be double-emitted.
+                synthesize_cancel_tool_ends(self.event_sender.as_ref(), inflight);
+                return Err(AlmsError::Cancelled);
             }
         }
+
+        // All inner futures completed (cancel arm did not fire). Assemble
+        // the final result vector in `tool_calls` order: conflicting tools
+        // get the DM conflict error, executed tools get their slot's
+        // result. By construction every slot is `Some(_)` here.
+        let mut slot_iter = completed_results.into_iter();
+        let results: Vec<AlmsResult<serde_json::Value>> = tool_calls
+            .iter()
+            .map(|tc| {
+                if conflicting_tools.contains(&tc.function.name.as_str()) {
+                    Err(AlmsError::ToolExecution(DM_CONFLICT_MSG.to_string()))
+                } else {
+                    slot_iter.next().flatten().unwrap_or_else(|| {
+                        // Structurally unreachable: every non-conflicting
+                        // slot was populated by the drain loop above.
+                        // Mirrors the pre-#1078 `debug_assert` guard on the
+                        // `join_all` exec_iter — if this fires the
+                        // exec_indices / drain accounting has diverged.
+                        debug_assert!(
+                            false,
+                            "slot_iter exhausted or slot was None: \
+                             expected {} populated slots for non-conflicting tools",
+                            exec_len
+                        );
+                        Err(AlmsError::Runtime(
+                            "BUG: slot exhausted -- conflicting_tools filter \
+                             diverged from exec_indices"
+                                .into(),
+                        ))
+                    })
+                }
+            })
+            .collect();
+        Ok(results)
     }
 
     /// Persist assistant text content and tool call entries to session history.
@@ -935,132 +1091,174 @@ impl AgentRuntime {
         session_id: alms_core::SessionId,
         is_dm: bool,
     ) {
-        // Workspace root for relativising spill paths in the LLM-visible
-        // hint. When no workspace is attached (e.g. unit tests), fall back
-        // to the resolved sandbox root, then to None — `truncate` handles
-        // the None case by emitting the absolute path.
+        // Resolve once per batch — workspace root doesn't change between
+        // tool results in the same call (Tim's #1089 review suggestion).
         let workspace_root = self.workspace_root_for_truncate();
-
         for ((tool_call, result), invocation_id) in
             tool_calls.iter().zip(results).zip(invocation_ids)
         {
-            let (raw_content, ok) = match result {
-                Ok(value) => {
-                    let ok = tool_result_ok(&value);
-                    (value.to_string(), ok)
-                }
-                Err(e) => (format!("Error: {}", e), false),
-            };
-
-            // Apply the shared in-loop truncation policy. When the policy
-            // is disabled (e.g. unit tests, gateway with the feature
-            // turned off in TOML), `truncate` is a pass-through.
-            let outcome = crate::tool_output_truncate::truncate(
-                &raw_content,
-                &self.tool_output_truncate_policy,
-                &tool_call.id,
+            let content = self.persist_one_tool_result(
+                tool_call,
+                result,
+                *invocation_id,
+                tool_call_records,
+                tool_seq,
+                session_manager,
+                session_id,
+                is_dm,
                 workspace_root.as_deref(),
             );
-            let content = outcome.content;
-            let truncated_in_loop = outcome.truncated;
-
-            if truncated_in_loop {
-                debug!(
-                    target: "agent::loop",
-                    tool = %tool_call.function.name,
-                    tool_call_id = %tool_call.id,
-                    original_bytes = outcome.original_bytes,
-                    original_lines = outcome.original_lines,
-                    preview_bytes = content.len(),
-                    spill_path = ?outcome.output_path,
-                    "Tool output truncated by in-loop service (#851)"
-                );
-            }
-
-            messages.push(LlmMessage::tool_result(&tool_call.id, content.clone()));
-
-            // Persist tool result to session history.
-            // Intentionally fire-and-forget -- see persist_assistant_tool_calls
-            // for the rationale.
-            //
-            // Include tool_invocation_id in the metadata so history
-            // reconstruction can correlate tool results back to the same
-            // invocation ID used by live SSE tool_start/tool_end events.
-            // (Fixes #509)
-            //
-            // For DM sessions: store as Role::User with reasoning metadata
-            // merged with the existing ok/tool_invocation_id fields. This
-            // preserves the DM invariant (all shared-session messages are
-            // Role::User) and enables UI reasoning block reconstruction.
-            //
-            // When the in-loop truncate fired, we mark the persisted row
-            // with `truncated_in_loop: true` so `session_msg_to_llm` skips
-            // its own 2000-byte re-truncation — the bytes already on disk
-            // are the bytes the agent saw live.
-            {
-                let mut base_meta = serde_json::json!({
-                    "ok": ok,
-                    "tool_invocation_id": invocation_id.to_string(),
-                });
-                if truncated_in_loop && let Some(obj) = base_meta.as_object_mut() {
-                    obj.insert(
-                        "truncated_in_loop".to_string(),
-                        serde_json::Value::Bool(true),
-                    );
-                    obj.insert(
-                        "original_bytes".to_string(),
-                        serde_json::Value::Number(outcome.original_bytes.into()),
-                    );
-                    obj.insert(
-                        "original_lines".to_string(),
-                        serde_json::Value::Number(outcome.original_lines.into()),
-                    );
-                    if let Some(ref path) = outcome.output_path {
-                        obj.insert(
-                            "spill_path".to_string(),
-                            serde_json::Value::String(path.clone()),
-                        );
-                    }
-                }
-                let (role, metadata) = if is_dm {
-                    (
-                        SessionRole::User,
-                        Some(self.merge_reasoning_metadata(base_meta, is_dm)),
-                    )
-                } else {
-                    (SessionRole::Tool, Some(base_meta))
-                };
-                if let Err(e) = session_manager.append_message(
-                    session_id,
-                    SessionMessage {
-                        id: uuid::Uuid::new_v4().to_string(),
-                        role,
-                        content: SessionContent::ToolResult {
-                            tool_id: tool_call.id.clone(),
-                            result: serde_json::from_str(&content)
-                                .unwrap_or(serde_json::Value::String(content.clone())),
-                        },
-                        timestamp: alms_core::Timestamp::now(),
-                        metadata,
-                    },
-                ) {
-                    warn!("Failed to persist tool result to session: {}", e);
-                }
-            }
-
-            // Collect tool result record for per-run storage (all sessions).
-            tool_call_records.push(alms_core::ToolCallRecord {
-                seq: *tool_seq,
-                role: alms_core::ToolCallRole::Tool,
-                tool_name: Some(tool_call.function.name.clone()),
-                tool_id: Some(tool_call.id.clone()),
-                params: None,
-                result: Some(content.clone()),
-                timestamp: chrono::Utc::now(),
-                from_agent: self.agent_name.clone(),
-            });
-            *tool_seq += 1;
+            messages.push(LlmMessage::tool_result(&tool_call.id, content));
         }
+    }
+
+    /// Persist a single tool execution result to the session DB and append
+    /// a matching record to the per-run tool-call records vec. Returns the
+    /// (possibly truncated) content string so callers that also need to
+    /// push it into the in-memory LLM-message vec can do so without
+    /// re-running the truncation pass.
+    ///
+    /// Extracted from `process_tool_results` (#1078) so the cancel arm in
+    /// `run_tool_calls` can persist the subset of tools that completed
+    /// before the cancel landed. Pre-#1078, `process_tool_results` was the
+    /// sole persistence site for `Tool`-role rows; cancel-during-parallel-
+    /// tools would silently drop already-completed results, and the next
+    /// run's rebuild would synthesise `INTERRUPTED_TOOL_RESULT` markers
+    /// for tools that had actually succeeded.
+    ///
+    /// `workspace_root` is the resolved root used for relativising spill
+    /// paths in the LLM-visible hint. Callers compute it once per batch via
+    /// `workspace_root_for_truncate()` and pass it in so we don't re-resolve
+    /// it per tool call (Tim's #1089 review suggestion).
+    #[allow(clippy::too_many_arguments)] // Sibling of `process_tool_results`; same rationale.
+    fn persist_one_tool_result(
+        &self,
+        tool_call: &ToolCall,
+        result: AlmsResult<serde_json::Value>,
+        invocation_id: Uuid,
+        tool_call_records: &mut Vec<alms_core::ToolCallRecord>,
+        tool_seq: &mut u32,
+        session_manager: &SessionManager,
+        session_id: alms_core::SessionId,
+        is_dm: bool,
+        workspace_root: Option<&std::path::Path>,
+    ) -> String {
+        let (raw_content, ok) = match result {
+            Ok(value) => {
+                let ok = tool_result_ok(&value);
+                (value.to_string(), ok)
+            }
+            Err(e) => (format!("Error: {}", e), false),
+        };
+
+        // Apply the shared in-loop truncation policy. When the policy
+        // is disabled (e.g. unit tests, gateway with the feature
+        // turned off in TOML), `truncate` is a pass-through.
+        let outcome = crate::tool_output_truncate::truncate(
+            &raw_content,
+            &self.tool_output_truncate_policy,
+            &tool_call.id,
+            workspace_root,
+        );
+        let content = outcome.content;
+        let truncated_in_loop = outcome.truncated;
+
+        if truncated_in_loop {
+            debug!(
+                target: "agent::loop",
+                tool = %tool_call.function.name,
+                tool_call_id = %tool_call.id,
+                original_bytes = outcome.original_bytes,
+                original_lines = outcome.original_lines,
+                preview_bytes = content.len(),
+                spill_path = ?outcome.output_path,
+                "Tool output truncated by in-loop service (#851)"
+            );
+        }
+
+        // Persist tool result to session history.
+        // Intentionally fire-and-forget -- see persist_assistant_tool_calls
+        // for the rationale.
+        //
+        // Include tool_invocation_id in the metadata so history
+        // reconstruction can correlate tool results back to the same
+        // invocation ID used by live SSE tool_start/tool_end events.
+        // (Fixes #509)
+        //
+        // For DM sessions: store as Role::User with reasoning metadata
+        // merged with the existing ok/tool_invocation_id fields. This
+        // preserves the DM invariant (all shared-session messages are
+        // Role::User) and enables UI reasoning block reconstruction.
+        //
+        // When the in-loop truncate fired, we mark the persisted row
+        // with `truncated_in_loop: true` so `session_msg_to_llm` skips
+        // its own 2000-byte re-truncation — the bytes already on disk
+        // are the bytes the agent saw live.
+        {
+            let mut base_meta = serde_json::json!({
+                "ok": ok,
+                "tool_invocation_id": invocation_id.to_string(),
+            });
+            if truncated_in_loop && let Some(obj) = base_meta.as_object_mut() {
+                obj.insert(
+                    "truncated_in_loop".to_string(),
+                    serde_json::Value::Bool(true),
+                );
+                obj.insert(
+                    "original_bytes".to_string(),
+                    serde_json::Value::Number(outcome.original_bytes.into()),
+                );
+                obj.insert(
+                    "original_lines".to_string(),
+                    serde_json::Value::Number(outcome.original_lines.into()),
+                );
+                if let Some(ref path) = outcome.output_path {
+                    obj.insert(
+                        "spill_path".to_string(),
+                        serde_json::Value::String(path.clone()),
+                    );
+                }
+            }
+            let (role, metadata) = if is_dm {
+                (
+                    SessionRole::User,
+                    Some(self.merge_reasoning_metadata(base_meta, is_dm)),
+                )
+            } else {
+                (SessionRole::Tool, Some(base_meta))
+            };
+            if let Err(e) = session_manager.append_message(
+                session_id,
+                SessionMessage {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    role,
+                    content: SessionContent::ToolResult {
+                        tool_id: tool_call.id.clone(),
+                        result: serde_json::from_str(&content)
+                            .unwrap_or(serde_json::Value::String(content.clone())),
+                    },
+                    timestamp: alms_core::Timestamp::now(),
+                    metadata,
+                },
+            ) {
+                warn!("Failed to persist tool result to session: {}", e);
+            }
+        }
+
+        // Collect tool result record for per-run storage (all sessions).
+        tool_call_records.push(alms_core::ToolCallRecord {
+            seq: *tool_seq,
+            role: alms_core::ToolCallRole::Tool,
+            tool_name: Some(tool_call.function.name.clone()),
+            tool_id: Some(tool_call.id.clone()),
+            params: None,
+            result: Some(content.clone()),
+            timestamp: chrono::Utc::now(),
+            from_agent: self.agent_name.clone(),
+        });
+        *tool_seq += 1;
+
+        content
     }
 
     /// Resolve the workspace root for spill-path relativisation.

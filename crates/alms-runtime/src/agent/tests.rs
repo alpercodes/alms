@@ -3398,6 +3398,8 @@ async fn test_cancel_during_tool_execution_emits_tool_end_guarded() {
     // first (only) ToolStart.
     let watcher = spawn_cancel_on_tool_start(rx, cancel_token.clone(), 1);
 
+    let mut tool_call_records: Vec<alms_core::ToolCallRecord> = Vec::new();
+    let mut tool_seq: u32 = 0;
     let result = runtime
         .run_tool_calls(
             &tool_calls,
@@ -3405,6 +3407,9 @@ async fn test_cancel_during_tool_execution_emits_tool_end_guarded() {
             &[],
             &session_manager,
             session.id,
+            false,
+            &mut tool_call_records,
+            &mut tool_seq,
         )
         .await;
 
@@ -3497,8 +3502,19 @@ async fn test_cancel_during_tool_execution_emits_tool_end_parallel() {
     // before the cancel arm fires (Tim's nit on #846).
     let watcher = spawn_cancel_on_tool_start(rx, cancel_token.clone(), 3);
 
+    let mut tool_call_records: Vec<alms_core::ToolCallRecord> = Vec::new();
+    let mut tool_seq: u32 = 0;
     let result = runtime
-        .run_tool_calls(&tool_calls, &inv_ids, &[], &session_manager, session.id)
+        .run_tool_calls(
+            &tool_calls,
+            &inv_ids,
+            &[],
+            &session_manager,
+            session.id,
+            false,
+            &mut tool_call_records,
+            &mut tool_seq,
+        )
         .await;
 
     drop(runtime);
@@ -3545,6 +3561,214 @@ async fn test_cancel_during_tool_execution_emits_tool_end_parallel() {
             result_val
         );
     }
+}
+
+/// #1078 — A mixed parallel batch where tool A completes before the
+/// cancel arrives and tools B / C are still in-flight at cancel time.
+/// The fix in #1078 says: A's `Tool`-role row MUST be persisted to
+/// `session_messages`, AND a matching record MUST land in
+/// `tool_call_records`, before `Err(Cancelled)` propagates. Pre-fix,
+/// A's result was buffered inside `join_all`'s internal vec and dropped
+/// when the cancel arm won — the next run's rebuild would synthesise an
+/// `INTERRUPTED_TOOL_RESULT` for tool A even though it had succeeded.
+///
+/// Sequencing is event-driven (Tim's nit on #846, same pattern as the
+/// no-double-emission test below): the watcher fires
+/// `cancel_token.cancel()` the moment it observes A's `ToolEnd`, which
+/// proves A reached its sync terminal section (unregister + audit +
+/// emit) BEFORE the cancel could possibly land. Under the single-
+/// threaded `#[tokio::test]` executor, that also guarantees the drain
+/// loop has written `completed_results[A] = Some(...)` before the
+/// select! cancel arm wins, because the drain loop runs
+/// cooperatively without yielding between "fu.next() returned A's
+/// result" and "next fu.next().await parks on B / C".
+#[tokio::test]
+async fn test_cancel_persists_completed_parallel_results_1078() {
+    use tokio_util::sync::CancellationToken;
+
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<RuntimeEvent>();
+    let cancel_token = CancellationToken::new();
+
+    let blocking = std::sync::Arc::new(BlockingTestTool::new("block_test"));
+    // Three calls. We pre-fire A's release sender so its `rx.await`
+    // inside `execute()` resolves immediately when polled. B and C's
+    // senders are held by the test and never fired — those two futures
+    // will stay parked at their blocking awaits forever, so the
+    // FuturesUnordered drain loop yields control after collecting A's
+    // result, and the cancel arm of the outer `select!` can win.
+    let (release_a_tx, release_a_rx) = tokio::sync::oneshot::channel::<()>();
+    let _ = release_a_tx.send(());
+    blocking.enqueue(release_a_rx).await;
+
+    let (held_b_tx, release_b_rx) = tokio::sync::oneshot::channel::<()>();
+    blocking.enqueue(release_b_rx).await;
+    let (held_c_tx, release_c_rx) = tokio::sync::oneshot::channel::<()>();
+    blocking.enqueue(release_c_rx).await;
+
+    let runtime = make_runtime_for_cancel_test(
+        Posture::FullControl,
+        blocking.clone() as std::sync::Arc<dyn alms_sandbox::Tool>,
+        cancel_token.clone(),
+        tx,
+    );
+
+    let session_config = SessionConfig::default();
+    let session_manager = SessionManager::new(session_config);
+    let session = session_manager.get_or_create(runtime.agent_id, "test");
+
+    // Three distinct tool_call_ids so we can identify A's persisted
+    // `ToolResult` row in the session history afterwards. The first
+    // tool call ("tc-A") is the one whose release sender we pre-fired.
+    let tool_calls = vec![
+        ToolCall::new("tc-A", "block_test", "{}"),
+        ToolCall::new("tc-B", "block_test", "{}"),
+        ToolCall::new("tc-C", "block_test", "{}"),
+    ];
+    let inv_ids: Vec<uuid::Uuid> = (0..3).map(|_| uuid::Uuid::new_v4()).collect();
+
+    // Watcher: fires `cancel_token.cancel()` on the first observed
+    // `ToolEnd` (which is tool A's success, because B and C never
+    // complete). Mirrors the event-driven sequencing pattern from
+    // `test_no_double_tool_end_when_tool_ok_then_cancel`.
+    let watcher = {
+        let cancel_token = cancel_token.clone();
+        tokio::spawn(async move {
+            let mut rx = rx;
+            let mut starts = std::collections::HashSet::new();
+            let mut ends: Vec<(uuid::Uuid, bool, serde_json::Value)> = Vec::new();
+            let mut cancelled = false;
+            while let Some(ev) = rx.recv().await {
+                match ev {
+                    RuntimeEvent::ToolStart { invocation_id, .. } => {
+                        starts.insert(invocation_id);
+                    }
+                    RuntimeEvent::ToolEnd {
+                        invocation_id,
+                        ok,
+                        result,
+                        ..
+                    } => {
+                        ends.push((invocation_id, ok, result));
+                        if !cancelled {
+                            cancel_token.cancel();
+                            cancelled = true;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            (starts, ends)
+        })
+    };
+
+    let mut tool_call_records: Vec<alms_core::ToolCallRecord> = Vec::new();
+    let mut tool_seq: u32 = 0;
+    let result = runtime
+        .run_tool_calls(
+            &tool_calls,
+            &inv_ids,
+            &[],
+            &session_manager,
+            session.id,
+            /* is_dm */ false,
+            &mut tool_call_records,
+            &mut tool_seq,
+        )
+        .await;
+
+    // Drop runtime + held senders so the event channel + the still-
+    // parked B/C inner futures clean up and the watcher's loop exits.
+    drop(runtime);
+    drop(held_b_tx);
+    drop(held_c_tx);
+    let (_starts, ends) = watcher.await.unwrap();
+
+    // 1) The outer call returns Cancelled — A's persistence happens
+    //    on the cancel arm of the parallel branch in `run_tool_calls`.
+    assert!(
+        matches!(result, Err(AlmsError::Cancelled)),
+        "expected AlmsError::Cancelled, got {:?}",
+        result
+    );
+
+    // 2) Exactly one of the three `ToolEnd` events must report ok=true
+    //    — the real success event for tool A. The other two are
+    //    synthetic cancel events (ok=false, `error: "run cancelled"`).
+    let ok_ends: Vec<_> = ends.iter().filter(|(_, ok, _)| *ok).collect();
+    assert_eq!(
+        ok_ends.len(),
+        1,
+        "expected exactly one ok=true ToolEnd (the completed tool A) \
+         and two synthetic cancel ToolEnds for B + C, got {:?}",
+        ends
+    );
+
+    // 3) The session message log must contain exactly one `Role::Tool`
+    //    row, and that row's `tool_id` must be tool A's id. Pre-#1078
+    //    this row was missing — `process_tool_results` was bypassed by
+    //    the cancel arm and A's result was silently dropped.
+    let history = session_manager.get_history(session.id).unwrap();
+    let tool_rows: Vec<&alms_session::Message> = history
+        .iter()
+        .filter(|m| matches!(m.role, alms_session::Role::Tool))
+        .collect();
+    assert_eq!(
+        tool_rows.len(),
+        1,
+        "exactly one Tool-role row must be persisted after cancel \
+         (tool A — the one that completed before the cancel landed); \
+         tools B and C must NOT be persisted because they were still \
+         in-flight when the cancel arrived. got {} rows: {:?}",
+        tool_rows.len(),
+        tool_rows
+    );
+
+    let persisted_tool_id = match &tool_rows[0].content {
+        alms_session::Content::ToolResult { tool_id, .. } => tool_id.clone(),
+        other => panic!("unexpected Tool-role content shape: {:?}", other),
+    };
+    assert_eq!(
+        persisted_tool_id, "tc-A",
+        "the persisted tool result must be tool A's (the one that \
+         completed), not B or C. got tool_id={}",
+        persisted_tool_id
+    );
+
+    // 4) The persisted row's metadata must carry `ok: true` for tool A
+    //    (it succeeded before the cancel), so the rebuild pipeline
+    //    treats it as a real success and not an interrupted call.
+    let meta = tool_rows[0]
+        .metadata
+        .as_ref()
+        .expect("persisted tool result must have metadata");
+    assert_eq!(
+        meta.get("ok").and_then(|v| v.as_bool()),
+        Some(true),
+        "tool A's persisted ok flag must be true — its execute() returned \
+         Ok before the cancel arm fired. metadata={:?}",
+        meta
+    );
+
+    // 5) `tool_call_records` must include a `ToolCallRole::Tool` entry
+    //    for tool A so the gateway's per-run records (#696) surface the
+    //    completed tool to the UI / `GET /runs/{id}/tool-calls`.
+    let tool_records: Vec<&alms_core::ToolCallRecord> = tool_call_records
+        .iter()
+        .filter(|r| matches!(r.role, alms_core::ToolCallRole::Tool))
+        .collect();
+    assert_eq!(
+        tool_records.len(),
+        1,
+        "exactly one Tool-role ToolCallRecord must be appended on the \
+         cancel arm (for tool A). got {} records: {:?}",
+        tool_records.len(),
+        tool_records
+    );
+    assert_eq!(
+        tool_records[0].tool_id.as_deref(),
+        Some("tc-A"),
+        "the per-run record must reference tool A's tool_id"
+    );
 }
 
 /// #846 — No-double-emission regression: a tool that finishes Ok
@@ -3623,6 +3847,8 @@ async fn test_no_double_tool_end_when_tool_ok_then_cancel() {
     // sees the value as soon as it polls.
     let _ = release_tx.send(());
 
+    let mut tool_call_records: Vec<alms_core::ToolCallRecord> = Vec::new();
+    let mut tool_seq: u32 = 0;
     let result = runtime
         .run_tool_calls(
             &tool_calls,
@@ -3630,6 +3856,9 @@ async fn test_no_double_tool_end_when_tool_ok_then_cancel() {
             &[],
             &session_manager,
             session.id,
+            false,
+            &mut tool_call_records,
+            &mut tool_seq,
         )
         .await;
     drop(runtime);
