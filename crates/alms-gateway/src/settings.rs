@@ -3304,6 +3304,194 @@ mod tests {
     }
 
     // ==================================================================
+    // Codex follow-up on #1081 (#1088) — gate the persisted MODEL
+    // override on the same provider-validity check.
+    //
+    // Pre-fix: `AppState::new` correctly skipped `persisted.provider`
+    // when the provider name was no longer in `llm_config.providers`,
+    // but unconditionally applied `persisted.model` below that guard.
+    // For namespace-specific models (e.g. `claude-haiku-4-5`) that's a
+    // stale slug on the fallback provider (e.g. `openrouter`), surfacing
+    // as opaque 4xx on the next default-agent run.
+    //
+    // Post-fix: when the persisted provider is invalid, both `provider`
+    // and `model` are skipped together. A single WARN under `alms.config`
+    // names both dropped values; the in-file default `(provider, model)`
+    // pair is preserved end-to-end.
+    // ==================================================================
+
+    /// When the persisted provider has been removed from `alms.toml`,
+    /// the persisted *model* override must be skipped too — the model is
+    /// namespace-specific and would force the fallback provider to
+    /// receive an unresolvable slug.
+    #[tokio::test]
+    async fn boot_skips_persisted_model_when_persisted_provider_invalid() {
+        // 1. Mirror the upstream regression test: in-file default provider
+        //    is `openrouter` with a usable inline key; the persisted
+        //    settings record a stale `(anthropic-removed, claude-haiku-4-5)`
+        //    pair from a previous PATCH that targeted a provider that has
+        //    since been deleted from `alms.toml`.
+        let mut gateway_config = crate::gateway::GatewayConfig::default();
+        assert_eq!(
+            gateway_config.llm_config.provider, "openrouter",
+            "test relies on LlmConfig::default().provider being openrouter; \
+             update the assertion below if that changes"
+        );
+        assert_eq!(
+            gateway_config.llm_config.default_model, "moonshotai/kimi-k2.6",
+            "test relies on LlmConfig::default().default_model being \
+             moonshotai/kimi-k2.6; update the assertion below if that changes"
+        );
+        gateway_config.llm_config.providers.insert(
+            "openrouter".into(),
+            alms_core::config::ProviderEntry {
+                kind: alms_core::config::ProviderKind::OpenAiCompatible,
+                base_url: "https://openrouter.ai/api/v1".into(),
+                api_key_env: None,
+                api_key: Some("sk-or-from-provider-entry".into()),
+                model: None,
+                auth_scheme: alms_core::config::AuthScheme::Bearer,
+                quirks: alms_core::config::ProviderQuirks::default(),
+            },
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        gateway_config.data_dir = Some(tmp.path().to_path_buf());
+
+        // 2. Persisted: provider points at a name absent from
+        //    `llm_config.providers`, AND a namespace-specific model that
+        //    only makes sense on the dropped provider.
+        let persisted = PersistedSettings {
+            context: None,
+            session: None,
+            tools: None,
+            llm: None,
+            model: Some("claude-haiku-4-5".into()),
+            provider: Some("anthropic-removed".into()),
+        };
+        std::fs::write(
+            settings_path(tmp.path()),
+            serde_json::to_string_pretty(&persisted).unwrap(),
+        )
+        .unwrap();
+
+        // 3. Construct AppState — exercises the boot path.
+        let gateway = crate::gateway::Gateway::new(gateway_config).unwrap();
+        let scheduler = std::sync::Arc::new(alms_runtime::Scheduler::new());
+        let shutdown_token = tokio_util::sync::CancellationToken::new();
+        let (completion_tx, _cr) = tokio::sync::mpsc::unbounded_channel();
+        let (trigger_tx, _tr) = tokio::sync::mpsc::unbounded_channel();
+        let (dm_event_tx, _dr) = tokio::sync::mpsc::unbounded_channel();
+        let state = crate::server::AppState::new(
+            gateway,
+            scheduler,
+            shutdown_token,
+            completion_tx,
+            trigger_tx,
+            dm_event_tx,
+        )
+        .unwrap();
+
+        // 4. The boot path must have dropped BOTH the stale provider AND
+        //    the stale model. The LlmClient and the `server_llm_default`
+        //    surface must reflect the in-file default pair end-to-end.
+        assert_eq!(
+            state.llm.provider(),
+            "openrouter",
+            "boot must skip persisted provider when no longer configured"
+        );
+        assert_eq!(
+            state.llm.default_model(),
+            "moonshotai/kimi-k2.6",
+            "boot must skip persisted model when its persisted provider is \
+             invalid — the model is namespace-specific and would be an \
+             unresolvable slug on the fallback provider"
+        );
+        let default = state.server_llm_default.read().clone();
+        assert_eq!(
+            default.provider, "openrouter",
+            "server_llm_default.provider must mirror the in-file default"
+        );
+        assert_eq!(
+            default.model, "moonshotai/kimi-k2.6",
+            "server_llm_default.model must mirror the in-file default — \
+             not the dropped persisted model"
+        );
+        // Cross-check `state.llm_config` (the by-value snapshot used by
+        // GET /settings until the next restart) — both fields must reflect
+        // the in-file default pair, not the dropped persisted pair.
+        assert_eq!(state.llm_config.provider, "openrouter");
+        assert_eq!(state.llm_config.default_model, "moonshotai/kimi-k2.6");
+    }
+
+    /// When the persisted provider is absent (operator pinned only the
+    /// model via PATCH /settings, against the active in-file provider),
+    /// the persisted model override must still apply. This pins the
+    /// behavior that #1088's fix does NOT regress operators who only
+    /// PATCHed `model`.
+    #[tokio::test]
+    async fn boot_applies_persisted_model_when_persisted_provider_absent() {
+        let mut gateway_config = crate::gateway::GatewayConfig::default();
+        gateway_config.llm_config.providers.insert(
+            "openrouter".into(),
+            alms_core::config::ProviderEntry {
+                kind: alms_core::config::ProviderKind::OpenAiCompatible,
+                base_url: "https://openrouter.ai/api/v1".into(),
+                api_key_env: None,
+                api_key: Some("sk-or-from-provider-entry".into()),
+                model: None,
+                auth_scheme: alms_core::config::AuthScheme::Bearer,
+                quirks: alms_core::config::ProviderQuirks::default(),
+            },
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        gateway_config.data_dir = Some(tmp.path().to_path_buf());
+
+        let persisted = PersistedSettings {
+            context: None,
+            session: None,
+            tools: None,
+            llm: None,
+            // Operator pinned a different OpenRouter-namespace model via
+            // PATCH; no provider override (active provider stays
+            // openrouter from `alms.toml`).
+            model: Some("openai/gpt-4o-mini".into()),
+            provider: None,
+        };
+        std::fs::write(
+            settings_path(tmp.path()),
+            serde_json::to_string_pretty(&persisted).unwrap(),
+        )
+        .unwrap();
+
+        let gateway = crate::gateway::Gateway::new(gateway_config).unwrap();
+        let scheduler = std::sync::Arc::new(alms_runtime::Scheduler::new());
+        let shutdown_token = tokio_util::sync::CancellationToken::new();
+        let (completion_tx, _cr) = tokio::sync::mpsc::unbounded_channel();
+        let (trigger_tx, _tr) = tokio::sync::mpsc::unbounded_channel();
+        let (dm_event_tx, _dr) = tokio::sync::mpsc::unbounded_channel();
+        let state = crate::server::AppState::new(
+            gateway,
+            scheduler,
+            shutdown_token,
+            completion_tx,
+            trigger_tx,
+            dm_event_tx,
+        )
+        .unwrap();
+
+        assert_eq!(state.llm.provider(), "openrouter");
+        assert_eq!(
+            state.llm.default_model(),
+            "openai/gpt-4o-mini",
+            "persisted model must apply when persisted provider is absent — \
+             #1088 fix must not regress the model-only PATCH path"
+        );
+        let default = state.server_llm_default.read().clone();
+        assert_eq!(default.provider, "openrouter");
+        assert_eq!(default.model, "openai/gpt-4o-mini");
+    }
+
+    // ==================================================================
     // Codex follow-up on #1081 (P1 #2) — budget revalidation against
     // the post-patch default LLM pair.
     //

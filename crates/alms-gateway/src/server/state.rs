@@ -228,29 +228,86 @@ impl AppState {
             // `alms.toml` default provider, which is the operator's
             // most recent in-file configuration and the documented
             // recovery surface.
+            //
+            // Codex follow-up on #1081 (#1088): the model override must be
+            // gated on the same decision. Model names are namespace-specific
+            // (e.g. `claude-haiku-4-5` only makes sense on `anthropic`); if
+            // the persisted provider is invalid we fall back to the
+            // alms.toml default provider, and applying a stale namespace-
+            // specific model on top would force the new provider to receive
+            // a slug it can't resolve, surfacing as opaque 4xx wire errors
+            // on the next default-agent run. When the provider is dropped
+            // we drop the model too and let the alms.toml default model
+            // through. Operators can re-pin via PATCH /settings once the
+            // provider is restored.
+            let persisted_provider_valid = match persisted.provider {
+                Some(ref provider) if !provider.is_empty() => {
+                    llm_config.providers.contains_key(provider)
+                }
+                // No persisted provider override (or empty string) means
+                // we keep the in-file default and the persisted model
+                // override — if any — is applied verbatim. The operator
+                // explicitly pinned only the model via PATCH /settings,
+                // which targets the active provider.
+                _ => true,
+            };
             if let Some(ref provider) = persisted.provider
                 && !provider.is_empty()
             {
-                if llm_config.providers.contains_key(provider) {
+                if persisted_provider_valid {
                     llm_config.provider = provider.clone();
                     let secrets_handle = gateway.secrets_handle();
                     let secrets_guard = secrets_handle.read();
                     llm = llm.with_provider_and_secrets(provider, &secrets_guard);
                 } else {
-                    tracing::warn!(
-                        target: "alms.config",
-                        persisted_provider = %provider,
-                        active_provider = %llm_config.provider,
-                        "ignoring persisted server-default provider — \
-                         `[llm.providers.{provider}]` is no longer configured \
-                         in alms.toml; falling back to the in-file default. \
-                         PATCH /settings with a configured provider to clear \
-                         the persisted override, or restore the entry in \
-                         alms.toml."
-                    );
+                    // Branch the prose on whether a non-empty persisted
+                    // model is on the wire — when only a provider was
+                    // persisted, the "AND model" phrasing would mislead
+                    // operators scanning the log line. The structured
+                    // `persisted_model` field is identical either way so
+                    // log-shape consumers (and the regression tests) are
+                    // unaffected by the prose split.
+                    let has_persisted_model =
+                        persisted.model.as_deref().is_some_and(|m| !m.is_empty());
+                    if has_persisted_model {
+                        tracing::warn!(
+                            target: "alms.config",
+                            persisted_provider = %provider,
+                            persisted_model = persisted.model.as_deref().unwrap_or(""),
+                            active_provider = %llm_config.provider,
+                            active_model = %llm_config.default_model,
+                            "ignoring persisted server-default provider AND model — \
+                             `[llm.providers.{provider}]` is no longer configured \
+                             in alms.toml; falling back to the in-file default \
+                             provider and model. The persisted model is namespace- \
+                             specific and would be invalid on the fallback provider. \
+                             PATCH /settings with a configured (provider, model) \
+                             pair to clear the persisted override, or restore the \
+                             entry in alms.toml."
+                        );
+                    } else {
+                        tracing::warn!(
+                            target: "alms.config",
+                            persisted_provider = %provider,
+                            persisted_model = persisted.model.as_deref().unwrap_or(""),
+                            active_provider = %llm_config.provider,
+                            active_model = %llm_config.default_model,
+                            "ignoring persisted server-default provider — \
+                             `[llm.providers.{provider}]` is no longer configured \
+                             in alms.toml; falling back to the in-file default \
+                             provider and model. PATCH /settings with a \
+                             configured provider to clear the persisted \
+                             override, or restore the entry in alms.toml."
+                        );
+                    }
                 }
             }
-            if let Some(ref model) = persisted.model
+            // Only apply the persisted model when the persisted provider is
+            // either absent or still valid. If the provider was skipped
+            // above, the model is part of the same stale override and is
+            // dropped together (the WARN above already named it).
+            if persisted_provider_valid
+                && let Some(ref model) = persisted.model
                 && !model.is_empty()
             {
                 llm_config.default_model = model.clone();
