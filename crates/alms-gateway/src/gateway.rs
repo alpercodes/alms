@@ -835,7 +835,7 @@ impl Gateway {
                         runtime = runtime.with_project_root(project_root);
                     }
                     // Attach workspace so agent personality/goals/memories
-                    // are prepended to the system prompt (same as HTTP path).
+                    // are appended to the system prompt (same as HTTP path).
                     if let Some(ws_dir) = &self.config.workspace_dir {
                         let workspace =
                             alms_runtime::AgentWorkspace::new(ws_dir, &effective_name);

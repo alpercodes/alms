@@ -208,9 +208,12 @@ impl AgentRuntime {
 
     /// Rebuild the system prompt for tool-loop continuation or DM retry.
     ///
-    /// Combines the agent's initial prompt with the `tool_loop` continuation
-    /// guidance, assembles workspace prefix, and (for DM sessions) appends the
+    /// Assembles the base prompt with the workspace prefix, then appends the
+    /// `tool_loop` continuation guidance, and (for DM sessions) appends the
     /// DM addendum so the agent remembers to use `send_message`.
+    ///
+    /// Layer order is `base -> workspace -> tool_loop -> dm_addendum`, matching
+    /// the assembly order documented in `docs/system-prompts.md`.
     ///
     /// This is extracted as a helper to avoid three copies of the same pattern
     /// (initial tool-loop rebuild, DM text-only retry rebuild).
@@ -221,11 +224,9 @@ impl AgentRuntime {
         dm_peer: Option<&str>,
     ) {
         if !messages.is_empty() && messages[0].role == "system" {
-            let combined = format!(
-                "{}\n\n{}",
-                self.config.system_prompt, self.config.prompts.tool_loop
-            );
-            let mut prompt = self.assemble_system_prompt(&combined, include_user);
+            let mut prompt = self.assemble_system_prompt(&self.config.system_prompt, include_user);
+            prompt.push_str("\n\n");
+            prompt.push_str(&self.config.prompts.tool_loop);
             if let Some(peer) = dm_peer {
                 prompt.push_str(&Self::dm_addendum(peer));
             }

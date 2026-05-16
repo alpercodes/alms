@@ -55,8 +55,11 @@ continuation guidance.
 **Code path**: `agent_loop()` in `agent/loop_impl.rs` -- after processing tool results, the
 system message at `messages[0]` is rebuilt as:
 ```
-assemble_system_prompt(initial_prompt + "\n\n" + tool_loop_prompt)
+assemble_system_prompt(initial_prompt) + "\n\n" + tool_loop_prompt
 ```
+i.e. the base prompt and workspace prefix are assembled first, then the
+`tool_loop` continuation guidance is appended on top. For DM sessions the
+DM addendum is appended last (see § "Prompt Assembly Order").
 
 ### `dm_recipient.md` -- Direct Message Sessions
 
@@ -105,29 +108,40 @@ on what was accomplished, not internal steps.
 
 ## Prompt Assembly Order
 
-The full system prompt seen by the LLM is assembled in layers:
+The full system prompt seen by the LLM is assembled in layers, with the
+foundational role/identity prompt first and agent-specific personalization
+appended after it:
 
-1. **Workspace prefix** (optional): If the agent has a workspace attached,
-   `build_system_prompt_prefix()` reads workspace files in this order:
+1. **Base prompt**: Either `initial.md` (normal runs) or `bootstrap.md` (first-time
+   setup). This is the foundational role/identity prompt and always comes first.
+
+2. **Workspace prefix** (optional): If the agent has a workspace attached,
+   `build_system_prompt_prefix()` reads workspace files and appends them after
+   the base prompt: `{base_prompt}\n\n{workspace_prefix}`. The workspace files
+   are concatenated in this internal order:
    - `personality.md` (raw content)
    - `goals.md` (prefixed with `## Current Goals`)
    - `user.md` (prefixed with `## About the User`) — **conditional**: skipped for
      non-user-facing sessions (DM, subagent, and job contexts) to save tokens
    - `memories.md` (prefixed with `## Memories`, truncated at 4000 chars)
 
-2. **Base prompt**: Either `initial.md` (normal runs) or `bootstrap.md` (first-time
-   setup). These are joined as: `{workspace_prefix}\n\n{base_prompt}`
-
-3. **DM addendum** (optional): For DM sessions, `dm_recipient.md` (with `{peer}`
-   replaced) is appended after the base prompt: `{assembled}\n\n{dm_addendum}`
-
-4. **Tool loop addendum** (after first tool round): On subsequent LLM calls in the
+3. **Tool loop addendum** (after first tool round): On subsequent LLM calls in the
    same agent loop, the system message is rebuilt as:
-   `{workspace_prefix}\n\n{base_prompt}\n\n{tool_loop_prompt}`
-   For DM sessions, the DM addendum is also re-injected after the tool loop prompt:
-   `{workspace_prefix}\n\n{base_prompt}\n\n{tool_loop_prompt}\n\n{dm_addendum}`
-   This ensures the agent retains awareness that it must use `send_message` to reply,
-   even after processing tool calls (fixes #346).
+   `{base_prompt}\n\n{workspace_prefix}\n\n{tool_loop_prompt}`
 
-The assembly is handled by `assemble_system_prompt()` which prepends the workspace
-prefix to any base prompt string.
+4. **DM addendum** (optional, always last): For DM sessions, `dm_recipient.md`
+   (with `{peer}` replaced) is appended at the very end:
+   `{base_prompt}\n\n{workspace_prefix}\n\n{dm_addendum}` on the first turn, and
+   `{base_prompt}\n\n{workspace_prefix}\n\n{tool_loop_prompt}\n\n{dm_addendum}`
+   on subsequent tool-loop turns. This ensures the agent retains awareness that
+   it must use `send_message` to reply, even after processing tool calls (fixes #346).
+
+The base + workspace assembly is handled by `assemble_system_prompt()`. The
+order matches common LLM prompting practice — role/identity first, personalization
+later — and puts the most specific instructions nearer the end of the system block.
+
+Note: this ordering does **not** in itself improve Anthropic prompt-cache hit rates.
+The cache breakpoint in `anthropic.rs` attaches `cache_control` to the entire trailing
+system block atomically, so any byte drift inside that block (workspace updates,
+memory edits) invalidates the cached prefix regardless of the internal order. The
+swap is structurally good but is cache-neutral.

@@ -2010,6 +2010,149 @@ async fn test_dm_addendum_survives_tool_loop_rebuild() {
     );
 }
 
+// ---- System prompt assembly order regression tests ----
+//
+// These tests pin the layer order `base -> workspace -> tool_loop ->
+// dm_addendum` documented in `docs/system-prompts.md` § "Prompt Assembly
+// Order". The base prompt comes first (foundational role/identity), the
+// workspace prefix (agent-specific personalization) follows, and any
+// stage-specific addenda (tool_loop continuation, DM recipient hint) come
+// after that. This order matches common LLM prompting practice and keeps
+// the stable base prompt at the head of the system block — which improves
+// Anthropic prompt-cache hit rates when workspace content drifts.
+
+/// Non-DM, non-tool-loop turn: the base prompt comes first, then the
+/// workspace prefix follows. This is the canonical assembly produced by
+/// `assemble_system_prompt`.
+#[tokio::test]
+async fn test_system_prompt_order_base_before_workspace() {
+    use crate::workspace::AgentWorkspace;
+    use tempfile::tempdir;
+
+    let dir = tempdir().unwrap();
+    let agents_dir = dir.path().to_path_buf();
+    let agent_meta = agents_dir.join("alice");
+    std::fs::create_dir_all(&agent_meta).unwrap();
+    std::fs::write(
+        agent_meta.join("personality.md"),
+        "I am Alice, a concise coding assistant.",
+    )
+    .unwrap();
+    std::fs::write(agent_meta.join("goals.md"), "Help with Rust.").unwrap();
+
+    let config = LlmConfig {
+        mock: true,
+        ..LlmConfig::default()
+    };
+    let agent_config = AgentConfig {
+        // A distinctive base prompt we can search for unambiguously.
+        system_prompt: "BASE_PROMPT_MARKER: foundational identity.".to_string(),
+        sandbox_root: "".into(),
+        ..AgentConfig::default()
+    };
+    let runtime = AgentRuntime::new(
+        AgentId::new(),
+        agent_config,
+        LlmClient::new(config).unwrap(),
+    )
+    .unwrap()
+    .with_workspace(AgentWorkspace::new(&agents_dir, "alice"));
+
+    let assembled = runtime.assemble_system_prompt(&runtime.config.system_prompt, true);
+
+    let base_pos = assembled
+        .find("BASE_PROMPT_MARKER")
+        .expect("assembled prompt must contain the base prompt marker");
+    let personality_pos = assembled
+        .find("Alice, a concise coding assistant")
+        .expect("assembled prompt must contain the workspace personality");
+    let goals_pos = assembled
+        .find("## Current Goals")
+        .expect("assembled prompt must contain the workspace goals heading");
+
+    assert!(
+        base_pos < personality_pos,
+        "Base prompt must come before workspace personality. Got:\n{assembled}"
+    );
+    assert!(
+        personality_pos < goals_pos,
+        "Workspace internal order (personality -> goals) must be preserved. Got:\n{assembled}"
+    );
+}
+
+/// DM session, tool-loop iteration: the order must be
+/// `base -> workspace -> tool_loop -> dm_addendum`. This pins the full
+/// four-layer assembly and guards `rebuild_system_prompt_for_tool_loop`
+/// against accidental reordering.
+#[tokio::test]
+async fn test_system_prompt_order_dm_tool_loop_layers() {
+    use crate::workspace::AgentWorkspace;
+    use tempfile::tempdir;
+
+    let dir = tempdir().unwrap();
+    let agents_dir = dir.path().to_path_buf();
+    let agent_meta = agents_dir.join("bob");
+    std::fs::create_dir_all(&agent_meta).unwrap();
+    std::fs::write(
+        agent_meta.join("personality.md"),
+        "I am Bob, a methodical reviewer.",
+    )
+    .unwrap();
+
+    let config = LlmConfig {
+        mock: true,
+        ..LlmConfig::default()
+    };
+    let agent_config = AgentConfig {
+        system_prompt: "BASE_PROMPT_MARKER: bob's identity.".to_string(),
+        sandbox_root: "".into(),
+        ..AgentConfig::default()
+    };
+    let runtime = AgentRuntime::new(
+        AgentId::new(),
+        agent_config,
+        LlmClient::new(config).unwrap(),
+    )
+    .unwrap()
+    .with_agent_name("bob".to_string())
+    .with_workspace(AgentWorkspace::new(&agents_dir, "bob"));
+
+    // Simulate the tool-loop rebuild path with a DM peer.
+    let mut messages = vec![LlmMessage::system("placeholder".to_string())];
+    // Non-user-facing context: `user.md` is omitted but personality is included.
+    runtime.rebuild_system_prompt_for_tool_loop(&mut messages, false, Some("alice"));
+    let assembled = messages[0].content.as_deref().unwrap_or("");
+
+    let base_pos = assembled
+        .find("BASE_PROMPT_MARKER")
+        .expect("rebuilt prompt must contain the base prompt marker");
+    let personality_pos = assembled
+        .find("Bob, a methodical reviewer")
+        .expect("rebuilt prompt must contain the workspace personality");
+    // The tool_loop prompt content is loaded from `prompts/tool_loop.md`;
+    // search for its actual configured value to avoid coupling to file
+    // contents.
+    let tool_loop_pos = assembled
+        .find(&runtime.config.prompts.tool_loop)
+        .expect("rebuilt prompt must contain the tool_loop continuation guidance");
+    let dm_pos = assembled
+        .find("direct message from agent \"alice\"")
+        .expect("rebuilt prompt must contain the DM addendum for peer 'alice'");
+
+    assert!(
+        base_pos < personality_pos,
+        "Order layer 1->2 violated (base before workspace). Got:\n{assembled}"
+    );
+    assert!(
+        personality_pos < tool_loop_pos,
+        "Order layer 2->3 violated (workspace before tool_loop). Got:\n{assembled}"
+    );
+    assert!(
+        tool_loop_pos < dm_pos,
+        "Order layer 3->4 violated (tool_loop before dm_addendum). Got:\n{assembled}"
+    );
+}
+
 // ---- send_message / ignore_message conflict detection tests (#364) ----
 //
 // These tests exercise `detect_dm_conflict` for request-level conflict

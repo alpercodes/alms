@@ -46,12 +46,14 @@ impl std::str::FromStr for Posture {
 ///
 /// Developer-controlled prompt files embedded at compile time from
 /// `crates/alms-runtime/prompts/`. Not user-editable — workspace files
-/// (personality, goals, memories, user) are prepended to both stages.
+/// (personality, goals, memories, user) are appended after the base
+/// prompt at both stages (see `docs/system-prompts.md` § Prompt Assembly
+/// Order).
 ///
 /// The initial prompt comes from `AgentConfig.system_prompt` (defaults to
 /// `prompts/initial.md`, overridable per-agent). `tool_loop` is appended
-/// to the initial prompt after tool results — it never replaces the
-/// agent's identity.
+/// after the workspace prefix on subsequent LLM calls — it never replaces
+/// the agent's identity.
 #[derive(Debug, Clone)]
 pub struct SystemPrompts {
     /// Appended to the system prompt for LLM calls after tool results.

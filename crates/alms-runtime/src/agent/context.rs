@@ -11,8 +11,22 @@ use tracing::{debug, error, info, warn};
 use super::AgentRuntime;
 
 impl AgentRuntime {
-    /// Assemble the full system prompt for a given stage, prepending workspace
+    /// Assemble the full system prompt for a given stage, appending workspace
     /// files if attached.
+    ///
+    /// Order is `{base_prompt}\n\n{workspace_prefix}` so the foundational
+    /// role/identity prompt comes first and agent-specific personalization
+    /// (personality / goals / user / memories) follows. This matches common
+    /// LLM prompting practice (role/identity first, personalization later)
+    /// and puts the most specific instructions nearer the end of the system
+    /// block.
+    ///
+    /// Note: this swap is structurally cleaner but does not in itself improve
+    /// Anthropic prompt-cache hit rates. The cache breakpoint in
+    /// `anthropic.rs` attaches `cache_control` to the entire trailing system
+    /// block atomically, so any byte drift inside that block (workspace
+    /// updates, memory edits) invalidates the cached prefix regardless of
+    /// internal order.
     ///
     /// When `include_user` is false, `user.md` is omitted from the workspace
     /// prefix. This is used for non-user-facing sessions (DM, subagent, job).
@@ -22,7 +36,7 @@ impl AgentRuntime {
             if prefix.is_empty() {
                 base_prompt.to_string()
             } else {
-                format!("{}\n\n{}", prefix, base_prompt)
+                format!("{}\n\n{}", base_prompt, prefix)
             }
         } else {
             base_prompt.to_string()

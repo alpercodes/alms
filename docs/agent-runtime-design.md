@@ -272,18 +272,20 @@ The gateway's run-lifecycle wires these in a deterministic order: spill / tool-o
 
 **How they feed into the system prompt:**
 
-The workspace prefix is assembled by `build_system_prompt_prefix()` in `workspace.rs` and prepended to the base system prompt. The order is:
+The workspace prefix is assembled by `build_system_prompt_prefix()` in `workspace.rs` and **appended** after the base system prompt. The order is:
 
 ```
 System prompt = [
+  base_prompt (initial.md or bootstrap.md),
+  "\n\n",
   personality.md contents (raw, if exists),
   "## Current Goals\n" + goals.md contents (if exists),
   "## About the User\n" + user.md contents (if exists, user-facing sessions only),
-  "## Memories\n" + memories.md contents (if exists, truncated at 4000 chars),
-  "\n\n",
-  base_prompt (initial.md or bootstrap.md)
+  "## Memories\n" + memories.md contents (if exists, truncated at 4000 chars)
 ]
 ```
+
+The foundational role/identity prompt comes first; agent-specific personalization is appended after it, matching common LLM prompting practice (role/identity first, personalization later). See `docs/system-prompts.md` § "Prompt Assembly Order" for the canonical reference.
 
 For non-user-facing sessions (DM, subagent, job), `user.md` is omitted from the prefix to save tokens and avoid confusion.
 
