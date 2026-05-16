@@ -575,11 +575,36 @@ export function mapHistoryMessages(msgs, opts) {
  *
  * Scans the flat entry list produced by mapHistoryMessages and collects
  * `dm_reasoning_text` entries and `tool` entries that share the same
- * `runId` (and have `isReasoning` set). Each group is replaced with a
- * single `dm_reasoning` block entry at the position of the earliest
- * member. Non-reasoning entries pass through unchanged.
+ * `runId`. Each group is replaced with a single `dm_reasoning` block entry
+ * at the position of the earliest member. Non-reasoning entries pass
+ * through unchanged.
  *
  * Empty blocks (no tools, no thinking text) are omitted.
+ *
+ * ## Canonical DM-attribution surfaces (#1076)
+ *
+ * The two places that decide "is this content the agent's own vs. a
+ * peer's" — and where they sit in the pipeline — are:
+ *
+ * 1. **Backend, context-build time**:
+ *    `crates/alms-runtime/src/context.rs` — `apply_perspective()` flips
+ *    `Role::User` <-> `Role::Assistant` based on `from_agent` metadata,
+ *    and the `is_reasoning_message` filter above it strips ALL
+ *    `message_type: "reasoning"` rows so peer reasoning never enters
+ *    the LLM context. If you ever see peer chain-of-thought leaking
+ *    into a model prompt, this is the surface to audit.
+ *
+ * 2. **Frontend, DM-session render**:
+ *    - `groupDmReasoningBlocks` (this function) — buckets the flat
+ *      history entry list by `runId` into `dm_reasoning` blocks. Live
+ *      streaming has a parallel surface in
+ *      `hooks/use-session-stream.js::on('tool_start')` which appends
+ *      tool entries directly into the live block.
+ *    - `components/chat/dm-conversation-view.js::DmReasoningBlock` —
+ *      renders the collapsible header + body. Tools are rendered
+ *      INSIDE the collapsible by design; the sibling `m.type === 'tool'`
+ *      branch in `DmConversationView` is a defensive fallback for
+ *      entries that couldn't be grouped, not the canonical path.
  *
  * @param {Array} entries - flat chat message entries from mapHistoryMessages
  * @returns {Array} entries with reasoning groups collapsed into dm_reasoning blocks
@@ -604,7 +629,17 @@ export function groupDmReasoningBlocks(entries) {
             continue;
         }
 
-        if (e.type === 'tool' && e.runId && e.isReasoning) {
+        if (e.type === 'tool' && e.runId) {
+            // Every tool entry with a runId belongs to its run's reasoning
+            // block — this function only runs on DM history, where the
+            // canonical UX is that tool calls are grouped under the agent's
+            // collapsible. The earlier `e.isReasoning` requirement caused
+            // tools to leak out as sibling rows whenever the persistence
+            // path that produced the entry happened to omit the flag (e.g.
+            // session_messages entries without `metadata.message_type ===
+            // "reasoning"` — possible for legacy rows or fire-and-forget
+            // races). Drop the gate so attribution is consistent regardless
+            // of which storage path the entry came through (#1076).
             reasoningIndices.add(i);
             const group = groups.get(e.runId) || {
                 agentName: null, thinkingText: '', tools: [], firstIdx: i,
@@ -634,11 +669,21 @@ export function groupDmReasoningBlocks(entries) {
             const runId = e.runId;
             if (runId && groups.has(runId) && !inserted.has(runId)) {
                 const group = groups.get(runId);
-                // Skip empty blocks (no visible tools, no thinking text).
-                const visibleTools = group.tools.filter(
-                    t => !(t.tool === 'send_message' && t.status === 'done')
-                );
-                if (visibleTools.length > 0 || (group.thinkingText && group.thinkingText.trim())) {
+                // Skip empty blocks (no tools at all, no thinking text).
+                //
+                // Count the UNFILTERED tools array — `send_message:done`
+                // entries still represent a real agent turn that must
+                // surface the collapsible header. This mirrors the
+                // render-time hide predicate in DmReasoningBlock
+                // (`(tools || []).length > 0`) so the live path (which
+                // bypasses this grouper and hits DmReasoningBlock directly)
+                // and the reload path (which flows through this grouper)
+                // agree on whether a block exists for a given run. Without
+                // this alignment, a `send_message:done`-only run with no
+                // thinking text emitted a collapsible live but lost it
+                // after reload — the exact symptom #1076 set out to fix,
+                // surviving on the reload path (#1083).
+                if (group.tools.length > 0 || (group.thinkingText && group.thinkingText.trim())) {
                     result.push({
                         id: nextMsgId(),
                         type: 'dm_reasoning',

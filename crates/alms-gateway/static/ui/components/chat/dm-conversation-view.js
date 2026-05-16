@@ -168,8 +168,16 @@ function DmReasoningBlock({ runId, agentName, thinkingText, tools, status, isLiv
     );
     const toolCount = visibleTools.length;
 
-    // Empty + sealed blocks are hidden entirely.
-    if (!isLive && toolCount === 0 && (!displayThinking || !displayThinking.trim())) {
+    // Hide only when the run produced no tool calls at all AND no thinking
+    // text — this is the "notification-only" / "empty run" shape that has
+    // no per-turn affordance to carry. Runs that fired any tool (including
+    // a hidden send_message-done) represent a real agent turn and must
+    // always render the collapsible header, even when the chain-of-thought
+    // is empty or deduped against the reply body. Without this rule the
+    // collapsible blinks in and out across turns depending on whether the
+    // model emitted reasoning text identical to the reply (#1076).
+    const hadAnyTool = (tools || []).length > 0;
+    if (!isLive && !hadAnyTool && (!displayThinking || !displayThinking.trim())) {
         return null;
     }
 
@@ -348,13 +356,21 @@ export function DmConversationView() {
                         // Only show the tool row if it errored so the user sees the failure.
                         if (m.status === 'done' && !m.error) return null;
                     }
-                    // Tool calls in DMs: render a styled ToolRow on the
-                    // side of the agent that executed them. Tool messages
-                    // don't have fromAgent, so attribute them to the
-                    // perspective agent (whose run produced the tool call).
-                    // This matches the assistant-message side assignment
-                    // logic in messageSide() for messages without fromAgent.
-                    // (#652)
+                    // Defensive fallback for tool entries that could not be
+                    // grouped into a `dm_reasoning` block — i.e. they have
+                    // no `runId`. Post-#1076 the grouping no longer requires
+                    // `isReasoning`, so every tool with a `runId` lands
+                    // inside its block; only legacy / corrupt rows trip
+                    // this path. The canonical render path for DM tool
+                    // calls is INSIDE `DmReasoningBlock`. Keep this branch
+                    // so a missing-runId row still renders somewhere
+                    // instead of disappearing silently. (#1076)
+                    //
+                    // Tool messages don't have fromAgent, so attribute them
+                    // to the perspective agent (whose run produced the tool
+                    // call). This matches the assistant-message side
+                    // assignment logic in messageSide() for messages without
+                    // fromAgent. (#652)
                     const toolSide = messageSide(
                         { type: 'agent', role: 'assistant' },
                         participants,

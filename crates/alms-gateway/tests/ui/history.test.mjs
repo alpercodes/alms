@@ -273,3 +273,180 @@ test('#767 sanity: agent messages expose metadata.reasoning_blocks as `reasoning
     assert.equal(e.text, 'visible reply');
     assert.equal(e.reasoning, 'plan A plan B');
 });
+
+// ---------------------------------------------------------------------------
+// #1076: DM reasoning attribution must not drop tool entries that arrived
+// without `isReasoning` set on them.
+// ---------------------------------------------------------------------------
+//
+// Two persistence paths can produce DM tool entries:
+//   1. session_messages rows with `metadata.message_type === "reasoning"`
+//      (handled by the `tool_call` branch in mapHistoryMessages)
+//   2. run_tool_calls rows merged in via the `sessionToolCalls` block —
+//      these set `isReasoning: isDm || undefined`.
+//
+// Before #1076, `groupDmReasoningBlocks` required BOTH `runId` AND
+// `isReasoning`. Any tool entry slipped through without `isReasoning` (for
+// example, a session_messages tool_call row whose metadata lacked the
+// `message_type: reasoning` marker — possible for legacy rows, or when a
+// later runtime change writes the tool call before tagging it) rendered as
+// a stand-alone sibling row instead of being grouped under the agent's
+// collapsible. Drop the `isReasoning` gate so attribution stays consistent
+// regardless of which storage path the entry came through.
+
+test('#1076: tool entries with runId but no isReasoning still group into dm_reasoning block', () => {
+    // Build a flat entry list directly (we are testing the grouping pass,
+    // not the upstream mapping path). `mapHistoryMessages` produces
+    // `isReasoning: true` for entries that come through the reasoning
+    // metadata path; here we simulate the "leaky" path where a tool entry
+    // arrives with a runId but without the flag (the bug condition).
+    const flat = [
+        {
+            id: 'msg-1',
+            type: 'dm_reasoning_text',
+            runId: 'run-A',
+            fromAgent: 'iris',
+            text: 'thinking about response',
+            ts: '2026-05-14T12:00:01Z',
+        },
+        {
+            id: 'msg-2',
+            type: 'tool',
+            tool: 'fs_read',
+            params: { path: 'foo.txt' },
+            status: 'done',
+            result: 'contents',
+            runId: 'run-A',
+            // isReasoning intentionally omitted to model the bug condition.
+            fromAgent: 'iris',
+            ts: '2026-05-14T12:00:02Z',
+        },
+    ];
+
+    const grouped = groupDmReasoningBlocks(flat);
+
+    // The text + the tool must collapse into ONE dm_reasoning block — no
+    // stray sibling tool row left behind.
+    assert.equal(grouped.length, 1, 'tool without isReasoning must be absorbed into the block');
+    const block = grouped[0];
+    assert.equal(block.type, 'dm_reasoning');
+    assert.equal(block.runId, 'run-A');
+    assert.equal(block.agentName, 'iris');
+    assert.equal(block.tools.length, 1);
+    assert.equal(block.tools[0].tool, 'fs_read');
+    assert.equal(block.thinkingText, 'thinking about response');
+});
+
+test('#1076: tool-only run (no thinking text) groups into a block when runId is set', () => {
+    // A DM turn where the model went straight to a tool call without
+    // emitting any chain-of-thought. The block must still materialise so
+    // the per-turn affordance is consistent across runs — DmReasoningBlock
+    // takes care of suppressing the header when truly empty, but a block
+    // with a real tool call inside is NOT empty.
+    const flat = [
+        {
+            id: 'msg-1',
+            type: 'tool',
+            tool: 'shell',
+            params: { command: 'ls' },
+            status: 'done',
+            result: 'a.txt b.txt',
+            runId: 'run-B',
+            fromAgent: 'aero',
+            ts: '2026-05-14T12:01:00Z',
+        },
+    ];
+
+    const grouped = groupDmReasoningBlocks(flat);
+    assert.equal(grouped.length, 1);
+    const block = grouped[0];
+    assert.equal(block.type, 'dm_reasoning');
+    assert.equal(block.agentName, 'aero');
+    assert.equal(block.tools.length, 1);
+    assert.equal(block.thinkingText, '');
+});
+
+test('#1076: tools WITHOUT a runId still pass through as sibling rows (defensive fallback)', () => {
+    // The post-#1076 grouping only requires a `runId`; entries that lack
+    // one (legacy / malformed rows) must still render somewhere instead of
+    // disappearing. DmConversationView renders these as sibling tool rows.
+    const flat = [
+        {
+            id: 'msg-1',
+            type: 'tool',
+            tool: 'shell',
+            status: 'done',
+            // runId intentionally absent.
+            ts: '2026-05-14T12:02:00Z',
+        },
+    ];
+
+    const grouped = groupDmReasoningBlocks(flat);
+    assert.equal(grouped.length, 1);
+    assert.equal(grouped[0].type, 'tool', 'rowless tool must survive grouping as a sibling entry');
+});
+
+// ---------------------------------------------------------------------------
+// #1083: reload-path emission filter must mirror the render-time hide rule
+// in DmReasoningBlock so a DM-reply turn whose only tool is `send_message`
+// (status: done) and which has no thinking text still emits a
+// `dm_reasoning` block.
+// ---------------------------------------------------------------------------
+//
+// Symptom 1 from #1076 was fixed at the render layer by changing
+// DmReasoningBlock's hide predicate to count the UNFILTERED tools array
+// (`(tools || []).length > 0`). But the upstream emission filter in
+// `groupDmReasoningBlocks` was still filtering `visibleTools` (excluding
+// `send_message:done`) before deciding whether to emit a block at all.
+//
+// Result: live path emitted the block (SSE handler bypasses the grouper and
+// goes straight to DmReasoningBlock), reload path silently dropped it
+// (grouper's emission filter rejected before reaching the render). The
+// collapsible blinked into existence on the live turn and vanished after
+// reload — exactly the symptom #1076 set out to kill, surviving on the
+// reload path.
+//
+// This test pins the reload-path behaviour: a `send_message:done`-only run
+// with no thinking text MUST emit a dm_reasoning block. DmReasoningBlock's
+// render-time rule then decides whether the header is visible.
+
+test('#1083: send_message:done-only run with no thinking text still emits a dm_reasoning block', () => {
+    // The exact shape of a DM-reply turn that fires the asymmetry: a single
+    // `send_message` tool entry (status: done) attached to a runId, with
+    // NO accompanying `dm_reasoning_text` entry. Before the fix, the
+    // emission filter at history.js:676 counted only `visibleTools`
+    // (send_message:done excluded), so the block was never emitted on
+    // reload. After the fix, the emission filter mirrors the render-time
+    // rule and emits the block; DmReasoningBlock then renders the
+    // collapsible header (`hadAnyTool` is true).
+    const flat = [
+        {
+            id: 'msg-1',
+            type: 'tool',
+            tool: 'send_message',
+            params: { message: 'hello there' },
+            status: 'done',
+            result: 'ok',
+            runId: 'run-1083',
+            fromAgent: 'iris',
+            ts: '2026-05-16T10:00:00Z',
+        },
+    ];
+
+    const grouped = groupDmReasoningBlocks(flat);
+
+    // Must emit a dm_reasoning block, not a sibling tool row.
+    assert.equal(grouped.length, 1, 'send_message:done-only run must produce a single grouped block');
+    const block = grouped[0];
+    assert.equal(block.type, 'dm_reasoning', 'block must be of type dm_reasoning (not a stray tool row)');
+    assert.equal(block.runId, 'run-1083');
+    assert.equal(block.agentName, 'iris');
+    assert.equal(block.tools.length, 1);
+    assert.equal(block.tools[0].tool, 'send_message');
+    assert.equal(block.tools[0].status, 'done');
+    assert.equal(
+        block.thinkingText,
+        '',
+        'thinkingText is empty — the render path decides visibility based on (tools || []).length',
+    );
+});
