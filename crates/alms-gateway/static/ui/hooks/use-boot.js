@@ -1,7 +1,7 @@
 import { fetchSettings } from '../api/settings.js';
 import { listSessions, createSession, getSessionMessages } from '../api/sessions.js';
 import { agents, activeAgentId } from '../state/agents.js';
-import { sessions, activeSessionId, showNotifications, crossAgentSessions, expandedAgentId } from '../state/sessions.js';
+import { sessions, activeSessionId, crossAgentSessions, expandedAgentId } from '../state/sessions.js';
 import { activeRunId, selectedRunId, runs } from '../state/runs.js';
 import { serverDefaults } from '../state/settings.js';
 import { replaceMessages } from '../state/chat-actions.js';
@@ -14,7 +14,7 @@ import { openAgentEventsStream, closeAgentEventsStream } from './use-agent-event
 import { bumpSelectGeneration } from '../state/select-generation.js';
 import { loadSession } from '../utils/load-session.js';
 import { clearAllSubagents } from '../state/subagents.js';
-import { defaultExpandedAgent } from '../utils/sidebar-grouping.js';
+import { defaultExpandedAgent, filterChatSessions } from '../utils/sidebar-grouping.js';
 
 const AGENT_KEY = 'alms_active_agent';
 
@@ -166,9 +166,11 @@ export async function boot() {
  */
 export async function fetchCrossAgentSurfaces() {
     try {
+        // Notifications are always returned by `/sessions` (no opt-in
+        // flag); DMs are still gated on `include_dms` so the cross-agent
+        // fetch picks them up alongside chats + notifications.
         const data = await listSessions(null, {
             includeDms: true,
-            includeNotifications: showNotifications.value,
         });
         return data.sessions || [];
     } catch (err) {
@@ -193,21 +195,32 @@ async function loadAgentSessions(agentId, preferredSessionId) {
 
     try {
         // Fan-out: per-agent chat-session list + cross-agent DM /
-        // notification list run in parallel. The per-agent call no
-        // longer asks for DMs / notifications because `SessionList`
-        // sources both surfaces exclusively from `crossAgentSessions`
-        // and filters them out of the per-agent list before grouping
-        // (Tim review #2 on PR #1010 — the per-agent flags were
-        // redundant payload that never reached the renderer).
+        // notification list run in parallel. The per-agent call asks
+        // only for chats (no `include_dms`) because `SessionList`
+        // sources DMs / notifications exclusively from
+        // `crossAgentSessions` and filters them out of the per-agent
+        // list before grouping (Tim review #2 on PR #1010 — the
+        // per-agent flags were redundant payload that never reached
+        // the renderer). Notification rows still arrive on the
+        // per-agent call because `/sessions` now unconditionally
+        // returns them (PR #1100 removed the opt-in toggle), so we
+        // filter them out here via `filterChatSessions` before
+        // assigning to `sessions.value` — Codex P2 on PR #1100 caught
+        // that without this filter, an agent whose only session
+        // activity is a notification would skip the chat-creation
+        // fallback below and land in a read-only notification view at
+        // boot. The per-agent `sessions` signal semantically means
+        // "this agent's chat sessions" — notifications belong in the
+        // sidebar's dedicated cross-agent Notifications section,
+        // sourced from `crossAgentSessions`.
         const [data, crossAgent] = await Promise.all([
             listSessions(agentId, {
                 includeDms: false,
-                includeNotifications: false,
             }),
             fetchCrossAgentSurfaces(),
         ]);
         if (gen !== switchGeneration) return; // stale — discard
-        const agentSessions = data.sessions || [];
+        const agentSessions = filterChatSessions(data.sessions || []);
         sessions.value = agentSessions;
         crossAgentSessions.value = crossAgent;
 
@@ -215,6 +228,13 @@ async function loadAgentSessions(agentId, preferredSessionId) {
         // `has_active_run` snapshot so the sidebar's yellow dot shows
         // up immediately on boot / agent switch / reload-mid-run, even
         // before the first SSE event arrives on the agent feed.
+        //
+        // Tim observation on PR #1100: this iterates `agentSessions`,
+        // which is already chat-only after `filterChatSessions` above.
+        // Notification rows always carry `has_active_run = false`
+        // anyway (notifications never run), but keeping the filter
+        // upstream of this loop means any future consumer of
+        // `agentSessions` doesn't have to remember the contract.
         const seedBg = {};
         for (const s of agentSessions) {
             if (s.has_active_run) {
@@ -275,12 +295,14 @@ async function loadAgentSessions(agentId, preferredSessionId) {
             const [reloaded, reloadedCross] = await Promise.all([
                 listSessions(agentId, {
                     includeDms: false,
-                    includeNotifications: false,
                 }),
                 fetchCrossAgentSurfaces(),
             ]);
             if (gen !== switchGeneration) return; // stale — discard
-            sessions.value = reloaded.sessions || [];
+            // Same notification-filter contract as the initial fetch
+            // above — `/sessions` always returns notifications post
+            // PR #1100, but `sessions.value` is per-agent chats only.
+            sessions.value = filterChatSessions(reloaded.sessions || []);
             crossAgentSessions.value = reloadedCross;
             activeSessionId.value = resp.session_id;
             replaceMessages([]);

@@ -139,9 +139,8 @@ export function InputArea() {
     // so we drive its `.value` imperatively via the ref. The queue is a
     // global signal — every session-switch reducer wipes it to `[]`
     // (navigate-session, session-list newSession, timeline-tab,
-    // toggleNotifications, switchAgent), so this effect re-hydrates it
-    // from the per-session storage entry rather than racing those
-    // reducers. (#975 / #981)
+    // switchAgent), so this effect re-hydrates it from the per-session
+    // storage entry rather than racing those reducers. (#975 / #981)
     useEffect(() => {
         const el = promptRef.current;
         if (el) {

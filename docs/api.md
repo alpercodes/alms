@@ -122,16 +122,17 @@ But channels (Telegram) naturally bring `context_id` (chat id). So MVP should su
 ### 4.1 List sessions
 `GET /sessions`
 
-Returns all active sessions. Internal sessions (DM, notifications, episodic,
-subagent, job) are excluded by default.
+Returns all active sessions. Truly internal sessions (episodic, subagent,
+job) are excluded by default. Notification sessions (`notifications:*`)
+are always returned and participate in the `agent_id` filter; DM
+sessions are gated on `include_dms`.
 
 **Query parameters**
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `agent_id` | UUID | _(none)_ | Filter sessions by agent UUID. Does not apply to DM sessions (they use a nil sentinel agent). |
+| `agent_id` | UUID | _(none)_ | Filter sessions by agent UUID. Applies to chat, notification, and other agent-keyed sessions. Does not apply to DM sessions (they use a nil sentinel agent). |
 | `include_dms` | bool | `false` | When `true`, DM sessions (`dm:*` context IDs) are included alongside regular sessions. Other internal session types remain excluded. |
-| `include_notifications` | bool | `false` | When `true`, notification sessions (`notifications:*` context IDs) are included. These contain agent activity triggered by DM conversation endings, subagent completions, etc. The `agent_id` filter applies to notification sessions. |
 
 **Response 200**
 ```json
@@ -194,8 +195,9 @@ subagent, job) are excluded by default.
 | `"subagent"` | `subagent_{task}` | Subagent execution session. |
 | `"episodic"` | `episodic:{id}` | Episodic memory session. |
 
-> **Note**: DM sessions only appear when `?include_dms=true` is set. Notification sessions only appear when `?include_notifications=true` is set.
+> **Note**: DM sessions only appear when `?include_dms=true` is set.
 > DM sessions use `AgentId::nil()` as a sentinel, so the `agent_id` filter does not apply to them.
+> Notification sessions are always included in the response and participate in the `agent_id` filter.
 > Job, subagent, and episodic sessions are always excluded from the listing.
 
 ### 4.2 Create session

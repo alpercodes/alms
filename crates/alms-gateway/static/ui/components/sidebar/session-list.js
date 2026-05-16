@@ -1,5 +1,5 @@
 import { html, batch, useSignal } from '../../deps.js';
-import { sessions, activeSessionId, showNotifications, crossAgentSessions, expandedAgentId } from '../../state/sessions.js';
+import { sessions, activeSessionId, crossAgentSessions, expandedAgentId } from '../../state/sessions.js';
 import { agents, activeAgentId, activeAgent } from '../../state/agents.js';
 import { replaceMessages } from '../../state/chat-actions.js';
 import { activeRunId, selectedRunId, runs } from '../../state/runs.js';
@@ -7,13 +7,11 @@ import { bgRuns, messageQueue } from '../../state/queue.js';
 import { auditEvents } from '../../state/audit.js';
 import { listSessions, createSession, deleteSession } from '../../api/sessions.js';
 import { openSessionStream, closeSessionStream } from '../../hooks/use-session-stream.js';
-import { clearAllSubagents, parentSessionId } from '../../state/subagents.js';
+import { clearAllSubagents } from '../../state/subagents.js';
 import { saveActiveSession, switchAgent, fetchCrossAgentSurfaces } from '../../hooks/use-boot.js';
 import { bumpSelectGeneration } from '../../state/select-generation.js';
 import { navigateToSession } from '../../utils/navigate-session.js';
 import { clearComposerState } from '../../state/composer-storage.js';
-import { sessionSwitchLoading } from '../../state/loading.js';
-import { loadSession } from '../../utils/load-session.js';
 import {
     expandAgent,
     isAgentExpanded,
@@ -69,7 +67,6 @@ async function newSession() {
         const [data, cross] = await Promise.all([
             listSessions(activeAgentId.value, {
                 includeDms: true,
-                includeNotifications: showNotifications.value,
             }),
             fetchCrossAgentSurfaces(),
         ]);
@@ -198,7 +195,6 @@ function SessionItem({ session, activeAgentName }) {
             const [data, cross] = await Promise.all([
                 listSessions(activeAgentId.value, {
                     includeDms: true,
-                    includeNotifications: showNotifications.value,
                 }),
                 fetchCrossAgentSurfaces(),
             ]);
@@ -261,87 +257,6 @@ function SessionItem({ session, activeAgentName }) {
             }
         </div>
     `;
-}
-
-/**
- * Internal session types that are hidden when notifications are toggled off.
- */
-const INTERNAL_SESSION_TYPES = new Set(['notification', 'job', 'subagent']);
-
-/**
- * Toggle notification session visibility.  Persists the choice to
- * localStorage and reloads the session list from the API.
- *
- * When toggling OFF, if the currently active session is an internal
- * type (notification/job/subagent), we navigate away to the first
- * available chat session to avoid leaving a hidden session active
- * (which would render InputArea instead of the read-only footer).
- */
-async function toggleNotifications() {
-    const next = !showNotifications.value;
-    showNotifications.value = next;
-    localStorage.setItem('alms_show_notifications', String(next));
-
-    if (!activeAgentId.value) return;
-
-    try {
-        // Reload both per-agent and cross-agent surfaces so the new
-        // notifications-toggle state is reflected for every agent's
-        // notification rows, not just the currently-selected one.
-        const [data, cross] = await Promise.all([
-            listSessions(activeAgentId.value, {
-                includeDms: true,
-                includeNotifications: next,
-            }),
-            // fetchCrossAgentSurfaces reads `showNotifications.value`
-            // which was just set above — passes through correctly.
-            fetchCrossAgentSurfaces(),
-        ]);
-        const newSessions = data.sessions || [];
-
-        // If toggling OFF and the active session is internal, navigate away.
-        // Active session can live in either the per-agent list or the
-        // cross-agent surfaces (notifications), so check both.
-        if (!next && activeSessionId.value) {
-            const activeSess =
-                sessions.value.find(s => s.id === activeSessionId.value)
-                || crossAgentSessions.value.find(s => s.id === activeSessionId.value);
-            if (activeSess && INTERNAL_SESSION_TYPES.has(activeSess.session_type)) {
-                closeSessionStream();
-                const fallback = newSessions.find(s => !INTERNAL_SESSION_TYPES.has(s.session_type));
-                batch(() => {
-                    sessions.value = newSessions;
-                    crossAgentSessions.value = cross;
-                    activeSessionId.value = fallback ? fallback.id : null;
-                    activeRunId.value = null;
-                    selectedRunId.value = null;
-                    replaceMessages([]);
-                    messageQueue.value = [];
-                    auditEvents.value = null;
-                    clearAllSubagents();
-                    parentSessionId.value = null;
-                });
-                if (fallback) {
-                    saveActiveSession(activeAgentId.value, fallback.id);
-                    sessionSwitchLoading.value = true;
-                    try {
-                        await loadSession(fallback.id, {
-                            isStale: () => false,
-                            logPrefix: 'toggleNotifications',
-                        });
-                    } finally {
-                        sessionSwitchLoading.value = false;
-                    }
-                }
-                return;
-            }
-        }
-
-        sessions.value = newSessions;
-        crossAgentSessions.value = cross;
-    } catch (err) {
-        console.error('[toggleNotifications] reload failed:', err);
-    }
 }
 
 /**
@@ -546,20 +461,13 @@ export function SessionList() {
         crossAgent.filter(s => s.session_type === 'notification'),
         agentName
     );
-    const showNotif = showNotifications.value;
 
     const noAgents = !allAgents || allAgents.length === 0;
     const noContent = noAgents && dmSessions.length === 0 && notifSessions.length === 0;
 
     return html`
         <div class="sidebar-section" style="flex:1; min-height:0">
-            <div class="sidebar-label">
-                Sessions
-                <button class="notif-toggle ${showNotif ? 'active' : ''}"
-                        title=${showNotif ? 'Hide notification sessions' : 'Show notification sessions'}
-                        aria-pressed=${showNotif}
-                        onClick=${toggleNotifications}>\u26A1</button>
-            </div>
+            <div class="sidebar-label">Sessions</div>
             <div id="session-list" role="listbox" aria-label="Sessions">
                 ${noContent
                     ? html`<div class="empty-state">No sessions</div>`
@@ -628,7 +536,7 @@ export function SessionList() {
                         `)}
                     </div>
                 `}
-                ${showNotif && notifSessions.length > 0 && html`
+                ${notifSessions.length > 0 && html`
                     <${SectionDivider} label="Notifications"
                                        cls="session-divider-notification"
                                        id="session-section-notifications" />

@@ -73,33 +73,6 @@
   background: var(--notif-accent-muted);
 }
 
-/* ── Notification toggle button in sidebar header ── */
-.notif-toggle {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 20px;
-  height: 20px;
-  font-size: var(--text-xs);
-  background: none;
-  border: 1px solid var(--border-subtle);
-  border-radius: var(--radius-sm);
-  color: var(--text-disabled);
-  cursor: pointer;
-  padding: 0;
-  line-height: 1;
-  transition: all var(--duration-normal);
-}
-.notif-toggle:hover {
-  color: var(--notif-accent);
-  border-color: var(--notif-accent);
-}
-.notif-toggle.active {
-  color: var(--notif-accent);
-  border-color: var(--notif-accent);
-  background: var(--notif-accent-muted);
-}
-
 /* ── Internal session header bar (notification, job, subagent) ── */
 .internal-session-header {
   display: flex;

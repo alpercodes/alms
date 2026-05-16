@@ -21,8 +21,8 @@ export const activeSessionId = signal(null);
  * Populated alongside `sessions` from a second `listSessions(null, …)`
  * call (no agent filter) — see `fetchCrossAgentSurfaces` in
  * `hooks/use-boot.js`. Internal types (job, subagent, episodic) are
- * excluded by the backend's listing rules; DMs / notifications are
- * gated on the `include_dms` / `include_notifications` query flags.
+ * excluded by the backend's listing rules; notifications are always
+ * included; DMs are gated on the `include_dms` query flag.
  */
 export const crossAgentSessions = signal([]);
 
@@ -42,14 +42,6 @@ export const crossAgentSessions = signal([]);
  * `defaultExpandedAgent`, `isAgentExpanded`) own the transition rules.
  */
 export const expandedAgentId = signal(null);
-
-/**
- * Whether to show notification sessions in the sidebar.
- * Persisted to localStorage so the preference survives reloads.
- */
-export const showNotifications = signal(
-    localStorage.getItem('alms_show_notifications') === 'true'
-);
 
 /**
  * The active session object (if any).

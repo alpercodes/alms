@@ -39,6 +39,7 @@ const {
     groupSessionsByAgent,
     isOwnedByActiveAgent,
     sortCrossAgentRows,
+    filterChatSessions,
 } = await import(url.pathToFileURL(SIDEBAR_GROUPING_PATH).href);
 
 // ---------------------------------------------------------------------
@@ -368,4 +369,139 @@ test('cross-agent: sortCrossAgentRows does not mutate its input', () => {
     const before = rows.map(r => r.id);
     sortCrossAgentRows(rows, 'alice');
     assert.deepEqual(rows.map(r => r.id), before);
+});
+
+// ---------------------------------------------------------------------
+// filterChatSessions — per-agent chat-only filter (PR #1100 Codex P2)
+// ---------------------------------------------------------------------
+//
+// Pinned regression target:
+//   - Codex P2 on PR #1100 — `/sessions` always returns notification
+//     rows after the opt-in toggle removal, so `loadAgentSessions`
+//     must filter them out before assigning to `sessions.value`. The
+//     boot-flow chat-creation fallback branches on
+//     `agentSessions.length > 0`; without this filter, an agent
+//     whose only session activity is a notification skips the
+//     fallback and lands on a read-only notification view instead
+//     of starting a fresh chat. These tests pin the pure-function
+//     half of the fix — `loadAgentSessions` itself is integration
+//     territory (signal wiring, SSE streams, network) that can't be
+//     unit-tested cleanly under Node.
+
+test('#1100: filterChatSessions drops notification rows', () => {
+    // The headline regression: a per-agent `/sessions` response with
+    // only a notification must produce an empty chat-session list so
+    // the boot-flow chat-creation fallback fires.
+    const raw = [
+        { id: 'n1', session_type: 'notification', agent_id: 'agent_a' },
+    ];
+    assert.deepEqual(filterChatSessions(raw), []);
+});
+
+test('#1100: filterChatSessions keeps chat rows untouched', () => {
+    // Chat sessions are the per-agent surface — they survive the filter.
+    const raw = [
+        { id: 'c1', session_type: 'chat', agent_id: 'agent_a' },
+        { id: 'c2', session_type: 'chat', agent_id: 'agent_a' },
+    ];
+    assert.deepEqual(
+        filterChatSessions(raw).map(s => s.id),
+        ['c1', 'c2'],
+    );
+});
+
+test('#1100: filterChatSessions keeps chats and drops notifications when mixed', () => {
+    // Realistic shape: an agent with both ordinary chats and an
+    // incoming notification. Only the chats stay; notifications belong
+    // to the cross-agent sidebar section sourced from
+    // `crossAgentSessions`, not the per-agent `sessions` signal.
+    const raw = [
+        { id: 'c1', session_type: 'chat', agent_id: 'agent_a' },
+        { id: 'n1', session_type: 'notification', agent_id: 'agent_a' },
+        { id: 'c2', session_type: 'chat', agent_id: 'agent_a' },
+    ];
+    assert.deepEqual(
+        filterChatSessions(raw).map(s => s.id),
+        ['c1', 'c2'],
+    );
+});
+
+test('#1100: filterChatSessions preserves backend sort order', () => {
+    // The backend returns `last_activity DESC` — the filter must not
+    // shuffle the surviving rows. Pin this so a future refactor that
+    // swaps `filter` for something fancier can't silently regress the
+    // sidebar's "most recent first" ordering.
+    const raw = [
+        { id: 'c3', session_type: 'chat', agent_id: 'agent_a' },
+        { id: 'n1', session_type: 'notification', agent_id: 'agent_a' },
+        { id: 'c1', session_type: 'chat', agent_id: 'agent_a' },
+        { id: 'c2', session_type: 'chat', agent_id: 'agent_a' },
+    ];
+    assert.deepEqual(
+        filterChatSessions(raw).map(s => s.id),
+        ['c3', 'c1', 'c2'],
+    );
+});
+
+test('#1100: filterChatSessions returns empty for non-array input', () => {
+    // Defensive: `data.sessions` could in theory be `undefined` if the
+    // backend ever omits the field. Empty array is the safe fallback —
+    // the boot fallback then creates a fresh chat as intended.
+    assert.deepEqual(filterChatSessions(null), []);
+    assert.deepEqual(filterChatSessions(undefined), []);
+    assert.deepEqual(filterChatSessions('not an array'), []);
+    assert.deepEqual(filterChatSessions({}), []);
+});
+
+test('#1100: filterChatSessions skips null / non-object entries', () => {
+    // Defense in depth — malformed entries in the payload should not
+    // crash the filter. Drop them; keep valid chat rows.
+    const raw = [
+        null,
+        { id: 'c1', session_type: 'chat', agent_id: 'agent_a' },
+        undefined,
+        { id: 'n1', session_type: 'notification', agent_id: 'agent_a' },
+    ];
+    assert.deepEqual(
+        filterChatSessions(raw).map(s => s.id),
+        ['c1'],
+    );
+});
+
+test('#1100: filterChatSessions returns a new array (does not mutate input)', () => {
+    // Callers pass slices straight from signal values; the helper must
+    // not mutate the source list.
+    const raw = [
+        { id: 'c1', session_type: 'chat', agent_id: 'agent_a' },
+        { id: 'n1', session_type: 'notification', agent_id: 'agent_a' },
+    ];
+    const before = raw.map(s => s.id);
+    const out = filterChatSessions(raw);
+    assert.deepEqual(raw.map(s => s.id), before);
+    assert.notEqual(out, raw);
+});
+
+test('#1100: filterChatSessions models the "notification-only agent" boot edge case', () => {
+    // Direct simulation of the Codex P2 scenario: an agent whose only
+    // session activity on `/sessions` is a notification. The filter
+    // returns an empty array, so `loadAgentSessions` sees
+    // `agentSessions.length === 0` and enters the chat-creation
+    // fallback — exactly the pre-PR-#1100 behaviour the operator
+    // expects.
+    const notificationOnlyResponse = [
+        {
+            id: 'notif-1',
+            session_type: 'notification',
+            agent_id: 'agent_a',
+            agent_name: 'alice',
+            has_active_run: false,
+        },
+    ];
+    const agentSessions = filterChatSessions(notificationOnlyResponse);
+    assert.equal(agentSessions.length, 0);
+    // Mirror the branch condition in `loadAgentSessions` to make the
+    // assertion's intent unambiguous: this is the predicate that gates
+    // the chat-creation fallback.
+    const wouldCreateFallbackChat = agentSessions.length === 0;
+    assert.equal(wouldCreateFallbackChat, true);
 });

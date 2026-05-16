@@ -274,24 +274,27 @@ async fn health_check() -> impl IntoResponse {
     }))
 }
 
-/// GET /sessions?agent_id=<uuid>&include_dms=true&include_notifications=true — list sessions.
+/// GET /sessions?agent_id=<uuid>&include_dms=true — list sessions.
 ///
-/// By default, excludes internal sessions (DM, notifications, episodic,
+/// By default, excludes the truly internal session types (episodic,
 /// subagent, job) — these are implementation details not shown in the
 /// regular UI. Uses the same `INTERNAL_SESSION_PREFIXES` list as
 /// `find_user_facing_session` to keep the filter consistent.
 ///
-/// Optional inclusion flags allow the UI to selectively surface internal
-/// session types that have user-visible value:
+/// Notification sessions (`notifications:*` context IDs) are
+/// **unconditionally included** in the response. They surface real
+/// operator-facing activity (DM endings, subagent completions, peer
+/// messages) and are always rendered in the sidebar's Notifications
+/// section. They participate in the `agent_id` filter on this endpoint
+/// — when no `agent_id` is supplied the cross-agent fetch picks up
+/// notifications for every agent in the tenant.
+///
+/// Optional inclusion flag:
 ///
 /// - `include_dms=true` — include DM sessions (`dm:*` context IDs).
 ///   DM sessions are stored under `AgentId::nil()` (sentinel), so the
 ///   `agent_id` filter is not applied to them — instead they are included
 ///   based on participant names parsed from the context ID.
-///
-/// - `include_notifications=true` — include notification sessions
-///   (`notifications:*` context IDs). These contain agent activity
-///   triggered by DM endings, subagent completions, etc.
 ///
 /// Each session in the response is enriched with:
 /// - `session_type`: one of `"chat"`, `"dm"`, `"notification"`, `"job"`,
@@ -308,7 +311,6 @@ async fn list_sessions(
     Query(params): Query<ListSessionsQuery>,
 ) -> impl IntoResponse {
     let include_dms = params.include_dms.unwrap_or(false);
-    let include_notifications = params.include_notifications.unwrap_or(false);
     let all_sessions = state.session_manager.list_all();
 
     let mut result: Vec<serde_json::Value> = Vec::new();
@@ -326,11 +328,11 @@ async fn list_sessions(
                 // agent_id filter does not apply to DM sessions (they use nil sentinel)
             }
             "notification" => {
-                // Notification sessions: only include when explicitly requested
-                if !include_notifications {
-                    continue;
-                }
-                // Apply agent_id filter to notification sessions
+                // Notification sessions are always shown in the sidebar
+                // (no opt-in toggle). Apply the agent_id filter so a
+                // per-agent fetch only returns notifications owned by
+                // that agent; the cross-agent fetch (`agent_id` unset)
+                // picks up every notification in the tenant.
                 if let Some(agent_id) = params.agent_id
                     && session.agent_id != agent_id
                 {
@@ -501,10 +503,6 @@ struct ListSessionsQuery {
     /// When `true`, DM sessions (`dm:*` context IDs) are included in the
     /// response alongside regular user-facing sessions.
     include_dms: Option<bool>,
-    /// When `true`, notification sessions (`notifications:*` context IDs)
-    /// are included in the response. These sessions contain agent activity
-    /// triggered by DM conversation endings, subagent completions, etc.
-    include_notifications: Option<bool>,
 }
 
 /// Create a new session

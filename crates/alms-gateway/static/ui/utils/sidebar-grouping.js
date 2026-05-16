@@ -185,3 +185,39 @@ export function sortCrossAgentRows(rows, activeAgentName) {
     decorated.sort((a, b) => a.owned - b.owned || a.idx - b.idx);
     return decorated.map(d => d.s);
 }
+
+/**
+ * Filter a `/sessions` response down to ordinary chat sessions only —
+ * dropping notifications and any other non-chat surface that the
+ * backend now always returns inline (PR #1100 removed the
+ * `include_notifications` opt-in; notifications are unconditional on
+ * the wire so the frontend filters per-consumer).
+ *
+ * Pinned regression target:
+ *   - Codex P2 on PR #1100 — `loadAgentSessions` calls
+ *     `listSessions(agentId, { includeDms: false })`, and `/sessions`
+ *     now always includes notifications. The boot-flow chat-creation
+ *     fallback branches on `agentSessions.length > 0`; without this
+ *     filter, an agent whose only session activity is a notification
+ *     row lands in a read-only notification view at boot/switch
+ *     instead of starting a fresh chat. Per-agent `sessions.value`
+ *     semantically means "this agent's chat sessions" — notifications
+ *     are a cross-agent surface sourced from `crossAgentSessions` and
+ *     do not belong in the per-agent list.
+ *
+ * The filter is conservative: it drops `notification` only. DMs are
+ * already excluded by the per-agent fetch's `include_dms: false`
+ * query flag, and job / subagent / episodic types are excluded by the
+ * backend's `is_internal_context_id` filter. If a future backend
+ * change adds a new always-returned surface, extend the list here
+ * (and update the test).
+ *
+ * Returns a new array; does not mutate the input.
+ *
+ * @param {Array<object>} sessions Raw `/sessions` payload entries.
+ * @returns {Array<object>}
+ */
+export function filterChatSessions(sessions) {
+    if (!Array.isArray(sessions)) return [];
+    return sessions.filter(s => s && s.session_type !== 'notification');
+}
