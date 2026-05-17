@@ -365,13 +365,21 @@ impl Coordinator {
         // parent agent that started the run.
         let parent_agent_id = request.parent_agent_id;
 
-        // Derive the subagent's session early so it can be stored in the handle
-        // (for completion notifications) and returned to the caller (for tool results).
+        // Derive the subagent's identity once, here. This is the single source
+        // of truth for `(sub_agent_id, sub_context_id, sub_session_id)` — both
+        // the handle (returned to the parent's `invoke_agent` tool result) and
+        // the spawned `run_subagent` task use these exact values. Re-deriving
+        // inside `run_subagent` would mint a fresh `AgentId::new()` for ephemeral
+        // subagents (because `derive_subagent_identity` is non-deterministic in
+        // that branch), producing a second `(agent_id, context_id)` key on the
+        // session map and creating a duplicate session row — leaving the
+        // handle's `sub_session_id` pointing at an empty orphan while the
+        // subagent's actual messages land on the second row (#1075).
         let (sub_agent_id, sub_context_id) = derive_subagent_identity(task_id, &request);
-        let sub_session = self
+        let sub_session_id = self
             .session_manager
-            .get_or_create(sub_agent_id, &sub_context_id);
-        let sub_session_id = sub_session.id;
+            .get_or_create(sub_agent_id, &sub_context_id)
+            .id;
 
         let handle = SubagentHandle {
             task_id,
@@ -413,6 +421,10 @@ impl Coordinator {
         let run_registrar = self.run_registrar.clone();
         let security_config = self.security_config.clone();
 
+        // Move identity values into the spawned task — `run_subagent` and
+        // `run_agent_loop` use these instead of re-deriving so the entire
+        // subagent path operates on a single `(agent_id, context_id)` key
+        // and therefore a single session row (#1075).
         let span = tracing::info_span!(
             "subagent::execute",
             task_id = %task_id.0,
@@ -423,6 +435,9 @@ impl Coordinator {
                 run_subagent(
                     task_id,
                     request,
+                    sub_agent_id,
+                    sub_context_id,
+                    sub_session_id,
                     subagents,
                     active_named,
                     cancel_rx,
@@ -620,6 +635,14 @@ impl Drop for NamedSubagentGuard {
 async fn run_subagent(
     task_id: TaskId,
     request: SubagentRequest,
+    // Identity is resolved once by `spawn_subagent` and threaded through here
+    // so the entire subagent lifecycle (handle creation, run registration,
+    // `runtime.run` lookup) shares a single `(agent_id, context_id)` key and
+    // therefore a single session row (#1075). Re-deriving here would mint a
+    // fresh `AgentId::new()` for ephemeral subagents.
+    sub_agent_id: AgentId,
+    sub_context_id: String,
+    sub_session_id: SessionId,
     subagents: Arc<DashMap<TaskId, SubagentHandle>>,
     active_named: Arc<dashmap::DashSet<(AgentId, String)>>,
     cancel_rx: oneshot::Receiver<()>,
@@ -689,16 +712,9 @@ async fn run_subagent(
         }
     });
 
-    // Derive the subagent's identity early so we can register the run
-    // *before* the tokio::select!.  This ensures the run record is always
-    // updated — even when timeout or cancellation wins the select and the
-    // run_agent_loop future is dropped.
-    let (sub_agent_id, sub_context_id) = derive_subagent_identity(task_id, &request);
-
-    // Resolve the subagent's session early so we can (a) register the run
-    // and (b) include the session ID in the completion notification / tool result.
-    let sub_session = session_manager.get_or_create(sub_agent_id, &sub_context_id);
-    let sub_session_id = sub_session.id;
+    // Identity and session are already resolved by `spawn_subagent` and
+    // passed in as parameters (#1075). Re-deriving here would mint a fresh
+    // `AgentId::new()` for ephemeral subagents and create a duplicate row.
 
     // Register the subagent run with the RunRegistrar (if available) so it
     // appears in GET /runs, the UI sidebar, and CLI `alms run list`.
@@ -3459,6 +3475,159 @@ mod tests {
                 .and_then(|v| v.as_str())
                 .is_some_and(|s| s.contains("sub-")),
             "persisted spill_path must reference the subagent dir: {meta:?}"
+        );
+    }
+
+    // -- #1075 — one session row per subagent invocation -----------------------
+
+    /// Count sessions whose `context_id` starts with `subagent_`. Used by the
+    /// #1075 regression tests below — distinguishes subagent rows from the
+    /// parent's own session row (which uses a different context_id).
+    fn count_subagent_sessions(session_manager: &SessionManager) -> usize {
+        session_manager
+            .list_all()
+            .into_iter()
+            .filter(|s| s.context_id.starts_with("subagent_"))
+            .count()
+    }
+
+    /// #1075 — Ephemeral foreground dispatch must produce exactly ONE session
+    /// row, and the `session_id` returned to the parent (which flows into the
+    /// `invoke_agent` tool result) must match the row where messages were
+    /// actually written.
+    ///
+    /// Pre-fix: `derive_subagent_identity` was called twice — once in
+    /// `spawn_subagent` and once in `run_subagent` — minting a fresh
+    /// `AgentId::new()` each time for ephemeral subagents. That produced two
+    /// `(agent_id, context_id)` keys on the session map, two `get_or_create`
+    /// insertions, and two session rows. The handle held the first id (empty
+    /// orphan); messages landed on the second.
+    #[tokio::test]
+    async fn test_1075_ephemeral_foreground_produces_one_session_row() {
+        let coord = test_coordinator();
+        let (response, sub_session_id) = coord
+            .dispatch(
+                "Say hello".to_string(),
+                test_session_id(),
+                test_parent_agent_id(),
+                None,
+                None,
+                None, // ephemeral — the regression vector
+                None,
+            )
+            .await
+            .expect("dispatch should succeed");
+        assert!(response.contains("mock"));
+
+        // Exactly one subagent session row exists.
+        assert_eq!(
+            count_subagent_sessions(&coord.session_manager),
+            1,
+            "ephemeral foreground dispatch must create exactly one session row"
+        );
+
+        // The returned session_id (which the `invoke_agent` tool hands back
+        // to the parent) is the row where messages were actually written.
+        let history = coord
+            .session_manager
+            .get_history(sub_session_id)
+            .expect("returned session_id must resolve to a real row");
+        assert!(
+            !history.is_empty(),
+            "subagent session must have at least one message — \
+             pre-fix this id pointed at an empty orphan row (#1075)"
+        );
+    }
+
+    /// #1075 — Ephemeral background dispatch must also produce exactly ONE
+    /// session row. This is the original repro path (`is_background=true`)
+    /// from Atlas's diagnosis.
+    #[tokio::test]
+    async fn test_1075_ephemeral_background_produces_one_session_row() {
+        let coord = test_coordinator();
+        let (task_uuid, sub_session_id) = coord
+            .dispatch_background(
+                "Background work".to_string(),
+                test_session_id(),
+                test_parent_agent_id(),
+                None,
+                None,
+                None, // ephemeral — the regression vector
+                None,
+            )
+            .await
+            .expect("dispatch_background should succeed");
+
+        // Wait for the background task to finish so its messages land in
+        // the session before we count rows.
+        let tid = TaskId(task_uuid);
+        let mut found_terminal = false;
+        for _ in 0..50 {
+            match coord.get_status(tid) {
+                Some(TaskStatus::Completed) | Some(TaskStatus::Failed) => {
+                    found_terminal = true;
+                    break;
+                }
+                _ => tokio::time::sleep(Duration::from_millis(20)).await,
+            }
+        }
+        assert!(
+            found_terminal,
+            "background subagent should reach terminal state"
+        );
+
+        assert_eq!(
+            count_subagent_sessions(&coord.session_manager),
+            1,
+            "ephemeral background dispatch must create exactly one session row"
+        );
+
+        let history = coord
+            .session_manager
+            .get_history(sub_session_id)
+            .expect("returned session_id must resolve to a real row");
+        assert!(
+            !history.is_empty(),
+            "background subagent session must have at least one message — \
+             pre-fix this id pointed at an empty orphan row (#1075)"
+        );
+    }
+
+    /// #1075 — Named subagent dispatch (foreground) must also produce exactly
+    /// ONE session row. Named subagents were not affected by the original bug
+    /// because `derive_subagent_identity` uses `AgentId::deterministic(...)`
+    /// in that branch, so both call sites produced the same key — but the
+    /// post-fix invariant must hold for both branches.
+    #[tokio::test]
+    async fn test_1075_named_foreground_produces_one_session_row() {
+        let workspace_tmp = tempfile::TempDir::new().unwrap();
+        let coord = test_coordinator().with_workspace_dir(workspace_tmp.path().to_path_buf());
+        let (_response, sub_session_id) = coord
+            .dispatch(
+                "Investigate X".to_string(),
+                test_session_id(),
+                test_parent_agent_id(),
+                None,
+                None,
+                Some("researcher".to_string()),
+                None,
+            )
+            .await
+            .expect("dispatch should succeed");
+
+        assert_eq!(
+            count_subagent_sessions(&coord.session_manager),
+            1,
+            "named foreground dispatch must create exactly one session row"
+        );
+
+        let history = coord
+            .session_manager
+            .get_history(sub_session_id)
+            .expect("returned session_id must resolve to a real row");
+        assert!(
+            !history.is_empty(),
+            "named subagent session must have at least one message"
         );
     }
 }
