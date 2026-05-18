@@ -718,6 +718,28 @@ export function openSessionStream(sessionId, opts) {
                     status: 'running', startedAt, runId,
                 });
                 trackSubagentStart(name, task, toolId);
+                // #1105: backend may also embed `subagent_session_id` directly
+                // on the `tool_start` event for invoke_agent (alternative
+                // shape). When present, surface it immediately so the
+                // SubagentBar's "View session" button is live during the run
+                // — the dedicated `subagent_started` handler below covers
+                // the canonical event-based shape. Both paths are safe to
+                // run together because `setSubagentSessionId` is idempotent.
+                //
+                // Resolve the target entry key by `toolId` first to avoid the
+                // `setSubagentSessionId('subagent', ...)` fallback path, which
+                // attaches to the first running unnamed entry it finds — wrong
+                // target when multiple unnamed subagents run concurrently.
+                // For named subagents `findSubagentByToolInvocationId` returns
+                // the name directly; for unnamed it returns the
+                // `subagent-<toolId_prefix>` key just registered by
+                // `trackSubagentStart` above. Fall back to the resolved name
+                // only if no entry was found (defensive — should not happen
+                // since we just registered it).
+                if (data.subagent_session_id) {
+                    const key = findSubagentByToolInvocationId(toolId) || name;
+                    setSubagentSessionId(key, data.subagent_session_id);
+                }
             } else if (data.source_agent) {
                 trackSubagentTool(data.source_agent, {
                     id: toolId, tool: data.tool, params: data.params, status: 'running',
@@ -885,6 +907,54 @@ export function openSessionStream(sessionId, opts) {
                     resolved: false,
                 });
             }
+        });
+    });
+
+    // -- subagent_started (#1105) --
+    //
+    // Surfaces a foreground subagent's `session_id` to the parent stream as
+    // soon as `subagent::execute` creates the session, so the SubagentBar
+    // panel can render the "View session" button live (i.e. while the
+    // subagent is still running).
+    //
+    // Pre-#1105 backends do not emit this event. The handler is a no-op
+    // when the payload is missing fields, so older backends just keep the
+    // legacy behaviour (button appears at tool_end for foreground subagents,
+    // unchanged for background subagents — those still arrive via the
+    // invoke_agent tool_end `{task_id, session_id}` result and via the
+    // `subagent_completed` event below).
+    //
+    // Payload shape (per #1105 issue body):
+    //   { subagent_name, tool_invocation_id, subagent_session_id }
+    //
+    // Background subagents already get their session_id through `tool_end`
+    // moments after dispatch, so emitting this event for them is harmless
+    // and idempotent — `setSubagentSessionId` writes the same value either
+    // way. The resolution order mirrors `tool_end` for invoke_agent:
+    //   1. `subagent_name` from the event payload (named subagents)
+    //   2. lookup by `tool_invocation_id` (unnamed subagents — covers the
+    //      "subagent-<prefix>" key migration done in `trackSubagentTool`)
+    //
+    // If neither resolver returns a hit (malformed payload, out-of-order
+    // delivery against an entry that has already been removed, etc.) the
+    // handler no-ops. The previous fallback to the literal `'subagent'`
+    // could attach the session_id to an unrelated running unnamed entry
+    // via the first-match path in `setSubagentSessionId`, producing
+    // incorrect drill-down links.
+    on('subagent_started', (e) => {
+        batch(() => {
+            const data = JSON.parse(e.data);
+            const sessionId = data.subagent_session_id || null;
+            if (!sessionId) return;
+            const name = data.subagent_name
+                || findSubagentByToolInvocationId(data.tool_invocation_id);
+            if (!name) {
+                console.warn('[subagent_started] cannot resolve target entry',
+                    '— subagent_name:', data.subagent_name,
+                    'tool_invocation_id:', data.tool_invocation_id);
+                return;
+            }
+            setSubagentSessionId(name, sessionId);
         });
     });
 
