@@ -1,5 +1,5 @@
 use alms_core::{AlmsError, AlmsResult};
-use alms_sandbox::{FileStateCache, SandboxError, ToolRegistry as SandboxRegistry};
+use alms_sandbox::{FileStateCache, SandboxError, ToolContext, ToolRegistry as SandboxRegistry};
 use serde_json::Value;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -213,37 +213,61 @@ impl ToolRegistry {
     /// Execute a tool by name via sandbox
     pub async fn execute(&self, name: &str, params: Value) -> AlmsResult<Value> {
         debug!("Executing tool via sandbox: {}", name);
-        self.registry
-            .execute(name, params)
-            .await
-            .map_err(|e| match e {
-                SandboxError::ToolNotFound(tool) => {
-                    AlmsError::ToolExecution(format!("Tool '{}' not found", tool))
-                }
-                // Preserve the structured classifier target (#758) so the
-                // runtime can include it in SSE tool_end payloads and audit
-                // events without regexing the error message.
-                SandboxError::ShellBlocked { reason, target } => {
-                    warn!("Tool execution blocked by classifier: {reason} (target={target:?})");
-                    AlmsError::ToolBlocked { reason, target }
-                }
-                // Preserve the typed `AlmsError` carried across the
-                // sandbox boundary by `invoke_agent` — unwrap the box
-                // and propagate the inner variant verbatim so the
-                // parent agent's `tool_result` reads as one tractable
-                // line (e.g. `Subagent LLM error (anthropic 400): ...`)
-                // instead of the legacy 4-prefix
-                // `Tool execution failed: IO error: Subagent error:
-                // Runtime error: Runtime error: ...` wrap. Issue #920.
-                SandboxError::Subagent(inner) => {
-                    warn!("Subagent tool execution failed: {}", inner);
-                    *inner
-                }
-                other => {
-                    warn!("Tool execution failed: {}", other);
-                    AlmsError::ToolExecution(other.to_string())
-                }
-            })
+        Self::map_sandbox_error(self.registry.execute(name, params).await)
+    }
+
+    /// Execute a tool by name with per-call context (#1105).
+    ///
+    /// Threads the parent's `invocation_id` into the sandbox's
+    /// `Tool::execute_with_context` — used by the agent loop so the
+    /// `InvokeAgentTool` can carry it to the coordinator, which emits
+    /// the `subagent_started` SSE event with the parent's
+    /// `tool_invocation_id` for the UI's SubagentBar resolver. All
+    /// other tools fall through the default `execute_with_context`
+    /// impl, which discards `ctx` and calls plain `execute(params)`.
+    pub async fn execute_with_context(
+        &self,
+        name: &str,
+        params: Value,
+        ctx: ToolContext,
+    ) -> AlmsResult<Value> {
+        debug!("Executing tool via sandbox (with context): {}", name);
+        Self::map_sandbox_error(self.registry.execute_with_context(name, params, ctx).await)
+    }
+
+    /// Shared error-mapping for [`Self::execute`] and
+    /// [`Self::execute_with_context`]. Keeping it factored out
+    /// prevents the two entry points from drifting on the #920 typed-
+    /// error unwrap or the #758 classifier target preservation.
+    fn map_sandbox_error(result: Result<Value, SandboxError>) -> AlmsResult<Value> {
+        result.map_err(|e| match e {
+            SandboxError::ToolNotFound(tool) => {
+                AlmsError::ToolExecution(format!("Tool '{}' not found", tool))
+            }
+            // Preserve the structured classifier target (#758) so the
+            // runtime can include it in SSE tool_end payloads and audit
+            // events without regexing the error message.
+            SandboxError::ShellBlocked { reason, target } => {
+                warn!("Tool execution blocked by classifier: {reason} (target={target:?})");
+                AlmsError::ToolBlocked { reason, target }
+            }
+            // Preserve the typed `AlmsError` carried across the
+            // sandbox boundary by `invoke_agent` — unwrap the box
+            // and propagate the inner variant verbatim so the
+            // parent agent's `tool_result` reads as one tractable
+            // line (e.g. `Subagent LLM error (anthropic 400): ...`)
+            // instead of the legacy 4-prefix
+            // `Tool execution failed: IO error: Subagent error:
+            // Runtime error: Runtime error: ...` wrap. Issue #920.
+            SandboxError::Subagent(inner) => {
+                warn!("Subagent tool execution failed: {}", inner);
+                *inner
+            }
+            other => {
+                warn!("Tool execution failed: {}", other);
+                AlmsError::ToolExecution(other.to_string())
+            }
+        })
     }
 }
 

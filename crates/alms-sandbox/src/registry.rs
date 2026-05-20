@@ -1,6 +1,6 @@
 #[cfg(test)]
 use crate::NativeTool;
-use crate::{SandboxError, Tool, error::SandboxResult};
+use crate::{SandboxError, Tool, ToolContext, error::SandboxResult};
 use dashmap::DashMap;
 use serde_json::Value;
 use std::sync::Arc;
@@ -253,6 +253,23 @@ impl ToolRegistry {
     pub async fn execute(&self, name: &str, params: Value) -> SandboxResult<Value> {
         let tool = self.lookup(name)?;
         tool.execute(params).await
+    }
+
+    /// Execute a tool by name with per-call context (#1105).
+    ///
+    /// Used by the agent runtime to thread the parent's `invocation_id`
+    /// into `InvokeAgentTool` so the coordinator can carry it on the
+    /// `subagent_started` SSE event back to the parent's stream. All
+    /// other tools fall through `Tool::execute_with_context`'s default
+    /// impl, which discards `ctx` and calls plain `execute(params)`.
+    pub async fn execute_with_context(
+        &self,
+        name: &str,
+        params: Value,
+        ctx: ToolContext,
+    ) -> SandboxResult<Value> {
+        let tool = self.lookup(name)?;
+        tool.execute_with_context(params, ctx).await
     }
 }
 

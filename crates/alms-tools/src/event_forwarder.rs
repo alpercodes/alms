@@ -56,4 +56,22 @@ pub trait EventForwarder: Send + Sync + std::fmt::Debug {
 
     /// A non-fatal warning condition during the run.
     fn forward_warning(&self, code: String, message: String, source_agent: Option<String>);
+
+    /// A subagent's session has just been created (#1105). The gateway
+    /// converts this into a `subagent_started` SSE event so the UI's
+    /// SubagentBar can render the "View session" button live during a
+    /// foreground `invoke_agent` run instead of only at tool_end.
+    ///
+    /// `tool_invocation_id` is the parent's `invoke_agent` invocation id —
+    /// the UI's resolver falls back to it for ephemeral / unnamed
+    /// subagents where `subagent_name` is `None`. `subagent_session_id`
+    /// is the new session row's UUID. Default is a no-op so implementers
+    /// that don't yet care about the event don't have to opt in.
+    fn forward_subagent_started(
+        &self,
+        _tool_invocation_id: Uuid,
+        _subagent_name: Option<String>,
+        _subagent_session_id: Uuid,
+    ) {
+    }
 }

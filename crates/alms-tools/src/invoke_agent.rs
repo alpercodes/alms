@@ -3,10 +3,11 @@
 use crate::event_forwarder::EventForwarder;
 use crate::subagent::SubagentDispatcher;
 use alms_core::{AgentId, RunId, SessionId};
-use alms_sandbox::{SandboxError, Tool, error::SandboxResult};
+use alms_sandbox::{SandboxError, Tool, ToolContext, error::SandboxResult};
 use serde_json::Value;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
 
 /// Built-in tool that spawns a subagent and awaits its result.
 ///
@@ -107,6 +108,46 @@ impl Tool for InvokeAgentTool {
     }
 
     async fn execute(&self, params: Value) -> SandboxResult<Value> {
+        // Legacy path with no per-call context — falls through with
+        // `parent_tool_invocation_id: None`. The agent runtime routes
+        // every real invoke_agent call through `execute_with_context`
+        // (#1105); only synthetic call sites (a few unit tests in this
+        // file, future external callers) end up here, where the
+        // `subagent_started` event is harmless to skip because the
+        // legacy completion path still delivers the session id.
+        self.execute_inner(params, None).await
+    }
+
+    async fn execute_with_context(&self, params: Value, ctx: ToolContext) -> SandboxResult<Value> {
+        // #1105: thread the parent's `invocation_id` into the
+        // dispatcher so the coordinator can carry it on the
+        // `subagent_started` SSE event back to the parent's stream.
+        // The frontend's resolver in
+        // `crates/alms-gateway/static/ui/hooks/use-session-stream.js`
+        // falls back to this id when `subagent_name` is `None` (the
+        // ephemeral / unnamed subagent case) — without it the new
+        // session id would land on the first running unnamed
+        // SubagentBar entry the resolver finds, which is wrong when
+        // multiple concurrent unnamed subagents are in flight.
+        self.execute_inner(params, Some(ctx.invocation_id)).await
+    }
+
+    fn is_builtin(&self) -> bool {
+        true
+    }
+}
+
+impl InvokeAgentTool {
+    /// Shared implementation for [`Tool::execute`] and
+    /// [`Tool::execute_with_context`]. The only difference between
+    /// the two entry points is whether `parent_tool_invocation_id`
+    /// is populated; everything else (param parsing, name
+    /// validation, foreground/background routing) is identical.
+    async fn execute_inner(
+        &self,
+        params: Value,
+        parent_tool_invocation_id: Option<Uuid>,
+    ) -> SandboxResult<Value> {
         let task = params
             .get("task")
             .and_then(|v| v.as_str())
@@ -146,6 +187,7 @@ impl Tool for InvokeAgentTool {
                     self.background_event_tx.clone(),
                     subagent_name,
                     self.parent_cancel_token.clone(),
+                    parent_tool_invocation_id,
                 )
                 .await
                 .map_err(SandboxError::from)?;
@@ -166,6 +208,7 @@ impl Tool for InvokeAgentTool {
                 self.parent_event_tx.clone(),
                 subagent_name,
                 self.parent_cancel_token.clone(),
+                parent_tool_invocation_id,
             )
             .await
             .map_err(SandboxError::from)?;
@@ -174,10 +217,6 @@ impl Tool for InvokeAgentTool {
             "response": response,
             "session_id": sub_session_id.0.to_string(),
         }))
-    }
-
-    fn is_builtin(&self) -> bool {
-        true
     }
 }
 
@@ -203,6 +242,7 @@ mod tests {
             _parent_event_tx: Option<Arc<dyn EventForwarder>>,
             _subagent_name: Option<String>,
             _parent_cancel_token: Option<CancellationToken>,
+            _parent_tool_invocation_id: Option<Uuid>,
         ) -> AlmsResult<(String, SessionId)> {
             Ok((self.0.clone(), SessionId::new()))
         }
@@ -261,6 +301,7 @@ mod tests {
                 _parent_event_tx: Option<Arc<dyn EventForwarder>>,
                 _subagent_name: Option<String>,
                 _parent_cancel_token: Option<CancellationToken>,
+                _parent_tool_invocation_id: Option<Uuid>,
             ) -> AlmsResult<(String, SessionId)> {
                 Err(alms_core::AlmsError::SubagentLlmError {
                     provider: "anthropic".to_string(),
@@ -322,6 +363,7 @@ mod tests {
                 _parent_event_tx: Option<Arc<dyn EventForwarder>>,
                 _subagent_name: Option<String>,
                 _parent_cancel_token: Option<CancellationToken>,
+                _parent_tool_invocation_id: Option<Uuid>,
             ) -> AlmsResult<(String, SessionId)> {
                 Err(alms_core::AlmsError::Runtime(
                     "downstream blew up".to_string(),
@@ -381,6 +423,7 @@ mod tests {
             _parent_event_tx: Option<Arc<dyn EventForwarder>>,
             _subagent_name: Option<String>,
             _parent_cancel_token: Option<CancellationToken>,
+            _parent_tool_invocation_id: Option<Uuid>,
         ) -> AlmsResult<(String, SessionId)> {
             Ok(("foreground".to_string(), SessionId::new()))
         }
@@ -394,6 +437,7 @@ mod tests {
             _parent_event_tx: Option<Arc<dyn EventForwarder>>,
             _subagent_name: Option<String>,
             _parent_cancel_token: Option<CancellationToken>,
+            _parent_tool_invocation_id: Option<Uuid>,
         ) -> AlmsResult<(Uuid, SessionId)> {
             Ok((self.0, SessionId::new()))
         }
@@ -470,6 +514,7 @@ mod tests {
             _parent_event_tx: Option<Arc<dyn EventForwarder>>,
             subagent_name: Option<String>,
             _parent_cancel_token: Option<CancellationToken>,
+            _parent_tool_invocation_id: Option<Uuid>,
         ) -> AlmsResult<(String, SessionId)> {
             *self.0.lock().unwrap() = Some(subagent_name);
             Ok(("ok".to_string(), SessionId::new()))
@@ -548,5 +593,125 @@ mod tests {
             .execute(serde_json::json!({ "task": "x", "name": "my-agent" }))
             .await;
         assert!(result.is_ok());
+    }
+
+    // ── #1105: parent tool_invocation_id is threaded through ────────────────
+
+    /// A dispatcher that captures the `parent_tool_invocation_id` it
+    /// receives on both `dispatch` and `dispatch_background`.
+    #[derive(Debug)]
+    struct InvocationCapturingDispatcher {
+        foreground: std::sync::Mutex<Option<Option<Uuid>>>,
+        background: std::sync::Mutex<Option<Option<Uuid>>>,
+    }
+
+    impl InvocationCapturingDispatcher {
+        fn new() -> Self {
+            Self {
+                foreground: std::sync::Mutex::new(None),
+                background: std::sync::Mutex::new(None),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl SubagentDispatcher for InvocationCapturingDispatcher {
+        async fn dispatch(
+            &self,
+            _task: String,
+            _parent_session_id: SessionId,
+            _parent_agent_id: AgentId,
+            _parent_run_id: Option<RunId>,
+            _parent_event_tx: Option<Arc<dyn EventForwarder>>,
+            _subagent_name: Option<String>,
+            _parent_cancel_token: Option<CancellationToken>,
+            parent_tool_invocation_id: Option<Uuid>,
+        ) -> AlmsResult<(String, SessionId)> {
+            *self.foreground.lock().unwrap() = Some(parent_tool_invocation_id);
+            Ok(("ok".to_string(), SessionId::new()))
+        }
+
+        async fn dispatch_background(
+            &self,
+            _task: String,
+            _parent_session_id: SessionId,
+            _parent_agent_id: AgentId,
+            _parent_run_id: Option<RunId>,
+            _parent_event_tx: Option<Arc<dyn EventForwarder>>,
+            _subagent_name: Option<String>,
+            _parent_cancel_token: Option<CancellationToken>,
+            parent_tool_invocation_id: Option<Uuid>,
+        ) -> AlmsResult<(Uuid, SessionId)> {
+            *self.background.lock().unwrap() = Some(parent_tool_invocation_id);
+            Ok((Uuid::new_v4(), SessionId::new()))
+        }
+    }
+
+    /// `execute_with_context` carries the parent's invocation_id into
+    /// the dispatcher for foreground invocations — this is what feeds
+    /// the coordinator's `subagent_started` SSE emit (#1105).
+    #[tokio::test]
+    async fn test_execute_with_context_threads_invocation_id_foreground() {
+        let dispatcher = Arc::new(InvocationCapturingDispatcher::new());
+        let tool = InvokeAgentTool::new(
+            dispatcher.clone(),
+            SessionId::new(),
+            AgentId::new(),
+            None,
+            None,
+        );
+        let inv_id = Uuid::new_v4();
+        tool.execute_with_context(serde_json::json!({ "task": "x" }), ToolContext::new(inv_id))
+            .await
+            .unwrap();
+        let captured = dispatcher.foreground.lock().unwrap().take().unwrap();
+        assert_eq!(captured, Some(inv_id));
+    }
+
+    /// Same thing for background — Atlas's acceptance criteria explicitly
+    /// require the event to fire on both paths so the wire shape is
+    /// consistent. The frontend handler is idempotent for backgrounds
+    /// (the tool result + completion marker also carry the session id),
+    /// but emitting symmetrically keeps the contract simple.
+    #[tokio::test]
+    async fn test_execute_with_context_threads_invocation_id_background() {
+        let dispatcher = Arc::new(InvocationCapturingDispatcher::new());
+        let tool = InvokeAgentTool::new(
+            dispatcher.clone(),
+            SessionId::new(),
+            AgentId::new(),
+            None,
+            None,
+        );
+        let inv_id = Uuid::new_v4();
+        tool.execute_with_context(
+            serde_json::json!({ "task": "x", "background": true }),
+            ToolContext::new(inv_id),
+        )
+        .await
+        .unwrap();
+        let captured = dispatcher.background.lock().unwrap().take().unwrap();
+        assert_eq!(captured, Some(inv_id));
+    }
+
+    /// Plain `execute` (no context) preserves the legacy contract — the
+    /// dispatcher sees `None`. This keeps `Tool` consumers that call
+    /// `execute` directly (a few unit tests in this crate, future
+    /// external callers) from breaking.
+    #[tokio::test]
+    async fn test_execute_without_context_passes_none() {
+        let dispatcher = Arc::new(InvocationCapturingDispatcher::new());
+        let tool = InvokeAgentTool::new(
+            dispatcher.clone(),
+            SessionId::new(),
+            AgentId::new(),
+            None,
+            None,
+        );
+        tool.execute(serde_json::json!({ "task": "x" }))
+            .await
+            .unwrap();
+        let captured = dispatcher.foreground.lock().unwrap().take().unwrap();
+        assert_eq!(captured, None);
     }
 }

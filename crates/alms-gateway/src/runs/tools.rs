@@ -6,6 +6,7 @@ use alms_core::{RunId, SessionId};
 use alms_runtime::RuntimeEvent;
 use chrono::Utc;
 use tokio::sync::mpsc;
+use tracing::warn;
 
 // ---------------------------------------------------------------------------
 // RuntimeEventForwarder -- bridges alms-tools EventForwarder to RuntimeEvent
@@ -85,6 +86,19 @@ impl alms_tools::EventForwarder for RuntimeEventForwarder {
             code,
             message,
             source_agent,
+        });
+    }
+
+    fn forward_subagent_started(
+        &self,
+        tool_invocation_id: uuid::Uuid,
+        subagent_name: Option<String>,
+        subagent_session_id: uuid::Uuid,
+    ) {
+        let _ = self.tx.send(RuntimeEvent::SubagentStarted {
+            tool_invocation_id,
+            subagent_name,
+            subagent_session_id: SessionId(subagent_session_id),
         });
     }
 }
@@ -312,6 +326,138 @@ pub(super) async fn forward_runtime_events(
                     )
                     .await;
             }
+            // #1105: forwarded into the parent's SSE stream so the
+            // SubagentBar's "View session" button can render live during
+            // an `invoke_agent` run. Ordering invariant is preserved by
+            // the channel FIFO: the parent's `ToolStart` for
+            // `invoke_agent` is queued onto `runtime_tx` before
+            // `tool.execute()` runs, and `spawn_subagent` only emits
+            // `SubagentStarted` after that — so this event is always
+            // delivered after the corresponding `tool_start`. Background
+            // subagents share the same FIFO because the bg event
+            // forwarder task in `runs/lifecycle.rs` forwards
+            // `SubagentStarted` back onto the parent's `runtime_tx`
+            // (via an Arc clone of `invoke_agent_fwd`) rather than
+            // synthesising SSE on the bg channel directly.
+            RuntimeEvent::SubagentStarted {
+                tool_invocation_id,
+                subagent_name,
+                subagent_session_id,
+            } => {
+                run_manager
+                    .send_event(
+                        run_id,
+                        session_id,
+                        SseEventData::subagent_started(
+                            session_id,
+                            ToolInvocationId(tool_invocation_id),
+                            subagent_name,
+                            subagent_session_id,
+                        ),
+                    )
+                    .await;
+            }
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Background-subagent event routing (#1105)
+// ---------------------------------------------------------------------------
+
+/// Routes a single [`RuntimeEvent`] arriving on the background-subagent event
+/// channel.
+///
+/// This function carries the #1105 invariant for background subagents:
+/// `SubagentStarted` is **forwarded back onto the parent's runtime channel**
+/// via `bg_runtime_fwd` so the parent's [`forward_runtime_events`] task can
+/// convert it to SSE in strict FIFO order with the parent's
+/// `tool_start (invoke_agent)` event. The agent loop enqueues the parent
+/// `ToolStart` onto `runtime_tx` *before* `tool.execute()` runs, so by the
+/// time the bg task observes any event on its own channel the parent's
+/// `ToolStart` is already ahead of it on `runtime_tx` — single-channel FIFO
+/// from that point preserves the documented ordering.
+///
+/// Pre-#1105 the bg-channel handler synthesised SSE directly on a
+/// session-level channel that was independent of the parent's `runtime_tx`,
+/// which raced with the parent's `tool_start` and could deliver
+/// `subagent_started` to the client *before* the parent's `tool_start`. The
+/// frontend resolver (`findSubagentByToolInvocationId`) would then have no
+/// `activeSubagents` entry to attach the `subagent_session_id` to.
+///
+/// Returns:
+/// - `Some(SseEventData)` — the caller should emit this on the parent's
+///   session-level SSE stream (for `ToolStart` / `ToolEnd` events).
+/// - `None` — the event was handled internally (forwarded via
+///   `bg_runtime_fwd`, auto-denied, or dropped); the caller does nothing.
+///
+/// The integration test in `crates/alms-gateway/tests/sse_golden_tests.rs`
+/// pins the `SubagentStarted` reroute: it asserts that this function
+/// returns `None` for that variant *and* that the matching event lands on
+/// the parent's runtime channel. A revert to direct SSE emission would
+/// fail both assertions.
+pub fn route_bg_event(
+    event: RuntimeEvent,
+    bg_runtime_fwd: &dyn alms_tools::EventForwarder,
+    bg_run_id: RunId,
+) -> Option<SseEventData> {
+    match event {
+        RuntimeEvent::ToolStart {
+            invocation_id,
+            tool,
+            params,
+            source_agent,
+            task_id,
+        } => Some(SseEventData::tool_start(
+            bg_run_id,
+            ToolInvocationId(invocation_id),
+            &tool,
+            params,
+            source_agent,
+            task_id,
+        )),
+        RuntimeEvent::ToolEnd {
+            invocation_id,
+            ok,
+            result,
+            source_agent,
+            task_id,
+        } => Some(SseEventData::tool_end(
+            bg_run_id,
+            ToolInvocationId(invocation_id),
+            ok,
+            result,
+            source_agent,
+            task_id,
+        )),
+        RuntimeEvent::ApprovalRequired {
+            tool, decision_tx, ..
+        } => {
+            warn!(
+                tool = %tool,
+                "Background subagent requested approval -- \
+                 not supported, auto-denying"
+            );
+            let _ = decision_tx.send(false);
+            None
+        }
+        // #1105 — forward back onto the parent's runtime channel instead of
+        // synthesising SSE here. This preserves the FIFO ordering with the
+        // parent's `tool_start (invoke_agent)`. `forward_runtime_events`
+        // (above) owns the SSE conversion for `SubagentStarted` and emits
+        // on the same session stream.
+        RuntimeEvent::SubagentStarted {
+            tool_invocation_id,
+            subagent_name,
+            subagent_session_id,
+        } => {
+            bg_runtime_fwd.forward_subagent_started(
+                tool_invocation_id,
+                subagent_name,
+                subagent_session_id.0,
+            );
+            None
+        }
+        _ => None,
     }
 }

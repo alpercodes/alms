@@ -107,6 +107,36 @@ pub enum RuntimeEvent {
         /// When set, this warning originated from a subagent (not the parent).
         source_agent: Option<String>,
     },
+    /// A subagent's session has just been created and the parent's
+    /// `invoke_agent` tool call is now blocked waiting for it to finish.
+    ///
+    /// Emitted from the coordinator's `spawn_subagent` path the moment the
+    /// subagent's session row exists, AFTER the parent's `ToolStart` for
+    /// `invoke_agent` has been emitted to the parent's stream and BEFORE
+    /// any nested `ToolStart` from inside the subagent runs. The gateway
+    /// forwards it as the `subagent_started` SSE event so the UI's
+    /// SubagentBar can render the "View session" button live during the
+    /// foreground run instead of only at `tool_end`. See #1105.
+    ///
+    /// Idempotent on the client: background subagents already get their
+    /// `session_id` through the `invoke_agent` tool result and via the
+    /// `subagent_completed` event — `setSubagentSessionId` writes the same
+    /// value either way, so firing for background paths too keeps the
+    /// event semantics consistent without changing visible behaviour.
+    SubagentStarted {
+        /// Parent's `invoke_agent` `tool_invocation_id`. The frontend
+        /// resolves the SubagentBar entry by `subagent_name` first and
+        /// falls back to this id for ephemeral / unnamed subagents.
+        tool_invocation_id: Uuid,
+        /// Registered name of the subagent, or `None` for ephemeral
+        /// invocations spawned without `--name`.
+        subagent_name: Option<String>,
+        /// UUID of the subagent's session — the row where the subagent
+        /// persists its own messages (#1104). Same value the parent's
+        /// `invoke_agent` tool result carries; emitted early so the UI
+        /// can drill down before the parent's tool_end arrives.
+        subagent_session_id: alms_core::SessionId,
+    },
     /// Debug snapshot of the full context window sent to the LLM.
     ///
     /// Only emitted when `debug_mode` is enabled on the agent config.
@@ -296,6 +326,62 @@ mod tests {
         );
 
         assert!(rx.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_subagent_started_event_roundtrip() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<RuntimeEvent>();
+        let inv_id = Uuid::new_v4();
+        let sub_session = alms_core::SessionId::new();
+
+        tx.send(RuntimeEvent::SubagentStarted {
+            tool_invocation_id: inv_id,
+            subagent_name: Some("reviewer".to_string()),
+            subagent_session_id: sub_session,
+        })
+        .unwrap();
+
+        drop(tx);
+
+        let event = rx.recv().await.unwrap();
+        match event {
+            RuntimeEvent::SubagentStarted {
+                tool_invocation_id,
+                subagent_name,
+                subagent_session_id,
+            } => {
+                assert_eq!(tool_invocation_id, inv_id);
+                assert_eq!(subagent_name.as_deref(), Some("reviewer"));
+                assert_eq!(subagent_session_id, sub_session);
+            }
+            _ => panic!("Expected SubagentStarted event"),
+        }
+
+        assert!(rx.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_subagent_started_event_unnamed() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<RuntimeEvent>();
+        let inv_id = Uuid::new_v4();
+        let sub_session = alms_core::SessionId::new();
+
+        tx.send(RuntimeEvent::SubagentStarted {
+            tool_invocation_id: inv_id,
+            subagent_name: None,
+            subagent_session_id: sub_session,
+        })
+        .unwrap();
+
+        drop(tx);
+
+        let event = rx.recv().await.unwrap();
+        match event {
+            RuntimeEvent::SubagentStarted { subagent_name, .. } => {
+                assert!(subagent_name.is_none());
+            }
+            _ => panic!("Expected SubagentStarted event"),
+        }
     }
 
     #[tokio::test]

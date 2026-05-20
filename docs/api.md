@@ -662,6 +662,42 @@ Emitted on the agent's user-facing session when a scheduled job run finishes. Th
 
 `status` values: `"success"`, `"error"`, `"cancelled"`, `"unknown"`.
 
+`subagent_started`
+Emitted on the parent's session SSE stream the moment the coordinator creates the subagent's session row, ahead of any nested `tool_start` from inside the subagent. Used by the web UI's SubagentBar to render the "View session" button live during a foreground `invoke_agent` run (#1105) — without this event the button only appeared after `tool_end`, which for foreground subagents means after the subagent has finished. Fires for both foreground and background paths; the event is idempotent on the client (background subagents also carry `session_id` on the `invoke_agent` tool result and the `subagent_completed` event).
+
+Ordering invariant (paired with `tool_start` for `invoke_agent`):
+
+1. parent's `tool_start` for `invoke_agent` is emitted first (queued onto the runtime event channel before `tool.execute()` runs);
+2. `subagent_started` follows (queued by the coordinator's `spawn_subagent` after the parent's `tool_start`, FIFO on the same channel);
+3. any nested `tool_start` from inside the subagent comes after (the spawned subagent task hasn't started its loop yet at step 2).
+
+```json
+{
+  "session_id": "<uuid>",
+  "tool_invocation_id": "<uuid>",
+  "subagent_name": "reviewer",
+  "subagent_session_id": "<uuid>",
+  "ts": "..."
+}
+```
+
+`subagent_name` is omitted on the wire (`skip_serializing_if`) for ephemeral / unnamed subagents — the frontend resolver falls back to `tool_invocation_id` to attach the new session id to the right SubagentBar entry. `subagent_session_id` is the row where the subagent persists its own messages (same value the `invoke_agent` tool result carries post-#1104).
+
+`subagent_completed`
+Emitted on the parent's session SSE stream when a background subagent finishes. Foreground subagents do not produce this event because their final response arrives synchronously on the parent's `invoke_agent` `tool_end`; only background subagents go through the completion-notification path. Companion to `subagent_started` — same `subagent_session_id` value, so the frontend can render the "View session" button on the completion card without any additional resolution step.
+```json
+{
+  "session_id": "<uuid>",
+  "subagent_name": "researcher",
+  "status": "done",
+  "summary": "Truncated summary (max 200 chars)...",
+  "subagent_session_id": "<uuid>",
+  "ts": "..."
+}
+```
+
+`status` values: `"done"`, `"fail"`, `"cancelled"`. `subagent_name` is omitted on the wire for ephemeral subagents (same shape as `subagent_started`).
+
 #### Reconnect
 Supported via `Last-Event-ID` header (automatic browser reconnect) or `?last_event_id=<n>` query parameter (initial connection after loading history via REST). The query parameter takes precedence when both are present. The server replays events with IDs greater than the supplied value.
 

@@ -1,6 +1,6 @@
 //! Run creation, execution, and completion — the core run lifecycle.
 
-use super::tools::{RuntimeEventForwarder, forward_runtime_events};
+use super::tools::{RuntimeEventForwarder, forward_runtime_events, route_bg_event};
 use super::{RunParams, is_internal_context_id, resolve_agent_config};
 use crate::api_error;
 use crate::server::AppState;
@@ -1669,56 +1669,44 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
         let bg_state = state.clone();
         let bg_session_id = session_id;
         let bg_run_id = run_id;
+        // #1105 — preserve the documented ordering invariant for the
+        // background path. The parent's `tool_start (invoke_agent)` is
+        // queued on `runtime_tx` by the agent loop, but `SubagentStarted`
+        // for a background subagent is enqueued on the SEPARATE
+        // `bg_event_tx` by `spawn_subagent`. The two channels are drained
+        // by independent tasks, so converting `SubagentStarted` to SSE
+        // directly here can race the parent's `tool_start` and reach the
+        // client first — which leaves the frontend resolver
+        // (`setSubagentSessionId`) without an `activeSubagents` entry to
+        // attach the session id to (the bg path also explicitly skips
+        // `setSubagentSessionId` in the `tool_end` handler, so the only
+        // fallback is `subagent_completed` at the end of the bg subagent's
+        // lifetime). We forward `SubagentStarted` back onto the runtime
+        // channel via a clone of `invoke_agent_fwd` so the existing
+        // `forward_runtime_events` task picks it up in strict FIFO order
+        // after the parent's `tool_start` (which the agent loop enqueues
+        // BEFORE calling `tool.execute()`, i.e. before this bg task
+        // observes the event at all).
+        let bg_runtime_fwd = invoke_agent_fwd.clone();
         tokio::spawn(async move {
             let mut rx = bg_event_rx;
             while let Some(event) = rx.recv().await {
-                let sse = match event {
-                    alms_runtime::RuntimeEvent::ToolStart {
-                        invocation_id,
-                        tool,
-                        params,
-                        source_agent,
-                        task_id,
-                    } => SseEventData::tool_start(
-                        bg_run_id,
-                        crate::sse::ToolInvocationId(invocation_id),
-                        &tool,
-                        params,
-                        source_agent,
-                        task_id,
-                    ),
-                    alms_runtime::RuntimeEvent::ToolEnd {
-                        invocation_id,
-                        ok,
-                        result,
-                        source_agent,
-                        task_id,
-                    } => SseEventData::tool_end(
-                        bg_run_id,
-                        crate::sse::ToolInvocationId(invocation_id),
-                        ok,
-                        result,
-                        source_agent,
-                        task_id,
-                    ),
-                    alms_runtime::RuntimeEvent::ApprovalRequired {
-                        tool, decision_tx, ..
-                    } => {
-                        warn!(
-                            tool = %tool,
-                            "Background subagent requested approval -- \
-                             not supported, auto-denying"
-                        );
-                        let _ = decision_tx.send(false);
-                        continue;
-                    }
-                    _ => continue,
-                };
-                bg_state
-                    .run_manager
-                    .send_session_event(bg_session_id, bg_run_id, sse)
-                    .await;
+                if let Some(sse) = route_bg_event(event, &*bg_runtime_fwd, bg_run_id) {
+                    bg_state
+                        .run_manager
+                        .send_session_event(bg_session_id, bg_run_id, sse)
+                        .await;
+                }
             }
+            // Drop our `invoke_agent_fwd` clone here (explicit) so the
+            // parent's `runtime_tx` can close once `InvokeAgentTool` is
+            // dropped via `runtime` teardown. Without this drop the task
+            // would only exit when `bg_event_rx.recv()` returns `None`,
+            // which already happens via `bg_event_tx` being dropped at
+            // the same teardown point — but making the lifetime explicit
+            // keeps the shutdown comment block at the `forwarder_handle`
+            // await accurate.
+            drop(bg_runtime_fwd);
         });
 
         let bg_event_fwd: std::sync::Arc<dyn alms_tools::EventForwarder> =
@@ -1915,10 +1903,14 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
     };
 
     // Drop `runtime` to close the last sender on `runtime_tx`.
-    // The `invoke_agent_fwd` Arc was moved (not cloned) into `InvokeAgentTool`,
-    // which lives inside the runtime's tool registry, so dropping the runtime
-    // also drops the forwarder's sender.  Once all senders are gone the channel
-    // closes and `forwarder_handle` completes.
+    // The `invoke_agent_fwd` Arc was moved into `InvokeAgentTool`, which
+    // lives inside the runtime's tool registry, so dropping the runtime
+    // also drops that copy of the forwarder.  The bg event forwarder
+    // task holds an additional clone of `invoke_agent_fwd` (#1105 ordering
+    // fix) but that task exits as soon as `bg_event_tx` is dropped, which
+    // happens via the same `drop(runtime)` because `bg_event_tx` is owned
+    // by `InvokeAgentTool` through `bg_event_fwd`. Once both copies are
+    // released the channel closes and `forwarder_handle` completes.
     drop(runtime);
     forwarder_handle.await.ok();
 

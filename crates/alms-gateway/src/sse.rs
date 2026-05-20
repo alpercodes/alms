@@ -383,6 +383,44 @@ impl SseEventData {
         )
     }
 
+    /// Session-level: a subagent's session has just been created (#1105).
+    ///
+    /// Emitted on the parent's stream the moment the coordinator's
+    /// `spawn_subagent` resolves the subagent's session id, so the UI's
+    /// SubagentBar can render the "View session" button live during a
+    /// foreground `invoke_agent` run instead of only at `tool_end`.
+    ///
+    /// Ordering invariant (per #1105 issue body and Tim's review on PR
+    /// #1113): the parent's `tool_start` for `invoke_agent` MUST be
+    /// emitted before this event, and any nested `tool_start` from
+    /// inside the subagent MUST follow this event. The forwarding
+    /// plumbing in `runs/tools.rs` and `runs/lifecycle.rs` preserves
+    /// that ordering by virtue of the runtime channel's FIFO semantics —
+    /// `spawn_subagent` emits `SubagentStarted` after the parent
+    /// runtime has already queued its `ToolStart`, and the subagent's
+    /// loop only starts firing events after this point.
+    ///
+    /// `tool_invocation_id` is the parent's `invoke_agent` invocation
+    /// id; the frontend's resolver prefers `subagent_name` and falls
+    /// back to this id for ephemeral / unnamed subagents.
+    pub fn subagent_started(
+        session_id: alms_core::SessionId,
+        tool_invocation_id: ToolInvocationId,
+        subagent_name: Option<String>,
+        subagent_session_id: alms_core::SessionId,
+    ) -> Self {
+        Self::new(
+            "subagent_started",
+            SubagentStartedData {
+                session_id: session_id.0.to_string(),
+                tool_invocation_id: tool_invocation_id.0.to_string(),
+                subagent_name,
+                subagent_session_id: subagent_session_id.0.to_string(),
+                ts: Utc::now(),
+            },
+        )
+    }
+
     /// Session-level: a scheduled job completed (sent to the agent's user-facing session).
     pub fn job_completed(
         session_id: alms_core::SessionId,
@@ -890,6 +928,30 @@ struct SubagentCompletedData {
     status: String,
     summary: String,
     /// The subagent's own session ID (so the frontend can navigate to it).
+    subagent_session_id: String,
+    ts: DateTime<Utc>,
+}
+
+/// `subagent_started` SSE payload (#1105). Emitted on the parent's stream
+/// the moment the coordinator creates the subagent's session, so the UI's
+/// SubagentBar can render the "View session" button live for foreground
+/// runs. Companion to `subagent_completed`; same `subagent_session_id`
+/// the `invoke_agent` tool result carries post-#1104.
+#[derive(Debug, Serialize)]
+struct SubagentStartedData {
+    /// The parent session id this event is being delivered on.
+    session_id: String,
+    /// Parent's `invoke_agent` `tool_invocation_id`. Resolver fallback
+    /// for ephemeral subagents (`subagent_name == null`).
+    tool_invocation_id: String,
+    /// Registered name of the subagent, omitted from the wire when
+    /// `None` (ephemeral / unnamed invocation). The frontend's
+    /// resolver tries this first and falls back to
+    /// `tool_invocation_id`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    subagent_name: Option<String>,
+    /// The subagent's own session id (UUID) — same value the parent's
+    /// `invoke_agent` tool result carries.
     subagent_session_id: String,
     ts: DateTime<Utc>,
 }

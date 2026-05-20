@@ -29,6 +29,18 @@ pub trait SubagentDispatcher: Send + Sync + std::fmt::Debug {
     /// the subagent's tool events are forwarded into the parent run's SSE
     /// stream so the UI can show subagent activity inline.
     ///
+    /// `parent_tool_invocation_id` is the parent's `invoke_agent`
+    /// invocation id (#1105). When provided, the coordinator emits the
+    /// `subagent_started` SSE event back to the parent's stream carrying
+    /// this id so the UI's resolver can attach the new session id to
+    /// the right SubagentBar entry — including ephemeral / unnamed
+    /// subagents where `subagent_name` alone cannot disambiguate.
+    /// `None` is accepted for legacy code paths and tests that don't
+    /// need the event; the coordinator skips the emit entirely in that
+    /// case (the frontend resolver requires `tool_invocation_id` or
+    /// `subagent_name` to attach the session id, and would warn-and-no-op
+    /// without either).
+    ///
     /// Returns `(response_text, subagent_session_id)`.
     #[allow(clippy::too_many_arguments)]
     async fn dispatch(
@@ -40,6 +52,7 @@ pub trait SubagentDispatcher: Send + Sync + std::fmt::Debug {
         parent_event_fwd: Option<Arc<dyn EventForwarder>>,
         subagent_name: Option<String>,
         parent_cancel_token: Option<CancellationToken>,
+        parent_tool_invocation_id: Option<Uuid>,
     ) -> AlmsResult<(String, SessionId)>;
 
     /// Fire a subagent in the background and return its task ID immediately,
@@ -48,7 +61,8 @@ pub trait SubagentDispatcher: Send + Sync + std::fmt::Debug {
     /// The subagent runs concurrently with the parent's loop. Results are
     /// delivered automatically via the completion notification system.
     /// Subagent tool events are still forwarded into `parent_event_fwd`
-    /// when provided.
+    /// when provided. `parent_tool_invocation_id` has the same meaning
+    /// and #1105 semantics as on [`Self::dispatch`].
     ///
     /// Returns `(task_uuid, subagent_session_id)`.
     #[allow(clippy::too_many_arguments)]
@@ -61,6 +75,7 @@ pub trait SubagentDispatcher: Send + Sync + std::fmt::Debug {
         _parent_event_fwd: Option<Arc<dyn EventForwarder>>,
         _subagent_name: Option<String>,
         _parent_cancel_token: Option<CancellationToken>,
+        _parent_tool_invocation_id: Option<Uuid>,
     ) -> AlmsResult<(Uuid, SessionId)> {
         Err(AlmsError::Runtime(
             "dispatch_background not supported by this dispatcher".to_string(),

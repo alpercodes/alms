@@ -59,6 +59,15 @@ pub struct SubagentRequest {
     /// pre-registered in the agent registry (`alms agent create --name ...`).
     /// Its config and workspace files are loaded from the registry.
     pub subagent_name: Option<String>,
+    /// Parent's `invoke_agent` tool invocation id (#1105). When `Some`,
+    /// `spawn_subagent` emits a `subagent_started` SSE event onto the
+    /// parent's stream carrying this id so the UI's resolver can attach
+    /// the new session id to the right SubagentBar entry — including
+    /// ephemeral / unnamed subagents where `subagent_name` alone cannot
+    /// disambiguate concurrent invocations. `None` for legacy callers
+    /// and unit tests; the coordinator skips the emit in that case.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_tool_invocation_id: Option<Uuid>,
 }
 
 /// Status of a subagent task
@@ -381,6 +390,44 @@ impl Coordinator {
             .get_or_create(sub_agent_id, &sub_context_id)
             .id;
 
+        // #1105: emit `subagent_started` onto the parent's event stream
+        // the moment we know the subagent's session id, so the UI's
+        // SubagentBar can render the "View session" button live during
+        // a foreground `invoke_agent` run — instead of only after
+        // `tool_end` arrives, which for foreground subagents means
+        // *after the subagent has finished*. Ordering invariant
+        // (Tim's note on PR #1113):
+        //   1. parent's `tool_start (invoke_agent)` -- already queued
+        //      onto `runtime_tx` by the agent loop before
+        //      `tool.execute()` ran;
+        //   2. `subagent_started` -- queued here, AFTER step 1 by
+        //      FIFO of `runtime_tx`;
+        //   3. nested `tool_start` events from inside the subagent --
+        //      can only fire once the spawned subagent task below
+        //      begins its agent loop, which happens after this point.
+        // Fires for both foreground and background paths (Atlas's
+        // acceptance criteria) — `parent_event_tx` is the parent's
+        // runtime channel for foreground and the background event
+        // forwarder for background. The background path preserves the
+        // ordering invariant above because the gateway's bg event
+        // forwarder task re-routes `SubagentStarted` back onto the
+        // parent's `runtime_tx` rather than emitting SSE on the bg
+        // channel directly, so both paths share the same FIFO line
+        // with the parent's `tool_start (invoke_agent)`. Skipped when
+        // `parent_tool_invocation_id` is `None` because the frontend
+        // resolver needs the id (or `subagent_name`) to attach the
+        // session id to the right SubagentBar entry; legacy code
+        // paths and tests that don't supply it just fall through.
+        if let (Some(tx), Some(parent_inv_id)) =
+            (parent_event_tx.as_ref(), request.parent_tool_invocation_id)
+        {
+            tx.forward_subagent_started(
+                parent_inv_id,
+                request.subagent_name.clone(),
+                sub_session_id.0,
+            );
+        }
+
         let handle = SubagentHandle {
             task_id,
             status: TaskStatus::Pending,
@@ -495,6 +542,7 @@ impl SubagentDispatcher for Coordinator {
         parent_event_tx: Option<Arc<dyn EventForwarder>>,
         subagent_name: Option<String>,
         parent_cancel_token: Option<CancellationToken>,
+        parent_tool_invocation_id: Option<Uuid>,
     ) -> AlmsResult<(String, SessionId)> {
         let request = SubagentRequest {
             task,
@@ -503,6 +551,7 @@ impl SubagentDispatcher for Coordinator {
             parent_agent_id,
             parent_run_id,
             subagent_name,
+            parent_tool_invocation_id,
         };
 
         let (task_id, sub_session_id) = self
@@ -577,6 +626,7 @@ impl SubagentDispatcher for Coordinator {
         parent_event_tx: Option<Arc<dyn EventForwarder>>,
         subagent_name: Option<String>,
         parent_cancel_token: Option<CancellationToken>,
+        parent_tool_invocation_id: Option<Uuid>,
     ) -> alms_core::AlmsResult<(Uuid, SessionId)> {
         let request = SubagentRequest {
             task,
@@ -585,6 +635,7 @@ impl SubagentDispatcher for Coordinator {
             parent_agent_id,
             parent_run_id,
             subagent_name,
+            parent_tool_invocation_id,
         };
         let (task_id, sub_session_id) = self
             .spawn_subagent(request, parent_event_tx, true, parent_cancel_token)
@@ -1574,6 +1625,21 @@ async fn run_agent_loop(
                     // ContextDebug events from subagents are suppressed --
                     // they are only useful for the top-level agent's context.
                     RuntimeEvent::ContextDebug { .. } => continue,
+                    // SubagentStarted events from inside a subagent are
+                    // suppressed — a (future) sub-subagent's SubagentBar
+                    // entry belongs on the subagent's own session stream,
+                    // not the top-level parent's. The coordinator already
+                    // emits a SubagentStarted onto the original parent's
+                    // stream from `spawn_subagent` for this subagent at
+                    // the moment its session is created (#1105); that
+                    // event is what the UI SubagentBar resolver
+                    // consumes. Recursive subagent spawning is not yet
+                    // wired up (see `docs/autonomous-subagents-design.md`),
+                    // so in practice this arm is dead code today, but
+                    // the explicit suppression makes the match exhaustive
+                    // and documents the intended behaviour for when
+                    // sub-subagents land.
+                    RuntimeEvent::SubagentStarted { .. } => continue,
                 }
             }
         });
@@ -1657,6 +1723,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .await;
 
@@ -1685,6 +1752,7 @@ mod tests {
                 "Background work".to_string(),
                 test_session_id(),
                 test_parent_agent_id(),
+                None,
                 None,
                 None,
                 None,
@@ -1721,6 +1789,172 @@ mod tests {
         );
     }
 
+    // -- (c) #1105 -- spawn_subagent emits SubagentStarted onto parent's stream
+
+    /// A mock EventForwarder that records every `forward_subagent_started`
+    /// call. The default impl is a no-op, so we explicitly override it here
+    /// to capture the args and assert on them.
+    #[derive(Debug, Default)]
+    struct CapturingEventForwarder {
+        started: parking_lot::Mutex<Vec<(uuid::Uuid, Option<String>, uuid::Uuid)>>,
+    }
+
+    impl alms_tools::EventForwarder for CapturingEventForwarder {
+        fn forward_tool_start(
+            &self,
+            _invocation_id: uuid::Uuid,
+            _tool: String,
+            _params: serde_json::Value,
+            _source_agent: Option<String>,
+            _task_id: Option<String>,
+        ) {
+        }
+        fn forward_tool_end(
+            &self,
+            _invocation_id: uuid::Uuid,
+            _ok: bool,
+            _result: serde_json::Value,
+            _source_agent: Option<String>,
+            _task_id: Option<String>,
+        ) {
+        }
+        fn forward_token_delta(&self, _delta: String, _source_agent: Option<String>) {}
+        fn forward_status(&self, _phase: String, _detail: Option<String>) {}
+        fn forward_warning(&self, _code: String, _message: String, _source_agent: Option<String>) {}
+        fn forward_subagent_started(
+            &self,
+            tool_invocation_id: uuid::Uuid,
+            subagent_name: Option<String>,
+            subagent_session_id: uuid::Uuid,
+        ) {
+            self.started
+                .lock()
+                .push((tool_invocation_id, subagent_name, subagent_session_id));
+        }
+    }
+
+    /// #1105 — `spawn_subagent` must emit `forward_subagent_started` on the
+    /// parent's event forwarder the moment the subagent's session row is
+    /// created, carrying the parent's `tool_invocation_id` and the new
+    /// session id. This is what the gateway turns into the
+    /// `subagent_started` SSE event so the UI's SubagentBar can render the
+    /// "View session" button live during a foreground `invoke_agent` run.
+    #[tokio::test]
+    async fn test_spawn_emits_subagent_started_when_invocation_id_set() {
+        let coord = test_coordinator();
+        let capture = Arc::new(CapturingEventForwarder::default());
+        let fwd: Arc<dyn alms_tools::EventForwarder> = capture.clone();
+        let parent_inv_id = uuid::Uuid::new_v4();
+
+        let request = SubagentRequest {
+            task: "test".to_string(),
+            timeout: Duration::from_secs(300),
+            parent_session: test_session_id(),
+            parent_agent_id: test_parent_agent_id(),
+            parent_run_id: None,
+            subagent_name: Some("reviewer".to_string()),
+            parent_tool_invocation_id: Some(parent_inv_id),
+        };
+        let (_task_id, sub_session_id) = coord
+            .spawn_subagent(request, Some(fwd), false, None)
+            .await
+            .expect("spawn_subagent should succeed");
+
+        // The event must be queued synchronously from inside `spawn_subagent`
+        // — no async polling needed. Lock the capture, drain, and assert.
+        let started = capture.started.lock();
+        assert_eq!(
+            started.len(),
+            1,
+            "spawn_subagent must emit exactly one SubagentStarted event"
+        );
+        let (got_inv_id, got_name, got_session_id) = started[0].clone();
+        assert_eq!(
+            got_inv_id, parent_inv_id,
+            "SubagentStarted must carry the parent's invocation_id verbatim"
+        );
+        assert_eq!(
+            got_name.as_deref(),
+            Some("reviewer"),
+            "SubagentStarted must carry the registered subagent name"
+        );
+        assert_eq!(
+            got_session_id, sub_session_id.0,
+            "SubagentStarted's session_id must match the value returned by \
+             spawn_subagent (the row where the subagent persists messages)"
+        );
+    }
+
+    /// Ephemeral (unnamed) subagents: `subagent_name` arrives as `None` on
+    /// the wire — the frontend resolver falls back to
+    /// `findSubagentByToolInvocationId`. The invocation id is the
+    /// disambiguator for concurrent unnamed runs, so it must still flow
+    /// through.
+    #[tokio::test]
+    async fn test_spawn_emits_subagent_started_for_ephemeral_subagent() {
+        let coord = test_coordinator();
+        let capture = Arc::new(CapturingEventForwarder::default());
+        let fwd: Arc<dyn alms_tools::EventForwarder> = capture.clone();
+        let parent_inv_id = uuid::Uuid::new_v4();
+
+        let request = SubagentRequest {
+            task: "ephemeral".to_string(),
+            timeout: Duration::from_secs(300),
+            parent_session: test_session_id(),
+            parent_agent_id: test_parent_agent_id(),
+            parent_run_id: None,
+            subagent_name: None, // unnamed / ephemeral
+            parent_tool_invocation_id: Some(parent_inv_id),
+        };
+        let (_task_id, sub_session_id) = coord
+            .spawn_subagent(request, Some(fwd), false, None)
+            .await
+            .expect("spawn_subagent should succeed");
+
+        let started = capture.started.lock();
+        assert_eq!(started.len(), 1);
+        let (got_inv_id, got_name, got_session_id) = started[0].clone();
+        assert_eq!(got_inv_id, parent_inv_id);
+        assert!(
+            got_name.is_none(),
+            "unnamed subagent must carry subagent_name = None so the frontend \
+             resolves via tool_invocation_id"
+        );
+        assert_eq!(got_session_id, sub_session_id.0);
+    }
+
+    /// Legacy callers / tests that don't supply `parent_tool_invocation_id`
+    /// must NOT see a `SubagentStarted` event — the frontend resolver
+    /// needs either `subagent_name` or `tool_invocation_id` to attach the
+    /// session id to a SubagentBar entry, and emitting without either
+    /// would warn-and-no-op (per Iris's resolver tightening in #1113).
+    /// Skipping the emit keeps the wire shape clean.
+    #[tokio::test]
+    async fn test_spawn_skips_subagent_started_when_invocation_id_absent() {
+        let coord = test_coordinator();
+        let capture = Arc::new(CapturingEventForwarder::default());
+        let fwd: Arc<dyn alms_tools::EventForwarder> = capture.clone();
+
+        let request = SubagentRequest {
+            task: "legacy".to_string(),
+            timeout: Duration::from_secs(300),
+            parent_session: test_session_id(),
+            parent_agent_id: test_parent_agent_id(),
+            parent_run_id: None,
+            subagent_name: Some("reviewer".to_string()),
+            parent_tool_invocation_id: None,
+        };
+        let _ = coord
+            .spawn_subagent(request, Some(fwd), false, None)
+            .await
+            .expect("spawn_subagent should succeed");
+
+        assert!(
+            capture.started.lock().is_empty(),
+            "no SubagentStarted should fire when parent_tool_invocation_id is None"
+        );
+    }
+
     // -- (d) cancel_subagent removes handle from DashMap -----------------------
     //
     // NOTE: The mock LLM completes synchronously, so by the time we call
@@ -1740,6 +1974,7 @@ mod tests {
             parent_agent_id: test_parent_agent_id(),
             parent_run_id: None,
             subagent_name: None,
+            parent_tool_invocation_id: None,
         };
         let (task_id, _sub_session_id) = coord
             .spawn_subagent(request, None, false, None)
@@ -1774,6 +2009,7 @@ mod tests {
             parent_agent_id: test_parent_agent_id(),
             parent_run_id: None,
             subagent_name: None,
+            parent_tool_invocation_id: None,
         };
         let (task_id, _sub_session_id) = coord
             .spawn_subagent(request, None, false, None)
@@ -1803,6 +2039,7 @@ mod tests {
             parent_agent_id: test_parent_agent_id(),
             parent_run_id: None,
             subagent_name: None,
+            parent_tool_invocation_id: None,
         };
         let (task_id, _sub_session_id) = coord
             .spawn_subagent(request, None, false, None)
@@ -1839,6 +2076,7 @@ mod tests {
             parent_agent_id: test_parent_agent_id(),
             parent_run_id: None,
             subagent_name: None,
+            parent_tool_invocation_id: None,
         };
         let (task_id, _sub_session_id) = coord
             .spawn_subagent(request, None, false, None)
@@ -2472,6 +2710,7 @@ mod tests {
                 None,
                 Some("reviewer".to_string()),
                 None,
+                None,
             )
             .await
             .expect("first dispatch should succeed");
@@ -2486,6 +2725,7 @@ mod tests {
                 None,
                 None,
                 Some("reviewer".to_string()),
+                None,
                 None,
             )
             .await
@@ -2553,6 +2793,7 @@ mod tests {
                 None,
                 None,
                 Some("researcher".to_string()),
+                None,
                 None,
             )
             .await
@@ -2635,6 +2876,7 @@ mod tests {
                     None,
                     Some("researcher".to_string()),
                     None,
+                    None,
                 )
                 .await
                 .expect("dispatch should succeed");
@@ -2709,6 +2951,7 @@ mod tests {
                 None,
                 Some("researcher".to_string()),
                 None,
+                None,
             )
             .await
             .expect("dispatch should succeed");
@@ -2748,6 +2991,7 @@ mod tests {
             parent_agent_id,
             parent_run_id: None,
             subagent_name: Some("researcher".to_string()),
+            parent_tool_invocation_id: None,
         };
         let (_task_id, _sub_session_id) = coord
             .spawn_subagent(request, None, false, None)
@@ -2762,6 +3006,7 @@ mod tests {
             parent_agent_id,
             parent_run_id: None,
             subagent_name: Some("researcher".to_string()),
+            parent_tool_invocation_id: None,
         };
         let result = coord.spawn_subagent(request2, None, false, None).await;
         assert!(
@@ -2782,6 +3027,7 @@ mod tests {
             parent_agent_id,
             parent_run_id: None,
             subagent_name: Some("coder".to_string()),
+            parent_tool_invocation_id: None,
         };
         assert!(
             coord
@@ -2808,6 +3054,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .await
             .expect("first dispatch should succeed");
@@ -2817,6 +3064,7 @@ mod tests {
                 "Task two".to_string(),
                 parent_session,
                 parent_agent_id,
+                None,
                 None,
                 None,
                 None,
@@ -2861,6 +3109,7 @@ mod tests {
             parent_agent_id,
             parent_run_id: None,
             subagent_name: Some("reviewer".into()),
+            parent_tool_invocation_id: None,
         };
         let req_b = SubagentRequest {
             task: "task B".into(),
@@ -2869,6 +3118,7 @@ mod tests {
             parent_agent_id,
             parent_run_id: None,
             subagent_name: Some("reviewer".into()),
+            parent_tool_invocation_id: None,
         };
 
         let (id_a, ctx_a) = derive_subagent_identity(TaskId::new(), &req_a);
@@ -2910,6 +3160,7 @@ mod tests {
             parent_agent_id,
             parent_run_id: None,
             subagent_name: Some("reviewer".into()),
+            parent_tool_invocation_id: None,
         };
 
         let (id_a, ctx_a) = derive_subagent_identity(TaskId::new(), &mk(parent_a));
@@ -2953,6 +3204,7 @@ mod tests {
                 None,
                 Some("reviewer".to_string()),
                 None,
+                None,
             )
             .await
             .expect("first dispatch should succeed");
@@ -2967,6 +3219,7 @@ mod tests {
                 None,
                 None,
                 Some("reviewer".to_string()),
+                None,
                 None,
             )
             .await
@@ -3026,6 +3279,7 @@ mod tests {
                 None,
                 None,
                 Some("reviewer".to_string()),
+                None,
                 None,
             )
             .await
@@ -3106,6 +3360,7 @@ mod tests {
                 None,
                 Some("reviewer".to_string()),
                 None,
+                None,
             )
             .await;
         assert!(
@@ -3145,6 +3400,7 @@ mod tests {
                 None,
                 Some("reviewer".to_string()),
                 None,
+                None,
             )
             .await
             .expect("parent_a dispatch should succeed");
@@ -3157,6 +3413,7 @@ mod tests {
                 None,
                 None,
                 Some("reviewer".to_string()),
+                None,
                 None,
             )
             .await
@@ -3514,6 +3771,7 @@ mod tests {
                 None,
                 None, // ephemeral — the regression vector
                 None,
+                None,
             )
             .await
             .expect("dispatch should succeed");
@@ -3553,6 +3811,7 @@ mod tests {
                 None,
                 None,
                 None, // ephemeral — the regression vector
+                None,
                 None,
             )
             .await
@@ -3610,6 +3869,7 @@ mod tests {
                 None,
                 None,
                 Some("researcher".to_string()),
+                None,
                 None,
             )
             .await

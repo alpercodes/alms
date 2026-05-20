@@ -1911,8 +1911,21 @@ impl AgentRuntime {
             }
         }
 
-        // Execute
-        let result = self.tools.execute(name, args.clone()).await;
+        // Execute. Thread the parent's `invocation_id` into the per-call
+        // `ToolContext` so `InvokeAgentTool` can carry it to the
+        // coordinator, which emits the `subagent_started` SSE event
+        // with the parent's `tool_invocation_id` for the UI's
+        // SubagentBar resolver (#1105). All other tools fall through
+        // the default `Tool::execute_with_context` impl, which
+        // discards the context and runs `Tool::execute` unchanged.
+        let result = self
+            .tools
+            .execute_with_context(
+                name,
+                args.clone(),
+                alms_sandbox::ToolContext::new(invocation_id),
+            )
+            .await;
         let elapsed = start.elapsed();
 
         // The inner future has finished and we are now in synchronous code

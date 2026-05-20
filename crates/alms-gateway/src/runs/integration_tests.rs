@@ -6979,6 +6979,7 @@ async fn subagent_session_messages_endpoint_returns_transcript() {
             None,
             Some("researcher".to_string()),
             None,
+            None,
         )
         .await
         .expect("subagent dispatch should succeed against mock LLM");
