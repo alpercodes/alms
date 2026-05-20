@@ -136,7 +136,8 @@ ALMS originally hardcoded `take(50)` messages in the agent loop. No compression,
 │  ┌──────────────────────────────────────┐   │
 │  │ Episodic Summaries (cross-session)    │   │
 │  │ "[Your conversation history...]"      │   │
-│  │ **User chat (last active: ...)**      │   │
+│  │ **User chat — session abc12345        │   │
+│  │   (last active: ...)**                │   │
 │  │  Helped debug CORS issue.             │   │
 │  └──────────────────────────────────────┘   │
 │  ┌──────────────────────────────────────┐   │

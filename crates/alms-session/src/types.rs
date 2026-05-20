@@ -25,7 +25,8 @@ pub struct SessionSummary {
     ///
     /// Derived from the session's `context_id` at summary generation time.
     /// Used by the episodic injection formatter to produce distinct headers
-    /// like `**User chat (last active: ...)**` instead of generic `**Session ...**`.
+    /// like `**User chat — session abc12345 (last active: ...)**` instead of
+    /// generic `**Session ...**`.
     ///
     /// `None` indicates an unknown or excluded source — entries with `None`
     /// are filtered out at injection time as a defense-in-depth measure.

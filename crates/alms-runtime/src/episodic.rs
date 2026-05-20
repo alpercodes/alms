@@ -650,10 +650,18 @@ pub fn format_episodic_for_injection(
             _ => continue,
         };
 
-        // Format: **<source_label> (last active: <date>)**\n<summary>
+        // Format: **<source_label> — session <id8> (last active: <date>)**\n<summary>
+        //
+        // The 8-char prefix of the SessionId UUID is sufficient for the agent
+        // to plug into `read_session` (paired with one `list_my_sessions` call
+        // for prefix verification if needed). The full UUID would add ~28
+        // chars per entry; the 8-char form keeps the token overhead small
+        // while making episodic memory actionable (#1106).
         let updated = summary.updated_at.0.format("%Y-%m-%d %H:%M UTC");
+        let session_id_str = summary.session_id.0.to_string();
+        let id_prefix = &session_id_str[..session_id_str.len().min(8)];
         let entry = format!(
-            "\n**{label} (last active: {updated})**\n{}",
+            "\n**{label} — session {id_prefix} (last active: {updated})**\n{}",
             summary.summary
         );
 
@@ -1513,7 +1521,17 @@ mod tests {
         );
         assert!(result.ends_with("</episodic_memory>"));
         assert!(result.contains("Debugged CORS issue"));
-        assert!(result.contains("**User chat (last active:"));
+        // #1106: header now includes session_id prefix between label and date.
+        assert!(result.contains("**User chat — session "));
+        assert!(result.contains("(last active:"));
+        // Verify the actual 8-char prefix of the session_id is in the header.
+        let session_id_str = summaries[0].session_id.0.to_string();
+        let id_prefix = &session_id_str[..8];
+        assert!(
+            result.contains(&format!("**User chat — session {id_prefix} (last active:")),
+            "Header must contain the 8-char session_id prefix between label and date \
+             (got: {result})"
+        );
     }
 
     #[test]
@@ -1540,10 +1558,13 @@ mod tests {
             make_summary("Summary B with some text.", 10),
             make_summary("Summary C with some text.", 15),
         ];
-        // Each summary entry is roughly: "\n**Session (last active: ...)**\n<text>"
-        // which is about 70-80 chars => ~25 tokens.  Header + XML wrapper is ~34 tokens.
-        // Budget of 85 should fit header + wrapper + 1-2 entries but not all 3.
-        let result = format_episodic_for_injection(&summaries, 85).unwrap();
+        // Each summary entry is roughly:
+        //   "\n**User chat — session xxxxxxxx (last active: ...)**\n<text>"
+        // which is about 90-100 chars => ~30 tokens (per #1106 the header now
+        // carries a 19-char session_id segment).  Header + XML wrapper is
+        // ~34 tokens.  Budget of 95 should fit header + wrapper + 1-2 entries
+        // but not all 3.
+        let result = format_episodic_for_injection(&summaries, 95).unwrap();
         assert!(result.contains("Summary A"), "Newest must be included");
         // Oldest (C) should be dropped
         assert!(
@@ -1581,14 +1602,59 @@ mod tests {
             make_summary_with_label("Telegram session.", 10, Some("Telegram chat")),
         ];
         let result = format_episodic_for_injection(&summaries, 5000).unwrap();
+        // #1106: header format is `**<label> — session <id8> (last active: ...)`
         assert!(
-            result.contains("**User chat (last active:"),
-            "Should use 'User chat' label"
+            result.contains("**User chat — session "),
+            "Should use 'User chat' label (got: {result})"
         );
         assert!(
-            result.contains("**Telegram chat (last active:"),
-            "Should use 'Telegram chat' label"
+            result.contains("**Telegram chat — session "),
+            "Should use 'Telegram chat' label (got: {result})"
         );
+    }
+
+    // -- #1106: regression -- session_id is included in every entry's header --
+
+    /// Regression for #1106 — every labelled episodic entry must carry its
+    /// session_id (truncated to the first 8 chars of the UUID) in the
+    /// header so the agent can directly feed it into `read_session` without
+    /// first calling `list_my_sessions` to map labels back to ids.
+    ///
+    /// Pre-fix, `format_episodic_for_injection` emitted
+    /// `**<label> (last active: <date>)**\n<summary>` with no session
+    /// handle. This test fails on that shape: it builds three summaries
+    /// across mixed session types (user-facing, Telegram, DM), each with
+    /// distinct session_ids, and asserts every one of those ids appears as
+    /// its 8-char prefix in the formatted output.
+    #[test]
+    fn test_format_episodic_includes_session_id_in_each_entry() {
+        let summaries = vec![
+            make_summary_with_label("Web session content.", 5, Some("User chat")),
+            make_summary_with_label("Telegram session content.", 10, Some("Telegram chat")),
+            make_summary_with_label("DM session content.", 15, Some("DM with bob")),
+        ];
+        let result = format_episodic_for_injection(&summaries, 5000).unwrap();
+
+        for summary in &summaries {
+            let id_prefix = &summary.session_id.0.to_string()[..8];
+            assert!(
+                result.contains(id_prefix),
+                "Formatted episodic memory must contain session_id prefix {id_prefix} \
+                 for summary {:?}. Without it, agents cannot dereference an episodic \
+                 entry into a concrete session_id for read_session (#1106). Got:\n{result}",
+                summary.summary
+            );
+        }
+
+        // And specifically each must appear adjacent to its own label, not
+        // merely somewhere in the output — guards against accidental shape
+        // changes that would make the id present but unparseable.
+        let web_id_prefix = &summaries[0].session_id.0.to_string()[..8];
+        let tg_id_prefix = &summaries[1].session_id.0.to_string()[..8];
+        let dm_id_prefix = &summaries[2].session_id.0.to_string()[..8];
+        assert!(result.contains(&format!("**User chat — session {web_id_prefix} ")));
+        assert!(result.contains(&format!("**Telegram chat — session {tg_id_prefix} ")));
+        assert!(result.contains(&format!("**DM with bob — session {dm_id_prefix} ")));
     }
 
     // -- S2: defense-in-depth: entries without source_label are skipped --------
@@ -1689,13 +1755,29 @@ mod tests {
             formatted.ends_with("</episodic_memory>"),
             "Should end with closing XML tag"
         );
+        // #1106: header format is `**<label> — session <id8> (last active: ...)`.
         assert!(
-            formatted.contains("**Telegram chat (last active:"),
-            "Telegram summary should have correct source label"
+            formatted.contains("**Telegram chat — session "),
+            "Telegram summary should have correct source label (got: {formatted})"
         );
         assert!(
-            formatted.contains("**User chat (last active:"),
-            "Web summary should have correct source label"
+            formatted.contains("**User chat — session "),
+            "Web summary should have correct source label (got: {formatted})"
+        );
+        // Verify the actual 8-char session_id prefixes are present in the output.
+        let web_id_prefix = &s_web.id.0.to_string()[..8];
+        let tg_id_prefix = &s_tg.id.0.to_string()[..8];
+        assert!(
+            formatted.contains(&format!(
+                "**User chat — session {web_id_prefix} (last active:"
+            )),
+            "Web entry must include its session_id prefix"
+        );
+        assert!(
+            formatted.contains(&format!(
+                "**Telegram chat — session {tg_id_prefix} (last active:"
+            )),
+            "Telegram entry must include its session_id prefix"
         );
         assert!(
             formatted.contains("Debugged CORS issue"),
@@ -1743,9 +1825,13 @@ mod tests {
             formatted2.contains("Discussed project architecture with bob"),
             "DM entry with source_label should be included"
         );
+        // #1106: DM header also carries the session_id prefix.
+        let dm_id_prefix = &s_dm.id.0.to_string()[..8];
         assert!(
-            formatted2.contains("**DM with bob (last active:"),
-            "DM entry should have correct source label header"
+            formatted2.contains(&format!(
+                "**DM with bob — session {dm_id_prefix} (last active:"
+            )),
+            "DM entry should have correct source label header with session_id (got: {formatted2})"
         );
         // Three labelled entries should produce headers.
         let header_count = formatted2.matches("(last active:").count();
