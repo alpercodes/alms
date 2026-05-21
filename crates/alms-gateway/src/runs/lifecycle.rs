@@ -384,6 +384,102 @@ pub async fn get_run_reasoning(
     })))
 }
 
+/// GET /runs/{run_id}/text — rehydrate accumulated in-flight visible-reply
+/// text for the **current parent-agent turn** of a run (#1107).
+///
+/// Mirror endpoint of [`get_run_reasoning`] for the visible reply channel.
+/// Visible text streams as `token_delta` SSE events which are flagged
+/// ephemeral in [`crate::server::RunManager::send_event`] and therefore
+/// **not** written to either the per-run or per-session event log
+/// ([`SessionEventLogManager`] holds nothing for them). Visible text is
+/// flushed to the message store only at end-of-turn via
+/// `persist_assistant_tool_calls`. While a turn is in flight there is no
+/// durable record of the partial assistant reply, so on a mid-turn
+/// session switch the UI's `chatMessages` state is wiped and there is
+/// nothing to repopulate it from — the messages GET returns no in-flight
+/// assistant entry yet, and the SSE replay cursor sits past every
+/// `token_delta` that already fired (and even if it didn't, replay
+/// itself doesn't carry token_delta because the events are ephemeral).
+///
+/// The fix is the in-memory per-run accumulator
+/// ([`crate::server::RunTextBuffer`]) maintained inside `send_event`:
+/// every parent-agent `token_delta` chunk appends to the buffer's `text`
+/// field and stamps `last_session_event_id` with the session log HWM at
+/// the moment of the append. This endpoint reads that snapshot and
+/// returns it verbatim. The HWM is the SSE replay watermark — the
+/// client bumps `lastEventId` up to it so subsequent SSE replay does not
+/// double-emit any non-ephemeral events that the rehydrated text was
+/// implicitly contemporaneous with.
+///
+/// Per-turn scoping (mirrors the #1077 contract on the reasoning side):
+/// parent-agent `tool_start` / `tool_end` events clear the buffer because
+/// the visible text emitted before a tool call has by then been sealed
+/// onto the closing assistant message of the prior turn and persisted to
+/// the message store. Returning that already-sealed text here would
+/// produce the same double-render bug the reasoning side hit in #1077 —
+/// once on the sealed bubble, once concatenated into a trailing unsealed
+/// bubble. Subagent tool events do not clear the buffer (the parent's
+/// turn frame is independent of subagent activity); subagent
+/// `token_delta` itself is filtered at append time (`source_agent` set
+/// is dropped), mirroring the UI's live `token_delta` handler.
+///
+/// Returns an empty `text` and `last_event_id: null` when the run has
+/// no recorded post-boundary visible text yet — the client calls this
+/// endpoint unconditionally on every reload that has an active run, so
+/// an empty-result case must be well-formed rather than a 404.
+///
+/// DM sessions are explicitly out of scope: DM visible reply uses a
+/// different surface (`dm_message` events and the
+/// `groupDmReasoningBlocks` layout); rehydrating into the main chat
+/// pane would surface a row that the DM view never renders. The
+/// frontend gates the call on `session_type !== 'dm'` so this endpoint
+/// itself does not need a DM branch — the backend remains uniform and
+/// returns whatever the buffer holds. Note that DM runs do still flow
+/// through `forward_runtime_events` → `send_event` → `token_delta`, so
+/// the per-run buffer IS populated for DM runs; it is simply
+/// populated-but-unread because the frontend never calls this endpoint
+/// for DM sessions. The wasted memory is bounded (see "Memory profile"
+/// below) and clears on terminal state like any other run. See the PR
+/// body for the follow-up issue if/when DM rehydration becomes worth
+/// the refactor.
+///
+/// **Memory profile.** The per-run buffer grows up to roughly the
+/// model's `max_tokens` worth of UTF-8 per in-flight turn (cleared on
+/// each parent-agent tool boundary, evicted on terminal state). For
+/// typical Anthropic 4.x runs with `max_tokens ≈ 8192` that is on the
+/// order of ~32 KB; long-form generations with `max_tokens` in the
+/// 64K range can reach ~256 KB per active run. Across a fleet of `N`
+/// concurrent active runs the total upper bound is roughly
+/// `N * max_tokens * bytes_per_token`. No hard cap is enforced
+/// today — `max_tokens` is the de-facto ceiling and active-run count
+/// already caps fleet memory in practice; a future explicit cap can
+/// be layered on if a deployment ever pushes that envelope.
+#[instrument(level = "info", skip(state), fields(run_id = %run_id.0))]
+pub async fn get_run_text(
+    State(state): State<AppState>,
+    Path(run_id): Path<RunId>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    // 404 on unknown run — matches the reasoning endpoint contract so the
+    // client surfaces "this run does not exist" the same way regardless of
+    // which rehydration surface it was probing.
+    let _run = state
+        .run_manager
+        .get_run(run_id)
+        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "NOT_FOUND", "Run not found"))?;
+
+    let snapshot = state.run_manager.run_text_buffer_snapshot(run_id);
+    let (text, last_event_id) = match snapshot {
+        Some(buf) => (buf.text, buf.last_session_event_id),
+        None => (String::new(), None),
+    };
+
+    Ok(Json(serde_json::json!({
+        "run_id": run_id.0.to_string(),
+        "text": text,
+        "last_event_id": last_event_id,
+    })))
+}
+
 /// POST /runs/{run_id}/cancel — cancel a running or queued run.
 #[instrument(level = "info", skip(state), fields(run_id = %run_id.0))]
 pub async fn cancel_run(

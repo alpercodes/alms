@@ -181,7 +181,7 @@ sessions are gated on `include_dms`.
 | `session_type` | string | Session type derived from the `context_id`. Always present. See table below. |
 | `participants` | string[] | Participant names parsed from the DM context ID (e.g. `["alice", "bob"]`). Only present when `session_type` is `"dm"`. |
 | `agent_name` | string | Agent name extracted from the notification context ID (e.g. `"alice"` from `"notifications:alice"`). Only present when `session_type` is `"notification"`. |
-| `has_active_run` | bool | `true` if any queued or running run is currently tied to this session, `false` otherwise. Drives the sidebar's "active" indicator on the initial load and after SSE reconnect. Always present. Pairs with the agent-scoped SSE feed (`GET /agents/{agent_id}/events`, section 5.8) which emits live `session_activity_started` / `session_activity_ended` transitions between calls to this endpoint. See #856. |
+| `has_active_run` | bool | `true` if any queued or running run is currently tied to this session, `false` otherwise. Drives the sidebar's "active" indicator on the initial load and after SSE reconnect. Always present. Pairs with the agent-scoped SSE feed (`GET /agents/{agent_id}/events`, section 5.9) which emits live `session_activity_started` / `session_activity_ended` transitions between calls to this endpoint. See #856. |
 
 **`session_type` values**
 
@@ -771,7 +771,36 @@ Notes:
 - The boundary computation is run-scoped: a tool event from a sibling run on the same session never clips the current run's reasoning.
 - For DM sessions, reasoning is routed through a distinct `dm_reasoning` block layout and this endpoint is not used by the DM rehydration path.
 
-### 5.6 Cancel a run
+### 5.6 Get in-flight visible-reply text
+`GET /runs/{run_id}/text`
+
+Returns the concatenated visible assistant reply text for the **current in-flight turn** of a run, plus the maximum SSE event_id covered by that text. Used by the web UI's `loadSession` flow to rehydrate the partial assistant bubble after a mid-turn session switch or page reload (#1107). This is the visible-reply analogue of §5.5 — same response shape, same per-turn scoping contract, same race-free `last_event_id` handoff.
+
+Visible-reply text is streamed as `token_delta` SSE events which the gateway flags ephemeral in `send_event` and therefore does NOT persist to either the per-run or per-session event log. The persistence path is end-of-turn only (flushed onto the sealed assistant message). On a mid-stream session switch the UI's `chatMessages` state is wiped, the messages GET has nothing yet for the in-flight turn, and SSE replay carries no `token_delta` (ephemeral). This endpoint plugs that gap by reading an in-memory per-run accumulator that `send_event` maintains in parallel with the visible event log.
+
+**Per-turn scoping (mirrors §5.5's #1077 contract).** A run may span multiple LLM turns, each closed by one or more parent-agent tool calls. Each closed turn's visible text has by then been sealed onto the corresponding assistant message and persisted to the messages store (returned by the standard messages GET in §5.3). This endpoint must therefore return ONLY visible text that belongs to the still-open trailing turn — otherwise prior-turn text would render twice on a mid-run reload (once from the sealed bubble, once seeded into a new unsealed bubble by the rehydration path). Concretely, parent-agent `tool_start` / `tool_end` events clear the accumulator; only the post-boundary tail is returned.
+
+**Response 200**
+```json
+{
+  "run_id": "<uuid>",
+  "text": "I'll look at the file and...",
+  "last_event_id": 142
+}
+```
+
+**Response 404** — run not found.
+
+Notes:
+- `text` is an empty string and `last_event_id` is `null` when the run has no post-boundary `token_delta` events yet (either no visible text has streamed, or every delta seen so far has already been sealed by a subsequent tool boundary, or the run has reached a terminal state and the buffer has been evicted). The endpoint is safe to call on every page load regardless of run state.
+- `last_event_id` is the session event log HWM at the moment the most recent delta was appended. The client should pass it as `?last_event_id=<n>` on the subsequent SSE open so the live stream replays only events not yet reflected in `text`. The HWM is sampled under the same lock chain as the append, so it never over-reports the session HWM — it can only under-report (the safe direction: the client advances the SSE cursor too little rather than skipping events).
+- Only **parent-agent** `tool_start` / `tool_end` events move the turn boundary. Subagent tool events do not clear the accumulator (the parent's turn frame is independent of subagent activity). `token_delta` events emitted with a non-null `source_agent` (subagent visible reply) are filtered out at append time, mirroring the UI's live `token_delta` handler which renders subagent output in a separate panel.
+- An unmatched parent-agent `tool_start` (approval-paused or cancelled mid-call) still seals the prior turn correctly: the boundary clear fires on the `tool_start` itself, so an `Inflight` tool invocation with no matching `tool_end` does not regress to the prior turn's slice.
+- The accumulator is keyed by `run_id`, so a sibling run on the same session (e.g. a background subagent run sharing the parent's session event log) never contaminates the parent's `/text` response.
+- The accumulator is evicted when the run reaches a terminal state (`Completed` / `Failed` / `Cancelled`), so post-completion calls return an empty `text` / null `last_event_id`. The messages GET in §5.3 is then the authoritative source — the Ok arm has sealed the visible text onto the final assistant message; the Cancelled-mid-stream arm drops the partial text by design (out of scope for in-flight rehydration).
+- For DM sessions, visible reply is routed through a distinct `dm_message` event stream and `groupDmReasoningBlocks` layout. The frontend does not call this endpoint for DM sessions (`session_type !== 'dm'` gate). The backend remains uniform and would return whatever the buffer holds for a DM run, but the DM view does not render the main chat pane so the result is never consumed.
+
+### 5.7 Cancel a run
 `POST /runs/{run_id}/cancel`
 
 Cancels a running or queued run. Returns 200 with `{"run_id":"...","status":"cancelled"}`.
@@ -797,7 +826,7 @@ The state flip + SSE broadcast on the HTTP boundary is independent of that
 cooperative unwind: the user-visible cancel lands synchronously on the HTTP
 response and on every subscribed SSE feed; the loop's actual exit follows.
 
-### 5.7 List runs
+### 5.8 List runs
 `GET /runs?session_id=<uuid>&limit=<n>` — list runs for a session (original behaviour).
 `GET /runs?agent_id=<uuid>&limit=<n>` — list runs across all sessions for an agent.
 
@@ -868,7 +897,7 @@ Notes:
 { "error": { "code": "AMBIGUOUS_FILTER", "message": "..." } }
 ```
 
-### 5.8 Stream agent-scoped events (SSE)
+### 5.9 Stream agent-scoped events (SSE)
 `GET /agents/{agent_id}/events`
 
 Persistent SSE feed scoped to a single agent, carrying activity events

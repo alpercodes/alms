@@ -19,7 +19,7 @@ use crate::server::AppState;
 use crate::sse::SseEventData;
 use alms_coordinator::message_bus::{DmEvent, MessageSource, RunTrigger};
 use alms_coordinator::{SubagentCompletion, TaskId, TaskStatus};
-use alms_core::{AgentId, Run, RunStatus, SessionId, TokenUsage};
+use alms_core::{AgentId, Run, RunId, RunStatus, SessionId, TokenUsage};
 use alms_tools::MessageSender;
 use alms_tools::message_sender::ConversationEndReason;
 use std::sync::Arc;
@@ -6909,6 +6909,635 @@ async fn get_run_reasoning_boundary_uses_unmatched_tool_start() {
         "an unmatched parent-agent tool_start (approval-paused / cancelled \
          mid-call) must still seal the prior turn — the boundary walks \
          both tool_start AND tool_end, not just tool_end"
+    );
+
+    shutdown_token.cancel();
+}
+
+// ---------------------------------------------------------------------------
+// #1107 — GET /runs/{run_id}/text in-flight visible-reply rehydration
+// ---------------------------------------------------------------------------
+
+/// Visible-reply text streams as `token_delta` SSE events which the
+/// gateway flags ephemeral in `send_event` and therefore does not write
+/// to either the per-run or per-session event log. The persistence path
+/// is end-of-turn only (flush onto the sealed assistant message). On a
+/// mid-stream session switch the UI's in-memory accumulation is wiped
+/// by `replaceMessages([])`, the messages GET has nothing yet for the
+/// in-flight turn, and SSE replay carries no token_delta (ephemeral). The
+/// dedicated endpoint reconstructs the partial reply from the per-run
+/// in-memory accumulator that `send_event` maintains, and returns the
+/// session event log HWM at the moment the most recent delta was
+/// appended so the client can advance its SSE replay cursor past any
+/// non-ephemeral events that were contemporaneous.
+#[tokio::test]
+async fn get_run_text_returns_concatenated_visible_reply_text() {
+    use axum::extract::{Path, State};
+    let (state, shutdown_token, _cr, _tr, _dr) = test_app_state();
+    let agent_id = AgentId::new();
+    let session = state
+        .session_manager
+        .get_or_create(agent_id, "test-text-rehydrate");
+    let session_id = session.id;
+
+    let run = Run::new(session_id, agent_id, "go talk".into());
+    let run_id = run.run_id;
+    state.run_manager.insert_run(run);
+
+    // Interleave a non-ephemeral event (`run_started`) so the buffer's
+    // `last_session_event_id` watermark has something to snap to —
+    // mirrors the reasoning test's mixed-event-type setup.
+    state
+        .run_manager
+        .send_event(
+            run_id,
+            session_id,
+            SseEventData::run_started(run_id, session_id),
+        )
+        .await;
+    state
+        .run_manager
+        .send_event(
+            run_id,
+            session_id,
+            SseEventData::token_delta(run_id, "Hello ", None),
+        )
+        .await;
+    state
+        .run_manager
+        .send_event(
+            run_id,
+            session_id,
+            SseEventData::token_delta(run_id, "world", None),
+        )
+        .await;
+    state
+        .run_manager
+        .send_event(
+            run_id,
+            session_id,
+            SseEventData::token_delta(run_id, "!", None),
+        )
+        .await;
+
+    let response = super::lifecycle::get_run_text(State(state.clone()), Path(run_id))
+        .await
+        .expect("get_run_text should succeed for a known run");
+    let body = response.0;
+
+    assert_eq!(
+        body["text"].as_str().unwrap(),
+        "Hello world!",
+        "rehydrated visible reply must equal the concatenation of every \
+         non-subagent token_delta delta in event-emission order"
+    );
+
+    let returned_id = body["last_event_id"]
+        .as_u64()
+        .expect("last_event_id must be present once a non-ephemeral event has been logged");
+    let session_hwm = state
+        .run_manager
+        .latest_session_event_id(session_id)
+        .await
+        .expect("session must have logged events");
+    assert!(
+        returned_id <= session_hwm,
+        "returned last_event_id {returned_id} must not exceed session HWM \
+         {session_hwm}; otherwise SSE replay would skip events that fired \
+         after the rehydration snapshot"
+    );
+
+    // Subagent token deltas (source_agent set) must be filtered out so
+    // the rehydration surface matches what the UI's live `token_delta`
+    // handler would have rendered (it early-returns on source_agent).
+    state
+        .run_manager
+        .send_event(
+            run_id,
+            session_id,
+            SseEventData::token_delta(run_id, "<subagent>", Some("worker-1".into())),
+        )
+        .await;
+    let response2 = super::lifecycle::get_run_text(State(state.clone()), Path(run_id))
+        .await
+        .expect("get_run_text should succeed after subagent delta");
+    assert_eq!(
+        response2.0["text"].as_str().unwrap(),
+        "Hello world!",
+        "subagent token_delta entries (source_agent set) must be \
+         filtered out of the rehydrated text"
+    );
+
+    shutdown_token.cancel();
+}
+
+/// When the run has not emitted any `token_delta` yet, the endpoint
+/// returns an empty `text` and a null `last_event_id`. The client calls
+/// this endpoint unconditionally on every reload that has an active run,
+/// so an empty-result case must be well-formed rather than 404 / error.
+#[tokio::test]
+async fn get_run_text_returns_empty_when_no_text_events_logged() {
+    use axum::extract::{Path, State};
+    let (state, shutdown_token, _cr, _tr, _dr) = test_app_state();
+    let agent_id = AgentId::new();
+    let session = state
+        .session_manager
+        .get_or_create(agent_id, "test-text-empty");
+    let session_id = session.id;
+
+    let run = Run::new(session_id, agent_id, "silent".into());
+    let run_id = run.run_id;
+    state.run_manager.insert_run(run);
+
+    let response = super::lifecycle::get_run_text(State(state.clone()), Path(run_id))
+        .await
+        .expect("get_run_text should succeed even with no token_delta events");
+    let body = response.0;
+    assert_eq!(body["text"].as_str().unwrap(), "");
+    assert!(
+        body["last_event_id"].is_null(),
+        "last_event_id must be null when no token_delta has been \
+         emitted, so the client leaves its SSE replay cursor untouched"
+    );
+
+    shutdown_token.cancel();
+}
+
+/// Visible-reply text emitted on one run must not contaminate the
+/// rehydrated text returned for a sibling run on the same session.
+/// Background subagent runs share their parent session's event log /
+/// SSE fanout, so without per-run keying the parent's `/text` endpoint
+/// would surface subagent reply text on the wrong run.
+#[tokio::test]
+async fn get_run_text_isolates_text_by_run_id() {
+    use axum::extract::{Path, State};
+    let (state, shutdown_token, _cr, _tr, _dr) = test_app_state();
+    let agent_id = AgentId::new();
+    let session = state
+        .session_manager
+        .get_or_create(agent_id, "test-text-isolation");
+    let session_id = session.id;
+
+    let run_a = Run::new(session_id, agent_id, "a".into());
+    let run_a_id = run_a.run_id;
+    state.run_manager.insert_run(run_a);
+    let run_b = Run::new(session_id, agent_id, "b".into());
+    let run_b_id = run_b.run_id;
+    state.run_manager.insert_run(run_b);
+
+    state
+        .run_manager
+        .send_event(
+            run_a_id,
+            session_id,
+            SseEventData::token_delta(run_a_id, "A1 ", None),
+        )
+        .await;
+    state
+        .run_manager
+        .send_event(
+            run_b_id,
+            session_id,
+            SseEventData::token_delta(run_b_id, "B1 ", None),
+        )
+        .await;
+    state
+        .run_manager
+        .send_event(
+            run_a_id,
+            session_id,
+            SseEventData::token_delta(run_a_id, "A2", None),
+        )
+        .await;
+
+    let resp_a = super::lifecycle::get_run_text(State(state.clone()), Path(run_a_id))
+        .await
+        .expect("get_run_text should succeed for run A");
+    let resp_b = super::lifecycle::get_run_text(State(state.clone()), Path(run_b_id))
+        .await
+        .expect("get_run_text should succeed for run B");
+
+    assert_eq!(
+        resp_a.0["text"].as_str().unwrap(),
+        "A1 A2",
+        "run A's rehydration must contain only run A's token_delta text"
+    );
+    assert_eq!(
+        resp_b.0["text"].as_str().unwrap(),
+        "B1 ",
+        "run B's rehydration must contain only run B's token_delta text"
+    );
+
+    shutdown_token.cancel();
+}
+
+/// Regression test mirroring the reasoning-side #1077 fix.
+///
+/// A run can span multiple LLM turns, each closed by one or more tool
+/// calls. Visible reply text emitted in a prior turn has been sealed
+/// onto the closing assistant message and persisted to the message
+/// store; the messages GET on reload returns that sealed bubble. If the
+/// rehydration buffer kept returning the prior-turn text on top of that,
+/// the chat pane would render the same text twice — once on the sealed
+/// bubble, once on a trailing unsealed bubble seeded by the load-session
+/// step 3 path. The fix clears the buffer on every parent-agent
+/// `tool_start` / `tool_end`, so this endpoint returns only the current
+/// turn's accumulated text.
+#[tokio::test]
+async fn get_run_text_drops_pre_turn_boundary_deltas() {
+    use axum::extract::{Path, State};
+    let (state, shutdown_token, _cr, _tr, _dr) = test_app_state();
+    let agent_id = AgentId::new();
+    let session = state
+        .session_manager
+        .get_or_create(agent_id, "test-text-per-turn");
+    let session_id = session.id;
+
+    let run = Run::new(session_id, agent_id, "multi-turn".into());
+    let run_id = run.run_id;
+    state.run_manager.insert_run(run);
+
+    // Turn 1: token_delta -> tool_start -> tool_end
+    state
+        .run_manager
+        .send_event(
+            run_id,
+            session_id,
+            SseEventData::token_delta(run_id, "Turn1-A ", None),
+        )
+        .await;
+    state
+        .run_manager
+        .send_event(
+            run_id,
+            session_id,
+            SseEventData::token_delta(run_id, "Turn1-B", None),
+        )
+        .await;
+    state
+        .run_manager
+        .send_event(
+            run_id,
+            session_id,
+            SseEventData::tool_start(
+                run_id,
+                crate::sse::ToolInvocationId(uuid::Uuid::new_v4()),
+                "echo",
+                serde_json::json!({}),
+                None,
+                None,
+            ),
+        )
+        .await;
+    state
+        .run_manager
+        .send_event(
+            run_id,
+            session_id,
+            SseEventData::tool_end(
+                run_id,
+                crate::sse::ToolInvocationId(uuid::Uuid::new_v4()),
+                true,
+                serde_json::json!({}),
+                None,
+                None,
+            ),
+        )
+        .await;
+
+    // Turn 2: fresh token_delta (still in flight — no closing tool yet)
+    state
+        .run_manager
+        .send_event(
+            run_id,
+            session_id,
+            SseEventData::token_delta(run_id, "Turn2-A ", None),
+        )
+        .await;
+    state
+        .run_manager
+        .send_event(
+            run_id,
+            session_id,
+            SseEventData::token_delta(run_id, "Turn2-B", None),
+        )
+        .await;
+
+    let response = super::lifecycle::get_run_text(State(state.clone()), Path(run_id))
+        .await
+        .expect("get_run_text should succeed");
+    let body = response.0;
+    assert_eq!(
+        body["text"].as_str().unwrap(),
+        "Turn2-A Turn2-B",
+        "visible-reply rehydration must include ONLY deltas emitted after \
+         the latest parent-agent tool boundary; Turn-1 text is already \
+         persisted to the sealed assistant message and would otherwise \
+         double-render (#1107, mirroring #1077 on the reasoning channel)"
+    );
+    assert!(
+        body["last_event_id"].as_u64().is_some(),
+        "last_event_id must be present once any non-ephemeral event \
+         has fired alongside the post-boundary deltas"
+    );
+
+    shutdown_token.cancel();
+}
+
+/// A subagent `tool_start` / `tool_end` (with `source_agent` set) must
+/// not clear the parent's text buffer. Subagent activity is independent
+/// of the parent's turn frame: an `invoke_agent` call spawns a subagent
+/// whose tool events are scoped to the subagent's own panel, and the
+/// parent's reply continues to accumulate in the same turn.
+#[tokio::test]
+async fn get_run_text_boundary_ignores_subagent_tool_events() {
+    use axum::extract::{Path, State};
+    let (state, shutdown_token, _cr, _tr, _dr) = test_app_state();
+    let agent_id = AgentId::new();
+    let session = state
+        .session_manager
+        .get_or_create(agent_id, "test-text-subagent-boundary");
+    let session_id = session.id;
+
+    let run = Run::new(session_id, agent_id, "subagent boundary".into());
+    let run_id = run.run_id;
+    state.run_manager.insert_run(run);
+
+    state
+        .run_manager
+        .send_event(
+            run_id,
+            session_id,
+            SseEventData::token_delta(run_id, "pre-sub ", None),
+        )
+        .await;
+    // Subagent tool_start — source_agent set. MUST NOT clear buffer.
+    state
+        .run_manager
+        .send_event(
+            run_id,
+            session_id,
+            SseEventData::tool_start(
+                run_id,
+                crate::sse::ToolInvocationId(uuid::Uuid::new_v4()),
+                "echo",
+                serde_json::json!({}),
+                Some("worker-1".into()),
+                None,
+            ),
+        )
+        .await;
+    state
+        .run_manager
+        .send_event(
+            run_id,
+            session_id,
+            SseEventData::tool_end(
+                run_id,
+                crate::sse::ToolInvocationId(uuid::Uuid::new_v4()),
+                true,
+                serde_json::json!({}),
+                Some("worker-1".into()),
+                None,
+            ),
+        )
+        .await;
+    state
+        .run_manager
+        .send_event(
+            run_id,
+            session_id,
+            SseEventData::token_delta(run_id, "post-sub", None),
+        )
+        .await;
+
+    let response = super::lifecycle::get_run_text(State(state.clone()), Path(run_id))
+        .await
+        .expect("get_run_text should succeed");
+    assert_eq!(
+        response.0["text"].as_str().unwrap(),
+        "pre-sub post-sub",
+        "subagent tool events (source_agent set) must NOT clear the \
+         parent's text buffer — only the parent's own tool calls seal \
+         the parent's current turn"
+    );
+
+    shutdown_token.cancel();
+}
+
+/// An unmatched parent-agent `tool_start` (approval-paused, or cancelled
+/// mid-call before `tool_end` fired) must still clear the buffer — the
+/// buffer's per-turn contract is that any parent-agent tool event seals
+/// the prior turn's visible reply, regardless of whether the matching
+/// `tool_end` arrived. Mirrors the reasoning-side `_uses_unmatched_tool_start`
+/// guard so the two channels stay aligned.
+#[tokio::test]
+async fn get_run_text_boundary_uses_unmatched_tool_start() {
+    use axum::extract::{Path, State};
+    let (state, shutdown_token, _cr, _tr, _dr) = test_app_state();
+    let agent_id = AgentId::new();
+    let session = state
+        .session_manager
+        .get_or_create(agent_id, "test-text-approval-paused");
+    let session_id = session.id;
+
+    let run = Run::new(session_id, agent_id, "approval-paused".into());
+    let run_id = run.run_id;
+    state.run_manager.insert_run(run);
+
+    // Turn 1: token_delta -> tool_start (NO matching tool_end — approval-paused).
+    state
+        .run_manager
+        .send_event(
+            run_id,
+            session_id,
+            SseEventData::token_delta(run_id, "Turn1-pre ", None),
+        )
+        .await;
+    state
+        .run_manager
+        .send_event(
+            run_id,
+            session_id,
+            SseEventData::tool_start(
+                run_id,
+                crate::sse::ToolInvocationId(uuid::Uuid::new_v4()),
+                "shell",
+                serde_json::json!({}),
+                None,
+                None,
+            ),
+        )
+        .await;
+
+    // Turn 2: fresh token_delta after the boundary.
+    state
+        .run_manager
+        .send_event(
+            run_id,
+            session_id,
+            SseEventData::token_delta(run_id, "Turn2-only", None),
+        )
+        .await;
+
+    let response = super::lifecycle::get_run_text(State(state.clone()), Path(run_id))
+        .await
+        .expect("get_run_text should succeed");
+    assert_eq!(
+        response.0["text"].as_str().unwrap(),
+        "Turn2-only",
+        "an unmatched parent-agent tool_start (approval-paused / cancelled \
+         mid-call) must still seal the prior turn's visible reply"
+    );
+
+    shutdown_token.cancel();
+}
+
+/// `last_event_id` boundary correctness — the watermark returned must
+/// never exceed the session event log HWM, so advancing the client's
+/// SSE replay cursor to it cannot skip events that fired after the
+/// rehydration snapshot was taken. Pins the contract that the response's
+/// `last_event_id` is sampled inside the same `send_event` critical
+/// section that captures the delta, not lazily resolved from a
+/// post-snapshot read.
+#[tokio::test]
+async fn get_run_text_last_event_id_bounded_by_session_hwm() {
+    use axum::extract::{Path, State};
+    let (state, shutdown_token, _cr, _tr, _dr) = test_app_state();
+    let agent_id = AgentId::new();
+    let session = state
+        .session_manager
+        .get_or_create(agent_id, "test-text-hwm-bounded");
+    let session_id = session.id;
+
+    let run = Run::new(session_id, agent_id, "hwm".into());
+    let run_id = run.run_id;
+    state.run_manager.insert_run(run);
+
+    // Mix some non-ephemeral events around the token_delta so the HWM
+    // walks across multiple ids and we can verify the watermark sits
+    // somewhere in the logged range.
+    state
+        .run_manager
+        .send_event(
+            run_id,
+            session_id,
+            SseEventData::run_started(run_id, session_id),
+        )
+        .await;
+    state
+        .run_manager
+        .send_event(
+            run_id,
+            session_id,
+            SseEventData::token_delta(run_id, "a", None),
+        )
+        .await;
+    state
+        .run_manager
+        .send_event(
+            run_id,
+            session_id,
+            SseEventData::reasoning_delta(run_id, "r", None),
+        )
+        .await;
+    state
+        .run_manager
+        .send_event(
+            run_id,
+            session_id,
+            SseEventData::token_delta(run_id, "b", None),
+        )
+        .await;
+
+    let response = super::lifecycle::get_run_text(State(state.clone()), Path(run_id))
+        .await
+        .expect("get_run_text should succeed");
+    let returned_id = response.0["last_event_id"]
+        .as_u64()
+        .expect("last_event_id must be present when text exists");
+    let session_hwm = state
+        .run_manager
+        .latest_session_event_id(session_id)
+        .await
+        .expect("session must have logged events");
+    assert!(
+        returned_id <= session_hwm,
+        "returned last_event_id {returned_id} must not exceed session HWM \
+         {session_hwm} — advancing the SSE replay cursor past this would \
+         drop events that fired after the rehydration snapshot"
+    );
+
+    shutdown_token.cancel();
+}
+
+/// The endpoint must 404 on an unknown run — same contract as the
+/// reasoning endpoint and the rest of the runs API.
+#[tokio::test]
+async fn get_run_text_returns_404_for_unknown_run() {
+    use axum::extract::{Path, State};
+    let (state, shutdown_token, _cr, _tr, _dr) = test_app_state();
+
+    let unknown_run = RunId::new();
+    let result = super::lifecycle::get_run_text(State(state.clone()), Path(unknown_run)).await;
+    let err = result.expect_err("unknown run must surface a 404, not 200 with empty text");
+    assert_eq!(err.0, axum::http::StatusCode::NOT_FOUND);
+
+    shutdown_token.cancel();
+}
+
+/// The buffer must be cleared when the run reaches a terminal state, so
+/// any post-run rehydration call returns the empty contract — by then
+/// the messages GET is the authoritative source of the final assistant
+/// reply and the buffer would otherwise double-render it on top of the
+/// sealed bubble.
+#[tokio::test]
+async fn get_run_text_returns_empty_after_run_completes() {
+    use axum::extract::{Path, State};
+    let (state, shutdown_token, _cr, _tr, _dr) = test_app_state();
+    let agent_id = AgentId::new();
+    let session = state
+        .session_manager
+        .get_or_create(agent_id, "test-text-post-terminal");
+    let session_id = session.id;
+
+    let run = Run::new(session_id, agent_id, "soon-done".into());
+    let run_id = run.run_id;
+    state.run_manager.insert_run(run);
+
+    state
+        .run_manager
+        .send_event(
+            run_id,
+            session_id,
+            SseEventData::token_delta(run_id, "Hello", None),
+        )
+        .await;
+
+    // Sanity-check: buffer is populated mid-run.
+    let response = super::lifecycle::get_run_text(State(state.clone()), Path(run_id))
+        .await
+        .expect("get_run_text should succeed for live run");
+    assert_eq!(response.0["text"].as_str().unwrap(), "Hello");
+
+    // Flip the run to Completed; the buffer must be evicted as part of
+    // the terminal transition.
+    state.run_manager.mark_run_as_running(run_id);
+    let transitioned =
+        state
+            .run_manager
+            .mark_run_as_completed(run_id, "Hello".into(), Default::default());
+    assert!(transitioned, "mark_run_as_completed should return true");
+
+    let response = super::lifecycle::get_run_text(State(state.clone()), Path(run_id))
+        .await
+        .expect("get_run_text should still succeed on terminal run");
+    assert_eq!(
+        response.0["text"].as_str().unwrap(),
+        "",
+        "post-terminal rehydration must return empty — the messages GET \
+         is the authoritative source for the final assistant reply once \
+         the run has completed"
     );
 
     shutdown_token.cancel();

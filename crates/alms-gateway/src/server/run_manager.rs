@@ -15,6 +15,26 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 
+/// Per-run accumulator of in-flight visible-reply text for the current
+/// parent-agent turn (#1107).
+///
+/// See the `run_text_buffers` field on [`RunManager`] for the rationale.
+/// `text` is the concatenation of every `token_delta` chunk fired by the
+/// parent agent (subagent deltas are filtered out — they belong to a
+/// different surface) since the last parent-agent `tool_start` /
+/// `tool_end` event, or since the start of the run if no parent-agent
+/// tool event has fired yet. `last_session_event_id` is the session
+/// event log HWM at the moment the most recent chunk was appended —
+/// used as the SSE replay watermark so the client can advance its
+/// `Last-Event-Id` cursor past any logged events that fired alongside
+/// the rehydrated deltas, mirroring the contract of the reasoning
+/// rehydration endpoint.
+#[derive(Debug, Clone, Default)]
+pub struct RunTextBuffer {
+    pub text: String,
+    pub last_session_event_id: Option<u64>,
+}
+
 /// Run manager for tracking runs and their event streams
 #[derive(Debug, Clone)]
 pub struct RunManager {
@@ -33,6 +53,20 @@ pub struct RunManager {
     /// Agent-scoped event log for `Last-Event-Id` reconnect on the
     /// agent-scoped feed.
     pub agent_event_log: AgentEventLogManager,
+    /// Per-run accumulator of in-flight visible-reply text (#1107).
+    ///
+    /// `token_delta` SSE events are deliberately *not* persisted to either
+    /// the per-run or per-session event log (they are flagged ephemeral in
+    /// `send_event` for cost reasons — visible text is flushed to the
+    /// message store at end-of-turn). That leaves the in-flight assistant
+    /// reply with no rehydration source: switching into / out of a session
+    /// mid-stream causes the partial reply to disappear because the
+    /// history GET doesn't have it yet and the SSE replay cursor sits
+    /// past every delta that already fired. This buffer is the in-memory
+    /// equivalent of the reasoning-rehydration path from #1043 / #1077,
+    /// scoped per parent-agent turn (cleared on parent-agent
+    /// `tool_start` / `tool_end`).
+    pub run_text_buffers: Arc<DashMap<RunId, RunTextBuffer>>,
     /// Counter of in-flight (spawned but not yet finished) run tasks.
     in_flight: Arc<AtomicUsize>,
     /// Notified when an in-flight run completes (counter reaches zero).
@@ -53,6 +87,7 @@ impl RunManager {
             session_event_log: crate::event_log::SessionEventLogManager::new(),
             agent_senders: Arc::new(DashMap::new()),
             agent_event_log: AgentEventLogManager::new(),
+            run_text_buffers: Arc::new(DashMap::new()),
             in_flight: Arc::new(AtomicUsize::new(0)),
             drain_notify: Arc::new(tokio::sync::Notify::new()),
             cancel_tokens: Arc::new(DashMap::new()),
@@ -308,6 +343,19 @@ impl RunManager {
         drop(entry);
         if transitioned {
             self.persist_snapshot(run_id, snapshot);
+            // #1107: drop the in-flight visible-reply text buffer when the
+            // run reaches a terminal state. On the Ok arm of the agent
+            // loop the final assistant message (including its full
+            // visible text) has been sealed and flushed to the message
+            // store, so the messages GET on the next load is the
+            // authoritative source and any leftover text in the buffer
+            // would race with that path on a same-tab reload. On the
+            // mid-stream `Err(AlmsError::Cancelled)` arm persistence is
+            // skipped and the partial visible text is dropped here by
+            // design — not a regression vs pre-#1107 (cancelled-partial
+            // text was never persisted) and out of scope for the
+            // in-flight rehydration use case this endpoint targets.
+            self.run_text_buffers.remove(&run_id);
         }
         transitioned
     }
@@ -536,6 +584,64 @@ impl RunManager {
             event.event_id = Some(event_id);
         }
 
+        // In-flight visible-reply text accumulator (#1107).
+        //
+        // `token_delta` is ephemeral and not persisted to either log, so
+        // the only way to rehydrate the partial reply when a user switches
+        // into a streaming session is to keep an in-memory per-run buffer
+        // here. Subagent deltas (with `source_agent` set) are filtered out
+        // because the UI's live `token_delta` handler also early-returns
+        // on them — the rehydration surface must mirror the live wire
+        // shape to avoid surfacing text that would never have rendered on
+        // a fresh subscription.
+        //
+        // Parent-agent `tool_start` / `tool_end` mark turn boundaries:
+        // the visible text up to that point has been sealed into the
+        // assistant message that the messages GET will return on the next
+        // load, so the buffer must be cleared to avoid double-rendering
+        // the prior turn's text on top of the freshly rehydrated sealed
+        // bubble (the #1077 symptom, transplanted to the text channel).
+        // Subagent tool events do not move the boundary (see the
+        // analogous logic in `get_run_reasoning`).
+        if event.event_type == "token_delta" {
+            let is_subagent = event
+                .data
+                .get("source_agent")
+                .map(|v| !v.is_null())
+                .unwrap_or(false);
+            if !is_subagent && let Some(delta) = event.data.get("delta").and_then(|v| v.as_str()) {
+                // Sample the session HWM under the same read snapshot that
+                // produced the latest persisted event — any non-ephemeral
+                // event that fires after this sample will have an event_id
+                // strictly greater than what we record here, so the client
+                // bumping `lastEventId` to this watermark cannot skip
+                // events that were not already accounted for elsewhere.
+                let hwm = self.session_event_log.latest_event_id(session_id).await;
+                let mut entry = self.run_text_buffers.entry(run_id).or_default();
+                entry.text.push_str(delta);
+                if let Some(id) = hwm {
+                    entry.last_session_event_id = Some(
+                        entry
+                            .last_session_event_id
+                            .map(|prev| prev.max(id))
+                            .unwrap_or(id),
+                    );
+                }
+            }
+        } else if event.event_type == "tool_start" || event.event_type == "tool_end" {
+            let is_subagent = event
+                .data
+                .get("source_agent")
+                .map(|v| !v.is_null())
+                .unwrap_or(false);
+            if !is_subagent {
+                // Parent-agent tool boundary — the assistant text accumulated
+                // so far has been sealed into the closing message of the
+                // prior turn; drop the buffer so the next turn starts clean.
+                self.run_text_buffers.remove(&run_id);
+            }
+        }
+
         if let Some(mut senders) = self.event_senders.get_mut(&run_id) {
             let before = senders.len();
             senders.retain(|sender| sender.send(event.clone()).is_ok());
@@ -702,6 +808,19 @@ impl RunManager {
     /// `?last_event_id=<n>` when opening the SSE stream.
     pub async fn latest_session_event_id(&self, session_id: SessionId) -> Option<u64> {
         self.session_event_log.latest_event_id(session_id).await
+    }
+
+    /// Snapshot the in-flight visible-reply text buffer for a run (#1107).
+    ///
+    /// Returns the accumulated parent-agent `token_delta` text for the
+    /// current turn, plus the session event log HWM at the moment the
+    /// most recent chunk was appended. Returns `None` when the run has
+    /// not yet emitted any post-boundary text — the caller (the
+    /// `/runs/{id}/text` endpoint) treats `None` as an empty rehydration
+    /// payload rather than a 404, mirroring the reasoning endpoint's
+    /// "well-formed empty" contract.
+    pub fn run_text_buffer_snapshot(&self, run_id: RunId) -> Option<RunTextBuffer> {
+        self.run_text_buffers.get(&run_id).map(|r| r.clone())
     }
 }
 

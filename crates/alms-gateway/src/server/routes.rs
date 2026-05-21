@@ -14,7 +14,7 @@ use crate::auth_keys;
 use crate::jobs::{cancel_job, create_job, get_job, list_jobs};
 use crate::runs::{
     cancel_dm, cancel_run, classify_session_type, create_run, get_run_reasoning, get_run_status,
-    get_run_tool_calls, is_internal_context_id, list_runs, stream_run_events,
+    get_run_text, get_run_tool_calls, is_internal_context_id, list_runs, stream_run_events,
 };
 use crate::settings::{get_settings, patch_settings};
 use crate::workspace::{get_workspace, open_workspace, update_workspace_file};
@@ -194,6 +194,7 @@ pub(crate) fn protected_router() -> Router<AppState> {
         .route("/runs/{run_id}/cancel", post(cancel_run))
         .route("/runs/{run_id}/tool-calls", get(get_run_tool_calls))
         .route("/runs/{run_id}/reasoning", get(get_run_reasoning))
+        .route("/runs/{run_id}/text", get(get_run_text))
         // Approvals
         .route("/approvals", get(list_approvals))
         .route("/approvals/{approval_id}", post(resolve_approval))

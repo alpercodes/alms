@@ -19,11 +19,11 @@
  */
 
 import { getSession, getSessionMessages, getSessionToolCalls } from '../api/sessions.js';
-import { listRuns, listApprovals, listAgentRuns, getRun, getRunReasoning } from '../api/runs.js';
+import { listRuns, listApprovals, listAgentRuns, getRun, getRunReasoning, getRunText } from '../api/runs.js';
 import { mapHistoryMessages, groupDmReasoningBlocks } from './history.js';
 import { normalizeApproval } from './approvals.js';
 import { chatMessages, nextMsgId } from '../state/chat.js';
-import { replaceMessages, appendMessage } from '../state/chat-actions.js';
+import { replaceMessages, appendMessage, updateMessage } from '../state/chat-actions.js';
 import { activeRunId, runs } from '../state/runs.js';
 import { openSessionStream } from '../hooks/use-session-stream.js';
 import { setAgentPhase, clearAgentPhase, setDmContext } from '../state/agent-status.js';
@@ -437,6 +437,65 @@ export async function loadSession(sessionId, opts) {
                 }
             } catch (err) {
                 console.warn(`[${logPrefix}] Failed to load in-flight reasoning:`, err);
+            }
+
+            // Rehydrate the in-flight turn's visible assistant reply text
+            // (#1107). Exact analog of the reasoning rehydration block
+            // above; same MUST-be-last placement and same DM-session
+            // gate. The dedicated endpoint returns the concatenation of
+            // `token_delta` text for the CURRENT TURN ONLY — deltas
+            // belonging to already-sealed prior turns are dropped by the
+            // backend buffer's per-turn boundary (cleared on parent-agent
+            // `tool_start` / `tool_end`), mirroring the reasoning
+            // endpoint's #1077 turn-scoping contract.
+            //
+            // Tail-merge semantics: the reasoning seed above may have
+            // already appended an unsealed assistant entry. If so, we
+            // fold the rehydrated text into that same entry's `text`
+            // field so the chat pane renders ONE bubble carrying both
+            // reasoning + text (matching the live handlers, which both
+            // target the same tail unsealed entry). If no reasoning seed
+            // landed (reasoning empty for this turn), we append a fresh
+            // unsealed entry with `reasoning: ''`. Either way the result
+            // is the single tail unsealed entry that `flushDeltaBuffer`
+            // and `reasoning_delta` will append further chunks to as the
+            // live SSE stream resumes — no double-bubble, no orphaned
+            // append target.
+            //
+            // Race mitigation: re-check the run-still-live status from
+            // the listRuns snapshot just as the reasoning block does. If
+            // the run terminated between step 1 and this fetch, the
+            // messages GET in step 2 has already picked up the final
+            // assistant message with its full visible text, and seeding
+            // an additional unsealed entry would render the text twice
+            // until `run_finished` arrives. Skip the seed in that case.
+            // The `last_event_id` handoff is still safe to apply.
+            try {
+                const textData = await getRunText(activeRunId.value);
+                if (isStale()) return;
+                if (runStillLive && textData?.text) {
+                    const merged = updateMessage(
+                        m => m.type === 'agent' && !m.sealed,
+                        m => ({ ...m, text: (m.text || '') + textData.text }),
+                    );
+                    if (!merged) {
+                        appendMessage({
+                            id: nextMsgId(),
+                            type: 'agent',
+                            role: 'assistant',
+                            text: textData.text,
+                            reasoning: '',
+                            sealed: false,
+                            ts: new Date().toISOString(),
+                        });
+                    }
+                }
+                if (textData?.last_event_id != null
+                    && (lastEventId == null || textData.last_event_id > lastEventId)) {
+                    lastEventId = textData.last_event_id;
+                }
+            } catch (err) {
+                console.warn(`[${logPrefix}] Failed to load in-flight text:`, err);
             }
         }
     }
