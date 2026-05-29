@@ -588,3 +588,242 @@ async fn test_bg_subagent_started_ordering_invariant() {
         "no extra events should land on the parent's runtime channel"
     );
 }
+
+/// Regression test for the #1115 background-subagent hang.
+///
+/// PR #1115 changed the gateway's background event-forwarder task to reroute
+/// `SubagentStarted` back onto the parent's `runtime_tx` via a clone of
+/// `invoke_agent_fwd`. The original commit held that clone as a **strong**
+/// `Arc`, which created a deadlock:
+///
+///   - The bg event-forwarder task lives as long as `bg_event_rx` has any
+///     sender, and `bg_event_tx` (inside `bg_event_fwd`) is cloned into the
+///     coordinator's subagent→parent *relay* task. That relay task only drops
+///     its `bg_event_tx` clone when the detached background subagent's loop
+///     finishes — which can be many seconds (or its full TTL) after the parent
+///     run's own `runtime.run()` returns.
+///   - A strong `invoke_agent_fwd` clone in the bg task is therefore a live
+///     `runtime_tx` sender for the entire background-subagent lifetime.
+///   - `forward_runtime_events` (awaited at `forwarder_handle.await` in
+///     `execute_run`) only completes once ALL `runtime_tx` senders close. With
+///     a lingering strong bg sender, `forwarder_handle.await` blocks and the
+///     parent run hangs in `Running` until the bg subagent completes.
+///
+/// The fix holds the bg-task forwarder as a `Weak` reference so it does not
+/// count toward the `runtime_tx` sender total. This test reconstructs the
+/// exact channel topology and asserts that the parent's drain
+/// (`forward_runtime_events`-equivalent) completes promptly even though a
+/// `bg_event_tx` clone is still alive (simulating the in-flight bg subagent).
+///
+/// A revert to the strong-`Arc` shape makes the parent-drain `recv()` below
+/// hang forever, tripping the test runtime's timeout.
+#[tokio::test]
+async fn test_bg_subagent_does_not_block_parent_run_drain() {
+    use alms_gateway::runs::tools::route_bg_event;
+    use alms_runtime::RuntimeEvent;
+    use std::sync::Arc;
+
+    #[derive(Debug)]
+    struct ChannelForwarder {
+        tx: tokio::sync::mpsc::UnboundedSender<RuntimeEvent>,
+    }
+    impl alms_tools::EventForwarder for ChannelForwarder {
+        fn forward_tool_start(
+            &self,
+            invocation_id: uuid::Uuid,
+            tool: String,
+            params: serde_json::Value,
+            source_agent: Option<String>,
+            task_id: Option<String>,
+        ) {
+            let _ = self.tx.send(RuntimeEvent::ToolStart {
+                invocation_id,
+                tool,
+                params,
+                source_agent,
+                task_id,
+            });
+        }
+        fn forward_tool_end(
+            &self,
+            invocation_id: uuid::Uuid,
+            ok: bool,
+            result: serde_json::Value,
+            source_agent: Option<String>,
+            task_id: Option<String>,
+        ) {
+            let _ = self.tx.send(RuntimeEvent::ToolEnd {
+                invocation_id,
+                ok,
+                result,
+                source_agent,
+                task_id,
+            });
+        }
+        fn forward_token_delta(&self, delta: String, source_agent: Option<String>) {
+            let _ = self.tx.send(RuntimeEvent::TokenDelta {
+                delta,
+                source_agent,
+            });
+        }
+        fn forward_status(&self, phase: String, detail: Option<String>) {
+            let _ = self.tx.send(RuntimeEvent::Status { phase, detail });
+        }
+        fn forward_warning(&self, code: String, message: String, source_agent: Option<String>) {
+            let _ = self.tx.send(RuntimeEvent::Warning {
+                code,
+                message,
+                source_agent,
+            });
+        }
+        fn forward_subagent_started(
+            &self,
+            tool_invocation_id: uuid::Uuid,
+            subagent_name: Option<String>,
+            subagent_session_id: uuid::Uuid,
+        ) {
+            let _ = self.tx.send(RuntimeEvent::SubagentStarted {
+                tool_invocation_id,
+                subagent_name,
+                subagent_session_id: SessionId(subagent_session_id),
+            });
+        }
+    }
+
+    // The parent's runtime channel — drained by `forward_runtime_events` in
+    // production. `runtime_rx` standing in for that drain.
+    let (runtime_tx, mut runtime_rx) = tokio::sync::mpsc::unbounded_channel::<RuntimeEvent>();
+
+    // `invoke_agent_fwd`: the STRONG forwarder held by `InvokeAgentTool`
+    // (which lives inside the runtime's tool registry). Dropped at
+    // `drop(runtime)` in `execute_run`.
+    let invoke_agent_fwd: Arc<dyn alms_tools::EventForwarder> = Arc::new(ChannelForwarder {
+        tx: runtime_tx.clone(),
+    });
+
+    // The bg subagent event channel. `bg_event_tx` is cloned into the
+    // coordinator's relay task; we model that lingering clone with
+    // `relay_holds_bg_tx` and keep it alive past the parent teardown.
+    let (bg_event_tx, bg_event_rx) =
+        tokio::sync::mpsc::unbounded_channel::<alms_runtime::RuntimeEvent>();
+    let relay_holds_bg_tx = bg_event_tx.clone();
+    let bg_run_id = RunId::new();
+
+    // The bg event-forwarder task — a faithful copy of the loop in
+    // `runs/lifecycle.rs`: holds `invoke_agent_fwd` only as a `Weak`, upgrades
+    // per-event, and routes via the production `route_bg_event`.
+    let bg_runtime_fwd = Arc::downgrade(&invoke_agent_fwd);
+    let routed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let routed_in_task = routed.clone();
+    let bg_task = tokio::spawn(async move {
+        let mut rx = bg_event_rx;
+        // A throwaway no-op forwarder for the post-parent-teardown window,
+        // matching `NoopEventForwarder` in lifecycle.rs.
+        #[derive(Debug)]
+        struct Noop;
+        impl alms_tools::EventForwarder for Noop {
+            fn forward_tool_start(
+                &self,
+                _: uuid::Uuid,
+                _: String,
+                _: serde_json::Value,
+                _: Option<String>,
+                _: Option<String>,
+            ) {
+            }
+            fn forward_tool_end(
+                &self,
+                _: uuid::Uuid,
+                _: bool,
+                _: serde_json::Value,
+                _: Option<String>,
+                _: Option<String>,
+            ) {
+            }
+            fn forward_token_delta(&self, _: String, _: Option<String>) {}
+            fn forward_status(&self, _: String, _: Option<String>) {}
+            fn forward_warning(&self, _: String, _: String, _: Option<String>) {}
+        }
+        while let Some(event) = rx.recv().await {
+            let _sse = match bg_runtime_fwd.upgrade() {
+                Some(strong) => route_bg_event(event, &*strong, bg_run_id),
+                None => route_bg_event(event, &Noop, bg_run_id),
+            };
+            routed_in_task.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    });
+
+    // Step 1: the bg subagent emits a `SubagentStarted` (in production this is
+    // queued by `spawn_subagent` BEFORE `dispatch_background` returns, i.e.
+    // while `invoke_agent_fwd` is alive). It must reroute onto `runtime_tx`.
+    let inv_id = uuid::Uuid::new_v4();
+    let sub_session = SessionId::new();
+    bg_event_tx
+        .send(RuntimeEvent::SubagentStarted {
+            tool_invocation_id: inv_id,
+            subagent_name: Some("worker".to_string()),
+            subagent_session_id: sub_session,
+        })
+        .unwrap();
+
+    // The reroute lands on the parent's runtime channel.
+    let rerouted = runtime_rx
+        .recv()
+        .await
+        .expect("SubagentStarted must reroute onto the parent's runtime channel");
+    match rerouted {
+        RuntimeEvent::SubagentStarted {
+            tool_invocation_id, ..
+        } => assert_eq!(tool_invocation_id, inv_id),
+        _ => panic!("expected rerouted SubagentStarted on the parent's runtime channel"),
+    }
+
+    // Step 2: parent run finishes. `execute_run` drops `runtime`, which drops
+    // both the runtime's own `runtime_tx` sender AND `invoke_agent_fwd` (the
+    // strong forwarder inside `InvokeAgentTool`). Model both drops here.
+    drop(invoke_agent_fwd);
+    drop(runtime_tx);
+
+    // CRUCIAL: the background subagent is STILL RUNNING — its relay task holds
+    // a live `bg_event_tx` clone. Pre-fix, this kept a strong `runtime_tx`
+    // sender alive inside the bg task and the drain below would hang.
+    //
+    // The parent's `forward_runtime_events`-equivalent drain must now complete
+    // promptly: with the Weak fix, the only remaining `runtime_tx` senders
+    // (the runtime + `invoke_agent_fwd`) are gone, so `recv()` returns `None`.
+    let drain = tokio::time::timeout(std::time::Duration::from_secs(5), runtime_rx.recv()).await;
+    match drain {
+        Ok(None) => {}
+        Ok(Some(_)) => panic!("unexpected extra event on the parent's runtime channel"),
+        Err(_) => panic!(
+            "parent run drain must complete (recv -> None) once the runtime and \
+             invoke_agent_fwd senders drop, even though a background subagent's \
+             bg_event_tx clone is still alive. A strong bg_runtime_fwd clone would \
+             keep a runtime_tx sender alive and hang this recv (the #1115 deadlock)."
+        ),
+    }
+
+    // The bg subagent then continues to emit its own tool events, which still
+    // route to SSE even after the parent is gone (the Weak upgrade fails, the
+    // Noop fallback is used, and route_bg_event converts ToolEnd directly).
+    relay_holds_bg_tx
+        .send(RuntimeEvent::ToolEnd {
+            invocation_id: uuid::Uuid::new_v4(),
+            ok: true,
+            result: serde_json::json!({"done": true}),
+            source_agent: Some("worker".to_string()),
+            task_id: None,
+        })
+        .unwrap();
+
+    // Close the bg channel (subagent finished) and let the bg task drain.
+    drop(relay_holds_bg_tx);
+    drop(bg_event_tx);
+    bg_task.await.unwrap();
+    assert_eq!(
+        routed.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "bg task must process both the SubagentStarted reroute and the \
+         post-parent-teardown ToolEnd"
+    );
+}

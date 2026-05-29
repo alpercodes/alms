@@ -337,7 +337,7 @@ pub(super) async fn forward_runtime_events(
             // subagents share the same FIFO because the bg event
             // forwarder task in `runs/lifecycle.rs` forwards
             // `SubagentStarted` back onto the parent's `runtime_tx`
-            // (via an Arc clone of `invoke_agent_fwd`) rather than
+            // (via a `Weak` upgrade of `invoke_agent_fwd`) rather than
             // synthesising SSE on the bg channel directly.
             RuntimeEvent::SubagentStarted {
                 tool_invocation_id,

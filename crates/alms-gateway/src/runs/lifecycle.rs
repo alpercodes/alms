@@ -23,6 +23,43 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, instrument, warn};
 
+/// A no-op [`EventForwarder`] used by the background-subagent event task as a
+/// fallback once the parent run's `invoke_agent_fwd` has been dropped (the
+/// `Weak::upgrade` in the bg task returns `None`).
+///
+/// At that point the parent's `runtime_tx` is already closed and there is no
+/// meaningful `SubagentStarted` reroute left to perform — the only events
+/// still arriving on the bg channel are the bg subagent's own
+/// `ToolStart` / `ToolEnd`, which [`route_bg_event`] converts to SSE directly
+/// without ever calling into the forwarder. This zero-sized type satisfies the
+/// `&dyn EventForwarder` parameter for those calls without holding any sender.
+#[derive(Debug)]
+struct NoopEventForwarder;
+
+impl alms_tools::EventForwarder for NoopEventForwarder {
+    fn forward_tool_start(
+        &self,
+        _invocation_id: uuid::Uuid,
+        _tool: String,
+        _params: serde_json::Value,
+        _source_agent: Option<String>,
+        _task_id: Option<String>,
+    ) {
+    }
+    fn forward_tool_end(
+        &self,
+        _invocation_id: uuid::Uuid,
+        _ok: bool,
+        _result: serde_json::Value,
+        _source_agent: Option<String>,
+        _task_id: Option<String>,
+    ) {
+    }
+    fn forward_token_delta(&self, _delta: String, _source_agent: Option<String>) {}
+    fn forward_status(&self, _phase: String, _detail: Option<String>) {}
+    fn forward_warning(&self, _code: String, _message: String, _source_agent: Option<String>) {}
+}
+
 /// GET /runs?session_id=<uuid>&limit=<n> — list runs for a session (existing)
 /// GET /runs?agent_id=<uuid>&limit=<n> — list runs across all sessions for an agent
 ///
@@ -1783,26 +1820,72 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
         // after the parent's `tool_start` (which the agent loop enqueues
         // BEFORE calling `tool.execute()`, i.e. before this bg task
         // observes the event at all).
-        let bg_runtime_fwd = invoke_agent_fwd.clone();
+        // #1115 deadlock fix: hold the parent-channel forwarder as a *Weak*
+        // reference, NOT a strong `Arc` clone.
+        //
+        // `bg_runtime_fwd` exists solely to reroute the single
+        // `SubagentStarted` event onto the parent's `runtime_tx` so it lands
+        // in FIFO order behind the parent's `tool_start (invoke_agent)` (the
+        // #1105 ordering invariant). That event is emitted by
+        // `Coordinator::spawn_subagent` *synchronously, before
+        // `dispatch_background` returns* — i.e. while the parent's
+        // `runtime.run()` is still in flight and the strong `invoke_agent_fwd`
+        // (held by `InvokeAgentTool` inside the runtime) is still alive.
+        //
+        // The `Weak::upgrade` for that event therefore succeeds in practice,
+        // but it is NOT strictly guaranteed. The event is *enqueued* onto
+        // `bg_event_tx` while the strong ref is alive, yet it is *drained* by
+        // the separate task spawned below; nothing synchronizes that task's
+        // `upgrade()` call against the parent run completing and dropping
+        // `runtime` (and with it `invoke_agent_fwd`). For the upgrade to miss,
+        // the bg drain task would have to be starved past the parent's
+        // teardown — and the parent must complete another full LLM round-trip
+        // after `dispatch_background` returns before it reaches `drop(runtime)`,
+        // so that window is tiny. If it ever does miss, the degradation is
+        // benign: the `SubagentStarted` reroute is silently dropped and the UI
+        // falls back to pre-#1105 behavior — the "View session" button surfaces
+        // at `subagent_completed` instead of at start (the subagent
+        // `session_id` is already in the `invoke_agent` tool result either way).
+        //
+        // A *strong* clone here is a deadlock: the bg event forwarder task
+        // lives as long as `bg_event_rx` has any sender, and `bg_event_tx`
+        // (inside `bg_event_fwd`) is cloned into the coordinator's
+        // subagent→parent relay task, which only drops it when the background
+        // subagent's loop finishes. So a strong `bg_runtime_fwd` keeps a
+        // `runtime_tx` sender alive for the entire background-subagent
+        // lifetime, and `forward_runtime_events` (awaited at
+        // `forwarder_handle.await` below) never observes all senders close.
+        // The parent run then hangs in `Running` until the bg subagent
+        // completes or its TTL expires — exactly the regression #1115
+        // introduced (pre-#1115 the bg task held no `runtime_tx` sender at
+        // all). A `Weak` does not contribute to the sender count, so
+        // `drop(runtime)` closes `runtime_tx` promptly regardless of how long
+        // the detached bg subagent keeps the bg channel open.
+        let bg_runtime_fwd = std::sync::Arc::downgrade(&invoke_agent_fwd);
         tokio::spawn(async move {
             let mut rx = bg_event_rx;
             while let Some(event) = rx.recv().await {
-                if let Some(sse) = route_bg_event(event, &*bg_runtime_fwd, bg_run_id) {
+                // Upgrade only for the duration of routing a single event.
+                // After the parent run finishes and drops `runtime` (and with
+                // it `invoke_agent_fwd`), the upgrade returns `None`; by that
+                // point the parent's `runtime_tx` is closed and no
+                // `SubagentStarted` reroute is meaningful anyway — the only
+                // events still arriving on `bg_event_rx` are the bg subagent's
+                // own `ToolStart` / `ToolEnd`, which `route_bg_event` converts
+                // to SSE directly (no forwarder needed). We use a throwaway
+                // no-op forwarder in that case so those `Some(sse)` paths keep
+                // working.
+                let sse = match bg_runtime_fwd.upgrade() {
+                    Some(strong) => route_bg_event(event, &*strong, bg_run_id),
+                    None => route_bg_event(event, &NoopEventForwarder, bg_run_id),
+                };
+                if let Some(sse) = sse {
                     bg_state
                         .run_manager
                         .send_session_event(bg_session_id, bg_run_id, sse)
                         .await;
                 }
             }
-            // Drop our `invoke_agent_fwd` clone here (explicit) so the
-            // parent's `runtime_tx` can close once `InvokeAgentTool` is
-            // dropped via `runtime` teardown. Without this drop the task
-            // would only exit when `bg_event_rx.recv()` returns `None`,
-            // which already happens via `bg_event_tx` being dropped at
-            // the same teardown point — but making the lifetime explicit
-            // keeps the shutdown comment block at the `forwarder_handle`
-            // await accurate.
-            drop(bg_runtime_fwd);
         });
 
         let bg_event_fwd: std::sync::Arc<dyn alms_tools::EventForwarder> =
@@ -1998,15 +2081,22 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
             .await
     };
 
-    // Drop `runtime` to close the last sender on `runtime_tx`.
+    // Drop `runtime` to close the last STRONG sender on `runtime_tx`.
     // The `invoke_agent_fwd` Arc was moved into `InvokeAgentTool`, which
     // lives inside the runtime's tool registry, so dropping the runtime
-    // also drops that copy of the forwarder.  The bg event forwarder
-    // task holds an additional clone of `invoke_agent_fwd` (#1105 ordering
-    // fix) but that task exits as soon as `bg_event_tx` is dropped, which
-    // happens via the same `drop(runtime)` because `bg_event_tx` is owned
-    // by `InvokeAgentTool` through `bg_event_fwd`. Once both copies are
-    // released the channel closes and `forwarder_handle` completes.
+    // also drops that strong copy of the forwarder — and the runtime's own
+    // `RuntimeEventSender`. Once those close, `forward_runtime_events`
+    // observes `rx.recv()` return `None` and `forwarder_handle` completes.
+    //
+    // The bg event forwarder task holds only a *Weak* reference to
+    // `invoke_agent_fwd` (the #1115 deadlock fix), so it does NOT keep a
+    // `runtime_tx` sender alive. This matters because that bg task — and the
+    // `bg_event_tx` feeding it — can outlive this run by the full lifetime of
+    // a detached background subagent: the coordinator's subagent→parent relay
+    // task clones `bg_event_tx` and only drops it when the bg subagent's loop
+    // finishes. Were `bg_runtime_fwd` a strong `Arc`, `forwarder_handle.await`
+    // here would block until the bg subagent completed (or its TTL expired),
+    // hanging the parent run in `Running` — the regression #1115 introduced.
     drop(runtime);
     forwarder_handle.await.ok();
 
