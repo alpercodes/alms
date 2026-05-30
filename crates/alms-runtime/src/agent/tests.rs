@@ -1048,6 +1048,155 @@ async fn test_approval_channel_closed_appends_audit_entry() {
     );
 }
 
+/// Regression for A2-1 (#1125): when the approval `decision_tx` is dropped
+/// without a value on the no-cancel-token (`inflight == None`) path, the
+/// channel-closed unwind MUST emit a matching `ToolEnd` for the `tool_start`
+/// it already fired, so the 1:1 `tool_start`/`tool_end` invariant (#816/#846)
+/// the cancel and deny sibling branches uphold is preserved here too.
+/// Pre-fix this branch returned `Err(ToolExecution)` with no `ToolEnd`,
+/// sticking the frontend spinner. Falsifiable: deleting the `ToolEnd` emit in
+/// the channel-closed arm makes the `saw_tool_end` assertion fail.
+#[tokio::test]
+async fn test_approval_channel_closed_emits_matching_tool_end() {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<RuntimeEvent>();
+    let llm_config = LlmConfig {
+        mock: true,
+        ..LlmConfig::default()
+    };
+    let tools =
+        crate::tools::ToolRegistry::with_builtins_sandboxed(None, true, &["math".to_string()]);
+    let session_config = SessionConfig::default();
+    let session_manager = SessionManager::new(session_config);
+    let agent_id = AgentId::new();
+    let session = session_manager.get_or_create(agent_id, "test");
+
+    // `cancel_token: None` is critical — the channel-closed branch only fires
+    // in the `else` arm of the cancel-token check. With no cancel token the
+    // sequential Guarded path passes `inflight: None` here.
+    let runtime = AgentRuntime {
+        agent_id,
+        config: AgentConfig {
+            posture: Posture::Guarded,
+            ..AgentConfig::default()
+        },
+        llm: LlmClient::new(llm_config).unwrap(),
+        summary_llm: None,
+        tools,
+        workspace: None,
+        event_sender: Some(tx),
+        run_id: None,
+        cancel_token: None,
+        resolved_sandbox_root: None,
+        shell_unrestricted: true,
+        shell_default_env: std::collections::HashMap::new(),
+        shell_permissions: alms_core::config::ShellPermissions::default(),
+        shell_classification_mode: alms_core::config::ShellClassificationMode::default(),
+        shell_spill_policy: alms_sandbox::shell::spill::ShellSpillPolicy::disabled(),
+        tool_output_truncate_policy:
+            crate::tool_output_truncate::ToolOutputTruncatePolicy::disabled(),
+        extra_fs_read_roots: Vec::new(),
+        agent_name: None,
+    };
+
+    let tool_call = ToolCall::new("tc-closed", "math", r#"{"operation":"add","a":1,"b":2}"#);
+    let invocation_id = uuid::Uuid::new_v4();
+
+    // Collector task: drain every event until the channel closes (which
+    // happens once `runtime` — and the `tx` clone it holds — is dropped after
+    // the call returns). On `ApprovalRequired`, drop `decision_tx` to close the
+    // approval channel and trigger the channel-closed unwind. Crucially we do
+    // NOT drop `rx` early, so the `ToolEnd` the unwind emits is observed.
+    // `RuntimeEvent` is not `Debug` (it carries a oneshot sender), so we
+    // reduce each event to a small inspectable tuple inside the collector.
+    let collector = tokio::spawn(async move {
+        let mut tool_starts = 0usize;
+        let mut tool_ends = 0usize;
+        let mut matching_tool_end = false;
+        while let Some(event) = rx.recv().await {
+            match event {
+                RuntimeEvent::ApprovalRequired { decision_tx, .. } => {
+                    // Drop without sending → closes the approval channel and
+                    // triggers the channel-closed unwind.
+                    drop(decision_tx);
+                }
+                RuntimeEvent::ToolStart {
+                    invocation_id: id,
+                    tool,
+                    ..
+                } if id == invocation_id && tool == "math" => {
+                    tool_starts += 1;
+                }
+                RuntimeEvent::ToolEnd {
+                    invocation_id: id,
+                    ok,
+                    result,
+                    source_agent,
+                    task_id,
+                } if id == invocation_id => {
+                    tool_ends += 1;
+                    if !ok
+                        && source_agent.is_none()
+                        && task_id.is_none()
+                        && result == serde_json::json!({"error": "approval channel closed"})
+                    {
+                        matching_tool_end = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        (tool_starts, tool_ends, matching_tool_end)
+    });
+
+    let result = runtime
+        .execute_tool_call(
+            &tool_call,
+            invocation_id,
+            &session_manager,
+            session.id,
+            None,
+        )
+        .await;
+
+    // Drop the runtime (and its `tx` clone) so the collector's channel closes.
+    drop(runtime);
+    let (tool_starts, tool_ends, matching_tool_end) = collector.await.unwrap();
+
+    // The call still unwinds with the channel-closed error.
+    assert!(
+        matches!(&result, Err(AlmsError::ToolExecution(msg)) if msg == "Tool 'math' approval channel closed"),
+        "expected channel-closed ToolExecution error, got {:?}",
+        result
+    );
+
+    // A matching ToolStart must have been emitted for this invocation.
+    assert_eq!(
+        tool_starts, 1,
+        "expected exactly one ToolStart for the math invocation, got {}",
+        tool_starts
+    );
+
+    // THE REGRESSION ASSERTION: a matching terminal ToolEnd must follow, with
+    // the exact shape the cancel/deny sibling branches use. Pre-fix the
+    // channel-closed arm emitted no ToolEnd and this fails.
+    assert!(
+        matching_tool_end,
+        "channel-closed unwind must emit a matching ToolEnd \
+         {{ ok: false, result: {{\"error\": \"approval channel closed\"}} }} for \
+         the prior ToolStart (A2-1 / #1125 1:1 invariant)"
+    );
+
+    // 1:1 invariant: exactly one ToolStart and exactly one ToolEnd for the
+    // invocation, with no stray duplicate ToolEnd.
+    assert_eq!(
+        (tool_starts, tool_ends),
+        (1, 1),
+        "expected exactly one ToolStart and one ToolEnd for the invocation, got ({}, {})",
+        tool_starts,
+        tool_ends
+    );
+}
+
 #[tokio::test]
 async fn test_auto_approved_tool_bypasses_approval_in_guarded_posture() {
     // Prove that an auto-approved tool (echo) executes successfully under

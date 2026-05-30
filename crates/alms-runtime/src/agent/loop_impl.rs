@@ -1839,6 +1839,16 @@ impl AgentRuntime {
                 match decision_rx.await {
                     Ok(v) => v,
                     Err(_) => {
+                        // Unregister before emit so the outer cancel arm in
+                        // `run_tool_calls` cannot synthesise a duplicate
+                        // (#846 protocol), matching the cancel and deny sibling
+                        // branches. In the Guarded sequential path that reaches
+                        // this arm, `cancel_token` is `None` and therefore
+                        // `inflight` is `None` too (the two are coupled at the
+                        // `execute_tool_call` call site), so this is a no-op
+                        // today — but it keeps the branch symmetric with its
+                        // siblings and correct if the coupling ever changes.
+                        unregister_inflight(inflight, invocation_id);
                         // #894: persist the channel-closed unwind to the audit
                         // log. Sibling gap to #815 / #893. Without this append,
                         // a closed approval channel (approver disconnected,
@@ -1847,9 +1857,7 @@ impl AgentRuntime {
                         // operators have to dig through logs to figure out why.
                         // Using `AuditDecision::Deny` mirrors the pattern from
                         // #815 (user denial) and #893 (cancellation) — the
-                        // error string is the discriminator. The cancel-token
-                        // branch is not active here (`inflight` is `None`), so
-                        // no inflight unregister is needed.
+                        // error string is the discriminator.
                         //
                         // The error string mirrors the `Tool '{name}'` prefix
                         // shape used by #815 and #893 so log queries that
@@ -1869,6 +1877,20 @@ impl AgentRuntime {
                                 timestamp: alms_core::Timestamp::now(),
                             },
                         );
+                        // A2-1 (#1125): emit the matching `ToolEnd` for the
+                        // `tool_start` we already fired above. Without this the
+                        // frontend spinner sticks — the cancel and deny sibling
+                        // branches in this same gate both emit a terminal
+                        // `ToolEnd`, and the 1:1 `tool_start`/`tool_end`
+                        // invariant (#816/#846) requires it here too. Mirrors
+                        // the cancel/deny `ToolEnd` shape field-for-field.
+                        let _ = sender.send(RuntimeEvent::ToolEnd {
+                            invocation_id,
+                            ok: false,
+                            result: serde_json::json!({"error": "approval channel closed"}),
+                            source_agent: None,
+                            task_id: None,
+                        });
                         return Err(alms_core::AlmsError::ToolExecution(closed_reason));
                     }
                 }
