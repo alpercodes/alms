@@ -259,90 +259,165 @@ pub async fn generate_and_persist_summary(
     llm: &LlmClient,
     req: PersistSummaryRequest,
 ) {
+    // Extract req fields immediately to prevent ownership / move errors during retries.
+    let req_mode = req.mode;
+    let req_agent_id = req.agent_id;
+    let req_session_id = req.session_id;
+    let req_run_id = req.run_id;
+    let req_run_input = req.run_input;
+    let req_run_output = req.run_output;
+    let req_run_reasoning = req.run_reasoning;
+    let req_context_id = req.context_id;
+    let req_summary_model = req.summary_model;
+    let req_agent_name = req.agent_name;
+    let req_summary_max_tokens = req.summary_max_tokens;
+
     // Check if the session type should be summarised.
-    let source = match derive_source_label(&req.context_id, &req.agent_name) {
+    let source = match derive_source_label(&req_context_id, &req_agent_name) {
         Some(s) => s,
         None => {
             debug!(
-                context_id = req.context_id.as_str(),
+                context_id = req_context_id.as_str(),
                 "Skipping summary for excluded session type"
             );
             return;
         }
     };
 
-    // Load existing summary from DB (if any).
-    let existing_summary = match session_manager.store() {
-        Some(store) => match store.load_session_summary(req.agent_id, req.session_id) {
-            Ok(Some(s)) => Some(s.summary),
-            Ok(None) => None,
+    // Load existing summary from DB (if any) alongside last_run_id for optimistic locking.
+    let (existing_summary, expected_last_run_id) = match session_manager.store() {
+        Some(store) => match store.load_session_summary(req_agent_id, req_session_id) {
+            Ok(Some(s)) => (Some(s.summary), s.last_run_id),
+            Ok(None) => (None, None),
             Err(e) => {
                 warn!("Failed to load existing session summary: {e}");
-                None
+                (None, None)
             }
         },
-        None => None,
+        None => (None, None),
     };
 
-    let params = SummaryParams {
-        mode: req.mode,
-        agent_id: req.agent_id,
-        session_id: req.session_id,
-        run_id: req.run_id,
-        run_input: req.run_input,
-        run_output: req.run_output,
-        run_reasoning: req.run_reasoning,
-        context_id: req.context_id.clone(),
-        existing_summary,
-        summary_model: req.summary_model,
-        agent_name: req.agent_name,
-        summary_max_tokens: req.summary_max_tokens,
-    };
+    let mut current_existing_summary = existing_summary;
+    let mut current_expected_last_run_id = expected_last_run_id;
 
-    let summary_text = match generate_session_summary(llm, &params).await {
-        Some(text) => text,
-        None => return,
-    };
-
-    info!(
-        source_type = source.source_type.as_str(),
-        source_label = source.source_label.as_str(),
-        summary_len = summary_text.len(),
-        "Session summary generated"
-    );
-
-    // Upsert to database (with source label for injection formatting).
-    // I5: Retry once on transient SQLite errors (e.g. SQLITE_BUSY) so that
-    // a momentary lock contention does not permanently lose a summary.
     if let Some(store) = session_manager.store() {
         let mut persisted = false;
-        for attempt in 1..=2 {
-            match store.upsert_session_summary(
+
+        // Exponential backoff: 50ms doubling per attempt (attempt 1 -> 50ms,
+        // 2 -> 100ms, 3 -> 200ms). Used by every retry arm so no failure path
+        // hot-loops the upsert.
+        async fn backoff(attempt: i32) {
+            let delay_ms = 50u64 * (1u64 << ((attempt.max(1) - 1) as u32));
+            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+        }
+
+        // Retry up to 3 times on conflict with exponential backoff.
+        for attempt in 1..=3 {
+            let params = SummaryParams {
+                mode: req_mode.clone(),
+                agent_id: req_agent_id,
+                session_id: req_session_id,
+                run_id: req_run_id,
+                run_input: req_run_input.clone(),
+                run_output: req_run_output.clone(),
+                run_reasoning: req_run_reasoning.clone(),
+                context_id: req_context_id.clone(),
+                existing_summary: current_existing_summary.clone(),
+                summary_model: req_summary_model.clone(),
+                agent_name: req_agent_name.clone(),
+                summary_max_tokens: req_summary_max_tokens,
+            };
+
+            let summary_text = match generate_session_summary(llm, &params).await {
+                Some(text) => text,
+                None => {
+                    debug!("Summary generation produced no result (attempt {attempt})");
+                    return;
+                }
+            };
+
+            info!(
+                attempt,
+                source_type = source.source_type.as_str(),
+                source_label = source.source_label.as_str(),
+                summary_len = summary_text.len(),
+                "Session summary generated"
+            );
+
+            // Attempt optimistic upsert check
+            match store.upsert_session_summary_optimistic(
                 params.agent_id,
                 params.session_id,
                 &summary_text,
                 Some(params.run_id),
                 Some(&source.source_label),
+                current_expected_last_run_id,
             ) {
-                Ok(()) => {
+                Ok(true) => {
                     persisted = true;
                     break;
                 }
-                Err(e) if attempt < 2 => {
+                Ok(false) => {
+                    // Conflict detected: another run updated the summary in the meantime.
+                    if attempt == 3 {
+                        error!(
+                            attempts = 3,
+                            "Failed to persist session summary due to concurrent updates"
+                        );
+                        break;
+                    }
+                    warn!(
+                        attempt,
+                        "Conflict detected during session summary upsert, reloading and retrying..."
+                    );
+                    // Reload latest from DB and update expected_last_run_id +
+                    // current_existing_summary so the next attempt carries the
+                    // current sentinel.
+                    match store.load_session_summary(req_agent_id, req_session_id) {
+                        Ok(Some(s)) => {
+                            current_existing_summary = Some(s.summary);
+                            current_expected_last_run_id = s.last_run_id;
+                        }
+                        Ok(None) => {
+                            current_existing_summary = None;
+                            current_expected_last_run_id = None;
+                        }
+                        Err(e) => {
+                            // Reloading the latest summary itself failed. We now
+                            // hold a known-stale `expected_last_run_id`; re-running
+                            // the optimistic upsert with it is guaranteed to
+                            // conflict again, burning every remaining attempt for
+                            // nothing. Surface the reload failure and stop rather
+                            // than hot-looping on a sentinel we already know is
+                            // stale — the next run on this session will retry from
+                            // a fresh load.
+                            error!(
+                                attempt,
+                                "Failed to reload session summary after conflict; aborting retries: {e}"
+                            );
+                            break;
+                        }
+                    }
+                    backoff(attempt).await;
+                }
+                Err(e) if attempt < 3 => {
+                    // SQLite busy/transient error: back off and retry the upsert
+                    // with the same expected version (the row was not mutated).
                     warn!(
                         attempt,
                         "Transient failure persisting session summary, retrying: {e}"
                     );
-                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    backoff(attempt).await;
                 }
                 Err(e) => {
                     error!(
-                        attempts = 2,
-                        "Failed to persist session summary after retries: {e}"
+                        attempts = 3,
+                        "Failed to persist session summary after transient errors: {e}"
                     );
                 }
             }
         }
+
         if persisted {
             debug!("Session summary persisted successfully");
         }
@@ -1904,5 +1979,80 @@ mod tests {
     #[test]
     fn test_extract_dm_peer_agent_not_in_context_returns_none() {
         assert_eq!(extract_dm_peer("dm:alice:bob", "charlie"), None);
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_summary_race() {
+        use alms_session::Session;
+
+        let store = alms_session::SqliteStore::open_in_memory().unwrap();
+        let session_manager = std::sync::Arc::new(
+            SessionManager::with_store(alms_session::SessionConfig::default(), store).unwrap(),
+        );
+        let store = session_manager.store().unwrap().clone();
+        let agent_id = AgentId::new();
+        let s = Session::new(agent_id, "web-chat-race");
+        store.save_session(&s).unwrap();
+
+        let llm = LlmClient::new(crate::llm_types::LlmConfig {
+            mock: true,
+            ..Default::default()
+        })
+        .unwrap();
+
+        let req_a = PersistSummaryRequest {
+            mode: RunSummaryMode::Heuristic,
+            agent_id,
+            session_id: s.id,
+            run_id: RunId::new(),
+            run_input: "Input A".to_string(),
+            run_output: "Output A".to_string(),
+            run_reasoning: None,
+            context_id: "web-chat-race".to_string(),
+            summary_model: None,
+            agent_name: "myagent".to_string(),
+            summary_max_tokens: 1000,
+        };
+
+        let req_b = PersistSummaryRequest {
+            mode: RunSummaryMode::Heuristic,
+            agent_id,
+            session_id: s.id,
+            run_id: RunId::new(),
+            run_input: "Input B".to_string(),
+            run_output: "Output B".to_string(),
+            run_reasoning: None,
+            context_id: "web-chat-race".to_string(),
+            summary_model: None,
+            agent_name: "myagent".to_string(),
+            summary_max_tokens: 1000,
+        };
+
+        let handle_a = tokio::spawn({
+            let sm = session_manager.clone();
+            let llm = llm.clone();
+            async move {
+                generate_and_persist_summary(&sm, &llm, req_a).await;
+            }
+        });
+
+        let handle_b = tokio::spawn({
+            let sm = session_manager.clone();
+            let llm = llm.clone();
+            async move {
+                generate_and_persist_summary(&sm, &llm, req_b).await;
+            }
+        });
+
+        let _ = tokio::join!(handle_a, handle_b);
+
+        let final_summary = store.load_session_summary(agent_id, s.id).unwrap().unwrap();
+        println!("Concurrent race final summary: {}", final_summary.summary);
+
+        assert!(
+            final_summary.summary.contains("Input A") && final_summary.summary.contains("Input B"),
+            "Race condition lost one of the summaries! got: {}",
+            final_summary.summary
+        );
     }
 }

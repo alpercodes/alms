@@ -229,7 +229,12 @@ fn build_command(
 ) -> SandboxResult<tokio::process::Command> {
     let wrapped = wrap_command_with_pwd_marker(command, pwd_marker);
 
-    let mut cmd = tokio::process::Command::new("bash");
+    #[cfg(windows)]
+    let bash_bin = resolve_bash_path().clone();
+    #[cfg(not(windows))]
+    let bash_bin = PathBuf::from("bash");
+
+    let mut cmd = tokio::process::Command::new(bash_bin);
     cmd.arg("-c");
     cmd.arg(&wrapped);
 
@@ -252,6 +257,90 @@ fn build_command(
     }
 
     Ok(cmd)
+}
+
+/// Resolve the Git-Bash executable once per process and cache the result.
+///
+/// `discover_bash_path` performs up to ~10 `Path::exists()` syscalls walking
+/// the well-known Git-for-Windows install locations. Since the answer is stable
+/// for the lifetime of the process, the resolution is memoized in a `LazyLock`
+/// so `build_command` pays the stat cost only on the first invocation.
+#[cfg(windows)]
+fn resolve_bash_path() -> &'static PathBuf {
+    static BASH_PATH: std::sync::LazyLock<PathBuf> = std::sync::LazyLock::new(discover_bash_path);
+    &BASH_PATH
+}
+
+#[cfg(windows)]
+fn discover_bash_path() -> PathBuf {
+    let paths = [
+        "C:\\Program Files\\Git\\bin\\bash.exe",
+        "C:\\Program Files\\Git\\usr\\bin\\bash.exe",
+        "C:\\Program Files (x86)\\Git\\bin\\bash.exe",
+        "C:\\Program Files (x86)\\Git\\usr\\bin\\bash.exe",
+    ];
+    for p in &paths {
+        let path = Path::new(p);
+        if path.exists() {
+            return path.to_path_buf();
+        }
+    }
+
+    if let Ok(pf) = std::env::var("ProgramFiles") {
+        let path = Path::new(&pf).join("Git").join("bin").join("bash.exe");
+        if path.exists() {
+            return path;
+        }
+        let path = Path::new(&pf)
+            .join("Git")
+            .join("usr")
+            .join("bin")
+            .join("bash.exe");
+        if path.exists() {
+            return path;
+        }
+    }
+
+    if let Ok(pf86) = std::env::var("ProgramFiles(x86)") {
+        let path = Path::new(&pf86).join("Git").join("bin").join("bash.exe");
+        if path.exists() {
+            return path;
+        }
+        let path = Path::new(&pf86)
+            .join("Git")
+            .join("usr")
+            .join("bin")
+            .join("bash.exe");
+        if path.exists() {
+            return path;
+        }
+    }
+
+    if let Ok(local) = std::env::var("LocalAppData") {
+        let path = Path::new(&local)
+            .join("Programs")
+            .join("Git")
+            .join("bin")
+            .join("bash.exe");
+        if path.exists() {
+            return path;
+        }
+    }
+
+    if let Ok(up) = std::env::var("USERPROFILE") {
+        let path = Path::new(&up)
+            .join("AppData")
+            .join("Local")
+            .join("Programs")
+            .join("Git")
+            .join("bin")
+            .join("bash.exe");
+        if path.exists() {
+            return path;
+        }
+    }
+
+    PathBuf::from("bash")
 }
 
 /// Apply Landlock filesystem restrictions to a command via `pre_exec`.
@@ -769,7 +858,13 @@ mod tests {
         let cmd = build_command("echo hello", cwd, None, true, TEST_MARKER).unwrap();
         // The command should be a bash process
         let inner = cmd.as_std();
+        #[cfg(unix)]
         assert_eq!(inner.get_program(), "bash");
+        #[cfg(windows)]
+        assert!(
+            inner.get_program().to_string_lossy().ends_with("bash.exe")
+                || inner.get_program() == "bash"
+        );
         let args: Vec<_> = inner.get_args().collect();
         assert_eq!(args[0], "-c");
         // The second arg should contain our command and the pwd marker

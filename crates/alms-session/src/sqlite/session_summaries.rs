@@ -47,6 +47,114 @@ impl SqliteStore {
         Ok(())
     }
 
+    /// Insert or update the episodic summary for a `(agent_id, session_id)` pair using optimistic locking.
+    ///
+    /// Checks `expected_last_run_id` to prevent concurrent overwrite races.
+    /// Returns `Ok(true)` if successfully persisted, or `Ok(false)` if a conflict is detected.
+    pub fn upsert_session_summary_optimistic(
+        &self,
+        agent_id: AgentId,
+        session_id: SessionId,
+        summary_text: &str,
+        run_id: Option<RunId>,
+        source_label: Option<&str>,
+        expected_last_run_id: Option<RunId>,
+    ) -> AlmsResult<bool> {
+        let now = chrono::Utc::now().to_rfc3339();
+        let conn = self.conn.lock();
+
+        // 1. Try UPDATE first. This covers the case where the row exists.
+        // It filters on `last_run_id = expected` or `last_run_id IS NULL` when expected is None.
+        let expected_str = expected_last_run_id.map(|r| r.0.to_string());
+
+        let update_sql = if expected_str.is_some() {
+            "UPDATE session_summaries SET \
+                 summary      = ?3, \
+                 last_run_id  = ?4, \
+                 updated_at   = ?5, \
+                 source_label = ?6 \
+             WHERE agent_id = ?1 AND session_id = ?2 AND last_run_id = ?7"
+        } else {
+            "UPDATE session_summaries SET \
+                 summary      = ?3, \
+                 last_run_id  = ?4, \
+                 updated_at   = ?5, \
+                 source_label = ?6 \
+             WHERE agent_id = ?1 AND session_id = ?2 AND last_run_id IS NULL"
+        };
+
+        let rows_affected = if let Some(ref expected) = expected_str {
+            conn.execute(
+                update_sql,
+                params![
+                    agent_id.0.to_string(),
+                    session_id.0.to_string(),
+                    summary_text,
+                    run_id.map(|r| r.0.to_string()),
+                    &now,
+                    source_label,
+                    expected,
+                ],
+            )
+            .map_err(|e| {
+                AlmsError::Runtime(format!("SQLite update session_summary optimistic: {e}"))
+            })?
+        } else {
+            conn.execute(
+                update_sql,
+                params![
+                    agent_id.0.to_string(),
+                    session_id.0.to_string(),
+                    summary_text,
+                    run_id.map(|r| r.0.to_string()),
+                    &now,
+                    source_label,
+                ],
+            )
+            .map_err(|e| {
+                AlmsError::Runtime(format!("SQLite update session_summary optimistic: {e}"))
+            })?
+        };
+
+        if rows_affected == 1 {
+            return Ok(true);
+        }
+
+        // 2. If no rows were affected:
+        // - If we expected a specific last_run_id, it is a guaranteed conflict (either row is missing or last_run_id changed).
+        if expected_str.is_some() {
+            return Ok(false);
+        }
+
+        // - If expected_last_run_id was None, the row might not exist yet. Let's try to INSERT.
+        let result = conn.execute(
+            "INSERT INTO session_summaries \
+                 (agent_id, session_id, summary, last_run_id, updated_at, source_label) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                agent_id.0.to_string(),
+                session_id.0.to_string(),
+                summary_text,
+                run_id.map(|r| r.0.to_string()),
+                &now,
+                source_label,
+            ],
+        );
+
+        match result {
+            Ok(_) => Ok(true),
+            Err(rusqlite::Error::SqliteFailure(err, _))
+                if err.code == rusqlite::ErrorCode::ConstraintViolation =>
+            {
+                // UniqueConstraint / UniqueViolation indicates a row was inserted concurrently.
+                Ok(false)
+            }
+            Err(e) => Err(AlmsError::Runtime(format!(
+                "SQLite insert session_summary optimistic: {e}"
+            ))),
+        }
+    }
+
     /// Load all episodic summaries for an agent, ordered by `updated_at DESC`
     /// (most recently active session first), up to `limit`.
     ///
@@ -459,5 +567,98 @@ mod tests {
         assert!(loaded.last_run_id.is_none());
         assert_eq!(loaded.summary, "heuristic summary");
         assert!(loaded.source_label.is_none());
+    }
+
+    #[test]
+    fn test_upsert_session_summary_optimistic() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let session = new_session();
+        store.save_session(&session).unwrap();
+
+        let run1 = RunId::new();
+        let run2 = RunId::new();
+        let run3 = RunId::new();
+
+        // Case 1: Row does not exist, expected is None -> Success (returns true)
+        let ok = store
+            .upsert_session_summary_optimistic(
+                session.agent_id,
+                session.id,
+                "Initial summary.",
+                Some(run1),
+                Some("User chat"),
+                None,
+            )
+            .unwrap();
+        assert!(ok);
+
+        let loaded = store
+            .load_session_summary(session.agent_id, session.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.summary, "Initial summary.");
+        assert_eq!(loaded.last_run_id, Some(run1));
+
+        // Case 2: Row exists with last_run_id = run1, expected is Some(run1) -> Success (returns true)
+        let ok = store
+            .upsert_session_summary_optimistic(
+                session.agent_id,
+                session.id,
+                "Updated summary.",
+                Some(run2),
+                Some("User chat"),
+                Some(run1),
+            )
+            .unwrap();
+        assert!(ok);
+
+        let loaded = store
+            .load_session_summary(session.agent_id, session.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.summary, "Updated summary.");
+        assert_eq!(loaded.last_run_id, Some(run2));
+
+        // Case 3: Row exists with last_run_id = run2, expected is Some(run1) (outdated!) -> Conflict (returns false)
+        let ok = store
+            .upsert_session_summary_optimistic(
+                session.agent_id,
+                session.id,
+                "Stale update.",
+                Some(run3),
+                Some("User chat"),
+                Some(run1),
+            )
+            .unwrap();
+        assert!(!ok);
+
+        // Verify summary was NOT updated
+        let loaded = store
+            .load_session_summary(session.agent_id, session.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.summary, "Updated summary.");
+        assert_eq!(loaded.last_run_id, Some(run2));
+
+        // Case 4: Row exists with last_run_id = run2, expected is None (outdated/conflict!) -> Conflict (returns false)
+        let ok = store
+            .upsert_session_summary_optimistic(
+                session.agent_id,
+                session.id,
+                "Stale insert attempt.",
+                Some(run3),
+                Some("User chat"),
+                None,
+            )
+            .unwrap();
+        assert!(!ok);
+
+        // Verify summary was NOT updated
+        let loaded = store
+            .load_session_summary(session.agent_id, session.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.summary, "Updated summary.");
+        assert_eq!(loaded.last_run_id, Some(run2));
     }
 }

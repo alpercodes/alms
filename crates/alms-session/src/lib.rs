@@ -497,6 +497,35 @@ impl SessionManager {
         Ok(())
     }
 
+    /// Insert or update the episodic summary for a `(agent_id, session_id)` pair using optimistic locking.
+    ///
+    /// Checks `expected_last_run_id` to prevent concurrent overwrite races.
+    /// Returns `Ok(true)` if successfully persisted, or `Ok(false)` if a conflict is detected.
+    /// Returns `Ok(true)` (with a warning) when no SQLite store is configured.
+    pub fn upsert_session_summary_optimistic(
+        &self,
+        agent_id: AgentId,
+        session_id: SessionId,
+        summary_text: &str,
+        run_id: Option<RunId>,
+        source_label: Option<&str>,
+        expected_last_run_id: Option<RunId>,
+    ) -> AlmsResult<bool> {
+        if let Some(store) = &self.store {
+            store.upsert_session_summary_optimistic(
+                agent_id,
+                session_id,
+                summary_text,
+                run_id,
+                source_label,
+                expected_last_run_id,
+            )
+        } else {
+            warn!("upsert_session_summary_optimistic called without SQLite store -- skipping");
+            Ok(true)
+        }
+    }
+
     /// Load all episodic summaries for an agent, ordered by `updated_at DESC`,
     /// up to `limit`.
     ///
