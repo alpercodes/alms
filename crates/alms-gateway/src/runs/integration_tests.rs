@@ -791,6 +791,7 @@ fn format_completion_notification_for_failed_subagent() {
             completion_tokens: 200,
             ..TokenUsage::default()
         }),
+        parent_tool_invocation_id: None,
     };
 
     let notification = super::notifications::format_completion_notification(&completion);
@@ -824,6 +825,7 @@ fn format_completion_notification_for_cancelled_subagent() {
         tool_count: Some(1),
         duration_ms: Some(1500),
         token_usage: None,
+        parent_tool_invocation_id: None,
     };
 
     let notification = super::notifications::format_completion_notification(&completion);
@@ -1100,6 +1102,7 @@ async fn subagent_completion_propagates_session_id() {
                 completion_tokens: 800,
                 ..TokenUsage::default()
             }),
+            parent_tool_invocation_id: None,
         })
         .unwrap();
     drop(test_tx);
@@ -1219,6 +1222,7 @@ async fn subagent_completion_with_missing_parent_session_is_skipped() {
             tool_count: None,
             duration_ms: None,
             token_usage: None,
+            parent_tool_invocation_id: None,
         })
         .unwrap();
     drop(test_tx);
@@ -1268,6 +1272,7 @@ async fn subagent_completion_marker_includes_rich_metadata() {
                 completion_tokens: 15_000,
                 ..TokenUsage::default()
             }),
+            parent_tool_invocation_id: None,
         })
         .unwrap();
     drop(test_tx);
@@ -1364,6 +1369,7 @@ async fn subagent_completion_marker_includes_reasoning_tokens() {
                 reasoning_tokens: Some(2_048),
                 ..TokenUsage::default()
             }),
+            parent_tool_invocation_id: None,
         })
         .unwrap();
     drop(test_tx);

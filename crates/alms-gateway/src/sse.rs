@@ -363,8 +363,18 @@ impl SseEventData {
     }
 
     /// Session-level: a background subagent completed.
+    ///
+    /// `tool_invocation_id` is the parent's `invoke_agent` invocation id
+    /// (#1125, A1-2), mirroring the sibling `subagent_started` event. When
+    /// present the frontend resolves the completion to the right SubagentBar
+    /// entry by invocation id — which disambiguates concurrent unnamed /
+    /// ephemeral subagents that the name-only first-match heuristic
+    /// cross-wires. `None` for legacy callers that don't carry the id; the
+    /// field is then omitted from the wire and the frontend falls back to
+    /// `subagent_session_id`, then `subagent_name`.
     pub fn subagent_completed(
         session_id: alms_core::SessionId,
+        tool_invocation_id: Option<ToolInvocationId>,
         subagent_name: Option<String>,
         status: &str,
         summary: &str,
@@ -374,6 +384,7 @@ impl SseEventData {
             "subagent_completed",
             SubagentCompletedData {
                 session_id: session_id.0.to_string(),
+                tool_invocation_id: tool_invocation_id.map(|id| id.0.to_string()),
                 subagent_name,
                 status: status.to_string(),
                 summary: summary.chars().take(200).collect(),
@@ -401,8 +412,12 @@ impl SseEventData {
     /// loop only starts firing events after this point.
     ///
     /// `tool_invocation_id` is the parent's `invoke_agent` invocation
-    /// id; the frontend's resolver prefers `subagent_name` and falls
-    /// back to this id for ephemeral / unnamed subagents.
+    /// id; the frontend's resolver tries it **first** (id → session id →
+    /// name, per #1125 A1-2), which disambiguates ephemeral / unnamed
+    /// subagents that share `subagent_name == null`. It is a required
+    /// field here — the coordinator skips emitting this event entirely
+    /// when the id is absent, since a `subagent_started` without it can't
+    /// be attached to a SubagentBar entry.
     pub fn subagent_started(
         session_id: alms_core::SessionId,
         tool_invocation_id: ToolInvocationId,
@@ -923,6 +938,13 @@ struct RunQueuePositionData {
 #[derive(Debug, Serialize)]
 struct SubagentCompletedData {
     session_id: String,
+    /// Parent's `invoke_agent` `tool_invocation_id` (#1125, A1-2). Mirrors
+    /// `SubagentStartedData::tool_invocation_id`; the frontend's resolver
+    /// prefers this id (disambiguates concurrent unnamed subagents) and
+    /// falls back to `subagent_session_id`, then `subagent_name`. Omitted
+    /// from the wire when the emitter doesn't carry the id (legacy callers).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_invocation_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     subagent_name: Option<String>,
     status: String,
@@ -941,13 +963,17 @@ struct SubagentCompletedData {
 struct SubagentStartedData {
     /// The parent session id this event is being delivered on.
     session_id: String,
-    /// Parent's `invoke_agent` `tool_invocation_id`. Resolver fallback
-    /// for ephemeral subagents (`subagent_name == null`).
+    /// Parent's `invoke_agent` `tool_invocation_id`. The frontend's
+    /// resolver tries this **first** (it disambiguates concurrent unnamed /
+    /// ephemeral subagents that share `subagent_name == null`), then the
+    /// subagent session id, then `subagent_name`. Always serialized — a
+    /// `subagent_started` without it is useless to the resolver, so the
+    /// coordinator skips the whole emit rather than send a `None` id.
     tool_invocation_id: String,
     /// Registered name of the subagent, omitted from the wire when
-    /// `None` (ephemeral / unnamed invocation). The frontend's
-    /// resolver tries this first and falls back to
-    /// `tool_invocation_id`.
+    /// `None` (ephemeral / unnamed invocation). The frontend's resolver
+    /// consults this **last**, after `tool_invocation_id` and the
+    /// subagent session id (#1125, A1-2).
     #[serde(skip_serializing_if = "Option::is_none")]
     subagent_name: Option<String>,
     /// The subagent's own session id (UUID) — same value the parent's
@@ -1157,6 +1183,66 @@ mod tests {
         );
 
         assert_eq!(event.event_type, "tool_end");
+    }
+
+    /// Pins the `subagent_completed` SSE wire key for the parent's
+    /// `invoke_agent` invocation id (#1125, A1-2). The frontend resolver
+    /// reads `data.tool_invocation_id` (tier 1, ahead of session id and
+    /// name), so the Rust field must serialize literally as snake_case
+    /// `tool_invocation_id` with no `rename`. A future `rename_all` slip on
+    /// `SubagentCompletedData` would silently break the Rust→JS contract the
+    /// whole fix depends on; this assertion guards it. Mirrors the
+    /// `subagent_started` wire shape.
+    #[test]
+    fn test_subagent_completed_serializes_tool_invocation_id_key() {
+        let tool_id = ToolInvocationId::new();
+        let event = SseEventData::subagent_completed(
+            alms_core::SessionId::new(),
+            Some(tool_id),
+            Some("helper".into()),
+            "completed",
+            "did the thing",
+            alms_core::SessionId::new(),
+        );
+
+        assert_eq!(event.event_type, "subagent_completed");
+        let value = serde_json::to_value(&event).unwrap();
+        let data = value
+            .get("data")
+            .and_then(|v| v.as_object())
+            .expect("event.data should be an object");
+        assert_eq!(
+            data.get("tool_invocation_id").and_then(|v| v.as_str()),
+            Some(tool_id.0.to_string().as_str()),
+            "tool_invocation_id must serialize under that exact snake_case \
+             key — the frontend resolver reads data.tool_invocation_id"
+        );
+    }
+
+    /// When the emitter doesn't carry the invocation id (legacy callers),
+    /// `tool_invocation_id` must be omitted from the wire — not serialized
+    /// as `null` — so the pre-#1125 wire shape stays byte-compatible and the
+    /// frontend cleanly falls back to session id, then name.
+    #[test]
+    fn test_subagent_completed_omits_tool_invocation_id_when_none() {
+        let event = SseEventData::subagent_completed(
+            alms_core::SessionId::new(),
+            None,
+            Some("helper".into()),
+            "completed",
+            "did the thing",
+            alms_core::SessionId::new(),
+        );
+
+        let value = serde_json::to_value(&event).unwrap();
+        let data = value
+            .get("data")
+            .and_then(|v| v.as_object())
+            .expect("event.data should be an object");
+        assert!(
+            data.get("tool_invocation_id").is_none(),
+            "tool_invocation_id must be skipped when None — got {value}"
+        );
     }
 
     #[test]

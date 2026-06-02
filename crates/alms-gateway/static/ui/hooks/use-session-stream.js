@@ -32,7 +32,7 @@ import { batch, signal } from '../deps.js';
 import { chatMessages, nextMsgId } from '../state/chat.js';
 import { appendMessage, updateMessage, filterMessages, transformMessages } from '../state/chat-actions.js';
 import { activeRunId, bumpRunListGeneration } from '../state/runs.js';
-import { trackSubagentStart, trackSubagentEnd, trackSubagentTool, findSubagentByToolInvocationId, setSubagentSessionId, activeSubagents } from '../state/subagents.js';
+import { trackSubagentStart, trackSubagentEnd, trackSubagentTool, findSubagentByToolInvocationId, findSubagentBySessionId, setSubagentSessionId, activeSubagents } from '../state/subagents.js';
 import { agentPhase, setAgentPhase, clearAgentPhase, setDmContext, revertPhase, dmPeer } from '../state/agent-status.js';
 import { messageQueue } from '../state/queue.js';
 import { activeSessionId, activeSession, dmParticipants } from '../state/sessions.js';
@@ -966,9 +966,23 @@ export function openSessionStream(sessionId, opts) {
             const status = data.status || 'done';
             const sessionId = data.subagent_session_id || null;
             const summary = data.summary || '';
+            // A1-2 / #1125: the event now carries the parent's invoke_agent
+            // tool_invocation_id (serialized only when present). It is the
+            // only reliable disambiguator when two unnamed/ephemeral
+            // subagents run concurrently — both arrive with
+            // `subagent_name: null` → name "subagent", and the name-only
+            // first-match fallback would end / attach the session id to the
+            // WRONG chip. Pass it to the resolvers, which try
+            // tool_invocation_id → session id → name in that order.
+            const toolInvocationId = data.tool_invocation_id || null;
 
             // Look up subagent entry for metadata (task, tool count, duration)
-            const entry = activeSubagents.value[name]
+            // using the same resolution order: tool_invocation_id first, then
+            // session id, then the legacy name match.
+            const entryKey = findSubagentByToolInvocationId(toolInvocationId)
+                || findSubagentBySessionId(sessionId);
+            const entry = (entryKey && activeSubagents.value[entryKey])
+                || activeSubagents.value[name]
                 || Object.values(activeSubagents.value).find(
                     e => e.displayName === name || (name === 'subagent' && e.status === 'running')
                 );
@@ -979,11 +993,11 @@ export function openSessionStream(sessionId, opts) {
 
             // If subagent_session_id is provided, store it on the subagent entry
             if (sessionId) {
-                setSubagentSessionId(name, sessionId);
+                setSubagentSessionId(name, sessionId, toolInvocationId);
             }
 
             // Update SubagentBar (stays visible until auto-remove delay)
-            trackSubagentEnd(name, status);
+            trackSubagentEnd(name, status, toolInvocationId, sessionId);
 
             // Render a rich completion card instead of a plain system message
             appendMessage({

@@ -301,6 +301,12 @@ export function mapHistoryMessages(msgs, opts) {
                     durationMs: md.duration_ms != null ? md.duration_ms : null,
                     sessionId: md.session_id || null,
                     summary: md.summary || '',
+                    // A1-2 / #1125: the persisted subagent_completion marker
+                    // now carries the parent's invoke_agent tool_invocation_id.
+                    // Surfaced here so history-replay pairing
+                    // (rehydrateSubagentsFromHistory) can resolve by it if the
+                    // session-id FIFO ever proves insufficient.
+                    toolInvocationId: md.tool_invocation_id || null,
                 }, m.timestamp);
                 continue;
             }

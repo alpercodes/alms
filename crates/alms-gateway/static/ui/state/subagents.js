@@ -130,28 +130,33 @@ export function trackSubagentTool(name, tool) {
  * The entry stays visible for REMOVE_DELAY_MS so the user can see the
  * final status (checkmark / X) before it disappears.
  *
- * For unnamed subagents the backend sends `subagent_name: null`, which
- * resolves to the fallback name "subagent". Since the entry key is
- * "subagent-{id}", a direct lookup would miss. When `name` is "subagent"
- * and no exact match exists, we search for any running entry whose key
- * starts with "subagent-" and end that one instead.
+ * Resolution order (A1-2 / #1125):
+ *   1. `toolInvocationId` — exact correlation with the parent's invoke_agent
+ *      call. This is the only reliable disambiguator when two unnamed /
+ *      ephemeral subagents run concurrently (both arrive with
+ *      `subagent_name: null` → caller name "subagent"). The
+ *      `subagent_completed` SSE event now carries `tool_invocation_id`
+ *      (matching the `subagent_started` / `tool_start` paths).
+ *   2. `subagentSessionId` — match the entry whose stored sessionId equals
+ *      the completing subagent's session. Useful when the id was attached
+ *      earlier (via `subagent_started` or the invoke_agent result) but the
+ *      tool_invocation_id is unavailable.
+ *   3. `name` — legacy first-match fallback. For unnamed subagents the
+ *      backend sends `subagent_name: null` → caller passes "subagent", but
+ *      the entry key is "subagent-{id}", so we search for any running entry
+ *      whose key starts with "subagent-". Named subagents match by key
+ *      directly. This path is preserved last so named-subagent behaviour and
+ *      older events without the id keep working unchanged.
+ *
+ * @param {string} name - The subagent key / display name ("subagent" for unnamed).
+ * @param {string} status - Terminal status ('done' | 'fail').
+ * @param {string} [toolInvocationId] - The parent's invoke_agent tool_invocation_id.
+ * @param {string} [subagentSessionId] - The completing subagent's session UUID.
  */
-export function trackSubagentEnd(name, status) {
-    let key = name;
-    let current = activeSubagents.value[key];
-
-    // Fallback for unnamed subagents: the backend sends subagent_name=null,
-    // so the caller passes "subagent" — but the entry key is "subagent-{id}".
-    if (!current && name === 'subagent') {
-        for (const [k, info] of Object.entries(activeSubagents.value)) {
-            if (k.startsWith('subagent-') && info.status === 'running') {
-                key = k;
-                current = info;
-                break;
-            }
-        }
-    }
-
+export function trackSubagentEnd(name, status, toolInvocationId, subagentSessionId) {
+    const key = resolveSubagentKey(name, toolInvocationId, subagentSessionId);
+    if (!key) return;
+    const current = activeSubagents.value[key];
     if (!current) return;
     activeSubagents.value = {
         ...activeSubagents.value,
@@ -185,26 +190,85 @@ export function findSubagentByToolInvocationId(toolInvocationId) {
 }
 
 /**
- * Set the session ID on a subagent entry.
- * Called when the invoke_agent result includes a session_id, or when the
- * subagent_completed event arrives with a session_id.
+ * Find the subagent entry key whose stored sessionId matches the given
+ * session UUID. Returns the key, or null if not found.
  *
- * @param {string} name - The subagent key
- * @param {string} sessionId - The subagent's session UUID
+ * Used as the second-tier resolver (after tool_invocation_id) for
+ * `subagent_completed` / `setSubagentSessionId` so concurrent unnamed
+ * subagents resolve to the right chip even when the tool_invocation_id is
+ * unavailable but the session id was attached earlier (e.g. via
+ * `subagent_started`). See A1-2 / #1125.
  */
-export function setSubagentSessionId(name, sessionId) {
-    let current = activeSubagents.value[name];
-    // Fallback search for unnamed subagents (same logic as trackSubagentEnd)
-    let key = name;
-    if (!current && name === 'subagent') {
+export function findSubagentBySessionId(sessionId) {
+    if (!sessionId) return null;
+    for (const [name, info] of Object.entries(activeSubagents.value)) {
+        if (info.sessionId === sessionId) return name;
+    }
+    return null;
+}
+
+/**
+ * Resolve the activeSubagents map key for a subagent event using the A1-2
+ * (#1125) resolution order: tool_invocation_id first, then session id, then
+ * the name first-match fallback. Returns the resolved key, or null if no
+ * entry matched.
+ *
+ * The name fallback preserves the legacy behaviour: named subagents match
+ * by key directly; the literal "subagent" (unnamed, no id available) matches
+ * the first running "subagent-{id}" entry. Keeping name LAST means older
+ * events without a tool_invocation_id and all named-subagent flows behave
+ * exactly as before.
+ *
+ * @param {string} name - The subagent key / display name ("subagent" for unnamed).
+ * @param {string} [toolInvocationId] - The parent's invoke_agent tool_invocation_id.
+ * @param {string} [sessionId] - The subagent's session UUID.
+ * @returns {string|null}
+ */
+function resolveSubagentKey(name, toolInvocationId, sessionId) {
+    // 1. Exact correlation by the parent's invoke_agent tool_invocation_id.
+    const byInvocation = findSubagentByToolInvocationId(toolInvocationId);
+    if (byInvocation) return byInvocation;
+
+    // 2. Match by the subagent's session id (attached earlier).
+    const bySession = findSubagentBySessionId(sessionId);
+    if (bySession) return bySession;
+
+    // 3. Legacy name fallback.
+    if (activeSubagents.value[name]) return name;
+    if (name === 'subagent') {
         for (const [k, info] of Object.entries(activeSubagents.value)) {
-            if (k.startsWith('subagent-')) {
-                key = k;
-                current = info;
-                break;
+            if (k.startsWith('subagent-') && info.status === 'running') {
+                return k;
             }
         }
     }
+    return null;
+}
+
+/**
+ * Set the session ID on a subagent entry.
+ * Called when the invoke_agent result includes a session_id, when the
+ * subagent_started event fires, or when the subagent_completed event arrives
+ * with a session_id.
+ *
+ * Resolution order mirrors `trackSubagentEnd` (A1-2 / #1125): resolve the
+ * target entry by `toolInvocationId` first, then by an already-set matching
+ * `sessionId` (idempotent re-attach), then by name. The name first-match
+ * fallback is preserved last so named-subagent and pre-id flows are unchanged.
+ *
+ * Callers that already pre-resolve the key (e.g. the `tool_start` /
+ * `subagent_started` handlers do `findSubagentByToolInvocationId(toolId) || name`)
+ * can omit `toolInvocationId`; passing it is preferred so resolution is robust
+ * for concurrent unnamed subagents.
+ *
+ * @param {string} name - The subagent key / display name ("subagent" for unnamed).
+ * @param {string} sessionId - The subagent's session UUID.
+ * @param {string} [toolInvocationId] - The parent's invoke_agent tool_invocation_id.
+ */
+export function setSubagentSessionId(name, sessionId, toolInvocationId) {
+    const key = resolveSubagentKey(name, toolInvocationId, sessionId);
+    if (!key) return;
+    const current = activeSubagents.value[key];
     if (!current) return;
     activeSubagents.value = {
         ...activeSubagents.value,
@@ -470,6 +534,17 @@ export function rehydrateSubagentsFromHistory(messages) {
             // Pair with the oldest unpaired background invocation for
             // this session. Without a session_id we cannot pair (and
             // the marker is informational only); ignore it.
+            //
+            // A1-2 / #1125: the persisted subagent_completion marker now
+            // also carries `m.toolInvocationId` (surfaced by history.js).
+            // The session-id FIFO pairing here is already correct for the
+            // two cases that matter — unnamed concurrent backgrounds don't
+            // share a session_id (UUID v4 per dispatch) so their queues are
+            // independent, and named subagents collapse onto a shared map
+            // key making FIFO/pairing observably equivalent (see the long
+            // note above). tool_invocation_id is available if a future
+            // refactor ever needs exact per-invocation pairing here; not
+            // wired in now to keep this pass low-risk.
             if (!m.sessionId) continue;
             const queue = pendingBySession.get(m.sessionId);
             if (queue && queue.length > 0) {

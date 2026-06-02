@@ -450,6 +450,14 @@ pub(crate) async fn completion_notification_loop(
                 "session_id": completion.subagent_session_id.0.to_string(),
                 "summary": &completion.summary,
             });
+            // Carry the parent's invoke_agent invocation id (#1125, A1-2) into
+            // the persisted marker so a reload that replays history (rather than
+            // the live SSE event) can still resolve the completion to the right
+            // SubagentBar entry by invocation id. Mirrors the SSE field; omitted
+            // when the emitter doesn't carry the id (legacy callers).
+            if let Some(inv) = completion.parent_tool_invocation_id {
+                meta["tool_invocation_id"] = serde_json::json!(inv.to_string());
+            }
             if let Some(ref task) = completion.task_description {
                 meta["task_description"] = serde_json::json!(task);
             }
@@ -503,6 +511,9 @@ pub(crate) async fn completion_notification_loop(
                 alms_core::RunId::new(), // no run yet
                 SseEventData::subagent_completed(
                     session_id,
+                    completion
+                        .parent_tool_invocation_id
+                        .map(crate::sse::ToolInvocationId),
                     completion.subagent_name.clone(),
                     status_str,
                     &completion.summary,
@@ -1242,6 +1253,10 @@ mod tests {
         // Mirrors the pattern in `runs::integration_tests` — a side channel
         // owned by the test feeds the loop, and dropping the sender causes
         // the receiver to return None so the loop exits on its own.
+        // A known invocation id so we can assert it threads through to the
+        // persisted marker (and, by the shared `completion` field, the SSE
+        // event) — the A1-2 fix for #1125.
+        let parent_inv_id = uuid::Uuid::new_v4();
         let (test_tx, test_rx) = mpsc::unbounded_channel();
         test_tx
             .send(alms_coordinator::SubagentCompletion {
@@ -1256,6 +1271,7 @@ mod tests {
                 tool_count: Some(3),
                 duration_ms: Some(1200),
                 token_usage: None,
+                parent_tool_invocation_id: Some(parent_inv_id),
             })
             .unwrap();
         drop(test_tx);
@@ -1295,6 +1311,9 @@ mod tests {
         assert_eq!(meta["subagent_name"], "researcher");
         assert_eq!(meta["status"], "done");
         assert_eq!(meta["session_id"], subagent_session_id.0.to_string());
+        // #1125 A1-2: the parent's invoke_agent invocation id threads through
+        // to the marker so a reload can resolve the completion by invocation id.
+        assert_eq!(meta["tool_invocation_id"], parent_inv_id.to_string());
 
         // Clean up: cancel the shutdown token so background tasks (if any) stop.
         shutdown_token.cancel();

@@ -115,6 +115,14 @@ pub struct SubagentCompletion {
     pub duration_ms: Option<u64>,
     /// Token usage from the subagent run (prompt + completion).
     pub token_usage: Option<TokenUsage>,
+    /// Parent's `invoke_agent` tool invocation id (#1125, A1-2). Mirrors
+    /// `SubagentRequest::parent_tool_invocation_id` / the id carried by the
+    /// sibling `subagent_started` event so the frontend can resolve the
+    /// completion to the right SubagentBar entry by invocation id rather
+    /// than the name-only first-match heuristic — which cross-wires when two
+    /// unnamed/ephemeral subagents run concurrently. `None` for legacy callers
+    /// and unit tests that don't supply it; the SSE field is then omitted.
+    pub parent_tool_invocation_id: Option<Uuid>,
 }
 
 /// Handle to a running subagent
@@ -968,6 +976,7 @@ async fn run_subagent(
             tool_count,
             duration_ms: Some(elapsed_ms),
             token_usage,
+            parent_tool_invocation_id: request.parent_tool_invocation_id,
         };
         if let Err(e) = tx.send(completion) {
             warn!(
