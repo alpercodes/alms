@@ -433,6 +433,7 @@ impl Coordinator {
                 parent_inv_id,
                 request.subagent_name.clone(),
                 sub_session_id.0,
+                is_background,
             );
         }
 
@@ -1800,12 +1801,18 @@ mod tests {
 
     // -- (c) #1105 -- spawn_subagent emits SubagentStarted onto parent's stream
 
+    /// One captured `forward_subagent_started` call:
+    /// `(tool_invocation_id, subagent_name, subagent_session_id, background)`.
+    /// The `background` flag (#1125, A1-1) is `false` for foreground
+    /// (`dispatch`) and `true` for background (`dispatch_background`).
+    type CapturedStart = (uuid::Uuid, Option<String>, uuid::Uuid, bool);
+
     /// A mock EventForwarder that records every `forward_subagent_started`
     /// call. The default impl is a no-op, so we explicitly override it here
     /// to capture the args and assert on them.
     #[derive(Debug, Default)]
     struct CapturingEventForwarder {
-        started: parking_lot::Mutex<Vec<(uuid::Uuid, Option<String>, uuid::Uuid)>>,
+        started: parking_lot::Mutex<Vec<CapturedStart>>,
     }
 
     impl alms_tools::EventForwarder for CapturingEventForwarder {
@@ -1835,10 +1842,14 @@ mod tests {
             tool_invocation_id: uuid::Uuid,
             subagent_name: Option<String>,
             subagent_session_id: uuid::Uuid,
+            background: bool,
         ) {
-            self.started
-                .lock()
-                .push((tool_invocation_id, subagent_name, subagent_session_id));
+            self.started.lock().push((
+                tool_invocation_id,
+                subagent_name,
+                subagent_session_id,
+                background,
+            ));
         }
     }
 
@@ -1877,7 +1888,7 @@ mod tests {
             1,
             "spawn_subagent must emit exactly one SubagentStarted event"
         );
-        let (got_inv_id, got_name, got_session_id) = started[0].clone();
+        let (got_inv_id, got_name, got_session_id, got_background) = started[0].clone();
         assert_eq!(
             got_inv_id, parent_inv_id,
             "SubagentStarted must carry the parent's invocation_id verbatim"
@@ -1891,6 +1902,11 @@ mod tests {
             got_session_id, sub_session_id.0,
             "SubagentStarted's session_id must match the value returned by \
              spawn_subagent (the row where the subagent persists messages)"
+        );
+        assert!(
+            !got_background,
+            "foreground spawn_subagent must emit background=false so the \
+             gateway persists the #1125 (A1-1) subagent_started marker"
         );
     }
 
@@ -1922,7 +1938,7 @@ mod tests {
 
         let started = capture.started.lock();
         assert_eq!(started.len(), 1);
-        let (got_inv_id, got_name, got_session_id) = started[0].clone();
+        let (got_inv_id, got_name, got_session_id, got_background) = started[0].clone();
         assert_eq!(got_inv_id, parent_inv_id);
         assert!(
             got_name.is_none(),
@@ -1930,6 +1946,49 @@ mod tests {
              resolves via tool_invocation_id"
         );
         assert_eq!(got_session_id, sub_session_id.0);
+        assert!(
+            !got_background,
+            "foreground path must emit background=false"
+        );
+    }
+
+    /// #1125 (A1-1) — the background (`dispatch_background`) path must emit
+    /// `forward_subagent_started` with `background = true` so the gateway's
+    /// `forward_runtime_events` arm SKIPS the durable `subagent_started`
+    /// marker for background subagents (which are already reload-safe via
+    /// their persisted `{task_id, session_id}` tool result). This is the
+    /// coordinator-side guarantee that the foreground-only marker gating in
+    /// the gateway has a correct `background` discriminator to key on.
+    #[tokio::test]
+    async fn test_spawn_emits_subagent_started_background_true_for_bg_path() {
+        let coord = test_coordinator();
+        let capture = Arc::new(CapturingEventForwarder::default());
+        let fwd: Arc<dyn alms_tools::EventForwarder> = capture.clone();
+        let parent_inv_id = uuid::Uuid::new_v4();
+
+        let request = SubagentRequest {
+            task: "bg".to_string(),
+            timeout: Duration::from_secs(300),
+            parent_session: test_session_id(),
+            parent_agent_id: test_parent_agent_id(),
+            parent_run_id: None,
+            subagent_name: Some("worker".to_string()),
+            parent_tool_invocation_id: Some(parent_inv_id),
+        };
+        // is_background = true — the only difference from the foreground tests.
+        let (_task_id, _sub_session_id) = coord
+            .spawn_subagent(request, Some(fwd), true, None)
+            .await
+            .expect("spawn_subagent should succeed");
+
+        let started = capture.started.lock();
+        assert_eq!(started.len(), 1);
+        let (_got_inv_id, _got_name, _got_session_id, got_background) = started[0].clone();
+        assert!(
+            got_background,
+            "background spawn_subagent must emit background=true so the \
+             gateway suppresses the #1125 (A1-1) subagent_started marker"
+        );
     }
 
     /// Legacy callers / tests that don't supply `parent_tool_invocation_id`

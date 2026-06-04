@@ -136,6 +136,15 @@ pub enum RuntimeEvent {
         /// `invoke_agent` tool result carries; emitted early so the UI
         /// can drill down before the parent's tool_end arrives.
         subagent_session_id: alms_core::SessionId,
+        /// `true` when the invocation was `dispatch_background`, `false`
+        /// for the foreground `dispatch` path. The live SSE event is
+        /// identical either way, but the gateway persists a durable
+        /// `subagent_started` lifecycle marker **only** for the foreground
+        /// path (#1125, A1-1) — background subagents are already reload-safe
+        /// via their persisted `{task_id, session_id}` tool result, while a
+        /// foreground subagent's session id otherwise survives only on the
+        /// non-durable live SSE event log and is lost on reload.
+        background: bool,
     },
     /// Debug snapshot of the full context window sent to the LLM.
     ///
@@ -338,6 +347,7 @@ mod tests {
             tool_invocation_id: inv_id,
             subagent_name: Some("reviewer".to_string()),
             subagent_session_id: sub_session,
+            background: false,
         })
         .unwrap();
 
@@ -349,10 +359,12 @@ mod tests {
                 tool_invocation_id,
                 subagent_name,
                 subagent_session_id,
+                background,
             } => {
                 assert_eq!(tool_invocation_id, inv_id);
                 assert_eq!(subagent_name.as_deref(), Some("reviewer"));
                 assert_eq!(subagent_session_id, sub_session);
+                assert!(!background);
             }
             _ => panic!("Expected SubagentStarted event"),
         }
@@ -370,6 +382,7 @@ mod tests {
             tool_invocation_id: inv_id,
             subagent_name: None,
             subagent_session_id: sub_session,
+            background: true,
         })
         .unwrap();
 
@@ -377,8 +390,13 @@ mod tests {
 
         let event = rx.recv().await.unwrap();
         match event {
-            RuntimeEvent::SubagentStarted { subagent_name, .. } => {
+            RuntimeEvent::SubagentStarted {
+                subagent_name,
+                background,
+                ..
+            } => {
                 assert!(subagent_name.is_none());
+                assert!(background);
             }
             _ => panic!("Expected SubagentStarted event"),
         }

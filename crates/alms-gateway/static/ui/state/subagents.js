@@ -506,6 +506,17 @@ export function rehydrateSubagentsFromHistory(messages) {
     const pendingBySession = new Map(); // sessionId -> array of pending background rows
     const candidateRows = []; // foreground-running + still-pending background rows in order
     const additions = {};
+    // A1-1 / #1125: tool_invocation_id -> subagent_session_id, harvested from
+    // the durable `subagent_started` lifecycle markers the backend persists on
+    // FOREGROUND invoke_agent calls. A foreground subagent that is still
+    // mid-run leaves its parent's invoke_agent tool row with `status:
+    // 'running'` and NO result yet (the parent is blocked), so the result's
+    // `session_id` is unavailable — the chip would otherwise rehydrate with
+    // `sessionId: null` and a dead "View session" button. We recover the
+    // session id from this marker, keyed by the same `tool_invocation_id` the
+    // live `subagent_started` SSE path uses, and attach it to the pending
+    // foreground chip below.
+    const startedSessionByInvocation = new Map(); // tool_invocation_id -> subagent_session_id
     let lastSeenTsMs = -Infinity;
     let orderingWarned = false;
 
@@ -528,6 +539,22 @@ export function rehydrateSubagentsFromHistory(messages) {
                     lastSeenTsMs = tsMs;
                 }
             }
+        }
+
+        if (m.type === 'subagent_started') {
+            // A1-1 / #1125: harvest the recovered foreground session id,
+            // keyed by tool_invocation_id (always present; subagent_name is
+            // omitted for ephemeral/unnamed invocations so we never key on
+            // it). Consumed in the second pass to fill the pending chip's
+            // sessionId. This record carries no chip of its own — it only
+            // supplies the session id the still-running invoke_agent row
+            // lacks. It also intentionally short-circuits the stray
+            // "Subagent started." notification bubble that the generic
+            // synthetic fallback in history.js used to render on reload.
+            if (m.toolInvocationId && m.subagentSessionId) {
+                startedSessionByInvocation.set(m.toolInvocationId, m.subagentSessionId);
+            }
+            continue;
         }
 
         if (m.type === 'subagent_completed') {
@@ -595,11 +622,19 @@ export function rehydrateSubagentsFromHistory(messages) {
         const m = row.msg;
         const params = m.params || {};
         const result = (typeof m.result === 'object' && m.result) || null;
-        const subagentSessionId = result?.session_id || null;
-
         const name = params.name || params.subagent_name || 'subagent';
         const task = params.task || '';
         const invocationId = m.id || null;
+
+        // Prefer the session id from the invoke_agent result (present for
+        // background rows and for completed foreground rows). For a FOREGROUND
+        // subagent still mid-run the parent's row has no result yet, so fall
+        // back to the durable `subagent_started` marker harvested above,
+        // resolved by tool_invocation_id (A1-1 / #1125). This is what makes
+        // the "View session" button live again on reload while a foreground
+        // subagent is in flight.
+        const subagentSessionId = (result?.session_id)
+            || (invocationId ? (startedSessionByInvocation.get(invocationId) || null) : null);
 
         const isUnnamed = (name === 'subagent');
         const key = (isUnnamed && invocationId)
@@ -610,7 +645,21 @@ export function rehydrateSubagentsFromHistory(messages) {
         // replaceMessages and this call would have already populated
         // the bar). The live entry has the authoritative start time
         // and any accumulated tool rows; don't overwrite.
-        if (activeSubagents.value[key]) continue;
+        //
+        // A1-1 / #1125: one exception — if the live entry exists but has
+        // no sessionId yet (the live `tool_start` fired without an inline
+        // `subagent_session_id`, which is the common case for foreground),
+        // and we recovered one from the `subagent_started` marker, attach
+        // it idempotently so the "View session" button goes live. Resolve
+        // by tool_invocation_id to avoid the literal-"subagent" first-match
+        // fallback when concurrent unnamed subagents are in flight.
+        if (activeSubagents.value[key]) {
+            const existing = activeSubagents.value[key];
+            if (!existing.sessionId && subagentSessionId) {
+                setSubagentSessionId(name, subagentSessionId, invocationId);
+            }
+            continue;
+        }
 
         // If the same key shows up twice in candidateRows (a named
         // subagent re-invoked while a previous invocation is still in

@@ -311,6 +311,39 @@ export function mapHistoryMessages(msgs, opts) {
                 continue;
             }
 
+            // Subagent *start* markers (A1-1 / #1125). The backend persists a
+            // durable `subagent_started` lifecycle marker on a FOREGROUND
+            // invoke_agent so that a reload / session-switch which replays
+            // session *history* (rather than the live SSE event log) can
+            // recover the in-flight chip's `session_id`. The live
+            // `subagent_started` SSE event only ever lands in the per-session
+            // event log and is replayed from `HWM+1`, so a start emitted
+            // before the reload is never re-delivered and the foreground chip
+            // would otherwise rehydrate with `sessionId: null` (dead "View
+            // session" button). We emit a lightweight record carrying the
+            // disambiguator (`tool_invocation_id`) and the recovered
+            // `subagent_session_id`; `rehydrateSubagentsFromHistory` consumes
+            // it to fill the pending foreground chip's session id. Crucially
+            // this also short-circuits the generic synthetic fallback below,
+            // which previously rendered a stray "Subagent 'X' started."
+            // notification bubble on every reload. Field names mirror the SSE
+            // event (`subagent_session_id`, not `session_id`) so the live and
+            // replay paths read the same key. `subagent_name` is omitted by
+            // the backend for ephemeral / unnamed invocations, so it may be
+            // undefined here — the rehydrator resolves purely by
+            // tool_invocation_id, which is always present.
+            if (isSynthetic && m.metadata.type === 'subagent_started') {
+                const md = m.metadata;
+                pushEntry({
+                    id: nextMsgId(),
+                    type: 'subagent_started',
+                    name: md.subagent_name || 'subagent',
+                    toolInvocationId: md.tool_invocation_id || null,
+                    subagentSessionId: md.subagent_session_id || null,
+                }, m.timestamp);
+                continue;
+            }
+
             // DM-ended notification markers (persisted on the webchat
             // session, not the DM session itself).
             if (isSynthetic && m.metadata.type === 'dm_ended_notification') {

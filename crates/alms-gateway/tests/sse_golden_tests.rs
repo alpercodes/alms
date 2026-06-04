@@ -472,11 +472,13 @@ async fn test_bg_subagent_started_ordering_invariant() {
             tool_invocation_id: Uuid,
             subagent_name: Option<String>,
             subagent_session_id: Uuid,
+            background: bool,
         ) {
             let _ = self.tx.send(RuntimeEvent::SubagentStarted {
                 tool_invocation_id,
                 subagent_name,
                 subagent_session_id: SessionId(subagent_session_id),
+                background,
             });
         }
     }
@@ -516,6 +518,7 @@ async fn test_bg_subagent_started_ordering_invariant() {
             tool_invocation_id,
             subagent_name: Some("helper".to_string()),
             subagent_session_id: subagent_session,
+            background: true,
         },
         &*bg_runtime_fwd,
         bg_run_id,
@@ -566,6 +569,7 @@ async fn test_bg_subagent_started_ordering_invariant() {
             tool_invocation_id: tid,
             subagent_session_id,
             subagent_name,
+            background,
         } => {
             assert_eq!(
                 *tid, tool_invocation_id,
@@ -575,6 +579,14 @@ async fn test_bg_subagent_started_ordering_invariant() {
             );
             assert_eq!(*subagent_session_id, subagent_session);
             assert_eq!(subagent_name.as_deref(), Some("helper"));
+            // The `background` flag must survive the reroute so the
+            // foreground-only #1125 (A1-1) marker stays suppressed for bg
+            // subagents in `forward_runtime_events`.
+            assert!(
+                *background,
+                "bg-path SubagentStarted must keep background=true through \
+                 the route_bg_event reroute"
+            );
         }
         _ => panic!("expected SubagentStarted second, got a different variant"),
     }
@@ -681,11 +693,13 @@ async fn test_bg_subagent_does_not_block_parent_run_drain() {
             tool_invocation_id: uuid::Uuid,
             subagent_name: Option<String>,
             subagent_session_id: uuid::Uuid,
+            background: bool,
         ) {
             let _ = self.tx.send(RuntimeEvent::SubagentStarted {
                 tool_invocation_id,
                 subagent_name,
                 subagent_session_id: SessionId(subagent_session_id),
+                background,
             });
         }
     }
@@ -763,6 +777,7 @@ async fn test_bg_subagent_does_not_block_parent_run_drain() {
             tool_invocation_id: inv_id,
             subagent_name: Some("worker".to_string()),
             subagent_session_id: sub_session,
+            background: true,
         })
         .unwrap();
 

@@ -1195,6 +1195,272 @@ async fn subagent_completion_propagates_session_id() {
     shutdown_token.cancel();
 }
 
+/// Drive `forward_runtime_events` with a single foreground
+/// `RuntimeEvent::SubagentStarted` and assert it persists a durable
+/// `subagent_started` lifecycle marker to the parent's session history
+/// (#1125, A1-1).
+///
+/// Helper: pre-seeds an `invoke_agent` `Content::ToolCall` row into history
+/// (mirroring the runtime agent loop, which appends the call row before
+/// `tool.execute()` runs), runs `forward_runtime_events` on the supplied
+/// event to completion, and returns the resulting parent-session history.
+///
+/// `subagent_name` is threaded into the `SubagentStarted` event so callers can
+/// exercise both the named (`Some(..)`) and ephemeral/unnamed (`None`) paths —
+/// the latter pins the conditional key-omission in the marker arm of
+/// `forward_runtime_events`.
+async fn run_subagent_started_marker_case(
+    context_id: &str,
+    background: bool,
+    subagent_name: Option<&str>,
+) -> (Vec<alms_session::Message>, uuid::Uuid, SessionId) {
+    use alms_runtime::RuntimeEvent;
+
+    let (state, shutdown_token, _cr, _tr, _dr) = test_app_state();
+
+    let parent_agent_id = AgentId::new();
+    let parent_session = state
+        .session_manager
+        .get_or_create(parent_agent_id, context_id);
+    let parent_session_id = parent_session.id;
+
+    let tool_invocation_id = uuid::Uuid::new_v4();
+    let subagent_session_id = SessionId::new();
+
+    // Seed the parent's `invoke_agent` tool-call row BEFORE the marker, just
+    // like the runtime agent loop (loop_impl.rs ~343) appends the call row
+    // before `tool.execute()` runs. The marker must land AFTER this row so
+    // the rehydrator sees the chip's tool row first.
+    state
+        .session_manager
+        .append_message(
+            parent_session_id,
+            alms_session::Message {
+                id: uuid::Uuid::new_v4().to_string(),
+                role: alms_session::Role::Assistant,
+                content: alms_session::Content::ToolCall {
+                    name: "invoke_agent".to_string(),
+                    params: serde_json::json!({ "agent_name": "researcher" }),
+                },
+                timestamp: alms_core::Timestamp::now(),
+                metadata: None,
+            },
+        )
+        .unwrap();
+
+    // Drive `forward_runtime_events` with one foreground SubagentStarted.
+    let (tx, rx) = mpsc::unbounded_channel::<RuntimeEvent>();
+    tx.send(RuntimeEvent::SubagentStarted {
+        tool_invocation_id,
+        subagent_name: subagent_name.map(str::to_string),
+        subagent_session_id,
+        background,
+    })
+    .unwrap();
+    drop(tx); // close the channel so the forwarder loop terminates
+
+    super::tools::forward_runtime_events(
+        rx,
+        RunId::new(),
+        parent_session_id,
+        state.run_manager.clone(),
+        state.approval_store.clone(),
+        state.session_manager.clone(),
+        context_id.to_string(),
+        None,
+    )
+    .await;
+
+    let history = state
+        .session_manager
+        .get_history(parent_session_id)
+        .unwrap();
+
+    shutdown_token.cancel();
+    (history, tool_invocation_id, subagent_session_id)
+}
+
+/// #1125 (A1-1): a FOREGROUND `subagent_started` event on a user-facing
+/// session must persist a durable lifecycle marker carrying
+/// `tool_invocation_id` + `subagent_session_id` + `subagent_name`,
+/// positioned AFTER the parent's `invoke_agent` tool-call row.
+///
+/// Falsifiable: removing the `persist_lifecycle_marker` call in the
+/// `SubagentStarted` arm of `forward_runtime_events` drops the marker and
+/// fails the "exactly one marker" assertion.
+#[tokio::test]
+async fn foreground_subagent_started_persists_marker_after_invoke_row() {
+    let (history, tool_invocation_id, subagent_session_id) =
+        run_subagent_started_marker_case("web", false, Some("researcher")).await;
+
+    // Locate the marker and the parent's invoke_agent tool-call row.
+    let marker_pos = history.iter().position(|m| {
+        m.metadata.as_ref().is_some_and(|meta| {
+            meta.get("type").and_then(|v| v.as_str()) == Some("subagent_started")
+        })
+    });
+    let invoke_pos = history.iter().position(|m| {
+        matches!(
+            &m.content,
+            alms_session::Content::ToolCall { name, .. } if name == "invoke_agent"
+        )
+    });
+
+    let marker_pos = marker_pos.expect("expected a subagent_started marker in parent history");
+    let invoke_pos = invoke_pos.expect("expected the seeded invoke_agent tool-call row");
+
+    // Exactly one marker (no duplicate persistence).
+    let marker_count = history
+        .iter()
+        .filter(|m| {
+            m.metadata.as_ref().is_some_and(|meta| {
+                meta.get("type").and_then(|v| v.as_str()) == Some("subagent_started")
+            })
+        })
+        .count();
+    assert_eq!(
+        marker_count, 1,
+        "expected exactly one subagent_started marker"
+    );
+
+    // ORDERING INVARIANT: marker lands AFTER the invoke_agent tool row so the
+    // rehydrator resolves the chip's tool row first, then fills its session id.
+    assert!(
+        marker_pos > invoke_pos,
+        "subagent_started marker (idx {marker_pos}) must come AFTER the \
+         invoke_agent tool-call row (idx {invoke_pos})"
+    );
+
+    // Metadata shape — the keys Iris's history.js + subagents.js consume.
+    let marker = &history[marker_pos];
+    assert_eq!(marker.role, alms_session::Role::System);
+    let meta = marker.metadata.as_ref().unwrap();
+    assert_eq!(meta["synthetic"], true);
+    assert_eq!(meta["type"], "subagent_started");
+    assert_eq!(
+        meta["tool_invocation_id"].as_str(),
+        Some(tool_invocation_id.to_string().as_str()),
+        "marker must carry the parent's invoke_agent tool_invocation_id (#1127 disambiguator)"
+    );
+    assert_eq!(
+        meta["subagent_session_id"].as_str(),
+        Some(subagent_session_id.0.to_string().as_str()),
+        "marker must carry the subagent's session id for chip rehydration"
+    );
+    assert_eq!(
+        meta["subagent_name"].as_str(),
+        Some("researcher"),
+        "marker must carry the subagent name when present"
+    );
+
+    // The marker is DM-hygiene-filtered like every other lifecycle marker.
+    assert!(
+        alms_tools::dm_filter::is_synthetic_marker(marker),
+        "subagent_started marker must be filtered by is_synthetic_marker"
+    );
+}
+
+/// #1125 (A1-1): an UNNAMED (ephemeral) foreground `subagent_started` event
+/// must persist a marker that OMITS the `subagent_name` key entirely —
+/// matching the live SSE event's `skip_serializing_if` so the frontend
+/// rehydrator (which reads `md.subagent_name` defensively as possibly
+/// undefined) never sees a `null`/empty name.
+///
+/// This pins the conditional `if let Some(name) = subagent_name` key insert in
+/// the `SubagentStarted` arm of `forward_runtime_events` at the PERSISTED
+/// MARKER level — the named case (above) exercises the `Some(..)` branch, this
+/// exercises the `None` branch. Falsifiable: unconditionally writing
+/// `subagent_name` (e.g. `json!(null)`) fails the `is_none()` assertion.
+#[tokio::test]
+async fn unnamed_foreground_subagent_started_omits_subagent_name() {
+    let (history, tool_invocation_id, subagent_session_id) =
+        run_subagent_started_marker_case("web", false, None).await;
+
+    // The marker is still persisted (foreground, non-internal) — only the
+    // `subagent_name` key differs from the named case.
+    let marker = history
+        .iter()
+        .find(|m| {
+            m.metadata.as_ref().is_some_and(|meta| {
+                meta.get("type").and_then(|v| v.as_str()) == Some("subagent_started")
+            })
+        })
+        .expect("expected a subagent_started marker for the unnamed foreground case");
+
+    let meta = marker.metadata.as_ref().unwrap();
+
+    // The id keys the frontend joins on are still present and correct — the
+    // rehydrator resolves the chip by `tool_invocation_id`, not by name, so the
+    // omitted name must not cost it the session id.
+    assert_eq!(
+        meta["tool_invocation_id"].as_str(),
+        Some(tool_invocation_id.to_string().as_str()),
+        "unnamed marker must still carry the tool_invocation_id join key"
+    );
+    assert_eq!(
+        meta["subagent_session_id"].as_str(),
+        Some(subagent_session_id.0.to_string().as_str()),
+        "unnamed marker must still carry the subagent session id"
+    );
+
+    // CONTRACT: the `subagent_name` key is ABSENT (not present-as-null) for an
+    // ephemeral/unnamed subagent — the wire shape Iris's frontend depends on.
+    assert!(
+        meta.get("subagent_name").is_none(),
+        "subagent_name must be OMITTED from the marker for an unnamed subagent, \
+         got {:?}",
+        meta.get("subagent_name")
+    );
+
+    // The unnamed `display_text` branch renders without a name suffix.
+    let alms_session::Content::Text(ref text) = marker.content else {
+        panic!("expected text content on the subagent_started marker");
+    };
+    assert_eq!(
+        text, "Subagent started.",
+        "unnamed marker display text must omit the ' '<name>'' suffix"
+    );
+}
+
+/// #1125 (A1-1): the BACKGROUND path must NOT persist a `subagent_started`
+/// marker — background subagents are already reload-safe via their persisted
+/// `{task_id, session_id}` tool result, so a start marker would be redundant.
+#[tokio::test]
+async fn background_subagent_started_persists_no_marker() {
+    let (history, _inv, _sub) =
+        run_subagent_started_marker_case("web", true, Some("researcher")).await;
+
+    let has_marker = history.iter().any(|m| {
+        m.metadata.as_ref().is_some_and(|meta| {
+            meta.get("type").and_then(|v| v.as_str()) == Some("subagent_started")
+        })
+    });
+    assert!(
+        !has_marker,
+        "background subagent_started must NOT persist a marker (already reload-safe)"
+    );
+}
+
+/// #1125 (A1-1): internal / DM contexts must NOT accrue a `subagent_started`
+/// marker — gated by `!is_internal_context_id`, exactly like the
+/// `run_warning` marker. A `subagent_` context id is internal.
+#[tokio::test]
+async fn internal_context_subagent_started_persists_no_marker() {
+    // `subagent_…` is classified internal by `is_internal_context_id`.
+    let (history, _inv, _sub) =
+        run_subagent_started_marker_case("subagent_task-internal", false, Some("researcher")).await;
+
+    let has_marker = history.iter().any(|m| {
+        m.metadata.as_ref().is_some_and(|meta| {
+            meta.get("type").and_then(|v| v.as_str()) == Some("subagent_started")
+        })
+    });
+    assert!(
+        !has_marker,
+        "internal/DM-context subagent_started must NOT persist a marker"
+    );
+}
+
 /// Test that subagent completion for a missing parent session is
 /// gracefully skipped (warn + continue), not a panic.
 ///

@@ -65,13 +65,25 @@ pub trait EventForwarder: Send + Sync + std::fmt::Debug {
     /// `tool_invocation_id` is the parent's `invoke_agent` invocation id —
     /// the UI's resolver falls back to it for ephemeral / unnamed
     /// subagents where `subagent_name` is `None`. `subagent_session_id`
-    /// is the new session row's UUID. Default is a no-op so implementers
-    /// that don't yet care about the event don't have to opt in.
+    /// is the new session row's UUID.
+    ///
+    /// `background` is `true` when this event originated from a background
+    /// (`dispatch_background`) invocation and `false` for the foreground
+    /// (`dispatch`) path. The live SSE event is identical either way, but
+    /// the gateway uses this flag to persist a durable `subagent_started`
+    /// lifecycle marker **only** for the foreground path (#1125, A1-1):
+    /// background subagents are already reload-safe because their
+    /// `{task_id, session_id}` tool result is persisted to history, whereas
+    /// a foreground subagent's session id reaches the client solely via the
+    /// (non-durable) live SSE event log and is lost on reload. Default is a
+    /// no-op so implementers that don't yet care about the event don't have
+    /// to opt in.
     fn forward_subagent_started(
         &self,
         _tool_invocation_id: Uuid,
         _subagent_name: Option<String>,
         _subagent_session_id: Uuid,
+        _background: bool,
     ) {
     }
 }

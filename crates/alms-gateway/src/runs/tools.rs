@@ -94,11 +94,13 @@ impl alms_tools::EventForwarder for RuntimeEventForwarder {
         tool_invocation_id: uuid::Uuid,
         subagent_name: Option<String>,
         subagent_session_id: uuid::Uuid,
+        background: bool,
     ) {
         let _ = self.tx.send(RuntimeEvent::SubagentStarted {
             tool_invocation_id,
             subagent_name,
             subagent_session_id: SessionId(subagent_session_id),
+            background,
         });
     }
 }
@@ -343,6 +345,7 @@ pub(super) async fn forward_runtime_events(
                 tool_invocation_id,
                 subagent_name,
                 subagent_session_id,
+                background,
             } => {
                 run_manager
                     .send_event(
@@ -351,11 +354,61 @@ pub(super) async fn forward_runtime_events(
                         SseEventData::subagent_started(
                             session_id,
                             ToolInvocationId(tool_invocation_id),
-                            subagent_name,
+                            subagent_name.clone(),
                             subagent_session_id,
                         ),
                     )
                     .await;
+
+                // #1125 (A1-1): persist a durable `subagent_started`
+                // lifecycle marker so a page reload that replays session
+                // *history* (rather than the live SSE event log) can still
+                // resolve the in-flight chip's session id. The live
+                // `subagent_started` SSE above only lands in the per-session
+                // event log, which `stream_session_events` replays from
+                // `HWM+1` after a reload — so a `subagent_started` emitted
+                // before the reload (≤ HWM) is never re-delivered and the
+                // foreground chip rehydrates with `sessionId: null`. The
+                // marker is recovered by `rehydrateSubagentsFromHistory`,
+                // mirroring the `subagent_completion` marker
+                // (`notifications.rs`).
+                //
+                // Scoped to FOREGROUND (`!background`): background subagents
+                // are already reload-safe because their
+                // `{task_id, session_id}` `invoke_agent` tool result is
+                // persisted to history, so a start marker would be redundant.
+                // Gated on `!is_internal_context_id` exactly like the
+                // `run_warning` marker above so internal / DM contexts don't
+                // accrue spurious markers.
+                //
+                // Marker metadata is symmetric with the live SSE event:
+                // `subagent_session_id` (the chip's session id, keyed for
+                // rehydration by `tool_invocation_id`) and `subagent_name`
+                // only when present (omitted for ephemeral / unnamed
+                // invocations, matching the SSE `skip_serializing_if`).
+                if !background && !super::is_internal_context_id(&context_id) {
+                    let mut extra = serde_json::json!({
+                        "tool_invocation_id": tool_invocation_id.to_string(),
+                        "subagent_session_id": subagent_session_id.0.to_string(),
+                    });
+                    if let Some(name) = subagent_name {
+                        extra["subagent_name"] = serde_json::json!(name);
+                    }
+                    super::markers::persist_lifecycle_marker(
+                        &session_manager,
+                        session_id,
+                        "subagent_started",
+                        format!(
+                            "Subagent{} started.",
+                            extra
+                                .get("subagent_name")
+                                .and_then(|v| v.as_str())
+                                .map(|n| format!(" '{n}'"))
+                                .unwrap_or_default()
+                        ),
+                        extra,
+                    );
+                }
             }
         }
     }
@@ -446,15 +499,24 @@ pub fn route_bg_event(
         // parent's `tool_start (invoke_agent)`. `forward_runtime_events`
         // (above) owns the SSE conversion for `SubagentStarted` and emits
         // on the same session stream.
+        //
+        // The `background` flag is preserved verbatim on the reroute. It is
+        // always `true` here — this is the bg event channel — so the
+        // `forward_runtime_events` arm skips the #1125 (A1-1) durable
+        // `subagent_started` marker for background subagents, which are
+        // already reload-safe via their persisted `{task_id, session_id}`
+        // tool result.
         RuntimeEvent::SubagentStarted {
             tool_invocation_id,
             subagent_name,
             subagent_session_id,
+            background,
         } => {
             bg_runtime_fwd.forward_subagent_started(
                 tool_invocation_id,
                 subagent_name,
                 subagent_session_id.0,
+                background,
             );
             None
         }
