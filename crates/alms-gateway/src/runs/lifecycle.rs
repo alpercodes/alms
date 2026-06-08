@@ -23,43 +23,6 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, instrument, warn};
 
-/// A no-op [`EventForwarder`] used by the background-subagent event task as a
-/// fallback once the parent run's `invoke_agent_fwd` has been dropped (the
-/// `Weak::upgrade` in the bg task returns `None`).
-///
-/// At that point the parent's `runtime_tx` is already closed and there is no
-/// meaningful `SubagentStarted` reroute left to perform — the only events
-/// still arriving on the bg channel are the bg subagent's own
-/// `ToolStart` / `ToolEnd`, which [`route_bg_event`] converts to SSE directly
-/// without ever calling into the forwarder. This zero-sized type satisfies the
-/// `&dyn EventForwarder` parameter for those calls without holding any sender.
-#[derive(Debug)]
-struct NoopEventForwarder;
-
-impl alms_tools::EventForwarder for NoopEventForwarder {
-    fn forward_tool_start(
-        &self,
-        _invocation_id: uuid::Uuid,
-        _tool: String,
-        _params: serde_json::Value,
-        _source_agent: Option<String>,
-        _task_id: Option<String>,
-    ) {
-    }
-    fn forward_tool_end(
-        &self,
-        _invocation_id: uuid::Uuid,
-        _ok: bool,
-        _result: serde_json::Value,
-        _source_agent: Option<String>,
-        _task_id: Option<String>,
-    ) {
-    }
-    fn forward_token_delta(&self, _delta: String, _source_agent: Option<String>) {}
-    fn forward_status(&self, _phase: String, _detail: Option<String>) {}
-    fn forward_warning(&self, _code: String, _message: String, _source_agent: Option<String>) {}
-}
-
 /// GET /runs?session_id=<uuid>&limit=<n> — list runs for a session (existing)
 /// GET /runs?agent_id=<uuid>&limit=<n> — list runs across all sessions for an agent
 ///
@@ -1832,20 +1795,22 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
         // `runtime.run()` is still in flight and the strong `invoke_agent_fwd`
         // (held by `InvokeAgentTool` inside the runtime) is still alive.
         //
-        // The `Weak::upgrade` for that event therefore succeeds in practice,
-        // but it is NOT strictly guaranteed. The event is *enqueued* onto
-        // `bg_event_tx` while the strong ref is alive, yet it is *drained* by
-        // the separate task spawned below; nothing synchronizes that task's
-        // `upgrade()` call against the parent run completing and dropping
-        // `runtime` (and with it `invoke_agent_fwd`). For the upgrade to miss,
-        // the bg drain task would have to be starved past the parent's
-        // teardown — and the parent must complete another full LLM round-trip
-        // after `dispatch_background` returns before it reaches `drop(runtime)`,
-        // so that window is tiny. If it ever does miss, the degradation is
-        // benign: the `SubagentStarted` reroute is silently dropped and the UI
-        // falls back to pre-#1105 behavior — the "View session" button surfaces
-        // at `subagent_completed` instead of at start (the subagent
-        // `session_id` is already in the `invoke_agent` tool result either way).
+        // The `Weak::upgrade` for that event succeeds while the parent run is
+        // in flight, but it is NOT strictly guaranteed — and crucially the
+        // parent can ALSO finish entirely before a bg subagent that was spawned
+        // near the end of the turn emits its `SubagentStarted` at all. The
+        // event is *enqueued* onto `bg_event_tx` and *drained* by the separate
+        // task spawned below; nothing synchronizes that task's `upgrade()` call
+        // against the parent run completing and dropping `runtime` (and with it
+        // `invoke_agent_fwd`). When the upgrade misses, `route_bg_event` now
+        // FALLS BACK to delivering the `subagent_started` event on the parent's
+        // *session* stream via `send_session_event` (#1125 A1-3) instead of
+        // dropping it, so the #1105 "View session during the run" surface is
+        // preserved even for a bg subagent that starts after the parent turn
+        // ends. (The `send_session_event` fallback is keyed by session, not by
+        // the parent's `runtime_tx` channel lifetime, so it is robust to the
+        // parent finishing; the subagent `session_id` is also still in the
+        // `invoke_agent` tool result as a backstop either way.)
         //
         // A *strong* clone here is a deadlock: the bg event forwarder task
         // lives as long as `bg_event_rx` has any sender, and `bg_event_tx`
@@ -1866,19 +1831,26 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
             let mut rx = bg_event_rx;
             while let Some(event) = rx.recv().await {
                 // Upgrade only for the duration of routing a single event.
+                // While the parent run is alive the upgrade succeeds and
+                // `route_bg_event` reroutes `SubagentStarted` back onto the
+                // parent's `runtime_tx` (the #1105 FIFO-ordering invariant),
+                // returning `None` so we do not also emit on the session
+                // stream.
+                //
                 // After the parent run finishes and drops `runtime` (and with
-                // it `invoke_agent_fwd`), the upgrade returns `None`; by that
-                // point the parent's `runtime_tx` is closed and no
-                // `SubagentStarted` reroute is meaningful anyway — the only
-                // events still arriving on `bg_event_rx` are the bg subagent's
-                // own `ToolStart` / `ToolEnd`, which `route_bg_event` converts
-                // to SSE directly (no forwarder needed). We use a throwaway
-                // no-op forwarder in that case so those `Some(sse)` paths keep
-                // working.
-                let sse = match bg_runtime_fwd.upgrade() {
-                    Some(strong) => route_bg_event(event, &*strong, bg_run_id),
-                    None => route_bg_event(event, &NoopEventForwarder, bg_run_id),
-                };
+                // it `invoke_agent_fwd`), the upgrade returns `None`. The
+                // bg subagent's own `ToolStart` / `ToolEnd` still convert to
+                // SSE directly via `route_bg_event` and reach the session
+                // stream regardless of the parent. For `SubagentStarted`,
+                // `route_bg_event` now FALLS BACK to returning the
+                // `subagent_started` `SseEventData` (rather than dropping it),
+                // which we deliver below via `send_session_event` — recovering
+                // the #1105 surface for a bg subagent that started after the
+                // parent turn ended (#1125 A1-3). `send_session_event` is
+                // independent of `runtime_tx`, so this does not reintroduce
+                // the #1124 deadlock.
+                let upgraded = bg_runtime_fwd.upgrade();
+                let sse = route_bg_event(event, upgraded.as_deref(), bg_run_id, bg_session_id);
                 if let Some(sse) = sse {
                     bg_state
                         .run_manager

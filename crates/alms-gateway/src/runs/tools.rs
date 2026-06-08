@@ -422,14 +422,14 @@ pub(super) async fn forward_runtime_events(
 /// channel.
 ///
 /// This function carries the #1105 invariant for background subagents:
-/// `SubagentStarted` is **forwarded back onto the parent's runtime channel**
-/// via `bg_runtime_fwd` so the parent's [`forward_runtime_events`] task can
-/// convert it to SSE in strict FIFO order with the parent's
-/// `tool_start (invoke_agent)` event. The agent loop enqueues the parent
-/// `ToolStart` onto `runtime_tx` *before* `tool.execute()` runs, so by the
-/// time the bg task observes any event on its own channel the parent's
-/// `ToolStart` is already ahead of it on `runtime_tx` — single-channel FIFO
-/// from that point preserves the documented ordering.
+/// while the parent run is alive, `SubagentStarted` is **forwarded back onto
+/// the parent's runtime channel** via `parent_fwd` so the parent's
+/// [`forward_runtime_events`] task can convert it to SSE in strict FIFO order
+/// with the parent's `tool_start (invoke_agent)` event. The agent loop
+/// enqueues the parent `ToolStart` onto `runtime_tx` *before* `tool.execute()`
+/// runs, so by the time the bg task observes any event on its own channel the
+/// parent's `ToolStart` is already ahead of it on `runtime_tx` — single-channel
+/// FIFO from that point preserves the documented ordering.
 ///
 /// Pre-#1105 the bg-channel handler synthesised SSE directly on a
 /// session-level channel that was independent of the parent's `runtime_tx`,
@@ -438,21 +438,42 @@ pub(super) async fn forward_runtime_events(
 /// frontend resolver (`findSubagentByToolInvocationId`) would then have no
 /// `activeSubagents` entry to attach the `subagent_session_id` to.
 ///
+/// `parent_fwd` encodes whether the parent run is still alive:
+/// - `Some(fwd)` — the parent's `runtime_tx` is live (the bg task's
+///   `Weak::upgrade` of `invoke_agent_fwd` succeeded). `SubagentStarted` is
+///   rerouted through it, preserving the FIFO ordering above; this function
+///   returns `None` so the caller does NOT also emit on the session stream
+///   (avoids double-delivery).
+/// - `None` — the parent run has finished and its `runtime_tx` /
+///   `forward_runtime_events` task is gone (`Weak::upgrade` returned `None`).
+///   The reroute would be silently dropped (#1125 A1-3), so instead this
+///   function returns the `subagent_started` `SseEventData` directly and the
+///   caller delivers it via `send_session_event` on the parent's session
+///   stream — recovering the #1105 "View session during the run" surface for a
+///   background subagent spawned near the end of a parent turn. Ordering is
+///   still correct because the parent's `tool_start (invoke_agent)` was already
+///   emitted (and persisted to the session event log) before the parent run
+///   ended, so it carries a strictly lower session event id than this
+///   fallback. The fallback path is independent of `runtime_tx`, so it does NOT
+///   reintroduce the #1124 strong-sender deadlock.
+///
 /// Returns:
 /// - `Some(SseEventData)` — the caller should emit this on the parent's
-///   session-level SSE stream (for `ToolStart` / `ToolEnd` events).
-/// - `None` — the event was handled internally (forwarded via
-///   `bg_runtime_fwd`, auto-denied, or dropped); the caller does nothing.
+///   session-level SSE stream (`ToolStart` / `ToolEnd` events, plus the
+///   dead-parent `SubagentStarted` fallback above).
+/// - `None` — the event was handled internally (rerouted via the live
+///   `parent_fwd`, auto-denied, or dropped); the caller does nothing.
 ///
-/// The integration test in `crates/alms-gateway/tests/sse_golden_tests.rs`
-/// pins the `SubagentStarted` reroute: it asserts that this function
-/// returns `None` for that variant *and* that the matching event lands on
-/// the parent's runtime channel. A revert to direct SSE emission would
-/// fail both assertions.
+/// The integration tests in `crates/alms-gateway/tests/sse_golden_tests.rs`
+/// pin both legs: with a live `parent_fwd` this function returns `None` for
+/// `SubagentStarted` *and* the matching event lands on the parent's runtime
+/// channel (ordering); with `parent_fwd == None` it returns
+/// `Some(subagent_started)` so the session-stream fallback fires (A1-3).
 pub fn route_bg_event(
     event: RuntimeEvent,
-    bg_runtime_fwd: &dyn alms_tools::EventForwarder,
+    parent_fwd: Option<&dyn alms_tools::EventForwarder>,
     bg_run_id: RunId,
+    bg_session_id: SessionId,
 ) -> Option<SseEventData> {
     match event {
         RuntimeEvent::ToolStart {
@@ -494,32 +515,54 @@ pub fn route_bg_event(
             let _ = decision_tx.send(false);
             None
         }
-        // #1105 — forward back onto the parent's runtime channel instead of
-        // synthesising SSE here. This preserves the FIFO ordering with the
-        // parent's `tool_start (invoke_agent)`. `forward_runtime_events`
-        // (above) owns the SSE conversion for `SubagentStarted` and emits
-        // on the same session stream.
+        // #1105 / #1125 (A1-3) — two-leg routing keyed on parent liveness.
+        //
+        // Parent alive (`Some(fwd)`): forward back onto the parent's runtime
+        // channel instead of synthesising SSE here. This preserves the FIFO
+        // ordering with the parent's `tool_start (invoke_agent)`.
+        // `forward_runtime_events` owns the SSE conversion for
+        // `SubagentStarted` and emits on the same session stream. We return
+        // `None` so the caller does NOT also `send_session_event` (no
+        // double-delivery).
         //
         // The `background` flag is preserved verbatim on the reroute. It is
         // always `true` here — this is the bg event channel — so the
         // `forward_runtime_events` arm skips the #1125 (A1-1) durable
-        // `subagent_started` marker for background subagents, which are
-        // already reload-safe via their persisted `{task_id, session_id}`
+        // foreground `subagent_started` marker for background subagents, which
+        // are already reload-safe via their persisted `{task_id, session_id}`
         // tool result.
+        //
+        // Parent dead (`None`): the reroute target is gone, so forwarding it
+        // would silently drop the event (#1125 A1-3). Instead emit the
+        // `subagent_started` `SseEventData` directly; the caller delivers it
+        // via `send_session_event` on the parent's session stream. This does
+        // NOT persist a foreground-style history marker (that is #1130's
+        // foreground-only path) — background subagents stay reload-safe via
+        // their tool result; this only recovers the live #1105 surface. The
+        // `bg_session_id` here is the parent's session id, matching the
+        // session the live SSE would have landed on.
         RuntimeEvent::SubagentStarted {
             tool_invocation_id,
             subagent_name,
             subagent_session_id,
             background,
-        } => {
-            bg_runtime_fwd.forward_subagent_started(
-                tool_invocation_id,
+        } => match parent_fwd {
+            Some(fwd) => {
+                fwd.forward_subagent_started(
+                    tool_invocation_id,
+                    subagent_name,
+                    subagent_session_id.0,
+                    background,
+                );
+                None
+            }
+            None => Some(SseEventData::subagent_started(
+                bg_session_id,
+                ToolInvocationId(tool_invocation_id),
                 subagent_name,
-                subagent_session_id.0,
-                background,
-            );
-            None
-        }
+                subagent_session_id,
+            )),
+        },
         _ => None,
     }
 }

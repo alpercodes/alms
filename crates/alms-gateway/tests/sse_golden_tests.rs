@@ -513,6 +513,7 @@ async fn test_bg_subagent_started_ordering_invariant() {
     // ---- Step 2: spawn_subagent enqueues `SubagentStarted` onto
     //              `bg_event_tx`; the bg event task routes it via
     //              `route_bg_event`. ----
+    let parent_session = SessionId::new();
     let outcome = route_bg_event(
         RuntimeEvent::SubagentStarted {
             tool_invocation_id,
@@ -520,18 +521,21 @@ async fn test_bg_subagent_started_ordering_invariant() {
             subagent_session_id: subagent_session,
             background: true,
         },
-        &*bg_runtime_fwd,
+        // Parent alive: pass the live forwarder so the reroute fires.
+        Some(&*bg_runtime_fwd),
         bg_run_id,
+        parent_session,
     );
 
     // Invariant 1: `SubagentStarted` from the bg channel MUST NOT be
-    // synthesised into SSE directly. A revert to the pre-`481ef7c` shape
-    // returns `Some(SseEventData)` here and this assertion fails.
+    // synthesised into SSE directly while the parent is alive. A revert to the
+    // pre-`481ef7c` shape returns `Some(SseEventData)` here and this assertion
+    // fails.
     assert!(
         outcome.is_none(),
         "route_bg_event must NOT synthesise SSE for SubagentStarted on \
-         the bg path -- it must forward back onto the parent's runtime \
-         channel (#1105). Got: {outcome:?}",
+         the bg path while the parent is alive -- it must forward back onto \
+         the parent's runtime channel (#1105). Got: {outcome:?}",
     );
 
     // ---- Step 3: drain the parent's runtime channel and assert ordering. ----
@@ -725,44 +729,18 @@ async fn test_bg_subagent_does_not_block_parent_run_drain() {
 
     // The bg event-forwarder task — a faithful copy of the loop in
     // `runs/lifecycle.rs`: holds `invoke_agent_fwd` only as a `Weak`, upgrades
-    // per-event, and routes via the production `route_bg_event`.
+    // per-event, and routes via the production `route_bg_event`. After the
+    // parent teardown the upgrade returns `None`, which `route_bg_event`
+    // handles internally (the dead-parent `Some(parent_fwd)` argument).
+    let bg_session_id = SessionId::new();
     let bg_runtime_fwd = Arc::downgrade(&invoke_agent_fwd);
     let routed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let routed_in_task = routed.clone();
     let bg_task = tokio::spawn(async move {
         let mut rx = bg_event_rx;
-        // A throwaway no-op forwarder for the post-parent-teardown window,
-        // matching `NoopEventForwarder` in lifecycle.rs.
-        #[derive(Debug)]
-        struct Noop;
-        impl alms_tools::EventForwarder for Noop {
-            fn forward_tool_start(
-                &self,
-                _: uuid::Uuid,
-                _: String,
-                _: serde_json::Value,
-                _: Option<String>,
-                _: Option<String>,
-            ) {
-            }
-            fn forward_tool_end(
-                &self,
-                _: uuid::Uuid,
-                _: bool,
-                _: serde_json::Value,
-                _: Option<String>,
-                _: Option<String>,
-            ) {
-            }
-            fn forward_token_delta(&self, _: String, _: Option<String>) {}
-            fn forward_status(&self, _: String, _: Option<String>) {}
-            fn forward_warning(&self, _: String, _: String, _: Option<String>) {}
-        }
         while let Some(event) = rx.recv().await {
-            let _sse = match bg_runtime_fwd.upgrade() {
-                Some(strong) => route_bg_event(event, &*strong, bg_run_id),
-                None => route_bg_event(event, &Noop, bg_run_id),
-            };
+            let upgraded = bg_runtime_fwd.upgrade();
+            let _sse = route_bg_event(event, upgraded.as_deref(), bg_run_id, bg_session_id);
             routed_in_task.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }
     });
@@ -819,8 +797,9 @@ async fn test_bg_subagent_does_not_block_parent_run_drain() {
     }
 
     // The bg subagent then continues to emit its own tool events, which still
-    // route to SSE even after the parent is gone (the Weak upgrade fails, the
-    // Noop fallback is used, and route_bg_event converts ToolEnd directly).
+    // route to SSE even after the parent is gone (the Weak upgrade fails, so
+    // `route_bg_event` is called with `parent_fwd == None` and converts ToolEnd
+    // directly).
     relay_holds_bg_tx
         .send(RuntimeEvent::ToolEnd {
             invocation_id: uuid::Uuid::new_v4(),
@@ -840,5 +819,191 @@ async fn test_bg_subagent_does_not_block_parent_run_drain() {
         2,
         "bg task must process both the SubagentStarted reroute and the \
          post-parent-teardown ToolEnd"
+    );
+}
+
+/// Regression test for #1125 A1-3: a background subagent's `SubagentStarted`
+/// emitted **after** the parent run has finished must still reach the parent's
+/// session stream (via the `send_session_event` fallback) instead of being
+/// silently dropped — while the parent-alive case must NOT double-deliver.
+///
+/// Failure scenario (pre-fix): the bg `SubagentStarted` is rerouted onto the
+/// parent's `runtime_tx` via `forward_subagent_started`. Once the parent run
+/// finishes and drops `invoke_agent_fwd`, the bg task's `Weak::upgrade` returns
+/// `None`, so `route_bg_event` was called with a no-op forwarder and the
+/// reroute became a silent drop — the #1105 "View session during the run"
+/// surface was lost for a bg subagent spawned near the end of a parent turn.
+///
+/// Post-fix `route_bg_event` takes `parent_fwd: Option<&dyn EventForwarder>`:
+/// - `Some(fwd)` (parent alive): reroute through the parent channel, return
+///   `None` so the caller does NOT also emit on the session stream (one
+///   delivery, FIFO after the parent's `tool_start`).
+/// - `None` (parent dead): return `Some(subagent_started)` so the caller
+///   delivers it via `send_session_event` (the fallback), carrying the same
+///   `tool_invocation_id` + `subagent_session_id` the live event would.
+///
+/// Both invariants are asserted here, falsifiably:
+///   - Parent-alive leg: `route_bg_event` returns `None` AND exactly one
+///     `SubagentStarted` lands on the parent's runtime channel (no fallback
+///     SSE). A revert that also emitted on the session stream would make the
+///     no-double-delivery assertion fail.
+///   - Parent-dead leg: `route_bg_event` returns `Some(SseEventData)` of type
+///     `subagent_started`, carrying `tool_invocation_id`, `subagent_session_id`
+///     and the parent `session_id`; AND nothing lands on the (dead) parent
+///     channel. A revert to the silent-drop shape returns `None` here and the
+///     fallback-delivery assertion fails.
+#[tokio::test]
+async fn test_bg_subagent_started_falls_back_to_session_stream_when_parent_dead() {
+    use alms_gateway::runs::tools::route_bg_event;
+    use alms_runtime::RuntimeEvent;
+    use std::sync::Arc;
+    use uuid::Uuid;
+
+    // Minimal forwarder mirroring `RuntimeEventForwarder`: pushes the
+    // rerouted `SubagentStarted` onto the parent's runtime channel. Only
+    // `forward_subagent_started` is exercised; the rest are no-ops because
+    // this test only routes `SubagentStarted` events.
+    #[derive(Debug)]
+    struct ChannelForwarder {
+        tx: tokio::sync::mpsc::UnboundedSender<RuntimeEvent>,
+    }
+    impl alms_tools::EventForwarder for ChannelForwarder {
+        fn forward_tool_start(
+            &self,
+            _: Uuid,
+            _: String,
+            _: serde_json::Value,
+            _: Option<String>,
+            _: Option<String>,
+        ) {
+        }
+        fn forward_tool_end(
+            &self,
+            _: Uuid,
+            _: bool,
+            _: serde_json::Value,
+            _: Option<String>,
+            _: Option<String>,
+        ) {
+        }
+        fn forward_token_delta(&self, _: String, _: Option<String>) {}
+        fn forward_status(&self, _: String, _: Option<String>) {}
+        fn forward_warning(&self, _: String, _: String, _: Option<String>) {}
+        fn forward_subagent_started(
+            &self,
+            tool_invocation_id: Uuid,
+            subagent_name: Option<String>,
+            subagent_session_id: Uuid,
+            background: bool,
+        ) {
+            let _ = self.tx.send(RuntimeEvent::SubagentStarted {
+                tool_invocation_id,
+                subagent_name,
+                subagent_session_id: SessionId(subagent_session_id),
+                background,
+            });
+        }
+    }
+
+    let (runtime_tx, mut runtime_rx) = tokio::sync::mpsc::unbounded_channel::<RuntimeEvent>();
+    let parent_fwd: Arc<dyn alms_tools::EventForwarder> = Arc::new(ChannelForwarder {
+        tx: runtime_tx.clone(),
+    });
+    let bg_run_id = RunId::new();
+    let parent_session = SessionId::new();
+    let tool_invocation_id = Uuid::new_v4();
+    let subagent_session = SessionId::new();
+
+    // ---- Leg 1: PARENT ALIVE -> reroute through parent channel, no fallback. ----
+    let alive = route_bg_event(
+        RuntimeEvent::SubagentStarted {
+            tool_invocation_id,
+            subagent_name: Some("worker".to_string()),
+            subagent_session_id: subagent_session,
+            background: true,
+        },
+        Some(&*parent_fwd),
+        bg_run_id,
+        parent_session,
+    );
+    assert!(
+        alive.is_none(),
+        "parent-alive: route_bg_event must reroute via the parent channel and \
+         return None (no session-stream fallback) -- got {alive:?}"
+    );
+    // Exactly one SubagentStarted on the parent channel, matching the
+    // invocation. (`RuntimeEvent` is not `Debug`, so match explicitly rather
+    // than `{:?}`-formatting the received value.)
+    match runtime_rx.try_recv() {
+        Ok(RuntimeEvent::SubagentStarted {
+            tool_invocation_id: tid,
+            subagent_session_id: sid,
+            ..
+        }) => {
+            assert_eq!(tid, tool_invocation_id);
+            assert_eq!(sid, subagent_session);
+        }
+        Ok(_) => {
+            panic!("expected a rerouted SubagentStarted on the parent channel, got another variant")
+        }
+        Err(_) => {
+            panic!("parent-alive leg must reroute the SubagentStarted onto the parent channel")
+        }
+    }
+    assert!(
+        runtime_rx.try_recv().is_err(),
+        "parent-alive leg must deliver the SubagentStarted exactly once"
+    );
+
+    // ---- Leg 2: PARENT DEAD -> fallback SseEventData for the session stream. ----
+    // Model the parent teardown: drop the forwarder and the channel just like
+    // `drop(runtime)` does in `execute_run`. In production the bg task observes
+    // this as `Weak::upgrade() -> None` and passes `parent_fwd = None`.
+    drop(parent_fwd);
+    drop(runtime_tx);
+
+    let dead = route_bg_event(
+        RuntimeEvent::SubagentStarted {
+            tool_invocation_id,
+            subagent_name: Some("worker".to_string()),
+            subagent_session_id: subagent_session,
+            background: true,
+        },
+        None,
+        bg_run_id,
+        parent_session,
+    );
+
+    // The dead-parent leg must produce a `subagent_started` SSE for the caller
+    // to deliver on the session stream — NOT a silent drop.
+    let sse = dead.expect(
+        "parent-dead: route_bg_event must FALL BACK to a subagent_started \
+         SseEventData (delivered via send_session_event) instead of dropping \
+         the event (#1125 A1-3)",
+    );
+    assert_eq!(
+        sse.event_type, "subagent_started",
+        "fallback event must be a subagent_started event"
+    );
+    assert_eq!(
+        sse.data["session_id"].as_str(),
+        Some(parent_session.0.to_string().as_str()),
+        "fallback must carry the PARENT session id (the session stream it lands on)"
+    );
+    assert_eq!(
+        sse.data["tool_invocation_id"].as_str(),
+        Some(tool_invocation_id.to_string().as_str()),
+        "fallback must carry the parent invoke_agent tool_invocation_id so the \
+         frontend resolver attaches the session id to the right chip"
+    );
+    assert_eq!(
+        sse.data["subagent_session_id"].as_str(),
+        Some(subagent_session.0.to_string().as_str()),
+        "fallback must carry the subagent's session id for the View-session link"
+    );
+    assert_eq!(
+        sse.data["subagent_name"].as_str(),
+        Some("worker"),
+        "fallback must preserve the subagent name when present"
     );
 }
