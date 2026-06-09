@@ -39,6 +39,63 @@ const removeTimers = {};
  *  Set to 15 seconds so completed subagents remain visible longer. */
 const REMOVE_DELAY_MS = 15000;
 
+/** Terminal subagent statuses — entries in these states are scheduled for
+ *  auto-removal from the bar after `REMOVE_DELAY_MS`. */
+const TERMINAL_STATUSES = new Set(['done', 'fail']);
+
+/**
+ * Arm (or re-arm) the auto-remove timer for a single subagent entry.
+ *
+ * The entry stays visible for `REMOVE_DELAY_MS` so the operator can see the
+ * final status (checkmark / X) before it disappears. Any pending timer for
+ * the same key is cleared first so repeated calls don't stack timers.
+ *
+ * Centralised so `trackSubagentEnd` and the rehydrate-time invariant sweep
+ * (`rearmTerminalRemoveTimers`) schedule removal identically. The callback
+ * re-reads `activeSubagents.value` at fire time and only deletes the entry if
+ * it is still the one we scheduled (a fresh re-invocation under the same key
+ * re-arms its own timer via `trackSubagentStart`, which cancels this one).
+ *
+ * @param {string} key - The `activeSubagents` map key.
+ */
+function scheduleSubagentRemoval(key) {
+    if (removeTimers[key]) {
+        clearTimeout(removeTimers[key]);
+    }
+    removeTimers[key] = setTimeout(() => {
+        delete removeTimers[key];
+        const { [key]: _, ...rest } = activeSubagents.value;
+        activeSubagents.value = rest;
+    }, REMOVE_DELAY_MS);
+}
+
+/**
+ * Re-arm an auto-remove timer for every entry already in a terminal
+ * (`done` / `fail`) status that has no pending timer (A1-4 / #1125).
+ *
+ * Invariant being restored: a terminal subagent chip must always have a
+ * live auto-remove timer, otherwise it sticks on the bar until the next
+ * session switch wipes the whole map. `clearAllSubagents()` (called at the
+ * top of every session switch) cancels every pending timer; if a subagent
+ * completion then lands via SSE in the same close→reopen window — or a chip
+ * created by a live `tool_start` between `replaceMessages` and rehydrate has
+ * its completion consumed while the map was momentarily cleared and is later
+ * re-seeded into a terminal state — the entry can carry a terminal status
+ * with no timer to remove it. Rehydrate (the single load chokepoint, run on
+ * every reload and session-switch-back) sweeps the map and re-arms one, so
+ * the stale chip self-heals on the next load instead of lingering.
+ *
+ * Running entries are untouched — they are removed by their own
+ * `trackSubagentEnd` when the subagent completes.
+ */
+function rearmTerminalRemoveTimers() {
+    for (const [key, info] of Object.entries(activeSubagents.value)) {
+        if (TERMINAL_STATUSES.has(info.status) && !removeTimers[key]) {
+            scheduleSubagentRemoval(key);
+        }
+    }
+}
+
 /**
  * Track a subagent invocation.
  *
@@ -164,14 +221,7 @@ export function trackSubagentEnd(name, status, toolInvocationId, subagentSession
     };
 
     // Schedule auto-removal after a brief delay.
-    if (removeTimers[key]) {
-        clearTimeout(removeTimers[key]);
-    }
-    removeTimers[key] = setTimeout(() => {
-        delete removeTimers[key];
-        const { [key]: _, ...rest } = activeSubagents.value;
-        activeSubagents.value = rest;
-    }, REMOVE_DELAY_MS);
+    scheduleSubagentRemoval(key);
 }
 
 /**
@@ -473,6 +523,15 @@ export function clearAllSubagents() {
  *   typically `chatMessages.value` immediately after `replaceMessages`).
  */
 export function rehydrateSubagentsFromHistory(messages) {
+    // A1-4 / #1125: restore the "terminal chip always has a live auto-remove
+    // timer" invariant before doing anything else. A completion that landed in
+    // the close→reopen window of a session switch (after `clearAllSubagents`
+    // cancelled the timers) can leave a `done` / `fail` entry with no timer,
+    // which would otherwise stick until the next switch. Runs unconditionally —
+    // even on the empty-history early return below — so a stale terminal chip
+    // carried over from a previous session self-heals on the next load.
+    rearmTerminalRemoveTimers();
+
     if (!Array.isArray(messages) || messages.length === 0) return;
 
     // Single chronological pass: maintain a per-session FIFO queue of

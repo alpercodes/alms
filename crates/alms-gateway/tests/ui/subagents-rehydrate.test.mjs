@@ -17,7 +17,7 @@
 // so the rehydration write surfaces back through the exported
 // `activeSubagents` value.
 
-import { test, beforeEach } from 'node:test';
+import { test, beforeEach, afterEach, mock } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -107,6 +107,14 @@ beforeEach(async () => {
     // Fresh module per test so `activeSubagents` state from a previous
     // test doesn't bleed across cases.
     mod = await loadSubagentsModule();
+});
+
+afterEach(() => {
+    // Restore real timers between tests so the A1-4 fake-timer cases below
+    // don't leak `mock.timers` into the synchronous rehydrate tests.
+    if (mock.timers && mock.timers.reset) {
+        mock.timers.reset();
+    }
 });
 
 // ---------------------------------------------------------------------------
@@ -546,6 +554,163 @@ test('#1041: rehydrated entry transitions to "done" via trackSubagentEnd', () =>
     // Simulate the SSE tool_end -> trackSubagentEnd chain.
     mod.trackSubagentEnd('reviewer', 'done');
     assert.equal(mod.activeSubagents.value.reviewer.status, 'done');
+});
+
+// ---------------------------------------------------------------------------
+// A1-4 / #1125: a completed-subagent chip can be left in a terminal
+// (`done`/`fail`) status with NO pending auto-remove timer when its
+// completion lands in the close→reopen window of a session switch — the
+// 15s timer that `trackSubagentEnd` armed was `clearTimeout`'d by
+// `clearAllSubagents()` while the entry itself survived / was re-seeded.
+// Such a chip would stick on the bar until the next session switch. The fix
+// makes `rehydrateSubagentsFromHistory` (the single load chokepoint, run on
+// every reload and session-switch-back) re-arm an auto-remove timer for any
+// entry already in a terminal status, so the stale chip self-heals.
+//
+// These tests use `node:test` fake timers to assert the timer is (re)armed
+// and actually fires, mirroring the pattern in `agent-events-timer.test.mjs`.
+// ---------------------------------------------------------------------------
+
+/**
+ * Reproduce the exact stuck state the audit describes: a terminal entry with
+ * its auto-remove timer already cancelled. We get there deterministically by
+ * driving the real module surface — `trackSubagentEnd` (arms the timer) then
+ * `clearAllSubagents` (cancels every timer) — but then re-establishing the
+ * terminal entry directly on the signal, standing in for the live/replayed
+ * SSE write that re-seeds it after the clear. The entry now has a terminal
+ * status and no pending timer: the leak.
+ */
+function seedTerminalChipWithoutTimer(mod, key, status) {
+    // 1. A normal completion arms the 15s timer for `key`.
+    mod.activeSubagents.value = {
+        [key]: {
+            status: 'running', tools: [], task: 't',
+            toolInvocationId: key, displayName: key,
+            startedAt: Date.now(), sessionId: null,
+        },
+    };
+    mod.trackSubagentEnd(key, status);
+    // 2. A session switch cancels every timer AND wipes the map.
+    mod.clearAllSubagents();
+    // 3. A racing SSE completion / re-seed re-establishes the terminal entry
+    //    while the map is otherwise empty — but no fresh timer is armed
+    //    (the live `trackSubagentEnd` ran against the now-cleared map and
+    //    returned early, so the entry came back via another path). Stand in
+    //    for that re-seed by writing the terminal entry straight onto the
+    //    signal.
+    mod.activeSubagents.value = {
+        [key]: {
+            status, tools: [], task: 't',
+            toolInvocationId: key, displayName: key,
+            startedAt: Date.now(), sessionId: null,
+        },
+    };
+}
+
+test('A1-4: rehydrate re-arms auto-remove timer for a stuck terminal chip', () => {
+    mock.timers.enable({ apis: ['setTimeout'] });
+
+    seedTerminalChipWithoutTimer(mod, 'reviewer', 'done');
+    // The chip is terminal with no timer — ticking 60s does NOT remove it.
+    mock.timers.tick(60000);
+    assert.equal(
+        mod.activeSubagents.value.reviewer.status, 'done',
+        'precondition: stuck terminal chip survives a tick with no timer',
+    );
+
+    // Rehydrate (with the chip still in the freshly-loaded history is not
+    // required — the sweep runs unconditionally). Pass an unrelated history
+    // so the additive seed adds nothing; only the invariant sweep should act.
+    mod.rehydrateSubagentsFromHistory([
+        { id: 'other', type: 'tool', tool: 'invoke_agent',
+          params: { name: 'other', task: 'x' }, status: 'done',
+          result: {}, ts: '2026-05-12T10:00:00Z' },
+    ]);
+
+    // The sweep re-armed the timer; after REMOVE_DELAY_MS the chip is gone.
+    mock.timers.tick(15000);
+    assert.equal(
+        mod.activeSubagents.value.reviewer, undefined,
+        'rehydrate must re-arm the timer so the stuck terminal chip is removed',
+    );
+});
+
+test('A1-4: fail-status stuck chip is also swept on rehydrate', () => {
+    mock.timers.enable({ apis: ['setTimeout'] });
+
+    seedTerminalChipWithoutTimer(mod, 'subagent-abcdef01', 'fail');
+    mock.timers.tick(60000);
+    assert.equal(mod.activeSubagents.value['subagent-abcdef01'].status, 'fail');
+
+    mod.rehydrateSubagentsFromHistory([]);
+
+    mock.timers.tick(15000);
+    assert.equal(
+        mod.activeSubagents.value['subagent-abcdef01'], undefined,
+        'fail-status stuck chip must be removed after the re-armed timer fires',
+    );
+});
+
+test('A1-4: rehydrate runs the sweep even on the empty-history early return', () => {
+    mock.timers.enable({ apis: ['setTimeout'] });
+
+    seedTerminalChipWithoutTimer(mod, 'reviewer', 'done');
+    // Empty history hits the `messages.length === 0` early return — the sweep
+    // is placed BEFORE that guard precisely so the stale chip still heals.
+    mod.rehydrateSubagentsFromHistory([]);
+
+    mock.timers.tick(15000);
+    assert.equal(
+        mod.activeSubagents.value.reviewer, undefined,
+        'empty-history rehydrate must still re-arm the terminal chip timer',
+    );
+});
+
+test('A1-4: rehydrate does NOT schedule removal for a running entry', () => {
+    mock.timers.enable({ apis: ['setTimeout'] });
+
+    // A live in-flight chip (no timer — running chips never have one).
+    mod.activeSubagents.value = {
+        reviewer: {
+            status: 'running', tools: [], task: 't',
+            toolInvocationId: 'reviewer', displayName: 'reviewer',
+            startedAt: Date.now(), sessionId: null,
+        },
+    };
+    mod.rehydrateSubagentsFromHistory([]);
+
+    // No timer should have been armed for a running entry: it survives.
+    mock.timers.tick(60000);
+    assert.equal(
+        mod.activeSubagents.value.reviewer?.status, 'running',
+        'running chip must not be auto-removed by the terminal sweep',
+    );
+});
+
+test('A1-4: rehydrate does not double-arm an entry that already has a live timer', () => {
+    mock.timers.enable({ apis: ['setTimeout'] });
+
+    // A normal completion: entry is terminal WITH a live timer.
+    mod.activeSubagents.value = {
+        reviewer: {
+            status: 'running', tools: [], task: 't',
+            toolInvocationId: 'reviewer', displayName: 'reviewer',
+            startedAt: Date.now(), sessionId: null,
+        },
+    };
+    mod.trackSubagentEnd('reviewer', 'done');
+
+    // Let 10s elapse, then rehydrate. The sweep must NOT reset the timer
+    // (the entry already has one) — i.e. it must not extend the chip's life
+    // by re-arming a fresh 15s window. 5s after rehydrate (15s total) the
+    // original timer fires and the chip is removed.
+    mock.timers.tick(10000);
+    mod.rehydrateSubagentsFromHistory([]);
+    mock.timers.tick(5000);
+    assert.equal(
+        mod.activeSubagents.value.reviewer, undefined,
+        'existing timer must still fire on its original schedule (no re-arm)',
+    );
 });
 
 // ---------------------------------------------------------------------------
