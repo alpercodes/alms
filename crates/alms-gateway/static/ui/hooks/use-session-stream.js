@@ -47,6 +47,11 @@ import {
     clearStreamDead,
     registerSessionReconnect,
 } from '../state/stream-health.js';
+import {
+    setSealedReasoningRunIds,
+    getSealedReasoningRunIds,
+    clearSealedReasoningRunIds,
+} from '../state/reasoning-dedupe.js';
 
 /**
  * Per-run DM thinking text accumulation buffer.
@@ -104,6 +109,15 @@ function friendlyErrorMessage(code, rawMsg) {
 }
 
 let activeSessionEs = null;
+/**
+ * The sessionId the currently-open stream belongs to. Tracked at module
+ * scope so the per-session reasoning-dedupe suppress-set (#1135) can be
+ * cleaned up correctly: when `openSessionStream` switches to a DIFFERENT
+ * session it drops the previous session's stored set, but a same-session
+ * reopen (EventSource reconnect) preserves it. `closeSessionStream` clears
+ * the current session's entry on genuine teardown.
+ */
+let activeStreamSessionId = null;
 let sessionRetryCount = 0;
 const MAX_SESSION_RETRIES = 10;
 /**
@@ -242,6 +256,18 @@ function sealLastAgent() {
  *   the REST API and only needs new live events going forward.
  */
 export function openSessionStream(sessionId, opts) {
+    // Recover the reasoning-dedupe suppress-set (#1135) BEFORE the internal
+    // `closeSessionStream()` below clears the per-session store, so a
+    // same-session EventSource reconnect (which reopens via this function
+    // without an `opts.sealedReasoningRunIds`) does not lose the set. A fresh
+    // `loadSession` for the same session supplies a new set in `opts` and
+    // supersedes this. For a session SWITCH (different `sessionId`) we ignore
+    // the prior session's set — its entry is dropped by `closeSessionStream`
+    // tearing down the old `activeStreamSessionId`.
+    const carriedSealedReasoning = (sessionId && (!opts || !(opts.sealedReasoningRunIds instanceof Set)))
+        ? getSealedReasoningRunIds(sessionId)
+        : null;
+
     closeSessionStream();
     if (!sessionId) return;
 
@@ -267,8 +293,26 @@ export function openSessionStream(sessionId, opts) {
     const url = `/sessions/${sessionId}/events${qs ? '?' + qs : ''}`;
     const es = new EventSource(url);
     activeSessionEs = es;
+    activeStreamSessionId = sessionId;
     sessionRetryCount = 0;
     lastSeenEventId = (opts && opts.lastEventId != null) ? opts.lastEventId : null;
+
+    // Reasoning-dedupe suppress-set (#1135). A fresh `loadSession` passes the
+    // freshly-built set in `opts.sealedReasoningRunIds`; record it under this
+    // session id so the reconnect paths (auto-backoff `onerror`, manual
+    // `reconnectSessionStream`) can recover it after the originating `opts`
+    // object is gone. Both reconnect paths call `openSessionStream` WITHOUT a
+    // suppress-set — for those reopens `carriedSealedReasoning` (recovered
+    // above, before the internal close cleared the store) is re-recorded so
+    // the set survives the reconnect rather than being lost. The Layer-3 guard
+    // below reads the recovered set (not `opts`) so it keeps firing across
+    // reconnects within the stream's lifetime.
+    if (opts && opts.sealedReasoningRunIds instanceof Set) {
+        setSealedReasoningRunIds(sessionId, opts.sealedReasoningRunIds);
+    } else if (carriedSealedReasoning instanceof Set) {
+        setSealedReasoningRunIds(sessionId, carriedSealedReasoning);
+    }
+    const sealedReasoningRunIds = getSealedReasoningRunIds(sessionId);
     // Defer clearing the dead-state flag until the connection
     // actually opens — see the `'open'` listener below. Constructing
     // an EventSource is optimistic and does not mean the server is
@@ -637,8 +681,17 @@ export function openSessionStream(sessionId, opts) {
         // below (append-to-tail and new-bubble), so it cannot create a second
         // unsealed bubble or land on a still-live run's tail. A live run is
         // never in the set, so its fresh deltas pass through untouched.
-        if (data.run_id && opts && opts.sealedReasoningRunIds
-            && opts.sealedReasoningRunIds.has(data.run_id)) {
+        //
+        // #1135: the guard reads `sealedReasoningRunIds` recovered from the
+        // per-session store at stream-open time rather than `opts` directly,
+        // so it survives EventSource reconnects. The `on()` wrapper advances
+        // `lastSeenEventId` before this handler runs, so a reconnect cursor
+        // can land mid-replay of a sealed run's trailing deltas; without the
+        // recovered set those re-replayed deltas would slip past the guard and
+        // create a spurious unsealed bubble that persists until the next
+        // reload (the run is terminal, so no future `run_finished` reseals it).
+        if (data.run_id && sealedReasoningRunIds
+            && sealedReasoningRunIds.has(data.run_id)) {
             return;
         }
         transformMessages(prev => {
@@ -1451,6 +1504,16 @@ export function closeSessionStream() {
     // Reset per-run state so it does not carry over to the next session.
     sawTokenDelta = false;
     clearAgentPhase();
+    // Drop the per-session reasoning-dedupe suppress-set (#1135) for the
+    // stream being torn down so the store does not accumulate entries across
+    // session switches (no cross-session leakage, no unbounded growth). A
+    // same-session EventSource reconnect re-records it in `openSessionStream`
+    // from `carriedSealedReasoning`, which is recovered BEFORE this close
+    // fires — so this teardown does not defeat the reconnect fix.
+    if (activeStreamSessionId != null) {
+        clearSealedReasoningRunIds(activeStreamSessionId);
+        activeStreamSessionId = null;
+    }
     if (activeSessionEs) {
         activeSessionEs.close();
         activeSessionEs = null;

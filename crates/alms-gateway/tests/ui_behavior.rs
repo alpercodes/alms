@@ -309,3 +309,25 @@ fn subagents_rehydrate_js_behaviour() {
 fn reasoning_coverage_gate_js_behaviour() {
     run_node_test("reasoning-coverage.test.mjs");
 }
+
+/// Pinned regression for issue #1135: the Layer-3 reasoning-dedupe suppress-set
+/// (`sealedReasoningRunIds`, introduced in #1133 / PR #1134) used to live only
+/// on the initial `openSessionStream` `opts`, so a mid-replay EventSource
+/// reconnect — which reopens with `{ lastEventId }` only — lost the set and
+/// let already-sealed reasoning re-duplicate as a spurious unsealed bubble
+/// until the next full reload. The fix hoists the set to a per-session
+/// module-scoped store in `static/ui/state/reasoning-dedupe.js` that the
+/// auto-backoff and manual reconnect paths recover after the originating
+/// `opts` object is gone. The JS-side test pins:
+///   - store / recover round-trip (same Set reference; null for unknown)
+///   - the recover-before-clear, re-record reconnect cycle preserves the set
+///   - per-session scoping (no cross-session leakage)
+///   - cleanup on teardown / session switch (no unbounded growth; bounded
+///     at the live session)
+///   - no-op safety for falsy sessionId and non-Set values (the four
+///     `openSessionStream` callers that pass no suppress-set stay inert)
+///   - last-write-wins so a fresh `loadSession` supersedes the old set
+#[test]
+fn reasoning_dedupe_store_js_behaviour() {
+    run_node_test("reasoning-dedupe.test.mjs");
+}
