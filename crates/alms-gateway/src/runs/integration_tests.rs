@@ -7187,6 +7187,357 @@ async fn get_run_reasoning_boundary_uses_unmatched_tool_start() {
 }
 
 // ---------------------------------------------------------------------------
+// #1133 / A3-1 — get_run_reasoning terminal seal (`null` cursor + empty text
+// + authoritative `terminal` flag)
+// ---------------------------------------------------------------------------
+
+/// A *live* run that has emitted post-boundary reasoning returns its
+/// accumulated text, a non-null `last_event_id` cursor, AND `terminal: false`.
+/// Pins that the terminal seal does NOT fire for a running run, so live
+/// multi-turn streaming is unaffected.
+#[tokio::test]
+async fn get_run_reasoning_live_run_returns_text_cursor_and_terminal_false() {
+    use axum::extract::{Path, State};
+    let (state, shutdown_token, _cr, _tr, _dr) = test_app_state();
+    let agent_id = AgentId::new();
+    let session = state
+        .session_manager
+        .get_or_create(agent_id, "test-1133-reasoning-live");
+    let session_id = session.id;
+
+    let run = Run::new(session_id, agent_id, "go think".into());
+    let run_id = run.run_id;
+    state.run_manager.insert_run(run);
+    // Run is in flight — the production state while the LLM call streams.
+    state.run_manager.mark_run_as_running(run_id);
+
+    state
+        .run_manager
+        .send_event(
+            run_id,
+            session_id,
+            SseEventData::reasoning_delta(run_id, "still ", None),
+        )
+        .await;
+    state
+        .run_manager
+        .send_event(
+            run_id,
+            session_id,
+            SseEventData::reasoning_delta(run_id, "thinking", None),
+        )
+        .await;
+
+    let response = super::lifecycle::get_run_reasoning(State(state.clone()), Path(run_id))
+        .await
+        .expect("get_run_reasoning should succeed for a live run");
+    let body = response.0;
+
+    assert_eq!(
+        body["text"].as_str().unwrap(),
+        "still thinking",
+        "a live run must still return its accumulated post-boundary reasoning"
+    );
+    assert!(
+        body["last_event_id"].as_u64().is_some(),
+        "a live run with reasoning must return a non-null last_event_id cursor"
+    );
+    assert_eq!(
+        body["terminal"].as_bool(),
+        Some(false),
+        "a non-terminal (Running) run must report terminal: false so the \
+         frontend keeps it live (no load-time dedupe, spinner preserved)"
+    );
+    assert!(
+        body["seal_event_id"].is_null(),
+        "a live run must report a null seal_event_id — the coverage anchor is \
+         meaningful only for a terminal run; a live run is never added to the \
+         frontend suppress-set"
+    );
+
+    shutdown_token.cancel();
+}
+
+/// The core #1133 fix on the natural-completion path: once a run is terminal
+/// (`Completed`), `get_run_reasoning` seals it — empty `text`, `null`
+/// `last_event_id`, `terminal: true` — *regardless* of the final-turn
+/// reasoning still sitting in the non-ephemeral session event log. (Unlike
+/// `get_run_text`, whose in-memory buffer is evicted on terminal transition,
+/// `reasoning_delta` is durable and has no natural backstop, hence this
+/// explicit seal.)
+#[tokio::test]
+async fn get_run_reasoning_terminal_completed_run_seals_to_null_cursor() {
+    use axum::extract::{Path, State};
+    let (state, shutdown_token, _cr, _tr, _dr) = test_app_state();
+    let agent_id = AgentId::new();
+    let session = state
+        .session_manager
+        .get_or_create(agent_id, "test-1133-reasoning-completed");
+    let session_id = session.id;
+
+    let run = Run::new(session_id, agent_id, "think then finish".into());
+    let run_id = run.run_id;
+    state.run_manager.insert_run(run);
+    state.run_manager.mark_run_as_running(run_id);
+
+    // Final-turn reasoning lands in the durable session event log...
+    state
+        .run_manager
+        .send_event(
+            run_id,
+            session_id,
+            SseEventData::reasoning_delta(run_id, "final ", None),
+        )
+        .await;
+    state
+        .run_manager
+        .send_event(
+            run_id,
+            session_id,
+            SseEventData::reasoning_delta(run_id, "answer", None),
+        )
+        .await;
+
+    // ...and the run completes (exactly what execute_run's Ok arm does).
+    let transitioned = state.run_manager.mark_run_as_completed(
+        run_id,
+        "done".to_string(),
+        alms_core::TokenUsage::default(),
+    );
+    assert!(
+        transitioned,
+        "Running → Completed must transition (test fixture sanity check)"
+    );
+
+    let response = super::lifecycle::get_run_reasoning(State(state.clone()), Path(run_id))
+        .await
+        .expect("get_run_reasoning should succeed for a terminal run");
+    let body = response.0;
+
+    assert_eq!(
+        body["text"].as_str().unwrap(),
+        "",
+        "a terminal run must blank the reasoning text — the sealed assistant \
+         message already renders it, so re-seeding would double-render"
+    );
+    assert!(
+        body["last_event_id"].is_null(),
+        "a terminal run must return a null last_event_id so the client stays \
+         at the messages-GET HWM and the terminal SSE event replays (else the \
+         spinner sticks)"
+    );
+    assert_eq!(
+        body["terminal"].as_bool(),
+        Some(true),
+        "a terminal run must report terminal: true — the authoritative signal \
+         the frontend keys its dedupe / spinner-clear off (empty text alone is \
+         overloaded with the live-but-no-reasoning case)"
+    );
+    // This fixture flips the run terminal in the store but never broadcasts
+    // `run_finished`, so no terminal event is in the log and the seal anchor
+    // is absent — which the frontend treats conservatively (do NOT suppress).
+    assert!(
+        body["seal_event_id"].is_null(),
+        "with no terminal SSE event in the log, seal_event_id must be null"
+    );
+
+    shutdown_token.cancel();
+}
+
+/// #1133 Codex #3 / sub-race B — pins the ordering invariant that makes the
+/// frontend coverage gate sound: `seal_event_id` (the terminal SSE event's id)
+/// is strictly ABOVE every reasoning-delta id, so a messages-GET that resolved
+/// before the seal (HWM == delta HWM) correctly fails the
+/// `historyHWM >= seal_event_id` check (sub-race B → render once), while one
+/// that resolved after it passes (sub-race A → suppress the duplicate). The
+/// runtime guarantees the ordering by sealing the assistant message into
+/// history and THEN flipping terminal + broadcasting the event (`execute_run`'s
+/// Ok arm: `append_message` → `mark_run_as_completed` → `send_event`).
+/// Deterministic and single-task — asserts the emitted field and id ordering,
+/// not a two-task interleave.
+#[tokio::test]
+async fn get_run_reasoning_terminal_seal_event_id_is_above_delta_hwm() {
+    use axum::extract::{Path, State};
+    let (state, shutdown_token, _cr, _tr, _dr) = test_app_state();
+    let agent_id = AgentId::new();
+    let session = state
+        .session_manager
+        .get_or_create(agent_id, "test-1133-seal-event-id");
+    let session_id = session.id;
+
+    let run = Run::new(session_id, agent_id, "think then finish".into());
+    let run_id = run.run_id;
+    state.run_manager.insert_run(run);
+    state.run_manager.mark_run_as_running(run_id);
+
+    // Final-turn reasoning streams into the durable session event log during
+    // the agent loop.
+    state
+        .run_manager
+        .send_event(
+            run_id,
+            session_id,
+            SseEventData::reasoning_delta(run_id, "final ", None),
+        )
+        .await;
+    state
+        .run_manager
+        .send_event(
+            run_id,
+            session_id,
+            SseEventData::reasoning_delta(run_id, "answer", None),
+        )
+        .await;
+
+    // Capture the session HWM at the moment a messages GET racing in sub-race
+    // B would have sampled it: AFTER the deltas, but BEFORE the run goes
+    // terminal and broadcasts `run_finished`. This is exactly the HWM the
+    // frontend would carry as `historyHWM` if its step-2 messages GET resolved
+    // here, before the runtime sealed the assistant message.
+    let delta_hwm = state
+        .run_manager
+        .latest_session_event_id(session_id)
+        .await
+        .expect("session HWM must exist after the reasoning deltas");
+
+    // The runtime seals the assistant message into history (a session-store
+    // write, not modelled here), THEN flips terminal and broadcasts. Mirror
+    // that ordering: state flip first, then the `run_finished` broadcast.
+    assert!(state.run_manager.mark_run_as_completed(
+        run_id,
+        "done".to_string(),
+        alms_core::TokenUsage::default(),
+    ));
+    state
+        .run_manager
+        .send_event(
+            run_id,
+            session_id,
+            SseEventData::run_finished(run_id, true, alms_core::TokenUsage::default()),
+        )
+        .await;
+
+    let response = super::lifecycle::get_run_reasoning(State(state.clone()), Path(run_id))
+        .await
+        .expect("get_run_reasoning should succeed for a terminal run");
+    let body = response.0;
+
+    // The seal anchor is exposed and equals the `run_finished` event id.
+    let seal_event_id = body["seal_event_id"]
+        .as_u64()
+        .expect("seal_event_id must be present and numeric on a terminal run");
+
+    // The load-time reasoning cursor stays null on terminal (no overshoot) —
+    // seal_event_id is a SEPARATE field and must not un-null the cursor.
+    assert!(
+        body["last_event_id"].is_null(),
+        "the reasoning cursor must stay null on terminal; seal_event_id is a \
+         separate coverage anchor, not the cursor"
+    );
+    assert_eq!(body["terminal"].as_bool(), Some(true));
+
+    // The load-bearing ordering invariant: the seal anchor is strictly above
+    // the reasoning-delta HWM (see the assertion message for how the frontend
+    // gate relies on it).
+    assert!(
+        seal_event_id > delta_hwm,
+        "seal_event_id ({seal_event_id}) must be strictly greater than the \
+         reasoning-delta HWM ({delta_hwm}) — this is what lets the frontend's \
+         `historyHWM >= seal_event_id` gate distinguish a messages-GET that \
+         resolved before the seal (sub-race B, render once) from one that \
+         resolved after it (sub-race A, suppress the duplicate)"
+    );
+
+    shutdown_token.cancel();
+}
+
+/// The cancel-path variant of the seal. A trailing `reasoning_delta` that
+/// races `run_cancelled` (logged *after* it here, mirroring the HTTP-cancel
+/// drain window where a delta can be assigned an id above `run_cancelled`)
+/// must NOT defeat the seal: once the run is `Cancelled`, the response is
+/// `{ text: "", last_event_id: null, terminal: true }`.
+///
+/// NOTE (deterministic by design): this test does NOT assert any ordering
+/// between the trailing delta's id and the `run_cancelled` id — that two-task
+/// interleave cannot be driven deterministically (see the
+/// `http_cancel_wins_against_natural_completion` comment), and atomic
+/// `log_event` makes each event indivisible without ordering which task wins
+/// the lock. The seal is robust precisely *because* it keys off the run's
+/// terminal status, not the cursor.
+#[tokio::test]
+async fn get_run_reasoning_cancel_path_trailing_delta_still_seals() {
+    use axum::extract::{Path, State};
+    let (state, shutdown_token, _cr, _tr, _dr) = test_app_state();
+    let agent_id = AgentId::new();
+    let session = state
+        .session_manager
+        .get_or_create(agent_id, "test-1133-reasoning-cancel");
+    let session_id = session.id;
+
+    let run = Run::new(session_id, agent_id, "cancel mid-think".into());
+    let run_id = run.run_id;
+    state.run_manager.insert_run(run);
+    state.run_manager.mark_run_as_running(run_id);
+
+    // HTTP cancel_run wins the race: flip to Cancelled + broadcast
+    // run_cancelled synchronously (exactly what the cancel handler does).
+    let cancelled = state.run_manager.mark_run_as_cancelled(run_id);
+    assert!(
+        cancelled,
+        "Running → Cancelled must transition (test fixture sanity check)"
+    );
+    state
+        .run_manager
+        .send_event(run_id, session_id, SseEventData::run_cancelled(run_id))
+        .await;
+
+    // A trailing reasoning_delta from the still-draining forwarder lands in
+    // the session event log AFTER run_cancelled — the exact id-race the
+    // unwinnable cursor could not survive. The terminal seal handles it
+    // without any id-ordering assumption.
+    state
+        .run_manager
+        .send_event(
+            run_id,
+            session_id,
+            SseEventData::reasoning_delta(run_id, "trailing", None),
+        )
+        .await;
+
+    let response = super::lifecycle::get_run_reasoning(State(state.clone()), Path(run_id))
+        .await
+        .expect("get_run_reasoning should succeed for a cancelled run");
+    let body = response.0;
+
+    assert_eq!(
+        body["text"].as_str().unwrap(),
+        "",
+        "a cancelled run must blank reasoning text even with a trailing \
+         post-cancel delta in the durable log"
+    );
+    assert!(
+        body["last_event_id"].is_null(),
+        "a cancelled run must return a null cursor so run_cancelled replays — \
+         the trailing delta must not be able to drag the cursor above the \
+         terminal event"
+    );
+    assert_eq!(
+        body["terminal"].as_bool(),
+        Some(true),
+        "a cancelled run is terminal: true"
+    );
+    // The seal anchor is the `run_cancelled` event id, captured even though a
+    // trailing reasoning_delta was logged after it — the trailing delta is not
+    // a terminal-type event, so it never becomes the anchor.
+    assert!(
+        body["seal_event_id"].as_u64().is_some(),
+        "a cancelled run must expose the run_cancelled event id as seal_event_id"
+    );
+
+    shutdown_token.cancel();
+}
+
+// ---------------------------------------------------------------------------
 // #1107 — GET /runs/{run_id}/text in-flight visible-reply rehydration
 // ---------------------------------------------------------------------------
 

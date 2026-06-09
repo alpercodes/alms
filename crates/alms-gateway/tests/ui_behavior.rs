@@ -290,3 +290,22 @@ fn agent_events_timer_js_behaviour() {
 fn subagents_rehydrate_js_behaviour() {
     run_node_test("subagents-rehydrate.test.mjs");
 }
+
+/// Behavioural coverage for `historyCoversSeal` in
+/// `static/ui/utils/reasoning-coverage.js` — the load-time coverage gate that
+/// decides whether a run that went terminal during a session load is added to
+/// the `reasoning_delta` suppress-set (#1133 Layer 3 / Codex finding #3).
+///
+/// Pins the sub-race split that the gate exists to resolve:
+///   - sub-race A (`historyHWM >= seal_event_id`): the messages GET captured
+///     the sealed reasoning -> suppress the replayed deltas (no double-render)
+///   - sub-race B (`historyHWM <  seal_event_id`): the run sealed AFTER the
+///     messages GET resolved -> history lacks the reasoning -> do NOT suppress
+///     so the replayed deltas render the final turn exactly once
+///   - missing/null/non-numeric anchor or HWM: conservative `false`
+///     (render once, never risk zero renders)
+///   - string-numeric `lastEventId` compares numerically, not lexically
+#[test]
+fn reasoning_coverage_gate_js_behaviour() {
+    run_node_test("reasoning-coverage.test.mjs");
+}

@@ -11,11 +11,22 @@ export const cancelRun = (runId) => post(`/runs/${runId}/cancel`);
 
 // Fetch accumulated extended-thinking ("reasoning") text for an in-flight
 // run. Used by `loadSession` to rehydrate the reasoning panel on page
-// reload (#1043). Returns `{ run_id, text, last_event_id }`. `text` may be
-// empty when the run has produced no reasoning yet; `last_event_id` may be
-// null in that case. When non-null, the caller should pass it as the SSE
-// `last_event_id` so the live stream does not double-emit deltas that are
-// already reflected in `text`.
+// reload (#1043). Returns
+// `{ run_id, text, last_event_id, terminal, seal_event_id }`.
+//
+//  - `text` may be empty when the run has produced no reasoning yet;
+//    `last_event_id` may be null in that case. When non-null, the caller
+//    should pass it as the SSE `last_event_id` so the live stream does not
+//    double-emit deltas already reflected in `text`.
+//  - `terminal` (#1133) — true once the run reaches a terminal state, where
+//    the backend forces `text: ""` + `last_event_id: null` (the reasoning is
+//    sealed onto the assistant message in history). A live run reports false.
+//  - `seal_event_id` (#1133 Codex #3) — the session-event-log id of the run's
+//    terminal SSE event when `terminal: true` (else null). The coverage anchor
+//    `loadSession` compares its messages-GET high-water mark against
+//    (`historyHWM >= seal_event_id`) to decide whether the loaded history
+//    already contains the sealed reasoning before adding the run to the
+//    load-time `reasoning_delta` suppress-set.
 export const getRunReasoning = (runId) => get(`/runs/${runId}/reasoning`);
 
 // Fetch accumulated visible-reply text for an in-flight run (#1107).

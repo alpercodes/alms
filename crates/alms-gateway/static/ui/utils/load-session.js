@@ -21,9 +21,10 @@
 import { getSession, getSessionMessages, getSessionToolCalls } from '../api/sessions.js';
 import { listRuns, listApprovals, listAgentRuns, getRun, getRunReasoning, getRunText } from '../api/runs.js';
 import { mapHistoryMessages, groupDmReasoningBlocks } from './history.js';
+import { historyCoversSeal } from './reasoning-coverage.js';
 import { normalizeApproval } from './approvals.js';
 import { chatMessages, nextMsgId } from '../state/chat.js';
-import { replaceMessages, appendMessage, updateMessage } from '../state/chat-actions.js';
+import { replaceMessages, appendMessage, updateMessage, filterMessages } from '../state/chat-actions.js';
 import { activeRunId, runs } from '../state/runs.js';
 import { openSessionStream } from '../hooks/use-session-stream.js';
 import { setAgentPhase, clearAgentPhase, setDmContext } from '../state/agent-status.js';
@@ -177,6 +178,15 @@ export async function loadSession(sessionId, opts) {
     // Hoisted so step 3 (in-flight reasoning rehydration for #1043) can
     // branch on session type without re-deriving it.
     let isDmSession = false;
+    // Load-time terminal-scoped dedupe set (#1133, Layer 3). Holds the
+    // run-ids whose final-turn reasoning is already sealed into the assistant
+    // bubble rehydrated by the messages GET in step 2; the `reasoning_delta`
+    // SSE handler drops any replayed delta carrying one of these run-ids so a
+    // run that went terminal during the load does not double-render. Populated
+    // and gated in step 3 (see the build site for the coverage logic), then
+    // threaded into `openSessionStream` opts at step 4. Built here keyed off
+    // the reasoning GET's `run_id` because sealed history messages carry none.
+    const sealedReasoningRunIds = new Set();
     try {
         const [historyData, toolCallData] = await Promise.all([
             getSessionMessages(sessionId),
@@ -411,15 +421,84 @@ export async function loadSession(sessionId, opts) {
         // advances the SSE cursor past events the UI no longer needs to
         // replay.
         if (!isDmSession) {
+            // Capture the active run-id once. Layer 4 (#1133) may null
+            // `activeRunId.value` mid-block when the reasoning GET reports a
+            // terminal run, so the GETs below and the dedupe-set add must read
+            // this stable local rather than the signal after it is cleared.
+            const reasoningRunId = activeRunId.value;
             const activeRunForReasoning = runs.value.find(
-                r => r.run_id === activeRunId.value
+                r => r.run_id === reasoningRunId
             );
             const runStillLive = activeRunForReasoning
                 && (activeRunForReasoning.status === 'running'
                     || activeRunForReasoning.status === 'queued');
             try {
-                const reasoningData = await getRunReasoning(activeRunId.value);
+                const reasoningData = await getRunReasoning(reasoningRunId);
                 if (isStale()) return;
+                // Terminal-run handling (#1133, Layers 3 + 4). Key the spinner
+                // clear (Layer 4) and the thinking-row removal (C2) off the
+                // authoritative `terminal` flag, never off empty-text —
+                // empty-text is overloaded (a live run with no post-boundary
+                // reasoning this turn also returns empty text + null cursor)
+                // and would false-positive on a live run. The suppress-set add
+                // (Layer 3) additionally gates on `seal_event_id` history
+                // coverage — see the sub-race A/B note below.
+                if (reasoningData?.terminal === true) {
+                    // Layer 3 (gated on history coverage — #1133 Codex #3 /
+                    // sub-race B). This run's reasoning is sealed onto the
+                    // assistant bubble ONLY IF the step-2 messages GET captured
+                    // it. Two sub-races of "run went terminal during the load",
+                    // split by which side of that GET the completion landed on:
+                    //
+                    //  A. Run finished BEFORE the messages GET resolved → the
+                    //     sealed reasoning is in the loaded history; its
+                    //     trailing replayed deltas would double-render →
+                    //     suppress via the set.
+                    //  B. Run finished AFTER it resolved → history does NOT
+                    //     contain the reasoning, yet the run already reports
+                    //     `terminal: true`. Suppressing here would drop the
+                    //     replayed deltas that are its only remaining source →
+                    //     it renders ZERO times until a manual reload.
+                    //
+                    // `historyCoversSeal` distinguishes them via `seal_event_id`
+                    // (the terminal event's id): `historyHWM >= seal_event_id`
+                    // ⟺ the messages GET ran after the seal ⟺ sub-race A. See
+                    // reasoning-coverage.js for the ordering that makes this
+                    // sound. NOTE a per-delta `eventId <= HWM` gate is NOT
+                    // enough: in a sub-race-B variant every delta can sit below
+                    // the HWM (reasoning finished before the messages GET) while
+                    // the SEALED message was appended after it — a per-delta
+                    // gate would drop those deltas yet history would not render
+                    // them. The terminal-event position is the only correct
+                    // anchor.
+                    //
+                    // `lastEventId` is still the step-2 HWM here — a terminal
+                    // run's reasoning/text GETs return null cursors, so the
+                    // step-3 bumps below have not moved it yet.
+                    if (historyCoversSeal(lastEventId, reasoningData.seal_event_id)) {
+                        sealedReasoningRunIds.add(reasoningRunId);
+                    }
+                    // Layer 4: if the run finished between step-1 `listRuns`
+                    // and the step-2 messages GET, its terminal SSE event was
+                    // swallowed by the messages-GET HWM, so `run_finished` /
+                    // `run_cancelled` never replays and `handleRunEnd` never
+                    // clears the spinner. Clear the active-run marker
+                    // authoritatively here. A genuinely-live run reports
+                    // `terminal: false`, keeps `activeRunId`, and gets
+                    // `run_finished` from the live stream as normal.
+                    activeRunId.value = null;
+                    // Layer 4 (C2): clearing `activeRunId` stops the input-area
+                    // spinner but does NOT remove the inline `type:'thinking'`
+                    // chat row seeded above for this run. In the swallowed-
+                    // terminal-event window this block handles, the SSE-driven
+                    // `sealLastAgent` / `flushDeltaBuffer` that normally drops
+                    // that row never fires, so the "Thinking…" bubble would
+                    // stick forever. Remove it here, scoped to this run via the
+                    // stable `reasoningRunId` local, mirroring the live handlers.
+                    filterMessages(
+                        m => !(m.type === 'thinking' && m.runId === reasoningRunId)
+                    );
+                }
                 if (runStillLive && reasoningData?.text) {
                     appendMessage({
                         id: nextMsgId(),
@@ -471,7 +550,7 @@ export async function loadSession(sessionId, opts) {
             // until `run_finished` arrives. Skip the seed in that case.
             // The `last_event_id` handoff is still safe to apply.
             try {
-                const textData = await getRunText(activeRunId.value);
+                const textData = await getRunText(reasoningRunId);
                 if (isStale()) return;
                 if (runStillLive && textData?.text) {
                     const merged = updateMessage(
@@ -507,7 +586,10 @@ export async function loadSession(sessionId, opts) {
     // which calls clearAgentPhase(). Any phase restoration must happen
     // AFTER this call, not before — otherwise it gets wiped immediately.
     if (isStale()) return;
-    openSessionStream(sessionId, { lastEventId });
+    // Thread the load-time sealed-reasoning dedupe set (#1133, Layer 3)
+    // into the stream so its `reasoning_delta` handler can drop replayed
+    // deltas for runs whose reasoning is already sealed into history.
+    openSessionStream(sessionId, { lastEventId, sealedReasoningRunIds });
 
     // Step 5: Restore agent phase for in-progress runs.
     //

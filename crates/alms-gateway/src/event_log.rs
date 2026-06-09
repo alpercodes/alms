@@ -35,16 +35,44 @@ impl EventLog {
         }
     }
 
-    pub async fn append(&self, event: LoggedEvent) {
+    /// Atomically mint the next event id, build the event from it, and append
+    /// it to the log — all within a single critical section.
+    ///
+    /// Minting the id and pushing the event used to be two separate lock
+    /// acquisitions, which let a concurrent task interleave between them and
+    /// tear the invariant that id-order equals append-order (an event could be
+    /// assigned a lower id but land later in the log). Holding the `next_id`
+    /// write lock across both the mint and the push closes that window.
+    ///
+    /// **Lock ordering (deadlock-free):** `next_id` is acquired *before*
+    /// `events`, the order every caller already used, so holding both in one
+    /// scope cannot deadlock against any other path. Holding `next_id` across
+    /// the push serializes minting against itself, giving id-order ==
+    /// append-order.
+    ///
+    /// When `max_len` is `Some(n)`, the log is trimmed to its most recent `n`
+    /// events after the push (the per-session / per-agent bound).
+    async fn mint_and_push(
+        &self,
+        build: impl FnOnce(u64) -> LoggedEvent,
+        max_len: Option<usize>,
+    ) -> u64 {
+        let mut next = self.next_id.write().await;
+        let event_id = *next;
+        *next += 1;
+
+        let event = build(event_id);
+
         let mut events = self.events.write().await;
         events.push(event);
-    }
+        if let Some(max) = max_len
+            && events.len() > max
+        {
+            let drain = events.len() - max;
+            events.drain(..drain);
+        }
 
-    pub async fn next_event_id(&self) -> u64 {
-        let mut next = self.next_id.write().await;
-        let id = *next;
-        *next += 1;
-        id
+        event_id
     }
 
     pub async fn events_from(&self, from_id: u64) -> Vec<LoggedEvent> {
@@ -86,20 +114,20 @@ impl EventLogManager {
         data: serde_json::Value,
     ) -> u64 {
         let log = self.get_or_create(run_id).await;
-        let event_id = log.next_event_id().await;
-
-        let event = LoggedEvent {
-            event_id,
-            run_id,
-            session_id,
-            event_type: event_type.to_string(),
-            data,
-            ts: Utc::now(),
-        };
-
-        // Single lock acquisition for append
-        log.events.write().await.push(event);
-        event_id
+        // Mint the id and append atomically (see [`EventLog::mint_and_push`]).
+        // Per-run logs are unbounded.
+        log.mint_and_push(
+            |event_id| LoggedEvent {
+                event_id,
+                run_id,
+                session_id,
+                event_type: event_type.to_string(),
+                data,
+                ts: Utc::now(),
+            },
+            None,
+        )
+        .await
     }
 
     pub async fn events_from(&self, run_id: RunId, from_id: u64) -> Vec<LoggedEvent> {
@@ -149,28 +177,20 @@ impl SessionEventLogManager {
         data: serde_json::Value,
     ) -> u64 {
         let log = self.get_or_create(session_id).await;
-        let event_id = log.next_event_id().await;
-
-        let event = LoggedEvent {
-            event_id,
-            run_id,
-            session_id,
-            event_type: event_type.to_string(),
-            data,
-            ts: Utc::now(),
-        };
-
-        // Append + trim in a single lock acquisition
-        {
-            let mut events = log.events.write().await;
-            events.push(event);
-            if events.len() > SESSION_EVENT_LOG_MAX {
-                let drain = events.len() - SESSION_EVENT_LOG_MAX;
-                events.drain(..drain);
-            }
-        }
-
-        event_id
+        // Mint the id, append, and trim atomically (see
+        // [`EventLog::mint_and_push`]).
+        log.mint_and_push(
+            |event_id| LoggedEvent {
+                event_id,
+                run_id,
+                session_id,
+                event_type: event_type.to_string(),
+                data,
+                ts: Utc::now(),
+            },
+            Some(SESSION_EVENT_LOG_MAX),
+        )
+        .await
     }
 
     pub async fn events_from(&self, session_id: SessionId, from_id: u64) -> Vec<LoggedEvent> {
@@ -236,28 +256,20 @@ impl AgentEventLogManager {
         data: serde_json::Value,
     ) -> u64 {
         let log = self.get_or_create(agent_id).await;
-        let event_id = log.next_event_id().await;
-
-        let event = LoggedEvent {
-            event_id,
-            run_id,
-            session_id,
-            event_type: event_type.to_string(),
-            data,
-            ts: Utc::now(),
-        };
-
-        // Append + trim in a single lock acquisition
-        {
-            let mut events = log.events.write().await;
-            events.push(event);
-            if events.len() > AGENT_EVENT_LOG_MAX {
-                let drain = events.len() - AGENT_EVENT_LOG_MAX;
-                events.drain(..drain);
-            }
-        }
-
-        event_id
+        // Mint the id, append, and trim atomically (see
+        // [`EventLog::mint_and_push`]).
+        log.mint_and_push(
+            |event_id| LoggedEvent {
+                event_id,
+                run_id,
+                session_id,
+                event_type: event_type.to_string(),
+                data,
+                ts: Utc::now(),
+            },
+            Some(AGENT_EVENT_LOG_MAX),
+        )
+        .await
     }
 
     pub async fn events_from(&self, agent_id: AgentId, from_id: u64) -> Vec<LoggedEvent> {
@@ -360,6 +372,64 @@ mod tests {
         // from_id = id1 + 1 should skip the first event
         let events = mgr.events_from(sid, id1 + 1).await;
         assert_eq!(events.len(), 2);
+    }
+
+    /// #1133 Layer 1 — `log_event` mints the id and appends the event in a
+    /// single critical section, so id-order always equals append-order even
+    /// under concurrent callers. The prior split primitive (`next_event_id()`
+    /// then `append()`) did not: a task could mint a lower id but lose the race
+    /// to push, landing it *after* a higher-id event — a torn id/position pair.
+    ///
+    /// We fire N concurrent `log_event` calls on a multi-threaded runtime so
+    /// the contention is real, then assert:
+    /// (a) the N returned ids are exactly the contiguous permutation `1..=N`
+    ///     (no double-mint, skip, or duplicate), and
+    /// (b) reading the log back in storage order yields the same `1..=N` — i.e.
+    ///     position == id, the no-torn invariant.
+    ///
+    /// Deterministic: it asserts a structural property that holds for EVERY
+    /// interleaving, not a particular ordering of two racing tasks. With the
+    /// pre-fix split primitives, (b) would be flaky-failing under load.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn log_event_assigns_id_and_position_atomically_under_concurrency() {
+        const N: u64 = 256;
+
+        let mgr = SessionEventLogManager::new();
+        let sid = test_session_id();
+        let rid = test_run_id();
+
+        let mut set = tokio::task::JoinSet::new();
+        for i in 0..N {
+            let mgr = mgr.clone();
+            set.spawn(async move {
+                mgr.log_event(sid, rid, "reasoning_delta", serde_json::json!({ "seq": i }))
+                    .await
+            });
+        }
+
+        let mut returned_ids = Vec::with_capacity(N as usize);
+        while let Some(res) = set.join_next().await {
+            returned_ids.push(res.expect("log_event task must not panic"));
+        }
+
+        // (a) The returned ids are exactly the contiguous permutation 1..=N.
+        returned_ids.sort_unstable();
+        let expected: Vec<u64> = (1..=N).collect();
+        assert_eq!(
+            returned_ids, expected,
+            "the N returned ids must be the contiguous permutation 1..=N — no \
+             id double-minted, skipped, or duplicated under concurrency"
+        );
+
+        // (b) Stored order == id order: positions and ids never tore apart.
+        let stored = mgr.events_from(sid, 0).await;
+        assert_eq!(stored.len(), N as usize, "every event must be persisted");
+        let stored_ids: Vec<u64> = stored.iter().map(|e| e.event_id).collect();
+        assert_eq!(
+            stored_ids, expected,
+            "events must appear in the log in strictly increasing id order — \
+             id-order == append-order is the atomicity invariant Layer 1 adds"
+        );
     }
 
     fn test_agent_id() -> AgentId {

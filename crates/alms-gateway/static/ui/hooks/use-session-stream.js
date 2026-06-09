@@ -628,6 +628,19 @@ export function openSessionStream(sessionId, opts) {
             }
             return;
         }
+        // Load-time terminal-scoped dedupe guard (#1133, Layer 3). For a run
+        // whose final-turn reasoning is already sealed into history, its
+        // trailing `reasoning_delta` events replay on stream open and would
+        // double-render. `loadSession` records those run-ids in
+        // `opts.sealedReasoningRunIds` (see its build site for the coverage
+        // gating). Drop the replayed delta before it reaches EITHER sub-branch
+        // below (append-to-tail and new-bubble), so it cannot create a second
+        // unsealed bubble or land on a still-live run's tail. A live run is
+        // never in the set, so its fresh deltas pass through untouched.
+        if (data.run_id && opts && opts.sealedReasoningRunIds
+            && opts.sealedReasoningRunIds.has(data.run_id)) {
+            return;
+        }
         transformMessages(prev => {
             // Drop any transient "thinking" indicator like token_delta does,
             // so the reasoning panel doesn't race with the pre-stream

@@ -285,6 +285,35 @@ pub async fn get_run_tool_calls(
 /// Returns an empty `text` and `last_event_id: null` when the run has no
 /// recorded post-boundary reasoning yet — the client can safely call this
 /// on every reload regardless of run state.
+///
+/// **Terminal runs (#1133):** when `run.status.is_terminal()`, the response
+/// is forced to `{ text: "", last_event_id: null, terminal: true,
+/// seal_event_id: <id|null> }`. Reasoning is sealed onto the run's assistant
+/// message in history, so this endpoint must not re-seed it (double-render)
+/// nor hand back a cursor that could overshoot the run's terminal SSE event
+/// (stuck spinner). The additive `terminal` boolean is authoritative because
+/// empty `text` alone is overloaded: a *live* run with no post-boundary
+/// reasoning this turn also returns empty text + a null cursor. A live run
+/// returns its accumulated `text` / cursor with `terminal: false`.
+///
+/// **`seal_event_id` (#1133 Codex #3 / sub-race B):** the session-event-log
+/// id of this run's terminal SSE event (`run_finished` / `run_cancelled` /
+/// `run_error`), or `null` if none has been logged yet. It is a SEPARATE
+/// field from the `last_event_id` reasoning cursor (which stays `null` on
+/// terminal to avoid overshoot): it is the *coverage anchor* the frontend
+/// uses to decide whether the loaded history already contains this run's
+/// sealed reasoning. The runtime appends the final assistant message
+/// (carrying `reasoning_blocks`) STRICTLY BEFORE the gateway flips the run
+/// terminal and broadcasts the terminal event (`append_message` →
+/// `mark_run_as_completed` → `send_event(run_finished)` in `execute_run`),
+/// with no history mutation in between, and the messages-GET samples its
+/// high-water mark in the same id space just before reading history. So
+/// `history_hwm >= seal_event_id` ⟺ the history read ran after the seal ⟺
+/// the sealed reasoning is present. The frontend gates its load-time
+/// `reasoning_delta` suppress-set on that comparison: deduped against the
+/// sealed bubble when history covers it (sub-race A), left to replay-and-
+/// render when it does not (sub-race B — messages-GET resolved before the
+/// seal landed).
 #[instrument(level = "info", skip(state), fields(run_id = %run_id.0))]
 pub async fn get_run_reasoning(
     State(state): State<AppState>,
@@ -316,9 +345,27 @@ pub async fn get_run_reasoning(
     // cancelled mid-call) still moves the boundary correctly — the
     // unfinished turn's reasoning is by definition older than the next
     // delta that would belong to a fresh turn.
+    //
+    // The same pass also records the run's seal anchor — the terminal SSE
+    // event's id (see the `seal_event_id` doc-comment rationale). We take the
+    // *minimum* terminal id, since the first terminal event is when the seal
+    // landed; there is normally exactly one (#1046/#1052 gate the cancel-vs-
+    // completion duplicate), so min == max in practice.
     let mut latest_turn_boundary: Option<u64> = None;
+    let mut seal_event_id: Option<u64> = None;
     for ev in &events {
         if ev.run_id != run_id {
+            continue;
+        }
+        if matches!(
+            ev.event_type.as_str(),
+            "run_finished" | "run_cancelled" | "run_error"
+        ) {
+            seal_event_id = Some(
+                seal_event_id
+                    .map(|s| s.min(ev.event_id))
+                    .unwrap_or(ev.event_id),
+            );
             continue;
         }
         if ev.event_type != "tool_start" && ev.event_type != "tool_end" {
@@ -377,10 +424,46 @@ pub async fn get_run_reasoning(
         last_event_id = Some(ev.event_id);
     }
 
+    // Terminal-run seal (#1133 / A3-1). `reasoning_delta` events are
+    // non-ephemeral, so unlike `get_run_text` (whose in-memory buffer is
+    // evicted on terminal transition) this endpoint would otherwise keep
+    // serving a completed run's final-turn reasoning from the durable event
+    // log, double-rendering it on top of the sealed assistant bubble; and any
+    // non-null cursor risks the client overshooting the terminal event (on the
+    // HTTP-cancel path a trailing delta can even outrank `run_cancelled`),
+    // leaving the spinner stuck. So for a terminal run we blank the text and
+    // null the cursor; see the doc comment for why `terminal` (not empty-text)
+    // is the authoritative signal the frontend keys off.
+    //
+    // Re-fetch the run status AFTER the `session_events_from` await (#1133 C1).
+    // The `run` snapshot was cloned before that in-memory await; if the run
+    // terminalizes *during* the await window the stale snapshot still reads
+    // `Running`, and we'd seal `terminal:false` with a live cursor — the exact
+    // A3-1 double-render the seal prevents, inside a narrow race. `get_run` is
+    // a cheap synchronous DashMap clone. If the run was evicted between the two
+    // lookups (`None`), fall back to the pre-await snapshot's status — the
+    // worst case is the same window we already tolerated before this fix.
+    let terminal = state
+        .run_manager
+        .get_run(run_id)
+        .map(|fresh| fresh.status)
+        .unwrap_or(run.status)
+        .is_terminal();
+    if terminal {
+        text.clear();
+        last_event_id = None;
+    } else {
+        // The seal anchor is meaningful only for a terminal run; a live run is
+        // never added to the frontend suppress-set, so do not advertise one.
+        seal_event_id = None;
+    }
+
     Ok(Json(serde_json::json!({
         "run_id": run_id.0.to_string(),
         "text": text,
         "last_event_id": last_event_id,
+        "terminal": terminal,
+        "seal_event_id": seal_event_id,
     })))
 }
 
