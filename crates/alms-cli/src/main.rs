@@ -3,6 +3,7 @@ mod cmd_auth;
 mod cmd_job;
 mod cmd_run;
 mod cmd_session;
+mod cmd_shell_host;
 mod helpers;
 
 use cmd_agent::AgentCommands;
@@ -71,6 +72,13 @@ enum Commands {
         /// Shell to generate completions for
         shell: Shell,
     },
+    /// Internal shell host (#1143, Phase 2 of #1121) — evaluates a bash
+    /// command read from stdin via the embedded brush interpreter and
+    /// exits with the command's exit code. Spawned by the daemon's shell
+    /// tool when `[tools].shell_engine = "builtin"`; hidden because it is
+    /// an implementation detail, not part of the public CLI surface.
+    #[command(hide = true, name = "shell-host")]
+    ShellHost,
     /// Manage sessions
     Session {
         #[command(subcommand)]
@@ -133,6 +141,22 @@ enum Commands {
 async fn main() -> anyhow::Result<()> {
     // Parse CLI args first so we can gate file logging on the Gateway command.
     let cli = Cli::parse();
+
+    // The hidden `shell-host` subcommand (#1143) dispatches before ANY
+    // logging or config initialization: its stdout/stderr ARE the agent
+    // shell command's output streams (piped by the daemon), so nothing
+    // else in this process may write to them. It also must stay cheap —
+    // it is re-exec'd once per shell tool call.
+    if matches!(cli.command, Commands::ShellHost) {
+        let code = cmd_shell_host::run().await;
+        // std::process::exit skips destructors; flush explicitly so no
+        // buffered command output is lost.
+        use std::io::Write;
+        let _ = std::io::stdout().flush();
+        let _ = std::io::stderr().flush();
+        std::process::exit(code);
+    }
+
     let is_gateway = matches!(cli.command, Commands::Gateway { .. });
 
     // Load config early to resolve log directory.
@@ -286,6 +310,10 @@ async fn main() -> anyhow::Result<()> {
         Commands::Completions { shell } => {
             let mut cmd = Cli::command();
             generate(shell, &mut cmd, "alms", &mut std::io::stdout());
+        }
+        Commands::ShellHost => {
+            // Dispatched before logging/config init at the top of main().
+            unreachable!("shell-host is handled before subscriber initialization")
         }
         Commands::Session { cmd, json } => {
             let store = open_db()?;
@@ -471,6 +499,21 @@ mod tests {
         assert!(!buf.is_empty());
         let output = String::from_utf8(buf).unwrap();
         assert!(output.contains("alms"));
+    }
+
+    #[test]
+    fn test_shell_host_subcommand_name_is_pinned() {
+        // The daemon's builtin shell engine spawns `current_exe()` with the
+        // literal argv `["shell-host"]` (alms-sandbox shell/exec.rs, #1143).
+        // This test pins the daemon<->child argv contract: without it, a
+        // rename on either side compiles clean on both and only fails at
+        // runtime in builtin mode (PR #1144 review, S4).
+        let cli =
+            Cli::try_parse_from(["alms", "shell-host"]).expect("`alms shell-host` must parse");
+        assert!(
+            matches!(cli.command, Commands::ShellHost),
+            "`alms shell-host` must resolve to the ShellHost subcommand"
+        );
     }
 
     #[test]

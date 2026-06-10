@@ -22,7 +22,7 @@ pub use types::{
     AnthropicConfig, AuthScheme, ChannelsConfig, ContextConfig, DEFAULT_AGENT_MAX_TOKENS,
     FsEditConfig, GeminiConfig, LlmConfig, LoggingConfig, OpenAiConfig, ProviderEntry,
     ProviderKind, ProviderQuirks, ReasoningEffort, RunSummaryMode, SecurityConfig, ServerConfig,
-    SessionConfig, ShellClassificationMode, ShellPermissions, ShellSpillConfig,
+    SessionConfig, ShellClassificationMode, ShellEngine, ShellPermissions, ShellSpillConfig,
     ToolOutputTruncateConfig, ToolsConfig,
 };
 

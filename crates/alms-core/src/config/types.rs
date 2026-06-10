@@ -1200,6 +1200,32 @@ pub struct ToolsConfig {
     /// of silently spawning the WSL launcher.
     #[serde(default)]
     pub shell_path: Option<PathBuf>,
+    /// Shell execution engine for the `shell` tool (#1143, Phase 2 of
+    /// #1121).
+    ///
+    /// * `"system-bash"` (default) — spawn an external bash resolved via
+    ///   [`shell_path`](Self::shell_path) / built-in discovery. This is
+    ///   byte-for-byte the pre-#1143 behavior.
+    /// * `"builtin"` — re-exec the ALMS binary itself as a hidden
+    ///   `alms shell-host` subcommand, which evaluates the command string
+    ///   with the `brush_core` Rust bash interpreter. No `PATH` or
+    ///   install-location resolution happens at all, so the silent-WSL
+    ///   hazard from #1121 is impossible by construction. The command
+    ///   still runs in a **child process**, so Landlock, timeouts,
+    ///   `kill_on_drop`, env scrubbing, the pwd marker, the
+    ///   destructive-command classifier, and [`ShellPermissions`] all
+    ///   apply unchanged.
+    ///
+    /// `builtin` is opt-in while brush compatibility is validated
+    /// (notably on Windows). Note that brush interprets bash *syntax*
+    /// but does not provide coreutils (`grep`, `sed`, `tail`, ...) —
+    /// external commands are still spawned from `PATH` by the child.
+    ///
+    /// **Config-file-only** (`[tools].shell_engine` in `alms.toml`) —
+    /// like [`shell_path`](Self::shell_path), never mutable via
+    /// `PATCH /settings`.
+    #[serde(default)]
+    pub shell_engine: ShellEngine,
     /// Permission-based allow/deny list for shell commands.
     ///
     /// Regex patterns matched against command strings before execution.
@@ -1270,6 +1296,7 @@ impl Default for ToolsConfig {
             sandbox_root: ".".into(),
             shell_policy: "sandboxed".into(),
             shell_path: None,
+            shell_engine: ShellEngine::default(),
             shell_permissions: ShellPermissions::default(),
             shell_classification_mode: ShellClassificationMode::default(),
             fs_edit: FsEditConfig::default(),
@@ -1305,6 +1332,24 @@ pub struct FsEditConfig {
     ///
     /// Opt-in per agent; never silently on. See issue #755.
     pub fuzzy_match: bool,
+}
+
+/// Shell execution engine for the `shell` tool (#1143, Phase 2 of #1121).
+///
+/// Selects *how* `alms-sandbox` spawns the child process that evaluates a
+/// shell command. Both engines run bash syntax in a sandboxed child; only
+/// the interpreter binary differs. See
+/// [`ToolsConfig::shell_engine`] for the full operator-facing contract.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ShellEngine {
+    /// Spawn an external `bash -c` (Phase 1 resolver from #1140).
+    /// Default — byte-for-byte the pre-#1143 behavior.
+    #[default]
+    SystemBash,
+    /// Re-exec `current_exe()` as `alms shell-host`, evaluating the
+    /// command via the embedded `brush_core` bash interpreter.
+    Builtin,
 }
 
 /// Built-in risk classification policy for the shell tool.

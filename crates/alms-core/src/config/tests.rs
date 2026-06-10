@@ -184,6 +184,31 @@ recent_window = 10
 }
 
 #[test]
+fn test_shell_engine_defaults_to_system_bash() {
+    // #1143: the new engine knob must default to today's behavior so the
+    // feature is strictly additive — no existing deployment changes.
+    let config = AlmsConfig::default();
+    assert_eq!(config.tools.shell_engine, ShellEngine::SystemBash);
+
+    // Absent from TOML → default.
+    let config: AlmsConfig = toml::from_str("[tools]\ntimeout_secs = 10\n").unwrap();
+    assert_eq!(config.tools.shell_engine, ShellEngine::SystemBash);
+}
+
+#[test]
+fn test_shell_engine_parses_from_toml() {
+    // #1143: kebab-case wire values per the issue spec.
+    let config: AlmsConfig = toml::from_str("[tools]\nshell_engine = \"builtin\"\n").unwrap();
+    assert_eq!(config.tools.shell_engine, ShellEngine::Builtin);
+
+    let config: AlmsConfig = toml::from_str("[tools]\nshell_engine = \"system-bash\"\n").unwrap();
+    assert_eq!(config.tools.shell_engine, ShellEngine::SystemBash);
+
+    // Anything else is a hard parse error, not a silent fallback.
+    assert!(toml::from_str::<AlmsConfig>("[tools]\nshell_engine = \"pwsh\"\n").is_err());
+}
+
+#[test]
 fn test_partial_toml() {
     // Only override one section — everything else keeps defaults
     let toml = r#"

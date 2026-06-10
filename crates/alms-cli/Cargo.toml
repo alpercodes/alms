@@ -15,6 +15,11 @@ alms-gateway = { path = "../alms-gateway" }
 alms-session = { path = "../alms-session" }
 
 anyhow.workspace = true
+# Embedded bash interpreter for the hidden `alms shell-host` subcommand
+# (#1143). Deliberately a dependency of alms-cli ONLY — alms-sandbox just
+# re-execs current_exe(), so no other crate gains a brush edge.
+brush-builtins = "0.2.0"
+brush-core = "0.5.0"
 chrono.workspace = true
 cron.workspace = true
 clap.workspace = true

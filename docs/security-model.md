@@ -150,7 +150,7 @@ Expose a `shell_exec` tool that is policy-gated.
 The shell tool's interface is command strings executed via `bash -c`.
 
 Request fields:
-- `command`: shell command string, executed via `bash -c` (on Windows via Git Bash, resolved from well-known install locations or derived from `git.exe` on `PATH`; overridable with the config-file-only `[tools].shell_path` knob. WSL's `System32\bash.exe` launcher is hard-rejected — if no Git Bash is found the tool fails with an actionable error instead of silently executing under WSL)
+- `command`: shell command string, evaluated as bash syntax by a child process. Under the default `system-bash` engine this is `bash -c` (on Windows via Git Bash, resolved from well-known install locations or derived from `git.exe` on `PATH`; overridable with the config-file-only `[tools].shell_path` knob. WSL's `System32\bash.exe` launcher is hard-rejected — if no Git Bash is found the tool fails with an actionable error instead of silently executing under WSL). See [§ 4.2a](#42a-shell-engines-shell_engine) for the opt-in `builtin` engine
 - `description`: brief description of what the command does (for audit logging)
 - `timeout_ms`: timeout in milliseconds (default 120000, max 600000)
 - `run_in_background`: when `true`, returns a task_id immediately; use `check_task` to poll results
@@ -169,6 +169,67 @@ Response fields:
 - `exit_code`
 - `stdout` (truncated to 30KB with head+tail line preservation)
 - `stderr` (truncated to 30KB with head+tail line preservation)
+
+<a id="42a-shell-engines-shell_engine"></a>
+### 4.2a Shell engines (`[tools].shell_engine`, #1143)
+
+The config-file-only `shell_engine` knob selects *which* bash-syntax
+interpreter evaluates the command. It is not mutable via
+`PATCH /settings` and has no env-var override; the active engine is
+logged at boot at `target = "alms.security"`.
+
+- **`system-bash` (default)** — `bash -c <command>` against the system
+  bash resolved as described in [§ 4.2](#42-minimal-contract-for-shell-renamed-from-shell_exec).
+  Pre-#1143 behavior, unchanged.
+- **`builtin` (opt-in, experimental)** — the daemon re-execs its **own
+  binary** (`std::env::current_exe()`, zero `PATH` or install-location
+  resolution) as the hidden `alms shell-host` subcommand, which
+  evaluates the command via the embedded `brush_core` Rust bash
+  interpreter. The command string travels over the child's **stdin**
+  (read to EOF before evaluation), not argv, sidestepping platform
+  quoting rules and command-line length limits. The host dispatches
+  before any logging/config/DB initialization — it never loads
+  `alms.toml`, never opens the database, and never touches auth state.
+  Profile and rc loading are explicitly skipped, so behavior can never
+  depend on operator dotfiles.
+
+Security posture of `builtin` relative to `system-bash`:
+
+- **Still a child process.** Landlock `pre_exec`, `kill_on_drop`, the
+  operator timeout (a single deadline covering both the stdin write and
+  the wait — a child that never drains its stdin is still killed at the
+  deadline), env scrubbing (`env_clear()` + secret filter:
+  `ALMS_AUTH_TOKEN`, `ALMS_MASTER_KEY`, and provider API keys never
+  reach the child), the pwd-marker wrapper, the destructive-command
+  classifier, and `shell_permissions` all apply unchanged — zero delta
+  vs. `system-bash`.
+- **Landlock grant on the ALMS binary (Linux).** For the re-exec'd
+  child to start under Landlock, the ruleset adds a **file-scoped**
+  `PathBeneath` grant (read + execute) on the ALMS binary itself — the
+  binary's file fd, not its parent directory, with the same rights the
+  ruleset already grants to all of `/usr`. On a standard
+  `/usr/local/bin/alms` install the binary was *already* exec-able
+  inside the sandbox under the `/usr` grant, so this is **not a new
+  access class** — it is parity for layouts where the binary lives
+  elsewhere (e.g. `target/debug`, `~/bin`). The grant is added only
+  when `shell_engine = "builtin"`; under `system-bash` the ruleset is
+  byte-identical to before. The binary is not setuid, and any nested
+  ALMS invocation from inside the sandbox inherits the Landlock domain
+  (Landlock propagates across fork/execve), so it stays fs-confined.
+- **No bundled coreutils.** brush interprets bash *syntax* only —
+  `grep`/`sed`/`awk`/`tail`/... remain external commands the shell
+  spawns from `PATH` like any bash would. On Windows without Git's
+  `usr/bin` on `PATH`, those externals may be missing entirely:
+  `builtin` removes the bash-*resolution* dependency, not the coreutils
+  dependency.
+- **Exit code 126 = host failure.** When the shell host itself fails
+  (cannot read the command from stdin, interpreter construction fails),
+  it exits with 126 — the POSIX "command invoked cannot execute"
+  convention — and an `alms shell-host:`-prefixed stderr diagnostic. A
+  user command that itself exits 126 ("found but not executable") is
+  distinguished by the absence of that stderr prefix. Host failure also
+  emits no pwd marker, so the persistent cwd is never corrupted by a
+  failed host.
 
 <a id="43-configurable-shell-permissions-shell_permissions"></a>
 ### 4.3 Configurable shell permissions (`shell_permissions`)

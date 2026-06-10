@@ -8,6 +8,7 @@ use super::security::{command_matches_denylist, is_secret_env_var, platform_crit
 use super::spill::{ShellSpillPolicy, write_spill};
 use super::types::{MAX_OUTPUT_BYTES, ShellInput, ShellOutput, ShellState};
 use crate::{SandboxError, error::SandboxResult};
+use alms_core::config::ShellEngine;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use tracing::{debug, error, info, instrument, warn};
@@ -92,13 +93,13 @@ pub(crate) async fn execute_command(
     }
 
     // Build and spawn the command
-    let mut cmd = build_command(command, &cwd, sandbox_root, unrestricted, pwd_marker)?;
+    let PreparedCommand {
+        mut cmd,
+        stdin_payload,
+    } = build_command(command, &cwd, sandbox_root, unrestricted, pwd_marker)?;
 
     // Configure environment
     configure_env(&mut cmd, default_env);
-
-    // Set timeout
-    let timeout = std::time::Duration::from_millis(input.timeout_ms);
 
     debug!(
         command = %command,
@@ -111,15 +112,7 @@ pub(crate) async fn execute_command(
         .spawn()
         .map_err(|e| SandboxError::Io(format!("Failed to spawn command: {e}")))?;
 
-    let result = tokio::time::timeout(timeout, child.wait_with_output())
-        .await
-        .map_err(|_| {
-            SandboxError::Io(format!(
-                "Process timed out after {}s",
-                input.timeout_ms / 1000
-            ))
-        })?
-        .map_err(|e| SandboxError::Io(format!("Process error: {e}")))?;
+    let result = drive_child_to_completion(child, stdin_payload, input.timeout_ms).await?;
 
     let exit_code = result.status.code().unwrap_or(-1);
 
@@ -210,37 +203,175 @@ pub(crate) async fn execute_command(
     })
 }
 
+/// Feed `stdin_payload` (builtin engine, #1143) to a spawned child and wait
+/// for it to exit, with **one** operator deadline covering the whole
+/// interaction.
+///
+/// The stdin write must sit inside the same `tokio::time::timeout` as
+/// `wait_with_output` (PR #1144 review, S1): if the payload exceeds the OS
+/// pipe buffer (~64 KiB — agents do emit large heredocs) and the child never
+/// drains its stdin (hung child, AV-suspended process, version-skewed binary
+/// on disk after an in-place upgrade), `write_all` would otherwise block
+/// forever *outside* the timeout that is supposed to be the hard backstop
+/// against exactly this kind of pathological child. On deadline expiry the
+/// interaction future is dropped, dropping `child` with it — and
+/// `kill_on_drop(true)` (set in `build_command`) reaps the process.
+async fn drive_child_to_completion(
+    mut child: tokio::process::Child,
+    stdin_payload: Option<String>,
+    timeout_ms: u64,
+) -> SandboxResult<std::process::Output> {
+    let timeout = std::time::Duration::from_millis(timeout_ms);
+
+    // Take the stdin handle eagerly so a missing-handle bug surfaces as its
+    // own error rather than masquerading as a timeout.
+    let stdin = match &stdin_payload {
+        Some(_) => Some(child.stdin.take().ok_or_else(|| {
+            SandboxError::Io("shell-host child has no stdin handle to receive the command".into())
+        })?),
+        None => None,
+    };
+
+    let interaction = async move {
+        // Builtin engine (#1143): the wrapped command travels over the
+        // child's stdin instead of argv, sidestepping platform quoting and
+        // command-line length limits. The shell-host child reads stdin to
+        // EOF before evaluating, so closing the handle (shutdown + drop at
+        // the end of this block) is what releases it.
+        if let (Some(payload), Some(mut stdin)) = (stdin_payload, stdin) {
+            use tokio::io::AsyncWriteExt;
+            stdin.write_all(payload.as_bytes()).await.map_err(|e| {
+                SandboxError::Io(format!("Failed to send command to shell host: {e}"))
+            })?;
+            stdin
+                .shutdown()
+                .await
+                .map_err(|e| SandboxError::Io(format!("Failed to close shell host stdin: {e}")))?;
+            // `stdin` drops here, closing the pipe and releasing the host.
+        }
+
+        child
+            .wait_with_output()
+            .await
+            .map_err(|e| SandboxError::Io(format!("Process error: {e}")))
+    };
+
+    tokio::time::timeout(timeout, interaction)
+        .await
+        .map_err(|_| SandboxError::Io(format!("Process timed out after {}s", timeout_ms / 1000)))?
+}
+
+/// A command ready to spawn, plus the bytes (if any) that must be written
+/// to its stdin and then closed before waiting on it.
+///
+/// `stdin_payload` is `Some` only for the `builtin` shell engine (#1143),
+/// where the wrapped command string travels over stdin to the re-exec'd
+/// `alms shell-host` child instead of argv.
+struct PreparedCommand {
+    cmd: tokio::process::Command,
+    stdin_payload: Option<String>,
+}
+
 /// Build the tokio Command for execution.
 ///
-/// Wraps the command with `bash -c` on all platforms. On Unix, `bash` is
-/// resolved from `PATH` by the OS as before. On Windows, Git Bash is
-/// resolved via [`resolve_shell_binary`]: the operator's `[tools].shell_path`
-/// override wins when set; otherwise well-known Git-for-Windows install
-/// locations are probed, then candidates derived from the location of
-/// `git.exe` on `PATH`. WSL's `C:\Windows\System32\bash.exe` launcher is
-/// never an acceptable interpreter — when nothing resolves, the command
-/// fails with an actionable error instead of silently executing inside WSL
-/// (#1121). We use bash (not `cmd /c`) because the pwd marker, exit code
-/// capture, and shell syntax all assume POSIX semantics.
+/// The command string is wrapped with the pwd marker and handed to a
+/// bash-syntax interpreter running in a **child process**. Which
+/// interpreter depends on the `[tools].shell_engine` knob (#1143):
+///
+/// * `system-bash` (default) — `bash -c <wrapped>`. On Unix, `bash` is
+///   resolved from `PATH` by the OS as before. On Windows, Git Bash is
+///   resolved via [`resolve_shell_binary`]: the operator's
+///   `[tools].shell_path` override wins when set; otherwise well-known
+///   Git-for-Windows install locations are probed, then candidates derived
+///   from the location of `git.exe` on `PATH`. WSL's
+///   `C:\Windows\System32\bash.exe` launcher is never an acceptable
+///   interpreter — when nothing resolves, the command fails with an
+///   actionable error instead of silently executing inside WSL (#1121).
+/// * `builtin` — re-exec `std::env::current_exe()` as the hidden
+///   `alms shell-host` subcommand, which evaluates the wrapped command via
+///   the embedded `brush_core` bash interpreter. Zero `PATH` resolution.
+///   The wrapped command is piped over stdin (see [`PreparedCommand`]).
+///
+/// We use bash syntax (not `cmd /c` / PowerShell) in both engines because
+/// the pwd marker, exit code capture, the destructive-command classifier,
+/// and operator `shell_permissions` regexes all assume POSIX semantics.
 ///
 /// On Linux 5.13+ with a sandbox root configured, Landlock filesystem
 /// restrictions are applied via `pre_exec` so the child process can only
-/// access files within the sandbox root.
+/// access files within the sandbox root — identically for both engines.
 fn build_command(
     command: &str,
     cwd: &Path,
     sandbox_root: Option<&Path>,
     unrestricted: bool,
     pwd_marker: &str,
-) -> SandboxResult<tokio::process::Command> {
+) -> SandboxResult<PreparedCommand> {
+    build_command_for_engine(
+        shell_engine(),
+        command,
+        cwd,
+        sandbox_root,
+        unrestricted,
+        pwd_marker,
+    )
+}
+
+/// Engine-parameterized core of [`build_command`].
+///
+/// Split out so unit tests can exercise both engines without mutating the
+/// process-global [`SHELL_ENGINE`] state.
+fn build_command_for_engine(
+    engine: ShellEngine,
+    command: &str,
+    cwd: &Path,
+    sandbox_root: Option<&Path>,
+    unrestricted: bool,
+    pwd_marker: &str,
+) -> SandboxResult<PreparedCommand> {
     let wrapped = wrap_command_with_pwd_marker(command, pwd_marker);
 
-    let bash_bin = resolve_shell_binary().map_err(SandboxError::Io)?;
+    // Extra paths the Landlock sandbox must keep readable+executable for
+    // the child to start at all. Empty for system-bash (bash lives under
+    // the always-granted system paths); for builtin it carries the ALMS
+    // binary itself, which may live anywhere (e.g. ~/bin, target/debug).
+    let mut extra_landlock_exec_paths: Vec<PathBuf> = Vec::new();
 
-    let mut cmd = tokio::process::Command::new(bash_bin);
-    cmd.arg("-c");
-    cmd.arg(&wrapped);
+    let mut prepared = match engine {
+        ShellEngine::SystemBash => {
+            let bash_bin = resolve_shell_binary().map_err(SandboxError::Io)?;
 
+            let mut cmd = tokio::process::Command::new(bash_bin);
+            cmd.arg("-c");
+            cmd.arg(&wrapped);
+            PreparedCommand {
+                cmd,
+                stdin_payload: None,
+            }
+        }
+        ShellEngine::Builtin => {
+            // Re-exec our own binary — deterministic by construction, no
+            // PATH or install-location resolution anywhere (#1143).
+            let exe = std::env::current_exe().map_err(|e| {
+                SandboxError::Io(format!(
+                    "shell_engine = \"builtin\": cannot determine the current \
+                     executable to re-exec as `alms shell-host`: {e}"
+                ))
+            })?;
+            extra_landlock_exec_paths.push(exe.clone());
+
+            let mut cmd = tokio::process::Command::new(exe);
+            cmd.arg("shell-host");
+            // The command string travels over stdin, not argv (quoting and
+            // command-line length limits). stdout/stderr stay piped below.
+            cmd.stdin(std::process::Stdio::piped());
+            PreparedCommand {
+                cmd,
+                stdin_payload: Some(wrapped),
+            }
+        }
+    };
+
+    let cmd = &mut prepared.cmd;
     cmd.current_dir(cwd);
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
@@ -249,7 +380,7 @@ fn build_command(
     // Apply Landlock filesystem sandboxing on Linux when a sandbox root is configured
     #[cfg(target_os = "linux")]
     if !unrestricted && let Some(root) = sandbox_root {
-        apply_landlock_sandbox(&mut cmd, root);
+        apply_landlock_sandbox(cmd, root, &extra_landlock_exec_paths);
     }
 
     // Suppress unused variable warnings on non-Linux platforms
@@ -257,9 +388,10 @@ fn build_command(
     {
         let _ = sandbox_root;
         let _ = unrestricted;
+        let _ = &extra_landlock_exec_paths;
     }
 
-    Ok(cmd)
+    Ok(prepared)
 }
 
 // ---------------------------------------------------------------------------
@@ -276,14 +408,24 @@ fn shell_path_override() -> Option<&'static Path> {
     SHELL_PATH_OVERRIDE.get().and_then(|o| o.as_deref())
 }
 
-/// Install the operator's `[tools].shell_path` override (if any) and log the
-/// resolved shell interpreter once at `target = "alms.security"`.
+/// Operator-selected `[tools].shell_engine` (#1143), installed once at boot
+/// via [`init_shell_resolution`]. Library users that never call init get
+/// the default (`SystemBash`) — identical to pre-#1143 behavior.
+static SHELL_ENGINE: std::sync::OnceLock<ShellEngine> = std::sync::OnceLock::new();
+
+fn shell_engine() -> ShellEngine {
+    SHELL_ENGINE.get().copied().unwrap_or_default()
+}
+
+/// Install the operator's `[tools].shell_path` override (if any) plus the
+/// `[tools].shell_engine` selection (#1143), and log the resolved shell
+/// interpreter once at `target = "alms.security"`.
 ///
 /// Called by the gateway at boot so operators learn the active shell before
 /// the first agent run — not from garbled tool output. Idempotent: the first
 /// call wins; a later call with a *different* value logs a WARN and keeps
 /// the original.
-pub fn init_shell_resolution(shell_path: Option<PathBuf>) {
+pub fn init_shell_resolution(shell_path: Option<PathBuf>, engine: ShellEngine) {
     if SHELL_PATH_OVERRIDE.set(shell_path.clone()).is_err()
         && shell_path_override() != shell_path.as_deref()
     {
@@ -294,17 +436,49 @@ pub fn init_shell_resolution(shell_path: Option<PathBuf>) {
             shell_path_override()
         );
     }
-    match resolve_shell_binary() {
-        Ok(path) => info!(
+    if SHELL_ENGINE.set(engine).is_err() && shell_engine() != engine {
+        warn!(
             target: "alms.security",
-            shell_path = %path.display(),
-            override_set = shell_path_override().is_some(),
-            "shell tool: commands will execute via this interpreter"
-        ),
-        Err(msg) => warn!(
-            target: "alms.security",
-            "shell tool: no usable shell interpreter found — shell commands will fail: {msg}"
-        ),
+            "init_shell_resolution called again with a different [tools].shell_engine; \
+             keeping the first value: {:?}",
+            shell_engine()
+        );
+    }
+    match shell_engine() {
+        ShellEngine::Builtin => {
+            if shell_path_override().is_some() {
+                warn!(
+                    target: "alms.security",
+                    "[tools].shell_path is set but [tools].shell_engine = \"builtin\" \
+                     never resolves an external shell — the override is ignored"
+                );
+            }
+            match std::env::current_exe() {
+                Ok(exe) => info!(
+                    target: "alms.security",
+                    host_binary = %exe.display(),
+                    "shell tool: builtin engine — commands run via re-exec'd \
+                     `alms shell-host` (embedded brush bash interpreter)"
+                ),
+                Err(e) => warn!(
+                    target: "alms.security",
+                    "shell tool: builtin engine selected but current_exe() failed — \
+                     shell commands will fail: {e}"
+                ),
+            }
+        }
+        ShellEngine::SystemBash => match resolve_shell_binary() {
+            Ok(path) => info!(
+                target: "alms.security",
+                shell_path = %path.display(),
+                override_set = shell_path_override().is_some(),
+                "shell tool: commands will execute via this interpreter"
+            ),
+            Err(msg) => warn!(
+                target: "alms.security",
+                "shell tool: no usable shell interpreter found — shell commands will fail: {msg}"
+            ),
+        },
     }
 }
 
@@ -546,8 +720,18 @@ fn find_git_exe_dir_on_path() -> Option<PathBuf> {
 ///
 /// If Landlock is not supported by the running kernel, a warning is logged
 /// and execution continues without filesystem restrictions.
+///
+/// `extra_exec_paths` are granted the same read+execute access as the
+/// standard system paths. The builtin shell engine (#1143) passes the ALMS
+/// binary itself here: the re-exec'd `alms shell-host` child must remain
+/// executable under the ruleset even when the binary lives outside
+/// `/usr`/`/bin`/`/lib` (e.g. `~/bin/alms`, `target/debug/alms`).
 #[cfg(target_os = "linux")]
-fn apply_landlock_sandbox(cmd: &mut tokio::process::Command, sandbox_root: &Path) {
+fn apply_landlock_sandbox(
+    cmd: &mut tokio::process::Command,
+    sandbox_root: &Path,
+    extra_exec_paths: &[PathBuf],
+) {
     // Canonicalize the sandbox root so the Landlock rules match real paths.
     // If canonicalization fails (dir doesn't exist yet), fall back to the
     // provided path — Landlock will simply deny all access, which is safer
@@ -568,7 +752,7 @@ fn apply_landlock_sandbox(cmd: &mut tokio::process::Command, sandbox_root: &Path
     // names. `~/path` (current user) still works because bash uses `$HOME`
     // for that, which doesn't read /etc/passwd. See `docs/security-model.md`
     // for the full rationale.
-    let system_read_paths: Vec<PathBuf> = vec![
+    let mut system_read_paths: Vec<PathBuf> = vec![
         PathBuf::from("/usr"),
         PathBuf::from("/bin"),
         PathBuf::from("/lib"),
@@ -586,6 +770,7 @@ fn apply_landlock_sandbox(cmd: &mut tokio::process::Command, sandbox_root: &Path
         PathBuf::from("/dev/zero"),
         PathBuf::from("/proc/self"),
     ];
+    system_read_paths.extend_from_slice(extra_exec_paths);
 
     // Clone what we need into the closure (pre_exec runs after fork, before exec)
     let root_for_closure = canonical_root.clone();
@@ -1050,9 +1235,12 @@ mod tests {
     fn test_build_command_wraps_with_bash() {
         let dir = tempfile::tempdir().unwrap();
         let cwd = dir.path();
-        let cmd = build_command("echo hello", cwd, None, true, TEST_MARKER).unwrap();
+        let prepared = build_command("echo hello", cwd, None, true, TEST_MARKER).unwrap();
+        // Default engine (system-bash) carries no stdin payload — the
+        // wrapped command rides argv exactly as pre-#1143.
+        assert!(prepared.stdin_payload.is_none());
         // The command should be a bash process
-        let inner = cmd.as_std();
+        let inner = prepared.cmd.as_std();
         #[cfg(unix)]
         assert_eq!(inner.get_program(), "bash");
         #[cfg(windows)]
@@ -1076,6 +1264,99 @@ mod tests {
         let wrapped = args[1].to_str().unwrap();
         assert!(wrapped.contains("echo hello"));
         assert!(wrapped.contains(TEST_MARKER));
+    }
+
+    // ── Builtin shell engine (#1143) ──────────────────────────────────────
+    //
+    // These exercise `build_command_for_engine` directly with an explicit
+    // engine so the process-global `SHELL_ENGINE` OnceLock is never
+    // mutated (tests share one process). The full spawn path cannot be
+    // unit-tested end-to-end here because `current_exe()` inside `cargo
+    // test` is the *test* binary, not `alms` — covering that path is the
+    // documented validation follow-up on #1143.
+
+    #[test]
+    fn test_build_command_builtin_reexecs_current_exe() {
+        let dir = tempfile::tempdir().unwrap();
+        let prepared = build_command_for_engine(
+            ShellEngine::Builtin,
+            "echo hello",
+            dir.path(),
+            None,
+            true,
+            TEST_MARKER,
+        )
+        .unwrap();
+
+        let inner = prepared.cmd.as_std();
+        // Zero PATH resolution: the program must be exactly current_exe().
+        assert_eq!(
+            PathBuf::from(inner.get_program()),
+            std::env::current_exe().unwrap()
+        );
+        // Single argv entry: the hidden subcommand. The command string is
+        // NOT on argv...
+        let args: Vec<_> = inner.get_args().collect();
+        assert_eq!(args, ["shell-host"]);
+        // ...it travels via stdin, wrapped with the pwd marker exactly
+        // like the bash -c path.
+        let payload = prepared
+            .stdin_payload
+            .expect("builtin engine pipes the command");
+        assert_eq!(
+            payload,
+            wrap_command_with_pwd_marker("echo hello", TEST_MARKER)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_stdin_write_is_covered_by_operator_timeout() {
+        // S1 (PR #1144 review): a child that never drains its stdin must not
+        // let the stdin write block past the operator deadline. The payload
+        // is far larger than any OS pipe buffer (~64 KiB), so `write_all`
+        // genuinely blocks once the buffer fills — the single timeout around
+        // the whole interaction is what gets us out, and `kill_on_drop`
+        // reaps the child when the interaction future is dropped.
+        let mut cmd = if cfg!(windows) {
+            // `ping -n 30` keeps stdin open without reading it for ~29s.
+            let mut c = tokio::process::Command::new("ping");
+            c.args(["-n", "30", "127.0.0.1"]);
+            c
+        } else {
+            let mut c = tokio::process::Command::new("sleep");
+            c.arg("30");
+            c
+        };
+        cmd.stdin(std::process::Stdio::piped());
+        cmd.stdout(std::process::Stdio::piped());
+        cmd.stderr(std::process::Stdio::piped());
+        cmd.kill_on_drop(true);
+
+        let child = cmd.spawn().expect("spawn non-draining child");
+        // 4 MiB — far beyond any platform's pipe buffer.
+        let payload = "x".repeat(4 * 1024 * 1024);
+
+        let started = std::time::Instant::now();
+        let result = drive_child_to_completion(child, Some(payload), 1_000).await;
+        let elapsed = started.elapsed();
+
+        let err = result.expect_err("write to a non-draining child must time out");
+        assert!(
+            err.to_string().contains("timed out"),
+            "expected the operator-timeout error, got: {err}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(15),
+            "timeout must fire at the deadline, not at child exit: {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn test_build_command_engine_dispatch_default_is_system_bash() {
+        // Without init_shell_resolution ever being called (library users,
+        // tests), the engine must default to system-bash — the additive
+        // guarantee of #1143.
+        assert_eq!(shell_engine(), ShellEngine::SystemBash);
     }
 
     // ── Shell binary resolution (#1121) ──────────────────────────────────
