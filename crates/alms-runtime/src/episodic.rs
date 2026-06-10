@@ -238,12 +238,13 @@ pub struct PersistSummaryRequest {
 /// (if any), generates a new one, and upserts it to the database.  All errors
 /// are logged and swallowed -- summary failure must never fail the run.
 ///
-/// **Known race condition:** Two concurrent runs for the same session can both
-/// load the same base summary, generate independently, and the last writer
-/// wins -- one update is silently lost.  This mirrors the existing within-run
-/// rolling-summary race and is acceptable for MVP because concurrent runs on
-/// the same session are rare.  A future fix could add optimistic locking
-/// (check `last_run_id` before upsert, retry on conflict).
+/// **Concurrent runs** on the same session are reconciled via optimistic
+/// locking on the `last_run_id` sentinel (#1123).  The upsert only commits if
+/// the stored `last_run_id` still matches the one observed when the base
+/// summary was loaded; on conflict the summary is regenerated from the
+/// reloaded base and the upsert is retried with exponential backoff (up to 3
+/// attempts).  Exhausting the retries logs an `error!` and drops the update
+/// rather than failing the run.
 #[instrument(
     level = "info",
     skip(session_manager, llm, req),
