@@ -993,6 +993,19 @@ or
 Note:
 - The run event stream should emit `approval_required` and then later `tool_start` once approved.
 
+**Deny semantics (#1109)** — denial means "stop", not a soft tool error:
+- The denied run terminates: the runtime records a
+  `{"user_denied": true, "message": ...}` tool result (distinct from the
+  `{"error": ...}` shape used for real tool failures), then the run goes
+  to `cancelled` (not `failed`) and emits `run_cancelled`.
+- Runs still `Queued` on the same session are also cancelled (status
+  `cancelled` + `run_cancelled` event each) so they don't auto-start when
+  the per-agent queue advances. A queued run whose cancel token is not
+  yet registered (the brief `POST /runs` insert-to-register window) is
+  skipped and left `Queued` — it will run normally (see #1142 for the
+  structural fix).
+- Queued runs on *other* sessions are untouched.
+
 ---
 
 ## 7) Jobs / cron (MVP+ but should be designed now)

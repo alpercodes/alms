@@ -589,16 +589,32 @@ async fn test_denied_approval_appends_deny_audit_entry() {
 
     deny_handler.await.unwrap();
 
-    // The loop must surface a tool-execution error mentioning the denial.
+    // #1109: the deny path returns the distinct `user_denied` result body
+    // (NOT an `Err` and NOT the `{"error": ...}` shape used by real tool
+    // runtime errors) so the persisted row and the next run's context
+    // rebuild carry an unambiguous user-policy signal.
     match &result {
-        Err(AlmsError::ToolExecution(msg)) => {
+        Ok(value) => {
+            assert_eq!(
+                value.get("user_denied").and_then(|v| v.as_bool()),
+                Some(true),
+                "expected user_denied: true in denial result, got {:?}",
+                value
+            );
+            assert_eq!(
+                value.get("message").and_then(|v| v.as_str()),
+                Some(crate::agent::loop_impl::USER_DENIED_MESSAGE),
+                "expected the concise denial gloss, got {:?}",
+                value
+            );
             assert!(
-                msg.contains("denied by user"),
-                "expected denial reason in error, got {:?}",
-                msg
+                value.get("error").is_none(),
+                "denial body must not collide with the `error` shape used \
+                 by real tool errors, got {:?}",
+                value
             );
         }
-        other => panic!("expected ToolExecution(denied by user), got {:?}", other),
+        other => panic!("expected Ok(user_denied result), got {:?}", other),
     }
 
     // The audit log must contain exactly one entry: a `Deny` decision for
@@ -645,6 +661,165 @@ async fn test_denied_approval_appends_deny_audit_entry() {
             .iter()
             .any(|e| matches!(e.decision, AuditDecision::Allow)),
         "denied call must not produce an Allow audit entry"
+    );
+}
+
+/// Regression test for #1109: a user denial must behave like a cancel,
+/// not a retryable tool error.
+///
+/// Denies the first approval of a two-tool Guarded batch with a live
+/// cancel token: the batch must unwind with `Err(Cancelled)`, the second
+/// tool must never prompt, the denied tool's `ToolEnd` must carry the
+/// `user_denied` body, and the denial must reach the per-run records via
+/// the cancel-unwind persistence pass (#1090) so the next run's rebuild
+/// replays it instead of an `INTERRUPTED_TOOL_RESULT` marker.
+#[tokio::test]
+async fn test_denied_approval_cancels_run_and_stops_batch() {
+    use tokio_util::sync::CancellationToken;
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<RuntimeEvent>();
+    let llm_config = LlmConfig {
+        mock: true,
+        ..LlmConfig::default()
+    };
+    // `math` is NOT auto-approved, so the approval gate fires.
+    let tools =
+        crate::tools::ToolRegistry::with_builtins_sandboxed(None, true, &["math".to_string()]);
+    let session_config = SessionConfig::default();
+    let session_manager = SessionManager::new(session_config);
+    let agent_id = AgentId::new();
+    let session = session_manager.get_or_create(agent_id, "test");
+    let cancel_token = CancellationToken::new();
+
+    let runtime = AgentRuntime {
+        agent_id,
+        config: AgentConfig {
+            posture: Posture::Guarded,
+            ..AgentConfig::default()
+        },
+        llm: LlmClient::new(llm_config).unwrap(),
+        summary_llm: None,
+        tools,
+        workspace: None,
+        event_sender: Some(tx),
+        run_id: None,
+        cancel_token: Some(cancel_token.clone()),
+        resolved_sandbox_root: None,
+        shell_unrestricted: true,
+        shell_default_env: std::collections::HashMap::new(),
+        shell_permissions: alms_core::config::ShellPermissions::default(),
+        shell_classification_mode: alms_core::config::ShellClassificationMode::default(),
+        shell_spill_policy: alms_sandbox::shell::spill::ShellSpillPolicy::disabled(),
+        tool_output_truncate_policy:
+            crate::tool_output_truncate::ToolOutputTruncatePolicy::disabled(),
+        extra_fs_read_roots: Vec::new(),
+        agent_name: None,
+    };
+
+    let tool_calls = vec![
+        ToolCall::new("tc-deny-1", "math", r#"{"operation":"add","a":1,"b":2}"#),
+        ToolCall::new("tc-deny-2", "math", r#"{"operation":"add","a":3,"b":4}"#),
+    ];
+    let invocation_ids = vec![uuid::Uuid::new_v4(), uuid::Uuid::new_v4()];
+
+    // Deny every approval that arrives; count them and capture ToolEnds.
+    let handler = tokio::spawn(async move {
+        let mut approval_count = 0u32;
+        let mut tool_ends: Vec<(bool, serde_json::Value)> = Vec::new();
+        while let Some(event) = rx.recv().await {
+            match event {
+                RuntimeEvent::ApprovalRequired { decision_tx, .. } => {
+                    approval_count += 1;
+                    let _ = decision_tx.send(false);
+                }
+                RuntimeEvent::ToolEnd { ok, result, .. } => {
+                    tool_ends.push((ok, result));
+                }
+                _ => {}
+            }
+        }
+        (approval_count, tool_ends)
+    });
+
+    let mut tool_call_records: Vec<alms_core::ToolCallRecord> = Vec::new();
+    let mut tool_seq: u32 = 0;
+    let result = runtime
+        .run_tool_calls(
+            &tool_calls,
+            &invocation_ids,
+            &[],
+            &session_manager,
+            session.id,
+            false,
+            &mut tool_call_records,
+            &mut tool_seq,
+        )
+        .await;
+
+    // (1) Denial unwinds the batch through the cancel path.
+    assert!(
+        matches!(result, Err(AlmsError::Cancelled)),
+        "expected Err(Cancelled) after deny, got {:?}",
+        result
+    );
+    assert!(
+        cancel_token.is_cancelled(),
+        "deny must cancel the run's own token so the gateway terminal \
+         arm drives the run to `cancelled`"
+    );
+
+    drop(runtime);
+    let (approval_count, tool_ends) = handler.await.unwrap();
+
+    // (2) The second tool never fired its approval gate.
+    assert_eq!(
+        approval_count, 1,
+        "denial must stop the batch before the next tool prompts"
+    );
+
+    // (3) Exactly one ToolEnd: the denied tool, ok=false, user_denied body.
+    assert_eq!(
+        tool_ends.len(),
+        1,
+        "expected a single ToolEnd (denied tool only), got {:?}",
+        tool_ends
+    );
+    let (ok, body) = &tool_ends[0];
+    assert!(!ok, "denied ToolEnd must carry ok=false");
+    assert_eq!(
+        body.get("user_denied").and_then(|v| v.as_bool()),
+        Some(true),
+        "denied ToolEnd must carry user_denied: true, got {:?}",
+        body
+    );
+    assert!(
+        body.get("error").is_none(),
+        "denied ToolEnd must not use the `error` key, got {:?}",
+        body
+    );
+
+    // (4) The denial result is persisted to the per-run records.
+    let denied_record = tool_call_records
+        .iter()
+        .find(|r| {
+            r.role == alms_core::ToolCallRole::Tool && r.tool_id.as_deref() == Some("tc-deny-1")
+        })
+        .expect("denied tool must have a persisted Tool-role record");
+    assert!(
+        denied_record
+            .result
+            .as_deref()
+            .is_some_and(|s| s.contains("user_denied")),
+        "persisted denial record must carry the user_denied body, got {:?}",
+        denied_record.result
+    );
+    // The second tool never ran — no Tool-role record for it.
+    assert!(
+        !tool_call_records
+            .iter()
+            .any(|r| r.role == alms_core::ToolCallRole::Tool
+                && r.tool_id.as_deref() == Some("tc-deny-2")),
+        "the never-executed second tool must not have a result record"
     );
 }
 
@@ -2047,6 +2222,28 @@ fn test_tool_result_ok_status_string_error_case_insensitive() {
         assert!(
             !helpers::tool_result_ok(&val),
             "status={s:?} should classify as failure"
+        );
+    }
+}
+
+#[test]
+fn test_tool_result_ok_user_denied() {
+    // #1109: the approval-gate deny body `{"user_denied": true, ...}` is
+    // a failed tool call for `ok`-flag purposes even though it carries no
+    // `error` key (deliberately — the distinct key is what lets the agent
+    // tell a user policy decision apart from a runtime error).
+    let val = crate::agent::loop_impl::user_denied_result();
+    assert!(!helpers::tool_result_ok(&val));
+
+    // Only an explicit boolean `true` flips the classifier.
+    for benign in [
+        serde_json::json!({"user_denied": false}),
+        serde_json::json!({"user_denied": "true"}),
+        serde_json::json!({"user_denied": 1}),
+    ] {
+        assert!(
+            helpers::tool_result_ok(&benign),
+            "user_denied={benign:?} should not classify as failure"
         );
     }
 }

@@ -476,6 +476,248 @@ async fn cancelled_during_shutdown_emits_cancelled_event() {
     );
 }
 
+/// Regression test for #1109: denying a tool approval must cancel runs
+/// still queued on the same session, BEFORE the decision reaches the
+/// runtime — they must NOT auto-start when the per-agent queue advances.
+///
+/// Drives the deny through the real `resolve_approval` handler. The
+/// denied run's own token must stay uncancelled (the runtime's deny
+/// branch owns it — see the #816 race note in `resolve_approval`), and
+/// queued runs on other sessions must be untouched.
+#[tokio::test]
+async fn deny_cancels_queued_runs_in_same_session() {
+    use crate::approvals::{PendingApproval, ResolveApprovalRequest};
+
+    let (state, shutdown_token, _cr, _tr, _dr) = test_app_state();
+    let agent_id = AgentId::new();
+    let session = state
+        .session_manager
+        .get_or_create(agent_id, "test-deny-queue");
+    let session_id = session.id;
+
+    // Run A: Running, with a pending approval (the run being denied).
+    let mut run_a = Run::new(session_id, agent_id, "guarded run".into());
+    run_a.mark_running();
+    let run_a_id = run_a.run_id;
+    state.run_manager.insert_run(run_a);
+    let token_a = CancellationToken::new();
+    state
+        .run_manager
+        .register_cancel_token(run_a_id, token_a.clone());
+
+    // Run B: Queued behind A on the SAME session.
+    let run_b = Run::new(session_id, agent_id, "queued behind".into());
+    let run_b_id = run_b.run_id;
+    state.run_manager.insert_run(run_b.clone());
+    let token_b = CancellationToken::new();
+    state
+        .run_manager
+        .register_cancel_token(run_b_id, token_b.clone());
+
+    // Run C: Queued on a DIFFERENT session of the same agent.
+    let other_session = state
+        .session_manager
+        .get_or_create(agent_id, "test-deny-queue-other");
+    let run_c = Run::new(other_session.id, agent_id, "other session".into());
+    let run_c_id = run_c.run_id;
+    state.run_manager.insert_run(run_c);
+    let token_c = CancellationToken::new();
+    state
+        .run_manager
+        .register_cancel_token(run_c_id, token_c.clone());
+
+    // Pending approval on run A, as the runtime's approval gate would
+    // have registered it.
+    let approval_id = uuid::Uuid::new_v4();
+    let (decision_tx, decision_rx) = tokio::sync::oneshot::channel();
+    state.approval_store.insert(PendingApproval {
+        approval_id,
+        run_id: run_a_id,
+        tool: "math".to_string(),
+        params: serde_json::json!({"operation": "add", "a": 1, "b": 2}),
+        requested_at: chrono::Utc::now(),
+        decision_tx,
+    });
+
+    let mut rx = subscribe_session(&state, session_id);
+
+    // Deny through the real HTTP handler.
+    let response = crate::approvals::resolve_approval(
+        axum::extract::State(state.clone()),
+        axum::extract::Path(approval_id),
+        axum::Json(ResolveApprovalRequest {
+            decision: "deny".to_string(),
+        }),
+    )
+    .await;
+    assert!(response.is_ok(), "deny resolution must succeed");
+
+    // The runtime received `false` — and only after the queued-run
+    // cancellation above had already been applied.
+    assert!(
+        !decision_rx.await.expect("decision channel must resolve"),
+        "runtime must receive the deny decision"
+    );
+
+    // (1) Queued same-session run: token cancelled + state flipped.
+    assert!(
+        token_b.is_cancelled(),
+        "queued same-session run's token must be cancelled on deny"
+    );
+    assert_eq!(
+        state.run_manager.get_run(run_b_id).unwrap().status,
+        RunStatus::Cancelled,
+        "queued same-session run must flip to Cancelled on deny"
+    );
+
+    // (2) The denied run is left to the runtime's deny branch.
+    assert!(
+        !token_a.is_cancelled(),
+        "handler must NOT cancel the denied run's token — the runtime's \
+         deny branch owns that after emitting the user_denied result"
+    );
+
+    // (3) Different-session queued run: untouched.
+    assert!(
+        !token_c.is_cancelled(),
+        "queued run on another session must not be cancelled"
+    );
+    assert_eq!(
+        state.run_manager.get_run(run_c_id).unwrap().status,
+        RunStatus::Queued,
+        "queued run on another session must stay Queued"
+    );
+
+    // run_cancelled (for B) and approval_resolved (for A) on the session feed.
+    let events = drain_events(&mut rx);
+    assert!(
+        events.iter().any(|e| e.event_type == "run_cancelled"),
+        "expected run_cancelled SSE for the queued run; got: {:?}",
+        events.iter().map(|e| &e.event_type).collect::<Vec<_>>()
+    );
+    assert!(
+        events.iter().any(|e| e.event_type == "approval_resolved"),
+        "expected approval_resolved SSE; got: {:?}",
+        events.iter().map(|e| &e.event_type).collect::<Vec<_>>()
+    );
+
+    // (4) When the per-agent queue later dequeues B's work item, the
+    // early-exit at the top of `execute_run` fires — B never runs.
+    super::lifecycle::execute_run(
+        state.clone(),
+        super::RunParams {
+            run_id: run_b_id,
+            session_id,
+            agent_id,
+            input: run_b.input,
+            context_id: "test-deny-queue".to_string(),
+            cancel_token: token_b,
+            is_peer_message: false,
+            is_system_triggered: false,
+            input_pre_persisted: false,
+        },
+    )
+    .await;
+    assert_eq!(
+        state.run_manager.get_run(run_b_id).unwrap().status,
+        RunStatus::Cancelled,
+        "queued run must never auto-start after a deny"
+    );
+
+    shutdown_token.cancel();
+}
+
+/// Regression pin for the #1139 review's C1 race: a same-session `Queued`
+/// run whose cancel token is NOT yet registered (the `create_run`
+/// insert-to-register window, lifecycle.rs ~:879-961) must be SKIPPED by
+/// the deny sweep — left `Queued`, never marked `Cancelled`, no
+/// `run_cancelled` broadcast. Marking it would let `create_run` register
+/// a fresh token and the unconditional `mark_running` resurrect a run
+/// that already announced `run_cancelled`. The structural fix (register
+/// token before `insert_run`) is tracked in #1142.
+#[tokio::test]
+async fn deny_skips_queued_run_without_registered_cancel_token() {
+    use crate::approvals::{PendingApproval, ResolveApprovalRequest};
+
+    let (state, shutdown_token, _cr, _tr, _dr) = test_app_state();
+    let agent_id = AgentId::new();
+    let session = state
+        .session_manager
+        .get_or_create(agent_id, "test-deny-no-token");
+    let session_id = session.id;
+
+    // Run A: Running, with a pending approval (the run being denied).
+    let mut run_a = Run::new(session_id, agent_id, "guarded run".into());
+    run_a.mark_running();
+    let run_a_id = run_a.run_id;
+    state.run_manager.insert_run(run_a);
+    let token_a = CancellationToken::new();
+    state
+        .run_manager
+        .register_cancel_token(run_a_id, token_a.clone());
+
+    // Run B: Queued on the SAME session, but with NO registered cancel
+    // token — visible to `list_queued_for_session` exactly as it is
+    // inside `create_run`'s insert-to-register window.
+    let run_b = Run::new(session_id, agent_id, "queued, token pending".into());
+    let run_b_id = run_b.run_id;
+    state.run_manager.insert_run(run_b);
+
+    let approval_id = uuid::Uuid::new_v4();
+    let (decision_tx, decision_rx) = tokio::sync::oneshot::channel();
+    state.approval_store.insert(PendingApproval {
+        approval_id,
+        run_id: run_a_id,
+        tool: "math".to_string(),
+        params: serde_json::json!({"operation": "add", "a": 1, "b": 2}),
+        requested_at: chrono::Utc::now(),
+        decision_tx,
+    });
+
+    let mut rx = subscribe_session(&state, session_id);
+
+    // Deny through the real HTTP handler.
+    let response = crate::approvals::resolve_approval(
+        axum::extract::State(state.clone()),
+        axum::extract::Path(approval_id),
+        axum::Json(ResolveApprovalRequest {
+            decision: "deny".to_string(),
+        }),
+    )
+    .await;
+    assert!(response.is_ok(), "deny resolution must succeed");
+    assert!(
+        !decision_rx.await.expect("decision channel must resolve"),
+        "runtime must receive the deny decision"
+    );
+
+    // The token-less queued run escaped the sweep: still Queued, never
+    // marked Cancelled (degraded pre-#1109 behavior, not corruption).
+    assert_eq!(
+        state.run_manager.get_run(run_b_id).unwrap().status,
+        RunStatus::Queued,
+        "queued run without a registered cancel token must be left Queued \
+         by the deny sweep — marking it Cancelled would race create_run's \
+         token registration and resurrect via mark_running"
+    );
+
+    // No run_cancelled was broadcast for it either.
+    let events = drain_events(&mut rx);
+    assert!(
+        !events.iter().any(|e| e.event_type == "run_cancelled"),
+        "no run_cancelled SSE may be emitted for a skipped token-less run; \
+         got: {:?}",
+        events.iter().map(|e| &e.event_type).collect::<Vec<_>>()
+    );
+    assert!(
+        events.iter().any(|e| e.event_type == "approval_resolved"),
+        "approval_resolved must still fire; got: {:?}",
+        events.iter().map(|e| &e.event_type).collect::<Vec<_>>()
+    );
+
+    shutdown_token.cancel();
+}
+
 // ---------------------------------------------------------------------------
 // 2. DM with ignore_message -> end_conversation -> notification flow
 // ---------------------------------------------------------------------------

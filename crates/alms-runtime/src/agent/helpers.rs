@@ -74,6 +74,15 @@ pub(crate) fn tool_result_ok(value: &serde_json::Value) -> bool {
         return false;
     }
 
+    // User-denial discriminator (#1109): the approval-gate deny branch
+    // returns `{"user_denied": true, ...}` — deliberately distinct from
+    // the `error` shape so the agent can tell user policy from runtime
+    // failure, but still a failed call for `ok`-flag purposes. Only an
+    // explicit boolean `true` matches.
+    if obj.get("user_denied").and_then(|v| v.as_bool()) == Some(true) {
+        return false;
+    }
+
     // In-band `error` string. The convention used by `send_message`,
     // `read_session`, `read_subagent_session`, `read_messages`, and the
     // background-shell `status: "failed"` payload (see callers in

@@ -59,21 +59,33 @@ impl ApprovalStore {
         self.pending.insert(approval.approval_id, approval);
     }
 
+    /// Remove a pending approval WITHOUT sending the decision, returning
+    /// the decision channel so the caller can sequence side effects before
+    /// the runtime learns the outcome. The deny path (#1109) needs this:
+    /// queued same-session runs must be cancelled before `false` is
+    /// delivered, or the per-agent queue could advance into a
+    /// not-yet-cancelled run.
+    pub fn take(&self, id: Uuid) -> Option<(ApprovalInfo, tokio::sync::oneshot::Sender<bool>)> {
+        self.pending.remove(&id).map(|(_, approval)| {
+            (
+                ApprovalInfo {
+                    approval_id: approval.approval_id,
+                    run_id: approval.run_id,
+                    tool: approval.tool,
+                    params: approval.params,
+                    requested_at: approval.requested_at,
+                },
+                approval.decision_tx,
+            )
+        })
+    }
+
     /// Resolve an approval. Returns the approval info if found, `None` otherwise.
     pub fn resolve(&self, id: Uuid, approve: bool) -> Option<ApprovalInfo> {
-        if let Some((_, approval)) = self.pending.remove(&id) {
-            let info = ApprovalInfo {
-                approval_id: approval.approval_id,
-                run_id: approval.run_id,
-                tool: approval.tool,
-                params: approval.params,
-                requested_at: approval.requested_at,
-            };
-            let _ = approval.decision_tx.send(approve);
-            Some(info)
-        } else {
-            None
-        }
+        self.take(id).map(|(info, decision_tx)| {
+            let _ = decision_tx.send(approve);
+            info
+        })
     }
 
     /// Remove all pending approvals for a given run (cleanup on run end).
@@ -154,10 +166,64 @@ pub async fn resolve_approval(
         }
     };
 
-    if let Some(info) = state.approval_store.resolve(approval_id, approve) {
+    if let Some((info, decision_tx)) = state.approval_store.take(approval_id) {
+        let run = state.run_manager.get_run(info.run_id);
+
+        // #1109: a denial means "stop" — runs queued behind the denied
+        // run on the same session must not auto-start when the per-agent
+        // queue advances. Cancel each the way the HTTP `cancel_run`
+        // handler does (#1046): token first — and skip entirely on a
+        // token miss, never marking Cancelled — then synchronous state
+        // flip + `run_cancelled` broadcast gated on the transition bool
+        // so `execute_run`'s queued-then-cancelled early exit can't
+        // double-broadcast. Runs BEFORE `decision_tx.send` so the queue
+        // can never advance into a live queued run. The denied run's own
+        // token is deliberately NOT cancelled here — that would race the
+        // runtime's approval-wait `select!` and could take the #816
+        // cancel arm instead of the deny branch, losing `user_denied`.
+        if !approve && let Some(ref run) = run {
+            for queued in state.run_manager.list_queued_for_session(run.session_id) {
+                if queued.run_id == info.run_id {
+                    continue;
+                }
+                if !state.run_manager.cancel_run(queued.run_id) {
+                    // Token not registered yet (create_run's insert-to-register
+                    // window, lifecycle.rs ~:879-961) or already cleaned up.
+                    // Mirror the HTTP cancel handler (lifecycle.rs ~:592): never
+                    // mark Cancelled on a token miss — create_run would register
+                    // a fresh token next and the unconditional `mark_running`
+                    // would resurrect the run after it already broadcast
+                    // `run_cancelled`. Skipping leaves the run Queued (pre-#1109
+                    // behavior for this one run) — safe degraded mode. The
+                    // structural fix (register token before `insert_run`) is
+                    // tracked in #1142.
+                    continue;
+                }
+                let transitioned = state.run_manager.mark_run_as_cancelled(queued.run_id);
+                if transitioned {
+                    state
+                        .run_manager
+                        .send_event(
+                            queued.run_id,
+                            queued.session_id,
+                            crate::sse::SseEventData::run_cancelled(queued.run_id),
+                        )
+                        .await;
+                    tracing::info!(
+                        run_id = %queued.run_id.0,
+                        session_id = %queued.session_id.0,
+                        denied_run_id = %info.run_id.0,
+                        "Cancelled queued run after tool denial (#1109)"
+                    );
+                }
+            }
+        }
+
+        let _ = decision_tx.send(approve);
+
         // Emit approval_resolved SSE event — only if the run is still tracked.
         let decision_str = if approve { "approve" } else { "deny" };
-        if let Some(run) = state.run_manager.get_run(info.run_id) {
+        if let Some(run) = run {
             state
                 .run_manager
                 .send_event(

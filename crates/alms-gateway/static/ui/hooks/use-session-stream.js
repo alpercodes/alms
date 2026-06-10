@@ -1186,7 +1186,8 @@ export function openSessionStream(sessionId, opts) {
     //
     // The tool row itself is updated separately via the `tool_end` event
     // emitted by the runtime after approve (success/fail based on tool
-    // execution) or immediately after deny (ok=false, "denied by user").
+    // execution) or immediately after deny (`user_denied: true` result,
+    // #1109 — the run then terminates via `run_cancelled`).
     on('approval_resolved', (e) => {
         const data = JSON.parse(e.data);
         filterMessages(

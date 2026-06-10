@@ -517,6 +517,24 @@ impl RunManager {
         runs
     }
 
+    /// List `Queued` runs for a session, sorted FIFO by `created_at` ASC.
+    ///
+    /// Used by the approval-deny handler (#1109) — see `resolve_approval`
+    /// for why queued runs are cancelled before the decision is delivered.
+    pub fn list_queued_for_session(&self, session_id: SessionId) -> Vec<Run> {
+        let mut runs: Vec<Run> = self
+            .runs
+            .iter()
+            .filter(|e| {
+                let r = e.value();
+                r.session_id == session_id && matches!(r.status, alms_core::RunStatus::Queued)
+            })
+            .map(|e| e.value().clone())
+            .collect();
+        runs.sort_by_key(|r| r.created_at);
+        runs
+    }
+
     /// Returns `true` if any `Running` run exists for the given agent.
     ///
     /// Used by `create_run` to compute `queued_behind` accurately: the per-agent

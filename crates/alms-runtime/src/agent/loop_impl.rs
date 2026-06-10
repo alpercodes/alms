@@ -87,6 +87,31 @@ fn synthesize_cancel_tool_ends(sender: Option<&RuntimeEventSender>, inflight: &I
     }
 }
 
+/// Agent-visible gloss attached to a user-denied tool result (#1109).
+/// Deliberately brief: the `user_denied` flag is the load-bearing
+/// signal; the message is a short gloss, matching prior art in mature
+/// agent tools.
+pub(crate) const USER_DENIED_MESSAGE: &str =
+    "The user denied this tool call. Do not retry it or work around the denial.";
+
+/// Build the wire/persistence body for a user-denied tool result (#1109).
+///
+/// Uses a distinct `user_denied: true` key — NOT the `error` key used by
+/// real tool runtime errors. The pre-#1109 `{"error": "denied by user"}`
+/// shape was routinely read by models as a retryable failure (retry with
+/// tweaked args, or pivot to an adjacent tool) rather than a deliberate
+/// user policy decision.
+///
+/// Emitted byte-identical in three places: the `ToolEnd` SSE event, the
+/// persisted `Tool`-role session row (what carries the signal into the
+/// next run's context rebuild), and the per-run tool-call records.
+pub(crate) fn user_denied_result() -> serde_json::Value {
+    serde_json::json!({
+        "user_denied": true,
+        "message": USER_DENIED_MESSAGE,
+    })
+}
+
 /// Output of a completed agent loop.
 ///
 /// Rolled up from every LLM call in the loop: `response` is the final
@@ -1918,18 +1943,43 @@ impl AgentRuntime {
                         decision: AuditDecision::Deny,
                         params: args.clone(),
                         result: None,
-                        error: Some(denial_reason.clone()),
+                        error: Some(denial_reason),
                         timestamp: alms_core::Timestamp::now(),
                     },
                 );
                 let _ = sender.send(RuntimeEvent::ToolEnd {
                     invocation_id,
                     ok: false,
-                    result: serde_json::json!({"error": "denied by user"}),
+                    result: user_denied_result(),
                     source_agent: None,
                     task_id: None,
                 });
-                return Err(alms_core::AlmsError::ToolExecution(denial_reason));
+                // #1109: a denial means "stop" — drive the run to
+                // `cancelled` instead of surfacing a tool error the loop
+                // keeps iterating on. Cancelling the run's own token lets
+                // the existing cancel machinery do the rest: the Guarded
+                // inter-tool check (Branch 1 in `run_tool_calls`) unwinds
+                // before the next tool can prompt, loop-top Checkpoint A
+                // unwinds before the next LLM turn, and the gateway's
+                // terminal `Err(Cancelled[WithToolCalls])` arm flips the
+                // run to `Cancelled` (#895 / #1046 / #1050). With no token
+                // attached (direct unit-test invocations) the loop simply
+                // continues with the `user_denied` result below. Also
+                // fires for the coordinator's auto-deny of unroutable
+                // subagent approvals — the subagent cancels instead of
+                // plowing on with every tool denied; the child token does
+                // not propagate to the parent.
+                if let Some(ref token) = self.cancel_token {
+                    token.cancel();
+                }
+                // `Ok` (not `Err`) so the denial body persists as a real
+                // `Tool`-role row (`process_tool_results` /
+                // `persist_completed_guarded_results_on_cancel`) — the
+                // next run's rebuild replays the explicit `user_denied`
+                // signal instead of an `INTERRUPTED_TOOL_RESULT` marker
+                // for an orphan tool_use block. `tool_result_ok` maps the
+                // body to `ok: false` on the persisted row.
+                return Ok(user_denied_result());
             }
         }
 
