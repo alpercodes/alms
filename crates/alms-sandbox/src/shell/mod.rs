@@ -21,6 +21,8 @@ pub mod security;
 pub mod spill;
 pub mod types;
 
+pub use exec::init_shell_resolution;
+
 use crate::{SandboxError, Tool, error::SandboxResult};
 use alms_core::config::{ShellClassificationMode as CoreClassificationMode, ShellPermissions};
 use classification::ClassificationMode;

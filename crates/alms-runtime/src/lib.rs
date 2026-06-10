@@ -40,3 +40,8 @@ pub use alms_core::{AlmsError, AlmsResult};
 // callers (gateway startup sweep, subagent plumbing) don't need a direct
 // dependency on `alms-sandbox`.
 pub use alms_sandbox::shell::spill;
+
+// Re-export the boot-time shell-interpreter initializer (#1121) for the
+// same reason: the gateway installs the `[tools].shell_path` override and
+// logs the resolved shell at startup without a direct `alms-sandbox` edge.
+pub use alms_sandbox::shell::init_shell_resolution;

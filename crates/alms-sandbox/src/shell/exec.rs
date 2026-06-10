@@ -10,7 +10,7 @@ use super::types::{MAX_OUTPUT_BYTES, ShellInput, ShellOutput, ShellState};
 use crate::{SandboxError, error::SandboxResult};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use tracing::{debug, error, instrument, warn};
+use tracing::{debug, error, info, instrument, warn};
 
 /// First ~100 chars of a command, intended for structured log fields.
 ///
@@ -212,10 +212,16 @@ pub(crate) async fn execute_command(
 
 /// Build the tokio Command for execution.
 ///
-/// Wraps the command with `bash -c` on all platforms. On Windows, this
-/// requires Git Bash or WSL to be available on PATH. We use bash (not
-/// `cmd /c`) because the pwd marker, exit code capture, and shell syntax
-/// all assume POSIX semantics.
+/// Wraps the command with `bash -c` on all platforms. On Unix, `bash` is
+/// resolved from `PATH` by the OS as before. On Windows, Git Bash is
+/// resolved via [`resolve_shell_binary`]: the operator's `[tools].shell_path`
+/// override wins when set; otherwise well-known Git-for-Windows install
+/// locations are probed, then candidates derived from the location of
+/// `git.exe` on `PATH`. WSL's `C:\Windows\System32\bash.exe` launcher is
+/// never an acceptable interpreter — when nothing resolves, the command
+/// fails with an actionable error instead of silently executing inside WSL
+/// (#1121). We use bash (not `cmd /c`) because the pwd marker, exit code
+/// capture, and shell syntax all assume POSIX semantics.
 ///
 /// On Linux 5.13+ with a sandbox root configured, Landlock filesystem
 /// restrictions are applied via `pre_exec` so the child process can only
@@ -229,10 +235,7 @@ fn build_command(
 ) -> SandboxResult<tokio::process::Command> {
     let wrapped = wrap_command_with_pwd_marker(command, pwd_marker);
 
-    #[cfg(windows)]
-    let bash_bin = resolve_bash_path().clone();
-    #[cfg(not(windows))]
-    let bash_bin = PathBuf::from("bash");
+    let bash_bin = resolve_shell_binary().map_err(SandboxError::Io)?;
 
     let mut cmd = tokio::process::Command::new(bash_bin);
     cmd.arg("-c");
@@ -259,88 +262,280 @@ fn build_command(
     Ok(cmd)
 }
 
+// ---------------------------------------------------------------------------
+// Shell binary resolution (#1121)
+// ---------------------------------------------------------------------------
+
+/// Operator-supplied `[tools].shell_path` override, installed once at boot
+/// via [`init_shell_resolution`]. `None` inside the `OnceLock` means the
+/// knob was explicitly unset; an unset `OnceLock` (library users that never
+/// call init) behaves identically.
+static SHELL_PATH_OVERRIDE: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+
+fn shell_path_override() -> Option<&'static Path> {
+    SHELL_PATH_OVERRIDE.get().and_then(|o| o.as_deref())
+}
+
+/// Install the operator's `[tools].shell_path` override (if any) and log the
+/// resolved shell interpreter once at `target = "alms.security"`.
+///
+/// Called by the gateway at boot so operators learn the active shell before
+/// the first agent run — not from garbled tool output. Idempotent: the first
+/// call wins; a later call with a *different* value logs a WARN and keeps
+/// the original.
+pub fn init_shell_resolution(shell_path: Option<PathBuf>) {
+    if SHELL_PATH_OVERRIDE.set(shell_path.clone()).is_err()
+        && shell_path_override() != shell_path.as_deref()
+    {
+        warn!(
+            target: "alms.security",
+            "init_shell_resolution called again with a different [tools].shell_path; \
+             keeping the first value: {:?}",
+            shell_path_override()
+        );
+    }
+    match resolve_shell_binary() {
+        Ok(path) => info!(
+            target: "alms.security",
+            shell_path = %path.display(),
+            override_set = shell_path_override().is_some(),
+            "shell tool: commands will execute via this interpreter"
+        ),
+        Err(msg) => warn!(
+            target: "alms.security",
+            "shell tool: no usable shell interpreter found — shell commands will fail: {msg}"
+        ),
+    }
+}
+
+/// Resolve the shell binary `build_command` will spawn.
+///
+/// Order:
+/// 1. Operator `[tools].shell_path` override — wins unconditionally when
+///    set. A missing file or a System32/Sysnative path is a hard error,
+///    never a silent fall-through to discovery.
+/// 2. (Windows) Git Bash discovery, memoized per process — well-known
+///    install locations first, then candidates derived from the location
+///    of `git.exe` on `PATH` (see [`bash_candidates`]).
+/// 3. (Unix) `bash`, resolved from `PATH` by the OS — unchanged.
+///
+/// On Windows there is deliberately **no** bare-`"bash"` fallback: with Git
+/// Bash's `bin` directory off `PATH` (the common case — only Git's `cmd`
+/// dir is on `PATH`), bare `bash` resolves to
+/// `C:\Windows\System32\bash.exe`, the WSL launcher, and commands silently
+/// execute in the wrong operating environment (#1121).
+fn resolve_shell_binary() -> Result<PathBuf, String> {
+    let override_path = shell_path_override();
+    if override_path.is_some() {
+        // Not memoized: validation is a single stat per spawn, and staying
+        // live means an operator who fixes the file the knob points at does
+        // not need a daemon restart.
+        return resolve_shell_path(override_path, &[], |p: &Path| p.is_file());
+    }
+    #[cfg(windows)]
+    {
+        resolve_bash_path().cloned()
+    }
+    #[cfg(not(windows))]
+    {
+        Ok(PathBuf::from("bash"))
+    }
+}
+
 /// Resolve the Git-Bash executable once per process and cache the result.
 ///
-/// `discover_bash_path` performs up to ~10 `Path::exists()` syscalls walking
-/// the well-known Git-for-Windows install locations. Since the answer is stable
-/// for the lifetime of the process, the resolution is memoized in a `LazyLock`
-/// so `build_command` pays the stat cost only on the first invocation.
+/// Discovery performs a bounded number of `is_file()` stats plus one walk
+/// of the `PATH` entries looking for `git.exe`. Since the answer is stable
+/// for the lifetime of the process, the resolution is memoized in a
+/// `LazyLock` so `build_command` pays the cost only on the first
+/// invocation. (Installing Git for Windows after daemon start therefore
+/// requires a daemon restart to be picked up.)
 #[cfg(windows)]
-fn resolve_bash_path() -> &'static PathBuf {
-    static BASH_PATH: std::sync::LazyLock<PathBuf> = std::sync::LazyLock::new(discover_bash_path);
-    &BASH_PATH
+fn resolve_bash_path() -> Result<&'static PathBuf, String> {
+    static BASH_PATH: std::sync::LazyLock<Result<PathBuf, String>> =
+        std::sync::LazyLock::new(discover_bash_path);
+    BASH_PATH.as_ref().map_err(Clone::clone)
 }
 
 #[cfg(windows)]
-fn discover_bash_path() -> PathBuf {
-    let paths = [
-        "C:\\Program Files\\Git\\bin\\bash.exe",
-        "C:\\Program Files\\Git\\usr\\bin\\bash.exe",
-        "C:\\Program Files (x86)\\Git\\bin\\bash.exe",
-        "C:\\Program Files (x86)\\Git\\usr\\bin\\bash.exe",
+fn discover_bash_path() -> Result<PathBuf, String> {
+    let candidates = bash_candidates(
+        &windows_static_bash_candidates(),
+        find_git_exe_dir_on_path().as_deref(),
+    );
+    resolve_shell_path(None, &candidates, |p: &Path| p.is_file())
+}
+
+/// Pure resolution core — unit-testable without touching the live
+/// filesystem or environment.
+///
+/// * `override_path` — operator `[tools].shell_path`. When `Some`, it wins
+///   unconditionally: a System32/Sysnative path or a non-file is a hard
+///   error, never a fall-through to `candidates`.
+/// * `candidates` — ordered discovery candidates (see [`bash_candidates`]).
+///   The first entry that is a file and is not under System32/Sysnative
+///   wins.
+/// * `is_file` — injected filesystem probe. The real callers pass
+///   `Path::is_file` (not `exists()` — a *directory* named `bash.exe` must
+///   not match).
+fn resolve_shell_path(
+    override_path: Option<&Path>,
+    candidates: &[PathBuf],
+    is_file: impl Fn(&Path) -> bool,
+) -> Result<PathBuf, String> {
+    if let Some(p) = override_path {
+        if is_under_windows_system32(p) {
+            return Err(format!(
+                "[tools].shell_path points at '{}', which is under System32/Sysnative — \
+                 that bash.exe is the WSL launcher, not a shell. Point shell_path at a \
+                 real shell executable (e.g. Git Bash's <GitRoot>\\bin\\bash.exe).",
+                p.display()
+            ));
+        }
+        if !is_file(p) {
+            return Err(format!(
+                "[tools].shell_path points at '{}', which does not exist or is not a \
+                 file. Fix the path in alms.toml, or remove the knob to use built-in \
+                 discovery.",
+                p.display()
+            ));
+        }
+        return Ok(p.to_path_buf());
+    }
+
+    for candidate in candidates {
+        // Belt-and-suspenders: `bash_candidates` already filters these, but
+        // no candidate source — present or future — may route to the WSL
+        // launcher.
+        if is_under_windows_system32(candidate) {
+            continue;
+        }
+        if is_file(candidate) {
+            return Ok(candidate.clone());
+        }
+    }
+
+    Err(
+        "Git Bash not found on this Windows host. The shell tool refuses to fall back \
+         to bare 'bash' because PATH resolution would silently spawn the WSL launcher \
+         (C:\\Windows\\System32\\bash.exe). Install Git for Windows, or set \
+         [tools].shell_path in alms.toml to the absolute path of a bash executable."
+            .to_string(),
+    )
+}
+
+/// True when `path` lives under a Windows `System32` or `Sysnative`
+/// directory — home of the WSL launcher `bash.exe`, which is never an
+/// acceptable shell interpreter (#1121).
+///
+/// Compared case-insensitively on normalized separators so
+/// `C:/WINDOWS/system32/bash.exe` and `\\?\C:\Windows\Sysnative\bash.exe`
+/// are both caught. String-based (rather than `Path::components`) so the
+/// check behaves identically — and is unit-testable — on non-Windows hosts,
+/// where backslashes are not path separators.
+fn is_under_windows_system32(path: &Path) -> bool {
+    let normalized = path
+        .to_string_lossy()
+        .to_ascii_lowercase()
+        .replace('/', "\\");
+    normalized.contains("\\system32\\")
+        || normalized.contains("\\sysnative\\")
+        || normalized.ends_with("\\system32")
+        || normalized.ends_with("\\sysnative")
+}
+
+/// Ordered Git-Bash candidate list: static well-known install locations
+/// first, then candidates derived from the directory containing `git.exe`
+/// (`<GitRoot>\cmd\git.exe` → `<GitRoot>\bin\bash.exe` and
+/// `<GitRoot>\usr\bin\bash.exe`).
+///
+/// `git.exe` on `PATH` is a far more reliable anchor than hardcoded install
+/// roots — it survives portable, non-`C:`-drive, and custom-prefix installs
+/// — and by construction can never point at the WSL launcher.
+/// System32/Sysnative entries are filtered out here, belt-and-suspenders
+/// with [`resolve_shell_path`].
+#[cfg_attr(not(windows), allow(dead_code))]
+fn bash_candidates(static_candidates: &[PathBuf], git_exe_dir: Option<&Path>) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = static_candidates
+        .iter()
+        .filter(|c| !is_under_windows_system32(c))
+        .cloned()
+        .collect();
+
+    if let Some(dir) = git_exe_dir
+        && let Some(git_root) = dir.parent()
+    {
+        for derived in [
+            git_root.join("bin").join("bash.exe"),
+            git_root.join("usr").join("bin").join("bash.exe"),
+        ] {
+            if !is_under_windows_system32(&derived) && !out.contains(&derived) {
+                out.push(derived);
+            }
+        }
+    }
+
+    out
+}
+
+/// The pre-#1121 static probe list, expressed as candidate paths: standard
+/// Git-for-Windows roots (literal `C:\` plus the `ProgramFiles`-family env
+/// vars, which differ on non-`C:` system drives) with `bin\bash.exe` and
+/// `usr\bin\bash.exe` under each.
+#[cfg(windows)]
+fn windows_static_bash_candidates() -> Vec<PathBuf> {
+    let mut roots: Vec<PathBuf> = vec![
+        PathBuf::from("C:\\Program Files\\Git"),
+        PathBuf::from("C:\\Program Files (x86)\\Git"),
     ];
-    for p in &paths {
-        let path = Path::new(p);
-        if path.exists() {
-            return path.to_path_buf();
+    for var in ["ProgramFiles", "ProgramFiles(x86)"] {
+        if let Ok(v) = std::env::var(var) {
+            roots.push(Path::new(&v).join("Git"));
         }
     }
-
-    if let Ok(pf) = std::env::var("ProgramFiles") {
-        let path = Path::new(&pf).join("Git").join("bin").join("bash.exe");
-        if path.exists() {
-            return path;
-        }
-        let path = Path::new(&pf)
-            .join("Git")
-            .join("usr")
-            .join("bin")
-            .join("bash.exe");
-        if path.exists() {
-            return path;
-        }
-    }
-
-    if let Ok(pf86) = std::env::var("ProgramFiles(x86)") {
-        let path = Path::new(&pf86).join("Git").join("bin").join("bash.exe");
-        if path.exists() {
-            return path;
-        }
-        let path = Path::new(&pf86)
-            .join("Git")
-            .join("usr")
-            .join("bin")
-            .join("bash.exe");
-        if path.exists() {
-            return path;
-        }
-    }
-
     if let Ok(local) = std::env::var("LocalAppData") {
-        let path = Path::new(&local)
-            .join("Programs")
-            .join("Git")
-            .join("bin")
-            .join("bash.exe");
-        if path.exists() {
-            return path;
-        }
+        roots.push(Path::new(&local).join("Programs").join("Git"));
     }
-
     if let Ok(up) = std::env::var("USERPROFILE") {
-        let path = Path::new(&up)
-            .join("AppData")
-            .join("Local")
-            .join("Programs")
-            .join("Git")
-            .join("bin")
-            .join("bash.exe");
-        if path.exists() {
-            return path;
-        }
+        roots.push(
+            Path::new(&up)
+                .join("AppData")
+                .join("Local")
+                .join("Programs")
+                .join("Git"),
+        );
     }
 
-    PathBuf::from("bash")
+    let mut out: Vec<PathBuf> = Vec::with_capacity(roots.len() * 2);
+    for root in roots {
+        for candidate in [
+            root.join("bin").join("bash.exe"),
+            root.join("usr").join("bin").join("bash.exe"),
+        ] {
+            if !out.contains(&candidate) {
+                out.push(candidate);
+            }
+        }
+    }
+    out
+}
+
+/// Locate the directory containing `git.exe` by walking the process `PATH`
+/// (a proven trick — see #1121). System32/Sysnative entries are
+/// skipped: we are anchoring on Git for Windows, and the WSL launcher's
+/// home can never be it.
+#[cfg(windows)]
+fn find_git_exe_dir_on_path() -> Option<PathBuf> {
+    let path_var = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path_var) {
+        if dir.as_os_str().is_empty() || is_under_windows_system32(&dir) {
+            continue;
+        }
+        if dir.join("git.exe").is_file() {
+            return Some(dir);
+        }
+    }
+    None
 }
 
 /// Apply Landlock filesystem restrictions to a command via `pre_exec`.
@@ -861,16 +1056,212 @@ mod tests {
         #[cfg(unix)]
         assert_eq!(inner.get_program(), "bash");
         #[cfg(windows)]
-        assert!(
-            inner.get_program().to_string_lossy().ends_with("bash.exe")
-                || inner.get_program() == "bash"
-        );
+        {
+            // Post-#1121: never bare "bash" (the WSL trap) and never a
+            // System32/Sysnative path. On a Windows host without Git Bash,
+            // build_command errors instead — the unwrap above is the assert.
+            let program = inner.get_program().to_string_lossy().into_owned();
+            assert!(
+                program.to_ascii_lowercase().ends_with("bash.exe"),
+                "expected a concrete bash.exe path, got: {program}"
+            );
+            assert!(
+                !is_under_windows_system32(Path::new(&program)),
+                "resolved shell must never live under System32/Sysnative: {program}"
+            );
+        }
         let args: Vec<_> = inner.get_args().collect();
         assert_eq!(args[0], "-c");
         // The second arg should contain our command and the pwd marker
         let wrapped = args[1].to_str().unwrap();
         assert!(wrapped.contains("echo hello"));
         assert!(wrapped.contains(TEST_MARKER));
+    }
+
+    // ── Shell binary resolution (#1121) ──────────────────────────────────
+    //
+    // These tests exercise the pure resolution core (`resolve_shell_path`,
+    // `bash_candidates`, `is_under_windows_system32`) with injected
+    // filesystem probes, so they run on every platform without touching the
+    // live filesystem or environment. Path fixtures use forward slashes and
+    // `join()`-built expectations so they compare equal under both Windows
+    // and Unix `Path` semantics.
+
+    #[test]
+    fn test_is_under_windows_system32() {
+        // The WSL launcher's home, in its common spellings.
+        assert!(is_under_windows_system32(Path::new(
+            "C:\\Windows\\System32\\bash.exe"
+        )));
+        assert!(is_under_windows_system32(Path::new(
+            "C:/Windows/System32/bash.exe"
+        )));
+        assert!(is_under_windows_system32(Path::new(
+            "C:\\WINDOWS\\SYSTEM32"
+        )));
+        // Sysnative (the 32-bit-process alias for the 64-bit System32).
+        assert!(is_under_windows_system32(Path::new(
+            "C:\\Windows\\Sysnative\\bash.exe"
+        )));
+        // Verbatim prefix and nested paths are still caught.
+        assert!(is_under_windows_system32(Path::new(
+            "\\\\?\\C:\\Windows\\System32\\bash.exe"
+        )));
+        assert!(is_under_windows_system32(Path::new(
+            "C:\\Windows\\System32\\wsl\\bash.exe"
+        )));
+        // Legitimate locations must not match.
+        assert!(!is_under_windows_system32(Path::new(
+            "C:\\Program Files\\Git\\bin\\bash.exe"
+        )));
+        assert!(!is_under_windows_system32(Path::new(
+            "D:\\tools\\PortableGit\\usr\\bin\\bash.exe"
+        )));
+        // Substring red herring: "system32" as a name *prefix* is not the dir.
+        assert!(!is_under_windows_system32(Path::new(
+            "C:\\system32fake\\bash.exe"
+        )));
+        assert!(!is_under_windows_system32(Path::new("/usr/bin/bash")));
+    }
+
+    #[test]
+    fn test_bash_candidates_git_derived_ordering() {
+        // Static well-knowns come first; git-derived candidates follow in
+        // bin → usr/bin order, rooted at the parent of git.exe's directory
+        // (<GitRoot>/cmd/git.exe → <GitRoot>/bin/bash.exe etc.).
+        let git_root = Path::new("D:/tools/PortableGit");
+        let statics = vec![Path::new("C:/Program Files/Git/bin/bash.exe").to_path_buf()];
+        let git_dir = git_root.join("cmd");
+
+        let candidates = bash_candidates(&statics, Some(&git_dir));
+
+        assert_eq!(
+            candidates,
+            vec![
+                Path::new("C:/Program Files/Git/bin/bash.exe").to_path_buf(),
+                git_root.join("bin").join("bash.exe"),
+                git_root.join("usr").join("bin").join("bash.exe"),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_bash_candidates_dedupes_git_derived_against_statics() {
+        // A standard install: git.exe found at <ProgramFiles>/Git/cmd, whose
+        // derived candidates already exist in the static list. No dupes.
+        let git_root = Path::new("C:/Program Files/Git");
+        let statics = vec![
+            git_root.join("bin").join("bash.exe"),
+            git_root.join("usr").join("bin").join("bash.exe"),
+        ];
+        let git_dir = git_root.join("cmd");
+
+        let candidates = bash_candidates(&statics, Some(&git_dir));
+        assert_eq!(candidates, statics);
+    }
+
+    #[test]
+    fn test_bash_candidates_filters_system32_entries() {
+        // Even a poisoned static list or a System32-derived git root must
+        // never produce a System32 candidate.
+        let statics = vec![
+            Path::new("C:\\Windows\\System32\\bash.exe").to_path_buf(),
+            Path::new("C:/Program Files/Git/bin/bash.exe").to_path_buf(),
+        ];
+        let candidates = bash_candidates(&statics, None);
+        assert_eq!(
+            candidates,
+            vec![Path::new("C:/Program Files/Git/bin/bash.exe").to_path_buf()]
+        );
+    }
+
+    #[test]
+    fn test_resolve_shell_path_override_wins_over_candidates() {
+        // Both the override and a discovery candidate "exist" — the
+        // operator's [tools].shell_path must win unconditionally.
+        let override_path = Path::new("D:/custom/bash.exe");
+        let candidates = vec![Path::new("C:/Program Files/Git/bin/bash.exe").to_path_buf()];
+
+        let resolved =
+            resolve_shell_path(Some(override_path), &candidates, |_: &Path| true).unwrap();
+        assert_eq!(resolved, override_path);
+    }
+
+    #[test]
+    fn test_resolve_shell_path_missing_override_is_hard_error() {
+        // Override set but pointing at a non-file: hard error, NOT a silent
+        // fall-through to discovery (a candidate that exists must not win).
+        let override_path = Path::new("D:/custom/bash.exe");
+        let candidates = vec![Path::new("C:/Program Files/Git/bin/bash.exe").to_path_buf()];
+
+        let err = resolve_shell_path(Some(override_path), &candidates, |p: &Path| {
+            p != override_path
+        })
+        .unwrap_err();
+        assert!(
+            err.contains("shell_path"),
+            "error must name the misconfigured knob: {err}"
+        );
+    }
+
+    #[test]
+    fn test_resolve_shell_path_system32_override_rejected() {
+        // Operator-supplied paths get the same System32/Sysnative hard
+        // reject as discovered candidates — even when the file exists.
+        let override_path = Path::new("C:\\Windows\\System32\\bash.exe");
+        let err = resolve_shell_path(Some(override_path), &[], |_: &Path| true).unwrap_err();
+        assert!(
+            err.contains("WSL"),
+            "error must explain the WSL-launcher rejection: {err}"
+        );
+    }
+
+    #[test]
+    fn test_resolve_shell_path_first_existing_candidate_wins() {
+        let first = Path::new("C:/Program Files/Git/bin/bash.exe").to_path_buf();
+        let second = Path::new("D:/tools/PortableGit/bin/bash.exe").to_path_buf();
+        let candidates = vec![first.clone(), second.clone()];
+
+        // Only the second exists → it wins.
+        let resolved = resolve_shell_path(None, &candidates, |p: &Path| p == second).unwrap();
+        assert_eq!(resolved, second);
+
+        // Both exist → ordering decides.
+        let resolved = resolve_shell_path(None, &candidates, |_: &Path| true).unwrap();
+        assert_eq!(resolved, first);
+    }
+
+    #[test]
+    fn test_resolve_shell_path_skips_system32_candidate_even_if_present() {
+        // Belt-and-suspenders inside the resolver itself: a System32
+        // candidate that sneaks past `bash_candidates` is still skipped.
+        let trap = Path::new("C:\\Windows\\System32\\bash.exe").to_path_buf();
+        let good = Path::new("C:/Program Files/Git/bin/bash.exe").to_path_buf();
+        let candidates = vec![trap, good.clone()];
+
+        let resolved = resolve_shell_path(None, &candidates, |_: &Path| true).unwrap();
+        assert_eq!(resolved, good);
+    }
+
+    #[test]
+    fn test_resolve_shell_path_not_found_is_actionable_error() {
+        // Nothing resolves: the result is a loud, actionable error — never
+        // a bare-"bash" fallback (the pre-#1121 silent-WSL failure mode).
+        let candidates = vec![Path::new("C:/nope/Git/bin/bash.exe").to_path_buf()];
+        let err = resolve_shell_path(None, &candidates, |_: &Path| false).unwrap_err();
+
+        assert!(
+            err.contains("Git for Windows"),
+            "error must tell the operator how to fix it (install Git): {err}"
+        );
+        assert!(
+            err.contains("[tools].shell_path"),
+            "error must mention the config-knob escape hatch: {err}"
+        );
+        assert!(
+            err.contains("WSL"),
+            "error must explain why bare 'bash' is refused: {err}"
+        );
     }
 
     #[test]

@@ -562,6 +562,14 @@ impl Gateway {
             &self.config.security_config,
         );
 
+        // Resolve the shell tool's interpreter once at boot and log it at
+        // `target = "alms.security"` (#1121). Installs the config-file-only
+        // `[tools].shell_path` override when set. On Windows this also
+        // surfaces "Git Bash not found" in the daemon's first log lines
+        // instead of letting the first agent run discover it from a failed
+        // tool call.
+        alms_runtime::init_shell_resolution(self.config.tools_config.shell_path.clone());
+
         // Shell output spill retention sweep (issue #756). Runs once at
         // startup — no background ticker — so expired `.alms/shell_output/*`
         // files are cleaned up the next time the gateway restarts rather

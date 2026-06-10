@@ -1176,6 +1176,30 @@ pub struct ToolsConfig {
     /// system paths like /usr, /bin, /lib). On Windows/macOS, sandboxed mode
     /// restricts cwd only -- the command can still access files outside the sandbox.
     pub shell_policy: String,
+    /// Absolute path to the shell interpreter used by the `shell` tool
+    /// (#1121).
+    ///
+    /// **Config-file-only** (`[tools].shell_path` in `alms.toml`) — like
+    /// [`ShellPermissions::classifier_overrides`], this knob is never
+    /// mutable via `PATCH /settings`. When set, it is checked first and
+    /// wins over all built-in discovery, subject to two hard validations
+    /// at spawn time: the path must be an existing *file*, and it must
+    /// not live under Windows' `System32`/`Sysnative` (that `bash.exe`
+    /// is the WSL launcher, not a shell).
+    ///
+    /// The target must be a **bash-compatible** interpreter: the pwd
+    /// marker wrapper, the destructive-command classifier, and operator
+    /// [`ShellPermissions`] regexes all assume POSIX/bash semantics —
+    /// pointing this at pwsh/zsh silently degrades the classifier to
+    /// coincidental matching.
+    ///
+    /// Default: unset. On Unix the tool runs `bash` from `PATH`; on
+    /// Windows, Git Bash is discovered from well-known install locations
+    /// and from the location of `git.exe` on `PATH`. If discovery fails
+    /// on Windows, the shell tool fails with an actionable error instead
+    /// of silently spawning the WSL launcher.
+    #[serde(default)]
+    pub shell_path: Option<PathBuf>,
     /// Permission-based allow/deny list for shell commands.
     ///
     /// Regex patterns matched against command strings before execution.
@@ -1245,6 +1269,7 @@ impl Default for ToolsConfig {
             max_output_bytes: 65536,
             sandbox_root: ".".into(),
             shell_policy: "sandboxed".into(),
+            shell_path: None,
             shell_permissions: ShellPermissions::default(),
             shell_classification_mode: ShellClassificationMode::default(),
             fs_edit: FsEditConfig::default(),

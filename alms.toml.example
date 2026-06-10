@@ -133,6 +133,18 @@ sandbox_root = "."
 # "unrestricted" — no cwd or filesystem restriction (power-user / full access).
 # Override with: ALMS_SHELL_POLICY=unrestricted
 shell_policy = "sandboxed"
+# Absolute path to the bash executable used by the `shell` tool (#1121).
+# Must be a BASH-COMPATIBLE interpreter: the pwd marker, the
+# destructive-command classifier, and operator `shell_permissions`
+# regexes all assume POSIX/bash semantics — pointing this at pwsh/zsh
+# silently degrades the classifier to coincidental matching.
+# THIS KNOB IS CONFIG-FILE-ONLY (not mutable via PATCH /settings). The
+# path must be an existing file; on Windows, paths under System32 /
+# Sysnative are rejected (that bash.exe is the WSL launcher, not a
+# shell). Unset = built-in discovery (Unix: `bash` from PATH; Windows:
+# Git Bash from well-known install locations and the location of
+# git.exe on PATH).
+# shell_path = "C:/Program Files/Git/bin/bash.exe"
 
 [security]
 # Operator-only escape hatch from the project-root filesystem sandbox (#947).

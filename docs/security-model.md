@@ -150,7 +150,7 @@ Expose a `shell_exec` tool that is policy-gated.
 The shell tool's interface is command strings executed via `bash -c`.
 
 Request fields:
-- `command`: shell command string, executed via `bash -c` (both Unix and Windows via Git Bash / WSL)
+- `command`: shell command string, executed via `bash -c` (on Windows via Git Bash, resolved from well-known install locations or derived from `git.exe` on `PATH`; overridable with the config-file-only `[tools].shell_path` knob. WSL's `System32\bash.exe` launcher is hard-rejected — if no Git Bash is found the tool fails with an actionable error instead of silently executing under WSL)
 - `description`: brief description of what the command does (for audit logging)
 - `timeout_ms`: timeout in milliseconds (default 120000, max 600000)
 - `run_in_background`: when `true`, returns a task_id immediately; use `check_task` to poll results
