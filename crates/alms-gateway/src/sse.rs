@@ -1361,15 +1361,15 @@ mod tests {
         let run_id = RunId::new();
         let event = SseEventData::run_warning(
             run_id,
-            "DM_TEXT_ONLY_RETRY",
-            "DM agent responded with text only",
+            "DM_EMPTY_REPLY_RETRY",
+            "DM agent produced no reply text",
             None,
         );
         assert_eq!(event.event_type, "run_warning");
-        assert_eq!(event.data["warning"]["code"], "DM_TEXT_ONLY_RETRY");
+        assert_eq!(event.data["warning"]["code"], "DM_EMPTY_REPLY_RETRY");
         assert_eq!(
             event.data["warning"]["message"],
-            "DM agent responded with text only"
+            "DM agent produced no reply text"
         );
     }
 

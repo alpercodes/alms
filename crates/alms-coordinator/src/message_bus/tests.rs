@@ -2337,3 +2337,212 @@ async fn test_reasoning_messages_not_forwarded_by_message_bus() {
         );
     }
 }
+
+// -----------------------------------------------------------------------
+// Expiry-sweep tombstone tests (#1154 / B5)
+// -----------------------------------------------------------------------
+
+/// B5 regression: when the inactivity sweep removed the depth entry for a
+/// DM pair, a late `end_conversation` (e.g. the agent's `ignore_message`
+/// landing after a long quiet period) must STILL write the `dm_ended`
+/// marker and notify the peer — pre-fix it returned `Ok(())` silently,
+/// conflating "expiry swept it" with "peer already ended it".
+#[tokio::test]
+async fn test_end_conversation_after_expiry_sweep_still_ends() {
+    let (bus, mut rx) = setup();
+    let alice_id = AgentId::new();
+    let bob_id = AgentId::new();
+    let charlie_id = AgentId::new();
+
+    // Open the alice-bob conversation.
+    bus.send("alice", alice_id, "bob", bob_id, "ping", None)
+        .await
+        .unwrap();
+    let _ = rx.try_recv();
+
+    let ab_ctx = dm_context_id("alice", "bob");
+    let ab_session = SessionId::deterministic_dm("alice", "bob");
+
+    // Backdate alice-bob activity, then trigger the opportunistic sweep
+    // via an unrelated send (same mechanism as
+    // `test_expired_entries_cleaned_up`).
+    bus.last_activity.insert(
+        ab_ctx.clone(),
+        std::time::Instant::now() - std::time::Duration::from_secs(DEPTH_EXPIRY_SECS + 1),
+    );
+    bus.send("alice", alice_id, "charlie", charlie_id, "hi", None)
+        .await
+        .unwrap();
+    let _ = rx.try_recv();
+    assert!(
+        !bus.depths.contains_key(&ab_ctx),
+        "precondition: alice-bob depth entry must be swept"
+    );
+    assert!(
+        bus.expired_pairs.contains_key(&ab_ctx),
+        "sweep must leave a tombstone for the alice-bob pair"
+    );
+
+    // Late end (bob ignores alice's message long after the sweep).
+    bus.end_conversation(
+        "bob",
+        bob_id,
+        "alice",
+        alice_id,
+        ConversationEndReason::Ignored,
+    )
+    .await
+    .unwrap();
+
+    // The dm_ended marker must be written despite the swept depth entry.
+    let history = bus.session_manager.get_history(ab_session).unwrap();
+    assert!(
+        history.iter().any(|m| {
+            m.metadata
+                .as_ref()
+                .and_then(|meta| meta.get("message_type"))
+                .and_then(|v| v.as_str())
+                == Some("dm_ended")
+        }),
+        "dm_ended marker must be persisted even when the depth entry was \
+         already removed by the expiry sweep"
+    );
+
+    // The peer must receive the ConversationEnded trigger.
+    let trigger = rx.try_recv().expect("expected ConversationEnded trigger");
+    assert!(
+        matches!(trigger.source, MessageSource::ConversationEnded { .. }),
+        "peer must be notified of the end after an expiry sweep"
+    );
+    assert_eq!(trigger.agent_id, alice_id);
+
+    // The tombstone is consumed.
+    assert!(
+        !bus.expired_pairs.contains_key(&ab_ctx),
+        "tombstone must be consumed by the end"
+    );
+}
+
+/// After a swept-pair end was emitted once, a duplicate `end_conversation`
+/// must take the skip path (the tombstone was consumed) — no second marker
+/// or trigger.
+#[tokio::test]
+async fn test_end_conversation_after_sweep_is_idempotent() {
+    let (bus, mut rx) = setup();
+    let alice_id = AgentId::new();
+    let bob_id = AgentId::new();
+
+    bus.send("alice", alice_id, "bob", bob_id, "ping", None)
+        .await
+        .unwrap();
+    let _ = rx.try_recv();
+
+    let ab_ctx = dm_context_id("alice", "bob");
+    let ab_session = SessionId::deterministic_dm("alice", "bob");
+
+    // Simulate the sweep directly: remove the depth entry, leave a tombstone.
+    bus.depths.remove(&ab_ctx);
+    bus.last_activity.remove(&ab_ctx);
+    bus.expired_pairs
+        .insert(ab_ctx.clone(), std::time::Instant::now());
+
+    // First end consumes the tombstone and emits the full end.
+    bus.end_conversation(
+        "bob",
+        bob_id,
+        "alice",
+        alice_id,
+        ConversationEndReason::Ignored,
+    )
+    .await
+    .unwrap();
+
+    // Second end must be a no-op.
+    bus.end_conversation(
+        "alice",
+        alice_id,
+        "bob",
+        bob_id,
+        ConversationEndReason::Ignored,
+    )
+    .await
+    .unwrap();
+
+    let mut trigger_count = 0;
+    while rx.try_recv().is_ok() {
+        trigger_count += 1;
+    }
+    assert_eq!(
+        trigger_count, 1,
+        "post-sweep end must remain idempotent: exactly 1 trigger expected"
+    );
+
+    let history = bus.session_manager.get_history(ab_session).unwrap();
+    let marker_count = history
+        .iter()
+        .filter(|m| {
+            m.metadata
+                .as_ref()
+                .and_then(|meta| meta.get("message_type"))
+                .and_then(|v| v.as_str())
+                == Some("dm_ended")
+        })
+        .count();
+    assert_eq!(marker_count, 1, "exactly one dm_ended marker expected");
+}
+
+/// A stale tombstone must not survive the pair becoming active again: if
+/// the pair was swept, then a new send restarts the conversation, then the
+/// peer properly ends it, a later duplicate end must take the skip path
+/// (no duplicate marker/trigger from the stale tombstone).
+#[tokio::test]
+async fn test_new_send_clears_sweep_tombstone() {
+    let (bus, mut rx) = setup();
+    let alice_id = AgentId::new();
+    let bob_id = AgentId::new();
+
+    let ab_ctx = dm_context_id("alice", "bob");
+
+    // Simulate a swept pair.
+    bus.expired_pairs
+        .insert(ab_ctx.clone(), std::time::Instant::now());
+
+    // New send restarts the conversation — tombstone must be dropped.
+    bus.send("alice", alice_id, "bob", bob_id, "fresh start", None)
+        .await
+        .unwrap();
+    let _ = rx.try_recv();
+    assert!(
+        !bus.expired_pairs.contains_key(&ab_ctx),
+        "a live conversation must clear the sweep tombstone"
+    );
+
+    // Proper end, then duplicate end: exactly one trigger overall.
+    bus.end_conversation(
+        "bob",
+        bob_id,
+        "alice",
+        alice_id,
+        ConversationEndReason::Ignored,
+    )
+    .await
+    .unwrap();
+    bus.end_conversation(
+        "alice",
+        alice_id,
+        "bob",
+        bob_id,
+        ConversationEndReason::Ignored,
+    )
+    .await
+    .unwrap();
+
+    let mut trigger_count = 0;
+    while rx.try_recv().is_ok() {
+        trigger_count += 1;
+    }
+    assert_eq!(
+        trigger_count, 1,
+        "duplicate end after restart must not re-fire via a stale tombstone"
+    );
+}

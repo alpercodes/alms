@@ -819,6 +819,36 @@ pub async fn create_run(
         ));
     }
 
+    // Option C (#1156 review follow-up on #1154): DM sessions are
+    // agent-to-agent only — reject the operator path. Peer DM turns are
+    // triggered exclusively by `MessageBus` -> `RunTrigger` ->
+    // `run_trigger_loop` (notifications.rs), which enqueues with
+    // `is_peer_message: true` and never goes through this handler. This
+    // handler always enqueues with `is_peer_message: false`, so a
+    // POST /runs on a `dm:` session would arm the implicit-reply
+    // machinery (`dm_recipient.md` prompt + send_message peer-fold)
+    // while the DM completion gate refuses delivery (`NotPeerDm`) — a
+    // guaranteed silent drop. Closing the unintended operator path is
+    // the structural fix; the RunTrigger path is unaffected by
+    // construction.
+    if context_id.starts_with("dm:") {
+        warn!(
+            session_id = %session_id.0,
+            context_id = %context_id,
+            "Rejecting POST /runs on a DM session with DM_SESSION_NOT_DIRECTLY_RUNNABLE (#1156)"
+        );
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error_code": "DM_SESSION_NOT_DIRECTLY_RUNNABLE",
+                "message": "DM sessions are agent-to-agent only; turns are \
+                            triggered via send_message, not POST /runs.",
+                "session_id": session_id.0.to_string(),
+                "context_id": context_id.as_str(),
+            })),
+        ));
+    }
+
     // #863: pre-flight per-agent config resolution so a per-agent provider
     // override with no model on any layer is rejected with a clean 400
     // BEFORE any LLM call rather than producing an opaque downstream 4xx
@@ -1333,6 +1363,24 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
                     SseEventData::session_activity_ended(session_id, run_id, agent_id),
                 )
                 .await;
+            // B4 (#1154): a peer-triggered DM run that dies on config
+            // resolution must still notify the DM peer — otherwise the
+            // peer's depth entry stays live until the 1800s sweep and the
+            // peer waits on a reply that will never come. `agent_name` is
+            // not resolved yet on this arm; the helper re-resolves it from
+            // the registry by `agent_id`.
+            super::dm_lifecycle::notify_dm_peer_of_setup_failure(
+                &state,
+                &run_id,
+                &session_id,
+                agent_id,
+                None,
+                &context_id,
+                is_peer_message,
+                truncate_error_for_peer(&alms_core::AlmsError::Runtime(e.to_string())),
+            )
+            .await;
+
             state.run_manager.remove_senders(run_id);
             state.run_manager.remove_cancel_token(run_id);
             state.approval_store.clear_for_run(run_id);
@@ -1413,7 +1461,25 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
         // flip) preserved here to keep the rejection-message wire shape
         // stable for clients branching on
         // `INVALID_TOKEN_BUDGET_FOR_PROVIDER`.
-        let _ = state.run_manager.mark_run_as_failed(run_id, message);
+        let _ = state
+            .run_manager
+            .mark_run_as_failed(run_id, message.clone());
+
+        // B4 (#1154): notify the DM peer when a peer-triggered DM run is
+        // rejected by the token-budget validator — same rationale as the
+        // resolve-failure arm above. `agent_name` IS resolved on this arm.
+        super::dm_lifecycle::notify_dm_peer_of_setup_failure(
+            &state,
+            &run_id,
+            &session_id,
+            agent_id,
+            agent_name.as_deref(),
+            &context_id,
+            is_peer_message,
+            truncate_error_for_peer(&alms_core::AlmsError::Runtime(message)),
+        )
+        .await;
+
         state.run_manager.remove_senders(run_id);
         state.run_manager.remove_cancel_token(run_id);
         state.approval_store.clear_for_run(run_id);
@@ -1662,6 +1728,21 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
                 );
             }
 
+            // B4 (#1154): notify the DM peer when a peer-triggered DM run
+            // dies on runtime construction — same rationale as the
+            // resolve-failure arm above.
+            super::dm_lifecycle::notify_dm_peer_of_setup_failure(
+                &state,
+                &run_id,
+                &session_id,
+                agent_id,
+                agent_name.as_deref(),
+                &context_id,
+                is_peer_message,
+                truncate_error_for_peer(&e),
+            )
+            .await;
+
             state.run_manager.remove_senders(run_id);
             state.run_manager.remove_cancel_token(run_id);
             state.approval_store.clear_for_run(run_id);
@@ -1678,6 +1759,16 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
     // Set agent name for perspective mapping in DM sessions.
     if let Some(ref name) = agent_name {
         runtime = runtime.with_agent_name(name.clone());
+    }
+
+    // Implicit DM reply mode (#1154): for peer-triggered DM runs the
+    // final assistant text IS the reply, delivered by the DM completion
+    // gate after the run completes. The flag arms the runtime's bounded
+    // empty-reply nudge and tells `finish_run` to leave the final-text
+    // persistence to `MessageBus::send` (avoiding a double-render in the
+    // DM session).
+    if is_peer_message && context_id.starts_with("dm:") {
+        runtime = runtime.with_dm_implicit_reply();
     }
 
     // #866: when a separate summary provider is configured, wire the
@@ -1977,13 +2068,31 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
     // Register peer messaging tools (Layer 2) when agent name is known.
     if let Some(ref name) = agent_name {
         let sender: std::sync::Arc<dyn alms_tools::MessageSender> = state.message_bus.clone();
+        // During a DM run, `send_message` is valid only for a NON-peer
+        // recipient (#1154 design default #2): a send aimed at the current
+        // peer is folded by the tool (no delivery) because the agent's
+        // final reply text is delivered implicitly by the completion gate.
+        //
+        // Gated on `is_peer_message` (#1156 defense-in-depth): the fold is
+        // only correct when the completion gate actually delivers, and the
+        // gate is armed exclusively for peer-triggered DM runs. Option C
+        // already rejects non-peer runs on `dm:` sessions at `create_run`,
+        // so this branch is unreachable for them today — the gate makes the
+        // invariant explicit if a new non-peer `dm:` path is ever introduced
+        // (folding without delivery would silently drop the message).
+        let dm_peer_for_send_tool = if is_peer_message {
+            extract_peer_from_dm_context(&context_id, name)
+        } else {
+            None
+        };
         let send_tool = alms_tools::SendMessageTool::new(
             sender,
             agent_id,
             name.clone(),
             state.session_manager.clone(),
             session_id,
-        );
+        )
+        .with_dm_peer(dm_peer_for_send_tool);
         let list_tool =
             alms_tools::ListAgentsTool::new(state.session_manager.clone(), name.clone());
         let read_tool =
@@ -2054,12 +2163,6 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
     } else {
         None
     };
-
-    // Capture a timestamp *before* the run starts so we can scope the DM
-    // outbound-message lookup to only messages written during this run.
-    // Without this, an `ignore_message` run would pick up a stale outbound
-    // message from a prior run (#434, Bug 1).
-    let run_start_ts = alms_core::Timestamp::now();
 
     // System-triggered notification runs (subagent completions, DM-ended)
     // that land on a user-facing session pre-persist the notification as
@@ -2202,51 +2305,18 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
             // consumes `output.response` (#927 reorder preserves the
             // original consume-then-clone shape, just rolls it earlier).
             //
-            // For DM runs the agent's actual outbound reply is sent via the
-            // `send_message` tool and persisted to the shared DM session —
-            // `output.response` is typically empty or a brief LLM
-            // acknowledgment.  Read the last outbound message from the DM
-            // session to capture the real content for episodic summaries
-            // (#421).
-            //
-            // All DM messages are stored as `Role::User` with `from_agent`
-            // metadata — perspective mapping to `Role::Assistant` only
-            // happens at context assembly time.  So we match on
-            // `from_agent` + `message_type == "dm"` instead of role.
-            //
-            // Interaction with the #1098 reasoning strip below: when the DM
-            // branch fires it replaces `output.response` with the last
-            // outbound DM message text — a string that by construction
-            // cannot equal or be a prefix of the run's reasoning trace
-            // (it's pulled from a tool-emitted user message, not from the
-            // final LLM turn). So `strip_reasoning_from_output` is a
-            // guaranteed no-op on the DM branch and the rewrite is
-            // safe regardless of `output.reasoning`'s value.
-            let run_output_for_summary = run_input_for_summary.as_ref().map(|_| {
-                if context_id.starts_with("dm:")
-                    && let Some(ref name) = agent_name
-                    && let Some(last_own) =
-                        state.session_manager.find_last_message(session_id, |m| {
-                            // Scope to messages written *during this run* to avoid
-                            // picking up stale outbound messages from prior runs
-                            // (e.g. when ignore_message was called in the current
-                            // run — #434 Bug 1).
-                            m.timestamp.0 >= run_start_ts.0
-                                && m.metadata.as_ref().is_some_and(|meta| {
-                                    meta.get("from_agent").and_then(|v| v.as_str()) == Some(name)
-                                        && meta.get("message_type").and_then(|v| v.as_str())
-                                            == Some("dm")
-                                })
-                                && matches!(m.content, alms_session::Content::Text(_))
-                        })
-                    && let alms_session::Content::Text(ref text) = last_own.content
-                    && !text.is_empty()
-                {
-                    return text.clone();
-                }
-                // Non-DM runs or fallback when no outbound message was found.
-                output.response.clone()
-            });
+            // Under implicit DM replies (#1154), `output.response` IS the
+            // outbound DM reply — the pre-#1154 lookup that read the last
+            // `send_message`-written outbound message from the DM session
+            // (#421 / #434 Bug 1) is obsolete: the reply is only persisted
+            // (via `MessageBus::send`) AFTER the completion gate below
+            // delivers it, so the run's own response field is the
+            // authoritative content for episodic summaries. `ignore_message`
+            // runs keep the pre-#1154 behaviour (empty response → empty
+            // summary output).
+            let run_output_for_summary = run_input_for_summary
+                .as_ref()
+                .map(|_| output.response.clone());
 
             // #1098: capture the extended-thinking trace from the final
             // LLM turn so the summarizer path can strip it from the
@@ -2260,6 +2330,16 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
             // no-op — so threading reasoning through is safe in both
             // cases.
             let run_reasoning_for_summary = output.reasoning.clone();
+
+            // Capture the final text + reasoning for the DM completion gate
+            // (#1154) before `mark_run_as_completed` consumes
+            // `output.response`. Under implicit replies the response is the
+            // candidate message for the DM peer; the reasoning copy lets
+            // the gate detect the `[Thinking]`-only promotion fallback
+            // (`response == reasoning`) so a reasoning trace is never
+            // delivered as a reply.
+            let dm_response = output.response.clone();
+            let dm_reasoning = output.reasoning.clone();
 
             // #927 (extends #895): flip the run state to `Completed`
             // BEFORE broadcasting `run_finished`. Pre-fix, a concurrent
@@ -2362,9 +2442,21 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
                     });
                 }
 
-                // -- DM post-run lifecycle (consolidated in #628) --
+                // -- DM completion gate (consolidated in #628, redesigned
+                //    for implicit replies in #1154) --
                 //
-                // Detect ignore_message, signal conversation end, emit SSE events.
+                // Every peer-triggered DM run exits as exactly one of
+                // delivered | ended | errored — never silence:
+                //
+                // - `ignore_message` succeeded → ended (marker + peer
+                //   notification + `dm_conversation_ended` SSE).
+                // - Deliverable final text → delivered to the peer via
+                //   `MessageBus::send` (persisted to the shared DM session
+                //   + peer run triggered). The final text IS the reply; no
+                //   `send_message` call is involved.
+                // - Neither → errored: the conversation is ended with an
+                //   `Errored` reason so the peer is notified.
+                //
                 // All logic lives in `dm_lifecycle::handle_dm_run_completion()`.
                 //
                 // #1052: gated on `completed_transitioned` together with
@@ -2384,7 +2476,7 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
                 // the atomicity guard, so skipping the
                 // `handle_dm_run_completion` call here cannot strand
                 // depth-counter state.
-                super::dm_lifecycle::handle_dm_run_completion(
+                let dm_exit = super::dm_lifecycle::handle_dm_run_completion(
                     super::dm_lifecycle::DmRunCompletionContext {
                         state: &state,
                         run_id,
@@ -2394,9 +2486,18 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
                         context_id: &context_id,
                         is_peer_message,
                         tool_calls: &output.tool_calls,
+                        response: &dm_response,
+                        reasoning: dm_reasoning.as_deref(),
                     },
                 )
                 .await;
+                if dm_exit != super::dm_lifecycle::DmRunExit::NotPeerDm {
+                    info!(
+                        run_id = %run_id.0,
+                        dm_exit = ?dm_exit,
+                        "DM completion gate exit"
+                    );
+                }
 
                 info!("Run {} completed successfully", run_id.0);
             } else {

@@ -79,10 +79,20 @@ impl AgentRuntime {
         let mut system_prompt =
             self.assemble_system_prompt(&self.config.system_prompt, include_user);
 
-        // For DM sessions, append instructions telling the agent how to reply.
-        // The agent's text response will NOT be stored in the shared session,
-        // so it must use `send_message` to communicate with the peer.
-        if context_id.starts_with("dm:")
+        // For peer-triggered DM runs, append the implicit-reply addendum
+        // (`dm_recipient.md`): the agent's final message text is delivered
+        // to the peer automatically by the gateway's DM completion gate
+        // (#1154) — no tool call required.
+        //
+        // Gated on `self.dm_implicit_reply` (#1156 defense-in-depth), which
+        // the gateway sets only for peer-triggered runs (`is_peer_message`).
+        // The completion gate only delivers for peer-triggered runs, so
+        // promising implicit delivery on any other `dm:` run would be a
+        // lie that ends in a silent drop. Option C already rejects non-peer
+        // runs on `dm:` sessions at run creation; this gate keeps the
+        // prompt honest even if a new non-peer `dm:` path is ever added.
+        if self.dm_implicit_reply
+            && context_id.starts_with("dm:")
             && let Some(peer) = self.dm_peer_name(context_id)
         {
             system_prompt.push_str(&Self::dm_addendum(&peer));

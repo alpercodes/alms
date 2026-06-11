@@ -11,8 +11,7 @@ use uuid::Uuid;
 
 use super::AgentRuntime;
 use super::dm::{
-    DM_CONFLICT_MSG, DM_TEXT_ONLY_MAX_RETRIES, DM_TEXT_ONLY_RETRY_MSG, detect_dm_conflict,
-    dm_tool_was_called, should_terminate_after_dm_send,
+    DM_CONFLICT_MSG, DM_EMPTY_REPLY_MAX_RETRIES, DM_EMPTY_REPLY_RETRY_MSG, detect_dm_conflict,
 };
 use super::helpers::tool_result_ok;
 use super::types::Posture;
@@ -230,9 +229,10 @@ impl AgentRuntime {
         let mut total_usage = TokenUsage::default();
         let mut tool_call_records: Vec<alms_core::ToolCallRecord> = Vec::new();
         let mut tool_seq: u32 = 0;
-        // Tracks how many times we have retried after a DM text-only response.
-        // Capped at DM_TEXT_ONLY_MAX_RETRIES to prevent infinite loops.
-        let mut dm_text_only_retries: u32 = 0;
+        // Tracks how many times we have nudged the agent after a DM run
+        // ended with no deliverable reply text (#1154 design default #3).
+        // Capped at DM_EMPTY_REPLY_MAX_RETRIES to prevent infinite loops.
+        let mut dm_empty_reply_retries: u32 = 0;
 
         loop {
             // Checkpoint A: check cancellation between iterations.
@@ -483,25 +483,18 @@ impl AgentRuntime {
                     );
                 }
 
-                // In a DM-triggered run, terminate the loop after the agent
-                // has successfully called `send_message`.  The reply has been
-                // delivered; re-entering the loop would let the LLM call
-                // `send_message` again, producing duplicate messages and a
-                // cascade of RunTrigger events (#407 Bug 1).
-                if should_terminate_after_dm_send(&tool_calls, is_dm, dm_check.conflict) {
-                    info!("DM run: send_message delivered -- ending loop (one reply per DM run)");
-                    let text = content.unwrap_or_default();
-                    return (
-                        tool_call_records,
-                        Ok(AgentLoopOutput {
-                            response: text,
-                            usage: total_usage,
-                            // The reasoning for this turn was already
-                            // persisted alongside its tool calls.
-                            reasoning: None,
-                        }),
-                    );
-                }
+                // NOTE (#1154): pre-implicit-reply, the loop terminated here
+                // when `send_message` appeared in the batch (the old
+                // `should_terminate_after_dm_send` presence check — #407
+                // Bug 1). That check did not verify the send succeeded or
+                // that the recipient was the DM peer, so a bad-recipient /
+                // depth-exceeded / self-message "soft error" result
+                // terminated the run as if a reply had been delivered,
+                // stranding the peer. Under implicit replies the agent's
+                // final assistant text IS the reply (delivered by the
+                // gateway's DM completion gate), `send_message` is only for
+                // contacting a *different* agent, and the loop simply
+                // continues like any other tool turn.
 
                 // Append tool_loop instructions to the system prompt for
                 // subsequent iterations. The agent's identity (initial prompt +
@@ -509,88 +502,89 @@ impl AgentRuntime {
                 // guidance on top.
                 //
                 // For DM sessions, re-inject the DM recipient addendum so the
-                // agent remembers to use `send_message` on every iteration --
-                // not just the first one (fixes #346).
+                // agent remembers the implicit-reply contract on every
+                // iteration -- not just the first one (fixes #346).
                 self.rebuild_system_prompt_for_tool_loop(&mut messages, include_user, dm_peer);
 
                 continue;
             }
 
-            // --- DM text-only response retry (#361) ---
+            // --- DM empty-reply nudge (#1154 design default #3) ---
             //
-            // When a DM-triggered run ends with a text-only response and
-            // neither `send_message` nor `ignore_message` was called during
-            // the entire run, the agent's response will be silently dropped
-            // (by design -- DM responses must go through `send_message`).
+            // Under implicit replies the final assistant text IS the message
+            // delivered to the DM peer (by the gateway's completion gate).
+            // When a peer-triggered DM run is about to end with no
+            // deliverable reply text — empty/whitespace-only content, or a
+            // `[Thinking]`-only promotion where `content == reasoning` —
+            // give the agent one bounded nudge to either write a real reply
+            // or call `ignore_message`. This replaces the old text-only
+            // retry machinery (#361), which retried in the OPPOSITE case
+            // (text present but no `send_message`) and ended with the
+            // silent `DM_TEXT_ONLY_DROPPED` drop.
             //
-            // Instead of accepting this silently, re-invoke the LLM with an
-            // error message so it gets one more chance to use the correct
-            // tool. We cap retries at DM_TEXT_ONLY_MAX_RETRIES to avoid
-            // infinite loops.
-            if is_dm
-                && !dm_tool_was_called(&tool_call_records)
-                && dm_text_only_retries < DM_TEXT_ONLY_MAX_RETRIES
-            {
-                dm_text_only_retries += 1;
+            // After the nudge is exhausted, the run completes with whatever
+            // (non-deliverable) text it has; the gateway's DM completion
+            // gate then ends the conversation with an `Errored` reason so
+            // the peer is notified instead of stranded.
+            let dm_reply_missing = is_dm
+                && self.dm_implicit_reply
+                && alms_core::deliverable_dm_reply(
+                    content.as_deref().unwrap_or(""),
+                    reasoning.as_deref(),
+                )
+                .is_none();
+
+            if dm_reply_missing && dm_empty_reply_retries < DM_EMPTY_REPLY_MAX_RETRIES {
+                dm_empty_reply_retries += 1;
                 warn!(
                     agent_id = %self.agent_id.0,
-                    retry = dm_text_only_retries,
-                    "DM run ended with text-only response -- retrying with error prompt"
+                    retry = dm_empty_reply_retries,
+                    "DM run ended with no deliverable reply text -- nudging once"
                 );
 
                 // Emit a warning event so the operator/UI is aware.
                 if let Some(ref tx) = self.event_sender {
                     let _ = tx.send(crate::events::RuntimeEvent::Warning {
-                        code: "DM_TEXT_ONLY_RETRY".to_string(),
-                        message: "Agent responded with text only in a DM session. \
-                                  Text responses are not delivered -- retrying with \
-                                  instructions to use send_message or ignore_message."
+                        code: "DM_EMPTY_REPLY_RETRY".to_string(),
+                        message: "Agent produced no reply text in a DM session. \
+                                  Retrying once with instructions to reply with \
+                                  text or use ignore_message."
                             .to_string(),
                         source_agent: None,
                     });
                 }
 
-                // Push the agent's text response as an assistant message so
-                // the LLM sees what it said, then append the error as a user
-                // message so it knows what went wrong.
-                if let Some(ref text) = content
-                    && !text.is_empty()
-                {
-                    messages.push(LlmMessage {
-                        role: "assistant".to_string(),
-                        content: Some(text.clone()),
-                        reasoning_content: None,
-                        tool_calls: None,
-                        tool_call_id: None,
-                    });
-                }
-                messages.push(LlmMessage::user(DM_TEXT_ONLY_RETRY_MSG));
+                // Append the nudge as a user message. The (non-deliverable)
+                // content is intentionally NOT replayed as assistant text:
+                // it is either empty or a promoted reasoning trace, and
+                // replaying a reasoning trace as assistant content would
+                // launder it into the next turn's context (#776 invariant).
+                messages.push(LlmMessage::user(DM_EMPTY_REPLY_RETRY_MSG));
 
                 // Re-inject the DM addendum into the system prompt so the
-                // agent is reminded of the tool requirement.
+                // agent is reminded of the implicit-reply contract.
                 self.rebuild_system_prompt_for_tool_loop(&mut messages, include_user, dm_peer);
 
                 continue;
             }
 
-            // If this is a DM run and the retry was exhausted without the
-            // agent calling send_message/ignore_message, the text response
-            // will be silently dropped by finish_run. Emit a warning so
-            // the operator has visibility into the failure.
-            if is_dm
-                && !dm_tool_was_called(&tool_call_records)
-                && dm_text_only_retries >= DM_TEXT_ONLY_MAX_RETRIES
-            {
+            // Nudge exhausted and still no deliverable reply: surface a
+            // warning for operator visibility. The gateway's DM completion
+            // gate converts this into an `Errored` conversation end for the
+            // peer (replaces the silent `DM_TEXT_ONLY_DROPPED` outcome).
+            if dm_reply_missing {
                 warn!(
                     agent_id = %self.agent_id.0,
-                    retries = dm_text_only_retries,
-                    "DM text-only retry exhausted -- response will be dropped"
+                    retries = dm_empty_reply_retries,
+                    "DM empty-reply nudge exhausted -- gateway will end the \
+                     conversation with an error so the peer is notified"
                 );
                 if let Some(ref tx) = self.event_sender {
                     let _ = tx.send(crate::events::RuntimeEvent::Warning {
-                        code: "DM_TEXT_ONLY_DROPPED".to_string(),
-                        message: "Agent failed to use send_message or ignore_message \
-                                  after retry. The text-only response has been dropped."
+                        code: "DM_EMPTY_REPLY".to_string(),
+                        message: "Agent failed to produce reply text after the \
+                                  nudge. The DM conversation will be ended with \
+                                  an error so the peer is notified."
                             .to_string(),
                         source_agent: None,
                     });

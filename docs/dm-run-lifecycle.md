@@ -2,6 +2,8 @@
 
 **Status**: research artifact — frozen as of 2026-04-25 against `release/0.2.2`. The source code in `crates/` is always authoritative; if this doc and the code disagree, fix the doc or open an issue.
 
+> **Superseded in part by #1154 (implicit DM replies)**: agents no longer call `send_message` to reply to their DM peer — the run's final assistant text IS the reply, delivered by the gateway's DM completion gate (`crates/alms-gateway/src/runs/dm_lifecycle.rs`) after the run completes. `should_terminate_after_dm_send`, the text-only retry, and the `send_message`-reply round-trip described below no longer exist. `send_message` survives only for contacting a *different* agent; `ignore_message` still ends the conversation. The queueing / parallelism / depth-counter analysis below still applies to the delivery path (the gate reuses `MessageBus::send`).
+
 **Originally filed as**: #740 (closed once landed here).
 
 **See also**: `docs/layer2-peer-messaging-design.md` (the design doc for peer messaging), `docs/api.md` (`dm_*` SSE event payloads).

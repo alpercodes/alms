@@ -607,6 +607,35 @@ pub fn ran_ignore_message_successfully(records: &[ToolCallRecord]) -> bool {
     })
 }
 
+/// Classify a run's final assistant text as a deliverable DM reply (#1154).
+///
+/// Under implicit DM replies, the agent's final assistant text **is** the
+/// message delivered to its DM peer — no `send_message` call required.
+/// This helper decides whether the text is actually deliverable:
+///
+/// - Empty or whitespace-only text is **not** deliverable (returns `None`).
+/// - Text that is byte-identical to the run's reasoning trace is **not**
+///   deliverable: that is the `[Thinking]`-only promotion fallback from
+///   `finalize_content_and_reasoning` (#1098 detection pattern,
+///   `response == reasoning`), where the model emitted no visible content
+///   and the runtime promoted the thinking trace as a stand-in answer.
+///   Reasoning must never be delivered to a peer as a reply.
+/// - Otherwise the trimmed text is the reply.
+///
+/// Shared between `alms-runtime` (the in-loop empty-reply nudge) and
+/// `alms-gateway` (the DM completion gate's delivered/errored decision) so
+/// both layers agree on what counts as a reply.
+pub fn deliverable_dm_reply<'a>(response: &'a str, reasoning: Option<&str>) -> Option<&'a str> {
+    let trimmed = response.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if reasoning.is_some_and(|r| r == response) {
+        return None;
+    }
+    Some(trimmed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1241,6 +1270,49 @@ mod tests {
         assert!(
             !ran_ignore_message_successfully(&records),
             "any tool error should prevent ignore_message from being treated as successful"
+        );
+    }
+
+    // ---- deliverable_dm_reply tests (#1154 implicit DM replies) ----
+
+    #[test]
+    fn test_deliverable_dm_reply_normal_text() {
+        assert_eq!(deliverable_dm_reply("Hello Bob!", None), Some("Hello Bob!"));
+    }
+
+    #[test]
+    fn test_deliverable_dm_reply_trims_whitespace() {
+        assert_eq!(
+            deliverable_dm_reply("  Hello Bob!\n", None),
+            Some("Hello Bob!")
+        );
+    }
+
+    #[test]
+    fn test_deliverable_dm_reply_empty_is_none() {
+        assert_eq!(deliverable_dm_reply("", None), None);
+    }
+
+    #[test]
+    fn test_deliverable_dm_reply_whitespace_only_is_none() {
+        assert_eq!(deliverable_dm_reply("   \n\t ", None), None);
+    }
+
+    /// `[Thinking]`-only promotion fallback: when the runtime promoted the
+    /// reasoning trace into `response` (`response == reasoning`, the #1098
+    /// detection pattern), the text is NOT a deliverable reply.
+    #[test]
+    fn test_deliverable_dm_reply_promoted_reasoning_is_none() {
+        let trace = "I should think about whether to reply...";
+        assert_eq!(deliverable_dm_reply(trace, Some(trace)), None);
+    }
+
+    /// Distinct reasoning alongside real visible text does not block delivery.
+    #[test]
+    fn test_deliverable_dm_reply_distinct_reasoning_delivers() {
+        assert_eq!(
+            deliverable_dm_reply("Hello Bob!", Some("thinking about a greeting")),
+            Some("Hello Bob!")
         );
     }
 }

@@ -100,7 +100,7 @@ pub enum RuntimeEvent {
     /// The gateway converts this to a `run_warning` SSE event so the
     /// operator/UI is informed. The run continues after the warning.
     Warning {
-        /// Machine-readable warning code (e.g. `DM_TEXT_ONLY_RETRY`).
+        /// Machine-readable warning code (e.g. `DM_EMPTY_REPLY_RETRY`).
         code: String,
         /// Human-readable warning message.
         message: String,
@@ -318,8 +318,8 @@ mod tests {
         let (tx, mut rx) = mpsc::unbounded_channel::<RuntimeEvent>();
 
         tx.send(RuntimeEvent::Warning {
-            code: "DM_TEXT_ONLY_RETRY".to_string(),
-            message: "Agent responded with text only in DM — retrying".to_string(),
+            code: "DM_EMPTY_REPLY_RETRY".to_string(),
+            message: "Agent produced no reply text in DM — retrying".to_string(),
             source_agent: None,
         })
         .unwrap();
@@ -329,8 +329,8 @@ mod tests {
         let event = rx.recv().await.unwrap();
         assert!(
             matches!(&event, RuntimeEvent::Warning { code, message, source_agent }
-                if code == "DM_TEXT_ONLY_RETRY"
-                && message.contains("text only")
+                if code == "DM_EMPTY_REPLY_RETRY"
+                && message.contains("no reply text")
                 && source_agent.is_none())
         );
 

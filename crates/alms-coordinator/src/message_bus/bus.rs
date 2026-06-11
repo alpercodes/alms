@@ -49,6 +49,23 @@ pub struct MessageBus {
     /// peer's source session instead of an invisible `notifications:` session.
     /// Entries are cleaned up alongside depth expiry.
     pub(super) source_sessions: DashMap<(String, String), SessionId>,
+    /// Tombstones for DM pairs whose depth entry was removed by the
+    /// `DEPTH_EXPIRY_SECS` inactivity sweep (#1154 / B5).
+    ///
+    /// `end_conversation` uses `depths.remove()` as its atomicity guard:
+    /// `None` historically meant "already ended by the peer" and the call
+    /// returned without writing the `dm_ended` marker or notifying the
+    /// peer. But the expiry sweep ALSO removes depth entries — conflating
+    /// "peer ended it" with "expiry swept it" meant a late
+    /// `ignore_message` / `end_conversation` on a swept pair silently
+    /// dropped the end: no marker, no `ConversationEnded` trigger, peer
+    /// stranded. The tombstone separates the two cases: sweeps record the
+    /// pair here, and `end_conversation` proceeds with the full end when
+    /// it finds (and consumes) a tombstone for a pair with no live depth
+    /// entry. Entries are removed when consumed, when the pair becomes
+    /// active again (`send`), or after `DEPTH_EXPIRY_SECS` via the
+    /// opportunistic cleanup pass.
+    pub(super) expired_pairs: DashMap<String, Instant>,
 }
 
 impl MessageBus {
@@ -64,6 +81,7 @@ impl MessageBus {
             depths: DashMap::new(),
             last_activity: DashMap::new(),
             source_sessions: DashMap::new(),
+            expired_pairs: DashMap::new(),
         }
     }
 
@@ -122,11 +140,17 @@ impl MessageSender for MessageBus {
 
         // Time-based depth expiry: if no messages have been exchanged in
         // this DM pair for DEPTH_EXPIRY_SECS, reset the depth counter so
-        // a new conversation burst can start fresh.
+        // a new conversation burst can start fresh. The sweep leaves a
+        // tombstone in `expired_pairs` so a late `end_conversation` can
+        // distinguish "swept by expiry" from "already ended by the peer"
+        // (#1154 / B5).
         if let Some(last) = self.last_activity.get(&dm_context)
             && last.elapsed().as_secs() >= DEPTH_EXPIRY_SECS
         {
-            self.depths.remove(&dm_context);
+            if self.depths.remove(&dm_context).is_some() {
+                self.expired_pairs
+                    .insert(dm_context.clone(), Instant::now());
+            }
             self.remove_source_sessions_for_dm(&dm_context);
         }
 
@@ -135,13 +159,21 @@ impl MessageSender for MessageBus {
         // retain entries that have been active within the expiry window.
         self.last_activity.retain(|key, last| {
             if last.elapsed().as_secs() >= DEPTH_EXPIRY_SECS {
-                self.depths.remove(key);
+                if self.depths.remove(key).is_some() {
+                    self.expired_pairs.insert(key.clone(), Instant::now());
+                }
                 self.remove_source_sessions_for_dm(key);
                 false
             } else {
                 true
             }
         });
+
+        // Tombstones are themselves bounded: a swept pair whose end never
+        // arrives within another DEPTH_EXPIRY_SECS window is dropped (a
+        // later end_conversation then takes the historical skip path).
+        self.expired_pairs
+            .retain(|_, swept_at| swept_at.elapsed().as_secs() < DEPTH_EXPIRY_SECS);
 
         // Internal depth tracking: increments each time a different sender
         // sends to the same DM pair. If Alice sends, then Bob replies, then
@@ -162,6 +194,12 @@ impl MessageSender for MessageBus {
             }
             *depth
         };
+
+        // The pair is live again (a depth entry now exists): drop any sweep
+        // tombstone so a future double-end after a proper `end_conversation`
+        // is not mistaken for a swept pair (which would emit a duplicate
+        // marker + trigger).
+        self.expired_pairs.remove(&dm_context);
 
         if current_depth > MAX_DM_DEPTH {
             // End the conversation cleanly: write a dm_ended marker to the
@@ -359,12 +397,34 @@ impl MessageSender for MessageBus {
         let was_active = self.depths.remove(&dm_context).is_some();
         self.last_activity.remove(&dm_context);
 
-        if !was_active {
+        if was_active {
+            // Defensive: a live depth entry means any old tombstone is
+            // stale (the pair restarted after a sweep) — drop it so a
+            // later duplicate end takes the skip path below.
+            self.expired_pairs.remove(&dm_context);
+        } else {
+            // No live depth entry. Distinguish "already ended by the
+            // peer" (skip — the peer's call wrote the marker and emitted
+            // the triggers) from "removed by the inactivity sweep"
+            // (#1154 / B5: proceed — nobody has signalled the end yet,
+            // and skipping would strand the peer with no `dm_ended`
+            // marker and no `ConversationEnded` notification). The
+            // tombstone `remove()` doubles as the atomicity guard for
+            // concurrent post-sweep end calls: only the caller that
+            // consumes the tombstone proceeds.
+            let was_swept = self.expired_pairs.remove(&dm_context).is_some();
+            if !was_swept {
+                info!(
+                    session_id = %session_id.0,
+                    "end_conversation skipped -- already ended by peer"
+                );
+                return Ok(());
+            }
             info!(
                 session_id = %session_id.0,
-                "end_conversation skipped -- already ended by peer"
+                "end_conversation on expiry-swept pair -- proceeding with \
+                 marker write and peer notification (#1154 / B5)"
             );
-            return Ok(());
         }
 
         // --- S2: Validate that the DM session exists ---

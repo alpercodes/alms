@@ -378,6 +378,18 @@ Notes:
 }
 ```
 
+**Response 400** (DM session, #1156):
+```json
+{
+  "error_code": "DM_SESSION_NOT_DIRECTLY_RUNNABLE",
+  "message": "DM sessions are agent-to-agent only; turns are triggered via send_message, not POST /runs.",
+  "session_id": "<uuid>",
+  "context_id": "dm:alice:bob"
+}
+```
+
+DM sessions (`context_id` starting with `dm:`) are agent-to-agent only. Peer DM turns are triggered exclusively by the `send_message` tool through the internal MessageBus (`RunTrigger` → trigger loop, which enqueues with `is_peer_message: true`) — never by `POST /runs`, which always enqueues non-peer runs. A non-peer run on a DM session would arm the implicit-reply machinery from #1154 (the DM recipient prompt and the `send_message` peer-fold) while the DM completion gate refuses delivery, guaranteeing a silent drop — so the gateway rejects the request up front.
+
 **Response 400** (resolved per-agent + server budget overshoots provider cap, #919):
 ```json
 {
@@ -574,10 +586,10 @@ Transient phase indicator emitted at key moments during the agent loop so the UI
 
 `run_warning`
 ```json
-{ "run_id": "<uuid>", "warning": {"code":"DM_TEXT_ONLY_RETRY","message":"..."} }
+{ "run_id": "<uuid>", "warning": {"code":"DM_EMPTY_REPLY_RETRY","message":"..."} }
 ```
 
-Emitted for non-fatal conditions that the frontend should display distinctly (yellow warning styling). Warning codes: `DM_TEXT_ONLY_RETRY` (DM agent responded with text only instead of using `send_message`/`ignore_message` -- retrying), `DM_TEXT_ONLY_DROPPED` (DM retry also failed -- text response was dropped). When the warning originates from a subagent, the payload includes a `source_agent` field identifying which subagent emitted it.
+Emitted for non-fatal conditions that the frontend should display distinctly (yellow warning styling). Warning codes: `DM_EMPTY_REPLY_RETRY` (peer-triggered DM run produced no deliverable reply text -- nudging once to reply with text or use `ignore_message`; #1154), `DM_EMPTY_REPLY` (the nudge was exhausted -- the gateway ends the DM conversation with an `errored` reason so the peer is notified). When the warning originates from a subagent, the payload includes a `source_agent` field identifying which subagent emitted it.
 
 `run_cancelled`
 ```json

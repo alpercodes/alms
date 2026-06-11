@@ -2694,10 +2694,16 @@ async fn create_run_resolves_per_agent_config_for_shared_session_via_requested_a
         .create_agent(&agent)
         .expect("agent seed should succeed");
 
-    let session_id = SessionId::deterministic_dm("alice", "bob");
+    // A non-DM shared session (agent_id = nil). This test originally used
+    // a `dm:` session as its shared-session vehicle, but POST /runs on DM
+    // sessions is rejected since #1156 (Option C — DM sessions are
+    // agent-to-agent only). The behaviour under test — per-agent config
+    // resolution via the request's `agent_id` on a shared session — is
+    // independent of the context flavour.
+    let session_id = SessionId::new();
     let session = state
         .session_manager
-        .get_or_create_shared(session_id, "dm:alice:bob");
+        .get_or_create_shared(session_id, "shared:config-resolution-test");
 
     let req = CreateRunRequest {
         session_id: session.id,
@@ -3801,7 +3807,7 @@ async fn handle_dm_run_completion_fires_when_completed_transition_wins() {
 
     // Mirror the lifecycle layer's behaviour: gate passes, so call
     // `handle_dm_run_completion`.
-    let signalled = super::dm_lifecycle::handle_dm_run_completion(
+    let exit = super::dm_lifecycle::handle_dm_run_completion(
         super::dm_lifecycle::DmRunCompletionContext {
             state: &state,
             run_id,
@@ -3811,13 +3817,16 @@ async fn handle_dm_run_completion_fires_when_completed_transition_wins() {
             context_id: dm_context,
             is_peer_message: true,
             tool_calls: &ignore_records,
+            response: "",
+            reasoning: None,
         },
     )
     .await;
-    assert!(
-        signalled,
-        "handle_dm_run_completion must return true for a peer-DM run \
-         that called ignore_message"
+    assert_eq!(
+        exit,
+        super::dm_lifecycle::DmRunExit::Ended,
+        "handle_dm_run_completion must take the Ended exit for a peer-DM \
+         run that called ignore_message"
     );
 
     tokio::task::yield_now().await;
@@ -8558,6 +8567,615 @@ async fn subagent_session_messages_endpoint_returns_transcript() {
             "{label} message must carry a string `timestamp` field; got {msg:?}"
         );
     }
+
+    shutdown_token.cancel();
+}
+
+// ---------------------------------------------------------------------------
+// DM completion gate tests (#1154 implicit replies)
+// ---------------------------------------------------------------------------
+
+/// Implicit reply happy path: a peer-triggered DM run that completes with
+/// plain final text — and NO `send_message` call — must have that text
+/// delivered to the peer: persisted to the shared DM session with
+/// `message_type: "dm"` metadata and a `RunTrigger` emitted for the peer.
+#[tokio::test]
+async fn dm_completion_gate_delivers_final_text() {
+    let (state, shutdown_token, _cr, mut tr, _dr) = test_app_state_with_sqlite();
+    let (alice_id, bob_id) = seed_alice_bob(&state);
+
+    // Alice opens the DM; drain her trigger.
+    let _ = state
+        .message_bus
+        .send("alice", alice_id, "bob", bob_id, "ping", None)
+        .await
+        .unwrap();
+    let _ = tr.try_recv();
+
+    let dm_context = "dm:alice:bob";
+    let dm_session_id = SessionId::deterministic_dm("alice", "bob");
+    let run_id = RunId::new();
+
+    // Bob's run completed with plain text and no tool calls.
+    let exit = super::dm_lifecycle::handle_dm_run_completion(
+        super::dm_lifecycle::DmRunCompletionContext {
+            state: &state,
+            run_id,
+            session_id: dm_session_id,
+            agent_id: bob_id,
+            agent_name: Some("bob"),
+            context_id: dm_context,
+            is_peer_message: true,
+            tool_calls: &[],
+            response: "Hello Alice, pong!",
+            reasoning: None,
+        },
+    )
+    .await;
+    assert_eq!(
+        exit,
+        super::dm_lifecycle::DmRunExit::Delivered,
+        "plain final text must take the Delivered exit"
+    );
+
+    // The reply is persisted to the shared DM session as a real DM message.
+    let history = state.session_manager.get_history(dm_session_id).unwrap();
+    let delivered = history.iter().find(|m| {
+        m.metadata.as_ref().is_some_and(|meta| {
+            meta.get("from_agent").and_then(|v| v.as_str()) == Some("bob")
+                && meta.get("message_type").and_then(|v| v.as_str()) == Some("dm")
+        })
+    });
+    let delivered = delivered.expect("bob's implicit reply must be persisted as a DM message");
+    assert!(
+        matches!(&delivered.content, alms_session::Content::Text(t) if t == "Hello Alice, pong!"),
+        "persisted DM message must carry the final assistant text"
+    );
+
+    // The peer is triggered with the reply text.
+    let trigger = tr
+        .try_recv()
+        .expect("peer must be triggered by the delivery");
+    assert_eq!(trigger.agent_id, alice_id);
+    assert_eq!(trigger.input, "Hello Alice, pong!");
+    assert!(
+        matches!(trigger.source, MessageSource::Agent { ref from_name, .. } if from_name == "bob"),
+        "trigger source must attribute the reply to bob"
+    );
+
+    shutdown_token.cancel();
+}
+
+/// B1 regression: a run whose only action was a FAILED `send_message`
+/// (bad recipient → soft-error tool result) and no final text must take
+/// the **errored** exit — the peer gets a `dm_ended` notification instead
+/// of waiting forever. Pre-#1154, the presence-only termination check
+/// completed the run as if the reply had been delivered.
+#[tokio::test]
+async fn dm_completion_gate_failed_send_no_longer_silently_completes() {
+    use alms_core::ToolCallRole;
+
+    let (state, shutdown_token, _cr, mut tr, _dr) = test_app_state_with_sqlite();
+    let (alice_id, bob_id) = seed_alice_bob(&state);
+
+    let _ = state
+        .message_bus
+        .send("alice", alice_id, "bob", bob_id, "ping", None)
+        .await
+        .unwrap();
+    let _ = tr.try_recv();
+
+    let dm_context = "dm:alice:bob";
+    let dm_session_id = SessionId::deterministic_dm("alice", "bob");
+    let run_id = RunId::new();
+
+    // Bob's run called send_message with a bad recipient (soft error
+    // result) and produced no final text.
+    let failed_send_records = vec![
+        alms_core::ToolCallRecord {
+            seq: 0,
+            role: ToolCallRole::Assistant,
+            tool_name: Some("send_message".to_string()),
+            tool_id: Some("call_1".to_string()),
+            params: Some(r#"{"to":"nonexistent","message":"hi"}"#.to_string()),
+            result: None,
+            timestamp: chrono::Utc::now(),
+            from_agent: None,
+        },
+        alms_core::ToolCallRecord {
+            seq: 1,
+            role: ToolCallRole::Tool,
+            tool_name: Some("send_message".to_string()),
+            tool_id: Some("call_1".to_string()),
+            params: None,
+            result: Some(r#"{"error":"Agent not found."}"#.to_string()),
+            timestamp: chrono::Utc::now(),
+            from_agent: None,
+        },
+    ];
+
+    let exit = super::dm_lifecycle::handle_dm_run_completion(
+        super::dm_lifecycle::DmRunCompletionContext {
+            state: &state,
+            run_id,
+            session_id: dm_session_id,
+            agent_id: bob_id,
+            agent_name: Some("bob"),
+            context_id: dm_context,
+            is_peer_message: true,
+            tool_calls: &failed_send_records,
+            response: "",
+            reasoning: None,
+        },
+    )
+    .await;
+    assert_eq!(
+        exit,
+        super::dm_lifecycle::DmRunExit::Errored,
+        "failed send_message + no final text must take the Errored exit, \
+         not silently complete"
+    );
+
+    // The peer is notified via the ConversationEnded trigger...
+    let trigger = tr
+        .try_recv()
+        .expect("peer must be notified of the errored end");
+    assert!(
+        matches!(
+            trigger.source,
+            MessageSource::ConversationEnded {
+                reason: ConversationEndReason::Errored { .. },
+                ..
+            }
+        ),
+        "trigger must carry the Errored reason; got {:?}",
+        trigger.source
+    );
+
+    // ...and the dm_ended marker lands in the session.
+    let history = state.session_manager.get_history(dm_session_id).unwrap();
+    assert!(
+        history.iter().any(|m| {
+            m.metadata
+                .as_ref()
+                .and_then(|meta| meta.get("message_type"))
+                .and_then(|v| v.as_str())
+                == Some("dm_ended")
+        }),
+        "dm_ended marker must be persisted on the errored exit"
+    );
+
+    shutdown_token.cancel();
+}
+
+/// Design default #3: an empty / whitespace-only final text with no end
+/// tool takes the **errored** exit (the runtime's bounded nudge already
+/// ran) — no empty message is delivered, and the peer is notified.
+#[tokio::test]
+async fn dm_completion_gate_empty_reply_ends_with_error() {
+    let (state, shutdown_token, _cr, mut tr, _dr) = test_app_state_with_sqlite();
+    let (alice_id, bob_id) = seed_alice_bob(&state);
+
+    let _ = state
+        .message_bus
+        .send("alice", alice_id, "bob", bob_id, "ping", None)
+        .await
+        .unwrap();
+    let _ = tr.try_recv();
+
+    let dm_context = "dm:alice:bob";
+    let dm_session_id = SessionId::deterministic_dm("alice", "bob");
+    let run_id = RunId::new();
+
+    let exit = super::dm_lifecycle::handle_dm_run_completion(
+        super::dm_lifecycle::DmRunCompletionContext {
+            state: &state,
+            run_id,
+            session_id: dm_session_id,
+            agent_id: bob_id,
+            agent_name: Some("bob"),
+            context_id: dm_context,
+            is_peer_message: true,
+            tool_calls: &[],
+            response: "   \n",
+            reasoning: None,
+        },
+    )
+    .await;
+    assert_eq!(exit, super::dm_lifecycle::DmRunExit::Errored);
+
+    // No DM message from bob may have been delivered.
+    let history = state.session_manager.get_history(dm_session_id).unwrap();
+    assert!(
+        !history.iter().any(|m| {
+            m.metadata.as_ref().is_some_and(|meta| {
+                meta.get("from_agent").and_then(|v| v.as_str()) == Some("bob")
+                    && meta.get("message_type").and_then(|v| v.as_str()) == Some("dm")
+            })
+        }),
+        "no (empty) DM message may be delivered to the peer"
+    );
+
+    // The peer is notified via the Errored conversation end.
+    let trigger = tr
+        .try_recv()
+        .expect("peer must be notified of the errored end");
+    assert!(matches!(
+        trigger.source,
+        MessageSource::ConversationEnded {
+            reason: ConversationEndReason::Errored { .. },
+            ..
+        }
+    ));
+
+    shutdown_token.cancel();
+}
+
+/// The `[Thinking]`-only promotion fallback (`response == reasoning`,
+/// #1098) is NOT a deliverable reply: the gate must take the errored exit
+/// rather than deliver a reasoning trace to the peer.
+#[tokio::test]
+async fn dm_completion_gate_promoted_reasoning_not_delivered() {
+    let (state, shutdown_token, _cr, mut tr, _dr) = test_app_state_with_sqlite();
+    let (alice_id, bob_id) = seed_alice_bob(&state);
+
+    let _ = state
+        .message_bus
+        .send("alice", alice_id, "bob", bob_id, "ping", None)
+        .await
+        .unwrap();
+    let _ = tr.try_recv();
+
+    let dm_context = "dm:alice:bob";
+    let dm_session_id = SessionId::deterministic_dm("alice", "bob");
+    let run_id = RunId::new();
+
+    let trace = "Let me think about whether this ping needs a response...";
+    let exit = super::dm_lifecycle::handle_dm_run_completion(
+        super::dm_lifecycle::DmRunCompletionContext {
+            state: &state,
+            run_id,
+            session_id: dm_session_id,
+            agent_id: bob_id,
+            agent_name: Some("bob"),
+            context_id: dm_context,
+            is_peer_message: true,
+            tool_calls: &[],
+            response: trace,
+            reasoning: Some(trace),
+        },
+    )
+    .await;
+    assert_eq!(
+        exit,
+        super::dm_lifecycle::DmRunExit::Errored,
+        "a promoted reasoning trace must NOT be delivered as a reply"
+    );
+
+    let history = state.session_manager.get_history(dm_session_id).unwrap();
+    assert!(
+        !history.iter().any(|m| {
+            m.metadata.as_ref().is_some_and(|meta| {
+                meta.get("from_agent").and_then(|v| v.as_str()) == Some("bob")
+                    && meta.get("message_type").and_then(|v| v.as_str()) == Some("dm")
+            })
+        }),
+        "the reasoning trace must not land in the DM session as a message"
+    );
+
+    let trigger = tr
+        .try_recv()
+        .expect("peer must be notified of the errored end");
+    assert!(matches!(
+        trigger.source,
+        MessageSource::ConversationEnded {
+            reason: ConversationEndReason::Errored { .. },
+            ..
+        }
+    ));
+
+    shutdown_token.cancel();
+}
+
+/// Non-peer-triggered runs on a DM session (and peer runs on non-DM
+/// sessions) are outside the gate: NotPeerDm, no side effects.
+#[tokio::test]
+async fn dm_completion_gate_not_peer_dm_is_noop() {
+    let (state, shutdown_token, _cr, mut tr, _dr) = test_app_state_with_sqlite();
+    let (alice_id, bob_id) = seed_alice_bob(&state);
+
+    let _ = state
+        .message_bus
+        .send("alice", alice_id, "bob", bob_id, "ping", None)
+        .await
+        .unwrap();
+    let _ = tr.try_recv();
+
+    let dm_session_id = SessionId::deterministic_dm("alice", "bob");
+
+    // Peer flag off → gate does not apply even on a dm: context.
+    let exit = super::dm_lifecycle::handle_dm_run_completion(
+        super::dm_lifecycle::DmRunCompletionContext {
+            state: &state,
+            run_id: RunId::new(),
+            session_id: dm_session_id,
+            agent_id: bob_id,
+            agent_name: Some("bob"),
+            context_id: "dm:alice:bob",
+            is_peer_message: false,
+            tool_calls: &[],
+            response: "hello",
+            reasoning: None,
+        },
+    )
+    .await;
+    assert_eq!(exit, super::dm_lifecycle::DmRunExit::NotPeerDm);
+
+    // dm: prefix missing → gate does not apply even for peer messages.
+    let exit = super::dm_lifecycle::handle_dm_run_completion(
+        super::dm_lifecycle::DmRunCompletionContext {
+            state: &state,
+            run_id: RunId::new(),
+            session_id: dm_session_id,
+            agent_id: bob_id,
+            agent_name: Some("bob"),
+            context_id: "web-chat-1234",
+            is_peer_message: true,
+            tool_calls: &[],
+            response: "hello",
+            reasoning: None,
+        },
+    )
+    .await;
+    assert_eq!(exit, super::dm_lifecycle::DmRunExit::NotPeerDm);
+
+    assert!(
+        tr.try_recv().is_err(),
+        "NotPeerDm exits must produce no triggers"
+    );
+
+    shutdown_token.cancel();
+}
+
+/// Option C (#1156, Tim's review on the #1154 PR): DM sessions are
+/// agent-to-agent only. `POST /runs` always enqueues with
+/// `is_peer_message: false`, so a run created through it on a `dm:`
+/// session would arm the implicit-reply machinery (DM recipient prompt +
+/// send_message peer-fold) while the completion gate refuses delivery
+/// (`NotPeerDm`) — a guaranteed silent drop. The handler must reject with
+/// a structured 400 instead.
+#[tokio::test]
+async fn create_run_rejects_dm_session_with_structured_400() {
+    use alms_core::{CreateRunRequest, RunInput};
+    use axum::Json;
+    use axum::extract::State;
+
+    let (state, shutdown_token, _cr, _tr, _dr) = test_app_state();
+
+    let dm_context = "dm:alice:bob";
+    let dm_session_id = SessionId::deterministic_dm("alice", "bob");
+    let session = state
+        .session_manager
+        .get_or_create_shared(dm_session_id, dm_context);
+
+    let req = CreateRunRequest {
+        session_id: session.id,
+        // Shared DM sessions require an agent_id on the request; supply
+        // one so the rejection under test (and not AGENT_ID_REQUIRED) is
+        // what fires.
+        agent_id: Some(AgentId::new()),
+        input: RunInput::Text { text: "hi".into() },
+    };
+
+    let Err((status, body)) = super::lifecycle::create_run(State(state.clone()), Json(req)).await
+    else {
+        panic!("create_run must reject non-peer runs on dm: sessions (#1156)");
+    };
+    assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+    assert_eq!(
+        body.0["error_code"], "DM_SESSION_NOT_DIRECTLY_RUNNABLE",
+        "rejection must carry the structured error code; got {:?}",
+        body.0
+    );
+    assert_eq!(body.0["context_id"], dm_context);
+
+    // The rejection must fire BEFORE any side effects: no run recorded,
+    // no user input pre-persisted to the DM session.
+    assert!(
+        state.run_manager.list_by_session(session.id, 10).is_empty(),
+        "no run may be created on the rejected path"
+    );
+    assert!(
+        state
+            .session_manager
+            .get_history(session.id)
+            .unwrap()
+            .is_empty(),
+        "no input may be persisted on the rejected path"
+    );
+
+    shutdown_token.cancel();
+}
+
+/// Companion to `create_run_rejects_dm_session_with_structured_400`: the
+/// peer-trigger path (`MessageBus` -> `RunTrigger` -> `run_trigger_loop`,
+/// which enqueues with `is_peer_message: true`) must be UNAFFECTED by the
+/// Option C rejection — it never goes through `create_run`. End-to-end
+/// against the mock LLM: the triggered run is created, executes, and the
+/// DM completion gate delivers bob's implicit reply to alice.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn peer_triggered_dm_run_is_not_rejected_and_delivers() {
+    let (state, shutdown_token, _cr, mut tr, _dr) = test_app_state_with_mock_llm();
+    let (alice_id, bob_id) = seed_alice_bob(&state);
+
+    // Alice DMs bob through the real MessageBus — persists the message to
+    // the shared DM session and emits the RunTrigger the gateway's
+    // trigger loop would normally consume.
+    let _ = state
+        .message_bus
+        .send("alice", alice_id, "bob", bob_id, "ping", None)
+        .await
+        .unwrap();
+    let trigger = tr
+        .try_recv()
+        .expect("MessageBus must emit a RunTrigger for bob");
+    assert_eq!(trigger.agent_id, bob_id);
+
+    // Feed the trigger through the actual run_trigger_loop.
+    let (test_tx, test_rx) = mpsc::unbounded_channel();
+    test_tx.send(trigger).unwrap();
+    drop(test_tx);
+    super::notifications::run_trigger_loop(test_rx, state.clone()).await;
+
+    let dm_session_id = SessionId::deterministic_dm("alice", "bob");
+
+    // The run was created — NOT rejected.
+    let runs = state.run_manager.list_by_session(dm_session_id, 10);
+    assert!(
+        !runs.is_empty(),
+        "peer-triggered DM run must be created on the trigger path"
+    );
+
+    // ...and executes to completion: the mock LLM's reply is delivered to
+    // the DM session by the completion gate. Poll with a timeout — the
+    // run executes on the agent queue's spawned task.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    let delivered = loop {
+        let history = state.session_manager.get_history(dm_session_id).unwrap();
+        let found = history
+            .iter()
+            .find(|m| {
+                m.metadata.as_ref().is_some_and(|meta| {
+                    meta.get("from_agent").and_then(|v| v.as_str()) == Some("bob")
+                        && meta.get("message_type").and_then(|v| v.as_str()) == Some("dm")
+                })
+            })
+            .cloned();
+        if let Some(msg) = found {
+            break msg;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for bob's implicit reply to be delivered; \
+             history: {history:?}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    };
+    assert!(
+        matches!(&delivered.content, alms_session::Content::Text(t) if t.contains("[mock]")),
+        "delivered DM message must carry the mock LLM's reply text; got {delivered:?}"
+    );
+
+    // The delivery re-triggers alice (normal DM ping-pong), proving the
+    // full MessageBus::send shape was used — not a bare session write.
+    let alice_trigger = tokio::time::timeout(std::time::Duration::from_secs(5), tr.recv())
+        .await
+        .expect("alice's trigger must arrive after the delivery")
+        .expect("trigger channel must stay open");
+    assert_eq!(alice_trigger.agent_id, alice_id);
+    assert!(
+        matches!(alice_trigger.source, MessageSource::Agent { ref from_name, .. } if from_name == "bob"),
+        "alice's trigger must attribute the reply to bob; got {:?}",
+        alice_trigger.source
+    );
+
+    shutdown_token.cancel();
+}
+
+/// B4 regression: a peer-triggered DM run that dies on a pre-loop setup
+/// failure (e.g. `resolve_agent_config` error — BEFORE the agent name is
+/// known) must still notify the peer. The helper re-resolves the agent
+/// name from the registry by ID.
+#[tokio::test]
+async fn dm_setup_failure_notifies_peer_without_agent_name() {
+    let (state, shutdown_token, _cr, mut tr, _dr) = test_app_state_with_sqlite();
+    let (alice_id, bob_id) = seed_alice_bob(&state);
+
+    let _ = state
+        .message_bus
+        .send("alice", alice_id, "bob", bob_id, "ping", None)
+        .await
+        .unwrap();
+    let _ = tr.try_recv();
+
+    let dm_context = "dm:alice:bob";
+    let dm_session_id = SessionId::deterministic_dm("alice", "bob");
+    let run_id = RunId::new();
+
+    // agent_name: None — the resolve-failure arm fires before the registry
+    // record is loaded; the helper must resolve "bob" by agent_id.
+    super::dm_lifecycle::notify_dm_peer_of_setup_failure(
+        &state,
+        &run_id,
+        &dm_session_id,
+        bob_id,
+        None,
+        dm_context,
+        true,
+        "failed to resolve agent config".to_string(),
+    )
+    .await;
+
+    // Peer notified with the Errored reason.
+    let trigger = tr
+        .try_recv()
+        .expect("peer must be notified of the setup failure");
+    assert_eq!(trigger.agent_id, alice_id);
+    match trigger.source {
+        MessageSource::ConversationEnded {
+            ref from_name,
+            ref reason,
+            ..
+        } => {
+            assert_eq!(from_name, "bob", "helper must resolve the agent name by ID");
+            assert!(
+                matches!(reason, ConversationEndReason::Errored { message }
+                    if message.contains("failed to resolve agent config")),
+                "reason must carry the setup-failure message; got {reason:?}"
+            );
+        }
+        other => panic!("expected ConversationEnded source, got {other:?}"),
+    }
+
+    // dm_ended marker persisted.
+    let history = state.session_manager.get_history(dm_session_id).unwrap();
+    assert!(
+        history.iter().any(|m| {
+            m.metadata
+                .as_ref()
+                .and_then(|meta| meta.get("message_type"))
+                .and_then(|v| v.as_str())
+                == Some("dm_ended")
+        }),
+        "dm_ended marker must be persisted on setup failure"
+    );
+
+    shutdown_token.cancel();
+}
+
+/// Non-DM / non-peer setup failures are outside the helper: no triggers,
+/// no markers.
+#[tokio::test]
+async fn dm_setup_failure_noop_outside_peer_dm() {
+    let (state, shutdown_token, _cr, mut tr, _dr) = test_app_state_with_sqlite();
+    let (_alice_id, bob_id) = seed_alice_bob(&state);
+
+    super::dm_lifecycle::notify_dm_peer_of_setup_failure(
+        &state,
+        &RunId::new(),
+        &SessionId::new(),
+        bob_id,
+        Some("bob"),
+        "web-chat-1234",
+        false,
+        "boom".to_string(),
+    )
+    .await;
+
+    assert!(
+        tr.try_recv().is_err(),
+        "non-peer-DM setup failures must not emit triggers"
+    );
 
     shutdown_token.cancel();
 }

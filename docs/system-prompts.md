@@ -12,12 +12,12 @@ files (`personality.md`, `goals.md`, `memories.md`, `user.md`).
 | `initial.md` | Base system prompt for all top-level agents. Sets the agent's default behavior and mentions the `alms --help` CLI discovery hint. | `AgentConfig::default()` in `crates/alms-runtime/src/agent/types.rs` |
 | `tool_loop.md` | Continuation prompt appended to the system message after tool results. Tells the LLM to analyze results and decide whether to use more tools or respond. | `SystemPrompts::default()` in `crates/alms-runtime/src/agent/types.rs` |
 | `bootstrap.md` | First-time agent onboarding prompt. Replaces the initial prompt when `personality.md` does not exist. Guides the agent through an interview to populate workspace files. | `AgentWorkspace::bootstrap_prompt()` in `crates/alms-runtime/src/workspace.rs` |
-| `dm_recipient.md` | Template appended to the system prompt when the agent receives a direct message. Contains a `{peer}` placeholder replaced at runtime with the sender's name. | `build_context()` in `crates/alms-runtime/src/agent/context.rs` |
+| `dm_recipient.md` | Template appended to the system prompt when the agent receives a direct message. Explains the implicit-reply contract (#1154): the final message text is delivered to the peer automatically. Contains a `{peer}` placeholder replaced at runtime with the sender's name. | `build_context()` in `crates/alms-runtime/src/agent/context.rs` |
 | `subagent.md` | Default system prompt for ephemeral (unnamed) subagents spawned via `invoke_agent`. | `DEFAULT_SUBAGENT_PROMPT` constant in `crates/alms-coordinator/src/lib.rs` |
 | `summarizer.md` | System prompt for the sliding-summary LLM call that compresses old conversation history into a rolling summary. | `maybe_summarize()` in `crates/alms-runtime/src/agent/context.rs` |
 | `session_summarizer.md` | System prompt for the episodic memory LLM call that generates cross-session summaries after each run. Focus on *what was accomplished*, not how. 1-3 sentences, past tense. | `generate_llm()` in `crates/alms-runtime/src/episodic.rs` |
 | `dm_summarizer.md` | DM-specific instruction prepended to the summarizer transcript. Tells the LLM to preserve per-agent attribution. Contains a `{transcript}` placeholder. | `maybe_summarize()` in `crates/alms-runtime/src/agent/context.rs` |
-| `dm_text_only_retry.md` | Error message injected when an agent uses a text-only response in a DM session instead of `send_message`/`ignore_message`. | `dm_text_only_retry()` in `crates/alms-runtime/src/agent/dm.rs` |
+| `dm_empty_reply_retry.md` | Nudge injected when a peer-triggered DM run is about to end with no deliverable reply text (#1154 implicit replies). Tells the agent its final message text IS the reply, or to use `ignore_message` to end. | `DM_EMPTY_REPLY_RETRY_MSG` in `crates/alms-runtime/src/agent/dm.rs` |
 | `dm_ended_with_history.md` | DM conversation ended notification template with embedded transcript. Contains `{reason}` and `{history}` placeholders. | `format_dm_ended_notification()` in `crates/alms-gateway/src/runs.rs` |
 | `dm_ended_no_history.md` | Fallback DM conversation ended notification when history is unavailable. Contains `{reason}` and `{from}` placeholders. Points agent to `read_messages`. | `format_dm_ended_notification()` in `crates/alms-gateway/src/runs.rs` |
 | `subagent_completed.md` | Background subagent completion notification template. Contains `{label}`, `{status}`, `{summary}`, and `{follow_up}` placeholders. | `format_completion_notification()` in `crates/alms-gateway/src/runs.rs` |
@@ -134,8 +134,9 @@ appended after it:
    (with `{peer}` replaced) is appended at the very end:
    `{base_prompt}\n\n{workspace_prefix}\n\n{dm_addendum}` on the first turn, and
    `{base_prompt}\n\n{workspace_prefix}\n\n{tool_loop_prompt}\n\n{dm_addendum}`
-   on subsequent tool-loop turns. This ensures the agent retains awareness that
-   it must use `send_message` to reply, even after processing tool calls (fixes #346).
+   on subsequent tool-loop turns. This ensures the agent retains awareness of
+   the implicit-reply contract (#1154 — its final message text IS the reply to
+   the peer), even after processing tool calls (fixes #346).
 
 The base + workspace assembly is handled by `assemble_system_prompt()`. The
 order matches common LLM prompting practice — role/identity first, personalization

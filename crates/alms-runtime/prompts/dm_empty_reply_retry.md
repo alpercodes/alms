@@ -1,0 +1,1 @@
+ERROR: Your run produced no reply text for the other agent. In a direct message conversation your final message text IS your reply — it is delivered to the other agent automatically. Either write your reply as plain text now, or use the `ignore_message` tool to explicitly end the conversation. Do not respond with an empty message.

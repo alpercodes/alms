@@ -1,28 +1,36 @@
 //! Consolidated DM post-run lifecycle handling.
 //!
-//! When a peer-triggered DM run completes, several steps must happen:
+//! When a peer-triggered DM run completes, the **DM completion gate**
+//! ([`handle_dm_run_completion`]) guarantees the run exits as exactly one of
+//! three outcomes — never silence (#1154):
 //!
-//! 1. Detect whether `ignore_message` was called
-//! 2. Resolve the peer agent from the `dm:` context ID
-//! 3. Call `end_conversation` on the `MessageBus` to reset depth counters
-//!    and emit `ConversationEnded` triggers to both agents
-//! 4. Emit a `dm_conversation_ended` SSE event on the DM session stream
+//! - **Ended**: `ignore_message` was successfully called → write the
+//!   `dm_ended` marker, reset depth counters, and emit `ConversationEnded`
+//!   triggers + the `dm_conversation_ended` SSE event.
+//! - **Delivered**: the run produced deliverable final assistant text → the
+//!   text IS the reply (implicit replies, #1154). Deliver it to the peer via
+//!   `MessageBus::send`, which persists it to the shared DM session and
+//!   triggers the peer's run. No `send_message` call is required.
+//! - **Errored**: no deliverable reply and no end signal (or delivery
+//!   failed) → end the conversation with an `Errored` reason so the peer is
+//!   notified instead of stranded.
 //!
-//! Previously this logic was inlined in `execute_run()` (lifecycle.rs lines
-//! 1085-1180). This module consolidates it into a single entry point so there
-//! is exactly one code path for ignore-message-driven conversation endings.
+//! Run-level failures (cancel / error / pre-loop setup failures) route
+//! through [`handle_dm_run_failure`] / [`notify_dm_peer_of_setup_failure`],
+//! which produce the **errored** exit for those paths.
 //!
 //! The `ConversationEnded` trigger handling (depth-exceeded SSE events,
 //! web-chat forwarding, notification formatting) remains in `notifications.rs`
 //! because it serves the *incoming notification* side, not the post-run side.
 //!
-//! See #628 and Tim's stability audit (#613) for background.
+//! See #628 and Tim's stability audit (#613) for background; #1154 for the
+//! implicit-reply redesign.
 
 use crate::api_error;
 use crate::server::AppState;
 use crate::sse::SseEventData;
 use alms_core::{AgentId, RunId, SessionId, ToolCallRecord, dm_participants};
-use alms_tools::message_sender::{ConversationEndReason, MessageSender as _};
+use alms_tools::message_sender::{ConversationEndReason, MessageSender as _, SendError};
 use axum::{
     Json,
     extract::{Path, State},
@@ -45,84 +53,120 @@ pub(super) struct DmRunCompletionContext<'a> {
     pub context_id: &'a str,
     pub is_peer_message: bool,
     pub tool_calls: &'a [ToolCallRecord],
+    /// The run's final assistant text (`RunOutput::response`). Under
+    /// implicit replies (#1154) this is the candidate message for the peer.
+    pub response: &'a str,
+    /// The final LLM turn's reasoning trace (`RunOutput::reasoning`). Used
+    /// to detect the `[Thinking]`-only promotion fallback
+    /// (`response == reasoning`, #1098) so a reasoning trace is never
+    /// delivered to the peer as a reply.
+    pub reasoning: Option<&'a str>,
 }
 
-/// Single entry point for DM post-run lifecycle handling.
+/// Exit taken by the DM completion gate for a successfully-completed run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum DmRunExit {
+    /// Not a peer-triggered DM run — the gate does not apply.
+    NotPeerDm,
+    /// The final assistant text was delivered to the peer (peer triggered).
+    Delivered,
+    /// The conversation was ended (`ignore_message`, or the delivery hit
+    /// the depth ceiling and the bus ended the conversation itself).
+    Ended,
+    /// The peer was notified that the run failed to produce a reply (or
+    /// that delivery / end-signalling failed). Best-effort: covers every
+    /// path where neither a delivery nor a clean end could be completed.
+    Errored,
+}
+
+/// DM completion gate (#1154): single entry point for DM post-run lifecycle
+/// handling on the `Ok` arm of `execute_run()`.
 ///
-/// Called from `execute_run()` after a run completes successfully. Evaluates
-/// whether the run was a peer-triggered DM that should signal conversation
-/// end, and if so, signals it to the `MessageBus` and emits the appropriate
-/// SSE event.
+/// Guarantees a peer-triggered DM run exits as exactly one of
+/// **delivered | ended | errored** — see the module docs for the outcome
+/// definitions. Returns [`DmRunExit::NotPeerDm`] without side effects for
+/// runs the gate does not apply to.
 ///
-/// Returns `true` if a conversation end was signalled, `false` otherwise
-/// (including when conditions are not met or an error occurs).
+/// # Decision order
 ///
-/// # End condition
+/// 1. `ignore_message` succeeded (per tool-call records) → **ended**.
+/// 2. The final text is a deliverable reply
+///    ([`alms_core::deliverable_dm_reply`]) → deliver via
+///    `MessageBus::send` → **delivered** (or **ended** when the send hits
+///    the depth ceiling — the bus has already ended the conversation — or
+///    **errored** when delivery fails outright).
+/// 3. Otherwise (empty/whitespace final text, promoted reasoning trace,
+///    failed `send_message`-only runs, …) → **errored**: the conversation
+///    is ended with an `Errored` reason so the peer is notified. This
+///    replaces the pre-#1154 silent `DM_TEXT_ONLY_DROPPED` outcome.
+pub(super) async fn handle_dm_run_completion(ctx: DmRunCompletionContext<'_>) -> DmRunExit {
+    if !(ctx.is_peer_message && ctx.context_id.starts_with("dm:")) {
+        return DmRunExit::NotPeerDm;
+    }
+
+    // ---- Exit 1: ended (explicit ignore_message) ----
+    if should_signal_dm_end(ctx.is_peer_message, ctx.tool_calls, ctx.context_id) {
+        return signal_dm_end_on_completion(&ctx).await;
+    }
+
+    // ---- Exit 2: delivered (implicit reply) ----
+    if let Some(reply) = alms_core::deliverable_dm_reply(ctx.response, ctx.reasoning) {
+        return deliver_implicit_reply(&ctx, reply).await;
+    }
+
+    // ---- Exit 3: errored (no reply, no end signal) ----
+    //
+    // The runtime's bounded empty-reply nudge already gave the agent a
+    // second chance; ending with an error here is what keeps the peer from
+    // waiting forever (replaces the silent `DM_TEXT_ONLY_DROPPED` drop).
+    warn!(
+        run_id = %ctx.run_id.0,
+        context_id = %ctx.context_id,
+        "DM run completed without a deliverable reply or end signal — \
+         ending conversation with an error so the peer is notified (#1154)"
+    );
+    if let Err(e) = handle_dm_run_failure(
+        ctx.state,
+        &ctx.run_id,
+        &ctx.session_id,
+        ctx.agent_id,
+        ctx.agent_name,
+        ctx.context_id,
+        ctx.is_peer_message,
+        ConversationEndReason::Errored {
+            message: "agent run completed without producing a reply".to_string(),
+        },
+    )
+    .await
+    {
+        warn!(
+            error = %e,
+            "Failed to signal no-reply conversation end — DM peer state may be stale"
+        );
+    }
+    DmRunExit::Errored
+}
+
+/// Exit-1 helper: signal the `ignore_message`-driven conversation end.
 ///
-/// A conversation end is signalled when the run is a peer-triggered DM
-/// (`is_peer_message` and `context_id` starts with `"dm:"`) AND
-/// `ignore_message` was successfully called during the run (verified via
-/// tool call records) -- reason: `Ignored`.
-///
-/// # Actions (in order)
-///
-/// 1. Extract the peer agent name from the `dm:` context ID
-/// 2. Resolve the peer's `AgentId` from the agent registry
-/// 3. Call `end_conversation()` on the `MessageBus` with the determined reason
-/// 4. Emit `dm_conversation_ended` SSE event on the DM session stream
+/// Carries the pre-#1154 `handle_dm_run_completion` body: resolve the peer,
+/// call `end_conversation(Ignored)` on the bus, and emit the
+/// `dm_conversation_ended` SSE event on the DM session stream.
 ///
 /// The sender's web-chat SSE marker is NOT emitted here -- it is handled by
 /// the sender's self-notification run in `run_trigger_loop` (notifications.rs),
 /// which calls `notify_dm_ended_to_webchat` for every `ConversationEnded`
 /// trigger recipient. Emitting it here as well would cause duplicate markers.
 /// See #556.
-pub(super) async fn handle_dm_run_completion(ctx: DmRunCompletionContext<'_>) -> bool {
-    // Determine the end reason, if any.
-    let end_reason = if should_signal_dm_end(ctx.is_peer_message, ctx.tool_calls, ctx.context_id) {
-        ConversationEndReason::Ignored
-    } else {
-        return false;
-    };
+async fn signal_dm_end_on_completion(ctx: &DmRunCompletionContext<'_>) -> DmRunExit {
+    let end_reason = ConversationEndReason::Ignored;
+    let reason_label = "ignore_message";
 
-    let reason_label = match &end_reason {
-        ConversationEndReason::Ignored => "ignore_message",
-        ConversationEndReason::DepthExceeded => "depth_exceeded",
-        ConversationEndReason::UserCancelled => "user_cancelled",
-        ConversationEndReason::Errored { .. } => "errored",
-    };
-
-    let Some(agent_name) = ctx.agent_name else {
-        debug!(
-            reason = reason_label,
-            "DM end detected but agent name is not set — skipping conversation end"
-        );
-        return false;
-    };
-
-    let Some(peer_name) = extract_peer_from_dm_context(ctx.context_id, agent_name) else {
-        debug!(
-            context_id = %ctx.context_id,
-            reason = reason_label,
-            "DM end detected but could not extract peer from context_id"
-        );
-        return false;
-    };
-
-    // Resolve the peer's AgentId from the agent registry.
-    let peer_agent_id = ctx
-        .state
-        .session_manager
-        .store()
-        .and_then(|store| store.load_agent_by_name(&peer_name).ok())
-        .flatten()
-        .map(|record| record.id);
-
-    let Some(peer_id) = peer_agent_id else {
-        warn!(
-            peer = %peer_name,
-            "Cannot signal conversation end — peer agent not found in registry"
-        );
-        return false;
+    let Some((agent_name, peer_name, peer_id)) = resolve_dm_pair(ctx, reason_label) else {
+        // Resolution failure means we cannot reach the bus at all — the
+        // peer is not notified. Surface it as the errored exit so callers
+        // and logs do not mistake it for a clean end.
+        return DmRunExit::Errored;
     };
 
     info!(
@@ -179,7 +223,7 @@ pub(super) async fn handle_dm_run_completion(ctx: DmRunCompletionContext<'_>) ->
             // for every ConversationEnded trigger recipient. Calling it here
             // as well would cause a duplicate marker for the sender. See #556.
 
-            true
+            DmRunExit::Ended
         }
         Err(e) => {
             warn!(
@@ -188,8 +232,197 @@ pub(super) async fn handle_dm_run_completion(ctx: DmRunCompletionContext<'_>) ->
                 error = %e,
                 "Failed to signal conversation end"
             );
-            false
+            DmRunExit::Errored
         }
+    }
+}
+
+/// Exit-2 helper: deliver the run's final assistant text to the DM peer.
+///
+/// `MessageBus::send` persists the reply to the shared DM session (with
+/// `from_agent` / `message_type: "dm"` metadata — the same shape the
+/// `send_message` tool produced pre-#1154, so DM perspective mapping
+/// applies unchanged) and triggers the peer's run.
+async fn deliver_implicit_reply(ctx: &DmRunCompletionContext<'_>, reply: &str) -> DmRunExit {
+    let Some((agent_name, peer_name, peer_id)) = resolve_dm_pair(ctx, "implicit_reply") else {
+        return DmRunExit::Errored;
+    };
+
+    match ctx
+        .state
+        .message_bus
+        .send(
+            agent_name,
+            ctx.agent_id,
+            &peer_name,
+            peer_id,
+            reply,
+            // The "source session" of an implicit reply is the DM session
+            // itself, which `MessageBus::send` correctly rejects as a
+            // source (a DM session cannot be its own source, #656) — so
+            // the peer's original source-session entry is preserved.
+            Some(ctx.session_id),
+        )
+        .await
+    {
+        Ok(receipt) => {
+            info!(
+                agent = %agent_name,
+                peer = %peer_name,
+                session_id = %receipt.session_id.0,
+                run_id = %ctx.run_id.0,
+                reply_len = reply.len(),
+                "DM completion gate: final assistant text delivered to peer (#1154)"
+            );
+            DmRunExit::Delivered
+        }
+        Err(SendError::DepthExceeded) => {
+            // The bus has already ended the conversation (marker write,
+            // depth reset, ConversationEnded triggers) as part of its
+            // depth-ceiling handling — this is a clean end, not an error.
+            info!(
+                agent = %agent_name,
+                peer = %peer_name,
+                "DM reply hit the depth ceiling — bus ended the conversation"
+            );
+            DmRunExit::Ended
+        }
+        Err(e) => {
+            warn!(
+                agent = %agent_name,
+                peer = %peer_name,
+                error = %e,
+                "DM reply delivery failed — ending conversation with an error"
+            );
+            if let Err(end_err) = handle_dm_run_failure(
+                ctx.state,
+                &ctx.run_id,
+                &ctx.session_id,
+                ctx.agent_id,
+                ctx.agent_name,
+                ctx.context_id,
+                ctx.is_peer_message,
+                ConversationEndReason::Errored {
+                    message: format!("reply delivery failed: {e}"),
+                },
+            )
+            .await
+            {
+                warn!(
+                    error = %end_err,
+                    "Failed to signal delivery-failure conversation end — \
+                     DM peer state may be stale"
+                );
+            }
+            DmRunExit::Errored
+        }
+    }
+}
+
+/// Resolve `(agent_name, peer_name, peer_id)` for a peer-triggered DM run.
+///
+/// Logs and returns `None` when the agent name is unset, the peer cannot be
+/// extracted from the context ID, or the peer is not in the registry.
+fn resolve_dm_pair<'a>(
+    ctx: &'a DmRunCompletionContext<'_>,
+    reason_label: &str,
+) -> Option<(&'a str, String, AgentId)> {
+    let Some(agent_name) = ctx.agent_name else {
+        debug!(
+            reason = reason_label,
+            "DM outcome detected but agent name is not set — skipping"
+        );
+        return None;
+    };
+
+    let Some(peer_name) = extract_peer_from_dm_context(ctx.context_id, agent_name) else {
+        debug!(
+            context_id = %ctx.context_id,
+            reason = reason_label,
+            "DM outcome detected but could not extract peer from context_id"
+        );
+        return None;
+    };
+
+    let peer_agent_id = ctx
+        .state
+        .session_manager
+        .store()
+        .and_then(|store| store.load_agent_by_name(&peer_name).ok())
+        .flatten()
+        .map(|record| record.id);
+
+    let Some(peer_id) = peer_agent_id else {
+        warn!(
+            peer = %peer_name,
+            reason = reason_label,
+            "Cannot complete DM outcome — peer agent not found in registry"
+        );
+        return None;
+    };
+
+    Some((agent_name, peer_name, peer_id))
+}
+
+/// Notify the DM peer when a peer-triggered DM run fails BEFORE the agent
+/// loop starts (#1154 / B4).
+///
+/// `execute_run()` has three pre-loop failure arms — `resolve_agent_config`
+/// error, token-budget rejection, and `AgentRuntime::new` failure — that
+/// historically returned early without any DM bookkeeping, stranding the
+/// peer until the depth-expiry sweep. This helper mirrors the post-loop
+/// failure arms by routing into [`handle_dm_run_failure`] with an `Errored`
+/// reason.
+///
+/// `agent_name` may be `None` on the earliest arm (`resolve_agent_config`
+/// failed before the registry record was loaded); in that case the name is
+/// re-resolved from the registry by `agent_id` so the peer extraction in
+/// `handle_dm_run_failure` can still succeed.
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn notify_dm_peer_of_setup_failure(
+    state: &AppState,
+    run_id: &RunId,
+    session_id: &SessionId,
+    agent_id: AgentId,
+    agent_name: Option<&str>,
+    context_id: &str,
+    is_peer_message: bool,
+    error_message: String,
+) {
+    if !(is_peer_message && context_id.starts_with("dm:")) {
+        return;
+    }
+
+    // Re-resolve the agent name by ID when the caller did not have it yet.
+    let resolved_name: Option<String> = match agent_name {
+        Some(name) => Some(name.to_string()),
+        None => state
+            .session_manager
+            .store()
+            .and_then(|store| store.load_agent_by_id(agent_id).ok())
+            .flatten()
+            .map(|record| record.name),
+    };
+
+    if let Err(e) = handle_dm_run_failure(
+        state,
+        run_id,
+        session_id,
+        agent_id,
+        resolved_name.as_deref(),
+        context_id,
+        is_peer_message,
+        ConversationEndReason::Errored {
+            message: error_message,
+        },
+    )
+    .await
+    {
+        warn!(
+            run_id = %run_id.0,
+            error = %e,
+            "Setup-failure DM peer notification failed — peer state may be stale"
+        );
     }
 }
 

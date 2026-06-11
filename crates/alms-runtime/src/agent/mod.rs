@@ -101,6 +101,20 @@ pub struct AgentRuntime {
     /// maps messages from this agent to `Role::Assistant` so the LLM sees
     /// them as its own previous responses.
     pub(crate) agent_name: Option<String>,
+    /// Implicit DM reply mode (#1154): set by the gateway for
+    /// peer-triggered DM runs. When `true`, the run's final assistant text
+    /// IS the message delivered to the DM peer — the gateway's DM
+    /// completion gate performs the delivery (and the associated session
+    /// persistence) after the run completes. The runtime reacts in two
+    /// places:
+    ///
+    /// 1. `agent_loop` arms the bounded empty-reply nudge when the run is
+    ///    about to end with no deliverable reply text.
+    /// 2. `finish_run` skips persisting the final DM text as a
+    ///    reasoning-type message — `MessageBus::send` persists it with
+    ///    `message_type: "dm"` on delivery, and persisting it here too
+    ///    would double-render the same text in the DM session.
+    pub(crate) dm_implicit_reply: bool,
 }
 
 impl AgentRuntime {
@@ -176,6 +190,7 @@ impl AgentRuntime {
                 crate::tool_output_truncate::ToolOutputTruncatePolicy::disabled(),
             extra_fs_read_roots: Vec::new(),
             agent_name: None,
+            dm_implicit_reply: false,
         };
 
         // Apply shell permissions / classification to the initially registered
@@ -613,6 +628,19 @@ impl AgentRuntime {
         self
     }
 
+    /// Enable implicit DM reply mode (#1154).
+    ///
+    /// Set by the gateway for peer-triggered DM runs only. See the field
+    /// docs on [`Self::dm_implicit_reply`] for the behavioural contract:
+    /// the run's final assistant text is delivered to the DM peer by the
+    /// gateway's completion gate, the runtime arms the bounded empty-reply
+    /// nudge, and `finish_run` leaves the final-text persistence to
+    /// `MessageBus::send`.
+    pub fn with_dm_implicit_reply(mut self) -> Self {
+        self.dm_implicit_reply = true;
+        self
+    }
+
     /// Append an extra read-only root onto the accumulated
     /// [`Self::extra_fs_read_roots`] list (#946 sibling-reads
     /// support).
@@ -980,7 +1008,13 @@ impl AgentRuntime {
     ) -> AlmsResult<RunOutput> {
         let is_dm = context_id.starts_with("dm:");
         let include_user = Self::is_user_facing_context(context_id);
-        let dm_peer = if is_dm {
+        // `dm_peer` drives the in-loop re-injection of the implicit-reply
+        // addendum (`rebuild_system_prompt_for_tool_loop`). Gated on
+        // `dm_implicit_reply` (#1156 defense-in-depth) so the loop-rebuild
+        // path follows the same invariant as `build_context`: the addendum
+        // is only injected for peer-triggered DM runs, where the gateway's
+        // completion gate actually delivers the final text.
+        let dm_peer = if is_dm && self.dm_implicit_reply {
             self.dm_peer_name(context_id)
         } else {
             None
@@ -1033,8 +1067,39 @@ impl AgentRuntime {
                 // reasoning text entries that `groupDmReasoningBlocks()`
                 // concatenates, resulting in doubled text on page reload.
                 // Skip persistence when tool calls were present.  (Fixes #687)
+                //
+                // Implicit DM reply (#1154): for peer-triggered DM runs the
+                // final text IS the reply, and the gateway's completion gate
+                // persists it via `MessageBus::send` as a `message_type:
+                // "dm"` message when it delivers. Persisting it here as a
+                // reasoning-type message too would double-render the same
+                // text in the DM session, so skip — only the final turn's
+                // extended-thinking trace (when distinct from the response)
+                // is persisted below so the UI keeps the collapsible
+                // reasoning panel.
                 let dm_text_already_persisted = is_dm && !tool_calls.is_empty();
-                if !response.is_empty() && !dm_text_already_persisted {
+                let implicit_dm_reply = is_dm && self.dm_implicit_reply;
+                if implicit_dm_reply {
+                    if let Some(trace) = reasoning
+                        .as_deref()
+                        .filter(|t| !t.is_empty() && *t != response)
+                    {
+                        let metadata = crate::agent::loop_impl::merge_reasoning_blocks(
+                            self.dm_reasoning_metadata(is_dm),
+                            Some(trace),
+                        );
+                        let reasoning_msg = SessionMessage {
+                            id: uuid::Uuid::new_v4().to_string(),
+                            role: SessionRole::User,
+                            content: SessionContent::Text(String::new()),
+                            timestamp: alms_core::Timestamp::now(),
+                            metadata,
+                        };
+                        if let Err(e) = session_manager.append_message(session_id, reasoning_msg) {
+                            warn!("Failed to persist final-turn reasoning trace: {}", e);
+                        }
+                    }
+                } else if !response.is_empty() && !dm_text_already_persisted {
                     let base_meta = if is_dm {
                         self.dm_reasoning_metadata(is_dm)
                     } else {

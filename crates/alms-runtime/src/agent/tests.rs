@@ -40,6 +40,7 @@ async fn test_stream_llm_call_emits_token_deltas() {
             crate::tool_output_truncate::ToolOutputTruncatePolicy::disabled(),
         extra_fs_read_roots: Vec::new(),
         agent_name: None,
+        dm_implicit_reply: false,
     };
 
     let request =
@@ -88,6 +89,7 @@ async fn test_build_context() {
             crate::tool_output_truncate::ToolOutputTruncatePolicy::disabled(),
         extra_fs_read_roots: Vec::new(),
         agent_name: None,
+        dm_implicit_reply: false,
     };
 
     let session_config = SessionConfig::default();
@@ -126,6 +128,7 @@ async fn test_build_context_dm_perspective_mapping() {
             crate::tool_output_truncate::ToolOutputTruncatePolicy::disabled(),
         extra_fs_read_roots: Vec::new(),
         agent_name: Some("bob".to_string()),
+        dm_implicit_reply: false,
     };
 
     let session_config = SessionConfig::default();
@@ -212,6 +215,7 @@ async fn test_build_context_non_dm_no_perspective() {
             crate::tool_output_truncate::ToolOutputTruncatePolicy::disabled(),
         extra_fs_read_roots: Vec::new(),
         agent_name: Some("bob".to_string()),
+        dm_implicit_reply: false,
     };
 
     let session_config = SessionConfig::default();
@@ -456,6 +460,7 @@ async fn test_guarded_posture_sequential_approvals() {
             crate::tool_output_truncate::ToolOutputTruncatePolicy::disabled(),
         extra_fs_read_roots: Vec::new(),
         agent_name: None,
+        dm_implicit_reply: false,
     };
 
     let tool_calls = vec![
@@ -563,6 +568,7 @@ async fn test_denied_approval_appends_deny_audit_entry() {
             crate::tool_output_truncate::ToolOutputTruncatePolicy::disabled(),
         extra_fs_read_roots: Vec::new(),
         agent_name: None,
+        dm_implicit_reply: false,
     };
 
     let tool_call = ToolCall::new("tc-deny", "math", r#"{"operation":"add","a":1,"b":2}"#);
@@ -714,6 +720,7 @@ async fn test_denied_approval_cancels_run_and_stops_batch() {
             crate::tool_output_truncate::ToolOutputTruncatePolicy::disabled(),
         extra_fs_read_roots: Vec::new(),
         agent_name: None,
+        dm_implicit_reply: false,
     };
 
     let tool_calls = vec![
@@ -870,6 +877,7 @@ async fn test_cancel_during_approval_wait_emits_tool_end() {
             crate::tool_output_truncate::ToolOutputTruncatePolicy::disabled(),
         extra_fs_read_roots: Vec::new(),
         agent_name: None,
+        dm_implicit_reply: false,
     };
 
     let tool_call = ToolCall::new("tc1", "math", r#"{"operation":"add","a":1,"b":2}"#);
@@ -1003,6 +1011,7 @@ async fn test_cancel_during_approval_wait_appends_audit_entry() {
             crate::tool_output_truncate::ToolOutputTruncatePolicy::disabled(),
         extra_fs_read_roots: Vec::new(),
         agent_name: None,
+        dm_implicit_reply: false,
     };
 
     let tool_call = ToolCall::new("tc-cancel", "math", r#"{"operation":"add","a":1,"b":2}"#);
@@ -1137,6 +1146,7 @@ async fn test_approval_channel_closed_appends_audit_entry() {
             crate::tool_output_truncate::ToolOutputTruncatePolicy::disabled(),
         extra_fs_read_roots: Vec::new(),
         agent_name: None,
+        dm_implicit_reply: false,
     };
 
     let tool_call = ToolCall::new("tc-closed", "math", r#"{"operation":"add","a":1,"b":2}"#);
@@ -1271,6 +1281,7 @@ async fn test_approval_channel_closed_emits_matching_tool_end() {
             crate::tool_output_truncate::ToolOutputTruncatePolicy::disabled(),
         extra_fs_read_roots: Vec::new(),
         agent_name: None,
+        dm_implicit_reply: false,
     };
 
     let tool_call = ToolCall::new("tc-closed", "math", r#"{"operation":"add","a":1,"b":2}"#);
@@ -1415,6 +1426,7 @@ async fn test_auto_approved_tool_bypasses_approval_in_guarded_posture() {
             crate::tool_output_truncate::ToolOutputTruncatePolicy::disabled(),
         extra_fs_read_roots: Vec::new(),
         agent_name: None,
+        dm_implicit_reply: false,
     };
 
     let tc = ToolCall::new("tc1", "echo", r#"{"message":"hello"}"#);
@@ -1505,6 +1517,7 @@ async fn test_classifier_blocked_shell_surfaces_target_in_tool_end() {
             crate::tool_output_truncate::ToolOutputTruncatePolicy::disabled(),
         extra_fs_read_roots: Vec::new(),
         agent_name: None,
+        dm_implicit_reply: false,
     };
 
     let tc = ToolCall::new("tc-blocked", "shell", r#"{"command":"rm -rf /etc"}"#);
@@ -1835,7 +1848,7 @@ fn test_dm_peer_name() {
 }
 
 /// Verify that the DM system prompt addendum is injected into the context
-/// when running on a DM session, telling the agent to use `send_message`.
+/// when running a peer-triggered (implicit-reply) run on a DM session.
 #[tokio::test]
 async fn test_dm_system_prompt_injection() {
     let config = LlmConfig {
@@ -1853,7 +1866,8 @@ async fn test_dm_system_prompt_injection() {
     };
     let runtime = AgentRuntime::new(bob_id, agent_config, llm)
         .unwrap()
-        .with_agent_name("bob".to_string());
+        .with_agent_name("bob".to_string())
+        .with_dm_implicit_reply();
 
     // Create a shared DM session with one message from alice.
     let dm_context = "dm:alice:bob";
@@ -1897,6 +1911,48 @@ async fn test_dm_system_prompt_injection() {
     assert!(
         system_text.contains("ignore_message"),
         "System prompt should mention ignore_message"
+    );
+}
+
+/// #1156 defense-in-depth: a run on a `dm:` session that is NOT
+/// peer-triggered (i.e. `dm_implicit_reply` was never armed by the
+/// gateway) must NOT receive the implicit-reply addendum. The prompt
+/// promises automatic delivery of the final text, and only the DM
+/// completion gate (armed exclusively for peer-triggered runs) keeps
+/// that promise — injecting it anywhere else would script a silent drop.
+#[tokio::test]
+async fn test_dm_no_addendum_without_implicit_reply_flag() {
+    let config = LlmConfig {
+        mock: true,
+        ..LlmConfig::default()
+    };
+    let session_manager = SessionManager::new(SessionConfig::default());
+    let llm = LlmClient::new(config).unwrap();
+
+    let agent_config = AgentConfig {
+        sandbox_root: "".into(),
+        ..AgentConfig::default()
+    };
+    // No `.with_dm_implicit_reply()` — models a hypothetical non-peer
+    // run on a DM session.
+    let runtime = AgentRuntime::new(AgentId::new(), agent_config, llm)
+        .unwrap()
+        .with_agent_name("bob".to_string());
+
+    let dm_context = "dm:alice:bob";
+    let session_id = alms_core::SessionId::deterministic_dm("alice", "bob");
+    let _session = session_manager.get_or_create_shared(session_id, dm_context);
+
+    let context = runtime
+        .build_context(&session_manager, &session_id, dm_context, "hello")
+        .await
+        .unwrap();
+
+    let system_text = context[0].content.as_deref().unwrap_or("");
+    assert!(
+        !system_text.contains("direct message from agent"),
+        "non-peer dm: run must NOT get the implicit-reply addendum. Got tail: {}",
+        &system_text[system_text.len().saturating_sub(300)..]
     );
 }
 
@@ -2303,9 +2359,12 @@ async fn test_dm_addendum_survives_tool_loop_rebuild() {
         sandbox_root: "".into(),
         ..AgentConfig::default()
     };
+    // `with_dm_implicit_reply` mirrors the gateway: the DM addendum is
+    // injected only for peer-triggered DM runs (#1156 defense-in-depth).
     let runtime = AgentRuntime::new(bob_id, agent_config, llm)
         .unwrap()
-        .with_agent_name("bob".to_string());
+        .with_agent_name("bob".to_string())
+        .with_dm_implicit_reply();
 
     // Set up a DM session.
     let dm_context = "dm:alice:bob";
@@ -2644,356 +2703,6 @@ fn test_no_dm_tools_no_conflict() {
     let check = dm::detect_dm_conflict(&tool_calls);
     assert!(!check.conflict);
     assert!(check.conflicting_tools.is_empty());
-}
-
-// ---- should_terminate_after_dm_send tests (#407 Bug 1) ----
-
-/// In a DM run, `send_message` alone should terminate the loop.
-#[test]
-fn test_dm_send_terminates_in_dm_context() {
-    use crate::llm_types::ToolCall;
-
-    let tool_calls = vec![ToolCall::new(
-        "tc_send",
-        "send_message",
-        r#"{"to":"alice","message":"hi"}"#,
-    )];
-
-    assert!(
-        dm::should_terminate_after_dm_send(&tool_calls, true, false),
-        "send_message in a DM run (no conflict) should terminate the loop"
-    );
-}
-
-/// Outside a DM run, `send_message` should NOT terminate the loop
-/// (the agent may be using it from a web-chat context to message
-/// another agent, and may have more work to do).
-#[test]
-fn test_dm_send_does_not_terminate_outside_dm() {
-    use crate::llm_types::ToolCall;
-
-    let tool_calls = vec![ToolCall::new(
-        "tc_send",
-        "send_message",
-        r#"{"to":"alice","message":"hi"}"#,
-    )];
-
-    assert!(
-        !dm::should_terminate_after_dm_send(&tool_calls, false, false),
-        "send_message outside a DM run should NOT terminate the loop"
-    );
-}
-
-/// When there is a conflict (both send_message and ignore_message),
-/// do NOT terminate — let the agent retry on the next iteration.
-#[test]
-fn test_dm_send_does_not_terminate_on_conflict() {
-    use crate::llm_types::ToolCall;
-
-    let tool_calls = vec![
-        ToolCall::new(
-            "tc_send",
-            "send_message",
-            r#"{"to":"alice","message":"hi"}"#,
-        ),
-        ToolCall::new("tc_ignore", "ignore_message", r#"{"reason":"done"}"#),
-    ];
-
-    assert!(
-        !dm::should_terminate_after_dm_send(&tool_calls, true, true),
-        "send_message with conflict should NOT terminate the loop"
-    );
-}
-
-/// When no DM tool is present, should_terminate_after_dm_send
-/// returns false even in a DM context.
-#[test]
-fn test_dm_send_no_dm_tools() {
-    use crate::llm_types::ToolCall;
-
-    let tool_calls = vec![ToolCall::new("tc_echo", "echo", r#"{"message":"hello"}"#)];
-
-    assert!(
-        !dm::should_terminate_after_dm_send(&tool_calls, true, false),
-        "No send_message call means no DM-send termination"
-    );
-}
-
-// ---- dm_tool_was_called tests (#361) ----
-
-/// Returns false when no tool call records exist.
-#[test]
-fn test_dm_tool_was_called_empty_records() {
-    assert!(
-        !dm::dm_tool_was_called(&[]),
-        "No records should mean no DM tool was called"
-    );
-}
-
-/// Returns false when only non-DM tools were called.
-#[test]
-fn test_dm_tool_was_called_only_non_dm_tools() {
-    let records = vec![
-        alms_core::ToolCallRecord {
-            seq: 0,
-            role: alms_core::ToolCallRole::Assistant,
-            tool_name: Some("echo".to_string()),
-            tool_id: Some("tc_echo".to_string()),
-            params: Some(r#"{"message":"hi"}"#.to_string()),
-            result: None,
-            timestamp: chrono::Utc::now(),
-            from_agent: None,
-        },
-        alms_core::ToolCallRecord {
-            seq: 1,
-            role: alms_core::ToolCallRole::Tool,
-            tool_name: Some("echo".to_string()),
-            tool_id: Some("tc_echo".to_string()),
-            params: None,
-            result: Some(r#"{"output":"hi"}"#.to_string()),
-            timestamp: chrono::Utc::now(),
-            from_agent: None,
-        },
-    ];
-    assert!(
-        !dm::dm_tool_was_called(&records),
-        "echo tool should not count as a DM tool"
-    );
-}
-
-/// Returns true when send_message was called and succeeded.
-#[test]
-fn test_dm_tool_was_called_send_message() {
-    let records = vec![
-        alms_core::ToolCallRecord {
-            seq: 0,
-            role: alms_core::ToolCallRole::Assistant,
-            tool_name: Some("send_message".to_string()),
-            tool_id: Some("tc_send".to_string()),
-            params: Some(r#"{"to":"alice","message":"hi"}"#.to_string()),
-            result: None,
-            timestamp: chrono::Utc::now(),
-            from_agent: None,
-        },
-        alms_core::ToolCallRecord {
-            seq: 1,
-            role: alms_core::ToolCallRole::Tool,
-            tool_name: Some("send_message".to_string()),
-            tool_id: Some("tc_send".to_string()),
-            params: None,
-            result: Some(r#"{"ok":true}"#.to_string()),
-            timestamp: chrono::Utc::now(),
-            from_agent: None,
-        },
-    ];
-    assert!(
-        dm::dm_tool_was_called(&records),
-        "send_message should be detected"
-    );
-}
-
-/// Returns true when ignore_message was called and succeeded.
-#[test]
-fn test_dm_tool_was_called_ignore_message() {
-    let records = vec![
-        alms_core::ToolCallRecord {
-            seq: 0,
-            role: alms_core::ToolCallRole::Assistant,
-            tool_name: Some("ignore_message".to_string()),
-            tool_id: Some("tc_ignore".to_string()),
-            params: Some(r#"{"reason":"not relevant"}"#.to_string()),
-            result: None,
-            timestamp: chrono::Utc::now(),
-            from_agent: None,
-        },
-        alms_core::ToolCallRecord {
-            seq: 1,
-            role: alms_core::ToolCallRole::Tool,
-            tool_name: Some("ignore_message".to_string()),
-            tool_id: Some("tc_ignore".to_string()),
-            params: None,
-            result: Some(r#"{"ok":true}"#.to_string()),
-            timestamp: chrono::Utc::now(),
-            from_agent: None,
-        },
-    ];
-    assert!(
-        dm::dm_tool_was_called(&records),
-        "ignore_message should be detected"
-    );
-}
-
-/// Only checks Assistant-role records paired with Tool-role results
-/// (not Tool-role results alone).
-#[test]
-fn test_dm_tool_was_called_ignores_tool_role_only() {
-    let records = vec![alms_core::ToolCallRecord {
-        seq: 0,
-        role: alms_core::ToolCallRole::Tool,
-        tool_name: Some("send_message".to_string()),
-        tool_id: Some("tc_send".to_string()),
-        params: None,
-        result: Some(r#"{"ok":true}"#.to_string()),
-        timestamp: chrono::Utc::now(),
-        from_agent: None,
-    }];
-    assert!(
-        !dm::dm_tool_was_called(&records),
-        "Tool-role records alone should not count — need an Assistant-role call too"
-    );
-}
-
-/// Returns false when send_message has an Assistant record but no
-/// corresponding Tool result (tool never executed).
-#[test]
-fn test_dm_tool_was_called_no_tool_result() {
-    let records = vec![alms_core::ToolCallRecord {
-        seq: 0,
-        role: alms_core::ToolCallRole::Assistant,
-        tool_name: Some("send_message".to_string()),
-        tool_id: Some("tc_send".to_string()),
-        params: Some(r#"{"to":"alice","message":"hi"}"#.to_string()),
-        result: None,
-        timestamp: chrono::Utc::now(),
-        from_agent: None,
-    }];
-    assert!(
-        !dm::dm_tool_was_called(&records),
-        "Assistant record without Tool result should not count"
-    );
-}
-
-/// Returns false when both send_message and ignore_message were
-/// recorded as Assistant calls but both received DM conflict error
-/// results (neither actually executed). This is the critical scenario
-/// from PR #365 + #369 interaction.
-#[test]
-fn test_dm_tool_was_called_conflict_batch_false_positive() {
-    let conflict_error = format!("Error: {}", dm::DM_CONFLICT_MSG);
-    let records = vec![
-        // Assistant records for both tools (recorded before conflict check)
-        alms_core::ToolCallRecord {
-            seq: 0,
-            role: alms_core::ToolCallRole::Assistant,
-            tool_name: Some("send_message".to_string()),
-            tool_id: Some("tc_send".to_string()),
-            params: Some(r#"{"to":"alice","message":"hi"}"#.to_string()),
-            result: None,
-            timestamp: chrono::Utc::now(),
-            from_agent: None,
-        },
-        alms_core::ToolCallRecord {
-            seq: 1,
-            role: alms_core::ToolCallRole::Assistant,
-            tool_name: Some("ignore_message".to_string()),
-            tool_id: Some("tc_ignore".to_string()),
-            params: Some(r#"{"reason":"spam"}"#.to_string()),
-            result: None,
-            timestamp: chrono::Utc::now(),
-            from_agent: None,
-        },
-        // Tool results for both — both contain the conflict error
-        alms_core::ToolCallRecord {
-            seq: 2,
-            role: alms_core::ToolCallRole::Tool,
-            tool_name: Some("send_message".to_string()),
-            tool_id: Some("tc_send".to_string()),
-            params: None,
-            result: Some(conflict_error.clone()),
-            timestamp: chrono::Utc::now(),
-            from_agent: None,
-        },
-        alms_core::ToolCallRecord {
-            seq: 3,
-            role: alms_core::ToolCallRole::Tool,
-            tool_name: Some("ignore_message".to_string()),
-            tool_id: Some("tc_ignore".to_string()),
-            params: None,
-            result: Some(conflict_error),
-            timestamp: chrono::Utc::now(),
-            from_agent: None,
-        },
-    ];
-    assert!(
-        !dm::dm_tool_was_called(&records),
-        "Conflict-blocked tool calls should not count as successfully called — \
-         the DM text-only retry must still trigger"
-    );
-}
-
-/// Returns true when send_message was conflict-blocked but then
-/// succeeded on a subsequent attempt (second batch after conflict).
-#[test]
-fn test_dm_tool_was_called_conflict_then_success() {
-    let conflict_error = format!("Error: {}", dm::DM_CONFLICT_MSG);
-    let records = vec![
-        // First batch: conflict — both tools blocked
-        alms_core::ToolCallRecord {
-            seq: 0,
-            role: alms_core::ToolCallRole::Assistant,
-            tool_name: Some("send_message".to_string()),
-            tool_id: Some("tc_send_1".to_string()),
-            params: Some(r#"{"to":"alice","message":"hi"}"#.to_string()),
-            result: None,
-            timestamp: chrono::Utc::now(),
-            from_agent: None,
-        },
-        alms_core::ToolCallRecord {
-            seq: 1,
-            role: alms_core::ToolCallRole::Assistant,
-            tool_name: Some("ignore_message".to_string()),
-            tool_id: Some("tc_ignore_1".to_string()),
-            params: Some(r#"{"reason":"spam"}"#.to_string()),
-            result: None,
-            timestamp: chrono::Utc::now(),
-            from_agent: None,
-        },
-        alms_core::ToolCallRecord {
-            seq: 2,
-            role: alms_core::ToolCallRole::Tool,
-            tool_name: Some("send_message".to_string()),
-            tool_id: Some("tc_send_1".to_string()),
-            params: None,
-            result: Some(conflict_error.clone()),
-            timestamp: chrono::Utc::now(),
-            from_agent: None,
-        },
-        alms_core::ToolCallRecord {
-            seq: 3,
-            role: alms_core::ToolCallRole::Tool,
-            tool_name: Some("ignore_message".to_string()),
-            tool_id: Some("tc_ignore_1".to_string()),
-            params: None,
-            result: Some(conflict_error),
-            timestamp: chrono::Utc::now(),
-            from_agent: None,
-        },
-        // Second batch: LLM picked just send_message — succeeds
-        alms_core::ToolCallRecord {
-            seq: 4,
-            role: alms_core::ToolCallRole::Assistant,
-            tool_name: Some("send_message".to_string()),
-            tool_id: Some("tc_send_2".to_string()),
-            params: Some(r#"{"to":"alice","message":"hello"}"#.to_string()),
-            result: None,
-            timestamp: chrono::Utc::now(),
-            from_agent: None,
-        },
-        alms_core::ToolCallRecord {
-            seq: 5,
-            role: alms_core::ToolCallRole::Tool,
-            tool_name: Some("send_message".to_string()),
-            tool_id: Some("tc_send_2".to_string()),
-            params: None,
-            result: Some(r#"{"ok":true}"#.to_string()),
-            timestamp: chrono::Utc::now(),
-            from_agent: None,
-        },
-    ];
-    assert!(
-        dm::dm_tool_was_called(&records),
-        "After conflict resolution, a successful send_message should be detected"
-    );
 }
 
 /// Verify that streaming usage is accumulated (merged) across chunks rather
@@ -3785,6 +3494,7 @@ fn make_runtime_for_cancel_test(
             crate::tool_output_truncate::ToolOutputTruncatePolicy::disabled(),
         extra_fs_read_roots: Vec::new(),
         agent_name: None,
+        dm_implicit_reply: false,
     }
 }
 
@@ -4708,6 +4418,7 @@ mod tool_output_truncate_integration {
             tool_output_truncate_policy: policy,
             extra_fs_read_roots: Vec::new(),
             agent_name: None,
+            dm_implicit_reply: false,
         }
     }
 
@@ -5511,6 +5222,7 @@ fn build_test_runtime_for_emit(
             crate::tool_output_truncate::ToolOutputTruncatePolicy::disabled(),
         extra_fs_read_roots: Vec::new(),
         agent_name,
+        dm_implicit_reply: false,
     }
 }
 
@@ -5673,5 +5385,189 @@ async fn emit_context_debug_attributes_dm_perspective_to_each_agent() {
     assert_ne!(
         alpha_emitted_id, beta_emitted_id,
         "DM perspective emits must carry distinct agent IDs per turn"
+    );
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// #1154 design default #3 — loop-level DM empty-reply nudge (Tim's S2
+// on PR #1156). The gate-side cases (empty reply → Errored exit etc.)
+// are covered in the gateway's integration tests; this exercises the
+// RUNTIME side: a scripted two-turn LLM where the first turn yields no
+// deliverable text, asserting the loop (a) emits the
+// `DM_EMPTY_REPLY_RETRY` warning, (b) injects the nudge message into
+// the next LLM request, and (c) returns the second turn's text as a
+// deliverable output.
+
+/// Read one full HTTP request (headers + Content-Length body) from a
+/// socket so the test can assert on the JSON payload the agent loop
+/// actually sent to the LLM on each turn.
+async fn read_full_http_request(sock: &mut tokio::net::TcpStream) -> String {
+    use tokio::io::AsyncReadExt;
+    let mut buf: Vec<u8> = Vec::new();
+    let mut tmp = [0u8; 8192];
+    loop {
+        let n = match sock.read(&mut tmp).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => n,
+        };
+        buf.extend_from_slice(&tmp[..n]);
+        let text = String::from_utf8_lossy(&buf);
+        if let Some(header_end) = text.find("\r\n\r\n") {
+            let content_length = text[..header_end]
+                .lines()
+                .find_map(|l| {
+                    let (k, v) = l.split_once(':')?;
+                    k.eq_ignore_ascii_case("content-length")
+                        .then(|| v.trim().parse::<usize>().ok())
+                        .flatten()
+                })
+                .unwrap_or(0);
+            if buf.len() >= header_end + 4 + content_length {
+                break;
+            }
+        }
+    }
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
+#[tokio::test]
+async fn dm_empty_reply_nudge_retries_once_then_delivers_second_turn_text() {
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::TcpListener;
+
+    const REPLY_TEXT: &str = "Hello alice, here is a real reply.";
+
+    // Scripted two-turn LLM: turn 1 streams no content (empty delta +
+    // stop), turn 2 streams a real text reply. OpenAI-style SSE bodies
+    // because the default provider (`openrouter`) parses the OpenAI
+    // wire shape.
+    let turn1_body = concat!(
+        "data: {\"id\":\"t1\",\"object\":\"chat.completion.chunk\",\"created\":1,",
+        "\"model\":\"test-model\",\"choices\":[{\"index\":0,",
+        "\"delta\":{\"role\":\"assistant\",\"content\":\"\"},\"finish_reason\":\"stop\"}]}\n\n",
+        "data: [DONE]\n\n"
+    );
+    let turn2_body = format!(
+        concat!(
+            "data: {{\"id\":\"t2\",\"object\":\"chat.completion.chunk\",\"created\":2,",
+            "\"model\":\"test-model\",\"choices\":[{{\"index\":0,",
+            "\"delta\":{{\"role\":\"assistant\",\"content\":\"{}\"}},",
+            "\"finish_reason\":\"stop\"}}]}}\n\n",
+            "data: [DONE]\n\n"
+        ),
+        REPLY_TEXT
+    );
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base_url = format!("http://{}", listener.local_addr().unwrap());
+
+    // Capture the request bodies so the nudge-injection assertion can
+    // look at what the loop actually sent on the second turn.
+    let captured: std::sync::Arc<tokio::sync::Mutex<Vec<String>>> =
+        std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let captured_writer = captured.clone();
+    tokio::spawn(async move {
+        for body in [turn1_body.to_string(), turn2_body] {
+            let (mut sock, _) = match listener.accept().await {
+                Ok(s) => s,
+                Err(_) => return,
+            };
+            let req = read_full_http_request(&mut sock).await;
+            captured_writer.lock().await.push(req);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = sock.write_all(response.as_bytes()).await;
+            let _ = sock.shutdown().await;
+        }
+    });
+
+    let llm_config = LlmConfig {
+        base_url,
+        api_key: "test-key".to_string(),
+        default_model: "test-model".to_string(),
+        timeout_secs: 5,
+        stream_chunk_timeout_secs: 5,
+        ..LlmConfig::default()
+    };
+    let agent_config = AgentConfig {
+        sandbox_root: "".into(),
+        ..AgentConfig::default()
+    };
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<RuntimeEvent>();
+    let runtime = AgentRuntime::new(
+        AgentId::new(),
+        agent_config,
+        LlmClient::new(llm_config).unwrap(),
+    )
+    .unwrap()
+    .with_agent_name("bob".to_string())
+    .with_dm_implicit_reply()
+    .with_event_sender(tx);
+
+    let session_manager = SessionManager::new(SessionConfig::default());
+    let dm_context = "dm:alice:bob";
+    let session_id = alms_core::SessionId::deterministic_dm("alice", "bob");
+    let _session = session_manager.get_or_create_shared(session_id, dm_context);
+
+    let messages = vec![LlmMessage::system("You are bob."), LlmMessage::user("ping")];
+    let (tool_calls, result) = runtime
+        .agent_loop(
+            &session_manager,
+            session_id,
+            messages,
+            /* is_dm */ true,
+            /* include_user */ false,
+            /* dm_peer */ Some("alice"),
+        )
+        .await;
+
+    // (c) The loop must complete with the SECOND turn's text — i.e. it
+    // retried after the empty first turn — and that text must be a
+    // deliverable DM reply for the gateway's completion gate.
+    assert!(tool_calls.is_empty(), "no tool calls were scripted");
+    let output = result.expect("agent_loop must succeed after the nudge retry");
+    assert_eq!(output.response, REPLY_TEXT);
+    assert!(
+        alms_core::deliverable_dm_reply(&output.response, output.reasoning.as_deref()).is_some(),
+        "the second-turn text must classify as deliverable"
+    );
+
+    // (a) Exactly one DM_EMPTY_REPLY_RETRY warning, and no terminal
+    // DM_EMPTY_REPLY (the retry succeeded).
+    let mut retry_warnings = 0;
+    let mut exhausted_warnings = 0;
+    while let Ok(event) = rx.try_recv() {
+        if let RuntimeEvent::Warning { code, .. } = event {
+            match code.as_str() {
+                "DM_EMPTY_REPLY_RETRY" => retry_warnings += 1,
+                "DM_EMPTY_REPLY" => exhausted_warnings += 1,
+                _ => {}
+            }
+        }
+    }
+    assert_eq!(
+        retry_warnings, 1,
+        "exactly one DM_EMPTY_REPLY_RETRY warning must be emitted"
+    );
+    assert_eq!(
+        exhausted_warnings, 0,
+        "the nudge succeeded, so no terminal DM_EMPTY_REPLY warning"
+    );
+
+    // (b) The nudge message was injected into the second LLM request.
+    let requests = captured.lock().await;
+    assert_eq!(requests.len(), 2, "the loop must have made two LLM calls");
+    assert!(
+        !requests[0].contains("ERROR: Your run produced no reply text"),
+        "first request must NOT contain the nudge"
+    );
+    assert!(
+        requests[1].contains("ERROR: Your run produced no reply text"),
+        "second request must carry the DM_EMPTY_REPLY_RETRY nudge message; got: {}",
+        requests[1]
     );
 }
