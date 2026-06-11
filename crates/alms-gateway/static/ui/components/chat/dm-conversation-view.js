@@ -28,6 +28,13 @@ import { DM_END_REASON_LABELS } from '../../utils/constants.js';
  *  sessions mid-request, the new session may briefly show "Stopping...". */
 const cancellingDm = signal(false);
 
+/** Message ids for which the "ungrouped DM tool" fallback warn has already
+ *  been emitted. The fallback render path runs inside the message `.map()`,
+ *  which re-executes on every re-render — without this guard a single escaped
+ *  tool would spam an identical `console.warn` once per render pass. Keyed by
+ *  the stable message id so each escaped tool warns exactly once. (#1154) */
+const warnedUngroupedToolIds = new Set();
+
 /**
  * Determine which "side" a message belongs to in the DM view.
  * The first participant in the alphabetically-sorted participants array
@@ -360,11 +367,29 @@ export function DmConversationView() {
                     // grouped into a `dm_reasoning` block — i.e. they have
                     // no `runId`. Post-#1076 the grouping no longer requires
                     // `isReasoning`, so every tool with a `runId` lands
-                    // inside its block; only legacy / corrupt rows trip
-                    // this path. The canonical render path for DM tool
-                    // calls is INSIDE `DmReasoningBlock`. Keep this branch
-                    // so a missing-runId row still renders somewhere
-                    // instead of disappearing silently. (#1076)
+                    // inside its block; B9 (#1154) further absorbs run-less
+                    // tools into the run they directly follow during
+                    // `groupDmReasoningBlocks`. By the time a tool reaches
+                    // THIS branch it has both no runId AND no adjacent run to
+                    // attribute it to — i.e. this path is supposed to be
+                    // dead. Instrument it loudly so any future regression
+                    // that lets a tool escape its collapsible (the "tool
+                    // calls render outside the block" symptom) is visible in
+                    // the console instead of silently shipping. (#1154)
+                    //
+                    // Gate on a module-level Set so each escaped tool warns
+                    // ONCE, not once per render pass — this branch runs inside
+                    // the render `.map()`, which re-executes on every signal
+                    // write. (Tim review nit, #1154)
+                    if (!warnedUngroupedToolIds.has(m.id)) {
+                        warnedUngroupedToolIds.add(m.id);
+                        console.warn(
+                            '[DmConversationView] ungrouped DM tool rendered as a '
+                            + 'standalone sibling row — this fallback is meant to be '
+                            + 'dead post-#1076/#1154. Tool:', m.tool, 'id:', m.id,
+                            'runId:', m.runId,
+                        );
+                    }
                     //
                     // Tool messages don't have fromAgent, so attribute them
                     // to the perspective agent (whose run produced the tool

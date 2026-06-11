@@ -54,9 +54,15 @@ function parseJobNotification(content, metadata) {
  * messages of type "tool_call" can be enriched with params/result
  * even when the session_messages table only has bare content blocks.
  *
- * DM sessions store tool calls exclusively in the per-run
- * `run_tool_calls` table, so without this merge the tool rows would
- * appear empty after a page reload.
+ * B13 (#1154): since #685/#988 DM tool calls ARE persisted to the DM
+ * session's message history — `run_tool_calls` is the secondary
+ * enrichment source, NOT the only store as an earlier version of this
+ * comment claimed. This index covers two cases: (a) a session_messages
+ * `tool_call` row that landed without params/result (a bare content
+ * block), and (b) a fire-and-forget session-persistence write that was
+ * dropped entirely, leaving the call only in `run_tool_calls`. In both
+ * cases the merge backfills params/result so the tool rows are not empty
+ * after a page reload.
  *
  * The index is keyed by tool_id (the provider-assigned tool_call_id
  * that correlates assistant tool_call messages with their results).
@@ -653,6 +659,12 @@ export function groupDmReasoningBlocks(entries) {
     const groups = new Map();
     // Track which indices belong to a reasoning group.
     const reasoningIndices = new Set();
+    // B9 (#1154): runId of the most recently grouped entry, used to absorb a
+    // run-less tool entry into the block of the run it directly follows.
+    // Reset whenever a non-groupable entry (a dm_message bubble, divider,
+    // etc.) intervenes — that marks a run boundary, so a later run-less tool
+    // can no longer be safely attributed to the earlier run.
+    let lastGroupedRunId = null;
 
     for (let i = 0; i < entries.length; i++) {
         const e = entries[i];
@@ -665,6 +677,7 @@ export function groupDmReasoningBlocks(entries) {
             group.agentName = group.agentName || e.fromAgent;
             group.thinkingText = (group.thinkingText || '') + (e.text || '');
             if (!groups.has(e.runId)) groups.set(e.runId, group);
+            lastGroupedRunId = e.runId;
             continue;
         }
 
@@ -690,7 +703,34 @@ export function groupDmReasoningBlocks(entries) {
             // metadata (see mapHistoryMessages).
             group.agentName = group.agentName || e.fromAgent;
             if (!groups.has(e.runId)) groups.set(e.runId, group);
+            lastGroupedRunId = e.runId;
             continue;
+        }
+
+        // B9 (#1154): a DM tool entry that arrived WITHOUT a runId (absent /
+        // empty `metadata.run_id` and no enrichment from run_tool_calls —
+        // possible for legacy rows or a dropped-metadata fire-and-forget
+        // write). Rather than letting it fall through to the sibling-row
+        // fallback in DmConversationView, absorb it into the block of the run
+        // it immediately follows when one is open. DM history is chronological
+        // and a tool call belongs to the agent turn it sits inside, so this
+        // attribution is sound; if no run is currently open (the tool is the
+        // first entry, or a bubble/divider reset the boundary) it is left
+        // ungrouped and the render-layer fallback handles it (with a warn).
+        if (e.type === 'tool' && !e.runId && lastGroupedRunId
+            && groups.has(lastGroupedRunId)) {
+            reasoningIndices.add(i);
+            const group = groups.get(lastGroupedRunId);
+            group.tools.push(e);
+            group.agentName = group.agentName || e.fromAgent;
+            continue;
+        }
+
+        // Any other entry (dm_message, image, divider, etc.) ends the current
+        // run's contiguous span — a run-less tool after this point can no
+        // longer be attributed to the prior run.
+        if (e.type !== 'tool') {
+            lastGroupedRunId = null;
         }
     }
 

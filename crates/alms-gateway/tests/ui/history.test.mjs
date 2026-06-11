@@ -370,6 +370,10 @@ test('#1076: tools WITHOUT a runId still pass through as sibling rows (defensive
     // The post-#1076 grouping only requires a `runId`; entries that lack
     // one (legacy / malformed rows) must still render somewhere instead of
     // disappearing. DmConversationView renders these as sibling tool rows.
+    //
+    // Post-#1154 nuance: a run-less tool is only absorbed when it directly
+    // FOLLOWS an open run. As the very first entry there is no run to
+    // attribute it to, so it stays a sibling — this case is unchanged.
     const flat = [
         {
             id: 'msg-1',
@@ -384,6 +388,102 @@ test('#1076: tools WITHOUT a runId still pass through as sibling rows (defensive
     const grouped = groupDmReasoningBlocks(flat);
     assert.equal(grouped.length, 1);
     assert.equal(grouped[0].type, 'tool', 'rowless tool must survive grouping as a sibling entry');
+});
+
+// ---------------------------------------------------------------------------
+// B9 (#1154): a DM tool entry that arrived WITHOUT a runId (absent / empty
+// metadata.run_id, no run_tool_calls enrichment) but which directly follows
+// an open run must be absorbed into that run's dm_reasoning block instead of
+// escaping to the standalone sibling-row fallback in DmConversationView.
+// ---------------------------------------------------------------------------
+
+test('#1154 B9: run-less tool following an open run is absorbed into that block', () => {
+    // A reasoning row + a run-tagged tool open run-A; a SECOND tool then
+    // arrives with no runId (the leaky persistence shape). It directly
+    // follows run-A's entries, so it must join run-A's block rather than
+    // leak out as a sibling.
+    const flat = [
+        {
+            id: 'msg-1',
+            type: 'dm_reasoning_text',
+            runId: 'run-A',
+            fromAgent: 'iris',
+            text: 'planning the edit',
+            ts: '2026-06-10T12:00:00Z',
+        },
+        {
+            id: 'msg-2',
+            type: 'tool',
+            tool: 'fs_read',
+            params: { path: 'a.txt' },
+            status: 'done',
+            runId: 'run-A',
+            fromAgent: 'iris',
+            ts: '2026-06-10T12:00:01Z',
+        },
+        {
+            id: 'msg-3',
+            type: 'tool',
+            tool: 'fs_write',
+            params: { path: 'a.txt' },
+            status: 'done',
+            // runId intentionally absent — the bug condition.
+            ts: '2026-06-10T12:00:02Z',
+        },
+    ];
+
+    const grouped = groupDmReasoningBlocks(flat);
+
+    // Everything collapses into ONE dm_reasoning block — no sibling tool row.
+    assert.equal(grouped.length, 1, 'run-less tool after an open run must be absorbed, not leaked');
+    const block = grouped[0];
+    assert.equal(block.type, 'dm_reasoning');
+    assert.equal(block.runId, 'run-A');
+    assert.equal(block.tools.length, 2, 'both the run-tagged and the run-less tool belong to the block');
+    assert.deepEqual(block.tools.map(t => t.tool), ['fs_read', 'fs_write']);
+});
+
+test('#1154 B9: run-less tool after a non-tool entry (run boundary) stays a sibling', () => {
+    // A dm_message bubble between run-A's tool and a later run-less tool marks
+    // a run boundary, so the later tool can no longer be safely attributed to
+    // run-A. It must stay a sibling (and the render layer warns).
+    const flat = [
+        {
+            id: 'msg-1',
+            type: 'tool',
+            tool: 'fs_read',
+            status: 'done',
+            runId: 'run-A',
+            fromAgent: 'iris',
+            ts: '2026-06-10T12:00:00Z',
+        },
+        {
+            id: 'msg-2',
+            type: 'agent',
+            role: 'assistant',
+            text: 'done reading',
+            fromAgent: 'iris',
+            ts: '2026-06-10T12:00:01Z',
+        },
+        {
+            id: 'msg-3',
+            type: 'tool',
+            tool: 'shell',
+            status: 'done',
+            // runId absent AND preceded by a bubble — no open run to join.
+            ts: '2026-06-10T12:00:02Z',
+        },
+    ];
+
+    const grouped = groupDmReasoningBlocks(flat);
+
+    // run-A's block + the bubble + the orphan sibling tool = 3 entries.
+    const block = grouped.find(e => e.type === 'dm_reasoning');
+    assert.ok(block, 'run-A must still form a block');
+    assert.equal(block.tools.length, 1, 'only run-A\'s own tool belongs to the block');
+    const siblingTool = grouped.find(e => e.type === 'tool');
+    assert.ok(siblingTool, 'the post-boundary run-less tool must remain a sibling row');
+    assert.equal(siblingTool.tool, 'shell');
 });
 
 // ---------------------------------------------------------------------------

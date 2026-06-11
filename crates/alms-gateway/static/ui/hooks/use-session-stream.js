@@ -92,6 +92,45 @@ function dmReasoningAgentName(source) {
 }
 
 /**
+ * Decide whether a `tool_start` (or sibling) event belongs to a DM
+ * conversation, robust to `activeSession` resolution timing.
+ *
+ * B9 (#1154): gating the DM grouping branch purely on
+ * `activeSession.value?.session_type === 'dm'` races with SSE
+ * attach/reconnect. On a fresh stream open (or a backoff reconnect that
+ * replays buffered events from `last_event_id`), `activeSession` may not
+ * have resolved yet — `listSessions` / `loadSession` populate the
+ * `sessions` / `crossAgentSessions` signals asynchronously, and a reconnect
+ * can fire its first `tool_start` before that lands. When the gate reads
+ * `false` mid-replay, the tool takes the NON-DM branch and gets appended as
+ * a standalone tool row that never joins its `dm_reasoning` block — the
+ * "sometimes tool calls render outside the collapsible" symptom.
+ *
+ * The fix is to OR in an event-driven signal that does not depend on session
+ * metadata being resolved: if a `dm_reasoning` block already exists in
+ * `chatMessages` for this run's `run_id`, the stream is unambiguously in a
+ * DM run (DM reasoning blocks are only ever created on DM sessions, by
+ * `run_created` / `run_started` / the lazy `tool_start` race path), so the
+ * tool must group into it regardless of attach/reconnect ordering. The
+ * `activeSession` check stays as the primary fast path for the common case.
+ *
+ * @param {string|null} runId - the event's run_id (already resolved with the
+ *   `data.run_id || activeRunId.value` fallback by the caller)
+ * @returns {boolean}
+ */
+function isDmEvent(runId) {
+    if (activeSession.value?.session_type === 'dm') return true;
+    // Event-driven fallback: a live DM reasoning block for this run is proof
+    // the run is a DM run even when activeSession hasn't resolved yet.
+    if (runId) {
+        return chatMessages.value.some(
+            m => m.type === 'dm_reasoning' && m.runId === runId
+        );
+    }
+    return false;
+}
+
+/**
  * Map error codes to user-friendly messages.
  * Falls back to the raw message if the code is not recognised.
  */
@@ -615,14 +654,31 @@ export function openSessionStream(sessionId, opts) {
     on('token_delta', (e) => {
         const data = JSON.parse(e.data);
         if (data.source_agent) return; // suppress subagent interleaving
-        const isDm = activeSession.value?.session_type === 'dm';
+        // S3 (#1154): gate via `isDmEvent` (run_id-aware), not a bare
+        // `activeSession` read. On a reconnect that replays buffered events
+        // from `last_event_id`, `activeSession` may not have resolved yet, so
+        // a bare check misroutes replayed DM `token_delta`s into the non-DM
+        // path — they land in `deltaBuffer` and flush as a standalone ghost
+        // bubble (the #685 symptom). `isDmEvent` ORs in the event-driven
+        // proof (a live `dm_reasoning` block for this run) so the delta stays
+        // on the DM path regardless of attach/reconnect ordering.
+        const isDm = isDmEvent(data.run_id || activeRunId.value);
         if (isDm) {
             // For DM sessions: accumulate thinking text into the per-run
             // buffer instead of the main chat delta buffer. The reasoning
             // text is displayed inside collapsible DmReasoningBlock
             // components, not as standalone agent messages. This prevents
             // ghost messages that vanish on reload. (#685)
-            const runId = activeRunId.value;
+            //
+            // B8 (#1154): bucket strictly by the event's own `run_id` rather
+            // than `activeRunId.value`. Two DM runs can overlap (a queued
+            // run's `run_created` overwrites `activeRunId` mid-stream, and
+            // `handleRunEnd` nulls `activeRunId` for the FIRST run to end),
+            // so keying on the mutable `activeRunId` lands one agent's
+            // thinking text in the other agent's collapsible. The wire-level
+            // `run_id` is the authoritative owner of the delta. Fall back to
+            // `activeRunId.value` only for legacy backends that omit it.
+            const runId = data.run_id || activeRunId.value;
             if (runId) {
                 const prev = dmThinkingBuffers.value;
                 const next = new Map(prev);
@@ -647,7 +703,11 @@ export function openSessionStream(sessionId, opts) {
         if (data.source_agent) return; // subagent reasoning is suppressed
         const delta = data.text || '';
         if (!delta) return;
-        const isDm = activeSession.value?.session_type === 'dm';
+        // S3 (#1154): gate via `isDmEvent` (run_id-aware) for the same
+        // reconnect-replay reason as the token_delta handler above — a bare
+        // `activeSession` read would misroute a replayed DM `reasoning_delta`
+        // into the non-DM path and spawn a spurious unsealed bubble.
+        const isDm = isDmEvent(data.run_id || activeRunId.value);
         if (isDm) {
             // For DM sessions: accumulate reasoning text into the per-run
             // thinking buffer instead of mutating chatMessages.  The
@@ -663,7 +723,13 @@ export function openSessionStream(sessionId, opts) {
             // until reload re-fetches history (where reasoning is grouped
             // into dm_reasoning blocks via groupDmReasoningBlocks and
             // never materialises as a stand-alone agent message). (#849)
-            const runId = activeRunId.value;
+            //
+            // B8 (#1154): bucket by the event's own `run_id`, not the mutable
+            // `activeRunId.value`. See the token_delta handler above — two
+            // overlapping DM runs would otherwise cross-contaminate each
+            // other's collapsible. Fall back to `activeRunId` only for legacy
+            // backends that omit `run_id` on the wire.
+            const runId = data.run_id || activeRunId.value;
             if (runId) {
                 const prev = dmThinkingBuffers.value;
                 const next = new Map(prev);
@@ -738,7 +804,11 @@ export function openSessionStream(sessionId, opts) {
                 'tool count before insertion:', toolCountBefore);
 
             const startedAt = Date.now();
-            const isDm = activeSession.value?.session_type === 'dm';
+            // B9 (#1154): use the race-proof DM detector instead of gating
+            // purely on activeSession resolution. A replayed tool_start on a
+            // reconnect whose session metadata hasn't landed yet still groups
+            // correctly when a dm_reasoning block already exists for this run.
+            const isDm = isDmEvent(runId);
 
             if (isDm && !data.source_agent) {
                 // DM sessions: add the tool to the live reasoning block
@@ -849,7 +919,14 @@ export function openSessionStream(sessionId, opts) {
 
             // DM reasoning blocks: update the matching tool inside the
             // block's tools array rather than updating a standalone message.
-            const isDm = activeSession.value?.session_type === 'dm';
+            //
+            // B9 (#1154): mirror the tool_start race-proofing. The matching
+            // tool_start may have grouped the tool into a dm_reasoning block
+            // via the event-driven detector even when activeSession hadn't
+            // resolved; tool_end must look inside the blocks under the same
+            // condition or it would fall through to the standalone-message
+            // path and fail to find the (correctly grouped) tool.
+            const isDm = isDmEvent(data.run_id || activeRunId.value || null);
             if (isDm && matchId && !data.source_agent) {
                 let dmFound = false;
                 transformMessages(prev => {
@@ -1127,12 +1204,64 @@ export function openSessionStream(sessionId, opts) {
         const data = JSON.parse(e.data);
         const peer = data.peer || 'unknown';
         const reason = DM_END_REASON_LABELS[data.reason] || data.reason || 'conversation ended';
-        appendMessage({
-            id: nextMsgId(), type: 'dm_ended', peer, reason,
-        });
+        // B10 (#1154): the backend may intentionally emit MULTIPLE
+        // `dm_conversation_ended` events for a SINGLE conversation-end (see
+        // `runs/dm_lifecycle.rs` — both the depth/ignore trigger path and the
+        // run-end terminal arm can fire one). Without a dedupe each event
+        // appended its own "conversation ended" banner, so a single end
+        // rendered two (or more) identical dividers.
+        //
+        // The dedupe is POSITIONAL, not key-based, because `context_id`
+        // ("dm:<a>:<b>") is PAIR-stable, NOT a per-conversation identity: a
+        // persistent DM session holds many conversation lifecycles, all
+        // carrying the SAME context_id (verified at every backend emit site).
+        // The reason label set is also tiny (depth_exceeded / ignored /
+        // user_cancelled / errored), so two genuinely separate ends on one
+        // session routinely share context_id + peer + reason. A key-based
+        // dedupe would silently swallow the second legitimate end.
+        //
+        // Backend duplicates for ONE end arrive ADJACENT with no conversation
+        // activity in between; a legitimate second end is always preceded by a
+        // new conversation. So we only dedupe against the TRAILING banner —
+        // scan backward and stop at the first real conversation entry
+        // (legitimate new conversation → never suppress) or the first
+        // `dm_ended` (compare it; if it matches, this is a duplicate). This
+        // also covers the both-ignore race and never suppresses
+        // reload-restored old banners (activity sits in between).
+        //
+        // The activity-break must list the actual `chatMessages` entry TYPES
+        // that a DM conversation produces, NOT the SSE event names. A delivered
+        // peer message is stored as `type: 'agent'` (live `dm_message` handler
+        // + the `history.js` reload mapper, which both map isDm messages to
+        // 'agent'); a user message is `'user'`; a queued-run indicator is
+        // `'thinking'` (the live reasoning block is `'dm_reasoning'`, deferred
+        // to `run_started` for queued runs). Breaking only on `'dm_reasoning'`
+        // here would miss the 'agent'/'user'/'thinking' entries and could
+        // SUPPRESS a legitimate second banner; listing every real entry type is
+        // conservative in the safe direction (worst case is a benign duplicate,
+        // never a missing banner). `'dm_message'` is kept for forward-safety
+        // even though nothing emits that entry type today.
+        const contextId = data.context_id || null;
+        let alreadyEnded = false;
+        for (let i = chatMessages.value.length - 1; i >= 0; i--) {
+            const m = chatMessages.value[i];
+            if (m.type === 'agent' || m.type === 'user' || m.type === 'thinking'
+                || m.type === 'dm_message' || m.type === 'dm_reasoning') break;
+            if (m.type === 'dm_ended') {
+                alreadyEnded = (contextId && m.contextId === contextId)
+                    || (m.peer === peer && m.reason === reason);
+                break;
+            }
+        }
+        if (!alreadyEnded) {
+            appendMessage({
+                id: nextMsgId(), type: 'dm_ended', peer, reason, contextId,
+            });
+        }
         // Reset the status bar -- the DM conversation is over, so the
         // "Chatting with {peer}..." phase and dmPeer context must be
-        // cleared to return to idle state.
+        // cleared to return to idle state. (Always runs, even on a deduped
+        // duplicate, so a late duplicate still clears any lingering phase.)
         clearAgentPhase();
     });
 
@@ -1245,7 +1374,6 @@ export function openSessionStream(sessionId, opts) {
             flushDeltaBuffer();
             sealLastAgent();
             const data = e.data ? JSON.parse(e.data) : {};
-            const isDm = activeSession.value?.session_type === 'dm';
 
             // Build the approval-resolution-and-append phase via
             // transformMessages so it results in a single signal write.
@@ -1254,6 +1382,15 @@ export function openSessionStream(sessionId, opts) {
             // (approval resolution + appended status/error/token messages)
             // is collapsed into one write to avoid intermediate states.
             const endingRunId = data.run_id || null;
+
+            // S3 (#1154): gate via `isDmEvent` (run_id-aware), not a bare
+            // `activeSession` read. On a reconnect that replays the terminal
+            // `run_finished`/`run_error`/`run_cancelled` before `activeSession`
+            // resolves, a bare check would seal the DM run on the non-DM path
+            // — skipping the `savedThinkingText` read below, so the run's
+            // final-turn reasoning is lost from its collapsible. `isDmEvent`
+            // ORs in the live `dm_reasoning` block proof for this run.
+            const isDm = isDmEvent(endingRunId || activeRunId.value);
 
             // Read and save thinking text BEFORE deleting from buffer,
             // so the transformMessages callback below can use it.
