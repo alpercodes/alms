@@ -13,18 +13,17 @@ alms-tools = { path = "../alms-tools" }
 
 tokio.workspace = true
 tokio-util.workspace = true
-crossbeam.workspace = true
 dashmap.workspace = true
 parking_lot.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 uuid.workspace = true
 chrono.workspace = true
-thiserror.workspace = true
 tracing.workspace = true
 async-trait.workspace = true
 
 [dev-dependencies]
 alms-sandbox = { path = "../alms-sandbox" }
+# Pulls tokio's `test-util` feature (paused-clock test helpers) — see #1158.
 tokio-test.workspace = true
 tempfile = "3"

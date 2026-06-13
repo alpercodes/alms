@@ -31,5 +31,6 @@ async-trait.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+# Pulls tokio's `test-util` feature (paused-clock test helpers), kept uniform
+# across the workspace — see #1158. (`tempfile` was removed here: unused.)
 tokio-test.workspace = true
-tempfile = "3"

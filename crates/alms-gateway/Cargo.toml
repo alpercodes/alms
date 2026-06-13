@@ -25,12 +25,13 @@ tower.workspace = true
 rust-embed.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-thiserror.workspace = true
 tracing.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
+# Pulls tokio's `test-util` feature, required by the run-manager drain tests
+# (`wait_drain` under a paused clock) — see #1158.
 tokio-test.workspace = true
 walkdir.workspace = true
 # Test-only subscriber for asserting structured WARN logs fire on the

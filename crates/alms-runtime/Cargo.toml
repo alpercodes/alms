@@ -24,10 +24,6 @@ reqwest.workspace = true
 # Tracing
 tracing.workspace = true
 
-# Error handling
-thiserror.workspace = true
-anyhow.workspace = true
-
 # Async traits
 async-trait.workspace = true
 
@@ -47,6 +43,8 @@ uuid.workspace = true
 dashmap.workspace = true
 
 [dev-dependencies]
+# Pulls tokio's `test-util` feature, required by the scheduler tests
+# (`tokio::time::pause()` / `advance()`) — see #1158.
 tokio-test.workspace = true
 tempfile = "3"
 # Integration test for the Gemini cache-expired retry cycle (#795). Scoped

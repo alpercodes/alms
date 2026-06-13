@@ -13,10 +13,10 @@ tokio-util.workspace = true
 parking_lot.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-thiserror.workspace = true
 tracing.workspace = true
 reqwest.workspace = true
 async-trait.workspace = true
 
 [dev-dependencies]
+# Pulls tokio's `test-util` feature (paused-clock test helpers) — see #1158.
 tokio-test.workspace = true
