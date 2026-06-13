@@ -30,6 +30,19 @@ mock = false
 # window, the stream is treated as stalled and terminated. Increase for
 # slow reasoning models or high-latency connections.
 stream_chunk_timeout_secs = 60
+# Agent-loop hard caps (#987 / B3). These bound a SINGLE agent run so a run
+# that keeps calling tools without ever producing a final reply terminates
+# instead of hanging forever. They apply to ALL run types — web chat, cron
+# jobs, and subagents — and a cap trip ends the run `failed` (for a
+# peer-triggered DM run the peer is notified). CONFIG-FILE-ONLY: not mutable
+# via PATCH /settings; restart the gateway to change them.
+# Max LLM-call iterations per run (one iteration = one LLM call + its tool
+# batch). Default 500. 0 = disabled (no limit).
+max_iterations = 500
+# Max wall-clock duration of a run, in seconds. Checked between iterations,
+# so the effective ceiling is this value plus at most one in-flight step.
+# Default 14400 (4 hours). 0 = disabled (no limit).
+max_run_duration_secs = 14400
 
 # Set API key via `alms auth set`:
 #   alms auth set openrouter sk-...

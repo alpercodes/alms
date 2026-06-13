@@ -83,6 +83,21 @@ pub struct AgentConfig {
     pub prompts: SystemPrompts,
     /// Maximum tokens per response
     pub max_tokens: u32,
+    /// Hard cap on the number of LLM-call iterations a single run may take
+    /// before the agent loop terminates it with an error (#987 / B3).
+    ///
+    /// Each iteration is one LLM call plus the tool batch it requests.
+    /// `0` disables the cap. Populated from
+    /// [`alms_core::config::LlmConfig::max_iterations`] by the gateway's
+    /// `AgentConfig` assembly and inherited by subagents.
+    pub max_iterations: u32,
+    /// Hard cap on the wall-clock duration of a single run, in seconds
+    /// (#987 / B3). `0` disables the cap. Checked between loop iterations.
+    ///
+    /// Populated from
+    /// [`alms_core::config::LlmConfig::max_run_duration_secs`] by the
+    /// gateway's `AgentConfig` assembly and inherited by subagents.
+    pub max_run_duration_secs: u64,
     /// Context window management config
     pub context_config: ContextConfig,
     /// Execution posture (full_control, guarded, or autonomous)
@@ -193,6 +208,12 @@ impl Default for AgentConfig {
             // `alms-core` so the config crate's #919 token-budget
             // validator can reuse the same default at load time.
             max_tokens: DEFAULT_AGENT_MAX_TOKENS,
+            // Mirror `LlmConfig::default()` (#987 / B3 / #1160): generous
+            // iteration ceiling + 4-hour wall-clock cap, sized for all run
+            // types. The gateway overwrites these from `[llm]` during
+            // `AgentConfig` assembly.
+            max_iterations: 500,
+            max_run_duration_secs: 14400,
             context_config: ContextConfig::default(),
             posture: Posture::default(),
             sandbox_root: ".".into(),

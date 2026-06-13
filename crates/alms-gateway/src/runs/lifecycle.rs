@@ -1259,6 +1259,30 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
             .await;
         state.run_manager.remove_cancel_token(run_id);
         state.run_manager.remove_senders(run_id);
+
+        // S1 (#1154): if this was a peer-triggered DM run cancelled while
+        // still `Queued` (HTTP cancel, #1109 deny cascade,
+        // `cancel_runs_for_session`, or shutdown), signal the peer that the
+        // conversation ended with `UserCancelled`. This is the single
+        // chokepoint every queued-then-cancelled run passes through — the
+        // synchronous `cancel_run` handler only flips state + emits
+        // `run_cancelled`, and the `Ok`/`Cancelled` arms below never run for
+        // a run cancelled before the loop started. Without this the peer was
+        // stranded until the `DEPTH_EXPIRY_SECS` sweep. `agent_name` is not
+        // resolved yet here (this exit precedes `resolve_agent_config`), so
+        // the helper re-resolves it from the registry by `agent_id`. The
+        // helper is a no-op for non-peer / non-`dm:` runs.
+        super::dm_lifecycle::notify_dm_peer_of_setup_cancellation(
+            &state,
+            &run_id,
+            &session_id,
+            agent_id,
+            None,
+            &context_id,
+            is_peer_message,
+        )
+        .await;
+
         info!("Run {} was cancelled before starting", run_id.0);
         // The queue head is advancing — fan out updated positions to any
         // remaining queued runs on this agent (#831).
@@ -2259,10 +2283,12 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
     forwarder_handle.await.ok();
 
     // Helper: persist tool call records (used by all outcome branches).
+    // `session_id` is stored on each row (B9(b), #1154) so the records stay
+    // attributable to this session even if the `runs` row is later removed.
     let persist_tool_calls = |records: &[alms_core::ToolCallRecord]| {
         if !records.is_empty()
             && let Some(store) = state.session_manager.store()
-            && let Err(e) = store.save_tool_calls(run_id, records)
+            && let Err(e) = store.save_tool_calls(run_id, session_id, records)
         {
             warn!(
                 "Failed to persist {} tool call records for run {}: {}",
@@ -2385,14 +2411,18 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
             // broadcast / episodic summary spawn / DM lifecycle handler
             // below would all fire as if the run had completed naturally.
             // With the bool gate in place, every post-flip side effect in
-            // this Ok arm is conditional on `completed_transitioned`: if
-            // a cancel won the race, the `Cancelled` arm (or the
-            // pre-cancel branch above) already emitted the canonical
-            // `run_cancelled` SSE and called `handle_dm_run_failure`, and
-            // we now stay silent here. Note this differs from the
-            // `Cancelled` / `Failed` Err arms below where
-            // `handle_dm_run_failure` is intentionally unconditional —
-            // see those arms for the rationale.
+            // this Ok arm is conditional on `completed_transitioned`: if a
+            // cancel won the race, the canonical `run_cancelled` SSE was
+            // already emitted (by the `Cancelled` arm, the synchronous HTTP
+            // `cancel_run` handler, or the pre-cancel early-exit above) and
+            // the DM peer was already signalled — by the `Cancelled` arm's
+            // `handle_dm_run_failure(UserCancelled)` when the loop ran, or by
+            // the pre-cancel early-exit's
+            // `notify_dm_peer_of_setup_cancellation` (S1, #1154) when the run
+            // was cancelled before the loop started. Either way we stay
+            // silent here. Note this differs from the `Cancelled` / `Failed`
+            // Err arms below where `handle_dm_run_failure` is intentionally
+            // unconditional — see those arms for the rationale.
             let completed_transitioned =
                 state
                     .run_manager
@@ -2467,15 +2497,26 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
                 // AND `dm_conversation_ended` with reason
                 // `"ignore_message"` (from this call), conflating an
                 // operator-driven cancel with an agent-driven ignore.
-                // Cancel-side conversation bookkeeping is handled
-                // unconditionally by `handle_dm_run_failure(UserCancelled)`
-                // in the `Cancelled` / `CancelledWithToolCalls` arms (see
-                // the comments there — per #1050's design, that call
-                // fires regardless of who wins the state-flip race). The
-                // `MessageBus::end_conversation` depth-remove there is
-                // the atomicity guard, so skipping the
-                // `handle_dm_run_completion` call here cannot strand
-                // depth-counter state.
+                //
+                // Cancel-side conversation bookkeeping is signalled by
+                // whichever path actually drove the run terminal — NOT
+                // necessarily this Ok arm's sibling `Cancelled` arm. There
+                // are two cancel paths and each owns the peer signal:
+                //   1. Cancelled *during* the loop → the `Cancelled` /
+                //      `CancelledWithToolCalls` arms call
+                //      `handle_dm_run_failure(UserCancelled)` (unconditional
+                //      per #1050, fires regardless of who wins the
+                //      state-flip race).
+                //   2. Cancelled *before* the loop started (queued-then-
+                //      cancelled) → the pre-cancel early-exit at the top of
+                //      `execute_run` calls
+                //      `notify_dm_peer_of_setup_cancellation` (S1, #1154);
+                //      this Ok arm is never reached on that path.
+                // Either way the peer is signalled exactly once, so skipping
+                // `handle_dm_run_completion` here when the cancel won is
+                // correct — and the `MessageBus::end_conversation`
+                // depth-remove in both paths is the atomicity guard, so it
+                // cannot strand depth-counter state.
                 let dm_exit = super::dm_lifecycle::handle_dm_run_completion(
                     super::dm_lifecycle::DmRunCompletionContext {
                         state: &state,
@@ -2501,14 +2542,45 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
 
                 info!("Run {} completed successfully", run_id.0);
             } else {
-                // The cancel / shutdown path won the race. The terminal
-                // arm that actually flipped the state has already emitted
-                // its SSE event and signalled the DM peer (via
-                // `handle_dm_run_failure`). All we owe here is a
-                // diagnostic log — the partial tool-call records and the
-                // run-boundary marker have already been persisted above
-                // (those are diagnostic and idempotent, so they fire
-                // regardless of who wins the race).
+                // A cancel / shutdown path won the state-flip race while the
+                // loop was producing this `Ok`. The `run_cancelled` SSE was
+                // already emitted by whichever path flipped the state.
+                //
+                // S1 (#1154): but NOT every winning path signals the DM peer.
+                // The synchronous HTTP `cancel_run` handler and
+                // `cancel_runs_for_session` only flip state + emit
+                // `run_cancelled` — they do not call `handle_dm_run_failure`.
+                // And because the loop returned `Ok` (not
+                // `Err(Cancelled)`), the `Cancelled` arm below — which would
+                // have signalled the peer — never runs. So in the
+                // Ok-arm-vs-HTTP-cancel interleaving the peer would be left
+                // stranded. Signal it here with `UserCancelled`. This is
+                // safe to call even if the peer was already signalled by a
+                // racing path: `MessageBus::end_conversation`'s
+                // `depths.remove()` / tombstone guard makes a second call a
+                // no-op (no duplicate marker or trigger). Best-effort — a
+                // returned error is logged, not propagated.
+                if let Err(e) = super::dm_lifecycle::handle_dm_run_failure(
+                    &state,
+                    &run_id,
+                    &session_id,
+                    agent_id,
+                    agent_name.as_deref(),
+                    &context_id,
+                    is_peer_message,
+                    ConversationEndReason::UserCancelled,
+                )
+                .await
+                {
+                    warn!(
+                        error = %e,
+                        "handle_dm_run_failure emitted error on Ok-but-cancelled \
+                         path — DM peer state may be stale"
+                    );
+                }
+
+                // The partial tool-call records and the run-boundary marker
+                // were already persisted above (diagnostic and idempotent).
                 info!(
                     "Run {} returned Ok but was already terminal — \
                      terminal-arm bookkeeping skipped (cancel / shutdown won)",

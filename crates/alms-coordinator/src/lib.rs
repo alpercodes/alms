@@ -1209,6 +1209,11 @@ fn agent_config_for_subagent(
         enabled_tools: base.enabled_tools.clone(),
         fs_edit_fuzzy_match: base.fs_edit_fuzzy_match,
         max_tokens: base.max_tokens,
+        // Agent-loop hard caps (#987 / B3) — inherited verbatim so a
+        // subagent that wedges in a tool loop terminates on the same
+        // ceiling its parent would.
+        max_iterations: base.max_iterations,
+        max_run_duration_secs: base.max_run_duration_secs,
         context_config: subagent_context_config,
         prompts: base.prompts.clone(),
         debug_mode: false,

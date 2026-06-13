@@ -826,7 +826,7 @@ pub(super) fn format_dm_conversation_history(messages: &[alms_session::Message])
 /// notification here and pass `is_peer = false` so `execute_run` uses
 /// `runtime.run()`, which persists the input to the notification session.
 pub(crate) async fn run_trigger_loop(
-    mut rx: mpsc::UnboundedReceiver<alms_coordinator::message_bus::RunTrigger>,
+    mut rx: mpsc::Receiver<alms_coordinator::message_bus::RunTrigger>,
     state: AppState,
 ) {
     use alms_coordinator::message_bus::MessageSource;
@@ -1061,7 +1061,7 @@ pub(crate) async fn run_trigger_loop(
 /// Without this loop, DM messages are invisible during live viewing and only
 /// appear on page reload. See #632 bugs 1 and 4.
 pub(crate) async fn dm_event_loop(
-    mut rx: tokio::sync::mpsc::UnboundedReceiver<alms_coordinator::message_bus::DmEvent>,
+    mut rx: tokio::sync::mpsc::Receiver<alms_coordinator::message_bus::DmEvent>,
     state: AppState,
 ) {
     while let Some(event) = rx.recv().await {
@@ -1122,9 +1122,10 @@ mod tests {
         let shutdown_token = CancellationToken::new();
         let (completion_tx, _completion_rx) = mpsc::unbounded_channel();
         // The trigger_tx is consumed by AppState's MessageBus; the test
-        // feeds run_trigger_loop via a separate channel below.
-        let (trigger_tx, _bus_rx) = mpsc::unbounded_channel();
-        let (dm_event_tx, _dm_event_rx) = mpsc::unbounded_channel();
+        // feeds run_trigger_loop via a separate channel below. Bounded
+        // (#842 / B11) to match the production channel shape.
+        let (trigger_tx, _bus_rx) = mpsc::channel(8);
+        let (dm_event_tx, _dm_event_rx) = mpsc::channel(8);
         let state = AppState::new(
             gateway,
             scheduler,
@@ -1151,7 +1152,7 @@ mod tests {
         let _web_session = state.session_manager.get_or_create(agent_id, "web");
 
         // -- Send a ConversationEnded trigger with source_session_id: None --
-        let (test_tx, test_rx) = mpsc::unbounded_channel();
+        let (test_tx, test_rx) = mpsc::channel(8);
         test_tx
             .send(RunTrigger {
                 agent_id,
@@ -1165,6 +1166,7 @@ mod tests {
                 },
                 context_id: notif_context_id.clone(),
             })
+            .await
             .unwrap();
         // Drop the sender so the loop exits after processing the one trigger.
         drop(test_tx);
@@ -1219,8 +1221,9 @@ mod tests {
         let scheduler = std::sync::Arc::new(alms_runtime::Scheduler::new());
         let shutdown_token = CancellationToken::new();
         let (completion_tx, _completion_rx) = mpsc::unbounded_channel();
-        let (trigger_tx, _bus_rx) = mpsc::unbounded_channel();
-        let (dm_event_tx, _dm_event_rx) = mpsc::unbounded_channel();
+        // Bounded (#842 / B11) to match the production channel shape.
+        let (trigger_tx, _bus_rx) = mpsc::channel(8);
+        let (dm_event_tx, _dm_event_rx) = mpsc::channel(8);
         let state = AppState::new(
             gateway,
             scheduler,

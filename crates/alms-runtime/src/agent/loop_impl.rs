@@ -233,6 +233,17 @@ impl AgentRuntime {
         // ended with no deliverable reply text (#1154 design default #3).
         // Capped at DM_EMPTY_REPLY_MAX_RETRIES to prevent infinite loops.
         let mut dm_empty_reply_retries: u32 = 0;
+        // Agent-loop hard caps (#987 / B3). Per-step timeouts bound how long
+        // any one LLM/tool step can take, but nothing bounded the *count* of
+        // steps or the total wall-clock — so an agent that kept calling tools
+        // without ever producing a deliverable reply ran forever. On a
+        // peer-triggered DM run that left the peer stranded on "Chatting
+        // with…" indefinitely; tripping either cap returns an `Err`, which
+        // `finish_run` wraps into `FailedWithToolCalls` and the gateway's
+        // `handle_dm_run_failure` converts into an `Errored` conversation end
+        // so the peer is notified. `0` disables a cap.
+        let mut iterations: u32 = 0;
+        let run_start = std::time::Instant::now();
 
         loop {
             // Checkpoint A: check cancellation between iterations.
@@ -241,6 +252,50 @@ impl AgentRuntime {
             {
                 info!(agent_id = %self.agent_id.0, "Run cancelled by user");
                 return (tool_call_records, Err(AlmsError::Cancelled));
+            }
+
+            // Checkpoint A2: enforce the agent-loop hard caps (#987 / B3)
+            // between iterations, before spending another LLM call. The
+            // iteration cap bounds the step count; the duration cap bounds
+            // total elapsed time so a run that makes slow forward progress
+            // still terminates. An in-flight step is bounded by its own
+            // per-step timeout, so the effective duration ceiling is this
+            // value plus at most one step.
+            iterations += 1;
+            if self.config.max_iterations > 0 && iterations > self.config.max_iterations {
+                warn!(
+                    agent_id = %self.agent_id.0,
+                    max_iterations = self.config.max_iterations,
+                    "Agent loop hit the maximum iteration cap without completing -- \
+                     terminating with an error (#987 / B3)"
+                );
+                return (
+                    tool_call_records,
+                    Err(AlmsError::Runtime(format!(
+                        "agent loop exceeded the maximum of {} iterations \
+                         without producing a final response",
+                        self.config.max_iterations
+                    ))),
+                );
+            }
+            if self.config.max_run_duration_secs > 0
+                && run_start.elapsed().as_secs() >= self.config.max_run_duration_secs
+            {
+                warn!(
+                    agent_id = %self.agent_id.0,
+                    max_run_duration_secs = self.config.max_run_duration_secs,
+                    elapsed_secs = run_start.elapsed().as_secs(),
+                    "Agent loop exceeded the maximum run duration without completing -- \
+                     terminating with an error (#987 / B3)"
+                );
+                return (
+                    tool_call_records,
+                    Err(AlmsError::Runtime(format!(
+                        "agent run exceeded the maximum duration of {} seconds \
+                         without producing a final response",
+                        self.config.max_run_duration_secs
+                    ))),
+                );
             }
 
             debug!(
@@ -394,27 +449,34 @@ impl AgentRuntime {
                     tool_seq += 1;
                 }
 
-                // Pre-execution conflict detection: send_message and
-                // ignore_message are mutually exclusive. If both appear in
-                // the same tool-call batch, execute neither -- return error
-                // results for both so the LLM can retry with just one.
-                // Other non-conflicting tools in the batch still execute
-                // normally. (Fixes #364)
-                let dm_check = detect_dm_conflict(&tool_calls);
+                // Pre-execution conflict detection (#364), recipient-aware
+                // under implicit replies (#1154 / S3): reject a batch only
+                // when `ignore_message` is paired with a `send_message`
+                // aimed at the *current peer* (folding a reply AND ending the
+                // conversation with them is contradictory). A `send_message`
+                // to a *different* agent alongside `ignore_message` ("loop in
+                // Charlie, then end with the peer") is legitimate and no
+                // longer rejected. Conflicting tools get error results so the
+                // LLM can retry; other tools in the batch still execute.
+                let dm_check = detect_dm_conflict(&tool_calls, dm_peer);
                 if dm_check.conflict {
                     warn!(
-                        "Agent called both send_message and ignore_message in same batch -- \
-                         rejecting both; the agent will retry with one"
+                        "Agent paired ignore_message with a send_message aimed at the \
+                         current DM peer -- rejecting both; the agent will retry with one"
                     );
                 }
 
                 // Emit status: list only the tool names that will actually
                 // execute (exclude conflicting tools so SSE subscribers do
-                // not see rejected tools listed as "executing").
+                // not see rejected tools listed as "executing"). Filter by
+                // batch *index* (#1160) so a third-agent `send_message` that
+                // shares the name of a folded peer-directed one is still
+                // listed as executing.
                 let tool_names: Vec<&str> = tool_calls
                     .iter()
-                    .map(|tc| tc.function.name.as_str())
-                    .filter(|name| !dm_check.conflicting_tools.contains(name))
+                    .enumerate()
+                    .filter(|(i, _)| !dm_check.conflicting_indices.contains(i))
+                    .map(|(_, tc)| tc.function.name.as_str())
                     .collect();
                 if !tool_names.is_empty() {
                     let detail = tool_names.join(", ");
@@ -434,7 +496,7 @@ impl AgentRuntime {
                     .run_tool_calls(
                         &tool_calls,
                         &invocation_ids,
-                        dm_check.conflicting_tools,
+                        &dm_check.conflicting_indices,
                         session_manager,
                         session_id,
                         is_dm,
@@ -704,7 +766,7 @@ impl AgentRuntime {
         &self,
         tool_calls: &[ToolCall],
         invocation_ids: &[Uuid],
-        conflicting_tools: &[&str],
+        conflicting_indices: &[usize],
         session_manager: &SessionManager,
         session_id: alms_core::SessionId,
         is_dm: bool,
@@ -754,8 +816,8 @@ impl AgentRuntime {
                 // cancel pass in `run_tool_calls_parallel` (Tim's #1089
                 // review suggestion, carried over for #1090).
                 let workspace_root = self.workspace_root_for_truncate();
-                for (tc, &inv_id) in tool_calls.iter().zip(invocation_ids) {
-                    if conflicting_tools.contains(&tc.function.name.as_str()) {
+                for (i, (tc, &inv_id)) in tool_calls.iter().zip(invocation_ids).enumerate() {
+                    if conflicting_indices.contains(&i) {
                         results.push(Err(AlmsError::ToolExecution(DM_CONFLICT_MSG.to_string())));
                         continue;
                     }
@@ -823,7 +885,7 @@ impl AgentRuntime {
                 self.run_tool_calls_parallel(
                     tool_calls,
                     invocation_ids,
-                    conflicting_tools,
+                    conflicting_indices,
                     session_manager,
                     session_id,
                     is_dm,
@@ -855,7 +917,7 @@ impl AgentRuntime {
         &self,
         tool_calls: &[ToolCall],
         invocation_ids: &[Uuid],
-        conflicting_tools: &[&str],
+        conflicting_indices: &[usize],
         session_manager: &SessionManager,
         session_id: alms_core::SessionId,
         is_dm: bool,
@@ -866,11 +928,11 @@ impl AgentRuntime {
         use futures::stream::{FuturesUnordered, StreamExt};
 
         // Indices (into `tool_calls`) of non-conflicting tools to execute.
-        let exec_indices: Vec<usize> = tool_calls
-            .iter()
-            .enumerate()
-            .filter(|(_, tc)| !conflicting_tools.contains(&tc.function.name.as_str()))
-            .map(|(i, _)| i)
+        // Membership is tested by batch *index* (#1160), not tool name, so a
+        // third-agent `send_message` that shares the name of a folded
+        // peer-directed one still executes.
+        let exec_indices: Vec<usize> = (0..tool_calls.len())
+            .filter(|i| !conflicting_indices.contains(i))
             .collect();
         let exec_len = exec_indices.len();
 
@@ -983,10 +1045,9 @@ impl AgentRuntime {
         // get the DM conflict error, executed tools get their slot's
         // result. By construction every slot is `Some(_)` here.
         let mut slot_iter = completed_results.into_iter();
-        let results: Vec<AlmsResult<serde_json::Value>> = tool_calls
-            .iter()
-            .map(|tc| {
-                if conflicting_tools.contains(&tc.function.name.as_str()) {
+        let results: Vec<AlmsResult<serde_json::Value>> = (0..tool_calls.len())
+            .map(|i| {
+                if conflicting_indices.contains(&i) {
                     Err(AlmsError::ToolExecution(DM_CONFLICT_MSG.to_string()))
                 } else {
                     slot_iter.next().flatten().unwrap_or_else(|| {
@@ -1002,7 +1063,7 @@ impl AgentRuntime {
                             exec_len
                         );
                         Err(AlmsError::Runtime(
-                            "BUG: slot exhausted -- conflicting_tools filter \
+                            "BUG: slot exhausted -- conflicting_indices filter \
                              diverged from exec_indices"
                                 .into(),
                         ))

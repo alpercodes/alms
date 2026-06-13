@@ -149,6 +149,7 @@ CREATE INDEX IF NOT EXISTS idx_runs_agent_id ON runs(agent_id);
 CREATE TABLE IF NOT EXISTS run_tool_calls (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     run_id     TEXT NOT NULL,
+    session_id TEXT,
     seq        INTEGER NOT NULL,
     role       TEXT NOT NULL,
     tool_name  TEXT,
@@ -160,6 +161,7 @@ CREATE TABLE IF NOT EXISTS run_tool_calls (
 );
 
 CREATE INDEX IF NOT EXISTS idx_run_tool_calls_run ON run_tool_calls(run_id, seq);
+CREATE INDEX IF NOT EXISTS idx_run_tool_calls_session ON run_tool_calls(session_id);
 
 CREATE TABLE IF NOT EXISTS session_summaries (
     agent_id     TEXT NOT NULL,
@@ -264,6 +266,7 @@ impl SqliteStore {
             "CREATE TABLE IF NOT EXISTS run_tool_calls (\
                  id         INTEGER PRIMARY KEY AUTOINCREMENT, \
                  run_id     TEXT NOT NULL, \
+                 session_id TEXT, \
                  seq        INTEGER NOT NULL, \
                  role       TEXT NOT NULL, \
                  tool_name  TEXT, \
@@ -280,6 +283,16 @@ impl SqliteStore {
         // DBs so the frontend fallback merge path can attribute DM reasoning
         // blocks to the correct agent (see #696).
         let _ = conn.execute_batch("ALTER TABLE run_tool_calls ADD COLUMN from_agent TEXT;");
+        // Auto-migrate: add session_id column to run_tool_calls (B9(b), #1154)
+        // so a tool-call row stays attributable to its session even if the
+        // `runs` row is later removed. Existing rows keep `session_id = NULL`
+        // and are still found via the `runs` join in
+        // `load_tool_calls_for_session` (backward-compat branch).
+        let _ = conn.execute_batch("ALTER TABLE run_tool_calls ADD COLUMN session_id TEXT;");
+        let _ = conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_run_tool_calls_session \
+                 ON run_tool_calls(session_id);",
+        );
         // Auto-migrate: add session_summaries table for cross-session episodic memory.
         let _ = conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS session_summaries (\

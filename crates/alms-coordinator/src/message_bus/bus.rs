@@ -30,10 +30,20 @@ use tracing::{debug, info, instrument, warn};
 pub struct MessageBus {
     pub(super) session_manager: Arc<SessionManager>,
     /// Channel to trigger runs on the gateway.
-    run_trigger_tx: mpsc::UnboundedSender<RunTrigger>,
+    ///
+    /// Bounded (#842 / B11): a runaway producer can no longer grow this queue
+    /// without limit. `MessageBus::send` / `end_conversation` are async and
+    /// push triggers with `Sender::send().await`, so when the buffer is full
+    /// the sender applies back-pressure (awaits a free slot) rather than
+    /// dropping the trigger — a lost `RunTrigger` would silently strand a DM
+    /// turn, exactly the failure class #1154 is closing.
+    run_trigger_tx: mpsc::Sender<RunTrigger>,
     /// Channel to notify the gateway of DM message persistence so SSE events
     /// can be emitted to viewers watching the DM session. See #632.
-    dm_event_tx: Option<mpsc::UnboundedSender<DmEvent>>,
+    ///
+    /// Bounded (#842 / B11) for the same reason as `run_trigger_tx`; these
+    /// events drive live DM SSE forwarding and are pushed with back-pressure.
+    dm_event_tx: Option<mpsc::Sender<DmEvent>>,
     /// Per-DM-pair depth tracker: "dm:a:b" -> (last_sender_name, depth).
     /// Depth increments each time the sender changes within the same pair.
     pub(super) depths: DashMap<String, (String, u32)>,
@@ -72,7 +82,7 @@ impl MessageBus {
     /// Create a new MessageBus.
     pub fn new(
         session_manager: Arc<SessionManager>,
-        run_trigger_tx: mpsc::UnboundedSender<RunTrigger>,
+        run_trigger_tx: mpsc::Sender<RunTrigger>,
     ) -> Self {
         Self {
             session_manager,
@@ -91,7 +101,7 @@ impl MessageBus {
     /// message is persisted to a DM session. The gateway's `dm_event_loop`
     /// consumes these and pushes SSE events to viewers watching that session.
     /// See #632.
-    pub fn with_dm_event_channel(mut self, tx: mpsc::UnboundedSender<DmEvent>) -> Self {
+    pub fn with_dm_event_channel(mut self, tx: mpsc::Sender<DmEvent>) -> Self {
         self.dm_event_tx = Some(tx);
         self
     }
@@ -201,6 +211,23 @@ impl MessageSender for MessageBus {
         // marker + trigger).
         self.expired_pairs.remove(&dm_context);
 
+        // B7 (#1154): stamp `last_activity` the moment the depth entry exists,
+        // BEFORE the depth-exceeded check and the `append_message` that can
+        // fail below. Both expiry paths key off `last_activity`, so if the
+        // first message's `append_message` returns `Err` after the depth
+        // entry was created, an entry stamped only on the success path (the
+        // historical `self.last_activity.insert` further down) would leave a
+        // `depths` entry that NO sweep can ever reclaim. The pair's *next*
+        // conversation then resumes from the stale depth and can hit
+        // `DepthExceeded` after one exchange ("DM randomly stops"). Stamping
+        // here keeps the invariant "every `depths` entry has a matching
+        // `last_activity`" intact at every early return after this point.
+        // The DepthExceeded branch below removes both maps via
+        // `end_conversation`, and the success path re-stamps the timestamp
+        // after the append — so this is the floor, not the only write.
+        self.last_activity
+            .insert(dm_context.clone(), Instant::now());
+
         if current_depth > MAX_DM_DEPTH {
             // End the conversation cleanly: write a dm_ended marker to the
             // session, reset the depth counter, and notify the peer.
@@ -301,22 +328,35 @@ impl MessageSender for MessageBus {
         // session so it can push an SSE event to any web UI client watching
         // this session live.  Without this, DM messages are invisible during
         // live viewing and only appear on reload.
-        if let Some(ref tx) = self.dm_event_tx
-            && let Err(e) = tx.send(DmEvent {
-                session_id,
-                from_agent: sender_name.to_string(),
-                from_agent_id: sender_agent_id,
-                message: message.to_string(),
-                ts: Utc::now(),
-            })
-        {
-            debug!(
-                error = %e,
-                "Failed to send DmEvent for SSE forwarding (receiver dropped)"
-            );
+        if let Some(ref tx) = self.dm_event_tx {
+            // Bounded send with back-pressure (#842 / B11): `await`s a free
+            // slot if the buffer is full rather than dropping the event.
+            // Err means the receiver was dropped (gateway shutting down) —
+            // best-effort, log and continue.
+            if let Err(e) = tx
+                .send(DmEvent {
+                    session_id,
+                    from_agent: sender_name.to_string(),
+                    from_agent_id: sender_agent_id,
+                    message: message.to_string(),
+                    ts: Utc::now(),
+                })
+                .await
+            {
+                debug!(
+                    error = %e,
+                    "Failed to send DmEvent for SSE forwarding (receiver dropped)"
+                );
+            }
         }
 
-        // --- Update last activity for depth expiry ---
+        // --- Refresh last activity for depth expiry ---
+        //
+        // `last_activity` was already stamped at depth-entry creation (B7
+        // floor, above). This re-stamp moves it forward to "message actually
+        // persisted" time on the success path, so the expiry clock measures
+        // idle time since the last *delivered* message rather than since the
+        // send was attempted.
         self.last_activity
             .insert(dm_context.clone(), Instant::now());
 
@@ -332,7 +372,11 @@ impl MessageSender for MessageBus {
             context_id: dm_context,
         };
 
-        if let Err(e) = self.run_trigger_tx.send(trigger) {
+        // Bounded send with back-pressure (#842 / B11): never drop a
+        // `RunTrigger` — a lost trigger silently strands the peer's DM turn.
+        // `await`s a free slot if the buffer is full; Err only when the
+        // receiver was dropped (gateway shutting down).
+        if let Err(e) = self.run_trigger_tx.send(trigger).await {
             warn!(
                 error = %e,
                 "Failed to send RunTrigger for peer message (receiver dropped)"
@@ -531,7 +575,9 @@ impl MessageSender for MessageBus {
             context_id: target_context_id,
         };
 
-        if let Err(e) = self.run_trigger_tx.send(trigger) {
+        // Bounded send with back-pressure (#842 / B11) — never drop the
+        // peer's end notification.
+        if let Err(e) = self.run_trigger_tx.send(trigger).await {
             warn!(
                 error = %e,
                 "Failed to send RunTrigger for conversation end notification (receiver dropped)"
@@ -572,7 +618,8 @@ impl MessageSender for MessageBus {
                 },
                 context_id: ctx,
             };
-            if let Err(e) = self.run_trigger_tx.send(sender_trigger) {
+            // Bounded send with back-pressure (#842 / B11).
+            if let Err(e) = self.run_trigger_tx.send(sender_trigger).await {
                 warn!(
                     error = %e,
                     "Failed to send RunTrigger for sender self-notification (receiver dropped)"

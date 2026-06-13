@@ -389,6 +389,75 @@ pub(super) async fn notify_dm_peer_of_setup_failure(
     is_peer_message: bool,
     error_message: String,
 ) {
+    notify_dm_peer_of_setup_outcome(
+        state,
+        run_id,
+        session_id,
+        agent_id,
+        agent_name,
+        context_id,
+        is_peer_message,
+        ConversationEndReason::Errored {
+            message: error_message,
+        },
+    )
+    .await;
+}
+
+/// Notify the DM peer when a peer-triggered DM run is **cancelled before the
+/// agent loop starts** (#1154 / S1).
+///
+/// A run cancelled while still `Queued` — HTTP `POST /runs/{id}/cancel`, the
+/// #1109 approval-deny cascade, `cancel_runs_for_session`, or graceful
+/// shutdown — reaches `execute_run`'s pre-loop early-exit and returns there
+/// without any DM bookkeeping. Neither the synchronous `cancel_run` handler
+/// (it only flips state + emits `run_cancelled`) nor the early-exit signalled
+/// the peer, so the peer was stranded on "Chatting with…" until the
+/// `DEPTH_EXPIRY_SECS` sweep. This helper routes the early-exit into
+/// [`handle_dm_run_failure`] with [`ConversationEndReason::UserCancelled`] so
+/// the peer is told the conversation ended.
+///
+/// Like [`notify_dm_peer_of_setup_failure`], `agent_name` may be `None` (the
+/// early-exit fires before the registry record is loaded); the name is
+/// re-resolved from the registry by `agent_id`.
+pub(super) async fn notify_dm_peer_of_setup_cancellation(
+    state: &AppState,
+    run_id: &RunId,
+    session_id: &SessionId,
+    agent_id: AgentId,
+    agent_name: Option<&str>,
+    context_id: &str,
+    is_peer_message: bool,
+) {
+    notify_dm_peer_of_setup_outcome(
+        state,
+        run_id,
+        session_id,
+        agent_id,
+        agent_name,
+        context_id,
+        is_peer_message,
+        ConversationEndReason::UserCancelled,
+    )
+    .await;
+}
+
+/// Shared body for the pre-loop DM peer-notification helpers
+/// ([`notify_dm_peer_of_setup_failure`] /
+/// [`notify_dm_peer_of_setup_cancellation`]). Gates on peer-DM, re-resolves
+/// the agent name by ID when the caller did not have it yet, and routes the
+/// supplied `reason` into [`handle_dm_run_failure`].
+#[allow(clippy::too_many_arguments)]
+async fn notify_dm_peer_of_setup_outcome(
+    state: &AppState,
+    run_id: &RunId,
+    session_id: &SessionId,
+    agent_id: AgentId,
+    agent_name: Option<&str>,
+    context_id: &str,
+    is_peer_message: bool,
+    reason: ConversationEndReason,
+) {
     if !(is_peer_message && context_id.starts_with("dm:")) {
         return;
     }
@@ -412,16 +481,14 @@ pub(super) async fn notify_dm_peer_of_setup_failure(
         resolved_name.as_deref(),
         context_id,
         is_peer_message,
-        ConversationEndReason::Errored {
-            message: error_message,
-        },
+        reason,
     )
     .await
     {
         warn!(
             run_id = %run_id.0,
             error = %e,
-            "Setup-failure DM peer notification failed — peer state may be stale"
+            "Pre-loop DM peer notification failed — peer state may be stale"
         );
     }
 }

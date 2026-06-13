@@ -488,6 +488,7 @@ mod tests {
         store
             .save_tool_calls(
                 run_id,
+                session.id,
                 &[
                     ToolCallRecord {
                         seq: 0,
@@ -526,6 +527,7 @@ mod tests {
         store
             .save_tool_call(
                 other_run_id,
+                other_session.id,
                 &ToolCallRecord {
                     seq: 0,
                     role: ToolCallRole::Assistant,

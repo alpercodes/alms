@@ -38,16 +38,16 @@ fn test_app_state() -> (
     AppState,
     CancellationToken,
     mpsc::UnboundedReceiver<SubagentCompletion>,
-    mpsc::UnboundedReceiver<RunTrigger>,
-    mpsc::UnboundedReceiver<DmEvent>,
+    mpsc::Receiver<RunTrigger>,
+    mpsc::Receiver<DmEvent>,
 ) {
     let gateway_config = GatewayConfig::default();
     let gateway = crate::gateway::Gateway::new(gateway_config).unwrap();
     let scheduler = Arc::new(alms_runtime::Scheduler::new());
     let shutdown_token = CancellationToken::new();
     let (completion_tx, completion_rx) = mpsc::unbounded_channel();
-    let (trigger_tx, trigger_rx) = mpsc::unbounded_channel();
-    let (dm_event_tx, dm_event_rx) = mpsc::unbounded_channel();
+    let (trigger_tx, trigger_rx) = mpsc::channel(64);
+    let (dm_event_tx, dm_event_rx) = mpsc::channel(64);
     let state = AppState::new(
         gateway,
         scheduler,
@@ -76,8 +76,8 @@ fn test_app_state_with_sqlite() -> (
     AppState,
     CancellationToken,
     mpsc::UnboundedReceiver<SubagentCompletion>,
-    mpsc::UnboundedReceiver<RunTrigger>,
-    mpsc::UnboundedReceiver<DmEvent>,
+    mpsc::Receiver<RunTrigger>,
+    mpsc::Receiver<DmEvent>,
 ) {
     let gateway_config = GatewayConfig {
         db_path: Some(":memory:".to_string()),
@@ -87,8 +87,8 @@ fn test_app_state_with_sqlite() -> (
     let scheduler = Arc::new(alms_runtime::Scheduler::new());
     let shutdown_token = CancellationToken::new();
     let (completion_tx, completion_rx) = mpsc::unbounded_channel();
-    let (trigger_tx, trigger_rx) = mpsc::unbounded_channel();
-    let (dm_event_tx, dm_event_rx) = mpsc::unbounded_channel();
+    let (trigger_tx, trigger_rx) = mpsc::channel(64);
+    let (dm_event_tx, dm_event_rx) = mpsc::channel(64);
     let state = AppState::new(
         gateway,
         scheduler,
@@ -117,8 +117,8 @@ fn test_app_state_with_mock_llm() -> (
     AppState,
     CancellationToken,
     mpsc::UnboundedReceiver<SubagentCompletion>,
-    mpsc::UnboundedReceiver<RunTrigger>,
-    mpsc::UnboundedReceiver<DmEvent>,
+    mpsc::Receiver<RunTrigger>,
+    mpsc::Receiver<DmEvent>,
 ) {
     let llm_config = alms_runtime::LlmConfig {
         mock: true,
@@ -133,8 +133,8 @@ fn test_app_state_with_mock_llm() -> (
     let scheduler = Arc::new(alms_runtime::Scheduler::new());
     let shutdown_token = CancellationToken::new();
     let (completion_tx, completion_rx) = mpsc::unbounded_channel();
-    let (trigger_tx, trigger_rx) = mpsc::unbounded_channel();
-    let (dm_event_tx, dm_event_rx) = mpsc::unbounded_channel();
+    let (trigger_tx, trigger_rx) = mpsc::channel(64);
+    let (dm_event_tx, dm_event_rx) = mpsc::channel(64);
     let state = AppState::new(
         gateway,
         scheduler,
@@ -163,8 +163,8 @@ fn test_app_state_with_failing_llm() -> (
     AppState,
     CancellationToken,
     mpsc::UnboundedReceiver<SubagentCompletion>,
-    mpsc::UnboundedReceiver<RunTrigger>,
-    mpsc::UnboundedReceiver<DmEvent>,
+    mpsc::Receiver<RunTrigger>,
+    mpsc::Receiver<DmEvent>,
 ) {
     // Port 1 is reserved (`tcpmux`) and almost universally unbound on
     // CI / dev machines, so `connect()` fails immediately with
@@ -187,8 +187,8 @@ fn test_app_state_with_failing_llm() -> (
     let scheduler = Arc::new(alms_runtime::Scheduler::new());
     let shutdown_token = CancellationToken::new();
     let (completion_tx, completion_rx) = mpsc::unbounded_channel();
-    let (trigger_tx, trigger_rx) = mpsc::unbounded_channel();
-    let (dm_event_tx, dm_event_rx) = mpsc::unbounded_channel();
+    let (trigger_tx, trigger_rx) = mpsc::channel(64);
+    let (dm_event_tx, dm_event_rx) = mpsc::channel(64);
     let state = AppState::new(
         gateway,
         scheduler,
@@ -228,8 +228,8 @@ async fn test_app_state_with_hanging_llm() -> (
     AppState,
     CancellationToken,
     mpsc::UnboundedReceiver<SubagentCompletion>,
-    mpsc::UnboundedReceiver<RunTrigger>,
-    mpsc::UnboundedReceiver<DmEvent>,
+    mpsc::Receiver<RunTrigger>,
+    mpsc::Receiver<DmEvent>,
 ) {
     use tokio::net::TcpListener;
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -265,8 +265,8 @@ async fn test_app_state_with_hanging_llm() -> (
     let scheduler = Arc::new(alms_runtime::Scheduler::new());
     let shutdown_token = CancellationToken::new();
     let (completion_tx, completion_rx) = mpsc::unbounded_channel();
-    let (trigger_tx, trigger_rx) = mpsc::unbounded_channel();
-    let (dm_event_tx, dm_event_rx) = mpsc::unbounded_channel();
+    let (trigger_tx, trigger_rx) = mpsc::channel(64);
+    let (dm_event_tx, dm_event_rx) = mpsc::channel(64);
     let state = AppState::new(
         gateway,
         scheduler,
@@ -752,7 +752,7 @@ async fn dm_conversation_ended_trigger_creates_notification_and_marker() {
     let mut web_rx = subscribe_session(&state, web_session_id);
 
     // Build a ConversationEnded trigger with Ignored reason.
-    let (test_tx, test_rx) = mpsc::unbounded_channel();
+    let (test_tx, test_rx) = mpsc::channel(8);
     test_tx
         .send(RunTrigger {
             agent_id,
@@ -766,6 +766,7 @@ async fn dm_conversation_ended_trigger_creates_notification_and_marker() {
             },
             context_id: notif_context_id.clone(),
         })
+        .await
         .unwrap();
     drop(test_tx);
 
@@ -859,7 +860,7 @@ async fn dm_depth_exceeded_graceful_without_agent_registry() {
             .get_or_create_with_id(dm_session_id, agent_id, "dm:alice:bob");
     let mut dm_rx = subscribe_session(&state, dm_session_id);
 
-    let (test_tx, test_rx) = mpsc::unbounded_channel();
+    let (test_tx, test_rx) = mpsc::channel(8);
     test_tx
         .send(RunTrigger {
             agent_id,
@@ -873,6 +874,7 @@ async fn dm_depth_exceeded_graceful_without_agent_registry() {
             },
             context_id: notif_context_id.clone(),
         })
+        .await
         .unwrap();
     drop(test_tx);
 
@@ -925,7 +927,7 @@ async fn notification_stays_on_invisible_session_when_no_source() {
     let web_session = state.session_manager.get_or_create(agent_id, "web");
     let web_session_id = web_session.id;
 
-    let (test_tx, test_rx) = mpsc::unbounded_channel();
+    let (test_tx, test_rx) = mpsc::channel(8);
     test_tx
         .send(RunTrigger {
             agent_id,
@@ -939,6 +941,7 @@ async fn notification_stays_on_invisible_session_when_no_source() {
             },
             context_id: notif_session.context_id.clone(),
         })
+        .await
         .unwrap();
     drop(test_tx);
 
@@ -977,7 +980,7 @@ async fn notification_uses_source_session_when_present() {
     let source_session = state.session_manager.get_or_create(agent_id, "my-chat");
     let source_session_id = source_session.id;
 
-    let (test_tx, test_rx) = mpsc::unbounded_channel();
+    let (test_tx, test_rx) = mpsc::channel(8);
     test_tx
         .send(RunTrigger {
             agent_id,
@@ -992,6 +995,7 @@ async fn notification_uses_source_session_when_present() {
             },
             context_id: source_session.context_id.clone(),
         })
+        .await
         .unwrap();
     drop(test_tx);
 
@@ -1258,7 +1262,7 @@ async fn triggered_run_uses_low_priority_and_records_run() {
     let mut rx = subscribe_session(&state, session_id);
 
     // Build and send a subagent completion trigger.
-    let (test_tx, test_rx) = mpsc::unbounded_channel();
+    let (test_tx, test_rx) = mpsc::channel(8);
     test_tx
         .send(RunTrigger {
             agent_id,
@@ -1267,6 +1271,7 @@ async fn triggered_run_uses_low_priority_and_records_run() {
             source: MessageSource::SubagentCompletion,
             context_id: session.context_id.clone(),
         })
+        .await
         .unwrap();
     drop(test_tx);
 
@@ -2223,7 +2228,7 @@ async fn dm_event_loop_forwards_messages_to_session_subscribers() {
     let mut rx = subscribe_session(&state, dm_session_id);
 
     // Send a DM event.
-    let (event_tx, event_rx) = mpsc::unbounded_channel();
+    let (event_tx, event_rx) = mpsc::channel(8);
     event_tx
         .send(DmEvent {
             session_id: dm_session_id,
@@ -2232,6 +2237,7 @@ async fn dm_event_loop_forwards_messages_to_session_subscribers() {
             message: "Hello Bob, this is a test DM!".to_string(),
             ts: chrono::Utc::now(),
         })
+        .await
         .unwrap();
     drop(event_tx);
 
@@ -5945,8 +5951,8 @@ async fn create_run_mock_mode_bypasses_budget_validation() {
     let scheduler = std::sync::Arc::new(alms_runtime::Scheduler::new());
     let shutdown_token = CancellationToken::new();
     let (completion_tx, _cr) = mpsc::unbounded_channel();
-    let (trigger_tx, _tr) = mpsc::unbounded_channel();
-    let (dm_event_tx, _dr) = mpsc::unbounded_channel();
+    let (trigger_tx, _tr) = mpsc::channel(8);
+    let (dm_event_tx, _dr) = mpsc::channel(8);
     let state = AppState::new(
         gateway,
         scheduler,
@@ -6215,8 +6221,8 @@ async fn execute_run_mock_mode_skips_budget_validation_on_non_http_path() {
     let scheduler = std::sync::Arc::new(alms_runtime::Scheduler::new());
     let shutdown_token = CancellationToken::new();
     let (completion_tx, _cr) = mpsc::unbounded_channel();
-    let (trigger_tx, _tr) = mpsc::unbounded_channel();
-    let (dm_event_tx, _dr) = mpsc::unbounded_channel();
+    let (trigger_tx, _tr) = mpsc::channel(8);
+    let (dm_event_tx, _dr) = mpsc::channel(8);
     let state = AppState::new(
         gateway,
         scheduler,
@@ -9022,8 +9028,8 @@ async fn peer_triggered_dm_run_is_not_rejected_and_delivers() {
     assert_eq!(trigger.agent_id, bob_id);
 
     // Feed the trigger through the actual run_trigger_loop.
-    let (test_tx, test_rx) = mpsc::unbounded_channel();
-    test_tx.send(trigger).unwrap();
+    let (test_tx, test_rx) = mpsc::channel(8);
+    test_tx.send(trigger).await.unwrap();
     drop(test_tx);
     super::notifications::run_trigger_loop(test_rx, state.clone()).await;
 
@@ -9175,6 +9181,165 @@ async fn dm_setup_failure_noop_outside_peer_dm() {
     assert!(
         tr.try_recv().is_err(),
         "non-peer-DM setup failures must not emit triggers"
+    );
+
+    shutdown_token.cancel();
+}
+
+/// S1 (#1154): a peer-triggered DM run cancelled while still `Queued`
+/// (HTTP cancel / #1109 deny cascade / session-cancel / shutdown) reaches
+/// `execute_run`'s pre-loop early-exit. That exit must notify the DM peer
+/// with `UserCancelled` — otherwise the peer is stranded on "Chatting
+/// with…" until the 1800s depth-expiry sweep, because neither the
+/// synchronous `cancel_run` handler nor the early-exit historically
+/// signalled the peer.
+#[tokio::test]
+async fn queued_then_cancelled_dm_run_notifies_peer() {
+    let (state, shutdown_token, _cr, mut tr, _dr) = test_app_state_with_sqlite();
+    let (alice_id, bob_id) = seed_alice_bob(&state);
+
+    // Open the DM: alice -> bob. This creates the shared DM session and the
+    // depth entry, and emits alice's RunTrigger for bob (which we discard —
+    // we drive bob's run manually below).
+    let _ = state
+        .message_bus
+        .send("alice", alice_id, "bob", bob_id, "ping", None)
+        .await
+        .unwrap();
+    let _ = tr.try_recv(); // discard alice->bob trigger
+
+    let dm_context = "dm:alice:bob";
+    let dm_session_id = SessionId::deterministic_dm("alice", "bob");
+    let mut dm_rx = subscribe_session(&state, dm_session_id);
+
+    // Bob's peer-triggered DM run, inserted as Queued, then cancelled while
+    // still queued (mirrors the HTTP cancel / deny cascade landing before the
+    // queue dispatches the work item).
+    let run = Run::new(dm_session_id, bob_id, "ping".to_string());
+    let run_id = run.run_id;
+    state.run_manager.insert_run(run.clone());
+    let cancel_token = CancellationToken::new();
+    state
+        .run_manager
+        .register_cancel_token(run_id, cancel_token.clone());
+    cancel_token.cancel();
+
+    // The per-agent queue eventually dispatches the work item; `execute_run`
+    // hits the pre-loop early-exit (token already cancelled).
+    super::lifecycle::execute_run(
+        state.clone(),
+        super::RunParams {
+            run_id,
+            session_id: dm_session_id,
+            agent_id: bob_id,
+            input: run.input,
+            context_id: dm_context.to_string(),
+            cancel_token,
+            is_peer_message: true,
+            is_system_triggered: true,
+            input_pre_persisted: false,
+        },
+    )
+    .await;
+
+    // The run must be Cancelled (never auto-started).
+    assert_eq!(
+        state.run_manager.get_run(run_id).unwrap().status,
+        RunStatus::Cancelled,
+        "queued-then-cancelled run must stay Cancelled"
+    );
+
+    // The peer (alice) must be notified with UserCancelled — the S1 fix.
+    let trigger = tr
+        .try_recv()
+        .expect("peer must be notified of the queued-cancel (S1)");
+    assert_eq!(trigger.agent_id, alice_id, "notification targets the peer");
+    match trigger.source {
+        MessageSource::ConversationEnded {
+            ref from_name,
+            ref reason,
+            ..
+        } => {
+            assert_eq!(from_name, "bob", "ended-by is the cancelled agent");
+            assert!(
+                matches!(reason, ConversationEndReason::UserCancelled),
+                "queued-cancel must signal UserCancelled; got {reason:?}"
+            );
+        }
+        other => panic!("expected ConversationEnded source, got {other:?}"),
+    }
+
+    // dm_ended marker with reason=user_cancelled persisted to the DM session.
+    let history = state.session_manager.get_history(dm_session_id).unwrap();
+    assert!(
+        history.iter().any(|m| {
+            let meta = m.metadata.as_ref();
+            meta.and_then(|x| x.get("message_type"))
+                .and_then(|v| v.as_str())
+                == Some("dm_ended")
+                && meta.and_then(|x| x.get("reason")).and_then(|v| v.as_str())
+                    == Some("user_cancelled")
+        }),
+        "dm_ended marker with reason=user_cancelled must be persisted"
+    );
+
+    // dm_conversation_ended SSE emitted on the DM session stream.
+    tokio::task::yield_now().await;
+    let events = drain_events(&mut dm_rx);
+    assert!(
+        events
+            .iter()
+            .any(|e| e.event_type == "dm_conversation_ended"),
+        "expected dm_conversation_ended SSE on the DM session stream"
+    );
+
+    shutdown_token.cancel();
+}
+
+/// S1 (#1154) negative: a NON-peer run cancelled while queued (e.g. a
+/// user-initiated `POST /runs` run) must NOT emit any DM peer notification —
+/// the helper is gated on `is_peer_message && dm:`.
+#[tokio::test]
+async fn queued_then_cancelled_non_peer_run_does_not_notify() {
+    let (state, shutdown_token, _cr, mut tr, _dr) = test_app_state_with_sqlite();
+    let (_alice_id, bob_id) = seed_alice_bob(&state);
+
+    let session = state.session_manager.get_or_create(bob_id, "web-chat-1");
+    let session_id = session.id;
+
+    let run = Run::new(session_id, bob_id, "hello".to_string());
+    let run_id = run.run_id;
+    state.run_manager.insert_run(run.clone());
+    let cancel_token = CancellationToken::new();
+    state
+        .run_manager
+        .register_cancel_token(run_id, cancel_token.clone());
+    cancel_token.cancel();
+
+    super::lifecycle::execute_run(
+        state.clone(),
+        super::RunParams {
+            run_id,
+            session_id,
+            agent_id: bob_id,
+            input: run.input,
+            context_id: "web-chat-1".to_string(),
+            cancel_token,
+            // Not a peer message — the user cancelled their own run.
+            is_peer_message: false,
+            is_system_triggered: false,
+            input_pre_persisted: false,
+        },
+    )
+    .await;
+
+    assert_eq!(
+        state.run_manager.get_run(run_id).unwrap().status,
+        RunStatus::Cancelled
+    );
+    assert!(
+        tr.try_recv().is_err(),
+        "non-peer queued-cancel must not emit a DM peer notification"
     );
 
     shutdown_token.cancel();

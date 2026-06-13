@@ -117,10 +117,9 @@ impl AppState {
         scheduler: Arc<Scheduler>,
         shutdown_token: CancellationToken,
         completion_tx: tokio::sync::mpsc::UnboundedSender<alms_coordinator::SubagentCompletion>,
-        run_trigger_tx: tokio::sync::mpsc::UnboundedSender<
-            alms_coordinator::message_bus::RunTrigger,
-        >,
-        dm_event_tx: tokio::sync::mpsc::UnboundedSender<alms_coordinator::message_bus::DmEvent>,
+        // Bounded (#842 / B11) — see `MessageBus` and `server::mod`.
+        run_trigger_tx: tokio::sync::mpsc::Sender<alms_coordinator::message_bus::RunTrigger>,
+        dm_event_tx: tokio::sync::mpsc::Sender<alms_coordinator::message_bus::DmEvent>,
     ) -> AlmsResult<Self> {
         let workspace_dir = gateway.workspace_dir().map(|p| p.to_path_buf());
         let data_dir = gateway

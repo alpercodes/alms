@@ -44,6 +44,24 @@ const MAX_DM_DEPTH: u32 = 20;
 /// easily exceed one minute. See discussion on #362 / decision D5 in #384.
 const DEPTH_EXPIRY_SECS: u64 = 1800;
 
+/// Buffer capacity for the bounded `RunTrigger` channel (#842 / B11).
+///
+/// Was an unbounded channel — a runaway producer (e.g. a tight DM ping-pong
+/// or a burst of `ConversationEnded` notifications) could grow it without
+/// limit. Bounded so producers apply back-pressure instead; senders use
+/// `Sender::send().await` and therefore never drop a trigger when the buffer
+/// is full. 1024 is generous headroom for normal peak load — the consumer
+/// (`run_trigger_loop`) drains it continuously, so the buffer only fills
+/// under sustained bursts, at which point back-pressure is the correct
+/// behaviour (slow the producer, never lose a DM turn).
+pub const RUN_TRIGGER_CHANNEL_CAPACITY: usize = 1024;
+
+/// Buffer capacity for the bounded `DmEvent` channel (#842 / B11).
+///
+/// Same rationale as [`RUN_TRIGGER_CHANNEL_CAPACITY`]; these events drive
+/// live DM SSE forwarding and are pushed with back-pressure.
+pub const DM_EVENT_CHANNEL_CAPACITY: usize = 1024;
+
 // ---------------------------------------------------------------------------
 // RunTrigger -- sent to the gateway to create runs
 // ---------------------------------------------------------------------------

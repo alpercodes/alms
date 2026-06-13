@@ -235,6 +235,15 @@ pub fn sanitize_error_for_session(err: &AlmsError) -> String {
                 "LLM request timed out".to_string()
             } else if msg.contains("context") || msg.contains("summary") {
                 "Context building failed".to_string()
+            } else if msg.contains("maximum") && msg.contains("iteration") {
+                // Agent-loop iteration cap (#987 / B3). The message is
+                // self-authored and secret-free; surface a distinct label so
+                // operators (and the DM peer's notification) can tell a wedged
+                // tool loop apart from a generic internal error.
+                "Agent stopped after reaching its iteration limit".to_string()
+            } else if msg.contains("maximum duration") {
+                // Agent-loop wall-clock cap (#987 / B3). Same rationale.
+                "Agent stopped after reaching its time limit".to_string()
             } else {
                 "Runtime error".to_string()
             }

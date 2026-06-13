@@ -6,15 +6,26 @@ impl SqliteStore {
     // ── Run Tool Calls ────────────────────────────────────────────────────
 
     /// Persist a single tool call record for a run.
-    pub fn save_tool_call(&self, run_id: RunId, record: &ToolCallRecord) -> AlmsResult<()> {
+    ///
+    /// `session_id` is stored alongside `run_id` (B9(b), #1154) so the row
+    /// stays attributable to its session even if the `runs` row is later
+    /// removed — [`Self::load_tool_calls_for_session`] no longer depends on a
+    /// surviving `runs` join to find it.
+    pub fn save_tool_call(
+        &self,
+        run_id: RunId,
+        session_id: SessionId,
+        record: &ToolCallRecord,
+    ) -> AlmsResult<()> {
         self.conn
             .lock()
             .execute(
                 "INSERT INTO run_tool_calls \
-                 (run_id, seq, role, tool_name, tool_id, params, result, timestamp, from_agent) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                 (run_id, session_id, seq, role, tool_name, tool_id, params, result, timestamp, from_agent) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                 params![
                     run_id.0.to_string(),
+                    session_id.0.to_string(),
                     record.seq as i64,
                     record.role.to_string(),
                     record.tool_name.as_deref(),
@@ -30,7 +41,14 @@ impl SqliteStore {
     }
 
     /// Persist a batch of tool call records for a run in a single transaction.
-    pub fn save_tool_calls(&self, run_id: RunId, records: &[ToolCallRecord]) -> AlmsResult<()> {
+    ///
+    /// `session_id` is stored on every row — see [`Self::save_tool_call`].
+    pub fn save_tool_calls(
+        &self,
+        run_id: RunId,
+        session_id: SessionId,
+        records: &[ToolCallRecord],
+    ) -> AlmsResult<()> {
         if records.is_empty() {
             return Ok(());
         }
@@ -41,10 +59,11 @@ impl SqliteStore {
         for record in records {
             tx.execute(
                 "INSERT INTO run_tool_calls \
-                 (run_id, seq, role, tool_name, tool_id, params, result, timestamp, from_agent) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                 (run_id, session_id, seq, role, tool_name, tool_id, params, result, timestamp, from_agent) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                 params![
                     run_id.0.to_string(),
+                    session_id.0.to_string(),
                     record.seq as i64,
                     record.role.to_string(),
                     record.tool_name.as_deref(),
@@ -140,11 +159,28 @@ impl SqliteStore {
         Ok(count.max(0) as u32)
     }
 
-    /// Load all tool call records for a session by joining through the `runs`
-    /// table, ordered by run creation time then sequence number.
+    /// Load all tool call records for a session, ordered by run creation time
+    /// then sequence number.
     ///
     /// Each returned [`SessionToolCall`] includes the `run_id` so the frontend
     /// can group or correlate calls with their originating run.
+    ///
+    /// B9(b) (#1154): rows are matched on the `run_tool_calls.session_id`
+    /// column and the `runs` table is **LEFT JOIN**ed only to recover the
+    /// `created_at` order key. The previous design INNER-JOINed `runs` and
+    /// filtered on `runs.session_id`, so a tool-call row whose `runs` row was
+    /// gone (e.g. a partial write where the run insert rolled back, or a
+    /// future delete path that prunes runs without their tool calls) was
+    /// silently dropped — and its call then could not be grouped into the
+    /// collapsible DM reasoning block on reload. Now such a row survives: it
+    /// matches via `tc.session_id`, the projection tolerates the missing run
+    /// row (its `created_at` is NULL and it simply sorts last), and `tc.run_id`
+    /// — which is `NOT NULL` — keeps grouping intact.
+    ///
+    /// Backward compatibility: rows written before the `session_id` column
+    /// existed have `tc.session_id IS NULL`; they are still matched through
+    /// the surviving `runs` join (`r.session_id = ?1`), so no historical row
+    /// is lost.
     pub fn load_tool_calls_for_session(
         &self,
         session_id: SessionId,
@@ -155,9 +191,10 @@ impl SqliteStore {
                 "SELECT tc.run_id, tc.seq, tc.role, tc.tool_name, tc.tool_id, \
                         tc.params, tc.result, tc.timestamp, tc.from_agent \
                  FROM run_tool_calls tc \
-                 INNER JOIN runs r ON tc.run_id = r.run_id \
-                 WHERE r.session_id = ?1 \
-                 ORDER BY r.created_at, tc.seq",
+                 LEFT JOIN runs r ON tc.run_id = r.run_id \
+                 WHERE tc.session_id = ?1 \
+                    OR (tc.session_id IS NULL AND r.session_id = ?1) \
+                 ORDER BY r.created_at IS NULL, r.created_at, tc.seq",
             )
             .map_err(|e| {
                 AlmsError::Runtime(format!("SQLite prepare load_tool_calls_for_session: {e}"))
@@ -283,6 +320,7 @@ mod tests {
     fn test_save_and_load_tool_calls() {
         let store = SqliteStore::open_in_memory().unwrap();
         let run_id = RunId::new();
+        let session_id = SessionId::new();
 
         let records = vec![
             new_tool_call_record(0, ToolCallRole::Assistant, "echo"),
@@ -291,7 +329,7 @@ mod tests {
             new_tool_call_record(3, ToolCallRole::Tool, "math"),
         ];
 
-        store.save_tool_calls(run_id, &records).unwrap();
+        store.save_tool_calls(run_id, session_id, &records).unwrap();
         let loaded = store.load_tool_calls(run_id).unwrap();
 
         assert_eq!(loaded.len(), 4);
@@ -309,6 +347,7 @@ mod tests {
     fn test_count_tool_calls() {
         let store = SqliteStore::open_in_memory().unwrap();
         let run_id = RunId::new();
+        let session_id = SessionId::new();
 
         assert_eq!(store.count_tool_calls(run_id).unwrap(), 0);
 
@@ -316,7 +355,7 @@ mod tests {
             new_tool_call_record(0, ToolCallRole::Assistant, "echo"),
             new_tool_call_record(1, ToolCallRole::Tool, "echo"),
         ];
-        store.save_tool_calls(run_id, &records).unwrap();
+        store.save_tool_calls(run_id, session_id, &records).unwrap();
 
         assert_eq!(store.count_tool_calls(run_id).unwrap(), 2);
     }
@@ -326,21 +365,28 @@ mod tests {
         let store = SqliteStore::open_in_memory().unwrap();
         let run1 = RunId::new();
         let run2 = RunId::new();
+        let session_id = SessionId::new();
 
         store
             .save_tool_call(
                 run1,
+                session_id,
                 &new_tool_call_record(0, ToolCallRole::Assistant, "echo"),
             )
             .unwrap();
         store
             .save_tool_call(
                 run2,
+                session_id,
                 &new_tool_call_record(0, ToolCallRole::Assistant, "math"),
             )
             .unwrap();
         store
-            .save_tool_call(run2, &new_tool_call_record(1, ToolCallRole::Tool, "math"))
+            .save_tool_call(
+                run2,
+                session_id,
+                &new_tool_call_record(1, ToolCallRole::Tool, "math"),
+            )
             .unwrap();
 
         assert_eq!(store.load_tool_calls(run1).unwrap().len(), 1);
@@ -353,8 +399,9 @@ mod tests {
     fn test_save_tool_calls_empty_batch() {
         let store = SqliteStore::open_in_memory().unwrap();
         let run_id = RunId::new();
+        let session_id = SessionId::new();
         // Empty batch should succeed without error.
-        store.save_tool_calls(run_id, &[]).unwrap();
+        store.save_tool_calls(run_id, session_id, &[]).unwrap();
         assert_eq!(store.load_tool_calls(run_id).unwrap().len(), 0);
     }
 
@@ -364,6 +411,7 @@ mod tests {
         // with result=None round-trip correctly through SQLite.
         let store = SqliteStore::open_in_memory().unwrap();
         let run_id = RunId::new();
+        let session_id = SessionId::new();
 
         let records = vec![
             ToolCallRecord {
@@ -388,7 +436,7 @@ mod tests {
             },
         ];
 
-        store.save_tool_calls(run_id, &records).unwrap();
+        store.save_tool_calls(run_id, session_id, &records).unwrap();
         let loaded = store.load_tool_calls(run_id).unwrap();
 
         assert_eq!(loaded.len(), 2);
@@ -416,6 +464,7 @@ mod tests {
         store
             .save_tool_calls(
                 run1.run_id,
+                session_id,
                 &[
                     new_tool_call_record(0, ToolCallRole::Assistant, "echo"),
                     new_tool_call_record(1, ToolCallRole::Tool, "echo"),
@@ -425,6 +474,7 @@ mod tests {
         store
             .save_tool_calls(
                 run2.run_id,
+                session_id,
                 &[new_tool_call_record(0, ToolCallRole::Assistant, "math")],
             )
             .unwrap();
@@ -471,12 +521,14 @@ mod tests {
         store
             .save_tool_call(
                 run_a.run_id,
+                session_a,
                 &new_tool_call_record(0, ToolCallRole::Assistant, "fs_read"),
             )
             .unwrap();
         store
             .save_tool_call(
                 run_b.run_id,
+                session_b,
                 &new_tool_call_record(0, ToolCallRole::Assistant, "shell"),
             )
             .unwrap();
@@ -512,7 +564,9 @@ mod tests {
             timestamp: chrono::Utc::now(),
             from_agent: Some("alice".to_string()),
         };
-        store.save_tool_call(run.run_id, &record).unwrap();
+        store
+            .save_tool_call(run.run_id, session_id, &record)
+            .unwrap();
 
         let loaded = store.load_tool_calls(run.run_id).unwrap();
         assert_eq!(loaded.len(), 1);
@@ -521,5 +575,110 @@ mod tests {
         let session_calls = store.load_tool_calls_for_session(session_id).unwrap();
         assert_eq!(session_calls.len(), 1);
         assert_eq!(session_calls[0].record.from_agent.as_deref(), Some("alice"));
+    }
+
+    /// B9(b) (#1154): a tool-call row whose `runs` row is gone must still be
+    /// returned by `load_tool_calls_for_session` so it can be grouped into
+    /// the collapsible DM reasoning block on reload. Pre-fix the INNER JOIN
+    /// on `runs` dropped it. The row is matched via its own `session_id`
+    /// column; the LEFT JOIN tolerates the missing run row (its `created_at`
+    /// is NULL and it sorts last).
+    #[test]
+    fn test_load_tool_calls_for_session_survives_missing_run_row() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let session_id = SessionId::new();
+        let agent_id = alms_core::AgentId::new();
+
+        // Two runs on the same session. `gone_run` will have its `runs` row
+        // deleted out from under its tool calls; `live_run` keeps its row.
+        let gone_run = alms_core::Run::new(session_id, agent_id, "gone".to_string());
+        let live_run = alms_core::Run::new(session_id, agent_id, "live".to_string());
+        store.save_run(&gone_run).unwrap();
+        store.save_run(&live_run).unwrap();
+
+        store
+            .save_tool_calls(
+                gone_run.run_id,
+                session_id,
+                &[new_tool_call_record(0, ToolCallRole::Assistant, "fs_read")],
+            )
+            .unwrap();
+        store
+            .save_tool_calls(
+                live_run.run_id,
+                session_id,
+                &[new_tool_call_record(0, ToolCallRole::Assistant, "echo")],
+            )
+            .unwrap();
+
+        // Delete the `runs` row for `gone_run` WITHOUT touching its tool
+        // calls — simulates a partial write / crash where the run insert was
+        // rolled back but the tool-call rows survived.
+        store
+            .conn
+            .lock()
+            .execute(
+                "DELETE FROM runs WHERE run_id = ?1",
+                params![gone_run.run_id.0.to_string()],
+            )
+            .unwrap();
+
+        let session_calls = store.load_tool_calls_for_session(session_id).unwrap();
+        assert_eq!(
+            session_calls.len(),
+            2,
+            "the orphaned tool-call row must survive the missing run row (LEFT JOIN)"
+        );
+
+        // Both runs' calls are present and grouped by their own run_id.
+        let run_ids: Vec<_> = session_calls.iter().map(|c| c.run_id).collect();
+        assert!(
+            run_ids.contains(&gone_run.run_id),
+            "the orphaned row keeps its run_id for grouping"
+        );
+        assert!(run_ids.contains(&live_run.run_id));
+
+        // The orphaned row (NULL created_at) sorts last.
+        assert_eq!(
+            session_calls[1].run_id, gone_run.run_id,
+            "the row with the missing run row sorts after live rows"
+        );
+        assert_eq!(
+            session_calls[1].record.tool_name.as_deref(),
+            Some("fs_read")
+        );
+    }
+
+    /// B9(b) backward compatibility: a legacy row with `session_id IS NULL`
+    /// (written before the column existed) is still found via the surviving
+    /// `runs` join, so no historical tool call is lost.
+    #[test]
+    fn test_load_tool_calls_for_session_finds_legacy_null_session_id_rows() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let session_id = SessionId::new();
+        let agent_id = alms_core::AgentId::new();
+
+        let run = alms_core::Run::new(session_id, agent_id, "legacy".to_string());
+        store.save_run(&run).unwrap();
+
+        // Insert a row the old way: no `session_id` column value (NULL).
+        store
+            .conn
+            .lock()
+            .execute(
+                "INSERT INTO run_tool_calls \
+                 (run_id, seq, role, tool_name, tool_id, params, result, timestamp) \
+                 VALUES (?1, 0, 'assistant', 'echo', 'call_0', NULL, NULL, ?2)",
+                params![run.run_id.0.to_string(), chrono::Utc::now().to_rfc3339()],
+            )
+            .unwrap();
+
+        let session_calls = store.load_tool_calls_for_session(session_id).unwrap();
+        assert_eq!(
+            session_calls.len(),
+            1,
+            "a legacy NULL-session_id row must still be found via the runs join"
+        );
+        assert_eq!(session_calls[0].run_id, run.run_id);
     }
 }

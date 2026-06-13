@@ -14,35 +14,125 @@ pub(crate) const DM_CONFLICT_MSG: &str = alms_core::DM_CONFLICT_MSG;
 /// Result of checking a tool-call batch for DM tool conflicts.
 #[derive(Debug)]
 pub(crate) struct DmConflictCheck {
-    /// Whether both `send_message` and `ignore_message` appear in the batch.
+    /// Whether both a peer-directed `send_message` and an `ignore_message`
+    /// appear in the batch.
     pub conflict: bool,
-    /// Tool names that should be blocked (empty slice when no conflict).
-    pub conflicting_tools: &'static [&'static str],
+    /// Batch **indices** (into the `tool_calls` slice passed to
+    /// [`detect_dm_conflict`]) of the *specific* tool calls that should be
+    /// blocked — the peer-directed `send_message` call(s) plus the
+    /// `ignore_message` call(s). Empty when there is no conflict.
+    ///
+    /// Keyed by **index** rather than by tool *name* (#1160, Codex P2): a
+    /// batch can hold two `send_message` calls — one folded reply to the
+    /// current peer and one legitimate hand-off to a *third* agent — and
+    /// they share the name `"send_message"`. Blocking by name would also
+    /// drop the third-agent hand-off, defeating the recipient-aware S3 rule
+    /// that explicitly allows `send_message(to: charlie)` + `ignore_message`.
+    /// Index identity is the right granularity: every site that consumes
+    /// this set already iterates the batch positionally (the `invocation_ids`
+    /// zip, the parallel arm's `exec_indices`/slot mapping), and indices are
+    /// collision-proof within a batch where `ToolCall::id` is not guaranteed
+    /// unique (or even non-empty) across providers / the streaming
+    /// accumulator.
+    pub conflicting_indices: Vec<usize>,
 }
 
 /// Inspect a tool-call batch for the `send_message` / `ignore_message`
-/// mutual-exclusivity conflict.  When both tools appear in the same batch,
-/// `conflict` is `true` and `conflicting_tools` lists the two names that
-/// should receive error results instead of executing.
+/// mutual-exclusivity conflict (#364), narrowed to be **recipient-aware**
+/// under implicit replies (#1154 / S3).
 ///
-/// When there is no conflict, `conflicting_tools` is empty and all tools
-/// can execute normally.
-pub(crate) fn detect_dm_conflict(tool_calls: &[ToolCall]) -> DmConflictCheck {
-    let has_send = tool_calls
-        .iter()
-        .any(|tc| tc.function.name == SEND_MESSAGE_TOOL);
-    let has_ignore = tool_calls
-        .iter()
-        .any(|tc| tc.function.name == IGNORE_MESSAGE_TOOL);
-    let conflict = has_send && has_ignore;
+/// Originally this flagged *any* batch containing both `send_message` and
+/// `ignore_message`. Under implicit replies that is too broad: replying to
+/// the current peer no longer uses `send_message` at all (the final
+/// assistant text IS the reply, and a `send_message` aimed at the current
+/// peer is *folded*, never delivered — see `SendMessageTool::with_dm_peer`).
+/// So `send_message` is now only legitimately used to address a *different*
+/// agent, and "loop in Charlie, then end the conversation with the current
+/// peer" — i.e. `send_message(to: charlie)` + `ignore_message` in one batch —
+/// is a perfectly valid combination that the old check wrongly rejected.
+///
+/// The genuine contradiction that remains is `send_message` aimed at the
+/// **current peer** together with `ignore_message`: that simultaneously
+/// folds a reply to the peer and ends the conversation with them. Only that
+/// case sets `conflict = true`.
+///
+/// `dm_peer` is the current DM peer's name (`None` outside a DM run, where
+/// no `send_message` can target "the peer" — so no conflict is possible).
+/// Recipient matching is case-insensitive, mirroring the peer-fold check in
+/// [`alms_tools::SendMessageTool`].
+pub(crate) fn detect_dm_conflict(
+    tool_calls: &[ToolCall],
+    dm_peer: Option<&str>,
+) -> DmConflictCheck {
+    // Single pass: collect the batch indices of the `ignore_message` call(s)
+    // and the *peer-directed* `send_message` call(s) separately. A
+    // `send_message` aimed at a *different* agent (the third-agent hand-off)
+    // is deliberately not collected — it is never part of the conflict.
+    let mut ignore_indices: Vec<usize> = Vec::new();
+    let mut peer_send_indices: Vec<usize> = Vec::new();
+    for (i, tc) in tool_calls.iter().enumerate() {
+        if tc.function.name == IGNORE_MESSAGE_TOOL {
+            ignore_indices.push(i);
+        } else if tc.function.name == SEND_MESSAGE_TOOL
+            && let Some(peer) = dm_peer
+            && send_targets_peer(tc, peer)
+        {
+            // A `send_message` conflicts only when it targets the current
+            // peer. Outside a DM run (`dm_peer == None`) no send can target
+            // "the peer", so none are collected here.
+            peer_send_indices.push(i);
+        }
+    }
+
+    // The genuine contradiction is a peer-directed `send_message` *and* an
+    // `ignore_message` in the same batch. Only then are the specific calls
+    // blocked; the (possible) third-agent `send_message` is left to execute.
+    let conflict = !peer_send_indices.is_empty() && !ignore_indices.is_empty();
+    let conflicting_indices = if conflict {
+        // Merge the two index lists. Both are already ascending and
+        // disjoint (a call is either `ignore_message` or `send_message`,
+        // never both), so concatenate and sort for a stable, deduplicated
+        // ascending set.
+        let mut merged = peer_send_indices;
+        merged.extend(ignore_indices);
+        merged.sort_unstable();
+        merged
+    } else {
+        Vec::new()
+    };
+
     DmConflictCheck {
         conflict,
-        conflicting_tools: if conflict {
-            &[SEND_MESSAGE_TOOL, IGNORE_MESSAGE_TOOL]
-        } else {
-            &[]
-        },
+        conflicting_indices,
     }
+}
+
+/// Return `true` when a `send_message` tool call's `to` argument names the
+/// current DM peer (case-insensitive). Malformed / missing arguments parse
+/// to `false` — an unparseable recipient cannot be proven to target the
+/// peer, so it is not treated as a conflict (the send tool will surface its
+/// own error when it runs).
+///
+/// Scope note (S3, PR #1160): this mirrors only the *raw `to`* peer-fold in
+/// [`alms_tools::SendMessageTool`] (the pre-resolution check), not its
+/// second, post-resolution fold that re-checks the registry-resolved
+/// canonical name. So a `send_message` addressing the peer by a non-`to`
+/// spelling that only resolves to the peer after a registry lookup — e.g. an
+/// agent **ID** or an alias — slips past this conflict gate while still being
+/// folded at execution time. That asymmetry is deliberate and harmless:
+/// `detect_dm_conflict` is a pure, pre-execution check with no agent-store
+/// handle (resolving an ID to a name here would couple it to SQLite), and the
+/// end state is identical either way — the paired `ignore_message` ends the
+/// conversation and the folded `send_message` reply is discarded, so the only
+/// thing the missed conflict would have changed is whether the batch was
+/// rejected up front versus folded during execution.
+fn send_targets_peer(tc: &ToolCall, peer: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(&tc.function.arguments)
+        .ok()
+        .as_ref()
+        .and_then(|v| v.get("to"))
+        .and_then(|to| to.as_str())
+        .is_some_and(|to| to.eq_ignore_ascii_case(peer))
 }
 
 /// Maximum number of times the agent loop will retry when a peer-triggered

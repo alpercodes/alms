@@ -5,9 +5,11 @@ use alms_tools::message_sender::{ConversationEndReason, MessageSender, SendError
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
-fn setup() -> (Arc<MessageBus>, mpsc::UnboundedReceiver<RunTrigger>) {
+fn setup() -> (Arc<MessageBus>, mpsc::Receiver<RunTrigger>) {
     let session_manager = Arc::new(alms_session::SessionManager::new(SessionConfig::default()));
-    let (tx, rx) = mpsc::unbounded_channel();
+    // Bounded (#842 / B11) to match the production channel shape; generous
+    // capacity so depth-exhaustion loops never block the test.
+    let (tx, rx) = mpsc::channel(MAX_DM_DEPTH as usize + 16);
     let bus = Arc::new(MessageBus::new(session_manager, tx));
     (bus, rx)
 }
@@ -347,6 +349,89 @@ async fn test_expired_entries_cleaned_up() {
     // alice-charlie should still be present (active)
     assert!(bus.depths.contains_key(&ac_ctx));
     assert!(bus.last_activity.contains_key(&ac_ctx));
+}
+
+/// B7 (#1154): `send()` must co-create the `depths` and `last_activity`
+/// entries for a pair, so a depth entry can ALWAYS be reclaimed by the
+/// inactivity sweep (which keys off `last_activity`). Pre-fix, the depth
+/// entry was created before `append_message`, and `last_activity` only on
+/// the success path — a first-message append failure left a `depths` entry
+/// that no sweep could ever remove.
+#[tokio::test]
+async fn test_send_co_creates_depth_and_last_activity() {
+    let (bus, _rx) = setup();
+    let a = AgentId::new();
+    let b = AgentId::new();
+
+    bus.send("alice", a, "bob", b, "hi", None).await.unwrap();
+
+    let ab_ctx = dm_context_id("alice", "bob");
+    assert!(bus.depths.contains_key(&ab_ctx), "depth entry must exist");
+    assert!(
+        bus.last_activity.contains_key(&ab_ctx),
+        "last_activity must be co-created with the depth entry (B7) so the \
+         pair is always reclaimable by the inactivity sweep"
+    );
+}
+
+/// B7 (#1154) regression: directly reproduce the leak the bug produced — a
+/// `depths` entry with NO matching `last_activity` — and confirm two things:
+/// (1) the opportunistic sweep cannot reclaim such an orphan (it iterates
+/// `last_activity` keys only), proving the leak is real; and (2) a `send()`
+/// to that pair re-stamps `last_activity` via the B7 floor (BEFORE the
+/// append that can fail), restoring reclaimability.
+#[tokio::test]
+async fn test_orphaned_depth_entry_is_healed_by_send_floor_stamp() {
+    let (bus, _rx) = setup();
+    let a = AgentId::new();
+    let b = AgentId::new();
+    let c = AgentId::new();
+
+    let ab_ctx = dm_context_id("alice", "bob");
+
+    // Simulate the pre-fix leak: a depth entry with no `last_activity`
+    // (what a failed first-message `send()` used to leave behind).
+    bus.depths.insert(ab_ctx.clone(), ("alice".to_string(), 5));
+
+    // Drive the opportunistic sweep via an unrelated pair. The sweep walks
+    // `last_activity`, so the orphaned `depths` entry is NOT reclaimed — the
+    // leak that B7 closes.
+    bus.send("alice", a, "charlie", c, "hi", None)
+        .await
+        .unwrap();
+    assert!(
+        bus.depths.contains_key(&ab_ctx),
+        "an orphaned depth entry (no last_activity) cannot be swept — this is \
+         exactly the leak B7 addresses"
+    );
+    assert!(
+        !bus.last_activity.contains_key(&ab_ctx),
+        "the orphan still has no last_activity before the healing send"
+    );
+
+    // Now a real `send()` for the leaked pair. The B7 floor stamps
+    // `last_activity` the moment the depth entry is (re)established, BEFORE
+    // the depth-exceeded check and the append — so the pair is reclaimable
+    // again regardless of what happens downstream.
+    bus.send("alice", a, "bob", b, "ping", None).await.unwrap();
+    assert!(
+        bus.last_activity.contains_key(&ab_ctx),
+        "send() must (re)stamp last_activity for the pair (B7 floor)"
+    );
+
+    // Confirm reclaimability end-to-end: backdate it and sweep — the pair is
+    // now removed, where the orphan never would have been.
+    bus.last_activity.insert(
+        ab_ctx.clone(),
+        std::time::Instant::now() - std::time::Duration::from_secs(DEPTH_EXPIRY_SECS + 1),
+    );
+    bus.send("alice", a, "charlie", c, "sweep", None)
+        .await
+        .unwrap();
+    assert!(
+        !bus.depths.contains_key(&ab_ctx),
+        "the previously-orphaned pair is now reclaimable via the sweep"
+    );
 }
 
 // -----------------------------------------------------------------------
@@ -1504,7 +1589,7 @@ async fn test_send_after_end_starts_fresh_conversation() {
 #[tokio::test]
 async fn test_end_conversation_trigger_channel_dropped_returns_ok() {
     let session_manager = Arc::new(alms_session::SessionManager::new(SessionConfig::default()));
-    let (tx, rx) = mpsc::unbounded_channel();
+    let (tx, rx) = mpsc::channel(16);
     let bus = Arc::new(MessageBus::new(session_manager, tx));
 
     let alice_id = AgentId::new();
@@ -1558,7 +1643,7 @@ async fn test_end_conversation_trigger_channel_dropped_returns_ok() {
 #[tokio::test]
 async fn test_send_trigger_channel_dropped_still_returns_receipt() {
     let session_manager = Arc::new(alms_session::SessionManager::new(SessionConfig::default()));
-    let (tx, rx) = mpsc::unbounded_channel();
+    let (tx, rx) = mpsc::channel(16);
     let bus = Arc::new(MessageBus::new(session_manager, tx));
 
     // Drop the receiver before sending any messages.
@@ -1584,6 +1669,59 @@ async fn test_send_trigger_channel_dropped_still_returns_receipt() {
     let history = bus.session_manager.get_history(session_id).unwrap();
     assert_eq!(history.len(), 1);
     assert_eq!(history[0].metadata.as_ref().unwrap()["from_agent"], "alice");
+}
+
+/// B11 (#842 / #1154): the bounded `RunTrigger` channel must NOT drop
+/// triggers under buffer pressure — `MessageBus::send` uses
+/// `Sender::send().await`, so when the buffer is full the sender applies
+/// back-pressure (awaits a free slot) instead of losing a DM turn. Here the
+/// channel capacity (1) is far smaller than the number of sends; with a
+/// concurrent consumer draining slowly, every trigger must still arrive.
+#[tokio::test]
+async fn test_bounded_run_trigger_channel_applies_backpressure_no_drop() {
+    let session_manager = Arc::new(alms_session::SessionManager::new(SessionConfig::default()));
+    // Capacity 1 — deliberately tiny so the producer must block on a full
+    // buffer if the consumer falls behind.
+    let (tx, mut rx) = mpsc::channel::<RunTrigger>(1);
+    let bus = Arc::new(MessageBus::new(session_manager, tx));
+
+    let a = AgentId::new();
+    let b = AgentId::new();
+
+    // Producer: alternate alice<->bob so each send is a distinct depth step
+    // and produces a trigger. Run it as a task so the consumer can interleave.
+    const N: usize = 12;
+    let producer = {
+        let bus = Arc::clone(&bus);
+        tokio::spawn(async move {
+            for i in 0..N {
+                if i % 2 == 0 {
+                    bus.send("alice", a, "bob", b, "ping", None).await.unwrap();
+                } else {
+                    bus.send("bob", b, "alice", a, "pong", None).await.unwrap();
+                }
+            }
+        })
+    };
+
+    // Consumer: drain with a small delay so the bounded buffer fills and the
+    // producer is forced to await free slots (exercising back-pressure).
+    let mut received = 0usize;
+    while received < N {
+        match rx.recv().await {
+            Some(_trigger) => {
+                received += 1;
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+            None => break,
+        }
+    }
+
+    producer.await.unwrap();
+    assert_eq!(
+        received, N,
+        "every RunTrigger must be delivered under back-pressure — none dropped"
+    );
 }
 
 /// Full round-trip: ignore_message flow (end_conversation with Ignored
@@ -1812,7 +1950,7 @@ async fn test_depth_exceeded_full_roundtrip_lifecycle() {
 #[tokio::test]
 async fn test_depth_exceeded_returns_depth_exceeded_even_when_end_conversation_noop() {
     let session_manager = Arc::new(alms_session::SessionManager::new(SessionConfig::default()));
-    let (tx, rx) = mpsc::unbounded_channel();
+    let (tx, rx) = mpsc::channel(16);
     let bus = Arc::new(MessageBus::new(session_manager, tx));
 
     // Drop the receiver so trigger sends will fail silently.

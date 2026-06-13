@@ -383,7 +383,7 @@ mod tests {
             timestamp: chrono::Utc::now(),
             from_agent: None,
         };
-        store.save_tool_call(run.run_id, &tc).unwrap();
+        store.save_tool_call(run.run_id, session_id, &tc).unwrap();
 
         let page = store.load_timeline_events(agent_id, None, 50).unwrap();
         let tool_events: Vec<_> = page

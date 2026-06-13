@@ -75,6 +75,29 @@ Small, deterministic transforms applied to the outgoing request body — cheaper
 
 ---
 
+## Agent-loop hard caps (issue #987)
+
+Two `[llm]` knobs bound a **single agent run** so a run that keeps calling tools without ever producing a final reply terminates instead of hanging forever:
+
+```toml
+[llm]
+max_iterations        = 500    # default 500; 0 = disabled (no limit)
+max_run_duration_secs = 14400  # default 14400 (4 hours); 0 = disabled (no limit)
+```
+
+| Knob | Default | Bounds |
+|---|---|---|
+| `max_iterations` | `500` | The number of LLM-call iterations a run may take. One iteration is one LLM call plus the tool batch it requests, so this caps the step count. |
+| `max_run_duration_secs` | `14400` | The wall-clock duration of a run, in seconds (default 4 hours). Checked between iterations; an in-flight LLM/tool step is bounded by its own per-step timeout (`timeout_secs` / `stream_chunk_timeout_secs`), so the effective ceiling is this value plus at most one step. |
+
+**These caps default ON and apply to every run type** — web chat, cron jobs, and subagents (the value is inherited verbatim by subagents) — not just DMs. This is an operator-facing behaviour change: after upgrading, a deployment that previously ran unbounded will now end any run that exceeds 500 LLM calls or 4 hours of wall-clock time as `failed`. A scheduled job that legitimately runs longer than 4 hours, or a deep autonomous turn exceeding 500 LLM calls, must raise (or disable) the relevant cap. When a cap trips on a peer-triggered DM run the gateway's DM completion gate converts the failure into an `Errored` conversation end, so the peer is notified rather than stranded.
+
+Set either knob to **`0` to disable that cap** (no limit) — the escape hatch for workloads that genuinely need unbounded runs.
+
+Both knobs are **config-file-only**: they are read at gateway startup and are **not mutable via `PATCH /settings`** (and have no `ALMS_*` env-var override). Edit `alms.toml` and restart the gateway to change them.
+
+---
+
 ## Anthropic extended thinking (issue #767)
 
 Claude 4.x exposes an optional extended-thinking mode where the model streams its internal reasoning as `thinking` content blocks before the final assistant text. ALMS can opt in on a per-server, per-agent, or per-run basis.

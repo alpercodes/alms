@@ -225,6 +225,35 @@ pub struct LlmConfig {
     pub max_retries: u32,
     pub max_tokens_per_run: u32,
     pub mock: bool,
+    /// Hard cap on the number of LLM-call iterations a single agent run may
+    /// take before it is terminated with an error (#987 / B3).
+    ///
+    /// Each loop iteration is one LLM call plus the tool batch it requests.
+    /// Per-step timeouts ([`Self::timeout_secs`] /
+    /// [`Self::stream_chunk_timeout_secs`]) bound how long any one step can
+    /// take, but nothing bounded the *count* of steps — so an agent that
+    /// keeps calling tools without ever producing a deliverable reply ran
+    /// forever. In a DM that left the peer stranded on "Chatting with…"
+    /// indefinitely; the gateway's DM completion gate now converts the cap
+    /// trip into an `Errored` conversation end so the peer is notified.
+    ///
+    /// Default 500 — generous enough that ordinary multi-tool turns are never
+    /// clipped (most finish in single digits), sized for all run types
+    /// including deep autonomous turns. `0` disables the cap (no limit).
+    /// Inherited by subagents.
+    pub max_iterations: u32,
+    /// Hard cap on the wall-clock duration of a single agent run, in seconds
+    /// (#987 / B3). `0` disables the cap.
+    ///
+    /// Complements [`Self::max_iterations`]: the iteration cap bounds the
+    /// step count, this bounds total elapsed time so a run that makes slow
+    /// forward progress (e.g. each step just under the per-step timeout)
+    /// still terminates. Checked between iterations; an in-flight LLM/tool
+    /// step is bounded by its own per-step timeout, so the effective ceiling
+    /// is this value plus at most one step. Default 14400 (4 hours) — a
+    /// generous ceiling sized for all run types, including long-running
+    /// scheduled jobs. Inherited by subagents.
+    pub max_run_duration_secs: u64,
     /// Per-chunk read timeout for SSE streaming (seconds).
     /// If no data arrives within this window the stream is treated as stalled.
     /// Default: 60. Increase for slow reasoning models or high-latency connections.
@@ -268,6 +297,16 @@ impl Default for LlmConfig {
             timeout_secs: 120,
             max_retries: 2,
             max_tokens_per_run: 0,
+            // 500 iterations is a generous ceiling sized for all run types
+            // (web chat, cron jobs, deep autonomous turns) — most agent turns
+            // finish in single digits even with parallel tool batches. Bounds
+            // the #987 "run forever" class without clipping legitimate long
+            // multi-tool work.
+            max_iterations: 500,
+            // 4 hours — generous wall-clock ceiling sized for all run types,
+            // including long-running scheduled jobs, while still terminating a
+            // wedged run that makes no forward progress.
+            max_run_duration_secs: 14400,
             mock: false,
             stream_chunk_timeout_secs: 60,
             providers: BTreeMap::new(),

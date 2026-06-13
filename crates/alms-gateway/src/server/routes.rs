@@ -841,8 +841,8 @@ mod tests {
         let scheduler = std::sync::Arc::new(alms_runtime::Scheduler::new());
         let shutdown_token = tokio_util::sync::CancellationToken::new();
         let (completion_tx, _completion_rx) = tokio::sync::mpsc::unbounded_channel();
-        let (trigger_tx, _trigger_rx) = tokio::sync::mpsc::unbounded_channel();
-        let (dm_event_tx, _dm_event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (trigger_tx, _trigger_rx) = tokio::sync::mpsc::channel(8);
+        let (dm_event_tx, _dm_event_rx) = tokio::sync::mpsc::channel(8);
         AppState::new(
             gateway,
             scheduler,

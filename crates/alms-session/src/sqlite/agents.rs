@@ -964,6 +964,7 @@ mod tests {
         store
             .save_tool_calls(
                 d_run_id,
+                ds.id,
                 &[
                     ToolCallRecord {
                         seq: 0,
@@ -995,6 +996,7 @@ mod tests {
         store
             .save_tool_call(
                 s_run_id,
+                ss.id,
                 &ToolCallRecord {
                     seq: 0,
                     role: ToolCallRole::Assistant,
@@ -1072,6 +1074,7 @@ mod tests {
         store
             .save_tool_call(
                 d_run_id,
+                ds.id,
                 &ToolCallRecord {
                     seq: 0,
                     role: ToolCallRole::Assistant,
@@ -1101,6 +1104,7 @@ mod tests {
         store
             .save_tool_call(
                 dm_run_id,
+                dm.id,
                 &ToolCallRecord {
                     seq: 0,
                     role: ToolCallRole::Assistant,
@@ -1332,6 +1336,7 @@ mod tests {
         store
             .save_tool_call(
                 a_dm_run_id,
+                dm.id,
                 &ToolCallRecord {
                     seq: 0,
                     role: ToolCallRole::Assistant,
@@ -1362,6 +1367,7 @@ mod tests {
         store
             .save_tool_call(
                 b_dm_run_id,
+                dm.id,
                 &ToolCallRecord {
                     seq: 0,
                     role: ToolCallRole::Assistant,
@@ -1543,6 +1549,7 @@ mod tests {
         store
             .save_tool_call(
                 a_run_id,
+                dm.id,
                 &ToolCallRecord {
                     seq: 0,
                     role: ToolCallRole::Assistant,
@@ -1668,6 +1675,7 @@ mod tests {
         store
             .save_tool_call(
                 a_run_id,
+                dm.id,
                 &ToolCallRecord {
                     seq: 0,
                     role: ToolCallRole::Assistant,

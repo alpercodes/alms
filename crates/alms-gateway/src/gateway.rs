@@ -99,6 +99,11 @@ impl GatewayConfig {
             llm_config: config.llm.clone().into(),
             agent_config: AgentConfig {
                 context_config: config.context.clone(),
+                // Agent-loop hard caps (#987 / B3): bound iteration count and
+                // wall-clock duration so a run that never produces a
+                // deliverable reply terminates instead of hanging forever.
+                max_iterations: config.llm.max_iterations,
+                max_run_duration_secs: config.llm.max_run_duration_secs,
                 sandbox_root: config.tools.sandbox_root.clone(),
                 shell_policy: config.tools.shell_policy.clone(),
                 shell_permissions: config.tools.shell_permissions.clone(),
