@@ -331,3 +331,31 @@ fn reasoning_coverage_gate_js_behaviour() {
 fn reasoning_dedupe_store_js_behaviour() {
     run_node_test("reasoning-dedupe.test.mjs");
 }
+
+/// Behavioural coverage for the live DM-stream render path in
+/// `static/ui/hooks/use-session-stream.js`, driven through a real
+/// `FakeEventSource` (source-rewrite loader — no mocking of the handlers).
+///
+/// Pins two arcs:
+///   - #1154 B8/B9/B10 — reasoning_delta run_id bucketing, race-proof tool
+///     grouping into the live `dm_reasoning` block, and positional
+///     `dm_conversation_ended` banner dedupe.
+///   - #1157 / #1162 — the implicit-reply live render. Under implicit DM
+///     replies (#1156) the agent's final text streams as visible
+///     `token_delta` AND is delivered as the `dm_message` bubble; painting it
+///     into the reasoning collapsible too double-rendered it (#1157),
+///     mis-attributed it to the sender before participants resolved (#1162
+///     sym-1), and showed partial-then-full mid-stream (#1162 sym-2). The
+///     tests pin that the reply renders exactly once (the bubble, correctly
+///     attributed), the collapsible holds reasoning only (pre-tool "thinking
+///     out loud" is committed at the tool boundary; the trailing reply is
+///     discarded at run end), and an unresolved-participants race never
+///     attributes a peer run to the sender.
+///
+/// Wires the file into `cargo test` / CI — previously it only ran under a
+/// direct `node --test` invocation, so the DM-render regressions had no Rust
+/// harness gate.
+#[test]
+fn dm_stream_rendering_js_behaviour() {
+    run_node_test("dm-stream-rendering.test.mjs");
+}

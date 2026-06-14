@@ -54,12 +54,57 @@ import {
 } from '../state/reasoning-dedupe.js';
 
 /**
- * Per-run DM thinking text accumulation buffer.
- * Keyed by run_id, values are accumulated token_delta text.
- * Uses a Preact signal so that DmReasoningBlock components
- * re-render when new thinking text arrives.
+ * Per-run DM **reasoning** accumulation buffer — the text shown inside the
+ * collapsible `DmReasoningBlock`. Keyed by run_id.
+ *
+ * This holds ONLY what the backend persists as DM reasoning (so the live
+ * collapsible matches the reload collapsible, #1157/#1162):
+ *
+ *   1. Every `reasoning_delta` (extended-thinking trace) for the run.
+ *   2. Visible `token_delta` text from a turn that *also* made a tool call —
+ *      i.e. "thinking out loud" that precedes a tool, which the runtime
+ *      persists as a `message_type: "reasoning"` row (see
+ *      `persist_assistant_tool_calls` in loop_impl.rs). That text is
+ *      "committed" into this buffer at the next `tool_start` boundary.
+ *
+ * It deliberately EXCLUDES the run's trailing visible text — the implicit DM
+ * reply (#1156). That text streams as `token_delta` after the last tool
+ * boundary and is delivered to the peer as the `dm_message` bubble; the
+ * runtime does NOT persist it as a reasoning row (`finish_run` in mod.rs
+ * persists only the final-turn extended-thinking trace, and only when it is
+ * distinct from the reply). Painting it here too made the reply render twice
+ * live (once in the collapsible, once as the bubble) — mis-attributed to the
+ * wrong agent when participants hadn't resolved, and partial-then-full while
+ * the stream was mid-flight. The trailing visible text lives in
+ * `dmPendingReplyBuffers` below until a tool boundary promotes it (intermediate
+ * thinking) or the run ends (implicit reply → discarded from the collapsible).
+ *
+ * Uses a Preact signal so that DmReasoningBlock components re-render when new
+ * committed reasoning text arrives.
  */
 export const dmThinkingBuffers = signal(new Map());
+
+/**
+ * Per-run buffer for the trailing visible `token_delta` text accumulated since
+ * the run's last tool boundary (or run start). Keyed by run_id.
+ *
+ * This is the candidate **implicit DM reply** (#1156): the agent's final
+ * assistant text IS the reply, delivered as a `dm_message` bubble. It must NOT
+ * render in the reasoning collapsible (that is the #1157/#1162 double-render).
+ *
+ * Lifecycle:
+ *   - DM `token_delta` appends here (never directly into `dmThinkingBuffers`).
+ *   - A DM `tool_start` "commits" the pending text into `dmThinkingBuffers`
+ *     (it preceded a tool call, so the runtime persisted it as reasoning) and
+ *     clears the pending slot for the next turn.
+ *   - Run end discards whatever remains here (the implicit reply, already shown
+ *     as the bubble) and clears the slot.
+ *
+ * Not a signal: nothing renders it, so it needs no reactivity. Kept at module
+ * scope alongside `deltaBuffer` and cleared per stream teardown in
+ * `closeSessionStream`.
+ */
+const dmPendingReplyBuffers = new Map();
 
 /**
  * Derive the correct agent name for a DM reasoning block from the
@@ -69,14 +114,28 @@ export const dmThinkingBuffers = signal(new Map());
  *   - source "peer:Alice" means Alice sent a message, so BOB is reasoning
  *   - source "peer:Bob"   means Bob sent a message, so ALICE is reasoning
  *
- * Falls back to the active agent's name for non-peer sources (e.g. user-
- * initiated runs) or when participants are not available.
- *
  * Fixes #692 — previously used `activeAgent.value?.name` which is the
  * agent selected in the UI dropdown, not necessarily the one reasoning.
  *
+ * ## Attribution safety for `peer:` sources (#1162 sym-1)
+ *
+ * For a `peer:X` source the reasoning agent is unambiguously "the participant
+ * that is NOT X" — but naming it requires the resolved participants list. If
+ * `dmParticipants` has not resolved yet (the SSE stream can deliver
+ * `run_created` before `loadSession` populates the session metadata),
+ * falling back to `activeAgent` is a coin flip: it is the UI-selected agent,
+ * which is the reasoning agent only when the operator happens to be viewing
+ * that side. Guessing wrong mis-attributed the block to the *sender* (Alice),
+ * which — combined with the old habit of streaming the reply into the
+ * collapsible — is exactly the "reply shows first as an Alice message" report.
+ * So for `peer:` sources we return `null` (the block renders the neutral
+ * "Agent reasoning" label) rather than risk a wrong name; the `activeAgent`
+ * fallback is reserved for NON-peer sources (user-initiated runs), where the
+ * active agent genuinely is the one reasoning.
+ *
  * @param {string|null} source - the run's source field (e.g. "peer:Alice")
- * @returns {string|null} the name of the agent doing the reasoning
+ * @returns {string|null} the name of the agent doing the reasoning, or null
+ *   when it cannot be determined without risk of mis-attribution
  */
 function dmReasoningAgentName(source) {
     if (source && source.startsWith('peer:')) {
@@ -86,8 +145,10 @@ function dmReasoningAgentName(source) {
             // The peer triggered the run — the OTHER participant is reasoning.
             return participants[0] === peerName ? participants[1] : participants[0];
         }
+        // Participants unresolved: prefer the neutral label over a wrong name.
+        return null;
     }
-    // Fallback: best effort from the active agent selector.
+    // Non-peer source (user-initiated): the active agent is the one reasoning.
     return activeAgent.value?.name || null;
 }
 
@@ -254,6 +315,49 @@ function scheduleFlush() {
     }
 }
 
+/**
+ * Promote a DM run's pending visible-reply text into its reasoning buffer.
+ *
+ * Called on a DM `tool_start`: any visible `token_delta` text accumulated in
+ * `dmPendingReplyBuffers` since the last tool boundary preceded this tool
+ * call, so it was "thinking out loud" that the runtime persists as a
+ * `message_type: "reasoning"` row (`persist_assistant_tool_calls` in
+ * loop_impl.rs). Committing it into `dmThinkingBuffers` keeps the live
+ * collapsible in step with the reload collapsible. The pending slot is then
+ * cleared so the NEXT turn's trailing text (the eventual implicit reply) is
+ * tracked independently.
+ *
+ * No-op when there is no pending text for the run.
+ *
+ * @param {string|null} runId
+ */
+function commitDmPendingReplyToReasoning(runId) {
+    if (!runId) return;
+    const pending = dmPendingReplyBuffers.get(runId);
+    if (!pending) return;
+    dmPendingReplyBuffers.delete(runId);
+    const prev = dmThinkingBuffers.value;
+    const next = new Map(prev);
+    next.set(runId, (next.get(runId) || '') + pending);
+    dmThinkingBuffers.value = next;
+}
+
+/**
+ * Discard a DM run's pending visible-reply text without committing it.
+ *
+ * Called on run end: the trailing visible text (everything since the last
+ * tool boundary) is the implicit DM reply (#1156), already delivered to the
+ * peer as the `dm_message` bubble and intentionally NOT persisted as a
+ * reasoning row by the runtime. Dropping it here is what keeps the reply from
+ * rendering twice live (#1157/#1162). No-op when the run has no pending text.
+ *
+ * @param {string|null} runId
+ */
+function discardDmPendingReply(runId) {
+    if (!runId) return;
+    dmPendingReplyBuffers.delete(runId);
+}
+
 function sealLastAgent() {
     const msgs = chatMessages.value;
     const hasThinking = msgs.some(m => m.type === 'thinking');
@@ -307,6 +411,47 @@ export function openSessionStream(sessionId, opts) {
         ? getSealedReasoningRunIds(sessionId)
         : null;
 
+    // Carry the per-run pending DM reply buffers across a same-session
+    // EventSource reconnect, mirroring the `carriedSealedReasoning` pattern
+    // immediately above (#1157/#1162 follow-up). The reconnect paths
+    // (auto-backoff `onerror`, manual `reconnectSessionStream`) reopen with
+    // `{ lastEventId }` only and resume from the numeric event cursor — but
+    // `token_delta` is ephemeral and is NOT replayed by that cursor. So if a
+    // reconnect lands AFTER pre-tool "thinking out loud" text streamed but
+    // BEFORE the `tool_start` that promotes it into the collapsible, the
+    // unconditional `dmPendingReplyBuffers.clear()` in `closeSessionStream`
+    // below would drop that not-yet-promoted text — lost from the live view
+    // until a full reload reconstructs it from the persisted reasoning row.
+    // Pre-#1157 that text lived in `dmThinkingBuffers`, which already survives
+    // a reconnect via `carriedSealedReasoning`; moving it to a buffer that the
+    // close clears reintroduced a live-not-equal-reload gap on the reconnect
+    // path. Recovering it here (BEFORE the internal close clears the map) and
+    // re-installing it after the reopen closes that gap.
+    //
+    // Same-session ONLY: gated on `sessionId === activeStreamSessionId` (the
+    // module-scope id still holds the PREVIOUS stream's session at this point,
+    // reassigned further down). On a session SWITCH the pending text belongs to
+    // the session being left and must not bleed into the new session's runs, so
+    // it is intentionally dropped by the close. The `opts`-has-no-fresh-
+    // `sealedReasoningRunIds` clause matches `carriedSealedReasoning`: a fresh
+    // `loadSession` (which DOES pass that set) reconstructs any pre-tool text
+    // from the persisted reasoning row, so carrying a stale live buffer over a
+    // reload would double-count — only the in-process reconnect carries.
+    //
+    // CRITICAL (#1157 must not regress): this carries the text as STILL-PENDING
+    // — it is re-seeded into `dmPendingReplyBuffers`, never committed into
+    // `dmThinkingBuffers`. The same `tool_start`-promote / run-end-discard rules
+    // then apply post-reconnect, so a trailing implicit reply that survives the
+    // reconnect is still discarded at run end and never sealed into the
+    // collapsible. Committing-on-close instead would seal the reply into the
+    // collapsible on any reconnect that lands after the last tool — exactly the
+    // #1157 double-render — so the carry-over (not a flush) is the only correct
+    // shape.
+    const carriedPendingReplies = (sessionId && sessionId === activeStreamSessionId
+        && (!opts || !(opts.sealedReasoningRunIds instanceof Set)))
+        ? new Map(dmPendingReplyBuffers)
+        : null;
+
     closeSessionStream();
     if (!sessionId) return;
 
@@ -352,6 +497,22 @@ export function openSessionStream(sessionId, opts) {
         setSealedReasoningRunIds(sessionId, carriedSealedReasoning);
     }
     const sealedReasoningRunIds = getSealedReasoningRunIds(sessionId);
+
+    // Re-install the per-run pending DM reply buffers recovered above, so a
+    // same-session reconnect preserves the not-yet-promoted pre-tool text that
+    // `closeSessionStream` just cleared (#1157/#1162 follow-up). Re-seeded as
+    // STILL-PENDING (into `dmPendingReplyBuffers`, never `dmThinkingBuffers`),
+    // so the `tool_start`-promote / run-end-discard rules still apply post-
+    // reconnect and a trailing implicit reply is never sealed into the
+    // collapsible. Mirrors the `carriedSealedReasoning` re-record above; the
+    // recovery already gated on same-session + no-fresh-load, so this is an
+    // unconditional repopulate of whatever was carried. Per-run keys are
+    // preserved verbatim, so overlapping-run isolation is intact.
+    if (carriedPendingReplies instanceof Map) {
+        for (const [runId, text] of carriedPendingReplies) {
+            dmPendingReplyBuffers.set(runId, text);
+        }
+    }
     // Defer clearing the dead-state flag until the connection
     // actually opens — see the `'open'` listener below. Constructing
     // an EventSource is optimistic and does not mean the server is
@@ -664,26 +825,44 @@ export function openSessionStream(sessionId, opts) {
         // on the DM path regardless of attach/reconnect ordering.
         const isDm = isDmEvent(data.run_id || activeRunId.value);
         if (isDm) {
-            // For DM sessions: accumulate thinking text into the per-run
-            // buffer instead of the main chat delta buffer. The reasoning
-            // text is displayed inside collapsible DmReasoningBlock
-            // components, not as standalone agent messages. This prevents
-            // ghost messages that vanish on reload. (#685)
+            // INVARIANT (cross-layer, #1156 Option C): treating EVERY DM
+            // `token_delta` as the discard-on-end pending reply is correct only
+            // because every DM run is peer-triggered with an implicit reply
+            // delivered as a `dm_message` bubble. `POST /runs` on any `dm:`
+            // session is unconditionally rejected with
+            // `DM_SESSION_NOT_DIRECTLY_RUNNABLE` (runs/lifecycle.rs ~L834), so
+            // there is no user-/directly-initiated DM run whose visible response
+            // would be silently dropped here with no bubble to replace it. If
+            // that gate is ever relaxed (direct DM runs become possible), this
+            // branch MUST be re-gated on a per-run peer/implicit-reply flag —
+            // do NOT "fix" the absence of a bubble for a hypothetical non-peer
+            // DM run by removing this buffering; that non-bug cannot occur today.
+            //
+            // For DM sessions: visible reply text does NOT go straight into the
+            // reasoning collapsible. Under implicit replies (#1156) the run's
+            // trailing visible text IS the reply, delivered as the `dm_message`
+            // bubble — painting it in the collapsible too double-rendered it
+            // (#1157), mis-attributed it to the wrong agent before participants
+            // resolved (#1162 sym-1), and showed partial-then-full mid-stream
+            // (#1162 sym-2). Buffer it as the *pending* reply instead; a later
+            // `tool_start` promotes it into `dmThinkingBuffers` (it was
+            // intermediate "thinking out loud" the runtime persists as
+            // reasoning), and run end discards it (it was the implicit reply).
             //
             // B8 (#1154): bucket strictly by the event's own `run_id` rather
             // than `activeRunId.value`. Two DM runs can overlap (a queued
             // run's `run_created` overwrites `activeRunId` mid-stream, and
             // `handleRunEnd` nulls `activeRunId` for the FIRST run to end),
             // so keying on the mutable `activeRunId` lands one agent's
-            // thinking text in the other agent's collapsible. The wire-level
-            // `run_id` is the authoritative owner of the delta. Fall back to
+            // text in the other agent's collapsible. The wire-level `run_id`
+            // is the authoritative owner of the delta. Fall back to
             // `activeRunId.value` only for legacy backends that omit it.
             const runId = data.run_id || activeRunId.value;
             if (runId) {
-                const prev = dmThinkingBuffers.value;
-                const next = new Map(prev);
-                next.set(runId, (next.get(runId) || '') + data.delta);
-                dmThinkingBuffers.value = next;
+                dmPendingReplyBuffers.set(
+                    runId,
+                    (dmPendingReplyBuffers.get(runId) || '') + data.delta,
+                );
             }
             return;
         }
@@ -709,10 +888,14 @@ export function openSessionStream(sessionId, opts) {
         // into the non-DM path and spawn a spurious unsealed bubble.
         const isDm = isDmEvent(data.run_id || activeRunId.value);
         if (isDm) {
-            // For DM sessions: accumulate reasoning text into the per-run
-            // thinking buffer instead of mutating chatMessages.  The
-            // DmReasoningBlock for the active run reads this buffer and
-            // displays the text inside the collapsible "thinking" pane.
+            // For DM sessions: reasoning IS the canonical collapsible content,
+            // so accumulate it directly into `dmThinkingBuffers` (unlike the
+            // visible `token_delta` reply, which is the bubble and is buffered
+            // separately in `dmPendingReplyBuffers`). The DmReasoningBlock for
+            // the active run reads this buffer and displays the text inside the
+            // collapsible "thinking" pane. This matches the reload render,
+            // where the runtime-persisted extended-thinking trace (`finish_run`
+            // in mod.rs) becomes the block's thinkingText.
             //
             // Without this branch, the fallback path below would push a
             // brand-new agent placeholder message with empty `text` and
@@ -811,6 +994,14 @@ export function openSessionStream(sessionId, opts) {
             const isDm = isDmEvent(runId);
 
             if (isDm && !data.source_agent) {
+                // A tool boundary closes the current turn: any visible reply
+                // text streamed so far was intermediate "thinking out loud"
+                // (the runtime persists it as reasoning), so promote it from
+                // the pending-reply buffer into the collapsible's reasoning
+                // buffer. Run end will instead discard the trailing pending
+                // text — the implicit reply, shown as the bubble. (#1157/#1162)
+                commitDmPendingReplyToReasoning(runId);
+
                 // DM sessions: add the tool to the live reasoning block
                 // for this run instead of inserting a standalone tool row.
                 const toolEntry = {
@@ -1396,6 +1587,15 @@ export function openSessionStream(sessionId, opts) {
             // so the transformMessages callback below can use it.
             // (C1 fix: previously the delete happened first, then the
             // callback read the updated signal and got empty string.)
+            //
+            // `dmThinkingBuffers` holds ONLY committed reasoning (reasoning_delta
+            // plus any pre-tool visible text promoted at a tool boundary). The
+            // run's trailing visible text — the implicit reply, already shown as
+            // the `dm_message` bubble — sits in `dmPendingReplyBuffers` and is
+            // discarded here, never sealed into the collapsible. That asymmetry
+            // is the #1157/#1162 fix: live now matches the reload render, where
+            // the runtime persists the reply as a `dm` bubble and only the
+            // distinct extended-thinking trace as reasoning.
             let savedThinkingText = '';
             if (isDm && endingRunId) {
                 savedThinkingText = dmThinkingBuffers.value.get(endingRunId) || '';
@@ -1404,6 +1604,7 @@ export function openSessionStream(sessionId, opts) {
                     next.delete(endingRunId);
                     dmThinkingBuffers.value = next;
                 }
+                discardDmPendingReply(endingRunId);
             }
 
             transformMessages(prev => {
@@ -1641,6 +1842,11 @@ export function closeSessionStream() {
     }
     // Reset per-run state so it does not carry over to the next session.
     sawTokenDelta = false;
+    // Drop any per-run pending DM reply text — it is the implicit reply that
+    // was (or will be) delivered as a `dm_message` bubble, never the
+    // collapsible, so it must not leak into a different session's run on
+    // reopen. (#1157/#1162)
+    dmPendingReplyBuffers.clear();
     clearAgentPhase();
     // Drop the per-session reasoning-dedupe suppress-set (#1135) for the
     // stream being torn down so the store does not accumulate entries across
