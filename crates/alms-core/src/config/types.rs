@@ -221,6 +221,18 @@ pub struct LlmConfig {
     pub model: String,
     #[serde(skip)]
     pub api_key: Option<String>,
+    /// Total per-request deadline (seconds): the whole LLM call — connect,
+    /// headers, and the full response body — must complete within this
+    /// window or the request is aborted.
+    ///
+    /// This is reqwest's total `.timeout()` and is the **only** bound on the
+    /// connect / header / time-to-first-byte wait — a healthy response that
+    /// is slow to *start* is governed by this value alone. A *stalled body*
+    /// (one that started arriving and then went quiet) is caught sooner by
+    /// the body-only inactivity guard
+    /// ([`Self::stream_chunk_timeout_secs`]), so this value is the outer
+    /// bound for an otherwise healthy-but-large or healthy-but-slow-to-start
+    /// response. Default 120.
     pub timeout_secs: u64,
     pub max_retries: u32,
     pub max_tokens_per_run: u32,
@@ -254,9 +266,28 @@ pub struct LlmConfig {
     /// generous ceiling sized for all run types, including long-running
     /// scheduled jobs. Inherited by subagents.
     pub max_run_duration_secs: u64,
-    /// Per-chunk read timeout for SSE streaming (seconds).
-    /// If no data arrives within this window the stream is treated as stalled.
-    /// Default: 60. Increase for slow reasoning models or high-latency connections.
+    /// Per-chunk body-read inactivity timeout (seconds) — the window within
+    /// which the response *body* must keep making progress, reset after every
+    /// successful read.
+    ///
+    /// Applied identically on both paths (#1163), and **only to the body
+    /// read** — never to the connect / header / time-to-first-byte wait,
+    /// which stays bounded solely by the total [`Self::timeout_secs`]:
+    /// - On the **streaming** path it is the application-level per-chunk
+    ///   timeout in `stream_response`: if no SSE data arrives within this
+    ///   window the stream is treated as stalled and terminated.
+    /// - On the **non-streaming** (buffered) path the body is drained as a
+    ///   chunk stream under the same per-chunk timeout
+    ///   (`read_body_with_idle_timeout`), so a body that starts arriving and
+    ///   then stalls mid-transfer faults within this window instead of hanging
+    ///   until the total [`Self::timeout_secs`] deadline.
+    ///
+    /// Because the guard is body-only, a healthy response that is merely slow
+    /// to send its *first* byte is governed by [`Self::timeout_secs`], not
+    /// this value — raise `timeout_secs` for slow-to-start upstreams.
+    ///
+    /// Default: 60. Increase for slow reasoning models or high-latency
+    /// connections.
     pub stream_chunk_timeout_secs: u64,
 
     /// Generic per-provider config table. Keys here are referenced by

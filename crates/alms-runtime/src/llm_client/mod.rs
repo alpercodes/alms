@@ -50,6 +50,28 @@ pub struct LlmClient {
 impl LlmClient {
     /// Create new LLM client with config
     pub fn new(mut config: LlmConfig) -> AlmsResult<Self> {
+        // The only reqwest-level deadline is the *total* `.timeout()` —
+        // "from when the request starts connecting until the response body has
+        // finished". It bounds the whole call (connect + headers + full body)
+        // at `timeout_secs`, and is the documented outer bound that governs
+        // time-to-first-byte for a healthy-but-slow-to-start response.
+        //
+        // The per-read inactivity guard for a *stalled* body (#1163) is NOT
+        // set here as a client-level `.read_timeout()`. reqwest's client-level
+        // read timeout also caps the header / time-to-first-byte wait (the
+        // sleep is polled while still waiting for connect + TLS + headers and
+        // does not reset until the body wrapper takes over), so wiring it to
+        // `stream_chunk_timeout_secs` would tighten the time-to-first-byte
+        // ceiling from `timeout_secs` to `stream_chunk_timeout_secs` for every
+        // call — regressing a healthy non-streaming `application/json` upstream
+        // (which buffers the whole completion before sending headers) or a slow
+        // reasoning model that legitimately takes longer than that to first
+        // byte. Instead the inactivity guard lives *inside the body read* on
+        // both paths: `streaming.rs` wraps each SSE chunk poll, and
+        // `parse_completion_response` reads the buffered body as a chunk stream
+        // under the same per-chunk `tokio::time::timeout`. A mid-body stall
+        // therefore faults in `stream_chunk_timeout_secs`, but the header wait
+        // stays bounded only by the total `timeout_secs`.
         let client = Client::builder()
             .timeout(std::time::Duration::from_secs(config.timeout_secs))
             .build()
@@ -374,6 +396,109 @@ impl LlmClient {
         self.parse_completion_response(response, &request).await
     }
 
+    /// Drain a successful response body into a `String` under a per-chunk
+    /// inactivity timeout, instead of the unbounded-per-read
+    /// `response.text().await` (#1163).
+    ///
+    /// Each `bytes_stream()` poll is wrapped in
+    /// `tokio::time::timeout(stream_chunk_timeout_secs, …)` — the same
+    /// body-only idle guard the streaming path applies in `streaming.rs`. A
+    /// body that starts arriving and then stalls mid-transfer (the #1163
+    /// symptom: a buffered `application/json` completion that never finishes)
+    /// therefore faults within `stream_chunk_timeout_secs` rather than hanging
+    /// until the total `.timeout()` deadline. Because the guard lives on the
+    /// body read and not on the client, the header / time-to-first-byte wait
+    /// stays bounded only by the total `timeout_secs` (no healthy-path
+    /// regression for a slow-to-start but otherwise healthy response).
+    ///
+    /// Both failure modes — a mid-body read error (connection reset, malformed
+    /// chunked transfer, H2 stream reset, gzip decode failure) and a stall —
+    /// surface the enriched #1044 decode diagnostic with provider, model,
+    /// status, content-type, and `bytes_read` intact, mirroring the streaming
+    /// path's mid-stream error shape.
+    async fn read_body_with_idle_timeout(
+        &self,
+        response: reqwest::Response,
+        model: &str,
+        status: u16,
+        content_type: Option<&str>,
+        content_length: Option<u64>,
+    ) -> AlmsResult<String> {
+        use futures::StreamExt;
+
+        let chunk_timeout = std::time::Duration::from_secs(self.config.stream_chunk_timeout_secs);
+        let provider_name = self.config.provider.as_str();
+
+        let mut byte_stream = response.bytes_stream();
+        let mut body = Vec::<u8>::new();
+
+        loop {
+            match tokio::time::timeout(chunk_timeout, byte_stream.next()).await {
+                // A chunk arrived — accumulate and keep reading.
+                Ok(Some(Ok(chunk))) => body.extend_from_slice(&chunk),
+                // Body finished cleanly.
+                Ok(None) => break,
+                // Mid-body read error (connection reset, malformed chunked
+                // transfer, H2 stream reset, gzip decode failure, etc.).
+                // reqwest's bare `Display` collapses this to "error decoding
+                // response body" with no context — walk the source chain and
+                // bake in the metadata captured before the read so the
+                // operator (and the parent agent's tool-call result) can tell
+                // the causes apart. See #1044.
+                Ok(Some(Err(e))) => {
+                    let chain = flatten_error_chain(&e);
+                    let diag = DecodeDiagnostic {
+                        provider: provider_name,
+                        model,
+                        status: Some(status),
+                        content_type,
+                        content_length,
+                        bytes_read: Some(body.len()),
+                        body_prefix: None,
+                    };
+                    let msg = format_decode_error("LLM response decode failed", &diag, &chain);
+                    error!("{msg}");
+                    return Err(AlmsError::Runtime(msg));
+                }
+                // Per-chunk inactivity timeout: the body started arriving (or
+                // not) and then went quiet for `stream_chunk_timeout_secs`.
+                // This is the #1163 stall. Surface the same enriched decode
+                // diagnostic — reqwest renders a real read/total timeout as
+                // "operation timed out", so we use the same wording for the
+                // synthetic body-idle timeout to keep the operator-facing
+                // shape and the existing tests aligned.
+                Err(_) => {
+                    let diag = DecodeDiagnostic {
+                        provider: provider_name,
+                        model,
+                        status: Some(status),
+                        content_type,
+                        content_length,
+                        bytes_read: Some(body.len()),
+                        body_prefix: None,
+                    };
+                    let msg = format_decode_error(
+                        "LLM response decode failed",
+                        &diag,
+                        &format!(
+                            "response body stalled (no data for {}s) — operation timed out",
+                            chunk_timeout.as_secs()
+                        ),
+                    );
+                    error!("{msg}");
+                    return Err(AlmsError::Runtime(msg));
+                }
+            }
+        }
+
+        // Decode the assembled bytes. `from_utf8_lossy` matches the streaming
+        // path's per-chunk decode; in practice every provider returns UTF-8
+        // JSON, and a lossy decode keeps a malformed-byte body parseable as
+        // far as possible for the diagnostic body-prefix on a later JSON parse
+        // failure rather than erroring opaquely here.
+        Ok(String::from_utf8_lossy(&body).into_owned())
+    }
+
     /// Parse a successful HTTP response into a `CompletionResponse`.
     ///
     /// Extracted so the cache-expired retry path (#769) can hit the
@@ -409,33 +534,29 @@ impl LlmClient {
         // Read the raw body first so we can log it for diagnostics, then
         // parse from the text.  This is essential for debugging models that
         // return content in unexpected fields (e.g. `reasoning_content`).
-        let body_text = match response.text().await {
-            Ok(t) => t,
-            Err(e) => {
-                // `response.text()` decodes the buffered body into a String;
-                // the reqwest error here means the body bytes themselves
-                // couldn't be read (connection reset mid-body, malformed
-                // chunked transfer, H2 stream reset, gzip decompression
-                // failure, etc.). reqwest's bare `Display` renders this as
-                // "error decoding response body" with no further context —
-                // we walk the source chain to recover the underlying
-                // hyper/IO cause and bake the response metadata we already
-                // captured into the bubbled error. See #1044.
-                let chain = flatten_error_chain(&e);
-                let diag = DecodeDiagnostic {
-                    provider: provider_name,
-                    model: &request.model,
-                    status: Some(status),
-                    content_type: content_type.as_deref(),
-                    content_length,
-                    bytes_read: None,
-                    body_prefix: None,
-                };
-                let msg = format_decode_error("LLM response decode failed", &diag, &chain);
-                error!("{msg}");
-                return Err(AlmsError::Runtime(msg));
-            }
-        };
+        //
+        // The body is drained as a chunk stream under a per-chunk inactivity
+        // timeout (`stream_chunk_timeout_secs`), mirroring the streaming path
+        // in `streaming.rs` (#1163). `response.text()` would buffer the whole
+        // body under only the total `.timeout()`, so a body that started
+        // arriving and then stalled mid-transfer (the #1163 symptom —
+        // `minimax/minimax-m3` on openrouter returning a buffered
+        // `application/json` body that never finished) would hang for the
+        // entire `timeout_secs` window before faulting. Wrapping each chunk
+        // poll bounds a mid-body stall to `stream_chunk_timeout_secs` while
+        // leaving the header / time-to-first-byte wait governed only by the
+        // total `timeout_secs` (the read timeout is deliberately *not* a
+        // client-level `.read_timeout()`, which would also cap the header
+        // wait — see `LlmClient::new`).
+        let body_text = self
+            .read_body_with_idle_timeout(
+                response,
+                &request.model,
+                status,
+                content_type.as_deref(),
+                content_length,
+            )
+            .await?;
 
         debug!(raw_body_len = body_text.len(), "LLM response body received");
 
@@ -961,7 +1082,10 @@ impl LlmClient {
 #[cfg(test)]
 mod tests {
     use super::sse_parsers::{parse_gemini_sse_block, parse_openai_sse};
-    use super::test_responder::{spawn_sequential_responder, spawn_truncated_body_responder};
+    use super::test_responder::{
+        spawn_sequential_responder, spawn_slow_body_responder, spawn_slow_headers_responder,
+        spawn_truncated_body_responder,
+    };
     use super::*;
     use std::sync::Mutex;
 
@@ -2775,6 +2899,245 @@ mod tests {
                 "body_prefix present but doesn't include SSE prefix, got: {msg}"
             );
         }
+    }
+
+    // ------------------------------------------------------------------
+    // #1163: a slow / stalled response *body* must fault *promptly* via the
+    // body-read per-chunk inactivity timeout (`stream_chunk_timeout_secs`,
+    // applied inside `read_body_with_idle_timeout` for the buffered path and
+    // `stream_response` for the streaming path) rather than hanging until the
+    // total `.timeout()` deadline. The reported failure was
+    // `minimax/minimax-m3` on openrouter returning a buffered
+    // `application/json` body that stalled mid-transfer — with no inactivity
+    // guard on the buffered path, `complete()` hung the *whole* window before
+    // surfacing "LLM response decode failed … operation timed out".
+    //
+    // The first two tests build a client whose per-chunk window (1s) is much
+    // shorter than its total deadline (30s) and point it at a responder that
+    // sends headers + a partial body, then stalls. The error must surface in
+    // ~1s (the body-read window), proving the per-chunk guard — not the total
+    // deadline — is what fired.
+    //
+    // The third test (`complete_slow_headers_succeeds_*`) is the inverse and
+    // the regression guard for Tim's Option-1 rework: the inactivity guard is
+    // body-only, so a healthy response that is merely slow to send its first
+    // byte (delay > the per-chunk window but < the total deadline) must
+    // *succeed*. The earlier client-level `.read_timeout()` mechanism also
+    // capped the header wait and would have clipped this call at the per-chunk
+    // window — this test fails against that head and passes after the rework.
+    // ------------------------------------------------------------------
+
+    /// Client with a short per-chunk body-read window and a comfortably longer
+    /// total deadline, so a stalled-body test faults via the body-read idle
+    /// guard (fast) and never via the total `.timeout()` (which would make the
+    /// test slow and prove the wrong thing). Conversely, a slow-*headers* test
+    /// must complete because the idle guard does not touch the header wait.
+    fn openai_client_short_read_timeout(base_url: String) -> LlmClient {
+        let mut core_cfg = alms_core::config::LlmConfig::default();
+        core_cfg.ensure_builtin_providers();
+        core_cfg.provider = "openai".into();
+        let mut runtime_cfg: LlmConfig = core_cfg.into();
+        runtime_cfg.api_key = "openai-test-key".into();
+        runtime_cfg.base_url = base_url;
+        // Total deadline far exceeds the per-chunk window — the body-read idle
+        // guard must be the one that fires on a stalled body, and the total
+        // deadline must be what (generously) bounds the header wait.
+        runtime_cfg.timeout_secs = 30;
+        runtime_cfg.stream_chunk_timeout_secs = 1;
+        LlmClient::new(runtime_cfg).unwrap()
+    }
+
+    /// Buffered (`complete()`) path: a body that starts arriving (200 +
+    /// partial JSON) then stalls must surface the structured decode error
+    /// quickly, driven by the body-read per-chunk timeout. This is the exact
+    /// #1163 symptom (`status=200`, `content_type=application/json`, body
+    /// never finishes) — the assertion that it returns *at all*, well under
+    /// the 30s total deadline, is the regression guard. Without the body-read
+    /// idle guard this test would hang ~30s before the total deadline fired.
+    #[tokio::test]
+    async fn complete_stalled_body_faults_on_read_timeout_not_total_deadline() {
+        // Advertise far more bytes than we send, then stall for longer than
+        // the per-read window (1s) but well under the total deadline (30s).
+        let partial = r#"{"id":"chatcmpl-1","object":"chat.completion","#;
+        let base_url = spawn_slow_body_responder(
+            200,
+            "application/json",
+            partial,
+            8192, // claimed length the body never reaches
+            // Stall longer than the *total* deadline (30s) so the only thing
+            // that can fault the read at ~1s is the per-read timeout. Without
+            // it, the call would block until the 30s total deadline (caught
+            // by the `< 15s` assertion below).
+            40,
+        )
+        .await;
+        let client = openai_client_short_read_timeout(base_url);
+        let request = CompletionRequest::new("minimax/minimax-m3")
+            .with_messages(vec![LlmMessage::user("hi")]);
+
+        let start = std::time::Instant::now();
+        let err = client
+            .complete(request)
+            .await
+            .expect_err("a stalled response body must surface an error, not hang then succeed");
+        let elapsed = start.elapsed();
+
+        // The defining assertion: we faulted via the ~1s read timeout, not
+        // the 30s total deadline. A generous 15s ceiling keeps the test
+        // robust on slow CI while still proving the read timeout (1s) — not
+        // the total deadline (30s) — is what fired.
+        assert!(
+            elapsed < std::time::Duration::from_secs(15),
+            "stalled body should fault on the per-read timeout (~1s), not the \
+             total deadline (30s); took {elapsed:?}"
+        );
+
+        // The bubbled error is the enriched non-stream decode diagnostic
+        // (#1044) — the same shape the operator saw in #1163.
+        let msg = err.to_string();
+        assert!(
+            msg.contains("LLM response decode failed"),
+            "expected the non-stream decode diagnostic, got: {msg}"
+        );
+        assert!(
+            msg.contains("provider=openai") && msg.contains("model=minimax/minimax-m3"),
+            "diagnostic must carry provider+model, got: {msg}"
+        );
+        // reqwest renders both the total-deadline and read-timeout faults as
+        // "operation timed out" — pin that the timeout cause surfaces.
+        assert!(
+            msg.contains("operation timed out"),
+            "expected a timeout cause in the chain, got: {msg}"
+        );
+    }
+
+    /// Streaming (`complete_stream()`) path: a stalled SSE body must also
+    /// terminate the stream with a timely error. The application-level
+    /// per-chunk timeout in `stream_response` is the sole guard here (the
+    /// client-level `.read_timeout()` was removed in the #1163 rework so the
+    /// header wait isn't capped — see `LlmClient::new`). The stream must yield
+    /// an `Err` well under the total deadline rather than hanging.
+    #[tokio::test]
+    async fn complete_stream_stalled_body_terminates_with_timely_error() {
+        use futures::StreamExt;
+
+        // A valid SSE prefix with no event terminator, then a stall: the
+        // SSE parser stays in "need more data" and the per-chunk window (1s)
+        // fires before the 30s total deadline.
+        let partial = "data: {\"id\":\"chatcmpl-1\",\"choices\":[{\"delta\":{\"content\":\"hel";
+        // Stall longer than the total deadline (30s); the application-level
+        // per-chunk SSE timeout (1s) in `stream_response` must catch it first.
+        let base_url = spawn_slow_body_responder(200, "text/event-stream", partial, 8192, 40).await;
+        let client = openai_client_short_read_timeout(base_url);
+        let request = CompletionRequest::new("minimax/minimax-m3")
+            .with_messages(vec![LlmMessage::user("hi")]);
+
+        let mut stream = match client.complete_stream(request).await {
+            Ok(s) => s,
+            Err(e) => panic!(
+                "complete_stream itself returned Err — wanted the error to surface inside the stream, got: {e}"
+            ),
+        };
+
+        let start = std::time::Instant::now();
+        let mut err_msg = None;
+        // Bounded pump: a future regression yielding a non-erroring infinite
+        // stream fails cleanly here instead of hanging the suite.
+        for _ in 0..32 {
+            match stream.next().await {
+                Some(Ok(_)) => continue,
+                Some(Err(e)) => {
+                    err_msg = Some(e.to_string());
+                    break;
+                }
+                None => break,
+            }
+        }
+        let elapsed = start.elapsed();
+        let msg = err_msg.expect("a stalled SSE body must yield a stream error, not hang");
+
+        assert!(
+            elapsed < std::time::Duration::from_secs(15),
+            "stalled stream should terminate on the per-chunk timeout (~1s), \
+             not the total deadline (30s); took {elapsed:?}"
+        );
+        // The application-level per-chunk timeout in `stream_response` is the
+        // sole guard now and renders the "LLM stream stalled" diagnostic. The
+        // "LLM stream decode failed" arm is retained defensively: a real
+        // mid-stream socket error (rather than a clean idle stall) would still
+        // surface that shape. Accept either — both are timely, both carry the
+        // model.
+        assert!(
+            msg.contains("LLM stream stalled") || msg.contains("LLM stream decode failed"),
+            "expected a stall/decode stream diagnostic, got: {msg}"
+        );
+        assert!(
+            msg.contains("model=minimax/minimax-m3"),
+            "stream diagnostic must carry the model, got: {msg}"
+        );
+    }
+
+    /// Regression guard for Tim's Option-1 rework (#1163): the inactivity
+    /// guard is **body-only**, so a healthy upstream that is merely slow to
+    /// send its first byte must NOT be clipped at the per-chunk window.
+    ///
+    /// The responder accepts the connection and sends nothing — no status
+    /// line, no headers — for 3s (> the 1s `stream_chunk_timeout_secs`, well
+    /// under the 30s `timeout_secs`), then writes one complete, valid OpenAI
+    /// completion. With the body-only guard, the 3s delay falls entirely in
+    /// the header / time-to-first-byte phase (governed only by the total
+    /// deadline), so the body read never starts its per-chunk clock until the
+    /// whole response is already in flight — the call succeeds.
+    ///
+    /// This test FAILS against the pre-rework head: the earlier client-level
+    /// `.read_timeout(stream_chunk_timeout_secs)` also capped the header wait
+    /// (reqwest polls that sleep while waiting for connect + TLS + headers,
+    /// resetting only once the body wrapper takes over), so the 3s header
+    /// delay would trip the 1s read window and surface "operation timed out"
+    /// before any byte arrived. Removing the client-level read timeout and
+    /// scoping the idle guard to the body read is exactly what this pins.
+    #[tokio::test]
+    async fn complete_slow_headers_succeeds_not_clipped_by_body_idle_guard() {
+        // A complete, well-formed OpenAI completion — the responder sends it
+        // in one write *after* the header delay.
+        let body = r#"{"id":"chatcmpl-1","object":"chat.completion","created":1700000000,"model":"minimax/minimax-m3","choices":[{"index":0,"message":{"role":"assistant","content":"hello from a slow-to-start upstream"},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":7,"total_tokens":10}}"#;
+        // 3s > stream_chunk_timeout_secs (1s) and << timeout_secs (30s): a
+        // healthy-but-slow-to-start response. The body-only guard must let it
+        // through; the pre-rework client `.read_timeout()` would have clipped
+        // it at ~1s.
+        let base_url = spawn_slow_headers_responder(200, "application/json", body, 3).await;
+        let client = openai_client_short_read_timeout(base_url);
+        let request = CompletionRequest::new("minimax/minimax-m3")
+            .with_messages(vec![LlmMessage::user("hi")]);
+
+        let start = std::time::Instant::now();
+        let resp = client.complete(request).await.expect(
+            "a healthy response that is slow to send its first byte (under the total \
+             deadline) must succeed — the inactivity guard is body-only and must not \
+             cap the header wait",
+        );
+        let elapsed = start.elapsed();
+
+        // It really did wait for the slow headers (so we exercised the
+        // header-wait path, not some fast-path shortcut) but finished well
+        // under the total deadline.
+        assert!(
+            elapsed >= std::time::Duration::from_secs(3),
+            "expected the call to wait out the ~3s header delay, took only {elapsed:?}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(15),
+            "expected completion well under the 30s total deadline, took {elapsed:?}"
+        );
+
+        // The body parsed into the real completion — proves we got past
+        // headers AND read the body to completion under the per-chunk guard.
+        let text = resp
+            .choices
+            .first()
+            .and_then(|c| c.message.content.as_deref())
+            .unwrap_or_default();
+        assert_eq!(text, "hello from a slow-to-start upstream");
     }
 
     /// Wire invariant (#773): an outbound OpenAI request built by the

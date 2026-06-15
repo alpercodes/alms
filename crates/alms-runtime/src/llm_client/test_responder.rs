@@ -186,3 +186,139 @@ pub(super) async fn spawn_truncated_body_responder(
 
     base_url
 }
+
+/// Variant of [`spawn_sequential_responder`] that simulates a **slow /
+/// stalled** response body: writes the HTTP headers (advertising a
+/// `Content-Length` larger than what it sends) plus an optional partial
+/// body, then *holds the connection open without sending the rest* for
+/// `stall_secs`. The body never finishes arriving within the per-chunk
+/// inactivity window, so the body-read idle guard
+/// (`read_body_with_idle_timeout` on the buffered path, `stream_response`
+/// on the streaming path) faults the read promptly — rather than hanging
+/// until the total request deadline.
+///
+/// This is the #1163 failure mode: `minimax/minimax-m3` on openrouter
+/// returned a buffered `application/json` body that stalled mid-transfer,
+/// and because the buffered `complete()` path had no inactivity guard at
+/// all it hung for the full total `.timeout()` window before surfacing
+/// "LLM response decode failed … operation timed out". Used to pin that a
+/// stalled body now faults within `stream_chunk_timeout_secs`.
+///
+/// Note this stalls *mid-body* — headers are sent immediately. The
+/// distinct slow-to-first-byte / header-wait path is covered separately by
+/// [`spawn_slow_headers_responder`], which must NOT be clipped by the
+/// per-chunk guard.
+///
+/// The task keeps the socket alive for `stall_secs` (don't make this
+/// longer than the test's own timeout budget) so the client side is the
+/// party that gives up first via its body-read idle timeout.
+pub(super) async fn spawn_slow_body_responder(
+    status: u16,
+    content_type: &'static str,
+    partial_body: &'static str,
+    claimed_len: usize,
+    stall_secs: u64,
+) -> String {
+    assert!(
+        claimed_len > partial_body.len(),
+        "claimed_len must exceed the partial body length so the body never \
+         completes (claimed={claimed_len} partial={})",
+        partial_body.len()
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let base_url = format!("http://{}/v1beta", addr);
+
+    tokio::spawn(async move {
+        let (mut sock, _) = match listener.accept().await {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        let mut buf = vec![0u8; 16 * 1024];
+        let _ = sock.read(&mut buf).await;
+        let reason = match status {
+            200 => "OK",
+            _ => "Status",
+        };
+        // Advertise more bytes than we send, flush the headers + partial
+        // body, then stall: keep the connection open without sending the
+        // remaining advertised bytes. The client's read timeout (not the
+        // total deadline) is what we want to fire first.
+        let headers = format!(
+            "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\n\
+             Content-Length: {claimed_len}\r\nConnection: close\r\n\r\n",
+        );
+        let _ = sock.write_all(headers.as_bytes()).await;
+        if !partial_body.is_empty() {
+            let _ = sock.write_all(partial_body.as_bytes()).await;
+        }
+        let _ = sock.flush().await;
+        // Hold the socket open, sending nothing further. The client side
+        // gives up first via its per-read inactivity timeout.
+        tokio::time::sleep(std::time::Duration::from_secs(stall_secs)).await;
+        drop(sock);
+    });
+
+    base_url
+}
+
+/// Variant of [`spawn_sequential_responder`] that simulates a **slow but
+/// healthy** upstream: accepts the connection, drains the request, then
+/// sends *nothing at all* — no status line, no headers, no body — for
+/// `delay_secs`, and only then writes a single complete, valid response.
+///
+/// This exercises the **time-to-first-byte / header-wait** path, which is a
+/// distinct phase from the mid-body stall covered by
+/// [`spawn_slow_body_responder`]: here the delay is entirely *before* any
+/// response byte is emitted, so the client is blocked waiting for headers,
+/// not for the rest of an already-started body.
+///
+/// It is the regression guard for #1163's Option-1 rework (Tim's review):
+/// the inactivity guard must live on the body read only, so a healthy
+/// response that is merely slow to *start* (delay under the total
+/// `timeout_secs` but over the per-chunk `stream_chunk_timeout_secs`) must
+/// **succeed**, not get clipped at the per-chunk window. The earlier
+/// `.read_timeout(stream_chunk_timeout_secs)` mechanism also capped this
+/// header wait and would fail such a call at the per-chunk window — this
+/// responder pins that the body-only guard does not.
+///
+/// `delay_secs` must be shorter than the client's total `timeout_secs` (so
+/// the healthy response still arrives in time) and longer than its
+/// `stream_chunk_timeout_secs` (so the test actually distinguishes the two).
+pub(super) async fn spawn_slow_headers_responder(
+    status: u16,
+    content_type: &'static str,
+    body: &'static str,
+    delay_secs: u64,
+) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let base_url = format!("http://{}/v1beta", addr);
+
+    tokio::spawn(async move {
+        let (mut sock, _) = match listener.accept().await {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        let mut buf = vec![0u8; 16 * 1024];
+        let _ = sock.read(&mut buf).await;
+        // The whole point: send NOTHING for `delay_secs` — the client sits in
+        // the connect+headers wait the entire time. This is time-to-first-
+        // byte latency, not a mid-body stall.
+        tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
+        let reason = match status {
+            200 => "OK",
+            _ => "Status",
+        };
+        // Now send one complete, well-formed response in a single write.
+        let response = format!(
+            "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\n\
+             Content-Length: {len}\r\nConnection: close\r\n\r\n{body}",
+            len = body.len(),
+        );
+        let _ = sock.write_all(response.as_bytes()).await;
+        let _ = sock.shutdown().await;
+    });
+
+    base_url
+}

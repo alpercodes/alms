@@ -693,9 +693,19 @@ pub struct LlmConfig {
     pub api_key: String,
     pub base_url: String,
     pub default_model: String,
+    /// Total per-request deadline (seconds) — reqwest's `.timeout()`,
+    /// covering connect + headers + full response body. The only bound on
+    /// the header / time-to-first-byte wait (the body-only idle guard below
+    /// never touches it).
     pub timeout_secs: u64,
     pub mock: bool,
-    /// Per-chunk read timeout for SSE streaming (seconds).
+    /// Per-chunk body-read inactivity timeout (seconds): applied only to the
+    /// response *body* on both paths — the application-level per-chunk SSE
+    /// timeout in `stream_response` and the same per-chunk guard wrapping the
+    /// buffered body read in `read_body_with_idle_timeout` — so a stalled
+    /// body (streaming or buffered) faults within this window rather than
+    /// hanging until `timeout_secs`. It is deliberately NOT a client-level
+    /// `.read_timeout()`, which would also cap the header wait (#1163).
     pub stream_chunk_timeout_secs: u64,
     /// How the API key is attached to each outgoing request. Defaults to
     /// `Bearer` for OpenAI-compatible providers.

@@ -96,6 +96,25 @@ Set either knob to **`0` to disable that cap** (no limit) — the escape hatch f
 
 Both knobs are **config-file-only**: they are read at gateway startup and are **not mutable via `PATCH /settings`** (and have no `ALMS_*` env-var override). Edit `alms.toml` and restart the gateway to change them.
 
+### Per-step LLM timeouts (issue #1163)
+
+Each individual LLM call is bounded by two complementary `[llm]` timeouts:
+
+```toml
+[llm]
+timeout_secs             = 120  # total per-request deadline (also bounds time-to-first-byte)
+stream_chunk_timeout_secs = 60  # per-chunk BODY-read inactivity timeout
+```
+
+| Knob | Default | Bounds |
+|---|---|---|
+| `timeout_secs` | `120` | **Total** per-request deadline — the whole call (connect + headers + full response body) must complete within this window (reqwest's `.timeout()`). It is also the **only** bound on the connect / header / time-to-first-byte wait, so it is the outer bound for a response that is healthy-but-large *or* healthy-but-slow-to-start. |
+| `stream_chunk_timeout_secs` | `60` | **Per-chunk body-read inactivity** timeout, reset after every successful read, applied **only to the response body** — never to the header/first-byte wait. On the streaming path it is the per-chunk SSE stall timeout; on the **non-streaming (buffered)** path the body is drained as a chunk stream under the same per-chunk guard, so a body that starts arriving then stalls mid-transfer faults within this window too. |
+
+Before #1163 the buffered (non-streaming) path had no body-read inactivity guard at all, so a slow/stalled **non-streaming** response body (seen with `minimax/minimax-m3` on openrouter, which returned a buffered `application/json` body that never finished arriving) hung for the *entire* `timeout_secs` window before failing with `LLM response decode failed … operation timed out`. The fix drains the buffered body as a chunk stream under the same per-chunk inactivity timeout the streaming path already used, so a stalled body — on **either** path — surfaces a clear error within `stream_chunk_timeout_secs` instead of dead-airing until the total deadline.
+
+The guard is deliberately **body-only** (not a client-level reqwest `.read_timeout()`, which would also cap the header / time-to-first-byte wait). A response that is *slow to send its first byte* — a non-streaming upstream that buffers the whole completion before sending headers, or a slow reasoning model — is therefore governed by `timeout_secs`, not `stream_chunk_timeout_secs`. Raise `stream_chunk_timeout_secs` for upstreams that stream/arrive in slow trickles once they've started; raise `timeout_secs` for upstreams that are simply slow to begin responding (or that return one large buffered body).
+
 ---
 
 ## Anthropic extended thinking (issue #767)
