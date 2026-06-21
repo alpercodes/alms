@@ -46,7 +46,8 @@ async fn test_stream_llm_call_emits_token_deltas() {
     let request =
         CompletionRequest::new("test").with_messages(vec![LlmMessage::user("hello world")]);
 
-    let result = runtime.stream_llm_call(request).await.unwrap();
+    let emitted = std::sync::atomic::AtomicBool::new(false);
+    let result = runtime.stream_llm_call(request, &emitted).await.unwrap();
 
     // Content should be the reassembled mock response
     assert_eq!(result.content.as_deref(), Some("[mock] hello world"));
@@ -54,6 +55,12 @@ async fn test_stream_llm_call_emits_token_deltas() {
     assert!(result.tool_calls.is_none());
     // Mock stream doesn't emit reasoning_content
     assert!(result.reasoning.is_none());
+    // The stream emitted visible token deltas, so the emitted-flag is set
+    // (the buffered-fallback reset/re-emit reconciliation reads this).
+    assert!(
+        emitted.load(std::sync::atomic::Ordering::Relaxed),
+        "stream_llm_call must flag that it emitted token deltas"
+    );
 
     // Verify TokenDelta events were emitted (one per word chunk)
     let mut deltas = Vec::new();

@@ -351,6 +351,15 @@ pub async fn get_run_reasoning(
     // *minimum* terminal id, since the first terminal event is when the seal
     // landed; there is normally exactly one (#1046/#1052 gate the cancel-vs-
     // completion duplicate), so min == max in practice.
+    //
+    // #1162 sym-2: a `stream_reset` event is also a boundary. When the
+    // streaming attempt painted a partial of THIS turn and then faulted, the
+    // runtime emitted those `reasoning_delta`s (durable), fired a
+    // `stream_reset`, and re-emitted the buffered full reasoning as a fresh
+    // `reasoning_delta` after the reset. The abandoned partial deltas sit in
+    // the log at ids ≤ the reset id; folding the reset into the boundary drops
+    // them so this endpoint rehydrates only the re-emitted full reasoning —
+    // exactly what the live UI shows after handling the reset.
     let mut latest_turn_boundary: Option<u64> = None;
     let mut seal_event_id: Option<u64> = None;
     for ev in &events {
@@ -366,6 +375,25 @@ pub async fn get_run_reasoning(
                     .map(|s| s.min(ev.event_id))
                     .unwrap_or(ev.event_id),
             );
+            continue;
+        }
+        // A parent-agent `stream_reset` moves the boundary past the abandoned
+        // partial reasoning. Subagent resets are suppressed upstream (their
+        // deltas never reach the parent stream), but mirror the same
+        // `source_agent` filter here for symmetry with the tool-boundary pass.
+        if ev.event_type == "stream_reset" {
+            let is_subagent = ev
+                .data
+                .get("source_agent")
+                .map(|v| !v.is_null())
+                .unwrap_or(false);
+            if !is_subagent {
+                latest_turn_boundary = Some(
+                    latest_turn_boundary
+                        .map(|b| b.max(ev.event_id))
+                        .unwrap_or(ev.event_id),
+                );
+            }
             continue;
         }
         if ev.event_type != "tool_start" && ev.event_type != "tool_end" {

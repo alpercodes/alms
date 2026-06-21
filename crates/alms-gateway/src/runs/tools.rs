@@ -162,6 +162,21 @@ pub(super) async fn forward_runtime_events(
                     )
                     .await;
             }
+            // #1162 sym-2: the streaming attempt painted a partial, then
+            // faulted and fell back to a buffered `complete()`. Tell the UI to
+            // drop the run's partial before the buffered full text re-streams.
+            // Run-scoped and persisted (non-ephemeral) so the reasoning-
+            // rehydration endpoint can use it as a boundary; `send_event` also
+            // clears the in-memory visible-reply buffer on it.
+            RuntimeEvent::StreamReset { source_agent } => {
+                run_manager
+                    .send_event(
+                        run_id,
+                        session_id,
+                        SseEventData::stream_reset(run_id, source_agent),
+                    )
+                    .await;
+            }
             RuntimeEvent::ToolStart {
                 invocation_id,
                 tool,

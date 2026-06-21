@@ -69,6 +69,39 @@ pub enum RuntimeEvent {
         /// When set, this delta originated from a subagent's LLM stream.
         source_agent: Option<String>,
     },
+    /// The current LLM call abandoned its partial stream and is restarting as
+    /// a buffered (non-streaming) call — discard any partial text already
+    /// painted for this run.
+    ///
+    /// `call_llm_with_cancellation` attempts streaming first and falls back to
+    /// a fresh buffered `complete()` when the stream fails mid-flight (e.g.
+    /// minimax-m3 on OpenRouter, whose stream reliably faults — see #1162 /
+    /// #1163). By the time it falls back, any `TokenDelta` / `ReasoningDelta`
+    /// chunks emitted before the failure have already been forwarded to the UI
+    /// and painted as a *partial* live render. The buffered retry then returns
+    /// the **full** response, which is delivered separately (for DM runs as the
+    /// `dm_message` bubble), so the abandoned partial surfaced as the
+    /// cut-off-then-full duplicate (#1162 sym-2).
+    ///
+    /// This event is emitted **only** when the failed stream actually emitted
+    /// ≥1 delta, immediately before the buffered `content` / `reasoning` are
+    /// re-emitted as fresh `TokenDelta` / `ReasoningDelta`. The gateway
+    /// forwards it as a `stream_reset` SSE event and, unlike the ephemeral
+    /// `token_delta` it retracts, **persists** it to the run and session event
+    /// logs (it is not in `send_event`'s `is_ephemeral` set). Persistence is
+    /// load-bearing: it gives the reasoning-rehydration endpoint
+    /// (`get_run_reasoning`) a durable boundary to drop every same-run
+    /// `reasoning_delta` at or before it, so a mid-fallback reconnect
+    /// rehydrates only the re-emitted full reasoning. Live, the UI drops the
+    /// run's partial so the re-emitted full text rebuilds a single clean
+    /// render that matches reload (live === reload).
+    StreamReset {
+        /// When set, this reset originated from a subagent's LLM stream.
+        /// Mirrors the `source_agent` gating on `TokenDelta` / `ReasoningDelta`
+        /// so the UI suppresses subagent stream resets the same way it
+        /// suppresses subagent deltas.
+        source_agent: Option<String>,
+    },
     /// A status update indicating the current phase of the agent run.
     ///
     /// Emitted at key moments so the gateway can forward a `status` SSE event

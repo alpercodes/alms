@@ -210,6 +210,49 @@ fn finalize_content_and_reasoning(
     (Some(reasoning_content.clone()), Some(reasoning_content))
 }
 
+/// Build the live-reconciliation events for a buffered fallback (#1162 sym-2).
+///
+/// When `call_llm_with_cancellation`'s streaming attempt faults and falls back
+/// to a buffered `complete()`, any partial it already painted live must be
+/// reconciled against the buffered full response. This pure helper decides the
+/// event sequence the caller forwards:
+///
+/// - `emitted == false` (the failed stream painted nothing, or there is no
+///   event sender): return an empty vec — there is no partial to retract and a
+///   re-emit would just be a redundant stream of text no clean stream produced.
+/// - `emitted == true`: return `[StreamReset, ReasoningDelta?, TokenDelta?]` —
+///   retract the abandoned partial, then re-stream the buffered `reasoning`
+///   (collapsible) and `content` (visible reply) in the same order a clean
+///   stream emits them. Empty `content` / `reasoning` are omitted so we never
+///   emit a zero-length delta. The result is a single live render identical to
+///   what a non-faulting stream would have produced — matching reload exactly.
+///
+/// Kept pure (takes `&str`/`bool`, returns owned events) so the
+/// reset-and-re-emit contract is unit-testable without a failing-stream mock.
+fn buffered_fallback_reconcile_events(
+    emitted: bool,
+    content: Option<&str>,
+    reasoning: Option<&str>,
+) -> Vec<RuntimeEvent> {
+    if !emitted {
+        return Vec::new();
+    }
+    let mut events = vec![RuntimeEvent::StreamReset { source_agent: None }];
+    if let Some(text) = reasoning.filter(|t| !t.is_empty()) {
+        events.push(RuntimeEvent::ReasoningDelta {
+            text: text.to_string(),
+            source_agent: None,
+        });
+    }
+    if let Some(text) = content.filter(|t| !t.is_empty()) {
+        events.push(RuntimeEvent::TokenDelta {
+            delta: text.to_string(),
+            source_agent: None,
+        });
+    }
+    events
+}
+
 impl AgentRuntime {
     /// Main agent loop with tool execution
     #[instrument(
@@ -679,14 +722,21 @@ impl AgentRuntime {
     ) -> AlmsResult<StreamCallResult> {
         self.emit_status(PHASE_CALLING_LLM, None);
 
+        // Tracks whether the streaming attempt painted any partial text live
+        // (`TokenDelta` / `ReasoningDelta`) before it (possibly) faulted. Read
+        // only on the buffered-fallback path to decide whether the abandoned
+        // partial must be retracted before the buffered full response is
+        // re-emitted. See `stream_llm_call` and `RuntimeEvent::StreamReset`.
+        let emitted = std::sync::atomic::AtomicBool::new(false);
+
         // Try streaming first.
         let stream_result = if let Some(ref token) = self.cancel_token {
             tokio::select! {
-                result = self.stream_llm_call(request.clone()) => result,
+                result = self.stream_llm_call(request.clone(), &emitted) => result,
                 _ = token.cancelled() => return Err(AlmsError::Cancelled),
             }
         } else {
-            self.stream_llm_call(request.clone()).await
+            self.stream_llm_call(request.clone(), &emitted).await
         };
 
         match stream_result {
@@ -723,6 +773,33 @@ impl AgentRuntime {
                     choice.message.reasoning_content.unwrap_or_default(),
                     has_tool_calls,
                 );
+
+                // Reconcile the live render with the buffered result (#1162
+                // sym-2). The streaming attempt may have already painted a
+                // *partial* of the reply (minimax-m3 on OpenRouter emits a few
+                // chunks, then its stream faults — see #1163). The buffered
+                // retry returns the FULL response, delivered separately (for a
+                // DM run, as the `dm_message` bubble), so the abandoned partial
+                // would otherwise linger as the cut-off-then-full duplicate.
+                //
+                // `buffered_fallback_reconcile_events` decides the sequence:
+                // when (and only when) the failed stream emitted ≥1 delta, the
+                // UI is told to drop the run's partial (`StreamReset`) and the
+                // buffered `content` / `reasoning` are re-emitted as fresh
+                // deltas — making the fallback indistinguishable from a clean
+                // stream (a single live render that matches reload, the #1164
+                // invariant). When nothing was emitted the vec is empty and no
+                // delta was ever shown, so no spurious reset / re-stream fires.
+                if let Some(ref sender) = self.event_sender {
+                    for ev in buffered_fallback_reconcile_events(
+                        emitted.load(std::sync::atomic::Ordering::Relaxed),
+                        content.as_deref(),
+                        reasoning.as_deref(),
+                    ) {
+                        let _ = sender.send(ev);
+                    }
+                }
+
                 Ok(StreamCallResult {
                     content,
                     reasoning,
@@ -1519,9 +1596,18 @@ impl AgentRuntime {
     /// (default 60s). If the provider stalls mid-stream, the chunk-level
     /// timeout fires and propagates an error up through this method. User-
     /// initiated cancellation is handled separately in `call_llm_with_cancellation`.
+    /// `emitted` is set to `true` the first time this call forwards a visible
+    /// `TokenDelta` or `ReasoningDelta` to the UI. The caller
+    /// (`call_llm_with_cancellation`) reads it on the buffered-fallback path:
+    /// a stream that faulted *after* painting a partial must be retracted with
+    /// `RuntimeEvent::StreamReset` before the buffered full response is
+    /// re-emitted, otherwise the abandoned partial double-renders against the
+    /// buffered result (#1162 sym-2). A stream that faulted before emitting
+    /// anything needs no reset.
     pub(crate) async fn stream_llm_call(
         &self,
         request: CompletionRequest,
+        emitted: &std::sync::atomic::AtomicBool,
     ) -> AlmsResult<StreamCallResult> {
         use futures::StreamExt;
 
@@ -1603,6 +1689,7 @@ impl AgentRuntime {
             {
                 content.push_str(&text);
                 if let Some(ref sender) = self.event_sender {
+                    emitted.store(true, std::sync::atomic::Ordering::Relaxed);
                     let _ = sender.send(RuntimeEvent::TokenDelta {
                         delta: text,
                         source_agent: None,
@@ -1625,6 +1712,7 @@ impl AgentRuntime {
             {
                 reasoning_content.push_str(&text);
                 if let Some(ref sender) = self.event_sender {
+                    emitted.store(true, std::sync::atomic::Ordering::Relaxed);
                     let _ = sender.send(RuntimeEvent::ReasoningDelta {
                         text,
                         source_agent: None,
@@ -2398,5 +2486,76 @@ mod finalize_content_tests {
             finalize_content_and_reasoning(String::new(), String::new(), true);
         assert!(content.is_none());
         assert!(reasoning.is_none());
+    }
+}
+
+#[cfg(test)]
+mod buffered_fallback_reconcile_tests {
+    use super::buffered_fallback_reconcile_events;
+    use crate::events::RuntimeEvent;
+
+    /// The failed stream painted nothing (no delta emitted, or no event
+    /// sender): no reset and no re-emit — there is no partial to retract and a
+    /// re-stream would surface text a clean stream never did. (#1162 sym-2)
+    #[test]
+    fn no_emission_yields_no_events() {
+        let events =
+            buffered_fallback_reconcile_events(false, Some("Hello Alice!"), Some("thinking"));
+        assert!(
+            events.is_empty(),
+            "no partial was painted, so nothing must be retracted or re-emitted"
+        );
+    }
+
+    /// The classic minimax-m3 shape (#1162 sym-2): the stream emitted a
+    /// partial, then faulted; the buffered retry returns distinct visible
+    /// content AND a reasoning trace. The reconciliation is
+    /// `StreamReset` → `ReasoningDelta(full)` → `TokenDelta(full)` so the live
+    /// render is rebuilt exactly as a clean stream would have produced it
+    /// (reasoning into the collapsible first, then the visible reply).
+    #[test]
+    fn emission_with_content_and_reasoning_resets_then_reemits_in_order() {
+        let events =
+            buffered_fallback_reconcile_events(true, Some("Hello Alice!"), Some("pondering"));
+        assert_eq!(events.len(), 3, "reset + reasoning + content");
+        assert!(
+            matches!(events[0], RuntimeEvent::StreamReset { source_agent: None }),
+            "the partial is retracted first"
+        );
+        assert!(
+            matches!(&events[1], RuntimeEvent::ReasoningDelta { text, source_agent: None } if text == "pondering"),
+            "reasoning is re-emitted before content (collapsible first)"
+        );
+        assert!(
+            matches!(&events[2], RuntimeEvent::TokenDelta { delta, source_agent: None } if delta == "Hello Alice!"),
+            "the full visible reply is re-emitted last"
+        );
+    }
+
+    /// A reply-only buffered result (no reasoning trace): reset + the visible
+    /// reply, no empty `ReasoningDelta`.
+    #[test]
+    fn emission_with_content_only_resets_then_reemits_content() {
+        let events = buffered_fallback_reconcile_events(true, Some("just the reply"), None);
+        assert_eq!(events.len(), 2, "reset + content");
+        assert!(matches!(events[0], RuntimeEvent::StreamReset { .. }));
+        assert!(
+            matches!(&events[1], RuntimeEvent::TokenDelta { delta, .. } if delta == "just the reply")
+        );
+    }
+
+    /// Empty `content` / `reasoning` strings are never re-emitted as
+    /// zero-length deltas — only the reset fires. (A reasoning-as-response
+    /// promotion that the gateway folds without a `dm_message` still resets
+    /// the abandoned partial; it just has nothing to re-stream here.)
+    #[test]
+    fn empty_strings_emit_only_the_reset() {
+        let events = buffered_fallback_reconcile_events(true, Some(""), Some(""));
+        assert_eq!(events.len(), 1, "only the reset — no zero-length deltas");
+        assert!(matches!(events[0], RuntimeEvent::StreamReset { .. }));
+
+        let events_none = buffered_fallback_reconcile_events(true, None, None);
+        assert_eq!(events_none.len(), 1, "only the reset when both are None");
+        assert!(matches!(events_none[0], RuntimeEvent::StreamReset { .. }));
     }
 }

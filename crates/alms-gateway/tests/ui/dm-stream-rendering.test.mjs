@@ -682,6 +682,253 @@ test('#1157/#1162: two overlapping implicit-reply runs keep their replies out of
 });
 
 // ---------------------------------------------------------------------------
+// #1162 sym-2 (reopened): the cut-off-then-full duplicate that survived #1164.
+//
+// Root cause is BACKEND, not the #1164 frontend token-routing: a DM agent on
+// minimax-m3 via OpenRouter (the #1163 provider) streams a PARTIAL of its reply,
+// then its stream faults and the runtime falls back to a buffered `complete()`
+// that returns the FULL response. The abandoned partial was already painted
+// live (token_delta / reasoning_delta), and the buffered full text is delivered
+// separately — for a DM run as the `dm_message` bubble — so the partial lingered
+// as the cut-off copy in front of the full copy.
+//
+// The fix: when the faulted stream emitted ≥1 delta, the runtime emits a
+// `stream_reset` SSE (this run), then re-emits the buffered content/reasoning as
+// fresh deltas. The UI's `stream_reset` handler drops the run's partial so the
+// re-emit rebuilds a single clean render that matches reload (live === reload).
+//
+// These drive the REAL handlers through the minimax-shaped sequence and assert
+// the observable single render. They FAIL on pre-fix `develop`, where there is
+// no `stream_reset` handler: the partial is never retracted, so the reply
+// renders twice (partial + bubble).
+// ---------------------------------------------------------------------------
+
+/** Total visible reply text painted across all unsealed+sealed agent bubbles. */
+function allAgentBubbleText() {
+    return T.chatMessages.value
+        .filter(m => m.type === 'agent')
+        .map(m => m.text || '');
+}
+
+test('#1162 sym-2: stream_reset discards the streamed partial; the buffered reply renders ONCE (reasoning-as-reply, steady-state DM)', () => {
+    reset();
+    T.activeSession.value = { session_type: 'dm', participants: ['alice', 'bob'] };
+    T.dmParticipants.value = ['alice', 'bob'];
+    T.activeAgent.value = { name: 'alice' };
+    const es = openStream('dm-sess');
+
+    es.emit('dm_message', { message: 'hi bob', from_agent: 'alice', from_agent_id: 'a' });
+    es.emit('run_created', { run_id: 'R', source: 'peer:alice' });
+
+    // minimax-m3 streams a PARTIAL — here via reasoning_delta (its reasoning
+    // channel carries the answer) — then its stream faults mid-flight.
+    es.emit('reasoning_delta', { run_id: 'R', text: 'Hello ' });
+    es.emit('reasoning_delta', { run_id: 'R', text: 'Ali' });
+    // Pre-fix the partial 'Hello Ali' now sits in the live collapsible buffer.
+
+    // Runtime falls back to buffered `complete()`: retract the partial, then
+    // re-emit the FULL buffered response. Buffered minimax returns distinct
+    // content + a (shorter) reasoning trace, so a dm_message IS delivered.
+    es.emit('stream_reset', { run_id: 'R' });
+    es.emit('reasoning_delta', { run_id: 'R', text: 'Greeting the user.' });
+    es.emit('token_delta', { run_id: 'R', delta: 'Hello Alice!' });
+    es.emit('run_finished', { run_id: 'R' });
+    es.emit('dm_message', { message: 'Hello Alice!', from_agent: 'bob', from_agent_id: 'b' });
+
+    // The reply renders exactly once — as Bob's bubble.
+    const replies = bubblesWithText('Hello Alice!');
+    assert.equal(replies.length, 1, 'the reply renders exactly once (no cut-off-then-full)');
+    assert.equal(replies[0].fromAgent, 'bob');
+
+    // The abandoned partial 'Hello Ali' is gone from EVERY surface: no agent
+    // bubble carries it, and the sealed collapsible holds only the re-emitted
+    // reasoning (never the reply text).
+    assert.ok(
+        !allAgentBubbleText().some(t => t.includes('Hello Ali') && t !== 'Hello Alice!'),
+        'the streamed partial must not survive as a bubble',
+    );
+    const block = reasoningBlock('R');
+    assert.ok(block, 'a sealed reasoning block exists for the run');
+    assert.equal(block.thinkingText, 'Greeting the user.',
+        'the collapsible holds only the re-emitted reasoning, not the abandoned partial or the reply');
+    assert.ok(!block.thinkingText.includes('Hello Ali'),
+        'the abandoned partial reasoning was cleared on stream_reset');
+});
+
+test('#1162 sym-2: stream_reset clears the non-DM fallthrough partial bubble (unresolved-session attach race)', () => {
+    reset();
+    // The attach race: run_created/deltas arrive BEFORE activeSession resolves
+    // as 'dm', so isDmEvent is false and the partial falls through to a VISIBLE
+    // growing agent bubble — the worst-case cut-off partial. minimax then
+    // faults and falls back to buffered.
+    const es = openStream('dm-sess');
+
+    es.emit('run_created', { run_id: 'R', source: 'peer:alice' });
+    es.emit('reasoning_delta', { run_id: 'R', text: 'thinking ' });
+    es.emit('token_delta', { run_id: 'R', delta: 'Hello ' });
+    es.emit('token_delta', { run_id: 'R', delta: 'Ali' });
+    // Pre-fix: a visible unsealed bubble now reads 'Hello Ali' (the cut-off).
+
+    es.emit('stream_reset', { run_id: 'R' });
+    // The partial bubble must be gone after the reset.
+    assert.equal(
+        allAgentBubbleText().filter(t => t.length > 0).length, 0,
+        'stream_reset removes the abandoned non-DM partial bubble',
+    );
+
+    // Buffered full response re-streams, then the dm_message bubble lands.
+    es.emit('token_delta', { run_id: 'R', delta: 'Hello Alice!' });
+    es.emit('run_finished', { run_id: 'R' });
+    es.emit('dm_message', { message: 'Hello Alice!', from_agent: 'bob', from_agent_id: 'b' });
+
+    const replies = bubblesWithText('Hello Alice!');
+    assert.equal(replies.length, 1, 'the reply renders exactly once after the reset + re-emit');
+    assert.ok(
+        !allAgentBubbleText().some(t => t.includes('Hello Ali') && t !== 'Hello Alice!'),
+        'no cut-off partial bubble survives',
+    );
+});
+
+test('#1162 sym-2: a clean stream (no stream_reset) is unaffected — the fix is inert when there is no fallback', () => {
+    reset();
+    T.activeSession.value = { session_type: 'dm', participants: ['alice', 'bob'] };
+    T.dmParticipants.value = ['alice', 'bob'];
+    T.activeAgent.value = { name: 'alice' };
+    const es = openStream('dm-sess');
+
+    // The common path: the stream succeeds, no fallback, no stream_reset. The
+    // #1164 behaviour must be preserved exactly (reply once as the bubble,
+    // genuine reasoning in the collapsible).
+    es.emit('run_created', { run_id: 'R', source: 'peer:alice' });
+    es.emit('reasoning_delta', { run_id: 'R', text: 'Pondering.' });
+    es.emit('token_delta', { run_id: 'R', delta: 'Hi there!' });
+    es.emit('run_finished', { run_id: 'R' });
+    es.emit('dm_message', { message: 'Hi there!', from_agent: 'bob', from_agent_id: 'b' });
+
+    assert.equal(bubblesWithText('Hi there!').length, 1, 'reply once (no regression to #1164)');
+    const block = reasoningBlock('R');
+    assert.equal(block.thinkingText, 'Pondering.', 'genuine reasoning still in the collapsible');
+});
+
+// ---------------------------------------------------------------------------
+// #1162 (Codex P2 attach-race follow-up): a peer DM `run_created` arriving
+// BEFORE `activeSession` resolves must still create a `dm_reasoning` block.
+//
+// A peer DM `run_created` is ALWAYS `is_notification: true` AND carries
+// `source: "peer:<name>"` (notifications.rs `enqueue_triggered_run` for
+// `MessageSource::Agent`). In the documented attach race `activeSession` has not
+// resolved to a DM yet, so the bare `isDm` read in `run_created` was false and
+// the run fell to the `is_notification` arm — appending a bare `thinking`
+// (queuedBehind:0) row instead of a `dm_reasoning` block. Live `reasoning_delta`
+// (correctly bucketed by `isDmEvent` via the `peerRunIds` set) then had no block
+// to render into, and `run_finished` (which only SEALS an existing block) had
+// nothing to seal — so the run's reasoning was DROPPED live and only reappeared
+// on reload (history rebuilds the block from the persisted reasoning row). A
+// subagent/job notification run (also `is_notification: true`, but a NON-`peer:`
+// source) must keep its plain thinking indicator — the `peer:` prefix is the
+// discriminator.
+//
+// Pre-fix these reproduce the orphaned-thinking / dropped-reasoning window; the
+// fix routes the run through the DM block-creation path via `isPeerSource`.
+// ---------------------------------------------------------------------------
+
+/** The single live-or-sealed dm_reasoning block for a run, or undefined. */
+function thinkingRow(runId) {
+    return T.chatMessages.value.find(
+        m => m.type === 'thinking' && m.runId === runId,
+    );
+}
+
+test('#1162 attach race: a peer DM run_created with unresolved session creates a dm_reasoning block (not an orphan thinking row)', () => {
+    reset();
+    // activeSession is still null — the attach race: run_created (and its
+    // deltas) land before loadSession resolves the session as a DM.
+    T.activeSession.value = null;
+    const es = openStream('dm-sess');
+
+    // A peer DM run_created is ALWAYS is_notification:true with a peer: source.
+    es.emit('run_created', { run_id: 'R', source: 'peer:alice', is_notification: true });
+
+    // The block must exist immediately so live reasoning has somewhere to land.
+    const block = reasoningBlock('R');
+    assert.ok(block && block.isLive,
+        'a live dm_reasoning block is created even before activeSession resolves');
+    assert.equal(thinkingRow('R'), undefined,
+        'no bare thinking indicator is appended for a peer DM run (that was the orphan)');
+});
+
+test('#1162 attach race: live reasoning survives to the sealed block (was dropped pre-fix)', () => {
+    reset();
+    T.activeSession.value = null; // unresolved through the whole run
+    const es = openStream('dm-sess');
+
+    es.emit('run_created', { run_id: 'R', source: 'peer:alice', is_notification: true });
+    // Genuine extended-thinking trace streams while the session is unresolved.
+    es.emit('reasoning_delta', { run_id: 'R', text: 'Pondering the greeting.' });
+    es.emit('run_finished', { run_id: 'R' });
+    // The implicit reply lands as the dm_message bubble (separate row).
+    es.emit('dm_message', { message: 'Hello Alice!', from_agent: 'bob', from_agent_id: 'b' });
+
+    const block = reasoningBlock('R');
+    assert.ok(block, 'a sealed dm_reasoning block exists for the run');
+    assert.equal(block.isLive, false, 'the block is sealed on run end');
+    // THE KEY ASSERTION: pre-fix there was no block to seal, so this reasoning
+    // was dropped live (only a reload rebuilt it). Now it is preserved.
+    assert.equal(block.thinkingText, 'Pondering the greeting.',
+        'the run reasoning is sealed into the collapsible live, matching the reload render');
+    // And no orphan thinking row survives the run end.
+    assert.equal(thinkingRow('R'), undefined, 'no orphan thinking indicator lingers');
+    // The reply still renders exactly once as Bob's bubble.
+    assert.equal(bubblesWithText('Hello Alice!').length, 1, 'the reply renders once as the bubble');
+});
+
+test('#1162 attach race: a QUEUED peer DM run gets its block at run_started even if still unresolved', () => {
+    reset();
+    T.activeSession.value = null; // unresolved through run_created AND run_started
+    const es = openStream('dm-sess');
+
+    // Queued peer DM run: run_created appends only a thinking indicator (the
+    // C1 invariant — the block is deferred to run_started for queued runs).
+    es.emit('run_created', { run_id: 'R', source: 'peer:alice', is_notification: true, queued_behind: 1 });
+    assert.ok(thinkingRow('R'), 'a queued run shows a thinking indicator at run_created');
+    assert.equal(reasoningBlock('R'), undefined,
+        'a queued run does NOT get a dm_reasoning block at run_created (deferred to run_started)');
+
+    // run_started fires while activeSession is STILL unresolved. `run_started`
+    // carries no source, so it relies on `peerRunIds` (recorded by run_created)
+    // via the run_id-aware `isDmEvent` gate.
+    es.emit('run_started', { run_id: 'R' });
+    const block = reasoningBlock('R');
+    assert.ok(block && block.isLive,
+        'run_started creates the dm_reasoning block via peerRunIds even when activeSession is unresolved');
+    assert.equal(thinkingRow('R'), undefined,
+        'the queued thinking indicator is replaced by the block at run_started');
+
+    // Reasoning then lands in the block and seals correctly.
+    es.emit('reasoning_delta', { run_id: 'R', text: 'Thinking hard.' });
+    es.emit('run_finished', { run_id: 'R' });
+    es.emit('dm_message', { message: 'Done!', from_agent: 'bob', from_agent_id: 'b' });
+    const sealed = reasoningBlock('R');
+    assert.equal(sealed.thinkingText, 'Thinking hard.',
+        'the queued-run reasoning is preserved into the sealed block');
+});
+
+test('#1162 attach race guard: a non-peer notification run (subagent completion) still shows a plain thinking indicator', () => {
+    reset();
+    // A subagent-completion notification run: is_notification:true but the
+    // source is NOT a peer: DM. This must NOT be misrouted into a DM block.
+    T.activeSession.value = { session_type: 'chat' };
+    const es = openStream('chat-sess');
+
+    es.emit('run_created', { run_id: 'N', source: 'subagent', is_notification: true });
+
+    assert.ok(thinkingRow('N'),
+        'a non-peer notification run still appends a plain thinking indicator');
+    assert.equal(reasoningBlock('N'), undefined,
+        'no dm_reasoning block is fabricated for a non-peer notification run');
+});
+
+// ---------------------------------------------------------------------------
 // #1157/#1162 reconnect carry-over (Codex P2 #2 / Tim Suggestion 1).
 //
 // The #1157 fix routes visible DM `token_delta` into the per-run

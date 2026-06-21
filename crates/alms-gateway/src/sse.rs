@@ -139,6 +139,29 @@ impl SseEventData {
         )
     }
 
+    /// The run's LLM call abandoned its partial stream and is restarting as a
+    /// buffered (non-streaming) call — the client must discard any partial
+    /// `token_delta` / `reasoning_delta` text already painted for this run, so
+    /// the re-emitted full text rebuilds a single clean render (#1162 sym-2).
+    ///
+    /// Run-scoped and **persisted** (non-ephemeral): `reasoning_delta` events
+    /// are themselves durable, so the abandoned partial reasoning sits in the
+    /// per-session event log too. Persisting the reset gives the reasoning-
+    /// rehydration endpoint (`get_run_reasoning`) a durable boundary to drop
+    /// every same-run `reasoning_delta` at or before it, mirroring the live
+    /// UI's reset so a mid-fallback reconnect rehydrates only the re-emitted
+    /// full reasoning. (Visible `token_delta` is ephemeral and rehydrated from
+    /// the in-memory `RunTextBuffer`, which `send_event` clears on this event.)
+    pub fn stream_reset(run_id: RunId, source_agent: Option<String>) -> Self {
+        Self::new(
+            "stream_reset",
+            StreamResetData {
+                run_id: run_id.0.to_string(),
+                source_agent,
+            },
+        )
+    }
+
     pub fn tool_start(
         run_id: RunId,
         tool_invocation_id: ToolInvocationId,
@@ -790,6 +813,15 @@ struct ReasoningDeltaData {
     /// Reasoning text chunk. The UI is expected to concatenate successive
     /// chunks into a single collapsible block per assistant turn.
     text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_agent: Option<String>,
+}
+
+/// Wire payload for a `stream_reset` SSE event — the run's streamed partial is
+/// being retracted before the buffered full response re-streams (#1162 sym-2).
+#[derive(Debug, Serialize)]
+struct StreamResetData {
+    run_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     source_agent: Option<String>,
 }

@@ -1615,6 +1615,22 @@ async fn run_agent_loop(
                     // which is confusing. The user doesn't need to know that a
                     // subagent is "building context" or "calling LLM".
                     RuntimeEvent::Status { .. } => continue,
+                    // Suppress subagent stream resets. A `StreamReset` retracts
+                    // the *partial* a stream painted before falling back to
+                    // buffered (#1162 sym-2). A subagent's own `TokenDelta` /
+                    // `ReasoningDelta` are forwarded to the parent's stream
+                    // tagged with `source_agent`, where the UI suppresses them
+                    // (subagent interleaving is hidden) — so nothing of the
+                    // subagent's partial was ever painted on the parent stream,
+                    // and there is no partial to retract here. Reload safety is
+                    // covered the same way: `get_run_reasoning` filters every
+                    // `source_agent`-tagged `reasoning_delta` out of rehydration
+                    // (mirroring the UI), so the subagent's abandoned partial is
+                    // never surfaced on the parent run and needs no reset
+                    // boundary on this stream. (`sub_rx` from this subagent
+                    // channel is consumed only by this parent-forwarding task,
+                    // never by the gateway's `forward_runtime_events`.)
+                    RuntimeEvent::StreamReset { .. } => continue,
                     // ApprovalRequired cannot be forwarded through EventForwarder
                     // (it requires a oneshot channel).  Background subagents
                     // should already have Guarded overridden to Autonomous, so

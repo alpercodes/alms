@@ -658,6 +658,20 @@ impl RunManager {
                 // prior turn; drop the buffer so the next turn starts clean.
                 self.run_text_buffers.remove(&run_id);
             }
+        } else if event.event_type == "stream_reset" {
+            let is_subagent = event
+                .data
+                .get("source_agent")
+                .map(|v| !v.is_null())
+                .unwrap_or(false);
+            if !is_subagent {
+                // #1162 sym-2: the partial accumulated here belongs to the
+                // abandoned stream. Drop it so a user switching into the
+                // session mid-fallback does not rehydrate the stale partial —
+                // the re-emitted full `token_delta` that follows re-accumulates
+                // the correct text from scratch (mirrors the live UI reset).
+                self.run_text_buffers.remove(&run_id);
+            }
         }
 
         if let Some(mut senders) = self.event_senders.get_mut(&run_id) {
