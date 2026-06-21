@@ -6,6 +6,13 @@ import { SUBAGENT_PREVIEW_LEN, TOOL_SUMMARY_LEN } from '../../utils/constants.js
 function SubagentPanel({ name, info, onClose }) {
     const icon = info.status === 'done' ? '\u2713' : info.status === 'fail' ? '\u2717' : null;
     const label = info.displayName || name;
+    // Live in-flight reasoning teed from the parent stream (#1149). Only shown
+    // while the subagent is still running \u2014 once it completes the panel reflects
+    // its final tool list, and the full thinking trace is on "View session".
+    const liveActivity = (info.status === 'running' && info.liveActivity) || '';
+    // Show "Waiting for activity..." only when nothing at all has streamed yet \u2014
+    // neither a tool nor any live reasoning.
+    const hasActivity = info.tools.length > 0 || !!liveActivity;
 
     const onViewSession = (e) => {
         e.stopPropagation();
@@ -24,8 +31,14 @@ function SubagentPanel({ name, info, onClose }) {
                 `}
                 <button class="sa-panel-close" onClick=${onClose}>\u00d7</button>
             </div>
+            ${liveActivity && html`
+                <div class="sa-panel-thinking">
+                    <span class="tc-spinner"></span>
+                    <span class="sa-panel-thinking-text">${liveActivity}</span>
+                </div>
+            `}
             <div class="sa-panel-tools">
-                ${info.tools.length === 0
+                ${!hasActivity
                     ? html`<div class="sa-panel-empty">Waiting for activity...</div>`
                     : info.tools.map(t => {
                         const summary = toolSummary(t.tool, t.params);
@@ -61,9 +74,13 @@ export function SubagentBar() {
                 const icon = info.status === 'done' ? '\u2713' : '\u2717';
                 const toolCount = info.tools.length;
                 const lastTool = info.tools[info.tools.length - 1];
+                // Chip activity label: a currently-running tool takes priority;
+                // otherwise, while the subagent is thinking with no tool in
+                // flight, show "thinking\u2026" so the chip reflects live progress
+                // (#1149) instead of looking idle until the next tool starts.
                 const activity = lastTool && lastTool.status === 'running'
                     ? lastTool.tool
-                    : '';
+                    : (isRunning && info.liveActivity ? 'thinking\u2026' : '');
                 const label = info.displayName || name;
 
                 return html`

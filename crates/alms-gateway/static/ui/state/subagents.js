@@ -3,7 +3,7 @@ import { activeSessionId } from './sessions.js';
 
 /**
  * Active subagents and their tool activity.
- * Shape: { [key]: { status, tools, task, toolInvocationId, displayName, startedAt, sessionId } }
+ * Shape: { [key]: { status, tools, task, toolInvocationId, displayName, startedAt, sessionId, liveActivity } }
  *
  * Keys are unique identifiers for each subagent invocation:
  *   - Named subagents use the agent name as the key (e.g. "reviewer").
@@ -23,8 +23,30 @@ import { activeSessionId } from './sessions.js';
  * `sessionId` is the subagent's session UUID, populated from the
  * invoke_agent result or the subagent_completed event. Used for
  * drill-down navigation ("View session").
+ *
+ * `liveActivity` is a bounded tail of the subagent's in-flight reasoning /
+ * extended-thinking text (#1149). The parent's session stream forwards a
+ * running subagent's `reasoning_delta` events tagged with `source_agent`;
+ * `use-session-stream.js` suppresses those from the PARENT's main chat /
+ * reasoning view (so subagent thinking never leaks into the parent run —
+ * the #1170 / `get_run_reasoning` invariant) but tees them HERE via
+ * `trackSubagentReasoning` so the SubagentBar panel can show what the
+ * subagent is thinking in real time instead of sitting on "Waiting for
+ * activity..." until the subagent finishes. Bounded to the most recent
+ * `LIVE_ACTIVITY_MAX_CHARS` characters so a long thinking trace can't grow
+ * the entry without bound.
  */
 export const activeSubagents = signal({});
+
+/**
+ * Max characters of subagent live-reasoning tail retained on a panel entry's
+ * `liveActivity` field (#1149). The panel surfaces the agent's CURRENT
+ * thinking, not its full transcript (that lives on the subagent's own session,
+ * reachable via "View session"), so only the most recent slice is kept. This
+ * also bounds memory for a long-running subagent whose reasoning stream never
+ * stops.
+ */
+const LIVE_ACTIVITY_MAX_CHARS = 2000;
 
 /**
  * When viewing a subagent session, stores the parent session ID so the
@@ -128,6 +150,7 @@ export function trackSubagentStart(name, task, toolInvocationId) {
             displayName: name,
             startedAt: Date.now(),
             sessionId: null,
+            liveActivity: '',
         },
     };
 }
@@ -178,6 +201,86 @@ export function trackSubagentTool(name, tool) {
     activeSubagents.value = {
         ...activeSubagents.value,
         [name]: { ...current, tools },
+    };
+}
+
+/**
+ * Resolve a forwarded `source_agent` label to a live `activeSubagents` entry,
+ * migrating the entry key when the backend label differs from the start-time
+ * key (#1149).
+ *
+ * Mirrors the key-resolution in `trackSubagentTool`: a forwarded subagent
+ * event is labelled with the backend `source_agent`. For NAMED subagents that
+ * equals the entry key directly. For UNNAMED subagents the entry was
+ * registered under `subagent-{toolInvocationId_prefix}` at `tool_start` time
+ * but the backend labels forwarded events with `subagent-{task_id_prefix}` (a
+ * different id), so we fall back to the first running unnamed entry and migrate
+ * it to the backend-assigned key (and its pending removal timer) so subsequent
+ * forwarded events for the same subagent match directly.
+ *
+ * Returns the resolved key, or `null` when no matching entry exists (e.g. the
+ * subagent already completed and its chip was auto-removed). The caller treats
+ * a `null` result as a no-op — a late forwarded delta for a gone subagent must
+ * never resurrect a removed chip.
+ *
+ * @param {string} name - The backend `source_agent` label.
+ * @returns {string|null} the resolved (possibly migrated) entry key.
+ */
+function resolveForwardedSubagentKey(name) {
+    if (activeSubagents.value[name]) return name;
+    if (name.startsWith('subagent-')) {
+        for (const [key, info] of Object.entries(activeSubagents.value)) {
+            if (key.startsWith('subagent-') && info.status === 'running') {
+                // Migrate the entry to the backend-assigned key so future
+                // forwarded events match directly.
+                const { [key]: entry, ...rest } = activeSubagents.value;
+                activeSubagents.value = { ...rest, [name]: entry };
+                if (removeTimers[key]) {
+                    clearTimeout(removeTimers[key]);
+                    delete removeTimers[key];
+                }
+                return name;
+            }
+        }
+    }
+    return null;
+}
+
+/**
+ * Append a chunk of a subagent's in-flight reasoning / extended-thinking text
+ * to its panel entry's `liveActivity` tail (#1149).
+ *
+ * The parent's session SSE stream forwards a running subagent's
+ * `reasoning_delta` events tagged with `source_agent`. `use-session-stream.js`
+ * suppresses those from the PARENT's main chat / reasoning view (subagent
+ * reasoning must never leak into the parent run's reasoning trace — the #1170 /
+ * `get_run_reasoning` invariant) and instead tees them here so the SubagentBar
+ * panel can render the subagent's live thinking rather than sitting on
+ * "Waiting for activity..." until completion.
+ *
+ * Only the most recent `LIVE_ACTIVITY_MAX_CHARS` characters are retained: the
+ * panel shows the subagent's CURRENT thinking, and the full transcript is
+ * available via "View session". Keying / migration matches `trackSubagentTool`
+ * so forwarded events from unnamed subagents (whose backend label differs from
+ * the start-time key) land on the right entry. A delta for an unknown / removed
+ * subagent is dropped (no chip is resurrected).
+ *
+ * @param {string} name - The backend `source_agent` label for the subagent.
+ * @param {string} delta - The reasoning text chunk to append.
+ */
+export function trackSubagentReasoning(name, delta) {
+    if (!delta) return;
+    const key = resolveForwardedSubagentKey(name);
+    if (!key) return;
+    const current = activeSubagents.value[key];
+    if (!current) return;
+    let next = (current.liveActivity || '') + delta;
+    if (next.length > LIVE_ACTIVITY_MAX_CHARS) {
+        next = next.slice(next.length - LIVE_ACTIVITY_MAX_CHARS);
+    }
+    activeSubagents.value = {
+        ...activeSubagents.value,
+        [key]: { ...current, liveActivity: next },
     };
 }
 
@@ -736,6 +839,7 @@ export function rehydrateSubagentsFromHistory(messages) {
             displayName: name,
             startedAt,
             sessionId: subagentSessionId,
+            liveActivity: '',
         };
     }
 

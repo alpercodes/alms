@@ -92,6 +92,24 @@
 .sa-panel-view-btn:hover {
   background: var(--info-muted);
 }
+/* Live in-flight subagent reasoning teed from the parent stream (#1149). */
+.sa-panel-thinking {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-3);
+  border-bottom: 1px solid var(--border-subtle);
+  font-size: var(--text-2xs);
+  color: var(--text-muted);
+  font-style: italic;
+}
+.sa-panel-thinking-text {
+  flex: 1;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 96px;
+  overflow-y: auto;
+}
 .sa-panel-tools { padding: var(--space-1) 0; }
 .sa-panel-empty {
   color: var(--text-disabled);

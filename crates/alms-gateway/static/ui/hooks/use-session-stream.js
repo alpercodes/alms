@@ -32,7 +32,7 @@ import { batch, signal } from '../deps.js';
 import { chatMessages, nextMsgId } from '../state/chat.js';
 import { appendMessage, updateMessage, filterMessages, transformMessages } from '../state/chat-actions.js';
 import { activeRunId, bumpRunListGeneration } from '../state/runs.js';
-import { trackSubagentStart, trackSubagentEnd, trackSubagentTool, findSubagentByToolInvocationId, findSubagentBySessionId, setSubagentSessionId, activeSubagents } from '../state/subagents.js';
+import { trackSubagentStart, trackSubagentEnd, trackSubagentTool, trackSubagentReasoning, findSubagentByToolInvocationId, findSubagentBySessionId, setSubagentSessionId, activeSubagents } from '../state/subagents.js';
 import { agentPhase, setAgentPhase, clearAgentPhase, setDmContext, revertPhase, dmPeer } from '../state/agent-status.js';
 import { messageQueue } from '../state/queue.js';
 import { activeSessionId, activeSession, dmParticipants } from '../state/sessions.js';
@@ -956,7 +956,19 @@ export function openSessionStream(sessionId, opts) {
     // live agent message so `ReasoningPanel` can render it collapsed.
     on('reasoning_delta', (e) => {
         const data = JSON.parse(e.data);
-        if (data.source_agent) return; // subagent reasoning is suppressed
+        if (data.source_agent) {
+            // Subagent reasoning is suppressed from the PARENT's main chat /
+            // reasoning view — it must never leak into the parent run's
+            // reasoning trace (the #1170 / `get_run_reasoning` invariant) or
+            // interleave into the parent's collapsible. But the operator still
+            // wants to watch a running subagent think (#1149), so tee the delta
+            // into that subagent's SubagentBar panel entry (`liveActivity`)
+            // before returning. This is purely additive panel state; nothing
+            // below this guard ever sees a subagent-tagged delta, so the parent
+            // rendering is unchanged.
+            trackSubagentReasoning(data.source_agent, data.text || '');
+            return;
+        }
         const delta = data.text || '';
         if (!delta) return;
         // S3 (#1154): gate via `isDmEvent` (run_id-aware) for the same
