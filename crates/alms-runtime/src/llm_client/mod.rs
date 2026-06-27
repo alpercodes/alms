@@ -1006,6 +1006,15 @@ impl LlmClient {
         &self.config.default_model
     }
 
+    /// The per-chunk body-read inactivity timeout (seconds) this client
+    /// enforces on the response body (#1163/#1169). Exposed so the agent
+    /// loop can derive the P0 ("awaiting first activity") inactivity budget
+    /// of the phase-aware run timer from it (#1150) — keeping that budget in
+    /// lockstep with the LLM idle timeout instead of hardcoding a constant.
+    pub fn stream_chunk_timeout_secs(&self) -> u64 {
+        self.config.stream_chunk_timeout_secs
+    }
+
     /// Borrow the `[llm.providers]` snapshot the client carries.
     ///
     /// The map is the same one consulted by [`Self::provider_kind`] and

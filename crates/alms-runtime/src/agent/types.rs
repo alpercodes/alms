@@ -91,13 +91,34 @@ pub struct AgentConfig {
     /// [`alms_core::config::LlmConfig::max_iterations`] by the gateway's
     /// `AgentConfig` assembly and inherited by subagents.
     pub max_iterations: u32,
-    /// Hard cap on the wall-clock duration of a single run, in seconds
-    /// (#987 / B3). `0` disables the cap. Checked between loop iterations.
+    /// Absolute wall-clock backstop on a single run, in seconds (#987 / B3,
+    /// repurposed in #1150). `0` disables it. Checked between loop iterations
+    /// alongside the phase-aware inactivity check.
     ///
-    /// Populated from
+    /// Since #1150 this is only the coarse backstop — the primary guard is
+    /// inactivity ([`Self::between_iterations_secs`] /
+    /// [`Self::tool_phase_ceiling_secs`]). A productive run that keeps making
+    /// progress is never clipped by inactivity, so this catches only a run
+    /// wedged in a forever-pinging loop. Populated from
     /// [`alms_core::config::LlmConfig::max_run_duration_secs`] by the
     /// gateway's `AgentConfig` assembly and inherited by subagents.
     pub max_run_duration_secs: u64,
+    /// Inactivity budget (seconds) for the between-iterations phase — the P1
+    /// budget of the phase-aware run timer (#1150). `0` disables it. Reset on
+    /// every progress signal and evaluated at the top-of-loop checkpoint.
+    ///
+    /// Populated from
+    /// [`alms_core::config::LlmConfig::between_iterations_secs`] by the
+    /// gateway's `AgentConfig` assembly and inherited by subagents.
+    pub between_iterations_secs: u64,
+    /// Coarse ceiling (seconds) on the tool-execution phase — the P3 budget
+    /// of the phase-aware run timer (#1150). `0` disables it. Reset at
+    /// tool-batch start and evaluated at the next top-of-loop checkpoint.
+    ///
+    /// Populated from
+    /// [`alms_core::config::LlmConfig::tool_phase_ceiling_secs`] by the
+    /// gateway's `AgentConfig` assembly and inherited by subagents.
+    pub tool_phase_ceiling_secs: u64,
     /// Context window management config
     pub context_config: ContextConfig,
     /// Execution posture (full_control, guarded, or autonomous)
@@ -208,12 +229,15 @@ impl Default for AgentConfig {
             // `alms-core` so the config crate's #919 token-budget
             // validator can reuse the same default at load time.
             max_tokens: DEFAULT_AGENT_MAX_TOKENS,
-            // Mirror `LlmConfig::default()` (#987 / B3 / #1160): generous
-            // iteration ceiling + 4-hour wall-clock cap, sized for all run
-            // types. The gateway overwrites these from `[llm]` during
-            // `AgentConfig` assembly.
+            // Mirror `LlmConfig::default()` (#987 / B3 / #1160 / #1150):
+            // generous iteration ceiling, 24-hour absolute backstop, and the
+            // phase-aware inactivity budgets (P1 = 3 min, P3 = 15 min). The
+            // gateway overwrites these from `[llm]` during `AgentConfig`
+            // assembly.
             max_iterations: 500,
-            max_run_duration_secs: 14400,
+            max_run_duration_secs: 86400,
+            between_iterations_secs: 180,
+            tool_phase_ceiling_secs: 900,
             context_config: ContextConfig::default(),
             posture: Posture::default(),
             sandbox_root: ".".into(),

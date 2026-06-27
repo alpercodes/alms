@@ -75,26 +75,47 @@ Small, deterministic transforms applied to the outgoing request body — cheaper
 
 ---
 
-## Agent-loop hard caps (issue #987)
+## Agent-loop hard caps (issues #987, #1150)
 
-Two `[llm]` knobs bound a **single agent run** so a run that keeps calling tools without ever producing a final reply terminates instead of hanging forever:
+A handful of `[llm]` knobs bound a **single agent run** so a run that keeps calling tools without ever producing a final reply terminates instead of hanging forever:
 
 ```toml
 [llm]
-max_iterations        = 500    # default 500; 0 = disabled (no limit)
-max_run_duration_secs = 14400  # default 14400 (4 hours); 0 = disabled (no limit)
+max_iterations         = 500    # default 500;   0 = disabled (no limit)
+between_iterations_secs = 180   # default 180;   0 = disabled (P1 inactivity budget)
+tool_phase_ceiling_secs = 900   # default 900;   0 = disabled (P3 tool-batch ceiling)
+max_run_duration_secs  = 86400  # default 86400 (24h); 0 = disabled (absolute backstop)
 ```
 
 | Knob | Default | Bounds |
 |---|---|---|
 | `max_iterations` | `500` | The number of LLM-call iterations a run may take. One iteration is one LLM call plus the tool batch it requests, so this caps the step count. |
-| `max_run_duration_secs` | `14400` | The wall-clock duration of a run, in seconds (default 4 hours). Checked between iterations; an in-flight LLM/tool step is bounded by its own per-step timeout (`timeout_secs` / `stream_chunk_timeout_secs`), so the effective ceiling is this value plus at most one step. |
+| `between_iterations_secs` | `180` | **P1 inactivity budget** — how long a run may go without any progress signal while resting between iterations before it is terminated as *stalled*. Reset on every progress signal. |
+| `tool_phase_ceiling_secs` | `900` | **P3 tool-phase ceiling** — a coarse backstop on how long a single tool batch may run. Reset at tool-batch start and evaluated at the next checkpoint. Set *above* the longest single-tool timeout (the `shell` tool's 600s `MAX_TIMEOUT_SECS`), not equal to it — a 600s ceiling would false-stall a `shell` command run to its own 600s cap (the batch completes, then the next checkpoint sees `idle == ceiling`). The 5-minute margin keeps it clear of every per-tool timeout (`http_get` ≈ 30s, background `shell` ≈ 5s; `fs_*` untimed, tracked in #1173). **A batch that blocks on a foreground `invoke_agent` or on human approval is exempt** — bounded instead by the subagent's own inherited phase timer / the human, so this ceiling never applies (see P3b / P3c below). |
+| `max_run_duration_secs` | `86400` | **Absolute wall-clock backstop**, in seconds (default 24h). Inactivity (above) is the primary guard now; this only catches a run that pings activity forever (a bug). Checked between iterations alongside the inactivity check. |
 
-**These caps default ON and apply to every run type** — web chat, cron jobs, and subagents (the value is inherited verbatim by subagents) — not just DMs. This is an operator-facing behaviour change: after upgrading, a deployment that previously ran unbounded will now end any run that exceeds 500 LLM calls or 4 hours of wall-clock time as `failed`. A scheduled job that legitimately runs longer than 4 hours, or a deep autonomous turn exceeding 500 LLM calls, must raise (or disable) the relevant cap. When a cap trips on a peer-triggered DM run the gateway's DM completion gate converts the failure into an `Errored` conversation end, so the peer is notified rather than stranded.
+### Phase-aware inactivity model (#1150)
 
-Set either knob to **`0` to disable that cap** (no limit) — the escape hatch for workloads that genuinely need unbounded runs.
+Before #1150, `max_run_duration_secs` was a **flat wall-clock cap** (default 4h): a run that made slow-but-real forward progress was clipped the moment total elapsed time hit the cap. #1150 replaces that with a **progress-aware** primary guard. The loop tracks the time since the run last made *progress* — a streamed token / reasoning delta, an LLM response, or a tool start — and at each between-iterations checkpoint terminates the run if that idle time exceeds the budget for the **phase** the run is in:
 
-Both knobs are **config-file-only**: they are read at gateway startup and are **not mutable via `PATCH /settings`** (and have no `ALMS_*` env-var override). Edit `alms.toml` and restart the gateway to change them.
+| Phase | When | Budget |
+|---|---|---|
+| **P0** awaiting first activity | iteration 1, before the run has produced anything | *derived*: `stream_chunk_timeout_secs + 30s` (≈90s with defaults) — not a knob, so it tracks the LLM idle timeout. A first LLM call that hangs *before* its first byte is bounded by the per-request HTTP guards (`timeout_secs` / `stream_chunk_timeout_secs`), not this check. |
+| **P1** between iterations | resting between iterations | `between_iterations_secs` |
+| **P2** mid-LLM-call | a streamed response is arriving | *no independent timer* — every token / reasoning delta resets the activity clock, so a long-but-productive stream is never clipped. A stream that **stalls** (no chunk for `stream_chunk_timeout_secs`) is faulted by the per-chunk body-read guard (#1169) instead. |
+| **P3** executing a tool batch | a tool batch is running | `tool_phase_ceiling_secs` |
+| **P3b** blocking foreground `invoke_agent` | the batch runs a foreground subagent | *unbounded* — the parent blocks on the subagent for its whole runtime with no progress signal reaching the parent's activity clock, so the P3 ceiling would otherwise kill the *parent* the moment a productive long subagent returns. The subagent governs itself via the same in-loop phase timer it inherits (a hung one self-terminates and returns an error to the parent); the parent's absolute `max_run_duration_secs` backstop still applies. A *background* `invoke_agent` returns immediately and stays in P3. |
+| **P3c** awaiting human approval | a Guarded-posture batch is blocked on a tool that routes through the human-approval gate | *unbounded* — in **Guarded** posture (the default for user-triggered interactive runs) a tool that is not auto-approved blocks the run until the human approves or denies. A human who takes longer than the P3 ceiling to approve must not be read as a stall, so an approval-gated batch is exempt — the same class of fix as P3b. The absolute `max_run_duration_secs` backstop (24h) still bounds a truly-abandoned approval. A batch of only auto-approved tools, or any FullControl / Autonomous run (no approval gate), stays in P3. |
+
+The net effect: a long but **productive** run (steady tokens, or back-to-back tool calls that each make progress) is **never** terminated by this timer, however long it runs — only a genuinely *stalled* run (no progress for the phase budget) trips. A stalled run surfaces a distinct session-history label, **"Agent stopped after stalling (no activity)"**, separate from the iteration-limit and time-limit labels. This is a minimal, watchdog-free implementation: the check runs only *between* iterations, so the terminating tool/LLM step finishes first and the run is ended at the following checkpoint — there is no mid-step interruption.
+
+**These caps default ON and apply to every run type** — web chat, cron jobs, and subagents (each value is inherited verbatim by subagents) — not just DMs. A subagent is now bounded by this same in-loop phase timer (plus `max_iterations`); the coordinator's old 5-minute (300s) wall-clock subagent kill — which killed legitimately long subagents mid-work — was **removed** in #1150. When any cap trips on a peer-triggered DM run the gateway's DM completion gate converts the failure into an `Errored` conversation end, so the peer is notified rather than stranded.
+
+**Upgrade impact:** after upgrading, a deployment that previously ran unbounded will end any run that exceeds 500 LLM calls, stalls past a phase budget, or runs 24h of wall-clock as `failed`. The headline change versus pre-#1150 is that the run-duration guard is now **inactivity-based** rather than flat wall-clock, and the absolute backstop default was raised from 4h to 24h — so a legitimate long-running scheduled job that makes steady progress is no longer clipped at 4h. A deep autonomous turn exceeding 500 LLM calls must still raise (or disable) `max_iterations`.
+
+Set any knob to **`0` to disable that cap/budget** (no limit) — the escape hatch for workloads that genuinely need unbounded runs (or an unbounded single phase).
+
+All four knobs are **config-file-only**: they are read at gateway startup and are **not mutable via `PATCH /settings`** (and have no `ALMS_*` env-var override). Edit `alms.toml` and restart the gateway to change them.
 
 ### Per-step LLM timeouts (issue #1163)
 

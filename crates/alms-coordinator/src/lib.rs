@@ -14,10 +14,18 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::Duration;
 
-/// How long (in seconds) a subagent is allowed to run before it times out,
-/// and also how long its result is kept in memory after completion so that
-/// the completion notification system can process it.
-const SUBAGENT_TTL_SECS: u64 = 300;
+/// How long (in seconds) a subagent's result is kept in memory after the run
+/// completes so the completion-notification system can poll it (background
+/// dispatch) before the handle is reaped.
+///
+/// This is purely a post-completion retention window. It used to be the same
+/// `SUBAGENT_TTL_SECS` constant that *also* served as a hard 5-minute
+/// wall-clock kill on an actively-running subagent — but that overloaded
+/// timer killed legitimately long subagents mid-work (#1150). The run-kill
+/// arm was removed in #1150; a subagent now terminates via the
+/// inherited in-loop phase-aware inactivity timer (#1150) + `max_iterations`,
+/// or via cancellation. Only this retention concern remains here.
+const RESULT_RETENTION_SECS: u64 = 300;
 
 /// Max characters in a completion notification summary.
 const NOTIFICATION_SUMMARY_MAX_CHARS: usize = 800;
@@ -47,7 +55,6 @@ impl Default for TaskId {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SubagentRequest {
     pub task: String,
-    pub timeout: Duration,
     pub parent_session: SessionId,
     /// The parent agent's persistent ID. Named subagent sessions are keyed
     /// on `(parent_agent_id, name)` so the same named subagent resolves to
@@ -333,10 +340,7 @@ impl Coordinator {
     #[instrument(
         level = "info",
         skip(self, request, parent_event_tx),
-        fields(
-            parent_session = %request.parent_session.0,
-            timeout_secs = %request.timeout.as_secs(),
-        )
+        fields(parent_session = %request.parent_session.0)
     )]
     pub async fn spawn_subagent(
         &self,
@@ -555,7 +559,6 @@ impl SubagentDispatcher for Coordinator {
     ) -> AlmsResult<(String, SessionId)> {
         let request = SubagentRequest {
             task,
-            timeout: Duration::from_secs(SUBAGENT_TTL_SECS),
             parent_session: parent_session_id,
             parent_agent_id,
             parent_run_id,
@@ -639,7 +642,6 @@ impl SubagentDispatcher for Coordinator {
     ) -> alms_core::AlmsResult<(Uuid, SessionId)> {
         let request = SubagentRequest {
             task,
-            timeout: Duration::from_secs(SUBAGENT_TTL_SECS),
             parent_session: parent_session_id,
             parent_agent_id,
             parent_run_id,
@@ -800,21 +802,21 @@ async fn run_subagent(
     // TaskResult / completion notification), and optionally the full
     // RunOutput so we can record accurate token usage in the run record.
     //
-    // #920: also returns the structured `AlmsError` (when the agent loop
-    // produced one) so the caller can forward it down the typed-error
-    // oneshot. Timeouts and cancellations have no underlying `AlmsError`
-    // and use `None` here — `dispatch()` falls back to the JSON path
-    // for those, exactly as before.
+    // #1150: the implicit 5-minute wall-clock kill arm
+    // (`tokio::time::sleep(request.timeout)`) was removed. It killed
+    // legitimately long subagents mid-work — especially during reasoning
+    // phases — with a generic `Timeout`. A subagent now terminates the same
+    // way a top-level run does: via the inherited in-loop phase-aware
+    // inactivity timer (#1150) + `max_iterations`, which surface as a normal
+    // `Err` on the completion arm, or via cancellation. Only the cancel and
+    // completion arms remain.
+    //
+    // #920: the completion arm also returns the structured `AlmsError` (when
+    // the agent loop produced one) so the caller can forward it down the
+    // typed-error oneshot. A cancellation has no underlying `AlmsError` and
+    // uses `None` here — `dispatch()` falls back to the JSON path for it,
+    // exactly as before.
     let (new_status, result_value, tokens_used, run_output, typed_error) = tokio::select! {
-        _ = tokio::time::sleep(request.timeout) => {
-            warn!(
-                target: "subagent::timeout",
-                task_id = %task_id.0,
-                timeout_secs = %request.timeout.as_secs(),
-                "Subagent timed out"
-            );
-            (TaskStatus::Failed, serde_json::json!({"error": "Timeout"}), None, None, None)
-        }
         _ = child_cancel_token.cancelled() => {
             info!(
                 target: "subagent::cancelled",
@@ -868,8 +870,8 @@ async fn run_subagent(
     bridge_handle.abort();
 
     // Update the run record with the outcome.  This executes regardless of
-    // which tokio::select! branch fired (normal completion, timeout, or
-    // cancellation), preventing orphaned "Running" records.
+    // which tokio::select! branch fired (normal completion or cancellation),
+    // preventing orphaned "Running" records.
     if let (Some(registrar), Some(mut run)) = (&run_registrar, subagent_run) {
         match new_status {
             TaskStatus::Completed => {
@@ -1040,7 +1042,10 @@ async fn run_subagent(
     let _ = result_tx.send(task_result);
 
     // Keep the handle long enough for background callers to poll the result.
-    tokio::time::sleep(Duration::from_secs(SUBAGENT_TTL_SECS)).await;
+    // This post-completion retention window is independent of the run
+    // lifetime — the run-kill timer that used to share this constant was
+    // removed in #1150.
+    tokio::time::sleep(Duration::from_secs(RESULT_RETENTION_SECS)).await;
     subagents.remove(&task_id);
     // Clean up cached prompt to prevent unbounded memory growth.
     //
@@ -1209,11 +1214,16 @@ fn agent_config_for_subagent(
         enabled_tools: base.enabled_tools.clone(),
         fs_edit_fuzzy_match: base.fs_edit_fuzzy_match,
         max_tokens: base.max_tokens,
-        // Agent-loop hard caps (#987 / B3) — inherited verbatim so a
-        // subagent that wedges in a tool loop terminates on the same
-        // ceiling its parent would.
+        // Agent-loop hard caps (#987 / B3 / #1150) — inherited verbatim so a
+        // subagent that wedges in a tool loop terminates on the same caps its
+        // parent would: iteration cap, absolute wall-clock backstop, and the
+        // phase-aware inactivity budgets. As of #1150 this in-loop phase timer
+        // (not the coordinator's old 5-minute wall-clock kill, now removed) is
+        // what bounds a subagent run.
         max_iterations: base.max_iterations,
         max_run_duration_secs: base.max_run_duration_secs,
+        between_iterations_secs: base.between_iterations_secs,
+        tool_phase_ceiling_secs: base.tool_phase_ceiling_secs,
         context_config: subagent_context_config,
         prompts: base.prompts.clone(),
         debug_mode: false,
@@ -1889,7 +1899,6 @@ mod tests {
 
         let request = SubagentRequest {
             task: "test".to_string(),
-            timeout: Duration::from_secs(300),
             parent_session: test_session_id(),
             parent_agent_id: test_parent_agent_id(),
             parent_run_id: None,
@@ -1945,7 +1954,6 @@ mod tests {
 
         let request = SubagentRequest {
             task: "ephemeral".to_string(),
-            timeout: Duration::from_secs(300),
             parent_session: test_session_id(),
             parent_agent_id: test_parent_agent_id(),
             parent_run_id: None,
@@ -1989,7 +1997,6 @@ mod tests {
 
         let request = SubagentRequest {
             task: "bg".to_string(),
-            timeout: Duration::from_secs(300),
             parent_session: test_session_id(),
             parent_agent_id: test_parent_agent_id(),
             parent_run_id: None,
@@ -2026,7 +2033,6 @@ mod tests {
 
         let request = SubagentRequest {
             task: "legacy".to_string(),
-            timeout: Duration::from_secs(300),
             parent_session: test_session_id(),
             parent_agent_id: test_parent_agent_id(),
             parent_run_id: None,
@@ -2058,7 +2064,6 @@ mod tests {
 
         let request = SubagentRequest {
             task: "Long running task".to_string(),
-            timeout: Duration::from_secs(300),
             parent_session: session_id,
             parent_agent_id: test_parent_agent_id(),
             parent_run_id: None,
@@ -2080,20 +2085,23 @@ mod tests {
         );
     }
 
-    // -- (e) very short timeout — race between timeout and mock completion ------
+    // -- (e) #1150 — no implicit wall-clock run-kill arm ------------------------
     //
-    // NOTE: The mock LLM's complete() returns without yielding, so
-    // tokio::select! may resolve the agent-loop branch before the 1ns timer.
-    // This test accepts both Failed (timeout won) and Completed (mock won).
+    // Regression for #1150: the dispatch `select!` no longer has a
+    // `tokio::time::sleep(request.timeout)` arm that fails a subagent with a
+    // generic `Timeout`. A subagent that completes normally (here, against the
+    // mock LLM) must surface `Completed` — never `Failed {"error":"Timeout"}`
+    // — proving the implicit 5-minute kill is gone and a long-but-productive
+    // subagent is bounded only by the inherited in-loop phase timer (#1150),
+    // `max_iterations`, or cancellation.
 
     #[tokio::test]
-    async fn test_very_short_timeout() {
+    async fn test_no_implicit_run_kill_completes_normally() {
         let coord = test_coordinator();
         let session_id = test_session_id();
 
         let request = SubagentRequest {
-            task: "Will timeout".to_string(),
-            timeout: Duration::from_nanos(1),
+            task: "Run to completion".to_string(),
             parent_session: session_id,
             parent_agent_id: test_parent_agent_id(),
             parent_run_id: None,
@@ -2107,10 +2115,31 @@ mod tests {
         let result_rx = coord.take_result_rx(task_id).unwrap();
 
         let task_result = result_rx.await.expect("should receive result");
-        assert!(
-            task_result.status == TaskStatus::Failed || task_result.status == TaskStatus::Completed,
-            "Expected Failed or Completed, got: {:?}",
+        assert_eq!(
+            task_result.status,
+            TaskStatus::Completed,
+            "with the run-kill arm removed (#1150) a normally-completing \
+             subagent must be Completed, not timed out; got: {:?}",
             task_result.status
+        );
+        // And specifically not the old generic timeout failure shape.
+        assert_ne!(
+            task_result.result.get("error").and_then(|e| e.as_str()),
+            Some("Timeout"),
+            "the removed run-kill arm's {{\"error\":\"Timeout\"}} result must \
+             never be produced (#1150)"
+        );
+
+        // Retention still works (#1150): dropping the run-kill `select!`
+        // arm must NOT have disturbed the *post-completion* retention window.
+        // Once the result has been delivered the handle is kept in the map for
+        // `RESULT_RETENTION_SECS` (well beyond this test) so the
+        // completion-notification poller can still read it — so the handle is
+        // present here, not reaped the instant the run finished.
+        assert!(
+            coord.get_status(task_id).is_some(),
+            "the completed subagent handle must be retained for polling after \
+             the run finishes (RESULT_RETENTION_SECS window, #1150)"
         );
     }
 
@@ -2123,7 +2152,6 @@ mod tests {
 
         let request = SubagentRequest {
             task: "List test".to_string(),
-            timeout: Duration::from_secs(300),
             parent_session: session_id,
             parent_agent_id: test_parent_agent_id(),
             parent_run_id: None,
@@ -2160,7 +2188,6 @@ mod tests {
 
         let request = SubagentRequest {
             task: "Take rx test".to_string(),
-            timeout: Duration::from_secs(300),
             parent_session: session_id,
             parent_agent_id: test_parent_agent_id(),
             parent_run_id: None,
@@ -2212,6 +2239,16 @@ mod tests {
                 retention_days: 14,
             },
             enabled_tools: vec!["echo".into(), "math".into()],
+            // Agent-loop hard caps (#987 / B3 / #1150) — set to non-default
+            // values so inheritance is proven, not just a default match. The
+            // phase-aware inactivity budgets (#1150) must propagate to a
+            // subagent verbatim so it terminates on the same progress-aware
+            // ceilings its parent would (the coordinator's old 5-minute
+            // wall-clock kill having been removed in #1150).
+            max_iterations: 123,
+            max_run_duration_secs: 99_999,
+            between_iterations_secs: 222,
+            tool_phase_ceiling_secs: 333,
             ..AgentConfig::default()
         };
 
@@ -2236,6 +2273,12 @@ mod tests {
         assert_eq!(config.tool_output_truncate.max_bytes, 16_384);
         assert_eq!(config.tool_output_truncate.max_lines, 1500);
         assert_eq!(config.tool_output_truncate.retention_days, 14);
+        // Should inherit the agent-loop hard caps, including the #1150
+        // phase-aware inactivity budgets, verbatim.
+        assert_eq!(config.max_iterations, 123);
+        assert_eq!(config.max_run_duration_secs, 99_999);
+        assert_eq!(config.between_iterations_secs, 222);
+        assert_eq!(config.tool_phase_ceiling_secs, 333);
         // system_prompt should be the default subagent prompt, not the parent's
         assert_eq!(config.system_prompt, DEFAULT_SUBAGENT_PROMPT);
 
@@ -2266,6 +2309,12 @@ mod tests {
         assert!(config2.tool_output_truncate.enabled);
         assert_eq!(config2.tool_output_truncate.max_bytes, 16_384);
         assert_eq!(config2.tool_output_truncate.max_lines, 1500);
+        // The agent-loop hard caps (incl. the #1150 inactivity budgets) still
+        // inherit through the registry-override path.
+        assert_eq!(config2.max_iterations, 123);
+        assert_eq!(config2.max_run_duration_secs, 99_999);
+        assert_eq!(config2.between_iterations_secs, 222);
+        assert_eq!(config2.tool_phase_ceiling_secs, 333);
     }
 
     // -- per-named-subagent summary provider/model overlay (issue #872) --------
@@ -3075,7 +3124,6 @@ mod tests {
         // Spawn a named subagent with a long timeout so it stays active
         let request = SubagentRequest {
             task: "Long task".to_string(),
-            timeout: Duration::from_secs(300),
             parent_session: session_id,
             parent_agent_id,
             parent_run_id: None,
@@ -3090,7 +3138,6 @@ mod tests {
         // Second invocation with the same name should be rejected
         let request2 = SubagentRequest {
             task: "Another task".to_string(),
-            timeout: Duration::from_secs(300),
             parent_session: session_id,
             parent_agent_id,
             parent_run_id: None,
@@ -3111,7 +3158,6 @@ mod tests {
         // Different name should still work
         let request3 = SubagentRequest {
             task: "Different agent".to_string(),
-            timeout: Duration::from_secs(300),
             parent_session: session_id,
             parent_agent_id,
             parent_run_id: None,
@@ -3193,7 +3239,6 @@ mod tests {
 
         let req_a = SubagentRequest {
             task: "task A".into(),
-            timeout: Duration::from_secs(1),
             parent_session: session_a,
             parent_agent_id,
             parent_run_id: None,
@@ -3202,7 +3247,6 @@ mod tests {
         };
         let req_b = SubagentRequest {
             task: "task B".into(),
-            timeout: Duration::from_secs(1),
             parent_session: session_b,
             parent_agent_id,
             parent_run_id: None,
@@ -3244,7 +3288,6 @@ mod tests {
 
         let mk = |parent_agent_id: AgentId| SubagentRequest {
             task: "t".into(),
-            timeout: Duration::from_secs(1),
             parent_session: session,
             parent_agent_id,
             parent_run_id: None,
@@ -3346,8 +3389,9 @@ mod tests {
     /// insert/remove keys agree.
     #[tokio::test]
     async fn test_subagent_prompts_cache_cleanup_after_dispatch() {
-        // The cleanup waits SUBAGENT_TTL_SECS before pulling the handle and
-        // running the cache `remove`, so we can't realistically wait it out.
+        // The cleanup waits RESULT_RETENTION_SECS before pulling the handle
+        // and running the cache `remove`, so we can't realistically wait it
+        // out.
         // Instead, drive `dispatch` to completion and then directly drain the
         // cache by computing the same key shape `derive_subagent_identity`
         // produces — proving that the insert key matches what cleanup would
@@ -3400,7 +3444,7 @@ mod tests {
             "Cache must not still use the pre-#1051 parent_session key shape"
         );
 
-        // Now simulate the cleanup that fires after SUBAGENT_TTL_SECS by
+        // Now simulate the cleanup that fires after RESULT_RETENTION_SECS by
         // removing under the same key the production cleanup uses. If the
         // production cleanup were still keyed on parent_session, this would
         // be a no-op and the cache would leak.
@@ -3977,6 +4021,229 @@ mod tests {
         assert!(
             !history.is_empty(),
             "named subagent session must have at least one message"
+        );
+    }
+
+    // -- #1150 regression: a blocking foreground `invoke_agent` that outruns the
+    //    parent's P3 tool-phase ceiling must NOT stall-fail the parent --------
+
+    /// Read one full HTTP request (headers + Content-Length body) from a socket
+    /// so the scripted LLM server consumes the agent's request before
+    /// responding. Mirrors the helper in the runtime's agent-loop integration
+    /// tests.
+    async fn read_full_http_request(sock: &mut tokio::net::TcpStream) -> String {
+        use tokio::io::AsyncReadExt;
+        let mut buf: Vec<u8> = Vec::new();
+        let mut tmp = [0u8; 8192];
+        loop {
+            let n = match sock.read(&mut tmp).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => n,
+            };
+            buf.extend_from_slice(&tmp[..n]);
+            let text = String::from_utf8_lossy(&buf);
+            if let Some(header_end) = text.find("\r\n\r\n") {
+                let content_length = text[..header_end]
+                    .lines()
+                    .find_map(|l| {
+                        let (k, v) = l.split_once(':')?;
+                        k.eq_ignore_ascii_case("content-length")
+                            .then(|| v.trim().parse::<usize>().ok())
+                            .flatten()
+                    })
+                    .unwrap_or(0);
+                if buf.len() >= header_end + 4 + content_length {
+                    break;
+                }
+            }
+        }
+        String::from_utf8_lossy(&buf).into_owned()
+    }
+
+    /// A `SubagentDispatcher` whose foreground `dispatch` blocks for a fixed
+    /// duration — standing in for a long-but-productive subagent — then returns
+    /// a successful response. Records the call count so the test can confirm
+    /// the subagent actually ran (and blocked) rather than being short-circuited.
+    #[derive(Debug)]
+    struct SleepyForegroundDispatcher {
+        block: Duration,
+        response: String,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl SubagentDispatcher for SleepyForegroundDispatcher {
+        async fn dispatch(
+            &self,
+            _task: String,
+            _parent_session_id: SessionId,
+            _parent_agent_id: AgentId,
+            _parent_run_id: Option<RunId>,
+            _parent_event_tx: Option<Arc<dyn EventForwarder>>,
+            _subagent_name: Option<String>,
+            _parent_cancel_token: Option<CancellationToken>,
+            _parent_tool_invocation_id: Option<Uuid>,
+        ) -> AlmsResult<(String, SessionId)> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            // Block past the parent's P3 ceiling with no progress signal
+            // reaching the parent's ActivityClock — exactly the foreground
+            // subagent case #1150 must not kill the parent for.
+            tokio::time::sleep(self.block).await;
+            Ok((self.response.clone(), SessionId::new()))
+        }
+    }
+
+    /// #1150 regression (Tim's review): a **foreground** `invoke_agent` whose
+    /// subagent runs *past* the parent's `tool_phase_ceiling_secs` (P3) must
+    /// NOT stall-fail the parent. The parent blocks on `dispatch().await` for
+    /// the subagent's whole runtime, and the subagent's progress never touches
+    /// the parent's stack-local `ActivityClock` — so before the fix the parent
+    /// tripped P3 at the very next checkpoint and discarded the subagent's
+    /// completed work (re-creating, for the foreground path, the exact failure
+    /// #1150 set out to fix). The fix runs a blocking-`invoke_agent` batch under
+    /// the unbounded `ExecutingBlockingSubagent` phase, so the parent receives
+    /// the subagent's result and continues.
+    ///
+    /// Real foreground path: a real `alms_tools::InvokeAgentTool` over a real
+    /// parent `AgentRuntime` (driven via `run`), scripted to call `invoke_agent`
+    /// (turn 1) then answer with final text (turn 2). The subagent is a
+    /// `SleepyForegroundDispatcher` that blocks ~1.2s — well past the 1s P3
+    /// ceiling — then returns successfully. The earlier `SleepTool` +
+    /// background-dispatch tests do not exercise this interaction.
+    #[tokio::test]
+    async fn foreground_invoke_agent_past_p3_does_not_stall_parent() {
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpListener;
+
+        // Turn 1: request a single FOREGROUND `invoke_agent` (no `background`
+        // flag) and no final text, so the loop must run the subagent then
+        // iterate. Turn 2: a plain text reply that ends the run.
+        let turn1_body = concat!(
+            "data: {\"id\":\"t1\",\"object\":\"chat.completion.chunk\",\"created\":1,",
+            "\"model\":\"test-model\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",",
+            "\"tool_calls\":[{\"index\":0,\"id\":\"call_inv\",\"type\":\"function\",",
+            "\"function\":{\"name\":\"invoke_agent\",\"arguments\":\"{\\\"task\\\":\\\"do work\\\"}\"}}]},",
+            "\"finish_reason\":\"tool_calls\"}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let turn2_body = concat!(
+            "data: {\"id\":\"t2\",\"object\":\"chat.completion.chunk\",\"created\":2,",
+            "\"model\":\"test-model\",\"choices\":[{\"index\":0,",
+            "\"delta\":{\"role\":\"assistant\",\"content\":\"all done\"},",
+            "\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+
+        // Serve exactly the two scripted turns, counting calls so we can assert
+        // the parent made both (the subagent turn AND the final-text turn).
+        let call_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let call_count_writer = call_count.clone();
+        tokio::spawn(async move {
+            for body in [turn1_body, turn2_body] {
+                let (mut sock, _) = match listener.accept().await {
+                    Ok(s) => s,
+                    Err(_) => return,
+                };
+                let _ = read_full_http_request(&mut sock).await;
+                call_count_writer.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = sock.write_all(response.as_bytes()).await;
+                let _ = sock.shutdown().await;
+            }
+        });
+
+        let llm_config = LlmConfig {
+            base_url,
+            api_key: "test-key".to_string(),
+            default_model: "test-model".to_string(),
+            timeout_secs: 5,
+            stream_chunk_timeout_secs: 5,
+            ..LlmConfig::default()
+        };
+        let agent_config = AgentConfig {
+            sandbox_root: "".into(),
+            // `invoke_agent` is not auto-approved; Autonomous runs tools without
+            // an approval round-trip (the realistic posture for a
+            // subagent-spawning run).
+            posture: alms_runtime::Posture::Autonomous,
+            // Isolate P3: a 1s tool-phase ceiling with every other cap disabled.
+            // The subagent blocks ~1.2s, so a progress-blind P3 would trip.
+            max_iterations: 1000,
+            max_run_duration_secs: 0,
+            between_iterations_secs: 0,
+            tool_phase_ceiling_secs: 1,
+            ..AgentConfig::default()
+        };
+        let runtime = AgentRuntime::new(
+            AgentId::new(),
+            agent_config,
+            LlmClient::new(llm_config).unwrap(),
+        )
+        .unwrap()
+        .with_agent_name("parent".to_string());
+
+        // Register the REAL foreground invoke_agent tool, wired to a dispatcher
+        // that blocks ~1.2s then returns a successful response.
+        let dispatcher = Arc::new(SleepyForegroundDispatcher {
+            block: Duration::from_millis(1200),
+            response: "subagent finished its long task".to_string(),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let invoke_tool = alms_tools::InvokeAgentTool::new(
+            dispatcher.clone(),
+            SessionId::new(),
+            AgentId::new(),
+            None,
+            None,
+        );
+        runtime.tools().register(Arc::new(invoke_tool));
+
+        let session_manager = SessionManager::new(alms_session::SessionConfig::default());
+        let result = runtime
+            .run(&session_manager, "normal-context", "delegate the long task")
+            .await;
+
+        // The regression: pre-fix the parent tripped P3 the instant the ~1.2s
+        // subagent returned (idle > the 1s ceiling) and failed with a stalled
+        // error, discarding the subagent's work. With the blocking-invoke_agent
+        // exclusion the parent stays unbounded for that batch and continues.
+        let output = match result {
+            Ok(o) => o,
+            Err(e) => panic!(
+                "parent must NOT stall-fail on a foreground invoke_agent that \
+                 outruns the P3 ceiling; got error: {e}"
+            ),
+        };
+        assert_eq!(
+            output.response, "all done",
+            "the parent must continue past the blocking subagent to its final reply"
+        );
+        assert_eq!(
+            dispatcher.calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the foreground subagent must have actually run (and blocked) once"
+        );
+        assert_eq!(
+            call_count.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "the parent must make two LLM calls: the invoke_agent turn and the final-text turn"
+        );
+        // The subagent's result is carried into the parent run (not discarded
+        // by a stall trip).
+        assert!(
+            output
+                .tool_calls
+                .iter()
+                .any(|r| r.tool_name.as_deref() == Some("invoke_agent")),
+            "the invoke_agent call/result must be recorded in the parent run"
         );
     }
 }

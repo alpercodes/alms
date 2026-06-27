@@ -242,8 +242,16 @@ pub fn sanitize_error_for_session(err: &AlmsError) -> String {
                 // tool loop apart from a generic internal error.
                 "Agent stopped after reaching its iteration limit".to_string()
             } else if msg.contains("maximum duration") {
-                // Agent-loop wall-clock cap (#987 / B3). Same rationale.
+                // Agent-loop absolute wall-clock backstop (#987 / B3 / #1150).
+                // Same rationale.
                 "Agent stopped after reaching its time limit".to_string()
+            } else if msg.contains("stalled") {
+                // Phase-aware inactivity timeout (#1150). The message is
+                // self-authored ("agent run stalled -- no activity for {n}s
+                // during {phase}") and secret-free; surface a distinct label
+                // so a stalled (no-progress) run reads differently from the
+                // absolute-duration backstop above and the generic error.
+                "Agent stopped after stalling (no activity)".to_string()
             } else {
                 "Runtime error".to_string()
             }

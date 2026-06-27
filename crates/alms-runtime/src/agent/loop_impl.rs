@@ -6,6 +6,8 @@ use alms_session::{
 };
 use std::collections::HashMap;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 use tracing::{debug, error, info, instrument, warn};
 use uuid::Uuid;
 
@@ -15,6 +17,220 @@ use super::dm::{
 };
 use super::helpers::tool_result_ok;
 use super::types::Posture;
+
+/// The phase of an agent run for the phase-aware inactivity timer (#1150).
+///
+/// Replaces the old flat wall-clock `max_run_duration_secs` enforcement: a
+/// run is terminated when it makes no *progress* (a streamed token / reasoning
+/// delta, an LLM response, or a tool start) for the budget of the phase it is
+/// in, rather than when total wall-clock elapses. The budget per phase is
+/// returned by [`AgentRuntime::inactivity_budget`].
+///
+/// The phase is tracked on the stack in `agent_loop` and evaluated at the
+/// top-of-loop checkpoint against [`ActivityClock::idle`]. An LLM call that
+/// hangs *before* producing its first delta is bounded by the per-request HTTP
+/// guards (#1163/#1169), not this timer — that is the deliberately-accepted
+/// limitation of the minimal (no-watchdog) implementation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RunPhase {
+    /// P0 — iteration 1, before the run has produced any activity. Budget is
+    /// derived (`stream_chunk_timeout_secs + 30s` slack), never a flat knob,
+    /// so it scales with the LLM idle timeout.
+    AwaitingFirstActivity,
+    /// P1 — resting between iterations after the run has produced activity.
+    /// Budget = `between_iterations_secs`.
+    BetweenIterations,
+    /// P3 — a tool batch is/was executing. Budget = `tool_phase_ceiling_secs`,
+    /// the coarse backstop; timed tools finish first under their own timeout.
+    ExecutingTools,
+    /// P3b — a tool batch containing a *blocking* (foreground) `invoke_agent`
+    /// is/was executing. Budget is **unbounded** (`0` / disabled).
+    ///
+    /// A foreground `invoke_agent` blocks the parent's `agent_loop` until the
+    /// subagent completes, and the subagent's internal progress never touches
+    /// the parent's stack-local [`ActivityClock`] — it forwards events to the
+    /// parent's SSE channel, not the clock. Applying the P3 ceiling here would
+    /// terminate the *parent* the instant a productive long subagent
+    /// (legitimately past `tool_phase_ceiling_secs`) returns, discarding the
+    /// subagent's completed work — re-creating, for the foreground path, the
+    /// exact failure #1150 set out to fix. The subagent governs its own
+    /// runtime via the in-loop phase timer it inherits (a hung one
+    /// self-terminates and returns an error to the parent), and the parent's
+    /// absolute `max_run_duration_secs` backstop still bounds total runtime —
+    /// so the parent must not *also* wall-clock a blocking subagent call. A
+    /// *background* `invoke_agent` returns immediately and stays in the normal
+    /// `ExecutingTools` phase.
+    ExecutingBlockingSubagent,
+    /// P3c — a Guarded-posture tool batch is/was blocked on **human approval**.
+    /// Budget is **unbounded** (`0` / disabled).
+    ///
+    /// In Guarded posture — the default for user-triggered interactive runs
+    /// (only system-triggered runs are forced to Autonomous in
+    /// `resolve_posture_for_run`) — a tool that is not auto-approved blocks the
+    /// run at the approval gate until the human approves or denies. The human's
+    /// think-time produces no progress signal on the parent's stack-local
+    /// [`ActivityClock`], so applying the P3 ceiling here would stall-fail the
+    /// run the instant the human took longer than `tool_phase_ceiling_secs` to
+    /// decide — re-creating, for the approval path, the same false-stall the
+    /// foreground-subagent exemption ([`Self::ExecutingBlockingSubagent`])
+    /// avoids. The absolute `max_run_duration_secs` backstop still bounds a
+    /// truly-abandoned approval. A batch of only auto-approved tools, or any
+    /// FullControl / Autonomous run (no approval gate), stays in the normal
+    /// [`Self::ExecutingTools`] phase.
+    AwaitingApproval,
+}
+
+impl RunPhase {
+    /// Human-readable phase label embedded in the stall error message.
+    fn label(self) -> &'static str {
+        match self {
+            RunPhase::AwaitingFirstActivity => "awaiting the first response",
+            RunPhase::BetweenIterations => "between iterations",
+            RunPhase::ExecutingTools => "executing tools",
+            RunPhase::ExecutingBlockingSubagent => "executing a blocking subagent",
+            RunPhase::AwaitingApproval => "awaiting human approval",
+        }
+    }
+}
+
+/// Decide whether the phase-aware inactivity timer has tripped (#1150).
+///
+/// Pure so the per-phase trip / disable semantics are unit-testable without a
+/// running loop. Returns `Some(message)` — the exact terminal-error string the
+/// agent loop surfaces, which the session sanitiser maps to a "stalled" label
+/// — when `budget_secs > 0` and the run has been idle for at least that long
+/// in `phase`. A `budget_secs` of `0` disables the phase and always returns
+/// `None`, matching the documented `0`-disables escape hatch.
+fn stall_error(phase: RunPhase, idle: Duration, budget_secs: u64) -> Option<String> {
+    if budget_secs == 0 || idle.as_secs() < budget_secs {
+        return None;
+    }
+    Some(format!(
+        "agent run stalled -- no activity for {}s during {}",
+        idle.as_secs(),
+        phase.label()
+    ))
+}
+
+/// Canonical name of the subagent-spawning tool (`alms_tools::InvokeAgentTool`).
+///
+/// Matched as a string literal because `alms-runtime` does not (and per the
+/// crate dependency graph must not) depend on `alms-tools`, where the tool is
+/// defined — mirroring how `alms-core` matches `"ignore_message"` by name.
+const INVOKE_AGENT_TOOL_NAME: &str = "invoke_agent";
+
+/// Whether an `invoke_agent` tool call's arguments request *background*
+/// dispatch (`background: true`).
+///
+/// Mirrors `InvokeAgentTool`'s own parse exactly
+/// (`params.get("background").and_then(as_bool).unwrap_or(false)`): anything
+/// that is not a literal boolean `true` — absent, `false`, a non-bool value,
+/// or unparseable arguments — is foreground. Defaulting the unparseable case
+/// to *foreground* is the safe direction: a foreground classification only
+/// *disables* the P3 ceiling for the batch (see
+/// [`batch_has_blocking_invoke_agent`]), whereas a real background call returns
+/// immediately, so the ceiling was moot for it anyway.
+fn invoke_agent_call_is_background(arguments: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(arguments)
+        .ok()
+        .and_then(|v| v.get("background").and_then(serde_json::Value::as_bool))
+        .unwrap_or(false)
+}
+
+/// Whether a tool batch contains a *blocking* (foreground) `invoke_agent`
+/// call (#1150).
+///
+/// Such a batch is excluded from the P3 tool-phase inactivity ceiling and runs
+/// under [`RunPhase::ExecutingBlockingSubagent`] instead: a foreground
+/// `invoke_agent` blocks the parent's `agent_loop` until the subagent
+/// completes, and the subagent's internal progress never touches the parent's
+/// stack-local [`ActivityClock`] — so the parent would trip P3 the instant a
+/// productive long subagent returns and discard its completed work. A batch
+/// stays "blocking" even when it also holds other tools: it cannot return
+/// until the subagent does, so the P3 ceiling can never meaningfully bound it.
+///
+/// `conflicting_indices` are the DM-conflicting slots that will NOT execute
+/// (mirrors the executing-set filter used for the status emit), so a rejected
+/// call never counts. A *background* `invoke_agent` returns immediately and is
+/// deliberately not matched here.
+fn batch_has_blocking_invoke_agent(tool_calls: &[ToolCall], conflicting_indices: &[usize]) -> bool {
+    tool_calls.iter().enumerate().any(|(i, tc)| {
+        tc.function.name == INVOKE_AGENT_TOOL_NAME
+            && !conflicting_indices.contains(&i)
+            && !invoke_agent_call_is_background(&tc.function.arguments)
+    })
+}
+
+/// Whether a tool batch will block on **human approval** under the run's
+/// posture (#1150).
+///
+/// Such a batch is excluded from the P3 tool-phase inactivity ceiling and runs
+/// under [`RunPhase::AwaitingApproval`] instead: in `Posture::Guarded` — the
+/// default for user-triggered interactive runs — a tool that is not
+/// auto-approved blocks the run at the approval gate until the human approves
+/// or denies, and that think-time never touches the parent's
+/// [`ActivityClock`]. Applying P3 would stall-fail the run the instant the
+/// human took longer than `tool_phase_ceiling_secs` to decide; the absolute
+/// `max_run_duration_secs` backstop still bounds a truly-abandoned approval.
+///
+/// Mirrors the approval gate's own per-call decision exactly
+/// (`posture == Guarded && !is_auto_approved(name)` — see the gate in
+/// `execute_tool_call`): the batch needs approval iff the run is Guarded and at
+/// least one *executing* call routes through the gate. `is_auto_approved` is
+/// injected (the gate reads it from the tool registry) so this stays a pure,
+/// unit-testable predicate. `conflicting_indices` are the DM-conflicting slots
+/// that will NOT execute, so a rejected call never counts — matching the
+/// executing-set filter used for the status emit and
+/// [`batch_has_blocking_invoke_agent`]. In `FullControl` / `Autonomous` there
+/// is no approval gate, so this is always `false`.
+fn batch_needs_approval(
+    posture: Posture,
+    tool_calls: &[ToolCall],
+    conflicting_indices: &[usize],
+    is_auto_approved: impl Fn(&str) -> bool,
+) -> bool {
+    posture == Posture::Guarded
+        && tool_calls.iter().enumerate().any(|(i, tc)| {
+            !conflicting_indices.contains(&i) && !is_auto_approved(&tc.function.name)
+        })
+}
+
+/// Lock-free record of when an agent run last made progress, shared between
+/// `agent_loop` (which reads it at the top-of-loop checkpoint) and
+/// `stream_llm_call` (which bumps it on every streamed token / reasoning
+/// delta, so a long-but-productive stream resets the timer — #1150 P2).
+///
+/// Stored as nanoseconds elapsed since a fixed `base` instant in a single
+/// relaxed `AtomicU64`, so a per-token bump is a cheap atomic store with no
+/// mutex contention on the streaming hot path. `u64` nanoseconds since `base`
+/// does not wrap for ~584 years, so saturation is a non-issue.
+pub(crate) struct ActivityClock {
+    base: Instant,
+    last_nanos: AtomicU64,
+}
+
+impl ActivityClock {
+    /// Create a clock whose first activity timestamp is "now".
+    pub(crate) fn new() -> Self {
+        Self {
+            base: Instant::now(),
+            last_nanos: AtomicU64::new(0),
+        }
+    }
+
+    /// Record a progress signal at the current instant.
+    pub(crate) fn touch(&self) {
+        self.last_nanos
+            .store(self.base.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    }
+
+    /// Time since the last recorded progress signal.
+    fn idle(&self) -> Duration {
+        self.base.elapsed().saturating_sub(Duration::from_nanos(
+            self.last_nanos.load(Ordering::Relaxed),
+        ))
+    }
+}
 
 /// In-flight tool-call tracker shared between `run_tool_calls` and
 /// `execute_tool_call`.
@@ -254,6 +470,37 @@ fn buffered_fallback_reconcile_events(
 }
 
 impl AgentRuntime {
+    /// Inactivity budget, in seconds, for the given run phase (#1150).
+    /// `0` means the phase has no inactivity budget (disabled / not bounded by
+    /// this timer).
+    ///
+    /// - **P0** is *derived*, not a knob: `stream_chunk_timeout_secs + 30s`
+    ///   slack, so it tracks the LLM idle timeout (with the 60s default it is
+    ///   ~90s). A hung first call still defers to the per-request HTTP guards
+    ///   (#1163/#1169) because the checkpoint only runs *between* iterations.
+    /// - **P1** = `between_iterations_secs`.
+    /// - **P3** = `tool_phase_ceiling_secs`.
+    /// - **P3b** (a batch with a blocking foreground `invoke_agent`) = `0`
+    ///   (unbounded); the subagent's own inherited phase timer governs it, so
+    ///   the parent must not wall-clock the blocking call. See
+    ///   [`RunPhase::ExecutingBlockingSubagent`].
+    /// - **P3c** (a Guarded-posture batch blocked on human approval) = `0`
+    ///   (unbounded); a slow human approver must not be read as a stall. The
+    ///   absolute `max_run_duration_secs` backstop still bounds an abandoned
+    ///   approval. See [`RunPhase::AwaitingApproval`].
+    fn inactivity_budget(&self, phase: RunPhase) -> u64 {
+        match phase {
+            RunPhase::AwaitingFirstActivity => {
+                self.llm.stream_chunk_timeout_secs().saturating_add(30)
+            }
+            RunPhase::BetweenIterations => self.config.between_iterations_secs,
+            RunPhase::ExecutingTools => self.config.tool_phase_ceiling_secs,
+            // Unbounded: `0` disables the phase via `stall_error`. The absolute
+            // `max_run_duration_secs` backstop still applies in the loop.
+            RunPhase::ExecutingBlockingSubagent | RunPhase::AwaitingApproval => 0,
+        }
+    }
+
     /// Main agent loop with tool execution
     #[instrument(
         level = "debug",
@@ -276,17 +523,37 @@ impl AgentRuntime {
         // ended with no deliverable reply text (#1154 design default #3).
         // Capped at DM_EMPTY_REPLY_MAX_RETRIES to prevent infinite loops.
         let mut dm_empty_reply_retries: u32 = 0;
-        // Agent-loop hard caps (#987 / B3). Per-step timeouts bound how long
-        // any one LLM/tool step can take, but nothing bounded the *count* of
-        // steps or the total wall-clock — so an agent that kept calling tools
-        // without ever producing a deliverable reply ran forever. On a
-        // peer-triggered DM run that left the peer stranded on "Chatting
-        // with…" indefinitely; tripping either cap returns an `Err`, which
+        // Agent-loop hard caps (#987 / B3, reworked in #1150). Per-step
+        // timeouts bound how long any one LLM/tool step can take, but nothing
+        // bounded the *count* of steps or made the run-duration cap
+        // progress-aware — so an agent that kept calling tools without ever
+        // producing a deliverable reply ran forever, and a *productive* long
+        // run risked being clipped by the old flat wall-clock cap. On a
+        // peer-triggered DM run a wedge left the peer stranded on "Chatting
+        // with…" indefinitely; tripping any cap returns an `Err`, which
         // `finish_run` wraps into `FailedWithToolCalls` and the gateway's
         // `handle_dm_run_failure` converts into an `Errored` conversation end
         // so the peer is notified. `0` disables a cap.
         let mut iterations: u32 = 0;
         let run_start = std::time::Instant::now();
+
+        // Phase-aware inactivity timer (#1150). `activity` records the last
+        // progress signal (LLM response / streamed delta / tool start) and is
+        // shared with `stream_llm_call` so a long-but-productive stream keeps
+        // resetting it. `phase` tracks what the run was doing across the most
+        // recent idle window; the top-of-loop checkpoint terminates the run
+        // when `activity.idle()` exceeds the budget for `phase`. Starts in P0
+        // (awaiting the first response) until the run produces any activity.
+        //
+        // NOTE: P0 is structurally inert as a *trip*. It is only ever evaluated
+        // at iteration 1's checkpoint, where `activity.idle()` ≈ 0, and the
+        // phase advances to P1/P3 after the first LLM call and never returns to
+        // P0 — so its derived budget can never actually fire. A first LLM call
+        // that hangs before its first byte is bounded by the per-chunk HTTP
+        // guard (#1169), not this phase; the P0 budget exists only as a
+        // belt-and-suspenders ceiling that the no-watchdog design never reaches.
+        let activity = ActivityClock::new();
+        let mut phase = RunPhase::AwaitingFirstActivity;
 
         loop {
             // Checkpoint A: check cancellation between iterations.
@@ -297,13 +564,13 @@ impl AgentRuntime {
                 return (tool_call_records, Err(AlmsError::Cancelled));
             }
 
-            // Checkpoint A2: enforce the agent-loop hard caps (#987 / B3)
-            // between iterations, before spending another LLM call. The
-            // iteration cap bounds the step count; the duration cap bounds
-            // total elapsed time so a run that makes slow forward progress
-            // still terminates. An in-flight step is bounded by its own
-            // per-step timeout, so the effective duration ceiling is this
-            // value plus at most one step.
+            // Checkpoint A2: enforce the agent-loop hard caps (#987 / B3 /
+            // #1150) between iterations, before spending another LLM call. The
+            // iteration cap bounds the step count; the phase-aware inactivity
+            // check (below) terminates a run that stops making progress; and
+            // `max_run_duration_secs` is the absolute wall-clock backstop. An
+            // in-flight step is bounded by its own per-step timeout, so the
+            // effective ceiling is the budget plus at most one step.
             iterations += 1;
             if self.config.max_iterations > 0 && iterations > self.config.max_iterations {
                 warn!(
@@ -321,6 +588,10 @@ impl AgentRuntime {
                     ))),
                 );
             }
+            // Absolute wall-clock backstop (#987 / B3, raised to 24h in
+            // #1150). Inactivity is the primary guard now, so this only ever
+            // catches a run that pings activity forever (a bug). Kept
+            // alongside the phase check; `0` disables it.
             if self.config.max_run_duration_secs > 0
                 && run_start.elapsed().as_secs() >= self.config.max_run_duration_secs
             {
@@ -329,7 +600,7 @@ impl AgentRuntime {
                     max_run_duration_secs = self.config.max_run_duration_secs,
                     elapsed_secs = run_start.elapsed().as_secs(),
                     "Agent loop exceeded the maximum run duration without completing -- \
-                     terminating with an error (#987 / B3)"
+                     terminating with an error (#987 / B3 / #1150)"
                 );
                 return (
                     tool_call_records,
@@ -339,6 +610,32 @@ impl AgentRuntime {
                         self.config.max_run_duration_secs
                     ))),
                 );
+            }
+
+            // Phase-aware inactivity check (#1150). Terminate the run when it
+            // has made no progress for the budget of the phase it spent the
+            // most recent idle window in. `activity` is reset on every
+            // progress signal (LLM response / streamed delta / tool start), so
+            // a productive run — however long — is never clipped here; only a
+            // genuinely stalled run trips. `0` budget disables the phase. A
+            // hung *first* LLM call defers to the per-request HTTP guards
+            // (#1163/#1169) rather than this check, since the checkpoint only
+            // runs between iterations (the accepted no-watchdog limitation).
+            let budget = self.inactivity_budget(phase);
+            // Read the idle window once so the error message and the log field
+            // report the exact same figure (a second `activity.idle()` call
+            // would drift by a few µs).
+            let idle = activity.idle();
+            if let Some(msg) = stall_error(phase, idle, budget) {
+                warn!(
+                    agent_id = %self.agent_id.0,
+                    phase = phase.label(),
+                    idle_secs = idle.as_secs(),
+                    budget_secs = budget,
+                    "Agent run stalled -- no activity within the phase budget; \
+                     terminating with an error (#1150)"
+                );
+                return (tool_call_records, Err(AlmsError::Runtime(msg)));
             }
 
             debug!(
@@ -398,10 +695,21 @@ impl AgentRuntime {
                 reasoning,
                 tool_calls,
                 usage,
-            } = match self.call_llm_with_cancellation(request).await {
+            } = match self.call_llm_with_cancellation(request, &activity).await {
                 Ok(result) => result,
                 Err(e) => return (tool_call_records, Err(e)),
             };
+
+            // Record progress for the phase-aware inactivity timer (#1150): an
+            // LLM call that produced any content, reasoning, or tool calls
+            // counts as activity (this is also what `stream_llm_call` bumps on
+            // each streamed delta). After it returns the run rests
+            // `BetweenIterations` (P1); a tool batch below overrides the phase
+            // to `ExecutingTools` (P3) and re-touches the clock at batch start.
+            if content.is_some() || reasoning.is_some() || tool_calls.is_some() {
+                activity.touch();
+            }
+            phase = RunPhase::BetweenIterations;
 
             // Accumulate token usage from this LLM call
             if let Some(ref usage) = usage {
@@ -524,6 +832,51 @@ impl AgentRuntime {
                 if !tool_names.is_empty() {
                     let detail = tool_names.join(", ");
                     self.emit_status(PHASE_EXECUTING_TOOLS, Some(&detail));
+
+                    // Enter the tool-execution phase for the inactivity timer
+                    // (#1150 P3). Touch the clock at batch start so the next
+                    // checkpoint measures this batch against the coarse
+                    // `tool_phase_ceiling_secs` backstop — the ToolStart that
+                    // decision-#3 counts as activity. A batch that is entirely
+                    // DM-conflicting (no tool actually runs) leaves the phase
+                    // unchanged, so it is still governed by P0/P1.
+                    activity.touch();
+                    // EXCEPTIONS (#1150): two kinds of batch block on something
+                    // whose progress never reaches this clock, so the P3
+                    // ceiling would false-stall the run the instant the blocking
+                    // thing legitimately overran it. Both run under an unbounded
+                    // phase (budget 0); the absolute `max_run_duration_secs`
+                    // backstop still bounds them.
+                    //
+                    // P3b — a *blocking* (foreground) `invoke_agent`: the parent
+                    // blocks on the subagent for its full (possibly
+                    // long-but-productive) runtime, and the subagent's own
+                    // inherited phase timer does the bounding. A background
+                    // `invoke_agent` returns immediately and stays in P3.
+                    //
+                    // P3c — a Guarded-posture batch that routes through the
+                    // human-approval gate: the run blocks until the human
+                    // approves or denies, and a human slower than
+                    // `tool_phase_ceiling_secs` must not be read as a stall. The
+                    // predicate mirrors the gate's own per-call decision
+                    // (`Guarded && !is_auto_approved`). A batch of only
+                    // auto-approved tools, or any FullControl / Autonomous run,
+                    // has no approval gate and stays in P3.
+                    phase = if batch_has_blocking_invoke_agent(
+                        &tool_calls,
+                        &dm_check.conflicting_indices,
+                    ) {
+                        RunPhase::ExecutingBlockingSubagent
+                    } else if batch_needs_approval(
+                        self.config.posture,
+                        &tool_calls,
+                        &dm_check.conflicting_indices,
+                        |name| self.tools.is_auto_approved(name),
+                    ) {
+                        RunPhase::AwaitingApproval
+                    } else {
+                        RunPhase::ExecutingTools
+                    };
                 }
 
                 // Execute tools with posture-aware concurrency and cancellation.
@@ -716,9 +1069,14 @@ impl AgentRuntime {
     /// to buffered mode on streaming failure. Returns a [`StreamCallResult`]
     /// carrying content, reasoning trace (extended thinking, if any), tool
     /// calls, and usage.
+    ///
+    /// `activity` is the run's [`ActivityClock`] (#1150): the streaming path
+    /// bumps it on every visible delta so a long-but-productive stream keeps
+    /// the phase-aware inactivity timer from tripping at the next checkpoint.
     async fn call_llm_with_cancellation(
         &self,
         request: CompletionRequest,
+        activity: &ActivityClock,
     ) -> AlmsResult<StreamCallResult> {
         self.emit_status(PHASE_CALLING_LLM, None);
 
@@ -732,11 +1090,12 @@ impl AgentRuntime {
         // Try streaming first.
         let stream_result = if let Some(ref token) = self.cancel_token {
             tokio::select! {
-                result = self.stream_llm_call(request.clone(), &emitted) => result,
+                result = self.stream_llm_call(request.clone(), &emitted, activity) => result,
                 _ = token.cancelled() => return Err(AlmsError::Cancelled),
             }
         } else {
-            self.stream_llm_call(request.clone(), &emitted).await
+            self.stream_llm_call(request.clone(), &emitted, activity)
+                .await
         };
 
         match stream_result {
@@ -1604,10 +1963,18 @@ impl AgentRuntime {
     /// re-emitted, otherwise the abandoned partial double-renders against the
     /// buffered result (#1162 sym-2). A stream that faulted before emitting
     /// anything needs no reset.
+    ///
+    /// `activity` is the run's [`ActivityClock`] (#1150): it is touched on
+    /// every visible `TokenDelta` / `ReasoningDelta` so the phase-aware
+    /// inactivity timer in `agent_loop` treats a steadily-streaming response
+    /// as progress and never trips mid-reply. A *stalled* stream (no chunk
+    /// for `stream_chunk_timeout_secs`) is already faulted by the per-chunk
+    /// guard above, so this timer does not need to police it.
     pub(crate) async fn stream_llm_call(
         &self,
         request: CompletionRequest,
         emitted: &std::sync::atomic::AtomicBool,
+        activity: &ActivityClock,
     ) -> AlmsResult<StreamCallResult> {
         use futures::StreamExt;
 
@@ -1688,6 +2055,10 @@ impl AgentRuntime {
                 && !text.is_empty()
             {
                 content.push_str(&text);
+                // Progress signal for the inactivity timer (#1150). Touched
+                // unconditionally — a streaming reply with no UI subscriber is
+                // still making forward progress and must reset the timer.
+                activity.touch();
                 if let Some(ref sender) = self.event_sender {
                     emitted.store(true, std::sync::atomic::Ordering::Relaxed);
                     let _ = sender.send(RuntimeEvent::TokenDelta {
@@ -1711,6 +2082,11 @@ impl AgentRuntime {
                 && !text.is_empty()
             {
                 reasoning_content.push_str(&text);
+                // Progress signal for the inactivity timer (#1150) — reasoning
+                // deltas count as activity too, so a long extended-thinking
+                // stretch keeps the timer reset. Touched unconditionally for
+                // the same reason as the content branch above.
+                activity.touch();
                 if let Some(ref sender) = self.event_sender {
                     emitted.store(true, std::sync::atomic::Ordering::Relaxed);
                     let _ = sender.send(RuntimeEvent::ReasoningDelta {
@@ -2557,5 +2933,317 @@ mod buffered_fallback_reconcile_tests {
         let events_none = buffered_fallback_reconcile_events(true, None, None);
         assert_eq!(events_none.len(), 1, "only the reset when both are None");
         assert!(matches!(events_none[0], RuntimeEvent::StreamReset { .. }));
+    }
+}
+
+#[cfg(test)]
+mod inactivity_timer_tests {
+    use super::{
+        ActivityClock, Posture, RunPhase, batch_has_blocking_invoke_agent, batch_needs_approval,
+        invoke_agent_call_is_background, stall_error,
+    };
+    use crate::llm_types::ToolCall;
+    use std::time::Duration;
+
+    /// Below the budget, no phase trips — `stall_error` returns `None` so the
+    /// loop keeps running. Covers all three phase labels since the decision is
+    /// purely `idle < budget`.
+    #[test]
+    fn under_budget_never_trips() {
+        for phase in [
+            RunPhase::AwaitingFirstActivity,
+            RunPhase::BetweenIterations,
+            RunPhase::ExecutingTools,
+        ] {
+            assert!(
+                stall_error(phase, Duration::from_secs(5), 180).is_none(),
+                "{phase:?}: idle (5s) < budget (180s) must not trip"
+            );
+        }
+    }
+
+    /// At or past the budget the phase trips, and the message embeds both the
+    /// idle seconds and the phase label so the session sanitiser can map it to
+    /// the distinct "stalled" label.
+    #[test]
+    fn at_or_over_budget_trips_with_labelled_message() {
+        // Exactly at the budget trips (`idle.as_secs() < budget` is false).
+        let at = stall_error(RunPhase::BetweenIterations, Duration::from_secs(180), 180)
+            .expect("idle == budget must trip");
+        assert!(at.contains("stalled"), "message must say 'stalled': {at}");
+        assert!(at.contains("180s"), "message must embed idle seconds: {at}");
+        assert!(
+            at.contains("between iterations"),
+            "message must embed the P1 phase label: {at}"
+        );
+
+        // Past the budget trips with the larger idle figure.
+        let over = stall_error(RunPhase::ExecutingTools, Duration::from_secs(750), 600)
+            .expect("idle > budget must trip");
+        assert!(
+            over.contains("750s"),
+            "message must embed idle seconds: {over}"
+        );
+        assert!(
+            over.contains("executing tools"),
+            "message must embed the P3 phase label: {over}"
+        );
+
+        // P0 phase label flows through too (derived budget, here passed
+        // explicitly as the derived value would be).
+        let p0 = stall_error(RunPhase::AwaitingFirstActivity, Duration::from_secs(90), 90)
+            .expect("P0 idle == derived budget must trip");
+        assert!(
+            p0.contains("awaiting the first response"),
+            "message must embed the P0 phase label: {p0}"
+        );
+    }
+
+    /// A `0` budget is the documented escape hatch: the phase is disabled and
+    /// never trips, no matter how large the idle window — matching the
+    /// `value > 0` gate the loop's other hard caps use. Locks the semantics so
+    /// a refactor can't turn `0` into an instant trip.
+    #[test]
+    fn zero_budget_disables_the_phase() {
+        assert!(
+            stall_error(RunPhase::BetweenIterations, Duration::from_secs(86_400), 0).is_none(),
+            "a 0 budget must disable the phase even after a full day idle"
+        );
+        assert!(
+            stall_error(
+                RunPhase::ExecutingTools,
+                Duration::from_secs(u64::MAX / 2),
+                0
+            )
+            .is_none(),
+            "a 0 budget disables P3 regardless of idle"
+        );
+        // The blocking-subagent phase (P3b) is always unbounded: `agent_loop`
+        // feeds it `inactivity_budget(ExecutingBlockingSubagent) == 0`, so the
+        // parent never stall-fails on a blocking foreground `invoke_agent`,
+        // however long the subagent runs. (#1150)
+        assert!(
+            stall_error(
+                RunPhase::ExecutingBlockingSubagent,
+                Duration::from_secs(u64::MAX / 2),
+                0
+            )
+            .is_none(),
+            "the blocking-subagent phase must never trip (unbounded budget)"
+        );
+        // The approval-wait phase (P3c) is likewise unbounded: `agent_loop`
+        // feeds it `inactivity_budget(AwaitingApproval) == 0`, so a Guarded run
+        // blocked on human approval never stall-fails however long the human
+        // takes to decide. (#1150)
+        assert!(
+            stall_error(
+                RunPhase::AwaitingApproval,
+                Duration::from_secs(u64::MAX / 2),
+                0
+            )
+            .is_none(),
+            "the approval-wait phase must never trip (unbounded budget)"
+        );
+    }
+
+    /// A foreground `invoke_agent` in the batch makes it "blocking" — the batch
+    /// cannot return until the subagent completes, so it must be excluded from
+    /// the P3 ceiling. Absent / `false` / unparseable `background` all count as
+    /// foreground (the safe direction). (#1150)
+    #[test]
+    fn foreground_invoke_agent_batch_is_blocking() {
+        for args in [
+            r#"{"task":"x"}"#,                     // background absent
+            r#"{"task":"x","background":false}"#,  // explicit false
+            r#"{"task":"x","background":"true"}"#, // non-bool -> foreground
+            "{}",                                  // empty object
+            "",                                    // empty / no args
+            "not json",                            // unparseable -> foreground
+        ] {
+            let calls = vec![ToolCall::new("c1", "invoke_agent", args)];
+            assert!(
+                batch_has_blocking_invoke_agent(&calls, &[]),
+                "args {args:?} must classify as a blocking foreground invoke_agent"
+            );
+        }
+    }
+
+    /// A background (`background: true`) `invoke_agent` returns immediately, so
+    /// it does NOT make the batch blocking — the batch stays in the normal P3
+    /// phase.
+    #[test]
+    fn background_invoke_agent_batch_is_not_blocking() {
+        let calls = vec![ToolCall::new(
+            "c1",
+            "invoke_agent",
+            r#"{"task":"x","background":true}"#,
+        )];
+        assert!(!batch_has_blocking_invoke_agent(&calls, &[]));
+    }
+
+    /// A batch with no `invoke_agent` is never blocking, however long its tools
+    /// run — that is exactly what the P3 ceiling is for.
+    #[test]
+    fn non_invoke_agent_batch_is_not_blocking() {
+        let calls = vec![
+            ToolCall::new("c1", "echo", r#"{"message":"hi"}"#),
+            ToolCall::new("c2", "sleep_tool", "{}"),
+        ];
+        assert!(!batch_has_blocking_invoke_agent(&calls, &[]));
+    }
+
+    /// A foreground `invoke_agent` alongside other tools still makes the whole
+    /// batch blocking — `run_tool_calls` does not return until every tool
+    /// (including the subagent) completes, so the P3 ceiling can never bound it.
+    #[test]
+    fn mixed_batch_with_foreground_invoke_agent_is_blocking() {
+        let calls = vec![
+            ToolCall::new("c1", "echo", r#"{"message":"hi"}"#),
+            ToolCall::new("c2", "invoke_agent", r#"{"task":"x"}"#),
+        ];
+        assert!(batch_has_blocking_invoke_agent(&calls, &[]));
+    }
+
+    /// A DM-conflicting `invoke_agent` slot will not execute, so it must not
+    /// count as a blocking call — mirrors the executing-set filter the loop
+    /// uses for the status emit.
+    #[test]
+    fn conflicting_foreground_invoke_agent_is_excluded() {
+        let calls = vec![ToolCall::new("c1", "invoke_agent", r#"{"task":"x"}"#)];
+        assert!(!batch_has_blocking_invoke_agent(&calls, &[0]));
+    }
+
+    /// The background-flag parse matches `InvokeAgentTool`'s own
+    /// (`background` must be a literal boolean `true`); everything else is
+    /// foreground.
+    #[test]
+    fn background_flag_parse_matches_invoke_agent_tool() {
+        assert!(invoke_agent_call_is_background(r#"{"background":true}"#));
+        assert!(!invoke_agent_call_is_background(r#"{"background":false}"#));
+        assert!(!invoke_agent_call_is_background(r#"{"background":"true"}"#));
+        assert!(!invoke_agent_call_is_background(r#"{"background":1}"#));
+        assert!(!invoke_agent_call_is_background(r#"{"task":"x"}"#));
+        assert!(!invoke_agent_call_is_background("not json"));
+        assert!(!invoke_agent_call_is_background(""));
+    }
+
+    /// A realistic auto-approved set for the predicate tests — mirrors the
+    /// inherently-safe tools the sandbox auto-approves (`echo`, `datetime`,
+    /// read-only tools). `shell` / `fs_write` are NOT auto-approved and so
+    /// route through the Guarded approval gate.
+    fn is_auto_approved(name: &str) -> bool {
+        matches!(name, "echo" | "datetime" | "read_session")
+    }
+
+    /// Regression (#1150): a Guarded-posture run whose tool batch blocks on
+    /// **human approval** must NOT stall-fail when the human takes longer than
+    /// the P3 tool-phase ceiling to approve. The batch is classified as needing
+    /// approval, so the call site selects the unbounded `AwaitingApproval`
+    /// phase (budget 0) and an idle window far past `tool_phase_ceiling_secs`
+    /// (here an hour, well over the 900s default) still never trips. The 24h
+    /// `max_run_duration_secs` backstop still bounds a truly-abandoned
+    /// approval. Mirrors the foreground-`invoke_agent` exemption.
+    #[test]
+    fn guarded_approval_wait_past_p3_ceiling_does_not_stall() {
+        // A Guarded batch with a gated (non-auto-approved) tool needs approval.
+        let calls = vec![ToolCall::new("c1", "shell", r#"{"command":"ls"}"#)];
+        assert!(
+            batch_needs_approval(Posture::Guarded, &calls, &[], is_auto_approved),
+            "a Guarded batch with a gated tool must route through the approval gate"
+        );
+        // So the run sits in the unbounded AwaitingApproval phase (budget 0),
+        // and an approval wait an hour past the 900s P3 ceiling does not stall.
+        assert!(
+            stall_error(RunPhase::AwaitingApproval, Duration::from_secs(3600), 0).is_none(),
+            "an approval wait an hour past the P3 ceiling must not stall-fail"
+        );
+    }
+
+    /// A Guarded batch of only auto-approved tools never blocks on a human, so
+    /// it does NOT need approval and stays under the normal P3 ceiling.
+    #[test]
+    fn guarded_batch_of_auto_approved_tools_does_not_need_approval() {
+        let calls = vec![
+            ToolCall::new("c1", "echo", r#"{"message":"hi"}"#),
+            ToolCall::new("c2", "datetime", "{}"),
+        ];
+        assert!(!batch_needs_approval(
+            Posture::Guarded,
+            &calls,
+            &[],
+            is_auto_approved
+        ));
+    }
+
+    /// Only Guarded posture has a human-approval gate; FullControl and
+    /// Autonomous execute tools without approval, so their batches are never
+    /// approval-blocked and stay under the normal P3 ceiling — even with a
+    /// gated tool present.
+    #[test]
+    fn non_guarded_postures_never_need_approval() {
+        let calls = vec![ToolCall::new("c1", "shell", r#"{"command":"ls"}"#)];
+        for posture in [Posture::FullControl, Posture::Autonomous] {
+            assert!(
+                !batch_needs_approval(posture, &calls, &[], is_auto_approved),
+                "{posture:?} has no approval gate, so the batch must not need approval"
+            );
+        }
+    }
+
+    /// A mixed Guarded batch needs approval as soon as *one* executing call is
+    /// gated — exactly the gate's per-call decision applied across the batch.
+    #[test]
+    fn guarded_mixed_batch_needs_approval_if_any_tool_is_gated() {
+        let calls = vec![
+            ToolCall::new("c1", "echo", r#"{"message":"hi"}"#), // auto-approved
+            ToolCall::new("c2", "fs_write", r#"{"path":"a","content":"b"}"#), // gated
+        ];
+        assert!(batch_needs_approval(
+            Posture::Guarded,
+            &calls,
+            &[],
+            is_auto_approved
+        ));
+    }
+
+    /// A DM-conflicting gated slot will not execute, so it must not count as
+    /// needing approval — mirrors the executing-set filter the loop uses for
+    /// the status emit and `batch_has_blocking_invoke_agent`.
+    #[test]
+    fn conflicting_gated_tool_is_excluded_from_approval() {
+        let calls = vec![ToolCall::new("c1", "shell", r#"{"command":"ls"}"#)];
+        assert!(!batch_needs_approval(
+            Posture::Guarded,
+            &calls,
+            &[0],
+            is_auto_approved
+        ));
+    }
+
+    /// The clock starts "now" (≈0 idle) and `touch` resets the idle window —
+    /// the mechanism that lets a long-but-productive run (steady token /
+    /// reasoning / tool-start signals) avoid tripping the phase timer.
+    #[tokio::test]
+    async fn touch_resets_idle_window() {
+        let clock = ActivityClock::new();
+        // Fresh clock: effectively no idle time has accumulated.
+        assert!(
+            clock.idle() < Duration::from_secs(1),
+            "a fresh clock must report ~0 idle"
+        );
+
+        // Let some idle accrue, then touch and confirm the window collapsed.
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        let before = clock.idle();
+        clock.touch();
+        let after = clock.idle();
+        assert!(
+            after < before,
+            "touch must shrink the idle window (before={before:?}, after={after:?})"
+        );
+        assert!(
+            after < Duration::from_millis(20),
+            "after touch the idle window must be near-zero, got {after:?}"
+        );
     }
 }

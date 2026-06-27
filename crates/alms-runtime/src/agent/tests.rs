@@ -47,7 +47,11 @@ async fn test_stream_llm_call_emits_token_deltas() {
         CompletionRequest::new("test").with_messages(vec![LlmMessage::user("hello world")]);
 
     let emitted = std::sync::atomic::AtomicBool::new(false);
-    let result = runtime.stream_llm_call(request, &emitted).await.unwrap();
+    let activity = super::loop_impl::ActivityClock::new();
+    let result = runtime
+        .stream_llm_call(request, &emitted, &activity)
+        .await
+        .unwrap();
 
     // Content should be the reassembled mock response
     assert_eq!(result.content.as_deref(), Some("[mock] hello world"));
@@ -6199,5 +6203,280 @@ async fn agent_loop_zero_caps_disable_both_limits() {
         call_count.load(std::sync::atomic::Ordering::SeqCst),
         4,
         "the loop must make all four LLM calls — three tool turns plus the final text"
+    );
+}
+
+/// Test-only tool that sleeps a fixed duration and emits no progress signal
+/// while it runs. Used by the #1150 phase-aware inactivity-timer integration
+/// tests to drive the `ExecutingTools` (P3) phase either past the
+/// `tool_phase_ceiling_secs` backstop (a stall trip) or comfortably under it
+/// (a productive run that survives). It reports `is_auto_approved() == true`
+/// so it runs under the default Guarded posture with no approval round-trip —
+/// exactly like the builtin `echo` the sibling B3 cap tests drive.
+#[derive(Debug)]
+struct SleepTool {
+    ms: u64,
+}
+
+#[async_trait::async_trait]
+impl alms_sandbox::Tool for SleepTool {
+    fn name(&self) -> &str {
+        "sleep_tool"
+    }
+    fn description(&self) -> &str {
+        "sleeps for a fixed duration (test only)"
+    }
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::json!({"type": "object", "properties": {}})
+    }
+    async fn execute(
+        &self,
+        _params: serde_json::Value,
+    ) -> alms_sandbox::error::SandboxResult<serde_json::Value> {
+        tokio::time::sleep(std::time::Duration::from_millis(self.ms)).await;
+        Ok(serde_json::json!({"ok": true}))
+    }
+    fn is_auto_approved(&self) -> bool {
+        true
+    }
+}
+
+/// A streaming SSE body that requests exactly one `sleep_tool` call and no
+/// final text, so the loop keeps iterating (the model never "finishes") and
+/// the phase-aware timer is what must stop it.
+const SLEEP_TOOL_SSE_BODY: &str = concat!(
+    "data: {\"id\":\"t\",\"object\":\"chat.completion.chunk\",\"created\":1,",
+    "\"model\":\"test-model\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",",
+    "\"tool_calls\":[{\"index\":0,\"id\":\"call_sleep\",\"type\":\"function\",",
+    "\"function\":{\"name\":\"sleep_tool\",\"arguments\":\"{}\"}}]},",
+    "\"finish_reason\":\"tool_calls\"}]}\n\n",
+    "data: [DONE]\n\n"
+);
+
+/// #1150 (P3 ceiling): the phase-aware inactivity timer terminates a run whose
+/// tool batch overruns the `tool_phase_ceiling_secs` backstop. A `sleep_tool`
+/// that runs ~1.3s — producing no token / reasoning / tool-start signal while
+/// it sleeps — against a 1-second ceiling leaves the run idle past the budget,
+/// so the next top-of-loop checkpoint, now in the `ExecutingTools` phase, trips
+/// with the distinct "stalled" error. The iteration / wall-clock / P1 caps are
+/// all disabled so this isolates P3. (No watchdog: the slow tool finishes
+/// first; the run is terminated at the following checkpoint, not mid-tool.)
+#[tokio::test]
+async fn agent_loop_inactivity_tool_ceiling_terminates_with_error() {
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base_url = format!("http://{}", listener.local_addr().unwrap());
+
+    // Serve the sleep-tool response on every accepted connection. Count the
+    // calls so we can assert the ceiling tripped right after the first batch.
+    let call_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let call_count_writer = call_count.clone();
+    tokio::spawn(async move {
+        loop {
+            let (mut sock, _) = match listener.accept().await {
+                Ok(s) => s,
+                Err(_) => return,
+            };
+            let _ = read_full_http_request(&mut sock).await;
+            call_count_writer.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+                SLEEP_TOOL_SSE_BODY.len(),
+                SLEEP_TOOL_SSE_BODY
+            );
+            let _ = sock.write_all(response.as_bytes()).await;
+            let _ = sock.shutdown().await;
+        }
+    });
+
+    let llm_config = LlmConfig {
+        base_url,
+        api_key: "test-key".to_string(),
+        default_model: "test-model".to_string(),
+        timeout_secs: 5,
+        stream_chunk_timeout_secs: 5,
+        ..LlmConfig::default()
+    };
+    let agent_config = AgentConfig {
+        sandbox_root: "".into(),
+        // Isolate the P3 ceiling: iteration / wall-clock / P1 all disabled.
+        max_iterations: 1000,
+        max_run_duration_secs: 0,
+        between_iterations_secs: 0,
+        tool_phase_ceiling_secs: 1,
+        ..AgentConfig::default()
+    };
+    let runtime = AgentRuntime::new(
+        AgentId::new(),
+        agent_config,
+        LlmClient::new(llm_config).unwrap(),
+    )
+    .unwrap()
+    .with_agent_name("bob".to_string())
+    .with_dm_implicit_reply();
+    // The slow tool sleeps past the 1-second ceiling.
+    runtime
+        .tools
+        .register(std::sync::Arc::new(SleepTool { ms: 1300 }));
+
+    let session_manager = SessionManager::new(SessionConfig::default());
+    let dm_context = "dm:alice:bob";
+    let session_id = alms_core::SessionId::deterministic_dm("alice", "bob");
+    let _session = session_manager.get_or_create_shared(session_id, dm_context);
+
+    let messages = vec![LlmMessage::system("You are bob."), LlmMessage::user("ping")];
+    let (_tool_calls, result) = runtime
+        .agent_loop(
+            &session_manager,
+            session_id,
+            messages,
+            /* is_dm */ true,
+            /* include_user */ false,
+            /* dm_peer */ Some("alice"),
+        )
+        .await;
+
+    let err = match result {
+        Ok(_) => panic!("the tool-phase ceiling must terminate the loop with an error"),
+        Err(e) => e,
+    };
+    assert!(
+        !matches!(err, alms_core::AlmsError::Cancelled),
+        "the ceiling trip must be a failure, not a cancellation; got {err:?}"
+    );
+    let msg = err.to_string();
+    assert!(
+        msg.contains("stalled") && msg.contains("executing tools"),
+        "error must identify the stalled tool phase; got: {msg}"
+    );
+
+    // The ceiling tripped at the FIRST checkpoint after the slow batch, so the
+    // loop made exactly one LLM call — it never reached a second turn.
+    assert_eq!(
+        call_count.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the loop must trip on the ceiling after exactly one tool round-trip"
+    );
+
+    // The sanitiser surfaces the distinct stalled label (not the iteration or
+    // time-limit labels, and not the generic "Runtime error").
+    assert_eq!(
+        alms_core::sanitize_error_for_session(&alms_core::AlmsError::Runtime(msg)),
+        "Agent stopped after stalling (no activity)"
+    );
+}
+
+/// #1150 (productive run survives): the inactivity timer must NOT clip a run
+/// that keeps making progress, even when the run's total wall-clock far
+/// exceeds the (small) inactivity budgets. A `sleep_tool` batch of ~400ms per
+/// turn stays comfortably under the 1-second P3 ceiling, and every turn
+/// produces activity (the tool-call response + the tool start), so no
+/// checkpoint ever trips the stall guard. Across four turns the run spans
+/// ~1.6s — well past the 1-second budgets — yet it terminates on the
+/// *iteration* cap, never on a stall. This is the regression guard for the
+/// whole point of #1150: replacing the flat wall-clock cap with a
+/// progress-aware one so long-but-productive runs are not killed.
+#[tokio::test]
+async fn agent_loop_inactivity_productive_run_survives() {
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base_url = format!("http://{}", listener.local_addr().unwrap());
+
+    let call_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let call_count_writer = call_count.clone();
+    tokio::spawn(async move {
+        loop {
+            let (mut sock, _) = match listener.accept().await {
+                Ok(s) => s,
+                Err(_) => return,
+            };
+            let _ = read_full_http_request(&mut sock).await;
+            call_count_writer.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+                SLEEP_TOOL_SSE_BODY.len(),
+                SLEEP_TOOL_SSE_BODY
+            );
+            let _ = sock.write_all(response.as_bytes()).await;
+            let _ = sock.shutdown().await;
+        }
+    });
+
+    const MAX_ITERS: u32 = 4;
+    let llm_config = LlmConfig {
+        base_url,
+        api_key: "test-key".to_string(),
+        default_model: "test-model".to_string(),
+        timeout_secs: 5,
+        stream_chunk_timeout_secs: 5,
+        ..LlmConfig::default()
+    };
+    let agent_config = AgentConfig {
+        sandbox_root: "".into(),
+        // Small inactivity budgets (1s each) and the wall-clock backstop
+        // disabled, so ONLY the iteration cap can stop a productive run. If the
+        // inactivity timer were progress-blind it would trip long before the
+        // 4th turn; that it does not is the property under test.
+        max_iterations: MAX_ITERS,
+        max_run_duration_secs: 0,
+        between_iterations_secs: 1,
+        tool_phase_ceiling_secs: 1,
+        ..AgentConfig::default()
+    };
+    let runtime = AgentRuntime::new(
+        AgentId::new(),
+        agent_config,
+        LlmClient::new(llm_config).unwrap(),
+    )
+    .unwrap()
+    .with_agent_name("bob".to_string())
+    .with_dm_implicit_reply();
+    // ~400ms per batch: under the 1-second ceiling, but four of them span
+    // ~1.6s — comfortably past the 1-second budgets.
+    runtime
+        .tools
+        .register(std::sync::Arc::new(SleepTool { ms: 400 }));
+
+    let session_manager = SessionManager::new(SessionConfig::default());
+    let dm_context = "dm:alice:bob";
+    let session_id = alms_core::SessionId::deterministic_dm("alice", "bob");
+    let _session = session_manager.get_or_create_shared(session_id, dm_context);
+
+    let messages = vec![LlmMessage::system("You are bob."), LlmMessage::user("ping")];
+    let (_tool_calls, result) = runtime
+        .agent_loop(
+            &session_manager,
+            session_id,
+            messages,
+            /* is_dm */ true,
+            /* include_user */ false,
+            /* dm_peer */ Some("alice"),
+        )
+        .await;
+
+    let err = match result {
+        Ok(_) => panic!("the loop must terminate on the iteration cap, not run forever"),
+        Err(e) => e,
+    };
+    let msg = err.to_string();
+    // It survived every inactivity checkpoint and stopped on the iteration cap.
+    assert!(
+        msg.contains("iteration") && msg.contains(&MAX_ITERS.to_string()),
+        "a productive run must terminate on the iteration cap, not a stall; got: {msg}"
+    );
+    assert!(
+        !msg.contains("stalled"),
+        "the inactivity timer must NOT clip a productive run; got: {msg}"
+    );
+    assert_eq!(
+        call_count.load(std::sync::atomic::Ordering::SeqCst),
+        MAX_ITERS as usize,
+        "all four productive turns must run before the iteration cap trips"
     );
 }

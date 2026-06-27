@@ -254,18 +254,61 @@ pub struct LlmConfig {
     /// including deep autonomous turns. `0` disables the cap (no limit).
     /// Inherited by subagents.
     pub max_iterations: u32,
-    /// Hard cap on the wall-clock duration of a single agent run, in seconds
-    /// (#987 / B3). `0` disables the cap.
+    /// Absolute wall-clock backstop on a single agent run, in seconds
+    /// (#987 / B3, repurposed in #1150). `0` disables it.
     ///
-    /// Complements [`Self::max_iterations`]: the iteration cap bounds the
-    /// step count, this bounds total elapsed time so a run that makes slow
-    /// forward progress (e.g. each step just under the per-step timeout)
-    /// still terminates. Checked between iterations; an in-flight LLM/tool
-    /// step is bounded by its own per-step timeout, so the effective ceiling
-    /// is this value plus at most one step. Default 14400 (4 hours) — a
-    /// generous ceiling sized for all run types, including long-running
-    /// scheduled jobs. Inherited by subagents.
+    /// Since #1150 the *primary* run-duration guard is **inactivity-based**
+    /// (see [`Self::between_iterations_secs`] and
+    /// [`Self::tool_phase_ceiling_secs`]): a run is terminated when it stops
+    /// making progress for the relevant phase budget, not when total
+    /// wall-clock elapses. A run that keeps producing tokens / starting tools
+    /// indefinitely is therefore *not* killed by the inactivity guard — that
+    /// only happens if the agent is genuinely wedged in a productive-looking
+    /// loop (a bug). This value is the coarse backstop that catches exactly
+    /// that case.
+    ///
+    /// Checked between iterations alongside the inactivity check; an
+    /// in-flight LLM/tool step is bounded by its own per-step timeout, so the
+    /// effective ceiling is this value plus at most one step. Default 86400
+    /// (24 hours) — a deliberately generous ceiling that legitimate
+    /// long-running scheduled jobs never reach; raised from 4h in #1150 now
+    /// that inactivity (not wall-clock) is what stops a wedged run. Inherited
+    /// by subagents.
     pub max_run_duration_secs: u64,
+    /// Inactivity budget, in seconds, for the **between-iterations** phase of
+    /// an agent run — the P1 budget of the phase-aware run timer (#1150).
+    ///
+    /// Evaluated at the top-of-loop checkpoint: if the run has produced no
+    /// progress signal (a streamed token / reasoning delta, an LLM response,
+    /// or a tool start) for at least this many seconds while resting between
+    /// iterations, the run is terminated with a "stalled" error. Unlike the
+    /// old wall-clock cap this resets on every progress signal, so a long but
+    /// *productive* run is never clipped. `0` disables the P1 budget.
+    ///
+    /// Default 180 (3 minutes). Config-file-only — not mutable via
+    /// `PATCH /settings`. Inherited by subagents.
+    pub between_iterations_secs: u64,
+    /// Coarse ceiling, in seconds, on the **tool-execution** phase of an
+    /// agent run — the P3 budget of the phase-aware run timer (#1150).
+    ///
+    /// Reset at tool-batch start and evaluated at the next top-of-loop
+    /// checkpoint, so it bounds how long a single tool batch may run before
+    /// the run is terminated as stalled. Timed tools (e.g. `shell`, which is
+    /// itself capped at `MAX_TIMEOUT_SECS`) finish first under their own
+    /// timeout; this ceiling is the backstop for the currently-untimed
+    /// `fs_*` tools (their per-tool timeouts are tracked separately in
+    /// #1173). `0` disables the P3 ceiling.
+    ///
+    /// Default 900 (15 minutes) — deliberately set *above* the longest single
+    /// tool timeout (the shell tool's 600s `MAX_TIMEOUT_SECS`), not equal to
+    /// it: a 600s ceiling would false-stall a `shell` command that legitimately
+    /// ran to its own 600s cap, because the batch then completes and the next
+    /// checkpoint sees `idle == ceiling`, which trips. The 5-minute margin
+    /// keeps this backstop clear of every per-tool timeout (`http_get` ≈ 30s,
+    /// background `shell` ≈ 5s; `fs_*` is currently untimed).
+    /// Config-file-only — not mutable via `PATCH /settings`. Inherited by
+    /// subagents.
+    pub tool_phase_ceiling_secs: u64,
     /// Per-chunk body-read inactivity timeout (seconds) — the window within
     /// which the response *body* must keep making progress, reset after every
     /// successful read.
@@ -334,10 +377,21 @@ impl Default for LlmConfig {
             // the #987 "run forever" class without clipping legitimate long
             // multi-tool work.
             max_iterations: 500,
-            // 4 hours — generous wall-clock ceiling sized for all run types,
-            // including long-running scheduled jobs, while still terminating a
-            // wedged run that makes no forward progress.
-            max_run_duration_secs: 14400,
+            // 24 hours — absolute backstop only (#1150). Inactivity, not
+            // wall-clock, is what now stops a wedged run; this just catches a
+            // run that pings activity forever (a bug). Raised from 4h so a
+            // legitimate long-running scheduled job is never clipped.
+            max_run_duration_secs: 86400,
+            // Phase-aware inactivity budgets (#1150). P1 between-iterations
+            // idle = 3 min; P3 tool-batch ceiling = 15 min — deliberately a
+            // margin *above* the longest single-tool timeout (shell's 600s
+            // MAX_TIMEOUT_SECS) so a tool run to its own cap completes and
+            // reports back before this ceiling is evaluated; an equal 600s
+            // would false-stall such a run at `idle == ceiling`. The P0
+            // awaiting-first-activity budget is derived
+            // (stream_chunk_timeout_secs + 30s slack), not a knob.
+            between_iterations_secs: 180,
+            tool_phase_ceiling_secs: 900,
             mock: false,
             stream_chunk_timeout_secs: 60,
             providers: BTreeMap::new(),
