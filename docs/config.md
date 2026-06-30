@@ -100,7 +100,7 @@ Before #1150, `max_run_duration_secs` was a **flat wall-clock cap** (default 4h)
 
 | Phase | When | Budget |
 |---|---|---|
-| **P0** awaiting first activity | iteration 1, before the run has produced anything | *derived*: `stream_chunk_timeout_secs + 30s` (≈90s with defaults) — not a knob, so it tracks the LLM idle timeout. A first LLM call that hangs *before* its first byte is bounded by the per-request HTTP guards (`timeout_secs` / `stream_chunk_timeout_secs`), not this check. |
+| **P0** awaiting first activity | iteration 1, before the run has produced anything | *derived*: `stream_chunk_timeout_secs + 30s` (≈210s with defaults) — not a knob, so it tracks the LLM idle timeout. A first LLM call that hangs *before* its first byte is bounded by the per-request HTTP guards (`timeout_secs` / `stream_chunk_timeout_secs`), not this check. |
 | **P1** between iterations | resting between iterations | `between_iterations_secs` |
 | **P2** mid-LLM-call | a streamed response is arriving | *no independent timer* — every token / reasoning delta resets the activity clock, so a long-but-productive stream is never clipped. A stream that **stalls** (no chunk for `stream_chunk_timeout_secs`) is faulted by the per-chunk body-read guard (#1169) instead. |
 | **P3** executing a tool batch | a tool batch is running | `tool_phase_ceiling_secs` |
@@ -123,18 +123,20 @@ Each individual LLM call is bounded by two complementary `[llm]` timeouts:
 
 ```toml
 [llm]
-timeout_secs             = 120  # total per-request deadline (also bounds time-to-first-byte)
-stream_chunk_timeout_secs = 60  # per-chunk BODY-read inactivity timeout
+timeout_secs             = 600  # total per-request deadline (also bounds time-to-first-byte)
+stream_chunk_timeout_secs = 180  # per-chunk BODY-read inactivity timeout
 ```
 
 | Knob | Default | Bounds |
 |---|---|---|
-| `timeout_secs` | `120` | **Total** per-request deadline — the whole call (connect + headers + full response body) must complete within this window (reqwest's `.timeout()`). It is also the **only** bound on the connect / header / time-to-first-byte wait, so it is the outer bound for a response that is healthy-but-large *or* healthy-but-slow-to-start. |
-| `stream_chunk_timeout_secs` | `60` | **Per-chunk body-read inactivity** timeout, reset after every successful read, applied **only to the response body** — never to the header/first-byte wait. On the streaming path it is the per-chunk SSE stall timeout; on the **non-streaming (buffered)** path the body is drained as a chunk stream under the same per-chunk guard, so a body that starts arriving then stalls mid-transfer faults within this window too. |
+| `timeout_secs` | `600` | **Total** per-request deadline — the whole call (connect + headers + full response body) must complete within this window (reqwest's `.timeout()`). It is the only bound on the **post-connect** header / time-to-first-byte wait, so it is the outer bound for a response that is healthy-but-large *or* healthy-but-slow-to-start. (TCP+TLS connect is bounded tighter by a fixed 30s client connect timeout — a const, not a knob — so a dead/unreachable provider fails in ~30s rather than after this whole window; #1177.) This is a per-*call* deadline, **not** a run cap; raised `120 → 600` in #1177 because heavy reasoning models (`minimax/minimax-m3` on openrouter) legitimately reason past 120s. |
+| `stream_chunk_timeout_secs` | `180` | **Per-chunk body-read inactivity** timeout, reset after every successful read, applied **only to the response body** — never to the header/first-byte wait. On the streaming path it is the per-chunk SSE stall timeout; on the **non-streaming (buffered)** path the body is drained as a chunk stream under the same per-chunk guard, so a body that starts arriving then stalls mid-transfer faults within this window too. Raised `60 → 180` in #1177 (also lifts the derived P0 budget `90 → 210s`). |
 
 Before #1163 the buffered (non-streaming) path had no body-read inactivity guard at all, so a slow/stalled **non-streaming** response body (seen with `minimax/minimax-m3` on openrouter, which returned a buffered `application/json` body that never finished arriving) hung for the *entire* `timeout_secs` window before failing with `LLM response decode failed … operation timed out`. The fix drains the buffered body as a chunk stream under the same per-chunk inactivity timeout the streaming path already used, so a stalled body — on **either** path — surfaces a clear error within `stream_chunk_timeout_secs` instead of dead-airing until the total deadline.
 
 The guard is deliberately **body-only** (not a client-level reqwest `.read_timeout()`, which would also cap the header / time-to-first-byte wait). A response that is *slow to send its first byte* — a non-streaming upstream that buffers the whole completion before sending headers, or a slow reasoning model — is therefore governed by `timeout_secs`, not `stream_chunk_timeout_secs`. Raise `stream_chunk_timeout_secs` for upstreams that stream/arrive in slow trickles once they've started; raise `timeout_secs` for upstreams that are simply slow to begin responding (or that return one large buffered body).
+
+The agent loop attempts streaming first and falls back to a buffered `complete()` on a streaming failure. When the streaming attempt blew the **total `timeout_secs`** deadline (a reqwest `operation timed out`), that buffered re-issue is **futile** — it waits out the same deadline and fails identically — so the loop short-circuits and surfaces the diagnostic immediately (#1162 / #1163 / #1177). Every other streaming failure keeps the fallback: a per-chunk **stall** (a token gap past `stream_chunk_timeout_secs`) can still recover, because the buffered path is non-streaming and its header/first-byte wait is bounded by the full `timeout_secs` — a slow-*generating* model's mid-stream silence is absorbed there, then the body arrives in a burst; *decode* faults (connection reset, malformed/truncated JSON, gzip failure) can likewise succeed on a fresh request.
 
 ---
 

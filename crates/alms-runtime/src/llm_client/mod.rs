@@ -47,14 +47,29 @@ pub struct LlmClient {
     gemini_cache: GeminiCacheStore,
 }
 
+/// TCP + TLS connection-establishment timeout for the LLM HTTP client.
+///
+/// Bounds **only** connection setup, so a dead / unreachable provider (wrong
+/// `base_url`, host down) fails in ~30s instead of waiting out the full
+/// `timeout_secs` total deadline. It does NOT bound the post-connect header /
+/// time-to-first-byte wait — a host that connects then hangs silently is still
+/// a `timeout_secs` case (#1163). Connect time is environment-fixed, not
+/// model/operator-tunable, so this is a const rather than a config knob (#1178).
+const CONNECT_TIMEOUT_SECS: u64 = 30;
+
 impl LlmClient {
     /// Create new LLM client with config
     pub fn new(mut config: LlmConfig) -> AlmsResult<Self> {
-        // The only reqwest-level deadline is the *total* `.timeout()` —
-        // "from when the request starts connecting until the response body has
-        // finished". It bounds the whole call (connect + headers + full body)
-        // at `timeout_secs`, and is the documented outer bound that governs
-        // time-to-first-byte for a healthy-but-slow-to-start response.
+        // Two reqwest-level deadlines are set. The *total* `.timeout()` bounds
+        // the whole call (connect + headers + full body) at `timeout_secs` and
+        // is the outer bound that governs time-to-first-byte for a
+        // healthy-but-slow-to-start response. `.connect_timeout()` adds a
+        // tighter sub-bound (`CONNECT_TIMEOUT_SECS`) on TCP + TLS setup only, so
+        // a dead / unreachable provider fails in ~30s rather than eating the
+        // full `timeout_secs` — it does NOT touch the post-connect header /
+        // first-byte wait, which stays bounded solely by the total
+        // `timeout_secs` (a host that connects then hangs silently is still a
+        // `timeout_secs` case).
         //
         // The per-read inactivity guard for a *stalled* body (#1163) is NOT
         // set here as a client-level `.read_timeout()`. reqwest's client-level
@@ -74,6 +89,7 @@ impl LlmClient {
         // stays bounded only by the total `timeout_secs`.
         let client = Client::builder()
             .timeout(std::time::Duration::from_secs(config.timeout_secs))
+            .connect_timeout(std::time::Duration::from_secs(CONNECT_TIMEOUT_SECS))
             .build()
             .map_err(|e| AlmsError::Runtime(format!("Failed to create HTTP client: {}", e)))?;
 

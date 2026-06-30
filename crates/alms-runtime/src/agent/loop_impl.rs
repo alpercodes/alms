@@ -469,14 +469,47 @@ fn buffered_fallback_reconcile_events(
     events
 }
 
+/// Whether a streaming-attempt error is a reqwest **total/connect timeout**
+/// (renders `operation timed out`) — the only class where the buffered
+/// `complete()` fallback is genuinely futile. A total timeout proves the whole
+/// call already exceeded `timeout_secs`, so a buffered re-issue waits out the
+/// same deadline and fails identically (#1162 / #1163, minimax-m3 on
+/// openrouter); `call_llm_with_cancellation` short-circuits it.
+///
+/// Deliberately does NOT match a streaming per-chunk **stall** (`stream
+/// stalled`): the buffered path is non-streaming, so its first-byte wait
+/// (`req.send()`) is bounded by the full `timeout_secs`, not the per-chunk
+/// guard — a slow-*generating* model whose stream went quiet can still recover
+/// on the re-issue (the silence falls in the header wait, then the body bursts
+/// in). Decode faults (connection reset, malformed JSON, gzip) recover too.
+///
+/// Gated on the `AlmsError::Runtime` transport/decode variant: every genuine
+/// timeout signal (total/connect, body-stall, send-phase) is `Runtime`
+/// (`streaming.rs`, `mod.rs`), while a non-2xx provider response is
+/// `AlmsError::SubagentLlmError` and is excluded by construction — its `Display`
+/// carries the raw provider body, which must never short-circuit. Within the
+/// `Runtime` string the model's partial output (a decode error's
+/// `body_prefix="…"`) is stripped before matching, so only the trusted formatter
+/// prefix + reqwest error chain is inspected — closing the untrusted-content
+/// class (Codex P2 on #1177). Anchored on the exact `operation timed out`
+/// phrase; test-pinned.
+fn stream_error_is_timeout(err: &AlmsError) -> bool {
+    let AlmsError::Runtime(s) = err else {
+        return false;
+    };
+    s.split_once("body_prefix=")
+        .map_or(s.as_str(), |(head, _)| head)
+        .contains("operation timed out")
+}
+
 impl AgentRuntime {
     /// Inactivity budget, in seconds, for the given run phase (#1150).
     /// `0` means the phase has no inactivity budget (disabled / not bounded by
     /// this timer).
     ///
     /// - **P0** is *derived*, not a knob: `stream_chunk_timeout_secs + 30s`
-    ///   slack, so it tracks the LLM idle timeout (with the 60s default it is
-    ///   ~90s). A hung first call still defers to the per-request HTTP guards
+    ///   slack, so it tracks the LLM idle timeout (with the 180s default it is
+    ///   ~210s). A hung first call still defers to the per-request HTTP guards
     ///   (#1163/#1169) because the checkpoint only runs *between* iterations.
     /// - **P1** = `between_iterations_secs`.
     /// - **P3** = `tool_phase_ceiling_secs`.
@@ -1101,6 +1134,22 @@ impl AgentRuntime {
         match stream_result {
             Ok(result) => Ok(result),
             Err(e) => {
+                // A reqwest *total* timeout re-stalls the same way on a buffered
+                // re-issue (it waits out the same `.timeout()` deadline), so skip
+                // the futile fallback and surface the diagnostic now. Everything
+                // else keeps the fallback — a per-chunk *stall* is recoverable
+                // (the buffered first-byte wait absorbs mid-generation silence)
+                // and decode faults can succeed fresh (#1162 / #1163). Any
+                // already-painted partial is left to the run-failure path, as it
+                // is today when the buffered retry also errors before the
+                // reconcile.
+                if stream_error_is_timeout(&e) {
+                    warn!(
+                        "Streaming timed out/stalled; skipping the buffered \
+                         fallback (a re-issue would re-stall the same way): {e}"
+                    );
+                    return Err(e);
+                }
                 warn!("Streaming failed, falling back to buffered: {}", e);
                 let response = if let Some(ref token) = self.cancel_token {
                     tokio::select! {
@@ -2933,6 +2982,126 @@ mod buffered_fallback_reconcile_tests {
         let events_none = buffered_fallback_reconcile_events(true, None, None);
         assert_eq!(events_none.len(), 1, "only the reset when both are None");
         assert!(matches!(events_none[0], RuntimeEvent::StreamReset { .. }));
+    }
+}
+
+#[cfg(test)]
+mod stream_error_classification_tests {
+    use super::stream_error_is_timeout;
+    use alms_core::AlmsError;
+
+    /// Reported #1163 case: reqwest's total `.timeout()` tripped mid-body →
+    /// `operation timed out`. Timeout-class.
+    #[test]
+    fn reqwest_total_deadline_timeout_is_timeout_class() {
+        let err = AlmsError::Runtime(
+            "LLM stream decode failed [provider=openrouter model=minimax/minimax-m3 \
+             bytes_read=221629]: error decoding response body: request or response \
+             body error: operation timed out"
+                .to_string(),
+        );
+        assert!(stream_error_is_timeout(&err));
+    }
+
+    /// A streaming per-chunk stall (`LLM stream stalled … partial response
+    /// discarded`) is **not** the total-timeout class — it can recover on a
+    /// non-streaming re-issue, so it must NOT short-circuit (Codex P2). Note it
+    /// carries no `operation timed out` phrase.
+    #[test]
+    fn synthetic_per_chunk_stall_is_not_timeout_class() {
+        let err = AlmsError::Runtime(
+            "LLM stream stalled [provider=openrouter model=minimax/minimax-m3 \
+             bytes_read=4096] (no data for 180s) — partial response discarded"
+                .to_string(),
+        );
+        assert!(!stream_error_is_timeout(&err));
+    }
+
+    /// A `send()`-phase (header-wait) timeout → `HTTP request failed: …
+    /// operation timed out`. Timeout-class.
+    #[test]
+    fn send_phase_timeout_is_timeout_class() {
+        let err = AlmsError::Runtime(
+            "HTTP request failed: error sending request for url (https://openrouter.ai): \
+             operation timed out"
+                .to_string(),
+        );
+        assert!(stream_error_is_timeout(&err));
+    }
+
+    /// A mid-stream connection reset is a *decode* fault — keep the fallback.
+    #[test]
+    fn connection_reset_is_decode_class() {
+        let err = AlmsError::Runtime(
+            "LLM stream decode failed [provider=openrouter model=minimax/minimax-m3 \
+             bytes_read=10]: error decoding response body: error reading a body from \
+             connection: connection reset by peer"
+                .to_string(),
+        );
+        assert!(!stream_error_is_timeout(&err));
+    }
+
+    /// A malformed/truncated JSON body (#1162 sym-2): decode-class, keep the
+    /// fallback.
+    #[test]
+    fn malformed_json_parse_is_decode_class() {
+        let err = AlmsError::Runtime(
+            "LLM response parse failed (OpenAI) [provider=openai model=gpt-4o status=200]: \
+             expected value at line 1 column 1"
+                .to_string(),
+        );
+        assert!(!stream_error_is_timeout(&err));
+    }
+
+    /// Empty-choices is decode-class (non-timeout) — must not short-circuit.
+    #[test]
+    fn empty_choices_is_decode_class() {
+        let err = AlmsError::Runtime("LLM returned empty choices array".to_string());
+        assert!(!stream_error_is_timeout(&err));
+    }
+
+    /// Anchor precision: a decode fault whose `body_prefix` merely contains the
+    /// word "timeout" stays non-timeout (the anchor is the exact `operation
+    /// timed out` phrase).
+    #[test]
+    fn decode_fault_with_timeout_word_in_body_prefix_is_decode_class() {
+        let err = AlmsError::Runtime(
+            "LLM stream decode failed [provider=openrouter model=minimax/minimax-m3 \
+             bytes_read=42]: error decoding response body: connection reset by peer; \
+             body_prefix=\"data: {\\\"content\\\":\\\"the request will timeout soon\\\"}\""
+                .to_string(),
+        );
+        assert!(!stream_error_is_timeout(&err));
+    }
+
+    /// Codex P2 on #1177: a decode fault (connection reset) whose `body_prefix`
+    /// carries the **exact** phrase `operation timed out` — the model was
+    /// discussing timeouts — must stay non-timeout so the recoverable buffered
+    /// fallback is NOT skipped. The transport portion (before `body_prefix=`)
+    /// has no timeout, so stripping it is what makes this `false`; the test
+    /// fails if the strip is removed.
+    #[test]
+    fn decode_fault_with_exact_timeout_phrase_in_body_prefix_is_not_timeout_class() {
+        let err = AlmsError::Runtime(
+            "LLM stream decode failed [provider=openrouter model=minimax/minimax-m3 \
+             bytes_read=64]: error decoding response body: error reading a body from \
+             connection: connection reset by peer; \
+             body_prefix=\"data: {\\\"content\\\":\\\"the operation timed out, i think\\\"}\""
+                .to_string(),
+        );
+        assert!(!stream_error_is_timeout(&err));
+    }
+
+    /// Codex P2 on #1177: a non-2xx provider response is
+    /// `AlmsError::SubagentLlmError`, whose `Display` carries the raw provider
+    /// body. Even if that body says `operation timed out` (a 504 / proxy timeout
+    /// page) it must classify NOT-timeout so the buffered fallback still runs —
+    /// only `AlmsError::Runtime` transport errors may short-circuit. Fails if the
+    /// variant gate is removed.
+    #[test]
+    fn subagent_llm_error_with_timeout_phrase_in_body_is_not_timeout_class() {
+        let err = AlmsError::subagent_llm_error("openrouter", 504, "upstream operation timed out");
+        assert!(!stream_error_is_timeout(&err));
     }
 }
 

@@ -732,9 +732,12 @@ impl Default for LlmConfig {
             api_key: String::new(),
             base_url: "https://openrouter.ai/api/v1".to_string(),
             default_model: "moonshotai/kimi-k2.6".to_string(),
-            timeout_secs: 120,
+            // Mirror of `alms_core::config::LlmConfig` defaults — keep in sync.
+            // 600s = per-call HTTP deadline (heavy reasoning models); 180s =
+            // per-chunk body-silence guard. See that type's rustdoc (#1163).
+            timeout_secs: 600,
             mock: false,
-            stream_chunk_timeout_secs: 60,
+            stream_chunk_timeout_secs: 180,
             auth_scheme: alms_core::config::AuthScheme::default(),
             quirks: alms_core::config::ProviderQuirks::default(),
             providers: std::collections::BTreeMap::new(),

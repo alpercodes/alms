@@ -1236,7 +1236,7 @@ Returns current server defaults for UI pre-population.
   "max_tokens": 4096,
   "posture": "guarded",
   "context_strategy": "truncate",
-  "stream_chunk_timeout_secs": 60,
+  "stream_chunk_timeout_secs": 180,
   "enabled_tools": ["datetime", "echo", "fs_edit", "fs_glob", "fs_grep", "fs_list", "fs_read", "fs_write", "http_get", "math", "shell_exec", "invoke_agent", "read_subagent_session", "workspace_write", "list_my_sessions", "read_session", "send_message", "list_agents", "read_messages", "ignore_message"],
   "agent_id": "<uuid>",
   "agents": [{"name": "main", "id": "<uuid>", "is_default": true, "model": null, "needs_bootstrap": false}],

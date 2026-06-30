@@ -18,8 +18,8 @@ provider = "openrouter"
 base_url = "https://openrouter.ai/api/v1"
 # model identifier
 model = "moonshotai/kimi-k2.6"
-# request timeout
-timeout_secs = 120
+# total per-call request deadline (seconds): connect + headers + full body
+timeout_secs = 600
 # retry count on transient failures
 max_retries = 2
 # token budget per run (0 = unlimited)
@@ -29,7 +29,7 @@ mock = false
 # per-chunk SSE read timeout (seconds). If no data arrives within this
 # window, the stream is treated as stalled and terminated. Increase for
 # slow reasoning models or high-latency connections.
-stream_chunk_timeout_secs = 60
+stream_chunk_timeout_secs = 180
 # Agent-loop hard caps (#987 / B3). These bound a SINGLE agent run so a run
 # that keeps calling tools without ever producing a final reply terminates
 # instead of hanging forever. They apply to ALL run types — web chat, cron

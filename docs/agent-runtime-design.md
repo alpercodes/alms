@@ -24,7 +24,7 @@ bind = "127.0.0.1:8080"
 # base_url = "https://openrouter.ai/api/v1"
 # model = "moonshotai/kimi-k2.6"
 # api_key loaded from secrets store via `alms auth set` (never in config file)
-timeout_secs = 120
+timeout_secs = 600
 max_retries = 2
 # Token budget per run (0 = unlimited)
 max_tokens_per_run = 0

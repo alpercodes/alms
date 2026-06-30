@@ -5984,6 +5984,243 @@ async fn agent_loop_iteration_cap_terminates_with_error() {
     );
 }
 
+/// #1162 / #1163 + Codex P2: a streaming per-chunk **stall** must FALL THROUGH
+/// to the buffered `complete()` fallback and can recover there. The buffered
+/// path is non-streaming, so its first-byte wait (`req.send()`) is bounded by
+/// the full `timeout_secs`, not the per-chunk guard — a slow-*generating* model
+/// whose stream went quiet still succeeds on the re-issue. The mock stalls the
+/// first (streaming) call past the 1s per-chunk window, then returns a complete
+/// non-streaming JSON on the second (buffered) call; the run must succeed with
+/// that content, having made exactly TWO upstream calls.
+#[tokio::test]
+async fn agent_loop_stalled_stream_falls_back_to_buffered_and_recovers() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::TcpListener;
+
+    // A valid SSE prefix with no event terminator: the parser stays in "need
+    // more data", and because the server then holds the connection open the
+    // per-chunk idle guard fires (-> "stream stalled", not "operation timed out").
+    let partial = "data: {\"id\":\"x\",\"object\":\"chat.completion.chunk\",\
+                   \"choices\":[{\"delta\":{\"content\":\"hel";
+    // The buffered (non-streaming) retry's full response.
+    let buffered_body = r#"{"id":"cmpl-1","object":"chat.completion","created":1,"model":"test-model","choices":[{"index":0,"message":{"role":"assistant","content":"recovered via buffered"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":2,"total_tokens":3}}"#;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base_url = format!("http://{}", listener.local_addr().unwrap());
+
+    let call_count = std::sync::Arc::new(AtomicUsize::new(0));
+    let call_count_writer = call_count.clone();
+    tokio::spawn(async move {
+        loop {
+            let (mut sock, _) = match listener.accept().await {
+                Ok(s) => s,
+                Err(_) => return,
+            };
+            let _ = read_full_http_request(&mut sock).await;
+            // `fetch_add` returns the prior value: 0 = streaming, 1 = buffered.
+            let n = call_count_writer.fetch_add(1, Ordering::SeqCst);
+            if n == 0 {
+                // Streaming attempt: headers + partial, then stall past the 1s
+                // per-chunk window so the idle guard faults it ("stream stalled").
+                let headers = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\
+                               Content-Length: 8192\r\nConnection: close\r\n\r\n";
+                let _ = sock.write_all(headers.as_bytes()).await;
+                let _ = sock.write_all(partial.as_bytes()).await;
+                let _ = sock.flush().await;
+                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                drop(sock);
+            } else {
+                // Buffered `complete()`: one full, valid non-streaming JSON.
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    buffered_body.len(),
+                    buffered_body
+                );
+                let _ = sock.write_all(response.as_bytes()).await;
+                let _ = sock.shutdown().await;
+            }
+        }
+    });
+
+    let llm_config = LlmConfig {
+        base_url,
+        api_key: "test-key".to_string(),
+        default_model: "test-model".to_string(),
+        // Per-chunk window (1s) below the total deadline (30s): the streaming
+        // idle guard faults the stall; the buffered retry completes well within.
+        timeout_secs: 30,
+        stream_chunk_timeout_secs: 1,
+        ..LlmConfig::default()
+    };
+    let agent_config = AgentConfig {
+        sandbox_root: "".into(),
+        max_iterations: 1000,
+        max_run_duration_secs: 0,
+        ..AgentConfig::default()
+    };
+    let runtime = AgentRuntime::new(
+        AgentId::new(),
+        agent_config,
+        LlmClient::new(llm_config).unwrap(),
+    )
+    .unwrap()
+    .with_agent_name("bob".to_string())
+    .with_dm_implicit_reply();
+
+    let session_manager = SessionManager::new(SessionConfig::default());
+    let dm_context = "dm:alice:bob";
+    let session_id = alms_core::SessionId::deterministic_dm("alice", "bob");
+    let _session = session_manager.get_or_create_shared(session_id, dm_context);
+
+    let messages = vec![LlmMessage::system("You are bob."), LlmMessage::user("ping")];
+    let (_tool_calls, result) = runtime
+        .agent_loop(
+            &session_manager,
+            session_id,
+            messages,
+            /* is_dm */ true,
+            /* include_user */ false,
+            /* dm_peer */ Some("alice"),
+        )
+        .await;
+
+    // The stall must NOT short-circuit: the buffered retry recovers the run.
+    let output = match result {
+        Ok(o) => o,
+        Err(e) => panic!("a recoverable stall must succeed via the buffered fallback, got: {e}"),
+    };
+    assert!(
+        output.response.contains("recovered via buffered"),
+        "run must return the buffered retry's content; got: {:?}",
+        output.response
+    );
+    // Defining assertion: TWO upstream calls — the stalled stream, then the
+    // buffered retry that succeeded (proving the recovery the narrowing exists
+    // for; pre-narrowing the stall short-circuited at one call).
+    assert_eq!(
+        call_count.load(Ordering::SeqCst),
+        2,
+        "a stall must fall through to the buffered retry (stream + buffered = 2)"
+    );
+}
+
+/// #1162 / #1163: a streaming **total** timeout (`operation timed out` — the
+/// whole call blew `timeout_secs`) IS genuinely futile to re-issue, so it must
+/// short-circuit the buffered fallback — exactly ONE upstream call, with the
+/// timeout diagnostic surfaced. (Preserves the original minimax-fix coverage,
+/// now scoped to the total-timeout class per Codex P2.) The mock holds the
+/// stream open while the per-chunk window stays generous, so the reqwest total
+/// `.timeout()` is what faults the read.
+#[tokio::test]
+async fn agent_loop_total_timeout_stream_skips_futile_buffered_fallback() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::TcpListener;
+
+    let partial = "data: {\"id\":\"x\",\"object\":\"chat.completion.chunk\",\
+                   \"choices\":[{\"delta\":{\"content\":\"hel";
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base_url = format!("http://{}", listener.local_addr().unwrap());
+
+    let call_count = std::sync::Arc::new(AtomicUsize::new(0));
+    let call_count_writer = call_count.clone();
+    tokio::spawn(async move {
+        loop {
+            let (mut sock, _) = match listener.accept().await {
+                Ok(s) => s,
+                Err(_) => return,
+            };
+            let _ = read_full_http_request(&mut sock).await;
+            call_count_writer.fetch_add(1, Ordering::SeqCst);
+            // Headers + partial, then hold open past the total deadline.
+            let headers = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\
+                           Content-Length: 8192\r\nConnection: close\r\n\r\n";
+            let _ = sock.write_all(headers.as_bytes()).await;
+            let _ = sock.write_all(partial.as_bytes()).await;
+            let _ = sock.flush().await;
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            drop(sock);
+        }
+    });
+
+    let llm_config = LlmConfig {
+        base_url,
+        api_key: "test-key".to_string(),
+        default_model: "test-model".to_string(),
+        // Total deadline (2s) BELOW the per-chunk window (30s): the reqwest
+        // total `.timeout()` faults the read first -> "operation timed out".
+        timeout_secs: 2,
+        stream_chunk_timeout_secs: 30,
+        ..LlmConfig::default()
+    };
+    let agent_config = AgentConfig {
+        sandbox_root: "".into(),
+        max_iterations: 1000,
+        max_run_duration_secs: 0,
+        ..AgentConfig::default()
+    };
+    let runtime = AgentRuntime::new(
+        AgentId::new(),
+        agent_config,
+        LlmClient::new(llm_config).unwrap(),
+    )
+    .unwrap()
+    .with_agent_name("bob".to_string())
+    .with_dm_implicit_reply();
+
+    let session_manager = SessionManager::new(SessionConfig::default());
+    let dm_context = "dm:alice:bob";
+    let session_id = alms_core::SessionId::deterministic_dm("alice", "bob");
+    let _session = session_manager.get_or_create_shared(session_id, dm_context);
+
+    let messages = vec![LlmMessage::system("You are bob."), LlmMessage::user("ping")];
+    let start = std::time::Instant::now();
+    let (_tool_calls, result) = runtime
+        .agent_loop(
+            &session_manager,
+            session_id,
+            messages,
+            /* is_dm */ true,
+            /* include_user */ false,
+            /* dm_peer */ Some("alice"),
+        )
+        .await;
+    let elapsed = start.elapsed();
+
+    let err = match result {
+        Ok(_) => panic!("a total-timeout stream must terminate the run with an error"),
+        Err(e) => e,
+    };
+    assert!(
+        !matches!(err, alms_core::AlmsError::Cancelled),
+        "a total timeout is a failure, not a cancellation; got {err:?}"
+    );
+    // The surfaced error is the timeout diagnostic, carrying the model.
+    let msg = err.to_string();
+    assert!(
+        msg.contains("operation timed out"),
+        "expected the total-timeout diagnostic to surface; got: {msg}"
+    );
+    assert!(
+        msg.contains("model=test-model"),
+        "the surfaced error must carry the model for attribution; got: {msg}"
+    );
+    // Defining assertion: exactly ONE upstream call — the buffered fallback is
+    // futile for a total timeout and must be skipped.
+    assert_eq!(
+        call_count.load(Ordering::SeqCst),
+        1,
+        "a total-timeout streaming failure must NOT trigger the buffered fallback"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(15),
+        "total-timeout run should fail fast (one call); took {elapsed:?}"
+    );
+}
+
 /// B3 (#987 / #1154): the wall-clock duration cap also terminates a wedged
 /// loop, independently of the iteration cap. A mock that sleeps ~1.2s per
 /// turn against a 1-second run-duration budget trips the between-iteration

@@ -932,7 +932,7 @@ export function SettingsModal({ open, onClose }) {
                     <div class="settings-info">
                         <div>Version: <span class="settings-info-value">${defaults.version || 'unknown'}</span></div>
                         <div>Base URL: <span class="settings-info-value">${defaults.base_url || 'unknown'}</span></div>
-                        <div>Stream timeout: <span class="settings-info-value">${defaults.stream_chunk_timeout_secs || 60}s</span></div>
+                        <div>Stream timeout: <span class="settings-info-value">${defaults.stream_chunk_timeout_secs || 180}s</span></div>
                     </div>
                 </div>
 

@@ -225,14 +225,22 @@ pub struct LlmConfig {
     /// headers, and the full response body — must complete within this
     /// window or the request is aborted.
     ///
-    /// This is reqwest's total `.timeout()` and is the **only** bound on the
-    /// connect / header / time-to-first-byte wait — a healthy response that
-    /// is slow to *start* is governed by this value alone. A *stalled body*
-    /// (one that started arriving and then went quiet) is caught sooner by
-    /// the body-only inactivity guard
+    /// This is reqwest's total `.timeout()` and is the only bound on the
+    /// post-connect header / time-to-first-byte wait — a healthy response that
+    /// is slow to *start* is governed by this value alone. (TCP + TLS connect
+    /// is bounded tighter by the client's fixed connect timeout, so a
+    /// dead/unreachable host fails in ~30s rather than after this whole
+    /// window.) A *stalled body* (one that started arriving and then went
+    /// quiet) is caught sooner by the body-only inactivity guard
     /// ([`Self::stream_chunk_timeout_secs`]), so this value is the outer
     /// bound for an otherwise healthy-but-large or healthy-but-slow-to-start
-    /// response. Default 120.
+    /// response.
+    ///
+    /// Default 600 (10 min). This is the per-*call* HTTP deadline (one
+    /// request→response), not a run cap: heavy reasoning models (e.g.
+    /// `minimax/minimax-m3` on openrouter) legitimately reason past the old
+    /// 120s, while a genuine *stall* still fails fast via the body-only guard
+    /// below (#1163).
     pub timeout_secs: u64,
     pub max_retries: u32,
     pub max_tokens_per_run: u32,
@@ -329,8 +337,11 @@ pub struct LlmConfig {
     /// to send its *first* byte is governed by [`Self::timeout_secs`], not
     /// this value — raise `timeout_secs` for slow-to-start upstreams.
     ///
-    /// Default: 60. Increase for slow reasoning models or high-latency
-    /// connections.
+    /// Default: 180. The per-chunk *silence* guard for the body; a genuine
+    /// stall still fails within this window. Note the #1150 P0
+    /// awaiting-first-activity budget is *derived* as
+    /// `stream_chunk_timeout_secs + 30`, so this default moves it 90s → 210s
+    /// (intended — gives heavy reasoning models room before the first delta).
     pub stream_chunk_timeout_secs: u64,
 
     /// Generic per-provider config table. Keys here are referenced by
@@ -368,7 +379,10 @@ impl Default for LlmConfig {
             base_url: "https://openrouter.ai/api/v1".into(),
             model: "moonshotai/kimi-k2.6".into(),
             api_key: None,
-            timeout_secs: 120,
+            // 10 min — per-call HTTP deadline, not a run cap. Heavy reasoning
+            // models (minimax-m3 on openrouter) reason past the old 120s; a
+            // genuine stall still fails fast via stream_chunk_timeout_secs.
+            timeout_secs: 600,
             max_retries: 2,
             max_tokens_per_run: 0,
             // 500 iterations is a generous ceiling sized for all run types
@@ -389,11 +403,14 @@ impl Default for LlmConfig {
             // reports back before this ceiling is evaluated; an equal 600s
             // would false-stall such a run at `idle == ceiling`. The P0
             // awaiting-first-activity budget is derived
-            // (stream_chunk_timeout_secs + 30s slack), not a knob.
+            // (stream_chunk_timeout_secs + 30s slack), not a knob — so the 180s
+            // default below makes it ~210s.
             between_iterations_secs: 180,
             tool_phase_ceiling_secs: 900,
             mock: false,
-            stream_chunk_timeout_secs: 60,
+            // 3 min — per-chunk body-silence guard. Gives heavy reasoning
+            // models room before the first delta; derives P0 = ~210s (#1150).
+            stream_chunk_timeout_secs: 180,
             providers: BTreeMap::new(),
             anthropic: AnthropicConfig::default(),
             openai: OpenAiConfig::default(),
