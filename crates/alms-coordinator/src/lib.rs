@@ -1326,13 +1326,28 @@ fn agent_config_for_subagent(
 /// `(parent_session, name)` — so the same named subagent resolves to the
 /// same persistent session no matter which of the parent agent's chat
 /// sessions invoked it. See #1051 for the design decision.
+///
+/// Ephemeral (unnamed) subagent contexts embed the parent agent id too —
+/// `subagent_{parent_agent_id}_{task_id}` — so `read_subagent_session`'s
+/// by-`session_id` readback (#1181) can enforce parent ownership from the
+/// context alone, exactly like the named shape. Pre-hardening the ephemeral
+/// context was `subagent_{task_id}`, which forced the readback to treat the
+/// session UUID as a bearer capability — but that UUID leaks beyond the
+/// spawning parent (parent-visible `invoke_agent` result / completion text,
+/// and the shared DM `parent_session` for DM-triggered invocations), so any
+/// agent that learned it could read the transcript (Tim / Codex on PR #1185).
+/// The context format is coordinator-reserved — see
+/// `docs/security-model.md` § subagent session readback.
 fn derive_subagent_identity(task_id: TaskId, request: &SubagentRequest) -> (AgentId, String) {
     if let Some(ref name) = request.subagent_name {
         let stable_id = AgentId::deterministic(request.parent_agent_id, name);
         let stable_ctx = format!("subagent_{}_{}", request.parent_agent_id.0, name);
         (stable_id, stable_ctx)
     } else {
-        (AgentId::new(), format!("subagent_{}", task_id.0))
+        (
+            AgentId::new(),
+            format!("subagent_{}_{}", request.parent_agent_id.0, task_id.0),
+        )
     }
 }
 
@@ -3368,6 +3383,90 @@ mod tests {
             session.id, sub_session_id,
             "derived session ID should match the one returned by dispatch"
         );
+    }
+
+    /// Repro for #1181: after a parent invokes an EPHEMERAL / unnamed
+    /// subagent via the real coordinator path, the parent can read the
+    /// subagent's persisted transcript by `session_id` — the id dispatch
+    /// returns (and that `subagent_started` / the completion notification
+    /// surface). Pre-#1181 `read_subagent_session` only resolved by name,
+    /// so ephemeral transcripts were unreachable even though fully
+    /// persisted.
+    ///
+    /// Like the named test above, this drives the REAL
+    /// `derive_subagent_identity` context shape
+    /// (`subagent_{parent_agent_id}_{task_id}`, parent id embedded per the
+    /// PR #1185 ownership hardening) against the tool's access check — the
+    /// unit tests in `read_subagent_session.rs` construct that context by
+    /// hand, so they cannot catch the coordinator and the tool drifting
+    /// apart. Also pins the denial half: a NON-parent agent supplying the
+    /// same session UUID (which leaks into parent-visible text and shared DM
+    /// sessions) must be rejected — the UUID is not a bearer capability.
+    #[tokio::test]
+    async fn test_parent_can_read_ephemeral_subagent_session_by_id() {
+        use alms_sandbox::Tool;
+        use alms_tools::ReadSubagentSessionTool;
+
+        let workspace_tmp = tempfile::TempDir::new().unwrap();
+        let coord = test_coordinator().with_workspace_dir(workspace_tmp.path().to_path_buf());
+        let parent_session = test_session_id();
+        let parent_agent_id = test_parent_agent_id();
+
+        // Unnamed dispatch — fresh random session, context `subagent_{task_id}`.
+        let (_response, sub_session_id) = coord
+            .dispatch(
+                "Investigate topic X".to_string(),
+                parent_session,
+                parent_agent_id,
+                None,
+                None,
+                None, // unnamed → ephemeral
+                None,
+                None,
+            )
+            .await
+            .expect("dispatch should succeed");
+
+        let read_tool =
+            ReadSubagentSessionTool::new(coord.session_manager.clone(), parent_agent_id);
+        let result = read_tool
+            .execute(serde_json::json!({ "session_id": sub_session_id.0.to_string() }))
+            .await
+            .expect("read_subagent_session should not error");
+
+        debug!(?result, "parent read of ephemeral subagent session by id");
+
+        assert!(
+            result.get("error").is_none(),
+            "parent must be able to read its ephemeral subagent's session by id, got: {result}"
+        );
+        assert_eq!(result["session_id"], sub_session_id.0.to_string());
+        // Ephemeral subagents have no name — label is null.
+        assert!(result["subagent"].is_null());
+        assert!(
+            result["message_count"].as_u64().unwrap_or(0) > 0,
+            "ephemeral subagent session should have at least one message after dispatch"
+        );
+
+        // PR #1185 hardening: a DIFFERENT agent (e.g. a DM peer that saw the
+        // session id on the shared DM session) supplying the same UUID must
+        // be denied — ownership comes from the parent id embedded in the
+        // context by `derive_subagent_identity`, not from knowing the UUID.
+        let non_parent = AgentId::new();
+        assert_ne!(non_parent, parent_agent_id);
+        let peer_tool = ReadSubagentSessionTool::new(coord.session_manager.clone(), non_parent);
+        let denied = peer_tool
+            .execute(serde_json::json!({ "session_id": sub_session_id.0.to_string() }))
+            .await
+            .expect("read_subagent_session should not panic for non-parent");
+        assert!(
+            denied["error"]
+                .as_str()
+                .unwrap_or("")
+                .contains("another agent's subagent"),
+            "non-parent must be denied the ephemeral transcript, got: {denied}"
+        );
+        assert!(denied.get("messages").is_none());
     }
 
     /// Repro for #1042 / persistence path: after a daemon restart

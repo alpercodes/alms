@@ -647,9 +647,17 @@ pub(super) fn format_completion_notification(c: &alms_coordinator::SubagentCompl
             format!("\"{name}\""),
             format!("Use read_subagent_session(\"{name}\") for the full conversation history."),
         ),
+        // #1181: ephemeral / unnamed subagents are readable by session id —
+        // point the parent at the exact call that works. Pre-#1181 this said
+        // only "the summary is included above", leaving the parent with no
+        // discoverable path to the persisted full output when the summary
+        // was truncated.
         None => (
             format!("(task {})", c.task_id.0),
-            "The subagent result summary is included above.".to_string(),
+            format!(
+                "Use read_subagent_session(session_id=\"{}\") for the full conversation history.",
+                c.subagent_session_id.0
+            ),
         ),
     };
 

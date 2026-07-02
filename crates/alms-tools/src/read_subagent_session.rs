@@ -1,30 +1,44 @@
-//! read_subagent_session tool — on-demand context retrieval from a named
+//! read_subagent_session tool — on-demand context retrieval from a
 //! subagent's conversation history.
 //!
 //! Instead of carrying full subagent transcripts in the parent's context
 //! window, the parent calls this tool when it needs detail from a specific
-//! subagent's session. The tool derives the subagent's deterministic session
-//! ID (same UUID v5 logic as invoke_agent) and reads from SessionManager.
+//! subagent's session. Named subagents resolve by `name` (the same
+//! deterministic `(parent_agent_id, name)` derivation as invoke_agent,
+//! #1051). Ephemeral / unnamed subagents have no name to derive from, so
+//! they resolve by `session_id` instead (#1181) — the id every invoke_agent
+//! result, `subagent_started` event, and completion notification already
+//! surfaces to the parent.
 
-use alms_core::AgentId;
+use alms_core::{AgentId, SessionId};
 use alms_sandbox::{SandboxError, Tool, error::SandboxResult};
 use alms_session::SessionManager;
 use serde_json::Value;
 use std::sync::Arc;
 
-/// Built-in tool that reads conversation history from a named subagent's session.
+/// Built-in tool that reads conversation history from a subagent's session.
 ///
 /// Named subagents (created via `invoke_agent(name=...)`) have persistent
-/// sessions keyed on `(parent_agent_id, name)` (#1051). This tool lets the
-/// parent agent selectively read their conversation history without carrying
-/// it all in its own context window — and the same subagent name resolves
-/// to the same session no matter which of the parent's chat sessions is
-/// active.
+/// sessions keyed on `(parent_agent_id, name)` (#1051) and resolve by `name`
+/// — the same subagent name resolves to the same session no matter which of
+/// the parent's chat sessions is active.
+///
+/// Ephemeral / unnamed subagents (created via `invoke_agent` without a name,
+/// typically `background: true`) get a fresh random session per invocation,
+/// so there is nothing to derive a session from — pre-#1181 this tool simply
+/// could not read them even though their transcript is fully persisted. They
+/// resolve by `session_id`, guarded by [`Self::check_subagent_session_access`]
+/// so the by-id path cannot be used to read arbitrary non-subagent sessions —
+/// and, because the session UUID leaks beyond the spawning parent (it appears
+/// in parent-visible result/completion text and on shared DM sessions), the
+/// check enforces PARENT OWNERSHIP via the parent id embedded in the session
+/// context, never treating the UUID itself as a bearer capability.
 #[derive(Debug)]
 pub struct ReadSubagentSessionTool {
     session_manager: Arc<SessionManager>,
     /// Parent agent's persistent ID — drives the `(parent_agent_id, name)`
-    /// keying that mirrors `invoke_agent` (#1051).
+    /// keying that mirrors `invoke_agent` (#1051), and the ownership check
+    /// on the by-`session_id` path (#1181).
     parent_agent_id: AgentId,
 }
 
@@ -35,6 +49,85 @@ impl ReadSubagentSessionTool {
             parent_agent_id,
         }
     }
+
+    /// Authorize a by-`session_id` readback target (#1181, hardened per the
+    /// Tim / Codex access-control review on PR #1185).
+    ///
+    /// The by-id path must not turn this tool into "read any session by
+    /// UUID" — `read_session` already exists for the agent's OWN sessions
+    /// and enforces its own ownership model. Only subagent sessions are in
+    /// scope here, and BOTH `context_id` shapes the coordinator's
+    /// `derive_subagent_identity` produces embed the spawning parent's id,
+    /// which must match this tool's `parent_agent_id`:
+    ///
+    /// - `subagent_{parent_agent_id}_{name}` — named subagent (#1051).
+    /// - `subagent_{parent_agent_id}_{task_id}` — ephemeral / unnamed
+    ///   subagent. The parent id was added to this shape by the PR #1185
+    ///   hardening: the session UUID must NOT act as a bearer capability,
+    ///   because it leaks beyond the spawning parent — it appears in
+    ///   parent-visible `invoke_agent` result / completion text and, for
+    ///   DM-triggered invocations, is persisted onto the SHARED DM parent
+    ///   session where the DM peer can see it. This tool is registered for
+    ///   every agent and is auto-approved, so without the ownership check
+    ///   any agent that learned the UUID could read the full transcript.
+    ///
+    /// Legacy ephemeral sessions created before the hardening
+    /// (`subagent_{task_id}`, no parent linkage) are DENIED: their ownership
+    /// cannot be verified, and denying them is strictly no worse than
+    /// pre-#1181 behaviour (ephemeral readback never worked at all).
+    ///
+    /// Returns the subagent's name for an owned named session, `None` for an
+    /// owned ephemeral one, or a caller-facing error message.
+    fn check_subagent_session_access(
+        &self,
+        session: &alms_session::Session,
+    ) -> Result<Option<String>, String> {
+        let Some(rest) = session.context_id.strip_prefix("subagent_") else {
+            return Err(format!(
+                "Session {} is not a subagent session. Use read_session to read your own sessions.",
+                session.id.0
+            ));
+        };
+
+        // Legacy pre-hardening ephemeral shape: `subagent_{task_id}` with no
+        // parent linkage — ownership cannot be verified, so deny.
+        if uuid::Uuid::parse_str(rest).is_ok() {
+            return Err(format!(
+                "Session {} is a legacy ephemeral subagent session without parent \
+                 ownership metadata and cannot be read back.",
+                session.id.0
+            ));
+        }
+
+        // Both current shapes are `{parent_uuid}_{remainder}` — a UUID never
+        // contains '_', so the first '_' is the separator regardless of the
+        // remainder's own characters.
+        if let Some((parent, remainder)) = rest.split_once('_')
+            && let Ok(parent_uuid) = uuid::Uuid::parse_str(parent)
+        {
+            if AgentId(parent_uuid) != self.parent_agent_id {
+                return Err(format!(
+                    "Session {} belongs to another agent's subagent. You can only read \
+                     sessions of subagents you invoked.",
+                    session.id.0
+                ));
+            }
+            // Ephemeral remainder is the task UUID → no name label. (A named
+            // subagent whose registered name happens to parse as a UUID would
+            // get a null label too — cosmetic only; the ownership check above
+            // is identical either way.)
+            return if uuid::Uuid::parse_str(remainder).is_ok() {
+                Ok(None)
+            } else {
+                Ok(Some(remainder.to_string()))
+            };
+        }
+
+        Err(format!(
+            "Session {} has an unrecognized subagent session format.",
+            session.id.0
+        ))
+    }
 }
 
 #[async_trait::async_trait]
@@ -44,19 +137,34 @@ impl Tool for ReadSubagentSessionTool {
     }
 
     fn description(&self) -> &str {
-        "Read the conversation history of a named subagent. Named subagents \
-         (created via invoke_agent with a name) have persistent sessions — this \
-         tool lets you read their full conversation when you need the detail. \
-         Returns the last N messages (default 20) and the session summary if available."
+        "Read the conversation history of a subagent. For a NAMED subagent \
+         (created via invoke_agent with a name), pass 'name'. For an ephemeral / \
+         unnamed subagent (e.g. a background invoke_agent without a name), pass \
+         'session_id' — the subagent session UUID from the invoke_agent result or \
+         the completion notification. Returns the last N messages (default 20) \
+         and the session summary if available."
     }
 
     fn parameters(&self) -> Value {
+        // `required` is empty at schema level: exactly one of `name` /
+        // `session_id` must be provided, which JSON Schema's `required`
+        // cannot express — the execute path validates the one-of contract
+        // and returns a clear error otherwise (mirrors the shell tool's
+        // command/check_task mutual exclusivity).
         serde_json::json!({
             "type": "object",
             "properties": {
                 "name": {
                     "type": "string",
-                    "description": "The subagent's persistent name (e.g., 'reviewer', 'researcher')."
+                    "description": "The subagent's persistent name (e.g., 'reviewer', 'researcher'). \
+                                    Use for named subagents. Provide either this or session_id."
+                },
+                "session_id": {
+                    "type": "string",
+                    "description": "The subagent's session UUID. Use for ephemeral / unnamed \
+                                    subagents (returned by invoke_agent as session_id, and \
+                                    included in the background-completion notification). \
+                                    Provide either this or name."
                 },
                 "last_n": {
                     "type": "integer",
@@ -70,7 +178,7 @@ impl Tool for ReadSubagentSessionTool {
                                     fallback_messages/fallback_message_count keys. Default: false."
                 }
             },
-            "required": ["name"]
+            "required": []
         })
     }
 
@@ -78,10 +186,12 @@ impl Tool for ReadSubagentSessionTool {
         let name = params
             .get("name")
             .and_then(|v| v.as_str())
-            .filter(|s| !s.is_empty())
-            .ok_or_else(|| {
-                SandboxError::InvalidParameters("'name' is required and must be non-empty".into())
-            })?;
+            .filter(|s| !s.is_empty());
+
+        let session_id_param = params
+            .get("session_id")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty());
 
         let last_n = params.get("last_n").and_then(|v| v.as_u64()).unwrap_or(20) as usize;
 
@@ -90,23 +200,81 @@ impl Tool for ReadSubagentSessionTool {
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
 
-        // Derive the same deterministic identity that invoke_agent uses
-        // (#1051): keyed on `(parent_agent_id, name)`, so the same named
-        // subagent resolves to the same session across every chat the
-        // parent agent participates in.
-        let stable_id = AgentId::deterministic(self.parent_agent_id, name);
-        let stable_ctx = format!("subagent_{}_{}", self.parent_agent_id.0, name);
+        // Resolve the target session: by `name` for named subagents (the
+        // pre-#1181 path, unchanged), or by `session_id` for ephemeral /
+        // unnamed ones. `subagent_label` is the name when known (given, or
+        // recovered from a named session's context_id) and null for
+        // ephemeral subagents, which have no name.
+        let (session, subagent_label) = match (name, session_id_param) {
+            (Some(_), Some(_)) => {
+                return Err(SandboxError::InvalidParameters(
+                    "provide either 'name' or 'session_id', not both".into(),
+                ));
+            }
+            (None, None) => {
+                return Err(SandboxError::InvalidParameters(
+                    "either 'name' (named subagent) or 'session_id' (ephemeral / unnamed \
+                     subagent) is required"
+                        .into(),
+                ));
+            }
+            (Some(name), None) => {
+                // Derive the same deterministic identity that invoke_agent
+                // uses (#1051): keyed on `(parent_agent_id, name)`, so the
+                // same named subagent resolves to the same session across
+                // every chat the parent agent participates in.
+                let stable_id = AgentId::deterministic(self.parent_agent_id, name);
+                let stable_ctx = format!("subagent_{}_{}", self.parent_agent_id.0, name);
 
-        // Check if the session exists without creating it
-        let key = (stable_id, stable_ctx);
-        if !self.session_manager.has_session(&key) {
-            return Ok(serde_json::json!({
-                "error": format!("No session found for subagent '{name}'. It may not have been invoked yet."),
-                "subagent": name
-            }));
-        }
+                // Check if the session exists without creating it
+                let key = (stable_id, stable_ctx);
+                if !self.session_manager.has_session(&key) {
+                    return Ok(serde_json::json!({
+                        "error": format!("No session found for subagent '{name}'. It may not have been invoked yet."),
+                        "subagent": name
+                    }));
+                }
 
-        let session = self.session_manager.get_or_create(stable_id, &key.1);
+                let session = self.session_manager.get_or_create(stable_id, &key.1);
+                (session, Value::from(name))
+            }
+            (None, Some(sid_str)) => {
+                // #1181: ephemeral / unnamed subagents have a random session
+                // per invocation — nothing to derive. Resolve the persisted
+                // session directly by the id the parent already holds.
+                let session_id = uuid::Uuid::parse_str(sid_str).map(SessionId).map_err(|_| {
+                    SandboxError::InvalidParameters(format!(
+                        "'session_id' must be a valid UUID, got '{sid_str}'"
+                    ))
+                })?;
+
+                let Ok(session) = self.session_manager.get(session_id) else {
+                    return Ok(serde_json::json!({
+                        "error": format!("No session found with id '{sid_str}'."),
+                        "session_id": sid_str,
+                    }));
+                };
+
+                match self.check_subagent_session_access(&session) {
+                    Ok(named) => {
+                        let label = named.map(Value::from).unwrap_or(Value::Null);
+                        (session, label)
+                    }
+                    Err(msg) => {
+                        return Ok(serde_json::json!({
+                            "error": msg,
+                            "session_id": sid_str,
+                        }));
+                    }
+                }
+            }
+        };
+
+        // Both resolution paths converge here. Every response carries the
+        // resolved `session_id` (additive, #1181) so the parent has a stable
+        // handle for follow-up reads — e.g. paging through a long transcript
+        // with `last_n` after a truncated background summary.
+        let session_id_str = session.id.0.to_string();
 
         // Get summary if available
         let summary = self
@@ -126,7 +294,8 @@ impl Tool for ReadSubagentSessionTool {
 
             if let Some(ref text) = summary {
                 return Ok(serde_json::json!({
-                    "subagent": name,
+                    "subagent": subagent_label,
+                    "session_id": session_id_str,
                     "summary": text,
                     "has_summary": true,
                     "message_count": total,
@@ -149,7 +318,8 @@ impl Tool for ReadSubagentSessionTool {
                 .collect();
 
             return Ok(serde_json::json!({
-                "subagent": name,
+                "subagent": subagent_label,
+                "session_id": session_id_str,
                 "summary": Value::Null,
                 "has_summary": false,
                 "fallback_messages": recent,
@@ -180,7 +350,8 @@ impl Tool for ReadSubagentSessionTool {
             .collect();
 
         Ok(serde_json::json!({
-            "subagent": name,
+            "subagent": subagent_label,
+            "session_id": session_id_str,
             "message_count": total,
             "showing": recent.len(),
             "messages": recent,
@@ -453,12 +624,308 @@ mod tests {
         assert_eq!(result["message_count"], 1);
     }
 
+    /// #1181: `name` is no longer schema-required — exactly one of `name` /
+    /// `session_id` must be provided, which JSON Schema `required` cannot
+    /// express. The one-of contract is enforced in `execute` (pinned by the
+    /// `test_*_is_error` tests above/below); the schema must expose both
+    /// properties and require neither.
     #[tokio::test]
-    async fn test_schema_has_required_name() {
+    async fn test_schema_one_of_name_or_session_id() {
         let (tool, _) = make_tool();
         let schema = tool.parameters();
         let required = schema["required"].as_array().unwrap();
-        assert!(required.iter().any(|v| v == "name"));
+        assert!(
+            required.is_empty(),
+            "required must be empty — name and session_id are mutually exclusive alternatives"
+        );
+        let props = schema["properties"].as_object().unwrap();
+        assert!(props.contains_key("name"));
+        assert!(props.contains_key("session_id"));
+    }
+
+    // ── #1181: by-session_id readback for ephemeral / unnamed subagents ─────
+
+    /// Create an ephemeral subagent session exactly the way the coordinator's
+    /// `derive_subagent_identity` does for unnamed subagents: fresh random
+    /// `AgentId`, context `subagent_{parent_agent_id}_{task_id}` (the parent
+    /// id embedded per the PR #1185 ownership hardening). Returns the
+    /// session id.
+    fn populate_ephemeral_subagent(
+        mgr: &SessionManager,
+        parent_agent_id: AgentId,
+        messages: Vec<Message>,
+    ) -> alms_core::SessionId {
+        let task_id = uuid::Uuid::new_v4();
+        let session = mgr.get_or_create(
+            AgentId::new(),
+            format!("subagent_{}_{task_id}", parent_agent_id.0),
+        );
+        for msg in messages {
+            mgr.append_message(session.id, msg).unwrap();
+        }
+        session.id
+    }
+
+    /// The #1181 pinning test: an ephemeral / unnamed background subagent's
+    /// persisted transcript is readable by `session_id` — the exact readback
+    /// that failed in the live incident (session `eb90e207-…` had the full
+    /// output persisted but the tool reported no session).
+    #[tokio::test]
+    async fn test_reads_ephemeral_subagent_by_session_id() {
+        let (tool, mgr) = make_tool();
+        let sid = populate_ephemeral_subagent(
+            &mgr,
+            tool.parent_agent_id,
+            vec![
+                make_msg(Role::User, "long research task"),
+                make_msg(Role::Assistant, "the full 20k-char output"),
+            ],
+        );
+
+        let result = tool
+            .execute(serde_json::json!({ "session_id": sid.0.to_string() }))
+            .await
+            .unwrap();
+
+        assert!(
+            result.get("error").is_none(),
+            "ephemeral session must be readable by session_id, got: {result}"
+        );
+        assert_eq!(result["session_id"], sid.0.to_string());
+        // Ephemeral subagents have no name — the label is null, not a guess.
+        assert!(result["subagent"].is_null());
+        assert_eq!(result["message_count"], 2);
+        let msgs = result["messages"].as_array().unwrap();
+        assert_eq!(msgs[1]["role"], "assistant");
+        assert_eq!(msgs[1]["content"], "the full 20k-char output");
+    }
+
+    /// The PR #1185 access-control hole (Tim / Codex): the ephemeral session
+    /// UUID is NOT a bearer capability. It leaks beyond the spawning parent
+    /// (parent-visible invoke_agent result / completion text; the shared DM
+    /// parent session for DM-triggered invocations), and this tool is
+    /// registered auto-approved for every agent — so a DIFFERENT agent (e.g.
+    /// a DM peer) supplying the exact same UUID must be DENIED. Ownership is
+    /// enforced via the parent id embedded in the session context.
+    #[tokio::test]
+    async fn test_ephemeral_by_session_id_denied_for_non_parent() {
+        let (tool, mgr) = make_tool();
+        let sid = populate_ephemeral_subagent(
+            &mgr,
+            tool.parent_agent_id,
+            vec![make_msg(
+                Role::Assistant,
+                "spawning parent's private result",
+            )],
+        );
+
+        // A different agent (DM peer / any non-parent) learned the UUID.
+        let peer = AgentId::new();
+        assert_ne!(peer, tool.parent_agent_id);
+        let peer_tool = ReadSubagentSessionTool::new(mgr.clone(), peer);
+
+        let result = peer_tool
+            .execute(serde_json::json!({ "session_id": sid.0.to_string() }))
+            .await
+            .unwrap();
+        assert!(
+            result["error"]
+                .as_str()
+                .unwrap_or("")
+                .contains("another agent's subagent"),
+            "a non-parent supplying the leaked UUID must be denied, got: {result}"
+        );
+        assert!(result.get("messages").is_none());
+
+        // Control: the spawning parent still reads it fine.
+        let result = tool
+            .execute(serde_json::json!({ "session_id": sid.0.to_string() }))
+            .await
+            .unwrap();
+        assert!(
+            result.get("error").is_none(),
+            "the spawning parent must still be able to read, got: {result}"
+        );
+        assert_eq!(result["message_count"], 1);
+    }
+
+    /// Legacy ephemeral sessions created before the #1185 hardening have the
+    /// old `subagent_{task_id}` context with no parent linkage — ownership
+    /// cannot be verified, so they are denied (strictly no worse than
+    /// pre-#1181, when ephemeral readback never worked at all). This also
+    /// pins that the legacy shape can never fall through to an allow branch.
+    #[tokio::test]
+    async fn test_legacy_ephemeral_context_without_parent_is_denied() {
+        let (tool, mgr) = make_tool();
+        let task_id = uuid::Uuid::new_v4();
+        let session = mgr.get_or_create(AgentId::new(), format!("subagent_{task_id}"));
+        mgr.append_message(session.id, make_msg(Role::Assistant, "old transcript"))
+            .unwrap();
+
+        let result = tool
+            .execute(serde_json::json!({ "session_id": session.id.0.to_string() }))
+            .await
+            .unwrap();
+        assert!(
+            result["error"]
+                .as_str()
+                .unwrap_or("")
+                .contains("legacy ephemeral subagent session"),
+            "legacy no-parent contexts must be denied, got: {result}"
+        );
+        assert!(result.get("messages").is_none());
+    }
+
+    /// `last_n` and `summary_only` behave identically on the by-id path —
+    /// both resolution paths converge on the same readback body.
+    #[tokio::test]
+    async fn test_ephemeral_by_session_id_respects_last_n_and_summary_only() {
+        let (tool, mgr) = make_tool();
+        let msgs: Vec<Message> = (0..6)
+            .map(|i| make_msg(Role::User, &format!("msg {i}")))
+            .collect();
+        let sid = populate_ephemeral_subagent(&mgr, tool.parent_agent_id, msgs);
+
+        let result = tool
+            .execute(serde_json::json!({ "session_id": sid.0.to_string(), "last_n": 2 }))
+            .await
+            .unwrap();
+        assert_eq!(result["message_count"], 6);
+        assert_eq!(result["showing"], 2);
+        assert_eq!(result["messages"][0]["content"], "msg 4");
+        assert_eq!(result["messages"][1]["content"], "msg 5");
+
+        // summary_only with no summary set — fallback shape, same as by-name.
+        let result = tool
+            .execute(serde_json::json!({
+                "session_id": sid.0.to_string(),
+                "summary_only": true,
+                "last_n": 2,
+            }))
+            .await
+            .unwrap();
+        assert_eq!(result["has_summary"], false);
+        assert_eq!(result["fallback_message_count"], 6);
+        assert_eq!(result["fallback_showing"], 2);
+    }
+
+    /// A NAMED subagent session read by id resolves too, recovering the name
+    /// from the context — the parent may only hold the session id (e.g. from
+    /// a completion notification) and shouldn't need to know which path to
+    /// use.
+    #[tokio::test]
+    async fn test_reads_own_named_subagent_by_session_id() {
+        let (tool, mgr) = make_tool();
+        populate_subagent(
+            &tool,
+            &mgr,
+            "reviewer",
+            vec![make_msg(Role::Assistant, "review done")],
+        );
+        let stable_id = AgentId::deterministic(tool.parent_agent_id, "reviewer");
+        let stable_ctx = format!("subagent_{}_{}", tool.parent_agent_id.0, "reviewer");
+        let session = mgr.get_or_create(stable_id, &stable_ctx);
+
+        let result = tool
+            .execute(serde_json::json!({ "session_id": session.id.0.to_string() }))
+            .await
+            .unwrap();
+        assert!(result.get("error").is_none(), "got: {result}");
+        assert_eq!(result["subagent"], "reviewer");
+        assert_eq!(result["message_count"], 1);
+    }
+
+    /// Ownership boundary (#1051 carried over to the by-id path): a session
+    /// belonging to ANOTHER parent's named subagent is not readable, even
+    /// with the exact session id.
+    #[tokio::test]
+    async fn test_by_session_id_rejects_other_parents_named_subagent() {
+        let (tool, mgr) = make_tool();
+        let other_parent = AgentId::new();
+        assert_ne!(other_parent, tool.parent_agent_id);
+        let other_id = AgentId::deterministic(other_parent, "reviewer");
+        let other_ctx = format!("subagent_{}_{}", other_parent.0, "reviewer");
+        let session = mgr.get_or_create(other_id, &other_ctx);
+        mgr.append_message(session.id, make_msg(Role::Assistant, "private"))
+            .unwrap();
+
+        let result = tool
+            .execute(serde_json::json!({ "session_id": session.id.0.to_string() }))
+            .await
+            .unwrap();
+        assert!(
+            result["error"]
+                .as_str()
+                .unwrap_or("")
+                .contains("another agent's subagent"),
+            "must reject another parent's named subagent session, got: {result}"
+        );
+        assert!(result.get("messages").is_none());
+    }
+
+    /// The by-id path is scoped to SUBAGENT sessions only — it must not
+    /// become a generic read-any-session-by-uuid bypass of `read_session`'s
+    /// ownership model.
+    #[tokio::test]
+    async fn test_by_session_id_rejects_non_subagent_session() {
+        let (tool, mgr) = make_tool();
+        // A regular chat session (context does not start with "subagent_").
+        let session = mgr.get_or_create(AgentId::new(), "webchat");
+        mgr.append_message(session.id, make_msg(Role::User, "private chat"))
+            .unwrap();
+
+        let result = tool
+            .execute(serde_json::json!({ "session_id": session.id.0.to_string() }))
+            .await
+            .unwrap();
+        assert!(
+            result["error"]
+                .as_str()
+                .unwrap_or("")
+                .contains("not a subagent session"),
+            "must reject non-subagent sessions, got: {result}"
+        );
+        assert!(result.get("messages").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_by_session_id_unknown_session_is_friendly_error() {
+        let (tool, _) = make_tool();
+        let unknown = uuid::Uuid::new_v4();
+        let result = tool
+            .execute(serde_json::json!({ "session_id": unknown.to_string() }))
+            .await
+            .unwrap();
+        assert!(
+            result["error"]
+                .as_str()
+                .unwrap_or("")
+                .contains("No session found"),
+            "unknown id must produce the friendly no-session error, got: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_by_session_id_invalid_uuid_is_error() {
+        let (tool, _) = make_tool();
+        let err = tool
+            .execute(serde_json::json!({ "session_id": "not-a-uuid" }))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SandboxError::InvalidParameters(_)));
+    }
+
+    #[tokio::test]
+    async fn test_both_name_and_session_id_is_error() {
+        let (tool, _) = make_tool();
+        let err = tool
+            .execute(serde_json::json!({
+                "name": "reviewer",
+                "session_id": uuid::Uuid::new_v4().to_string(),
+            }))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SandboxError::InvalidParameters(_)));
     }
 
     /// Regression for #1051 — named subagent sessions are keyed on

@@ -742,6 +742,23 @@ Job safety:
 - Separate “user-visible messages” from “internal debug traces”.
 - Allow disabling debug traces in production.
 
+### Subagent session readback (#1181 / PR #1185)
+- The `subagent_` session `context_id` prefix is **coordinator-reserved**: only
+  `derive_subagent_identity` (alms-coordinator) may mint contexts with this
+  prefix, and `read_subagent_session`'s access check treats the shape as a
+  trusted ownership record. Both shapes embed the spawning parent's agent id —
+  `subagent_{parent_agent_id}_{name}` (named, #1051) and
+  `subagent_{parent_agent_id}_{task_id}` (ephemeral, #1181/#1185).
+- Ephemeral subagent transcript reads by `session_id` are **ownership-checked
+  by parent id, not bearer-capability**: knowing the session UUID is NOT
+  sufficient. The UUID intentionally leaks beyond the spawning parent (it
+  appears in parent-visible `invoke_agent` results / completion notifications
+  and, for DM-triggered invocations, on the shared DM session where the peer
+  sees it), and `read_subagent_session` is registered auto-approved for every
+  agent — so the tool only serves a session whose embedded parent id equals
+  the calling agent's id. Legacy ephemeral contexts without the embedded
+  parent id (`subagent_{task_id}`, pre-v0.2.4 hardening) are denied outright.
+
 ---
 
 ## 7) Audit logging (non-negotiable)

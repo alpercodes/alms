@@ -1081,6 +1081,42 @@ fn format_completion_notification_for_cancelled_subagent() {
     );
 }
 
+/// #1181: for an EPHEMERAL / unnamed subagent, the completion notification
+/// must point the parent at the by-session-id readback
+/// (`read_subagent_session(session_id=...)`). Pre-#1181 it said only "the
+/// summary is included above", leaving the parent no discoverable path to
+/// the persisted full output — the live incident had the parent conclude
+/// "there's no named session to read back" while the complete transcript
+/// sat readable at the subagent's session.
+#[test]
+fn format_completion_notification_for_unnamed_subagent_points_at_session_id_readback() {
+    let subagent_session_id = SessionId::new();
+    let completion = SubagentCompletion {
+        task_id: TaskId::new(),
+        subagent_name: None, // ephemeral / unnamed
+        status: TaskStatus::Completed,
+        summary: "Research finished (truncated summary)".to_string(),
+        parent_session_id: SessionId::new(),
+        parent_agent_id: AgentId::new(),
+        subagent_session_id,
+        task_description: Some("Research the topic".to_string()),
+        tool_count: Some(4),
+        duration_ms: Some(9000),
+        token_usage: None,
+        parent_tool_invocation_id: None,
+    };
+
+    let notification = super::notifications::format_completion_notification(&completion);
+    assert!(
+        notification.contains("read_subagent_session"),
+        "unnamed completion must point at the readback tool, got: {notification}"
+    );
+    assert!(
+        notification.contains(&subagent_session_id.0.to_string()),
+        "unnamed completion must carry the subagent's session id, got: {notification}"
+    );
+}
+
 /// Test that when a run with partial tool calls is recorded, the
 /// `RunManager` correctly tracks the run status as failed while
 /// preserving the error message.
