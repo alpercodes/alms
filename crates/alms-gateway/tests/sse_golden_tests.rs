@@ -457,6 +457,8 @@ async fn test_bg_subagent_started_ordering_invariant() {
                 source_agent,
             });
         }
+        fn forward_stream_reset(&self) {}
+        fn forward_run_terminal(&self, _: alms_tools::SubagentRunOutcome) {}
         fn forward_status(&self, phase: String, detail: Option<String>) {
             let _ = self.tx.send(RuntimeEvent::Status { phase, detail });
         }
@@ -682,6 +684,8 @@ async fn test_bg_subagent_does_not_block_parent_run_drain() {
                 source_agent,
             });
         }
+        fn forward_stream_reset(&self) {}
+        fn forward_run_terminal(&self, _: alms_tools::SubagentRunOutcome) {}
         fn forward_status(&self, phase: String, detail: Option<String>) {
             let _ = self.tx.send(RuntimeEvent::Status { phase, detail });
         }
@@ -887,6 +891,8 @@ async fn test_bg_subagent_started_falls_back_to_session_stream_when_parent_dead(
         ) {
         }
         fn forward_token_delta(&self, _: String, _: Option<String>) {}
+        fn forward_stream_reset(&self) {}
+        fn forward_run_terminal(&self, _: alms_tools::SubagentRunOutcome) {}
         fn forward_status(&self, _: String, _: Option<String>) {}
         fn forward_warning(&self, _: String, _: String, _: Option<String>) {}
         fn forward_subagent_started(

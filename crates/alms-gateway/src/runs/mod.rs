@@ -16,6 +16,7 @@ pub(crate) mod lifecycle;
 pub(crate) mod markers;
 pub(crate) mod notifications;
 pub(crate) mod streaming;
+pub(crate) mod subagent_self_sink;
 // `tools` is `pub` (not `pub(super)`) only so that the integration test in
 // `tests/sse_golden_tests.rs` can reach `route_bg_event` for the #1105 bg-path
 // ordering regression test. The other items in this module are `pub(super)`
@@ -37,6 +38,7 @@ pub(crate) use notifications::{
 pub use streaming::{
     SessionEventsQuery, stream_agent_events, stream_run_events, stream_session_events,
 };
+pub(crate) use subagent_self_sink::GatewaySubagentSelfSink;
 
 // Public struct and function used by gateway.rs
 pub use self::config::{ResolveAgentConfigError, ResolvedAgentConfig, resolve_agent_config};

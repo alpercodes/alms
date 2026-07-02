@@ -77,6 +77,16 @@ impl alms_tools::EventForwarder for RuntimeEventForwarder {
             .send(RuntimeEvent::ReasoningDelta { text, source_agent });
     }
 
+    fn forward_stream_reset(&self) {
+        // Untagged: only the #1180 subagent self-forward calls this, on a stream
+        // where the subagent is the main agent. `forward_runtime_events` /
+        // `forward_subagent_self_events` convert it to the same `stream_reset`
+        // SSE a top-level run emits.
+        let _ = self
+            .tx
+            .send(RuntimeEvent::StreamReset { source_agent: None });
+    }
+
     fn forward_status(&self, phase: String, detail: Option<String>) {
         let _ = self.tx.send(RuntimeEvent::Status { phase, detail });
     }
@@ -87,6 +97,14 @@ impl alms_tools::EventForwarder for RuntimeEventForwarder {
             message,
             source_agent,
         });
+    }
+
+    fn forward_run_terminal(&self, _outcome: alms_tools::SubagentRunOutcome) {
+        // No-op: the terminal event is only meaningful on a subagent's OWN
+        // session (#1180), handled by the self-sink forwarder. On the parent
+        // relay / top-level runtime channel the parent already learns of
+        // completion via `subagent_completed` (the #1046 guard prevents a
+        // double broadcast), so there is nothing to forward here.
     }
 
     fn forward_subagent_started(

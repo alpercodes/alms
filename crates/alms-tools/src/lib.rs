@@ -23,6 +23,7 @@ pub mod read_session;
 pub mod read_subagent_session;
 pub mod send_message;
 pub mod subagent;
+pub mod subagent_self_sink;
 
 // Re-export tool structs for ergonomic imports.
 pub use ignore_message::IgnoreMessageTool;
@@ -35,6 +36,7 @@ pub use read_subagent_session::ReadSubagentSessionTool;
 pub use send_message::SendMessageTool;
 
 // Re-export traits and supporting types.
-pub use event_forwarder::EventForwarder;
+pub use event_forwarder::{EventForwarder, SubagentRunOutcome};
 pub use message_sender::{ConversationEndReason, DeliveryReceipt, MessageSender, SendError};
 pub use subagent::SubagentDispatcher;
+pub use subagent_self_sink::SubagentSelfEventSink;

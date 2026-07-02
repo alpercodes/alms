@@ -11,6 +11,20 @@
 use serde_json::Value;
 use uuid::Uuid;
 
+/// Terminal outcome of a subagent's own run (#1180), forwarded once at
+/// end-of-run via [`EventForwarder::forward_run_terminal`] so the subagent's
+/// own-session SSE stream gets the matching terminal event and its in-flight
+/// state is cleaned up.
+#[derive(Debug, Clone)]
+pub enum SubagentRunOutcome {
+    /// Completed successfully — `usage` populates the `run_finished` event.
+    Completed { usage: alms_core::TokenUsage },
+    /// Failed — `error` populates the `run_error` event.
+    Failed { error: String },
+    /// Cancelled — emits `run_cancelled`.
+    Cancelled,
+}
+
 /// Type-erased event sink for subagent tool activity.
 ///
 /// Implementors forward events to whatever transport the caller uses
@@ -51,11 +65,30 @@ pub trait EventForwarder: Send + Sync + std::fmt::Debug {
     /// have to opt in explicitly.
     fn forward_reasoning_delta(&self, _text: String, _source_agent: Option<String>) {}
 
+    /// The streamed partial for the current turn is being retracted before a
+    /// buffered (non-streaming) response re-streams (#1162 sym-2). Any forwarder
+    /// that paints partials from `forward_token_delta` / `forward_reasoning_delta`
+    /// must surface this so the UI drops the abandoned partial before the
+    /// re-emit. Required (no default): silently dropping it double-renders the
+    /// turn on any stream where the partial was painted — the #1180 subagent
+    /// self-session stream is exactly such a stream.
+    fn forward_stream_reset(&self);
+
     /// A status update indicating the current phase of the agent run.
     fn forward_status(&self, phase: String, detail: Option<String>);
 
     /// A non-fatal warning condition during the run.
     fn forward_warning(&self, code: String, message: String, source_agent: Option<String>);
+
+    /// The subagent's own run reached a terminal state (#1180). Called ONCE at
+    /// end-of-run on the self-session forwarder only, so its own-session SSE
+    /// stream gets the matching terminal event (`run_finished` / `run_error` /
+    /// `run_cancelled`) — sealing the fullscreen view's assistant bubble and
+    /// clearing its spinner, mirroring a top-level run. Required (no default) so
+    /// no forwarder silently omits it. Parent/relay forwarders no-op it: the
+    /// parent already gets `subagent_completed` via the relay, and the #1046
+    /// guard keeps the coordinator's parent path from double-broadcasting.
+    fn forward_run_terminal(&self, outcome: SubagentRunOutcome);
 
     /// A subagent's session has just been created (#1105). The gateway
     /// converts this into a `subagent_started` SSE event so the UI's

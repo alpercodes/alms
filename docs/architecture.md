@@ -233,7 +233,7 @@ HTTP/SSE control plane. Handles top-level user interactions and exposes coordina
 **Task endpoints:** `GET /tasks`, `GET /tasks/{id}`
 **Other:** `GET /settings`, `GET /audit`, `POST /jobs`, `GET /jobs/{id}`, `GET /sessions`, `GET /health`
 
-**SSE event propagation:** Subagent `tool_start`/`tool_end`/`progress` events are forwarded into the parent run's SSE stream so the UI can show subagent activity inline.
+**SSE event propagation:** Subagent `tool_start`/`tool_end`/`progress` events are forwarded into the parent run's SSE stream (tagged with `source_agent`) so the UI can show subagent activity inline. A subagent's events are **also** mirrored, untagged, onto its own session's SSE event log (#1180) so the fullscreen subagent-session view streams live and replays.
 
 ### Channel Adapters (`alms-channel`)
 

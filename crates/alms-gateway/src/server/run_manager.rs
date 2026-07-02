@@ -854,6 +854,16 @@ impl RunManager {
     pub fn run_text_buffer_snapshot(&self, run_id: RunId) -> Option<RunTextBuffer> {
         self.run_text_buffers.get(&run_id).map(|r| r.clone())
     }
+
+    /// Evict a run's in-flight visible-reply text buffer (#1180).
+    ///
+    /// The `mark_run_as_*` terminal helpers evict this for top-level runs, but a
+    /// subagent's OWN run reaches terminal state via the coordinator's
+    /// `registrar.update_run` (which does not touch this buffer), so the
+    /// self-session terminal path evicts it explicitly here to avoid a leak.
+    pub fn evict_run_text_buffer(&self, run_id: RunId) {
+        self.run_text_buffers.remove(&run_id);
+    }
 }
 
 impl Default for RunManager {

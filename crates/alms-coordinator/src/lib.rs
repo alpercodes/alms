@@ -8,6 +8,7 @@ use alms_runtime::{AgentConfig, AgentRuntime, LlmClient, RunOutput};
 use alms_session::SessionManager;
 use alms_tools::event_forwarder::EventForwarder;
 use alms_tools::subagent::SubagentDispatcher;
+use alms_tools::subagent_self_sink::SubagentSelfEventSink;
 use async_trait::async_trait;
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
@@ -211,6 +212,12 @@ pub struct Coordinator {
     /// Optional run registrar — when set, subagent runs are registered as
     /// proper runs so they appear in GET /runs, the UI sidebar, and the CLI.
     run_registrar: Option<Arc<dyn RunRegistrar>>,
+    /// Optional sink (#1180) that mints a per-subagent [`EventForwarder`] bound
+    /// to the subagent's OWN session — when set, each spawned subagent
+    /// (foreground or background) mirrors its untagged run events to its own
+    /// session's SSE event log so the fullscreen subagent-session view streams
+    /// live and is replayable. The gateway provides the implementation.
+    subagent_self_sink: Option<Arc<dyn SubagentSelfEventSink>>,
     /// Security config snapshot (#947) — config-file-only, loaded once at
     /// gateway boot. The Coordinator consults
     /// [`SecurityConfig::is_full_os_access_agent`] for each named subagent
@@ -237,6 +244,7 @@ impl Coordinator {
             completion_tx: None,
             secrets: None,
             run_registrar: None,
+            subagent_self_sink: None,
             security_config: alms_core::config::SecurityConfig::default(),
         }
     }
@@ -266,6 +274,7 @@ impl Coordinator {
             completion_tx: None,
             secrets: None,
             run_registrar: None,
+            subagent_self_sink: None,
             security_config: alms_core::config::SecurityConfig::default(),
         }
     }
@@ -307,6 +316,16 @@ impl Coordinator {
     /// visible in GET /runs, the UI sidebar, and the CLI.
     pub fn with_run_registrar(mut self, registrar: Arc<dyn RunRegistrar>) -> Self {
         self.run_registrar = Some(registrar);
+        self
+    }
+
+    /// Set a subagent self-event sink (#1180) so each spawned subagent mirrors
+    /// its own (untagged) run events to its own session's SSE event log. This
+    /// powers the fullscreen subagent-session live view (foreground and
+    /// background alike). When unset, subagent events still reach the parent's
+    /// stream as before; only the subagent's own-session live SSE is skipped.
+    pub fn with_subagent_self_sink(mut self, sink: Arc<dyn SubagentSelfEventSink>) -> Self {
+        self.subagent_self_sink = Some(sink);
         self
     }
 
@@ -479,6 +498,7 @@ impl Coordinator {
         let completion_tx = self.completion_tx.clone();
         let secrets = self.secrets.clone();
         let run_registrar = self.run_registrar.clone();
+        let subagent_self_sink = self.subagent_self_sink.clone();
         let security_config = self.security_config.clone();
 
         // Move identity values into the spawned task — `run_subagent` and
@@ -515,6 +535,7 @@ impl Coordinator {
                     parent_cancel_token,
                     secrets,
                     run_registrar,
+                    subagent_self_sink,
                     security_config,
                     is_background,
                 )
@@ -728,6 +749,7 @@ async fn run_subagent(
     parent_cancel_token: Option<CancellationToken>,
     secrets: Option<Arc<parking_lot::RwLock<alms_core::secrets::SecretsStore>>>,
     run_registrar: Option<Arc<dyn RunRegistrar>>,
+    subagent_self_sink: Option<Arc<dyn SubagentSelfEventSink>>,
     security_config: alms_core::config::SecurityConfig,
     is_background: bool,
 ) {
@@ -798,6 +820,26 @@ async fn run_subagent(
         None
     };
 
+    // #1180: build a forwarder bound to the subagent's OWN session so its
+    // (untagged) run events stream to that session's SSE event log — powering
+    // the fullscreen subagent-session live view, foreground and background
+    // alike. Uses the subagent's registered run id when present (so
+    // `GET /runs/{id}/events` lines up) and a fresh id otherwise. `None` when no
+    // sink is wired (tests / non-gateway callers), leaving the parent-stream
+    // forward unchanged.
+    let self_event_fwd = subagent_self_sink.as_ref().map(|sink| {
+        let self_run_id = subagent_run
+            .as_ref()
+            .map(|r| r.run_id)
+            .unwrap_or_else(RunId::new);
+        sink.forwarder_for(sub_session_id, self_run_id)
+    });
+    // Keep a clone so we can emit the terminal event on the subagent's OWN
+    // session once `new_status` is known (#1180). `self_event_fwd` itself is
+    // moved into `run_agent_loop` for the content relay; the sink's two-channel
+    // drain orders the terminal after all content regardless of call timing.
+    let self_event_fwd_for_terminal = self_event_fwd.clone();
+
     // The select returns the task status, a JSON result value (for the
     // TaskResult / completion notification), and optionally the full
     // RunOutput so we can record accurate token usage in the run record.
@@ -825,7 +867,7 @@ async fn run_subagent(
             );
             (TaskStatus::Cancelled, serde_json::json!({"cancelled": true}), None, None, None)
         }
-        output = run_agent_loop(task_id, &request, sub_agent_id, &sub_context_id, &session_manager, &llm, parent_event_tx, &base_agent_config, workspace_dir.as_deref(), data_dir.as_deref(), project_root.as_deref(), &subagent_prompts, child_cancel_token.clone(), secrets.as_ref(), &security_config, is_background) => {
+        output = run_agent_loop(task_id, &request, sub_agent_id, &sub_context_id, &session_manager, &llm, parent_event_tx, self_event_fwd, &base_agent_config, workspace_dir.as_deref(), data_dir.as_deref(), project_root.as_deref(), &subagent_prompts, child_cancel_token.clone(), secrets.as_ref(), &security_config, is_background) => {
             match output {
                 Ok(run_output) => {
                     info!(
@@ -868,6 +910,37 @@ async fn run_subagent(
     // on the oneshot). This is a no-op if the token was already cancelled.
     child_cancel_token.cancel();
     bridge_handle.abort();
+
+    // #1180: seal the subagent's OWN session — emit its terminal SSE
+    // (run_finished / run_error / run_cancelled) and evict its text buffer via
+    // the self-sink. Only the subagent's own session: the parent already gets
+    // `subagent_completed` via the relay, and the #1046 guard keeps the
+    // coordinator silent on the parent path (no double-broadcast). The sink's
+    // two-channel drain orders this after all of the subagent's content.
+    if let Some(self_fwd) = self_event_fwd_for_terminal {
+        let outcome = match new_status {
+            TaskStatus::Completed => alms_tools::SubagentRunOutcome::Completed {
+                usage: run_output
+                    .as_ref()
+                    .map(|o| alms_core::TokenUsage {
+                        prompt_tokens: o.usage.prompt_tokens,
+                        completion_tokens: o.usage.completion_tokens,
+                        reasoning_tokens: o.usage.reasoning_tokens,
+                        cache_creation_input_tokens: o.usage.cache_creation_input_tokens,
+                        cache_read_input_tokens: o.usage.cache_read_input_tokens,
+                    })
+                    .unwrap_or_default(),
+            },
+            TaskStatus::Failed => alms_tools::SubagentRunOutcome::Failed {
+                error: result_value["error"]
+                    .as_str()
+                    .unwrap_or("unknown error")
+                    .to_string(),
+            },
+            _ => alms_tools::SubagentRunOutcome::Cancelled,
+        };
+        self_fwd.forward_run_terminal(outcome);
+    }
 
     // Update the run record with the outcome.  This executes regardless of
     // which tokio::select! branch fired (normal completion or cancellation),
@@ -1307,6 +1380,7 @@ async fn run_agent_loop(
     session_manager: &Arc<SessionManager>,
     llm: &LlmClient,
     parent_event_tx: Option<Arc<dyn EventForwarder>>,
+    self_event_tx: Option<Arc<dyn EventForwarder>>,
     base_agent_config: &AgentConfig,
     workspace_dir: Option<&std::path::Path>,
     data_dir: Option<&std::path::Path>,
@@ -1576,19 +1650,33 @@ async fn run_agent_loop(
         runtime = runtime.with_workspace(workspace);
     }
 
-    // Forward subagent tool events into the parent run's event stream,
-    // tagging each event with the subagent's identity so the UI can
-    // distinguish subagent activity from parent activity.
-    if let Some(parent_fwd) = parent_event_tx {
+    // Forward subagent events to two independent sinks: an UNTAGGED copy to the
+    // subagent's OWN session log (#1180 — powers the fullscreen subagent view)
+    // and a TAGGED (`source_agent`) copy to the parent stream (so the UI tees it
+    // into the parent's SubagentBar, not the parent's own chat/reasoning view).
+    if parent_event_tx.is_some() || self_event_tx.is_some() {
         let label = request
             .subagent_name
             .clone()
             .unwrap_or_else(|| format!("subagent-{}", &task_id.0.to_string()[..8]));
         let task_id_str = task_id.0.to_string();
+        let parent_fwd = parent_event_tx;
+        let self_fwd = self_event_tx;
         tokio::spawn(async move {
             use alms_runtime::RuntimeEvent;
             let mut rx = sub_rx;
             while let Some(event) = rx.recv().await {
+                // Untagged copy to the subagent's own session. Borrows `event`
+                // so the tagged parent forward below can still move it
+                // (RuntimeEvent isn't Clone — ApprovalRequired holds a oneshot).
+                if let Some(self_fwd) = self_fwd.as_deref() {
+                    forward_event_to_self(self_fwd, &event);
+                }
+
+                // Tagged copy to the parent stream; skipped when no parent sink.
+                let Some(parent_fwd) = parent_fwd.as_ref() else {
+                    continue;
+                };
                 let agent_label = Some(label.clone());
                 let tid = Some(task_id_str.clone());
                 match event {
@@ -1692,6 +1780,50 @@ async fn run_agent_loop(
     runtime
         .run(session_manager, context_id, &request.task)
         .await
+}
+
+/// Mirror a subagent's own runtime event UNTAGGED (`source_agent = None`) onto
+/// its own session's forwarder (#1180) — on a session's OWN stream the frontend
+/// renders untagged events as that session's main agent. Borrows `event` so the
+/// caller can still move it into the tagged parent forward (`RuntimeEvent` isn't
+/// `Clone`). `StreamReset` IS mirrored (unlike the parent relay, which drops it
+/// after suppressing subagent deltas): the self stream paints partials, so the
+/// buffered-fallback re-emit must be able to retract them (#1162 sym-2).
+/// Approval / context-debug / nested subagent-started are skipped.
+fn forward_event_to_self(self_fwd: &dyn EventForwarder, event: &alms_runtime::RuntimeEvent) {
+    use alms_runtime::RuntimeEvent;
+    match event {
+        RuntimeEvent::ToolStart {
+            invocation_id,
+            tool,
+            params,
+            ..
+        } => {
+            self_fwd.forward_tool_start(*invocation_id, tool.clone(), params.clone(), None, None);
+        }
+        RuntimeEvent::ToolEnd {
+            invocation_id,
+            ok,
+            result,
+            ..
+        } => {
+            self_fwd.forward_tool_end(*invocation_id, *ok, result.clone(), None, None);
+        }
+        RuntimeEvent::TokenDelta { delta, .. } => {
+            self_fwd.forward_token_delta(delta.clone(), None);
+        }
+        RuntimeEvent::ReasoningDelta { text, .. } => {
+            self_fwd.forward_reasoning_delta(text.clone(), None);
+        }
+        RuntimeEvent::Status { phase, detail } => {
+            self_fwd.forward_status(phase.clone(), detail.clone());
+        }
+        RuntimeEvent::Warning { code, message, .. } => {
+            self_fwd.forward_warning(code.clone(), message.clone(), None);
+        }
+        RuntimeEvent::StreamReset { .. } => self_fwd.forward_stream_reset(),
+        _ => {}
+    }
 }
 
 #[cfg(test)]
@@ -1830,6 +1962,268 @@ mod tests {
         );
     }
 
+    // -- #1180: subagent's OWN-session live SSE (foreground + background) -------
+
+    /// Capturing [`SubagentSelfEventSink`] (#1180): records each `forwarder_for`
+    /// binding and every event forwarded through the minted forwarders, so the
+    /// dispatch tests can assert both paths bind to the subagent's OWN session
+    /// and stream its untagged events in.
+    #[derive(Debug, Default)]
+    struct CapturingSelfSink {
+        bound: parking_lot::Mutex<Vec<(SessionId, RunId)>>,
+        events: Arc<parking_lot::Mutex<std::collections::HashMap<SessionId, Vec<String>>>>,
+    }
+
+    impl SubagentSelfEventSink for CapturingSelfSink {
+        fn forwarder_for(&self, session_id: SessionId, run_id: RunId) -> Arc<dyn EventForwarder> {
+            self.bound.lock().push((session_id, run_id));
+            Arc::new(CapturingSelfForwarder {
+                session_id,
+                events: self.events.clone(),
+            })
+        }
+    }
+
+    #[derive(Debug)]
+    struct CapturingSelfForwarder {
+        session_id: SessionId,
+        events: Arc<parking_lot::Mutex<std::collections::HashMap<SessionId, Vec<String>>>>,
+    }
+
+    impl CapturingSelfForwarder {
+        fn record(&self, kind: &str, source_agent: &Option<String>) {
+            // #1180: a subagent's own-session events must be untagged.
+            assert!(
+                source_agent.is_none(),
+                "subagent own-session event '{kind}' must be untagged, got {source_agent:?}"
+            );
+            self.events
+                .lock()
+                .entry(self.session_id)
+                .or_default()
+                .push(kind.to_string());
+        }
+    }
+
+    impl EventForwarder for CapturingSelfForwarder {
+        fn forward_tool_start(
+            &self,
+            _: uuid::Uuid,
+            _: String,
+            _: serde_json::Value,
+            source_agent: Option<String>,
+            _: Option<String>,
+        ) {
+            self.record("tool_start", &source_agent);
+        }
+        fn forward_tool_end(
+            &self,
+            _: uuid::Uuid,
+            _: bool,
+            _: serde_json::Value,
+            source_agent: Option<String>,
+            _: Option<String>,
+        ) {
+            self.record("tool_end", &source_agent);
+        }
+        fn forward_token_delta(&self, _: String, source_agent: Option<String>) {
+            self.record("token_delta", &source_agent);
+        }
+        fn forward_reasoning_delta(&self, _: String, source_agent: Option<String>) {
+            self.record("reasoning_delta", &source_agent);
+        }
+        fn forward_stream_reset(&self) {
+            self.events
+                .lock()
+                .entry(self.session_id)
+                .or_default()
+                .push("stream_reset".to_string());
+        }
+        fn forward_status(&self, _: String, _: Option<String>) {
+            // `status` carries no `source_agent` in the EventForwarder API.
+            self.events
+                .lock()
+                .entry(self.session_id)
+                .or_default()
+                .push("status".to_string());
+        }
+        fn forward_warning(&self, _: String, _: String, source_agent: Option<String>) {
+            self.record("warning", &source_agent);
+        }
+        fn forward_run_terminal(&self, outcome: alms_tools::SubagentRunOutcome) {
+            let kind = match outcome {
+                alms_tools::SubagentRunOutcome::Completed { .. } => "run_finished",
+                alms_tools::SubagentRunOutcome::Failed { .. } => "run_error",
+                alms_tools::SubagentRunOutcome::Cancelled => "run_cancelled",
+            };
+            self.events
+                .lock()
+                .entry(self.session_id)
+                .or_default()
+                .push(kind.to_string());
+        }
+    }
+
+    /// Poll the sink until the session has forwarded `target` (or the budget
+    /// expires). The coordinator's content relay and the terminal emit run on
+    /// separate tasks, so events can land just after `dispatch` returns.
+    async fn poll_self_events(
+        sink: &CapturingSelfSink,
+        sid: SessionId,
+        target: &str,
+    ) -> Vec<String> {
+        for _ in 0..100 {
+            let got = sink.events.lock().get(&sid).cloned().unwrap_or_default();
+            if got.iter().any(|e| e == target) {
+                return got;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        sink.events.lock().get(&sid).cloned().unwrap_or_default()
+    }
+
+    /// `forward_event_to_self` must strip the `source_agent` tag — events arrive
+    /// tagged for the parent relay, but the subagent's own session is untagged.
+    #[test]
+    fn test_forward_event_to_self_strips_source_agent_tag() {
+        let sink = CapturingSelfForwarder {
+            session_id: SessionId::new(),
+            events: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
+        };
+        let sid = sink.session_id;
+        // Events arrive TAGGED (as the coordinator's parent relay sees them)...
+        forward_event_to_self(
+            &sink,
+            &alms_runtime::RuntimeEvent::ReasoningDelta {
+                text: "secret".to_string(),
+                source_agent: Some("reviewer".to_string()),
+            },
+        );
+        forward_event_to_self(
+            &sink,
+            &alms_runtime::RuntimeEvent::ToolStart {
+                invocation_id: uuid::Uuid::new_v4(),
+                tool: "echo".to_string(),
+                params: serde_json::json!({}),
+                source_agent: Some("reviewer".to_string()),
+                task_id: Some("t".to_string()),
+            },
+        );
+        // ...and `record` (above) asserts each arrived untagged. A regression
+        // that forwarded the tag would trip those asserts.
+        let got = sink.events.lock().get(&sid).cloned().unwrap_or_default();
+        assert_eq!(
+            got,
+            vec!["reasoning_delta".to_string(), "tool_start".to_string()]
+        );
+    }
+
+    /// #1180 / #1162 sym-2: `forward_event_to_self` mirrors `StreamReset` onto
+    /// the subagent's own stream. The self stream paints partials (token /
+    /// reasoning deltas are forwarded), so dropping the reset would leave the
+    /// buffered re-emit stacked on an un-retracted partial — the double-render
+    /// Tim caught. (The parent relay can drop it; the self stream cannot.)
+    #[test]
+    fn test_forward_event_to_self_mirrors_stream_reset() {
+        let sink = CapturingSelfForwarder {
+            session_id: SessionId::new(),
+            events: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
+        };
+        let sid = sink.session_id;
+        forward_event_to_self(
+            &sink,
+            &alms_runtime::RuntimeEvent::StreamReset {
+                source_agent: Some("reviewer".to_string()),
+            },
+        );
+        let got = sink.events.lock().get(&sid).cloned().unwrap_or_default();
+        assert_eq!(got, vec!["stream_reset".to_string()]);
+    }
+
+    /// #1180 (foreground): a foreground subagent run streams its (untagged) run
+    /// events into a self-forwarder bound to the subagent's OWN session.
+    #[tokio::test]
+    async fn test_dispatch_foreground_streams_to_own_session_sink() {
+        let sink = Arc::new(CapturingSelfSink::default());
+        let coord = test_coordinator().with_subagent_self_sink(sink.clone());
+
+        let (_resp, sub_session_id) = coord
+            .dispatch(
+                "Say hello".to_string(),
+                test_session_id(),
+                test_parent_agent_id(),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("dispatch should succeed");
+
+        // The self-forwarder was built exactly once, bound to the subagent's OWN
+        // session (not the parent's).
+        let bound = sink.bound.lock().clone();
+        assert_eq!(bound.len(), 1, "one self-forwarder per subagent");
+        assert_eq!(
+            bound[0].0, sub_session_id,
+            "self-forwarder must be bound to the subagent's OWN session"
+        );
+
+        // The run's content + terminal streamed into the self-sink (mock LLM
+        // completes); `record` already pinned the content was untagged.
+        let got = poll_self_events(&sink, sub_session_id, "run_finished").await;
+        assert!(
+            got.contains(&"run_finished".to_string()),
+            "foreground subagent must stream content + a terminal (run_finished) \
+             to its OWN session sink, got {got:?}"
+        );
+    }
+
+    /// #1180 (background): same guarantee for a background subagent run.
+    #[tokio::test]
+    async fn test_dispatch_background_streams_to_own_session_sink() {
+        let sink = Arc::new(CapturingSelfSink::default());
+        let coord = test_coordinator().with_subagent_self_sink(sink.clone());
+
+        let (task_uuid, sub_session_id) = coord
+            .dispatch_background(
+                "Background work".to_string(),
+                test_session_id(),
+                test_parent_agent_id(),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("dispatch_background should succeed");
+
+        // Wait for the background subagent to reach a terminal state.
+        let tid = TaskId(task_uuid);
+        for _ in 0..100 {
+            match coord.get_status(tid) {
+                Some(TaskStatus::Completed) | Some(TaskStatus::Failed) => break,
+                _ => tokio::time::sleep(Duration::from_millis(20)).await,
+            }
+        }
+
+        let bound = sink.bound.lock().clone();
+        assert_eq!(bound.len(), 1, "one self-forwarder per subagent");
+        assert_eq!(
+            bound[0].0, sub_session_id,
+            "self-forwarder must be bound to the subagent's OWN session"
+        );
+
+        let got = poll_self_events(&sink, sub_session_id, "run_finished").await;
+        assert!(
+            got.contains(&"run_finished".to_string()),
+            "background subagent must stream content + a terminal (run_finished) \
+             to its OWN session sink, got {got:?}"
+        );
+    }
+
     // -- (c) #1105 -- spawn_subagent emits SubagentStarted onto parent's stream
 
     /// One captured `forward_subagent_started` call:
@@ -1866,8 +2260,10 @@ mod tests {
         ) {
         }
         fn forward_token_delta(&self, _delta: String, _source_agent: Option<String>) {}
+        fn forward_stream_reset(&self) {}
         fn forward_status(&self, _phase: String, _detail: Option<String>) {}
         fn forward_warning(&self, _code: String, _message: String, _source_agent: Option<String>) {}
+        fn forward_run_terminal(&self, _outcome: alms_tools::SubagentRunOutcome) {}
         fn forward_subagent_started(
             &self,
             tool_invocation_id: uuid::Uuid,

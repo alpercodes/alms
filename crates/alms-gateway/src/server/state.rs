@@ -343,7 +343,13 @@ impl AppState {
             Arc::clone(&agent_config),
         )
         .with_completion_channel(completion_tx)
-        .with_run_registrar(Arc::new(run_manager.clone()));
+        .with_run_registrar(Arc::new(run_manager.clone()))
+        // #1180: stream each subagent's OWN run events to its own session's SSE
+        // log so the fullscreen subagent-session view streams live and is
+        // replayable. Foreground and background alike.
+        .with_subagent_self_sink(Arc::new(crate::runs::GatewaySubagentSelfSink::new(
+            run_manager.clone(),
+        )));
         if let Some(ref ws_dir) = workspace_dir {
             coord = coord.with_workspace_dir(ws_dir.clone());
         }
