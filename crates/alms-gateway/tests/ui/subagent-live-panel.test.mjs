@@ -119,6 +119,7 @@ import {
     findSubagentBySessionId,
     setSubagentSessionId,
     activeSubagents,
+    clearAllSubagents,
 } from ${JSON.stringify(realSubagentsUrl)};
 
 function signal(initial) {
@@ -192,6 +193,7 @@ function clearSealedReasoningRunIds(id) { __sealedSets.delete(id); }
 export const __test = {
     signal, chatMessages, activeRunId, activeSession, dmParticipants,
     activeAgent, dmPeer, activeSubagents, trackSubagentStart, trackSubagentReasoning,
+    trackSubagentEnd, clearAllSubagents,
 };
 `;
 
@@ -263,7 +265,8 @@ function reset() {
     T.dmParticipants.value = [];
     T.activeAgent.value = null;
     T.dmPeer.value = null;
-    T.activeSubagents.value = {};
+    // Clears entries AND the #1183 pending early-reasoning buffers (no cross-test bleed).
+    T.clearAllSubagents();
     mod.dmThinkingBuffers.value = new Map();
     mod.closeSessionStream();
 }
@@ -403,4 +406,115 @@ test('#1149: an empty reasoning delta is ignored (no spurious panel write)', () 
 
     assert.equal(T.activeSubagents.value['reviewer'], before,
         'an empty delta is a no-op — the entry object reference is unchanged');
+});
+
+// ===========================================================================
+// #1183: an early background-subagent reasoning_delta (arriving before the
+// entry-creating tool_start) must be buffered and flushed, not dropped.
+// ===========================================================================
+
+test('#1183: reasoning_delta arriving BEFORE the entry exists is buffered, not dropped (named)', () => {
+    reset();
+    const es = openStream('sess-1');
+
+    // The subagent's first reasoning delta races ahead of the parent's
+    // tool_start — no entry exists yet.
+    es.emit('reasoning_delta', { source_agent: 'reviewer', text: 'early thinking. ' });
+    assert.deepEqual(T.activeSubagents.value, {},
+        'the early delta must NOT create a chip on its own');
+
+    // The parent's tool_start (invoke_agent) handler now creates the entry.
+    T.trackSubagentStart('reviewer', 'review the diff', 'inv-1');
+    const entry = T.activeSubagents.value['reviewer'];
+    assert.ok(entry, 'reviewer panel entry exists');
+    assert.equal(entry.liveActivity, 'early thinking. ',
+        'the buffered early reasoning is flushed into the new entry (not dropped)');
+
+    // Subsequent live deltas append after the flushed prefix, in order.
+    es.emit('reasoning_delta', { source_agent: 'reviewer', text: 'more thinking' });
+    assert.equal(T.activeSubagents.value['reviewer'].liveActivity,
+        'early thinking. more thinking',
+        'later deltas append after the flushed early reasoning');
+});
+
+test('#1183: early reasoning for an UNNAMED subagent flushes in order via the key migration', () => {
+    reset();
+    const es = openStream('sess-1');
+    const backendLabel = 'subagent-deadbeef'; // task_id-prefix label
+
+    // Early delta under the backend label — no entry yet.
+    es.emit('reasoning_delta', { source_agent: backendLabel, text: 'early ' });
+    assert.deepEqual(T.activeSubagents.value, {}, 'no chip created by the early delta');
+
+    // tool_start registers the entry under the tool-id-prefixed key (which
+    // differs from the backend label), so the flush cannot happen at start
+    // time — it happens on the NEXT resolved delta after the key migration.
+    T.trackSubagentStart('subagent', 'some task', 'abcdef0123456789');
+    es.emit('reasoning_delta', { source_agent: backendLabel, text: 'later' });
+
+    const entry = T.activeSubagents.value[backendLabel];
+    assert.ok(entry, 'entry migrated to the backend-assigned label');
+    assert.equal(entry.liveActivity, 'early later',
+        'the buffered early reasoning precedes the live delta (order preserved)');
+});
+
+test('#1183: the early-reasoning buffer is tail-bounded like liveActivity', () => {
+    reset();
+    const es = openStream('sess-1');
+
+    const chunk = 'y'.repeat(500);
+    for (let i = 0; i < 6; i++) {
+        es.emit('reasoning_delta', { source_agent: 'reviewer', text: chunk }); // 3000 chars
+    }
+    es.emit('reasoning_delta', { source_agent: 'reviewer', text: 'TAIL_MARK' });
+
+    T.trackSubagentStart('reviewer', 'task', 'inv-1');
+    const entry = T.activeSubagents.value['reviewer'];
+    assert.ok(entry.liveActivity.length <= 2000,
+        'the flushed buffer respects the liveActivity cap (<= 2000 chars)');
+    assert.ok(entry.liveActivity.endsWith('TAIL_MARK'),
+        'the most-recent buffered reasoning (the tail) is preserved');
+});
+
+test('#1183: clearAllSubagents evicts pending buffers (session switch)', () => {
+    reset();
+    const es = openStream('sess-1');
+
+    es.emit('reasoning_delta', { source_agent: 'reviewer', text: 'from the previous session' });
+    T.clearAllSubagents();
+
+    T.trackSubagentStart('reviewer', 'task', 'inv-1');
+    assert.equal(T.activeSubagents.value['reviewer'].liveActivity, '',
+        'a previous session buffered reasoning must not flush after a clear');
+});
+
+test('#1183: a completion evicts the pending buffer for that label (no stale flush into a re-invocation)', () => {
+    reset();
+    const es = openStream('sess-1');
+
+    // A late / replayed delta for a subagent whose chip is already gone.
+    es.emit('reasoning_delta', { source_agent: 'reviewer', text: 'stale replayed delta' });
+    // Its completion arrives (entry long removed) — must still evict.
+    T.trackSubagentEnd('reviewer', 'done');
+
+    T.trackSubagentStart('reviewer', 'task', 'inv-2');
+    assert.equal(T.activeSubagents.value['reviewer'].liveActivity, '',
+        'a stale buffer must never flush into a later re-invocation');
+});
+
+test('#1183: pending buffers are capped — the least-recently-written label is evicted', () => {
+    reset();
+    const es = openStream('sess-1');
+
+    // 9 distinct labels against a cap of 8: the oldest ('agent-0') is evicted.
+    for (let i = 0; i < 9; i++) {
+        es.emit('reasoning_delta', { source_agent: 'agent-' + i, text: 'buffered ' + i });
+    }
+
+    T.trackSubagentStart('agent-0', 'task', 'inv-a');
+    assert.equal(T.activeSubagents.value['agent-0'].liveActivity, '',
+        'the oldest label was evicted at the cap');
+    T.trackSubagentStart('agent-8', 'task', 'inv-b');
+    assert.equal(T.activeSubagents.value['agent-8'].liveActivity, 'buffered 8',
+        'a recently-written label is retained and flushes normally');
 });

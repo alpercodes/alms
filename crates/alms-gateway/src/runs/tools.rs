@@ -596,6 +596,21 @@ pub fn route_bg_event(
                 subagent_session_id,
             )),
         },
+        // #1180: forward a background subagent's reasoning deltas onto the
+        // parent's SESSION stream (tagged `source_agent`) so the SubagentBar's
+        // live tail lights up during a background `invoke_agent` run; the
+        // frontend tees them to the bar, away from the parent's own reasoning
+        // view. NOT rerouted through the parent's `runtime_tx` like
+        // `SubagentStarted`, because (a) these high-frequency deltas risk the
+        // #1124 strong-sender deadlock and (b) a background subagent routinely
+        // outlives the parent turn (runtime_tx is gone by then). `token_delta`
+        // is intentionally NOT forwarded (no bar surface; would only bloat the
+        // persisted session log).
+        RuntimeEvent::ReasoningDelta { text, source_agent } => Some(SseEventData::reasoning_delta(
+            bg_run_id,
+            &text,
+            source_agent,
+        )),
         _ => None,
     }
 }

@@ -34,7 +34,9 @@ import { activeSessionId } from './sessions.js';
  * subagent is thinking in real time instead of sitting on "Waiting for
  * activity..." until the subagent finishes. Bounded to the most recent
  * `LIVE_ACTIVITY_MAX_CHARS` characters so a long thinking trace can't grow
- * the entry without bound.
+ * the entry without bound. A delta that arrives before the entry exists
+ * (#1183 startup race) is buffered in `pendingReasoning` and flushed into
+ * `liveActivity` once the entry appears.
  */
 export const activeSubagents = signal({});
 
@@ -47,6 +49,69 @@ export const activeSubagents = signal({});
  * stops.
  */
 const LIVE_ACTIVITY_MAX_CHARS = 2000;
+
+/**
+ * Early-reasoning buffers for forwarded subagent `reasoning_delta` events that
+ * arrive BEFORE the matching `activeSubagents` entry exists (#1183). A
+ * background subagent's reasoning is routed onto the parent's session stream
+ * independently of the `runtime_tx` drain that carries the entry-creating
+ * `tool_start (invoke_agent)`, so its first deltas can beat the entry; without
+ * buffering they would be dropped and the bar would stay blank.
+ *
+ * Keyed by the backend `source_agent` label. Each buffer is tail-bounded to
+ * `LIVE_ACTIVITY_MAX_CHARS`, the map is LRU-capped at
+ * `PENDING_REASONING_MAX_BUFFERS`, and a buffer older than
+ * `PENDING_REASONING_MAX_AGE_MS` is discarded at flush time so a stale replayed
+ * delta can't front-run a later re-invocation. Dropped on `trackSubagentEnd`
+ * and `clearAllSubagents`. Values: { text, updatedAt }.
+ */
+const pendingReasoning = new Map();
+
+/** Max number of distinct `source_agent` labels buffered at once (#1183). */
+const PENDING_REASONING_MAX_BUFFERS = 8;
+
+/** Max age of a pending early-reasoning buffer before it is treated as stale
+ *  and discarded instead of flushed (#1183). The race window is sub-second;
+ *  30s is a generous ceiling. */
+const PENDING_REASONING_MAX_AGE_MS = 30000;
+
+/**
+ * Append an early (pre-entry) reasoning delta to the pending buffer for a
+ * backend `source_agent` label (#1183). Tail-bounded and LRU-capped — see the
+ * `pendingReasoning` doc above. Never creates an `activeSubagents` entry, so
+ * the "a late delta must not resurrect a removed chip" invariant holds.
+ */
+function bufferEarlyReasoning(name, delta) {
+    const now = Date.now();
+    const existing = pendingReasoning.get(name);
+    const fresh = existing
+        && (now - existing.updatedAt) <= PENDING_REASONING_MAX_AGE_MS;
+    let text = (fresh ? existing.text : '') + delta;
+    if (text.length > LIVE_ACTIVITY_MAX_CHARS) {
+        text = text.slice(text.length - LIVE_ACTIVITY_MAX_CHARS);
+    }
+    // Delete-then-set refreshes Map insertion order, so the cap eviction
+    // below always drops the least-recently-written label.
+    pendingReasoning.delete(name);
+    pendingReasoning.set(name, { text, updatedAt: now });
+    while (pendingReasoning.size > PENDING_REASONING_MAX_BUFFERS) {
+        const oldest = pendingReasoning.keys().next().value;
+        pendingReasoning.delete(oldest);
+    }
+}
+
+/**
+ * Remove and return the pending early-reasoning buffer for a label (#1183).
+ * Returns '' when there is no buffer or the buffer is stale (older than
+ * `PENDING_REASONING_MAX_AGE_MS`) — stale text is discarded, not flushed.
+ */
+function takePendingReasoning(name) {
+    const buf = pendingReasoning.get(name);
+    if (!buf) return '';
+    pendingReasoning.delete(name);
+    if (Date.now() - buf.updatedAt > PENDING_REASONING_MAX_AGE_MS) return '';
+    return buf.text;
+}
 
 /**
  * When viewing a subagent session, stores the parent session ID so the
@@ -150,7 +215,10 @@ export function trackSubagentStart(name, task, toolInvocationId) {
             displayName: name,
             startedAt: Date.now(),
             sessionId: null,
-            liveActivity: '',
+            // #1183: seed with any early reasoning buffered before this entry
+            // existed. Named subagents flush here (label == key); unnamed ones
+            // flush on the next resolved delta after the key migration.
+            liveActivity: takePendingReasoning(key),
         },
     };
 }
@@ -219,9 +287,10 @@ export function trackSubagentTool(name, tool) {
  * forwarded events for the same subagent match directly.
  *
  * Returns the resolved key, or `null` when no matching entry exists (e.g. the
- * subagent already completed and its chip was auto-removed). The caller treats
- * a `null` result as a no-op — a late forwarded delta for a gone subagent must
- * never resurrect a removed chip.
+ * subagent already completed and its chip was auto-removed, or the entry has
+ * not been created yet — see the #1183 startup race). A `null` result must
+ * never resurrect / create a chip; `trackSubagentReasoning` responds to it by
+ * buffering the delta (`pendingReasoning`), other callers no-op.
  *
  * @param {string} name - The backend `source_agent` label.
  * @returns {string|null} the resolved (possibly migrated) entry key.
@@ -262,8 +331,14 @@ function resolveForwardedSubagentKey(name) {
  * panel shows the subagent's CURRENT thinking, and the full transcript is
  * available via "View session". Keying / migration matches `trackSubagentTool`
  * so forwarded events from unnamed subagents (whose backend label differs from
- * the start-time key) land on the right entry. A delta for an unknown / removed
- * subagent is dropped (no chip is resurrected).
+ * the start-time key) land on the right entry.
+ *
+ * A delta that cannot be resolved to an entry is BUFFERED, not dropped (#1183,
+ * see `pendingReasoning`): a background subagent's reasoning can beat the
+ * `tool_start` that creates its entry. The buffer is flushed into
+ * `liveActivity` (ahead of the current delta) once the label resolves or at
+ * entry creation; buffering never creates an entry, so a gone subagent's late
+ * delta can't resurrect a chip.
  *
  * @param {string} name - The backend `source_agent` label for the subagent.
  * @param {string} delta - The reasoning text chunk to append.
@@ -271,10 +346,21 @@ function resolveForwardedSubagentKey(name) {
 export function trackSubagentReasoning(name, delta) {
     if (!delta) return;
     const key = resolveForwardedSubagentKey(name);
-    if (!key) return;
+    if (!key) {
+        // #1183: the entry doesn't exist yet (startup race) or is gone
+        // (late replay). Buffer instead of dropping — flushed on resolve,
+        // discarded when stale.
+        bufferEarlyReasoning(name, delta);
+        return;
+    }
     const current = activeSubagents.value[key];
     if (!current) return;
-    let next = (current.liveActivity || '') + delta;
+    // #1183: flush any reasoning buffered before this entry existed.
+    // `resolveForwardedSubagentKey` always resolves to `name` (directly or by
+    // migrating the entry to it), so buffer and entry keys coincide; the
+    // buffered text is older than `delta`, so it goes first.
+    const buffered = takePendingReasoning(name);
+    let next = (current.liveActivity || '') + buffered + delta;
     if (next.length > LIVE_ACTIVITY_MAX_CHARS) {
         next = next.slice(next.length - LIVE_ACTIVITY_MAX_CHARS);
     }
@@ -314,8 +400,16 @@ export function trackSubagentReasoning(name, delta) {
  * @param {string} [subagentSessionId] - The completing subagent's session UUID.
  */
 export function trackSubagentEnd(name, status, toolInvocationId, subagentSessionId) {
+    // #1183: a completed subagent produces no more reasoning; drop its pending
+    // buffer so it can't flush into a later re-invocation under the same name.
+    // Unconditional (before the lookup) so a completion for an already-removed
+    // chip still evicts.
+    pendingReasoning.delete(name);
     const key = resolveSubagentKey(name, toolInvocationId, subagentSessionId);
     if (!key) return;
+    // The entry key may have been migrated to the backend label (which is
+    // what buffers are keyed by) — evict under that label too.
+    pendingReasoning.delete(key);
     const current = activeSubagents.value[key];
     if (!current) return;
     activeSubagents.value = {
@@ -548,6 +642,9 @@ export function clearAllSubagents() {
         clearTimeout(removeTimers[key]);
         delete removeTimers[key];
     }
+    // #1183: drop early-reasoning buffers too — a session switch must never
+    // flush a previous session's buffered subagent reasoning into the next.
+    pendingReasoning.clear();
     activeSubagents.value = {};
 }
 
@@ -839,7 +936,9 @@ export function rehydrateSubagentsFromHistory(messages) {
             displayName: name,
             startedAt,
             sessionId: subagentSessionId,
-            liveActivity: '',
+            // #1183: same early-reasoning flush as `trackSubagentStart` —
+            // forwarded deltas can beat this rehydrate pass on a reload.
+            liveActivity: takePendingReasoning(key),
         };
     }
 

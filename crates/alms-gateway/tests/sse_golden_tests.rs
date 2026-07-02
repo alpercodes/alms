@@ -1013,3 +1013,111 @@ async fn test_bg_subagent_started_falls_back_to_session_stream_when_parent_dead(
         "fallback must preserve the subagent name when present"
     );
 }
+
+/// Regression test for #1180: a background subagent's `reasoning_delta` events
+/// must be forwarded onto the parent's SESSION stream tagged with
+/// `source_agent`, so the SubagentBar's live-activity tail (#1149 / #1171
+/// `trackSubagentReasoning`) lights up during the run.
+///
+/// Failure scenario (pre-fix): `route_bg_event` only converted
+/// `ToolStart` / `ToolEnd` / `SubagentStarted`; `ReasoningDelta` fell through
+/// the `_ => None` catch-all and was dropped, so the parent's subagent bar
+/// stayed blank for the entire background run even though the subagent was
+/// actively thinking. (#1171 wired this for the FOREGROUND path only.)
+///
+/// Asserts falsifiably:
+///   - `route_bg_event` returns `Some(SseEventData)` of type `reasoning_delta`
+///     (a revert to the dropped `_ => None` behaviour returns `None`, failing
+///     the `.expect`).
+///   - the event keeps the subagent's `source_agent` tag verbatim — this is
+///     the key the frontend uses to tee the delta to the bar and keep it out
+///     of the parent's own reasoning view (#1170 invariant).
+///   - the event carries the bg run id and the reasoning text.
+///   - both parent-liveness legs (`Some(parent_fwd)` and `None`) return the
+///     same `reasoning_delta`: unlike `SubagentStarted`, reasoning deltas are
+///     NOT rerouted through the parent's `runtime_tx` (which dies with the
+///     parent run) — the bar must keep updating after the parent turn ends, so
+///     they always go to the session-stream return value.
+#[tokio::test]
+async fn test_bg_subagent_reasoning_delta_forwarded_to_parent_session_stream() {
+    use alms_gateway::runs::tools::route_bg_event;
+    use alms_runtime::RuntimeEvent;
+    use std::sync::Arc;
+
+    let bg_run_id = RunId::new();
+    let parent_session = SessionId::new();
+
+    // No-op parent forwarder for the parent-alive leg. Reasoning deltas must
+    // NOT be rerouted through it (that path dies with the parent run); they go
+    // straight to the session-stream SSE return value regardless of liveness.
+    #[derive(Debug)]
+    struct NoopForwarder;
+    impl alms_tools::EventForwarder for NoopForwarder {
+        fn forward_tool_start(
+            &self,
+            _: uuid::Uuid,
+            _: String,
+            _: serde_json::Value,
+            _: Option<String>,
+            _: Option<String>,
+        ) {
+        }
+        fn forward_tool_end(
+            &self,
+            _: uuid::Uuid,
+            _: bool,
+            _: serde_json::Value,
+            _: Option<String>,
+            _: Option<String>,
+        ) {
+        }
+        fn forward_token_delta(&self, _: String, _: Option<String>) {}
+        fn forward_status(&self, _: String, _: Option<String>) {}
+        fn forward_warning(&self, _: String, _: String, _: Option<String>) {}
+    }
+    let parent_fwd: Arc<dyn alms_tools::EventForwarder> = Arc::new(NoopForwarder);
+
+    let assert_reasoning = |sse: Option<SseEventData>| {
+        let sse = sse.expect(
+            "#1180: route_bg_event must forward a background subagent's \
+             reasoning_delta as a session-stream SseEventData instead of \
+             dropping it via the `_ => None` catch-all",
+        );
+        assert_eq!(sse.event_type, "reasoning_delta");
+        assert_eq!(
+            sse.data["source_agent"].as_str(),
+            Some("reviewer"),
+            "forwarded reasoning_delta must keep the subagent's source_agent tag \
+             so the frontend tees it to the SubagentBar (and out of the parent \
+             reasoning view)"
+        );
+        assert_eq!(sse.data["text"].as_str(), Some("thinking hard"));
+        assert_eq!(
+            sse.data["run_id"].as_str(),
+            Some(bg_run_id.0.to_string().as_str())
+        );
+    };
+
+    // Parent-alive leg.
+    assert_reasoning(route_bg_event(
+        RuntimeEvent::ReasoningDelta {
+            text: "thinking hard".to_string(),
+            source_agent: Some("reviewer".to_string()),
+        },
+        Some(&*parent_fwd),
+        bg_run_id,
+        parent_session,
+    ));
+
+    // Parent-dead leg — same result (bar must keep updating after the parent
+    // run ends, so the event is never gated on parent liveness).
+    assert_reasoning(route_bg_event(
+        RuntimeEvent::ReasoningDelta {
+            text: "thinking hard".to_string(),
+            source_agent: Some("reviewer".to_string()),
+        },
+        None,
+        bg_run_id,
+        parent_session,
+    ));
+}

@@ -359,3 +359,30 @@ fn reasoning_dedupe_store_js_behaviour() {
 fn dm_stream_rendering_js_behaviour() {
     run_node_test("dm-stream-rendering.test.mjs");
 }
+
+/// Behavioural coverage for the SubagentBar live-activity tee in
+/// `static/ui/state/subagents.js` + the `reasoning_delta` handler in
+/// `static/ui/hooks/use-session-stream.js`, driven through a real
+/// `FakeEventSource` against the REAL subagents module.
+///
+/// Pins two arcs:
+///   - #1149 / #1171 — a `source_agent`-tagged `reasoning_delta` surfaces on
+///     the matching panel entry's `liveActivity` (with key migration for
+///     unnamed subagents and tail bounding) and never leaks into the parent's
+///     main-view reasoning or the DM collapsible.
+///   - #1183 (Codex P2 on PR #1183) — a background subagent's reasoning is
+///     delivered on the session stream independently of the parent's
+///     `runtime_tx` drain, so a delta can arrive BEFORE the entry-creating
+///     `tool_start (invoke_agent)`. Such a delta must be buffered (keyed by
+///     the forwarded `source_agent` label, tail-bounded, LRU-capped, aged
+///     out) and flushed into the entry's `liveActivity` once the entry is
+///     created / the label resolves — never silently dropped, and never
+///     creating/resurrecting a chip on its own.
+///
+/// Wires the file into `cargo test` / CI — previously it only ran under a
+/// direct `node --test` invocation, so these regressions had no Rust harness
+/// gate.
+#[test]
+fn subagent_live_panel_js_behaviour() {
+    run_node_test("subagent-live-panel.test.mjs");
+}
