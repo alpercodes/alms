@@ -79,7 +79,7 @@ function bumpRunListGeneration() {}
 // subagents (inert)
 function trackSubagentStart() {}
 function trackSubagentEnd() {}
-function trackSubagentTool() {}
+function trackSubagentActivity() {}
 function findSubagentByToolInvocationId() { return null; }
 function findSubagentBySessionId() { return null; }
 function setSubagentSessionId() {}

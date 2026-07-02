@@ -11,6 +11,23 @@
 use serde_json::Value;
 use uuid::Uuid;
 
+/// Wire-format `kind` values for [`EventForwarder::forward_subagent_activity`]
+/// (and the `subagent_activity` SSE event the gateway derives from it).
+///
+/// Keep in sync with the frontend's status-label mapping
+/// (`static/ui/utils/subagent-status.js`).
+pub mod subagent_activity_kind {
+    /// The subagent is producing reasoning / extended-thinking output.
+    pub const REASONING: &str = "reasoning";
+    /// The subagent is producing visible output tokens.
+    pub const WRITING: &str = "writing";
+    /// A tool started executing (the signal carries the tool name).
+    pub const TOOL_START: &str = "tool_start";
+    /// The running tool finished (back to a generic "running" state until
+    /// the next signal).
+    pub const TOOL_END: &str = "tool_end";
+}
+
 /// Terminal outcome of a subagent's own run (#1180), forwarded once at
 /// end-of-run via [`EventForwarder::forward_run_terminal`] so the subagent's
 /// own-session SSE stream gets the matching terminal event and its in-flight
@@ -56,6 +73,27 @@ pub trait EventForwarder: Send + Sync + std::fmt::Debug {
 
     /// A chunk of text from the LLM response stream.
     fn forward_token_delta(&self, delta: String, source_agent: Option<String>);
+
+    /// A coarse status signal describing what a subagent is doing right now
+    /// ([`subagent_activity_kind`]), for the parent's Subagent status bar.
+    ///
+    /// Emitted by the coordinator's subagent→parent relay INSTEAD of the
+    /// subagent's reasoning/token text and tool params/results — the parent
+    /// only needs to know *that* the subagent is reasoning / writing / using
+    /// a named tool, not *what* it produced (the full content streams to the
+    /// subagent's own session, #1184). `tool` is populated only for
+    /// `tool_start`. Deduplicated at the call site: consecutive deltas of the
+    /// same kind produce a single signal.
+    ///
+    /// Default is a no-op: a forwarder that ignores it merely shows less
+    /// status, so test doubles and single-purpose sinks don't have to opt in.
+    fn forward_subagent_activity(
+        &self,
+        _kind: String,
+        _tool: Option<String>,
+        _source_agent: Option<String>,
+    ) {
+    }
 
     /// A chunk of reasoning / extended-thinking text from the LLM stream.
     ///

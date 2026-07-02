@@ -162,6 +162,34 @@ impl SseEventData {
         )
     }
 
+    /// Coarse per-subagent status signal for the parent's Subagent status bar.
+    ///
+    /// Carries only the activity `kind` (`reasoning` / `writing` /
+    /// `tool_start` / `tool_end`) and — for `tool_start` — the tool name;
+    /// deliberately NO reasoning/token text and NO tool params/results (the
+    /// full content streams to the subagent's own session, #1184).
+    ///
+    /// **Ephemeral**: listed in `send_event`'s `is_ephemeral` set and routed
+    /// via `send_transient_session_event` on the background path, so it is
+    /// never persisted to any event log — the bar re-derives its status from
+    /// live signals after a reload.
+    pub fn subagent_activity(
+        run_id: RunId,
+        kind: &str,
+        tool: Option<String>,
+        source_agent: Option<String>,
+    ) -> Self {
+        Self::new(
+            "subagent_activity",
+            SubagentActivityData {
+                run_id: run_id.0.to_string(),
+                kind: kind.to_string(),
+                tool,
+                source_agent,
+            },
+        )
+    }
+
     pub fn tool_start(
         run_id: RunId,
         tool_invocation_id: ToolInvocationId,
@@ -822,6 +850,23 @@ struct ReasoningDeltaData {
 #[derive(Debug, Serialize)]
 struct StreamResetData {
     run_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_agent: Option<String>,
+}
+
+/// Wire payload for the ephemeral `subagent_activity` SSE event — a coarse
+/// status signal for the parent's Subagent status bar. `kind` is one of
+/// `reasoning` / `writing` / `tool_start` / `tool_end` (see
+/// `alms_tools::subagent_activity_kind`); `tool` is present only for
+/// `tool_start`. Never persisted (see `send_event`'s `is_ephemeral` set).
+#[derive(Debug, Serialize)]
+struct SubagentActivityData {
+    run_id: String,
+    kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool: Option<String>,
+    /// The subagent label the frontend routes the signal by. Always set in
+    /// practice; optional to mirror the other tagged payloads.
     #[serde(skip_serializing_if = "Option::is_none")]
     source_agent: Option<String>,
 }

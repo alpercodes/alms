@@ -583,7 +583,8 @@ impl RunManager {
     pub async fn send_event(&self, run_id: RunId, session_id: SessionId, mut event: SseEventData) {
         let is_ephemeral = event.event_type == "token_delta"
             || event.event_type == "status"
-            || event.event_type == "context_debug";
+            || event.event_type == "context_debug"
+            || event.event_type == "subagent_activity";
 
         // Per-run event log — skip ephemeral events (token_delta, status,
         // context_debug) to avoid persisting high-frequency or transient data.
@@ -729,6 +730,25 @@ impl RunManager {
 
         if let Some(mut senders) = self.session_senders.get_mut(&session_id) {
             senders.retain(|sender| sender.send(tagged.clone()).is_ok());
+            if senders.is_empty() {
+                drop(senders);
+                self.session_senders.remove(&session_id);
+            }
+        }
+    }
+
+    /// Fan a session-only event out to live session subscribers WITHOUT
+    /// persisting it to any event log.
+    ///
+    /// Used for high-frequency / moment-in-time signals (the `subagent_activity`
+    /// status events from the background-subagent channel) that are worthless
+    /// on replay and must not grow the session log. `event_id` is left `None`
+    /// so the replay dedup filter in `stream_with_replay` passes the event
+    /// through — the same contract as `send_event`'s ephemeral fast path.
+    /// Synchronous: pure in-memory fan-out, no log I/O to await.
+    pub fn send_transient_session_event(&self, session_id: SessionId, event: SseEventData) {
+        if let Some(mut senders) = self.session_senders.get_mut(&session_id) {
+            senders.retain(|sender| sender.send(event.clone()).is_ok());
             if senders.is_empty() {
                 drop(senders);
                 self.session_senders.remove(&session_id);

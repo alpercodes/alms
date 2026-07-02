@@ -2,15 +2,16 @@ import { signal } from '../deps.js';
 import { activeSessionId } from './sessions.js';
 
 /**
- * Active subagents and their tool activity.
- * Shape: { [key]: { status, tools, task, toolInvocationId, displayName, startedAt, sessionId, liveActivity } }
+ * Active subagents and their live status, backing the Subagent status bar.
+ * Shape: { [key]: { status, task, toolInvocationId, displayName, startedAt,
+ *                   sessionId, activity, toolsUsed } }
  *
  * Keys are unique identifiers for each subagent invocation:
  *   - Named subagents use the agent name as the key (e.g. "reviewer").
  *   - Unnamed subagents use "subagent-{toolInvocationId_prefix}" so that
  *     concurrent unnamed invocations each get their own slot.
  *
- * `displayName` is the human-friendly label shown in the SubagentBar chip.
+ * `displayName` is the human-friendly label shown on the status-bar chip.
  * For named subagents it equals the key; for unnamed ones it is "subagent".
  *
  * `toolInvocationId` is the tool_invocation_id of the parent's invoke_agent
@@ -21,96 +22,117 @@ import { activeSessionId } from './sessions.js';
  * Used to compute duration when the subagent completes.
  *
  * `sessionId` is the subagent's session UUID, populated from the
- * invoke_agent result or the subagent_completed event. Used for
- * drill-down navigation ("View session").
+ * invoke_agent result or the subagent_started/subagent_completed events.
+ * Clicking the chip navigates directly to this session.
  *
- * `liveActivity` is a bounded tail of the subagent's in-flight reasoning /
- * extended-thinking text (#1149). The parent's session stream forwards a
- * running subagent's `reasoning_delta` events tagged with `source_agent`;
- * `use-session-stream.js` suppresses those from the PARENT's main chat /
- * reasoning view (so subagent thinking never leaks into the parent run —
- * the #1170 / `get_run_reasoning` invariant) but tees them HERE via
- * `trackSubagentReasoning` so the SubagentBar panel can show what the
- * subagent is thinking in real time instead of sitting on "Waiting for
- * activity..." until the subagent finishes. Bounded to the most recent
- * `LIVE_ACTIVITY_MAX_CHARS` characters so a long thinking trace can't grow
- * the entry without bound. A delta that arrives before the entry exists
- * (#1183 startup race) is buffered in `pendingReasoning` and flushed into
- * `liveActivity` once the entry appears.
+ * `activity` is the subagent's MOST RECENT coarse activity signal:
+ * `{ kind, tool }` where `kind` is one of `reasoning` / `writing` /
+ * `tool_start` / `tool_end` and `tool` is the tool name (only for
+ * `tool_start`), or `null` before the first signal. Driven by the backend's
+ * ephemeral `subagent_activity` SSE events (tagged `source_agent`) via
+ * `trackSubagentActivity`. The bar renders it as a concise status label
+ * ("Reasoning…", "Using {tool}", "Writing…") — the subagent's actual
+ * reasoning/token text is deliberately NOT streamed to the parent anymore;
+ * the full transcript lives on the subagent's own session (#1184), reached
+ * by clicking the chip. A signal that arrives before the entry exists (the
+ * #1183 startup race) is held in `pendingActivity` and applied once the
+ * entry appears.
+ *
+ * `toolsUsed` counts observed `tool_start` signals, feeding the completion
+ * card's tool count.
  */
 export const activeSubagents = signal({});
 
 /**
- * Max characters of subagent live-reasoning tail retained on a panel entry's
- * `liveActivity` field (#1149). The panel surfaces the agent's CURRENT
- * thinking, not its full transcript (that lives on the subagent's own session,
- * reachable via "View session"), so only the most recent slice is kept. This
- * also bounds memory for a long-running subagent whose reasoning stream never
- * stops.
- */
-const LIVE_ACTIVITY_MAX_CHARS = 2000;
-
-/**
- * Early-reasoning buffers for forwarded subagent `reasoning_delta` events that
- * arrive BEFORE the matching `activeSubagents` entry exists (#1183). A
- * background subagent's reasoning is routed onto the parent's session stream
- * independently of the `runtime_tx` drain that carries the entry-creating
- * `tool_start (invoke_agent)`, so its first deltas can beat the entry; without
- * buffering they would be dropped and the bar would stay blank.
+ * Latest early activity signal per backend `source_agent` label, for signals
+ * that arrive BEFORE the matching `activeSubagents` entry exists (#1183
+ * startup race: a background subagent's stream is routed independently of the
+ * `runtime_tx` drain that carries the entry-creating `tool_start
+ * (invoke_agent)`, so its first signal can beat the entry).
  *
- * Keyed by the backend `source_agent` label. Each buffer is tail-bounded to
- * `LIVE_ACTIVITY_MAX_CHARS`, the map is LRU-capped at
- * `PENDING_REASONING_MAX_BUFFERS`, and a buffer older than
- * `PENDING_REASONING_MAX_AGE_MS` is discarded at flush time so a stale replayed
- * delta can't front-run a later re-invocation. Dropped on `trackSubagentEnd`
- * and `clearAllSubagents`. Values: { text, updatedAt }.
+ * Only the LATEST signal per label is kept (status is a point-in-time value,
+ * unlike the old text buffer this replaces). The map is LRU-capped at
+ * `PENDING_ACTIVITY_MAX_LABELS`, and an entry older than
+ * `PENDING_ACTIVITY_MAX_AGE_MS` is discarded at take time so a stale replayed
+ * signal can't front-run a later re-invocation. Dropped on `trackSubagentEnd`
+ * and `clearAllSubagents`. Values: { kind, tool, updatedAt }.
  */
-const pendingReasoning = new Map();
+const pendingActivity = new Map();
 
-/** Max number of distinct `source_agent` labels buffered at once (#1183). */
-const PENDING_REASONING_MAX_BUFFERS = 8;
+/** Max number of distinct `source_agent` labels buffered at once. */
+const PENDING_ACTIVITY_MAX_LABELS = 8;
 
-/** Max age of a pending early-reasoning buffer before it is treated as stale
- *  and discarded instead of flushed (#1183). The race window is sub-second;
- *  30s is a generous ceiling. */
-const PENDING_REASONING_MAX_AGE_MS = 30000;
+/** Max age of a pending early activity signal before it is treated as stale
+ *  and discarded instead of applied. The race window is sub-second; 30s is a
+ *  generous ceiling. */
+const PENDING_ACTIVITY_MAX_AGE_MS = 30000;
 
 /**
- * Append an early (pre-entry) reasoning delta to the pending buffer for a
- * backend `source_agent` label (#1183). Tail-bounded and LRU-capped — see the
- * `pendingReasoning` doc above. Never creates an `activeSubagents` entry, so
- * the "a late delta must not resurrect a removed chip" invariant holds.
+ * Record an early (pre-entry) activity signal for a backend `source_agent`
+ * label. Keeps only the latest signal per label; LRU-capped — see the
+ * `pendingActivity` doc above. Never creates an `activeSubagents` entry, so
+ * the "a late signal must not resurrect a removed chip" invariant holds.
  */
-function bufferEarlyReasoning(name, delta) {
-    const now = Date.now();
-    const existing = pendingReasoning.get(name);
-    const fresh = existing
-        && (now - existing.updatedAt) <= PENDING_REASONING_MAX_AGE_MS;
-    let text = (fresh ? existing.text : '') + delta;
-    if (text.length > LIVE_ACTIVITY_MAX_CHARS) {
-        text = text.slice(text.length - LIVE_ACTIVITY_MAX_CHARS);
-    }
+function bufferEarlyActivity(name, kind, tool) {
     // Delete-then-set refreshes Map insertion order, so the cap eviction
     // below always drops the least-recently-written label.
-    pendingReasoning.delete(name);
-    pendingReasoning.set(name, { text, updatedAt: now });
-    while (pendingReasoning.size > PENDING_REASONING_MAX_BUFFERS) {
-        const oldest = pendingReasoning.keys().next().value;
-        pendingReasoning.delete(oldest);
+    pendingActivity.delete(name);
+    pendingActivity.set(name, { kind, tool: tool || null, updatedAt: Date.now() });
+    while (pendingActivity.size > PENDING_ACTIVITY_MAX_LABELS) {
+        const oldest = pendingActivity.keys().next().value;
+        pendingActivity.delete(oldest);
     }
 }
 
 /**
- * Remove and return the pending early-reasoning buffer for a label (#1183).
- * Returns '' when there is no buffer or the buffer is stale (older than
- * `PENDING_REASONING_MAX_AGE_MS`) — stale text is discarded, not flushed.
+ * Remove and return the pending early activity signal for a label. Returns
+ * `null` when there is none or it is stale (older than
+ * `PENDING_ACTIVITY_MAX_AGE_MS`) — stale signals are discarded, not applied.
  */
-function takePendingReasoning(name) {
-    const buf = pendingReasoning.get(name);
-    if (!buf) return '';
-    pendingReasoning.delete(name);
-    if (Date.now() - buf.updatedAt > PENDING_REASONING_MAX_AGE_MS) return '';
-    return buf.text;
+function takePendingActivity(name) {
+    const buf = pendingActivity.get(name);
+    if (!buf) return null;
+    pendingActivity.delete(name);
+    if (Date.now() - buf.updatedAt > PENDING_ACTIVITY_MAX_AGE_MS) return null;
+    return { kind: buf.kind, tool: buf.tool };
+}
+
+/**
+ * Consume the pending early activity signal for a NEW entry keyed by `key`.
+ *
+ * Named subagents: the backend label equals the entry key, so the direct
+ * lookup suffices. UNNAMED subagents are the important case (Codex P2 on PR
+ * #1189): the entry key derives from the parent's invoke_agent
+ * tool_invocation_id (`subagent-{toolInvocationId_prefix}`) but the backend
+ * labels signals with the task id (`subagent-{task_id_prefix}`) — a DIFFERENT
+ * id — so an early signal is buffered under a label the direct lookup can
+ * never see. Pre-dedup that didn't matter (the next delta re-resolved and
+ * migrated the key), but the backend now collapses consecutive same-kind
+ * signals, so during a long initial reasoning / tool phase the buffered
+ * signal is the ONLY one — without this fallback the chip would sit on
+ * "Starting…" for the whole phase.
+ *
+ * Fallback: for an unnamed key, consume the OLDEST unnamed-labelled
+ * (`subagent-*`) buffer (skipping stale ones). With concurrent unnamed
+ * subagents this is a best-effort first-match — the same ambiguity class as
+ * `resolveForwardedSubagentKey`'s running-entry fallback, and status is
+ * self-correcting on the next live signal. The entry key is NOT migrated
+ * here; the next live signal still performs the normal key migration.
+ *
+ * @param {string} key - The new entry's `activeSubagents` key.
+ * @returns {{kind: string, tool: string|null}|null}
+ */
+function takePendingActivityForKey(key) {
+    const direct = takePendingActivity(key);
+    if (direct) return direct;
+    if (!key.startsWith('subagent-')) return null;
+    // Iterate over a snapshot: takePendingActivity deletes while we scan.
+    for (const label of [...pendingActivity.keys()]) {
+        if (!label.startsWith('subagent-')) continue;
+        const buf = takePendingActivity(label);
+        if (buf) return buf;
+    }
+    return null;
 }
 
 /**
@@ -205,70 +227,24 @@ export function trackSubagentStart(name, task, toolInvocationId) {
         clearTimeout(removeTimers[key]);
         delete removeTimers[key];
     }
+    // #1183: seed with any activity signal that raced ahead of this entry —
+    // including an unnamed subagent's backend-labelled buffer (see
+    // `takePendingActivityForKey`; the backend dedup means it may be the only
+    // signal for a long phase). A buffered tool_start counts toward
+    // `toolsUsed` exactly like the live path in `trackSubagentActivity`.
+    const buffered = takePendingActivityForKey(key);
     activeSubagents.value = {
         ...activeSubagents.value,
         [key]: {
             status: 'running',
-            tools: [],
             task: task || '',
             toolInvocationId: toolInvocationId || null,
             displayName: name,
             startedAt: Date.now(),
             sessionId: null,
-            // #1183: seed with any early reasoning buffered before this entry
-            // existed. Named subagents flush here (label == key); unnamed ones
-            // flush on the next resolved delta after the key migration.
-            liveActivity: takePendingReasoning(key),
+            activity: buffered,
+            toolsUsed: (buffered && buffered.kind === 'tool_start') ? 1 : 0,
         },
-    };
-}
-
-/**
- * Add a tool event to a subagent.
- *
- * The `name` parameter is the backend-assigned source_agent label, which for
- * unnamed subagents looks like "subagent-{task_id_prefix}". This is matched
- * directly against the entry key (which was derived the same way at start
- * time for unnamed subagents) or via the stored toolInvocationId as a
- * fallback.
- */
-export function trackSubagentTool(name, tool) {
-    let current = activeSubagents.value[name];
-
-    // Fallback: if no direct key match, search by toolInvocationId prefix.
-    // The tool_start handler registers unnamed subagents under
-    // "subagent-{toolInvocationId_prefix}" but the backend labels forwarded
-    // events with "subagent-{task_id_prefix}" (a different ID). Try to match
-    // by finding a running unnamed entry.
-    if (!current && name.startsWith('subagent-')) {
-        for (const [key, info] of Object.entries(activeSubagents.value)) {
-            if (key.startsWith('subagent-') && info.status === 'running') {
-                current = info;
-                // Migrate the entry to the backend-assigned key so future
-                // tool events match directly.
-                const { [key]: entry, ...rest } = activeSubagents.value;
-                activeSubagents.value = { ...rest, [name]: entry };
-                // Migrate any pending removal timer.
-                if (removeTimers[key]) {
-                    clearTimeout(removeTimers[key]);
-                    delete removeTimers[key];
-                }
-                break;
-            }
-        }
-    }
-
-    if (!current) return;
-    const tools = [...current.tools];
-    const idx = tools.findIndex(t => t.id === tool.id);
-    if (idx >= 0) {
-        tools[idx] = { ...tools[idx], ...tool };
-    } else {
-        tools.push(tool);
-    }
-    activeSubagents.value = {
-        ...activeSubagents.value,
-        [name]: { ...current, tools },
     };
 }
 
@@ -277,20 +253,20 @@ export function trackSubagentTool(name, tool) {
  * migrating the entry key when the backend label differs from the start-time
  * key (#1149).
  *
- * Mirrors the key-resolution in `trackSubagentTool`: a forwarded subagent
- * event is labelled with the backend `source_agent`. For NAMED subagents that
- * equals the entry key directly. For UNNAMED subagents the entry was
- * registered under `subagent-{toolInvocationId_prefix}` at `tool_start` time
- * but the backend labels forwarded events with `subagent-{task_id_prefix}` (a
- * different id), so we fall back to the first running unnamed entry and migrate
- * it to the backend-assigned key (and its pending removal timer) so subsequent
- * forwarded events for the same subagent match directly.
+ * A forwarded subagent event is labelled with the backend `source_agent`. For
+ * NAMED subagents that equals the entry key directly. For UNNAMED subagents
+ * the entry was registered under `subagent-{toolInvocationId_prefix}` at
+ * `tool_start` time but the backend labels forwarded events with
+ * `subagent-{task_id_prefix}` (a different id), so we fall back to the first
+ * running unnamed entry and migrate it to the backend-assigned key (and its
+ * pending removal timer) so subsequent forwarded events for the same subagent
+ * match directly.
  *
  * Returns the resolved key, or `null` when no matching entry exists (e.g. the
  * subagent already completed and its chip was auto-removed, or the entry has
  * not been created yet — see the #1183 startup race). A `null` result must
- * never resurrect / create a chip; `trackSubagentReasoning` responds to it by
- * buffering the delta (`pendingReasoning`), other callers no-op.
+ * never resurrect / create a chip; `trackSubagentActivity` responds to it by
+ * buffering the signal (`pendingActivity`), other callers no-op.
  *
  * @param {string} name - The backend `source_agent` label.
  * @returns {string|null} the resolved (possibly migrated) entry key.
@@ -316,57 +292,57 @@ function resolveForwardedSubagentKey(name) {
 }
 
 /**
- * Append a chunk of a subagent's in-flight reasoning / extended-thinking text
- * to its panel entry's `liveActivity` tail (#1149).
+ * Record a subagent's most recent coarse activity signal on its status-bar
+ * entry.
  *
- * The parent's session SSE stream forwards a running subagent's
- * `reasoning_delta` events tagged with `source_agent`. `use-session-stream.js`
- * suppresses those from the PARENT's main chat / reasoning view (subagent
- * reasoning must never leak into the parent run's reasoning trace — the #1170 /
- * `get_run_reasoning` invariant) and instead tees them here so the SubagentBar
- * panel can render the subagent's live thinking rather than sitting on
- * "Waiting for activity..." until completion.
+ * The backend emits ephemeral `subagent_activity` SSE events (tagged
+ * `source_agent`) describing WHAT KIND of thing the subagent is doing —
+ * `reasoning`, `writing`, `tool_start` (with the tool name) or `tool_end` —
+ * instead of streaming the subagent's actual reasoning/token content to the
+ * parent. The Subagent status bar renders the latest signal as a concise
+ * label ("Reasoning…", "Using {tool}", "Writing…"); the full transcript
+ * streams to the subagent's OWN session (#1184), reached by clicking the
+ * chip.
  *
- * Only the most recent `LIVE_ACTIVITY_MAX_CHARS` characters are retained: the
- * panel shows the subagent's CURRENT thinking, and the full transcript is
- * available via "View session". Keying / migration matches `trackSubagentTool`
- * so forwarded events from unnamed subagents (whose backend label differs from
- * the start-time key) land on the right entry.
+ * Keying / migration uses `resolveForwardedSubagentKey` so signals from
+ * unnamed subagents (whose backend label differs from the start-time key)
+ * land on the right entry.
  *
- * A delta that cannot be resolved to an entry is BUFFERED, not dropped (#1183,
- * see `pendingReasoning`): a background subagent's reasoning can beat the
- * `tool_start` that creates its entry. The buffer is flushed into
- * `liveActivity` (ahead of the current delta) once the label resolves or at
- * entry creation; buffering never creates an entry, so a gone subagent's late
- * delta can't resurrect a chip.
+ * A signal that cannot be resolved to an entry is BUFFERED, not dropped
+ * (#1183, see `pendingActivity`): a background subagent's first signal can
+ * beat the `tool_start` that creates its entry — and because the backend
+ * deduplicates consecutive same-kind signals, a dropped signal might not be
+ * re-sent until the next kind transition. Buffering never creates an entry,
+ * so a gone subagent's late signal can't resurrect a chip.
+ *
+ * `tool_start` signals also increment the entry's `toolsUsed` counter, which
+ * feeds the completion card's tool count.
  *
  * @param {string} name - The backend `source_agent` label for the subagent.
- * @param {string} delta - The reasoning text chunk to append.
+ * @param {string} kind - Activity kind: reasoning|writing|tool_start|tool_end.
+ * @param {string|null} [tool] - Tool name (only for kind === 'tool_start').
  */
-export function trackSubagentReasoning(name, delta) {
-    if (!delta) return;
+export function trackSubagentActivity(name, kind, tool) {
+    if (!kind) return;
     const key = resolveForwardedSubagentKey(name);
     if (!key) {
         // #1183: the entry doesn't exist yet (startup race) or is gone
-        // (late replay). Buffer instead of dropping — flushed on resolve,
-        // discarded when stale.
-        bufferEarlyReasoning(name, delta);
+        // (late replay). Buffer instead of dropping — applied on entry
+        // creation, discarded when stale.
+        bufferEarlyActivity(name, kind, tool);
         return;
     }
     const current = activeSubagents.value[key];
     if (!current) return;
-    // #1183: flush any reasoning buffered before this entry existed.
-    // `resolveForwardedSubagentKey` always resolves to `name` (directly or by
-    // migrating the entry to it), so buffer and entry keys coincide; the
-    // buffered text is older than `delta`, so it goes first.
-    const buffered = takePendingReasoning(name);
-    let next = (current.liveActivity || '') + buffered + delta;
-    if (next.length > LIVE_ACTIVITY_MAX_CHARS) {
-        next = next.slice(next.length - LIVE_ACTIVITY_MAX_CHARS);
-    }
+    // The entry is live now: this signal supersedes any buffered one.
+    pendingActivity.delete(name);
     activeSubagents.value = {
         ...activeSubagents.value,
-        [key]: { ...current, liveActivity: next },
+        [key]: {
+            ...current,
+            activity: { kind, tool: tool || null },
+            toolsUsed: (current.toolsUsed || 0) + (kind === 'tool_start' ? 1 : 0),
+        },
     };
 }
 
@@ -400,16 +376,16 @@ export function trackSubagentReasoning(name, delta) {
  * @param {string} [subagentSessionId] - The completing subagent's session UUID.
  */
 export function trackSubagentEnd(name, status, toolInvocationId, subagentSessionId) {
-    // #1183: a completed subagent produces no more reasoning; drop its pending
-    // buffer so it can't flush into a later re-invocation under the same name.
+    // #1183: a completed subagent produces no more activity; drop its pending
+    // signal so it can't apply to a later re-invocation under the same name.
     // Unconditional (before the lookup) so a completion for an already-removed
     // chip still evicts.
-    pendingReasoning.delete(name);
+    pendingActivity.delete(name);
     const key = resolveSubagentKey(name, toolInvocationId, subagentSessionId);
     if (!key) return;
     // The entry key may have been migrated to the backend label (which is
-    // what buffers are keyed by) — evict under that label too.
-    pendingReasoning.delete(key);
+    // what pending signals are keyed by) — evict under that label too.
+    pendingActivity.delete(key);
     const current = activeSubagents.value[key];
     if (!current) return;
     activeSubagents.value = {
@@ -540,8 +516,8 @@ async function loadNavDeps() {
         // `saveActiveSession` lives in use-boot.js. We pull it in here so
         // the subagent drill-down path persists the active session id to
         // localStorage the same way the sidebar / runs-tab navigation
-        // does. Without this, the operator clicks "View session" on a
-        // subagent chip, lands on the subagent transcript, then reloads
+        // does. Without this, the operator clicks a subagent chip,
+        // lands on the subagent transcript, then reloads
         // and falls back to the parent agent's first chat — the #1045
         // symptom. Dynamic import is used because the static one would
         // create the circular subagents.js <-> use-boot.js dependency
@@ -642,9 +618,9 @@ export function clearAllSubagents() {
         clearTimeout(removeTimers[key]);
         delete removeTimers[key];
     }
-    // #1183: drop early-reasoning buffers too — a session switch must never
-    // flush a previous session's buffered subagent reasoning into the next.
-    pendingReasoning.clear();
+    // #1183: drop early activity signals too — a session switch must never
+    // apply a previous session's buffered subagent status to the next.
+    pendingActivity.clear();
     activeSubagents.value = {};
 }
 
@@ -652,7 +628,7 @@ export function clearAllSubagents() {
  * Rehydrate `activeSubagents` from a freshly-loaded chat-history snapshot.
  *
  * Called by `loadSession()` after `replaceMessages(...)` so that page
- * reloads and session switches re-create the SubagentBar chips for any
+ * reloads and session switches re-create the Subagent status bar chips for any
  * subagent invocations that are still in flight server-side. Without
  * this, the bar lives only in SSE-event memory and silently disappears
  * across reload / session-switch boundaries until the run reaches a
@@ -685,7 +661,7 @@ export function clearAllSubagents() {
  *   with the oldest still-unpaired background invocation for that
  *   session (FIFO queue per `session_id`). Rows that remain unpaired
  *   at the end of the pass are the genuinely-in-flight invocations
- *   that get a SubagentBar chip.
+ *   that get a status-bar chip.
  *
  *   Tim's review on #1049 (suggestion 1) verified that FIFO vs LIFO
  *   is observably equivalent today — the "later-wins-same-key" rule
@@ -703,21 +679,19 @@ export function clearAllSubagents() {
  *   suggestion 2 — cheap detection of a load-bearing invariant).
  *
  * Existing entries are preserved (no clear): this function is purely
- * additive so a SubagentBar entry created by a live SSE `tool_start`
+ * additive so a status-bar entry created by a live SSE `tool_start`
  * that fired between `replaceMessages` and this call is not stomped.
  * The session-switch path explicitly calls `clearAllSubagents()`
  * before `loadSession()` (see `doSessionSwitch` above), so it always
  * starts from an empty bar; the page-reload path goes through
  * `boot()` which also starts from an empty bar.
  *
- * The subagent's inner tool-call history (the tool rows visible inside
- * the panel) is intentionally not reconstructed here — that data lives
- * on the subagent's own session and would require a second round-trip
- * per active subagent. The chip + panel chrome (name, task, spinner,
- * "View session" button) re-renders correctly with just the metadata
- * available on the parent's `invoke_agent` tool row; subsequent live
- * SSE `tool_start` events with `source_agent` set populate the inner
- * list as activity continues post-reload.
+ * The subagent's activity status (and `toolsUsed` count) is not
+ * reconstructed here — status is a live, point-in-time signal, and the
+ * detailed history lives on the subagent's own session (one click away).
+ * The chip re-renders correctly with just the metadata available on the
+ * parent's `invoke_agent` tool row; the next live `subagent_activity`
+ * signal repopulates the status label as activity continues post-reload.
  *
  * @param {Array} messages - chat messages array (post-`mapHistoryMessages`,
  *   typically `chatMessages.value` immediately after `replaceMessages`).
@@ -928,17 +902,20 @@ export function rehydrateSubagentsFromHistory(messages) {
         // the live `trackSubagentStart` behaviour.
         const startedAt = m.ts ? Date.parse(m.ts) || Date.now() : Date.now();
 
+        // #1183: same early-signal application as `trackSubagentStart` —
+        // forwarded activity signals can beat this rehydrate pass on a
+        // reload (including an unnamed subagent's backend-labelled buffer,
+        // and a buffered tool_start counts toward `toolsUsed`).
+        const buffered = takePendingActivityForKey(key);
         additions[key] = {
             status: 'running',
-            tools: [],
             task,
             toolInvocationId: invocationId,
             displayName: name,
             startedAt,
             sessionId: subagentSessionId,
-            // #1183: same early-reasoning flush as `trackSubagentStart` —
-            // forwarded deltas can beat this rehydrate pass on a reload.
-            liveActivity: takePendingReasoning(key),
+            activity: buffered,
+            toolsUsed: (buffered && buffered.kind === 'tool_start') ? 1 : 0,
         };
     }
 

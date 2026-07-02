@@ -32,7 +32,7 @@ import { batch, signal } from '../deps.js';
 import { chatMessages, nextMsgId } from '../state/chat.js';
 import { appendMessage, updateMessage, filterMessages, transformMessages } from '../state/chat-actions.js';
 import { activeRunId, bumpRunListGeneration } from '../state/runs.js';
-import { trackSubagentStart, trackSubagentEnd, trackSubagentTool, trackSubagentReasoning, findSubagentByToolInvocationId, findSubagentBySessionId, setSubagentSessionId, activeSubagents } from '../state/subagents.js';
+import { trackSubagentStart, trackSubagentEnd, trackSubagentActivity, findSubagentByToolInvocationId, findSubagentBySessionId, setSubagentSessionId, activeSubagents } from '../state/subagents.js';
 import { agentPhase, setAgentPhase, clearAgentPhase, setDmContext, revertPhase, dmPeer } from '../state/agent-status.js';
 import { messageQueue } from '../state/queue.js';
 import { activeSessionId, activeSession, dmParticipants } from '../state/sessions.js';
@@ -960,13 +960,12 @@ export function openSessionStream(sessionId, opts) {
             // Subagent reasoning is suppressed from the PARENT's main chat /
             // reasoning view — it must never leak into the parent run's
             // reasoning trace (the #1170 / `get_run_reasoning` invariant) or
-            // interleave into the parent's collapsible. But the operator still
-            // wants to watch a running subagent think (#1149), so tee the delta
-            // into that subagent's SubagentBar panel entry (`liveActivity`)
-            // before returning. This is purely additive panel state; nothing
-            // below this guard ever sees a subagent-tagged delta, so the parent
-            // rendering is unchanged.
-            trackSubagentReasoning(data.source_agent, data.text || '');
+            // interleave into the parent's collapsible. The backend no longer
+            // forwards subagent reasoning to the parent at all (the Subagent
+            // status bar is driven by the coarse `subagent_activity` signal
+            // instead, and the full text streams to the subagent's own
+            // session, #1184) — this guard remains for tagged deltas replayed
+            // from pre-status-bar session event logs.
             return;
         }
         const delta = data.text || '';
@@ -1078,9 +1077,11 @@ export function openSessionStream(sessionId, opts) {
     on('stream_reset', (e) => {
         const data = JSON.parse(e.data);
         // Subagent stream resets never reach here (the coordinator suppresses
-        // them — a subagent's partial is itself UI-suppressed on the parent
-        // stream), but mirror the delta handlers' `source_agent` guard so a
-        // future forwarding change can't paint then fail to clear.
+        // them — the parent paints no subagent content at all now: the status
+        // bar renders only coarse `subagent_activity` labels, so there is no
+        // subagent partial to retract, #1186). Keep the `source_agent` guard
+        // so a future forwarding change can't clear the PARENT's partial by
+        // mistake.
         if (data.source_agent) return;
         const runId = data.run_id || activeRunId.value || null;
         batch(() => {
@@ -1195,7 +1196,7 @@ export function openSessionStream(sessionId, opts) {
                 // #1105: backend may also embed `subagent_session_id` directly
                 // on the `tool_start` event for invoke_agent (alternative
                 // shape). When present, surface it immediately so the
-                // SubagentBar's "View session" button is live during the run
+                // Subagent status bar chip can navigate during the run
                 // — the dedicated `subagent_started` handler below covers
                 // the canonical event-based shape. Both paths are safe to
                 // run together because `setSubagentSessionId` is idempotent.
@@ -1215,9 +1216,13 @@ export function openSessionStream(sessionId, opts) {
                     setSubagentSessionId(key, data.subagent_session_id);
                 }
             } else if (data.source_agent) {
-                trackSubagentTool(data.source_agent, {
-                    id: toolId, tool: data.tool, params: data.params, status: 'running',
-                });
+                // Subagent-tagged tool events are no longer tracked here: the
+                // Subagent status bar is driven by the backend's coarse
+                // `subagent_activity` signal (which carries the tool name
+                // without the params payload). This branch only sees tagged
+                // events replayed from pre-status-bar session event logs and
+                // deliberately drops them — they must never render as parent
+                // tool rows.
             } else {
                 sealLastAgent();
                 appendMessage({
@@ -1245,7 +1250,13 @@ export function openSessionStream(sessionId, opts) {
             const status = data.ok ? 'done' : 'fail';
 
             if (data.source_agent) {
-                trackSubagentTool(data.source_agent, { id: matchId, status, result: data.result });
+                // Subagent-tagged tool_end: nothing to track (the status bar
+                // is driven by `subagent_activity` signals now; this arrives
+                // only as a replay from pre-status-bar event logs). Return
+                // before the matching logic below — its last-running-tool
+                // fallback could otherwise mis-close a PARENT tool row with
+                // the subagent's result.
+                return;
             }
 
             const endedAt = Date.now();
@@ -1324,8 +1335,9 @@ export function openSessionStream(sessionId, opts) {
                         // Resolve the subagent name: prefer the explicit name
                         // from params, fall back to looking up the entry by the
                         // invoke_agent tool_invocation_id (handles unnamed
-                        // subagents whose bar entry may have been renamed by
-                        // trackSubagentTool to the backend-assigned label).
+                        // subagents whose bar entry may have been migrated to
+                        // the backend-assigned label by a forwarded
+                        // `subagent_activity` signal).
                         const name = updatedMsg.params?.name
                             || updatedMsg.params?.subagent_name
                             || findSubagentByToolInvocationId(matchId);
@@ -1391,18 +1403,35 @@ export function openSessionStream(sessionId, opts) {
         });
     });
 
+    // -- subagent_activity --
+    //
+    // Coarse status signal for the Subagent status bar: the backend reduces a
+    // running subagent's activity to `{ source_agent, kind, tool? }` where
+    // `kind` is `reasoning` / `writing` / `tool_start` / `tool_end` (tool name
+    // only on `tool_start`). Ephemeral (never persisted/replayed) and
+    // deduplicated backend-side, so this handler fires roughly once per
+    // activity transition. The bar renders the latest signal as a concise
+    // label; the subagent's actual content streams to its OWN session (#1184).
+    on('subagent_activity', (e) => {
+        const data = JSON.parse(e.data);
+        // Defensive: a signal without a source label can't be routed to a
+        // chip. The backend always tags these.
+        if (!data.source_agent) return;
+        trackSubagentActivity(data.source_agent, data.kind, data.tool || null);
+    });
+
     // -- subagent_started (#1105) --
     //
     // Surfaces a foreground subagent's `session_id` to the parent stream as
-    // soon as `subagent::execute` creates the session, so the SubagentBar
-    // panel can render the "View session" button live (i.e. while the
-    // subagent is still running).
+    // soon as `subagent::execute` creates the session, so the Subagent
+    // status bar chip can navigate to the subagent session live (i.e. while
+    // the subagent is still running).
     //
     // Pre-#1105 backends do not emit this event. The handler is a no-op
     // when the payload is missing fields, so older backends just keep the
-    // legacy behaviour (button appears at tool_end for foreground subagents,
-    // unchanged for background subagents — those still arrive via the
-    // invoke_agent tool_end `{task_id, session_id}` result and via the
+    // legacy behaviour (chip becomes clickable at tool_end for foreground
+    // subagents, unchanged for background subagents — those still arrive via
+    // the invoke_agent tool_end `{task_id, session_id}` result and via the
     // `subagent_completed` event below).
     //
     // Payload shape (per #1105 issue body):
@@ -1414,7 +1443,8 @@ export function openSessionStream(sessionId, opts) {
     // way. The resolution order mirrors `tool_end` for invoke_agent:
     //   1. `subagent_name` from the event payload (named subagents)
     //   2. lookup by `tool_invocation_id` (unnamed subagents — covers the
-    //      "subagent-<prefix>" key migration done in `trackSubagentTool`)
+    //      "subagent-<prefix>" key migration done by forwarded
+    //      `subagent_activity` signals)
     //
     // If neither resolver returns a hit (malformed payload, out-of-order
     // delivery against an entry that has already been removed, etc.) the
@@ -1469,7 +1499,7 @@ export function openSessionStream(sessionId, opts) {
                 );
 
             const task = entry ? entry.task : '';
-            const toolCount = entry ? entry.tools.length : 0;
+            const toolCount = entry ? (entry.toolsUsed || 0) : 0;
             const durationMs = entry && entry.startedAt ? Date.now() - entry.startedAt : null;
 
             // If subagent_session_id is provided, store it on the subagent entry
@@ -1477,7 +1507,7 @@ export function openSessionStream(sessionId, opts) {
                 setSubagentSessionId(name, sessionId, toolInvocationId);
             }
 
-            // Update SubagentBar (stays visible until auto-remove delay)
+            // Update the Subagent status bar (stays visible until auto-remove delay)
             trackSubagentEnd(name, status, toolInvocationId, sessionId);
 
             // Render a rich completion card instead of a plain system message
@@ -1691,7 +1721,7 @@ export function openSessionStream(sessionId, opts) {
 
     // -- run_warning (non-fatal, e.g. max iterations) --
     // Subagent warnings (source_agent set) are suppressed in the parent
-    // chat -- they are visible via the SubagentBar drill-down into the
+    // chat -- they are visible via the Subagent status bar drill-down into the
     // subagent's own session.  (#602)
     on('run_warning', (e) => {
         const data = JSON.parse(e.data);

@@ -77,6 +77,19 @@ impl alms_tools::EventForwarder for RuntimeEventForwarder {
             .send(RuntimeEvent::ReasoningDelta { text, source_agent });
     }
 
+    fn forward_subagent_activity(
+        &self,
+        kind: String,
+        tool: Option<String>,
+        source_agent: Option<String>,
+    ) {
+        let _ = self.tx.send(RuntimeEvent::SubagentActivity {
+            kind,
+            tool,
+            source_agent,
+        });
+    }
+
     fn forward_stream_reset(&self) {
         // Untagged: only the #1180 subagent self-forward calls this, on a stream
         // where the subagent is the main agent. `forward_runtime_events` /
@@ -177,6 +190,26 @@ pub(super) async fn forward_runtime_events(
                         run_id,
                         session_id,
                         SseEventData::reasoning_delta(run_id, &text, source_agent),
+                    )
+                    .await;
+            }
+            // Subagent status signal for the parent's Subagent status bar.
+            // Synthesised by the coordinator relay for FOREGROUND subagents
+            // (whose parent forwarder is the parent's `runtime_tx`); the
+            // background path bypasses `runtime_tx` entirely and reaches the
+            // session stream via `route_bg_event` (#1124 constraint).
+            // `subagent_activity` is in `send_event`'s `is_ephemeral` set, so
+            // this fans out live-only and is never persisted.
+            RuntimeEvent::SubagentActivity {
+                kind,
+                tool,
+                source_agent,
+            } => {
+                run_manager
+                    .send_event(
+                        run_id,
+                        session_id,
+                        SseEventData::subagent_activity(run_id, &kind, tool, source_agent),
                     )
                     .await;
             }
@@ -491,9 +524,12 @@ pub(super) async fn forward_runtime_events(
 ///   reintroduce the #1124 strong-sender deadlock.
 ///
 /// Returns:
-/// - `Some(SseEventData)` — the caller should emit this on the parent's
-///   session-level SSE stream (`ToolStart` / `ToolEnd` events, plus the
-///   dead-parent `SubagentStarted` fallback above).
+/// - `Some(RoutedBgEvent::Persist(..))` — the caller should emit this on the
+///   parent's session-level SSE stream via `send_session_event` (persisted):
+///   the dead-parent `SubagentStarted` fallback above.
+/// - `Some(RoutedBgEvent::Transient(..))` — the caller should fan this out
+///   live-only via `send_transient_session_event` (never logged): the
+///   `subagent_activity` status signal.
 /// - `None` — the event was handled internally (rerouted via the live
 ///   `parent_fwd`, auto-denied, or dropped); the caller does nothing.
 ///
@@ -501,42 +537,15 @@ pub(super) async fn forward_runtime_events(
 /// pin both legs: with a live `parent_fwd` this function returns `None` for
 /// `SubagentStarted` *and* the matching event lands on the parent's runtime
 /// channel (ordering); with `parent_fwd == None` it returns
-/// `Some(subagent_started)` so the session-stream fallback fires (A1-3).
+/// `Some(Persist(subagent_started))` so the session-stream fallback fires
+/// (A1-3).
 pub fn route_bg_event(
     event: RuntimeEvent,
     parent_fwd: Option<&dyn alms_tools::EventForwarder>,
     bg_run_id: RunId,
     bg_session_id: SessionId,
-) -> Option<SseEventData> {
+) -> Option<RoutedBgEvent> {
     match event {
-        RuntimeEvent::ToolStart {
-            invocation_id,
-            tool,
-            params,
-            source_agent,
-            task_id,
-        } => Some(SseEventData::tool_start(
-            bg_run_id,
-            ToolInvocationId(invocation_id),
-            &tool,
-            params,
-            source_agent,
-            task_id,
-        )),
-        RuntimeEvent::ToolEnd {
-            invocation_id,
-            ok,
-            result,
-            source_agent,
-            task_id,
-        } => Some(SseEventData::tool_end(
-            bg_run_id,
-            ToolInvocationId(invocation_id),
-            ok,
-            result,
-            source_agent,
-            task_id,
-        )),
         RuntimeEvent::ApprovalRequired {
             tool, decision_tx, ..
         } => {
@@ -589,28 +598,58 @@ pub fn route_bg_event(
                 );
                 None
             }
-            None => Some(SseEventData::subagent_started(
+            None => Some(RoutedBgEvent::Persist(SseEventData::subagent_started(
                 bg_session_id,
                 ToolInvocationId(tool_invocation_id),
                 subagent_name,
                 subagent_session_id,
-            )),
+            ))),
         },
-        // #1180: forward a background subagent's reasoning deltas onto the
-        // parent's SESSION stream (tagged `source_agent`) so the SubagentBar's
-        // live tail lights up during a background `invoke_agent` run; the
-        // frontend tees them to the bar, away from the parent's own reasoning
-        // view. NOT rerouted through the parent's `runtime_tx` like
-        // `SubagentStarted`, because (a) these high-frequency deltas risk the
-        // #1124 strong-sender deadlock and (b) a background subagent routinely
-        // outlives the parent turn (runtime_tx is gone by then). `token_delta`
-        // is intentionally NOT forwarded (no bar surface; would only bloat the
-        // persisted session log).
-        RuntimeEvent::ReasoningDelta { text, source_agent } => Some(SseEventData::reasoning_delta(
-            bg_run_id,
-            &text,
+        // Subagent status signal for the parent's Subagent status bar (#1180
+        // follow-up). The coordinator relay already reduced the subagent's
+        // reasoning/token deltas and tool events to this coarse, deduplicated
+        // signal — the subagent's actual content (reasoning/token TEXT, tool
+        // params/results) is no longer forwarded to the parent at all (it
+        // streams to the subagent's OWN session instead, #1184).
+        //
+        // NOT rerouted through the parent's `runtime_tx` like
+        // `SubagentStarted`, because (a) rerouting risks the #1124
+        // strong-sender deadlock and (b) a background subagent routinely
+        // outlives the parent turn (runtime_tx is gone by then) — the bar
+        // must keep updating after the parent's turn ends. Routed as
+        // `Transient` so the caller fans it out live-only
+        // (`send_transient_session_event`): a status signal is worthless on
+        // replay and must not bloat the parent's persisted session log.
+        RuntimeEvent::SubagentActivity {
+            kind,
+            tool,
             source_agent,
-        )),
+        } => Some(RoutedBgEvent::Transient(SseEventData::subagent_activity(
+            bg_run_id,
+            &kind,
+            tool,
+            source_agent,
+        ))),
+        // Everything else is dropped. In particular the subagent's raw
+        // `ToolStart` / `ToolEnd` / `ReasoningDelta` / `TokenDelta` no longer
+        // reach this channel (the coordinator relay reduces them to
+        // `SubagentActivity` above); if a stray one ever arrives it must NOT
+        // be forwarded — the parent stream carries subagent status, never
+        // subagent content.
         _ => None,
     }
+}
+
+/// How the caller must deliver an event routed off the background-subagent
+/// channel by [`route_bg_event`].
+#[derive(Debug)]
+pub enum RoutedBgEvent {
+    /// Persist to the parent's session event log, then fan out
+    /// (`send_session_event`) — durable lifecycle markers like the
+    /// dead-parent `subagent_started` fallback.
+    Persist(SseEventData),
+    /// Fan out to live session subscribers only; never logged
+    /// (`send_transient_session_event`) — the ephemeral `subagent_activity`
+    /// status signal.
+    Transient(SseEventData),
 }

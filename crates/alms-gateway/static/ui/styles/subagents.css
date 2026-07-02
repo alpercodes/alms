@@ -13,7 +13,8 @@
   opacity: 0.75;
 }
 
-/* ── Subagent Status Bar ── */
+/* ── Subagent status bar — status-only chips; click navigates to the
+   subagent session (no expand-in-place panel) ── */
 .sa-bar {
   padding: var(--space-1) var(--space-3);
   display: flex;
@@ -39,97 +40,7 @@
 .sa-chip.fail { border-color: var(--error); color: var(--error); opacity: 0.7; }
 .sa-chip:hover { background: var(--surface-4); }
 .sa-chip-name { font-weight: 600; }
-.sa-chip-activity { color: var(--text-muted); }
-.sa-chip-count {
-  font-size: 0.6rem;
-  background: var(--surface-4);
-  padding: 0 4px;
-  border-radius: var(--radius-full);
-}
-.sa-panel {
-  position: absolute;
-  bottom: 100%;
-  left: var(--space-3);
-  right: var(--space-3);
-  background: var(--surface-2);
-  border: 1px solid var(--border-default);
-  border-radius: var(--radius-lg);
-  box-shadow: var(--shadow-lg);
-  max-height: 250px;
-  overflow-y: auto;
-  z-index: 10;
-}
-.sa-panel-header {
-  display: flex;
-  align-items: center;
-  gap: var(--space-2);
-  padding: var(--space-2) var(--space-3);
-  border-bottom: 1px solid var(--border-subtle);
-  font-size: var(--text-xs);
-}
-.sa-panel-name { font-weight: 600; color: var(--text-primary); }
-.sa-panel-task { color: var(--text-muted); flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.sa-panel-close {
-  background: none;
-  border: none;
-  color: var(--text-muted);
-  cursor: pointer;
-  font-size: var(--text-lg);
-  padding: 0 var(--space-1);
-}
-.sa-panel-close:hover { color: var(--text-primary); }
-.sa-panel-view-btn {
-  background: none;
-  border: 1px solid var(--info);
-  color: var(--info);
-  cursor: pointer;
-  font-family: var(--font-mono);
-  font-size: var(--text-2xs);
-  padding: 1px var(--space-2);
-  border-radius: var(--radius-sm);
-  transition: all var(--duration-fast);
-}
-.sa-panel-view-btn:hover {
-  background: var(--info-muted);
-}
-/* Live in-flight subagent reasoning teed from the parent stream (#1149). */
-.sa-panel-thinking {
-  display: flex;
-  align-items: flex-start;
-  gap: var(--space-2);
-  padding: var(--space-2) var(--space-3);
-  border-bottom: 1px solid var(--border-subtle);
-  font-size: var(--text-2xs);
-  color: var(--text-muted);
-  font-style: italic;
-}
-.sa-panel-thinking-text {
-  flex: 1;
-  white-space: pre-wrap;
-  word-break: break-word;
-  max-height: 96px;
-  overflow-y: auto;
-}
-.sa-panel-tools { padding: var(--space-1) 0; }
-.sa-panel-empty {
-  color: var(--text-disabled);
-  font-style: italic;
-  font-size: var(--text-xs);
-  padding: var(--space-2) var(--space-3);
-}
-.sa-tool-row {
-  display: flex;
-  align-items: center;
-  gap: var(--space-1);
-  padding: var(--space-1) var(--space-3);
-  font-size: var(--text-xs);
-  font-family: var(--font-mono);
-  color: var(--text-muted);
-}
-.sa-tool-row.done { color: var(--success); }
-.sa-tool-row.fail { color: var(--error); }
-.sa-tool-name { color: var(--accent-text); font-weight: 500; }
-.sa-tool-summary { color: var(--text-secondary); }
+.sa-chip-status { color: var(--text-muted); }
 @keyframes spin {
   to { transform: rotate(360deg); }
 }

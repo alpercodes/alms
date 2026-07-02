@@ -179,6 +179,33 @@ pub enum RuntimeEvent {
         /// non-durable live SSE event log and is lost on reload.
         background: bool,
     },
+    /// Coarse status signal describing what a subagent is doing right now,
+    /// for the parent's **Subagent status bar** (#1180 follow-up).
+    ///
+    /// NEVER emitted by the runtime itself. The coordinator's subagent→parent
+    /// relay (`alms-coordinator/src/lib.rs`) synthesises it from the
+    /// subagent's own `ReasoningDelta` / `TokenDelta` / `ToolStart` /
+    /// `ToolEnd` events, deduplicated so that only *transitions* between
+    /// activity kinds are forwarded — the subagent's actual reasoning/token
+    /// TEXT and tool params/results are deliberately NOT forwarded to the
+    /// parent (they bloat the parent's stream and session log; the full
+    /// content lives on the subagent's OWN session stream, #1184).
+    ///
+    /// The gateway converts this to an **ephemeral** `subagent_activity` SSE
+    /// event (never persisted — see `send_event`'s `is_ephemeral` set): the
+    /// bar is a live status surface that re-derives from fresh events after a
+    /// reload.
+    SubagentActivity {
+        /// Activity kind: one of the `alms_tools::subagent_activity_kind`
+        /// constants (`reasoning`, `writing`, `tool_start`, `tool_end`).
+        kind: String,
+        /// Tool name, populated only for `tool_start`.
+        tool: Option<String>,
+        /// The subagent label this status belongs to. Always `Some` in
+        /// practice — the UI routes the signal to the matching status-bar
+        /// chip by this label.
+        source_agent: Option<String>,
+    },
     /// Debug snapshot of the full context window sent to the LLM.
     ///
     /// Only emitted when `debug_mode` is enabled on the agent config.

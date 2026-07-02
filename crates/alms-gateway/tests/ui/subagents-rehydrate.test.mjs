@@ -144,7 +144,9 @@ test('#1041: rehydrates named foreground subagent with status=running', () => {
     assert.equal(entry.toolInvocationId, 'inv-foo-1');
     assert.equal(entry.sessionId, null,
         'foreground in-flight has no session_id until the result returns');
-    assert.deepEqual(entry.tools, []);
+    assert.equal(entry.activity, null,
+        'a rehydrated chip has no activity signal until the next live one');
+    assert.equal(entry.toolsUsed, 0);
     assert.equal(typeof entry.startedAt, 'number');
 });
 
@@ -423,13 +425,13 @@ test('#1049 codex P1: two same-session completions pair against two invocations 
 test('#1041: preserves existing live SSE-populated entries (no overwrite)', () => {
     // Simulate a live SSE `tool_start` having already populated the bar
     // (e.g. between `replaceMessages` and the rehydration call). The
-    // rehydration must not clobber the live entry's accumulated tools
-    // array or its authoritative start time.
+    // rehydration must not clobber the live entry's activity status,
+    // tool count, or its authoritative start time.
     mod.trackSubagentStart('reviewer', 'live task', 'inv-live');
-    mod.trackSubagentTool('reviewer', { id: 'tool-1', tool: 'fs_read', status: 'running' });
+    mod.trackSubagentActivity('reviewer', 'tool_start', 'fs_read');
     const liveBefore = mod.activeSubagents.value.reviewer;
     const liveStartedAt = liveBefore.startedAt;
-    const liveTools = liveBefore.tools;
+    const liveActivity = liveBefore.activity;
 
     const messages = [
         {
@@ -448,8 +450,10 @@ test('#1041: preserves existing live SSE-populated entries (no overwrite)', () =
         'live entry must win over the history rehydration');
     assert.equal(state.reviewer.startedAt, liveStartedAt,
         'live entry start time must be preserved');
-    assert.equal(state.reviewer.tools, liveTools,
-        'live entry accumulated tools must be preserved');
+    assert.equal(state.reviewer.activity, liveActivity,
+        'live entry activity status must be preserved');
+    assert.equal(state.reviewer.toolsUsed, 1,
+        'live entry tool count must be preserved');
 });
 
 test('#1041: empty / non-array input is a no-op', () => {
@@ -584,9 +588,10 @@ function seedTerminalChipWithoutTimer(mod, key, status) {
     // 1. A normal completion arms the 15s timer for `key`.
     mod.activeSubagents.value = {
         [key]: {
-            status: 'running', tools: [], task: 't',
+            status: 'running', task: 't',
             toolInvocationId: key, displayName: key,
             startedAt: Date.now(), sessionId: null,
+            activity: null, toolsUsed: 0,
         },
     };
     mod.trackSubagentEnd(key, status);
@@ -600,9 +605,10 @@ function seedTerminalChipWithoutTimer(mod, key, status) {
     //    signal.
     mod.activeSubagents.value = {
         [key]: {
-            status, tools: [], task: 't',
+            status, task: 't',
             toolInvocationId: key, displayName: key,
             startedAt: Date.now(), sessionId: null,
+            activity: null, toolsUsed: 0,
         },
     };
 }
@@ -672,9 +678,10 @@ test('A1-4: rehydrate does NOT schedule removal for a running entry', () => {
     // A live in-flight chip (no timer — running chips never have one).
     mod.activeSubagents.value = {
         reviewer: {
-            status: 'running', tools: [], task: 't',
+            status: 'running', task: 't',
             toolInvocationId: 'reviewer', displayName: 'reviewer',
             startedAt: Date.now(), sessionId: null,
+            activity: null, toolsUsed: 0,
         },
     };
     mod.rehydrateSubagentsFromHistory([]);
@@ -693,9 +700,10 @@ test('A1-4: rehydrate does not double-arm an entry that already has a live timer
     // A normal completion: entry is terminal WITH a live timer.
     mod.activeSubagents.value = {
         reviewer: {
-            status: 'running', tools: [], task: 't',
+            status: 'running', task: 't',
             toolInvocationId: 'reviewer', displayName: 'reviewer',
             startedAt: Date.now(), sessionId: null,
+            activity: null, toolsUsed: 0,
         },
     };
     mod.trackSubagentEnd('reviewer', 'done');

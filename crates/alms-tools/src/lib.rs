@@ -36,7 +36,7 @@ pub use read_subagent_session::ReadSubagentSessionTool;
 pub use send_message::SendMessageTool;
 
 // Re-export traits and supporting types.
-pub use event_forwarder::{EventForwarder, SubagentRunOutcome};
+pub use event_forwarder::{EventForwarder, SubagentRunOutcome, subagent_activity_kind};
 pub use message_sender::{ConversationEndReason, DeliveryReceipt, MessageSender, SendError};
 pub use subagent::SubagentDispatcher;
 pub use subagent_self_sink::SubagentSelfEventSink;

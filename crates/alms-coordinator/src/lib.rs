@@ -1665,91 +1665,57 @@ async fn run_agent_loop(
         runtime = runtime.with_workspace(workspace);
     }
 
-    // Forward subagent events to two independent sinks: an UNTAGGED copy to the
-    // subagent's OWN session log (#1180 — powers the fullscreen subagent view)
-    // and a TAGGED (`source_agent`) copy to the parent stream (so the UI tees it
-    // into the parent's SubagentBar, not the parent's own chat/reasoning view).
+    // Forward subagent events to two independent sinks: an UNTAGGED copy of the
+    // full content to the subagent's OWN session log (#1180 — powers the
+    // fullscreen subagent view) and a TAGGED (`source_agent`) coarse STATUS
+    // signal to the parent stream (the UI's Subagent status bar).
+    //
+    // The parent deliberately does NOT receive the subagent's reasoning/token
+    // text or tool params/results anymore: the bar only renders a status label
+    // ("Reasoning…", "Using {tool}", "Writing…"), and forwarding the full
+    // content bloated the parent's stream — and, worse, its persisted session
+    // event log — for no visible benefit (token efficiency is a first-class
+    // concern). The full content belongs on the subagent's own session, where
+    // the fullscreen view subscribes (#1184). This also closes #1186 by
+    // construction: the bar renders no reasoning text, so a buffered-fallback
+    // re-emit has no painted partial to duplicate and the subagent's
+    // `StreamReset` needs no parent-side retraction.
     if parent_event_tx.is_some() || self_event_tx.is_some() {
         let label = request
             .subagent_name
             .clone()
             .unwrap_or_else(|| format!("subagent-{}", &task_id.0.to_string()[..8]));
-        let task_id_str = task_id.0.to_string();
         let parent_fwd = parent_event_tx;
         let self_fwd = self_event_tx;
         tokio::spawn(async move {
             use alms_runtime::RuntimeEvent;
             let mut rx = sub_rx;
+            // Dedup state for `forward_status_to_parent` — the last activity
+            // kind forwarded to the parent. Per-subagent by construction: this
+            // task is the only consumer of this subagent's channel.
+            let mut last_activity_kind: Option<&'static str> = None;
             while let Some(event) = rx.recv().await {
-                // Untagged copy to the subagent's own session. Borrows `event`
-                // so the tagged parent forward below can still move it
+                // Untagged full-content copy to the subagent's own session.
+                // Borrows `event` so the match below can still move it
                 // (RuntimeEvent isn't Clone — ApprovalRequired holds a oneshot).
                 if let Some(self_fwd) = self_fwd.as_deref() {
                     forward_event_to_self(self_fwd, &event);
                 }
 
-                // Tagged copy to the parent stream; skipped when no parent sink.
+                // Tagged status signal to the parent stream; skipped when no
+                // parent sink.
                 let Some(parent_fwd) = parent_fwd.as_ref() else {
                     continue;
                 };
-                let agent_label = Some(label.clone());
-                let tid = Some(task_id_str.clone());
                 match event {
-                    RuntimeEvent::ToolStart {
-                        invocation_id,
-                        tool,
-                        params,
-                        ..
-                    } => {
-                        parent_fwd.forward_tool_start(
-                            invocation_id,
-                            tool,
-                            params,
-                            agent_label,
-                            tid,
-                        );
-                    }
-                    RuntimeEvent::ToolEnd {
-                        invocation_id,
-                        ok,
-                        result,
-                        ..
-                    } => {
-                        parent_fwd.forward_tool_end(invocation_id, ok, result, agent_label, tid);
-                    }
-                    RuntimeEvent::TokenDelta { delta, .. } => {
-                        parent_fwd.forward_token_delta(delta, agent_label);
-                    }
-                    RuntimeEvent::ReasoningDelta { text, .. } => {
-                        parent_fwd.forward_reasoning_delta(text, agent_label);
-                    }
-                    // Suppress subagent status events -- they would overwrite
-                    // the parent's thinking indicator with the subagent's phase,
-                    // which is confusing. The user doesn't need to know that a
-                    // subagent is "building context" or "calling LLM".
-                    RuntimeEvent::Status { .. } => continue,
-                    // Suppress subagent stream resets. A `StreamReset` retracts
-                    // the *partial* a stream painted before falling back to
-                    // buffered (#1162 sym-2). A subagent's own `TokenDelta` /
-                    // `ReasoningDelta` are forwarded to the parent's stream
-                    // tagged with `source_agent`, where the UI suppresses them
-                    // (subagent interleaving is hidden) — so nothing of the
-                    // subagent's partial was ever painted on the parent stream,
-                    // and there is no partial to retract here. Reload safety is
-                    // covered the same way: `get_run_reasoning` filters every
-                    // `source_agent`-tagged `reasoning_delta` out of rehydration
-                    // (mirroring the UI), so the subagent's abandoned partial is
-                    // never surfaced on the parent run and needs no reset
-                    // boundary on this stream. (`sub_rx` from this subagent
-                    // channel is consumed only by this parent-forwarding task,
-                    // never by the gateway's `forward_runtime_events`.)
-                    RuntimeEvent::StreamReset { .. } => continue,
                     // ApprovalRequired cannot be forwarded through EventForwarder
                     // (it requires a oneshot channel).  Background subagents
                     // should already have Guarded overridden to Autonomous, so
                     // this path is a fallback for FullControl subagents (which
                     // intentionally keep their posture).  Auto-deny the tool
-                    // call immediately so the subagent doesn't hang.
+                    // call immediately so the subagent doesn't hang. Handled
+                    // here (not in the helper) because sending on the oneshot
+                    // consumes `decision_tx`, which requires moving the event.
                     RuntimeEvent::ApprovalRequired {
                         tool, decision_tx, ..
                     } => {
@@ -1758,32 +1724,17 @@ async fn run_agent_loop(
                             "Subagent requested approval — auto-denying (approval not routable)"
                         );
                         let _ = decision_tx.send(false);
-                        continue;
                     }
-                    // Forward warnings from subagents, tagged with the
-                    // subagent label so the operator can tell them apart
-                    // from parent warnings.
-                    RuntimeEvent::Warning { code, message, .. } => {
-                        parent_fwd.forward_warning(code, message, agent_label);
-                    }
-                    // ContextDebug events from subagents are suppressed --
-                    // they are only useful for the top-level agent's context.
-                    RuntimeEvent::ContextDebug { .. } => continue,
-                    // SubagentStarted events from inside a subagent are
-                    // suppressed — a (future) sub-subagent's SubagentBar
-                    // entry belongs on the subagent's own session stream,
-                    // not the top-level parent's. The coordinator already
-                    // emits a SubagentStarted onto the original parent's
-                    // stream from `spawn_subagent` for this subagent at
-                    // the moment its session is created (#1105); that
-                    // event is what the UI SubagentBar resolver
-                    // consumes. Recursive subagent spawning is not yet
-                    // wired up (see `docs/autonomous-subagents-design.md`),
-                    // so in practice this arm is dead code today, but
-                    // the explicit suppression makes the match exhaustive
-                    // and documents the intended behaviour for when
-                    // sub-subagents land.
-                    RuntimeEvent::SubagentStarted { .. } => continue,
+                    // Everything else reduces to (at most) a deduped
+                    // `subagent_activity` status signal or a tagged warning —
+                    // see `forward_status_to_parent` for the full mapping and
+                    // the suppression rationale per variant.
+                    other => forward_status_to_parent(
+                        parent_fwd.as_ref(),
+                        &other,
+                        &label,
+                        &mut last_activity_kind,
+                    ),
                 }
             }
         });
@@ -1839,6 +1790,80 @@ fn forward_event_to_self(self_fwd: &dyn EventForwarder, event: &alms_runtime::Ru
         RuntimeEvent::StreamReset { .. } => self_fwd.forward_stream_reset(),
         _ => {}
     }
+}
+
+/// Reduce a subagent's runtime event to (at most) one TAGGED status signal for
+/// the parent's **Subagent status bar**.
+///
+/// This is the parent half of the subagent→parent relay. The bar renders a
+/// concise status label per subagent ("Reasoning…", "Using {tool}",
+/// "Writing…"), so the parent only needs to know *what kind* of activity is
+/// happening — never the reasoning/token TEXT or tool params/results. Those
+/// used to be forwarded verbatim (and the reasoning deltas + tool events were
+/// PERSISTED to the parent's session event log), bloating the parent stream
+/// with content the UI deliberately hid; the full content streams to the
+/// subagent's own session instead (#1184).
+///
+/// Mapping:
+/// - `ToolStart`      → `subagent_activity(kind=tool_start, tool=<name>)`
+/// - `ToolEnd`        → `subagent_activity(kind=tool_end)`
+/// - `ReasoningDelta` → `subagent_activity(kind=reasoning)` (deduped)
+/// - `TokenDelta`     → `subagent_activity(kind=writing)` (deduped)
+/// - `Warning`        → `forward_warning(..)` tagged with the subagent label
+///   (unchanged from the pre-status-bar relay)
+/// - everything else  → suppressed:
+///   * `Status` — would overwrite the parent's thinking indicator with the
+///     subagent's phase; the operator doesn't need the subagent's
+///     "building context" on the parent surface.
+///   * `StreamReset` — retracts a painted partial (#1162 sym-2), but the
+///     parent paints no subagent content at all now, so there is nothing to
+///     retract (this is what closes #1186). The subagent's OWN stream mirrors
+///     it via `forward_event_to_self`.
+///   * `ContextDebug` — only meaningful for the top-level agent's context.
+///   * `SubagentStarted` — a (future) sub-subagent's chip belongs on the
+///     subagent's own session stream; the coordinator already emits the
+///     `SubagentStarted` for THIS subagent from `spawn_subagent` (#1105).
+///   * `ApprovalRequired` — handled (auto-denied) by the caller, which owns
+///     the event by value; it can never reach this borrowing helper in
+///     production, and ignoring it here keeps the helper total.
+///
+/// Dedup (`last_activity_kind`): reasoning/token deltas arrive per-chunk, at
+/// high frequency. The bar only changes when the activity *kind* changes, so
+/// consecutive deltas of the same kind collapse into a single signal — the
+/// parent stream sees one event per phase transition instead of one per
+/// chunk. Tool boundaries always emit (they carry / clear the tool name) and
+/// also update the state, so a delta after a tool boundary re-emits its kind.
+fn forward_status_to_parent(
+    parent_fwd: &dyn EventForwarder,
+    event: &alms_runtime::RuntimeEvent,
+    label: &str,
+    last_activity_kind: &mut Option<&'static str>,
+) {
+    use alms_runtime::RuntimeEvent;
+    use alms_tools::subagent_activity_kind as kind;
+
+    let (activity_kind, tool) = match event {
+        RuntimeEvent::ToolStart { tool, .. } => (kind::TOOL_START, Some(tool.clone())),
+        RuntimeEvent::ToolEnd { .. } => (kind::TOOL_END, None),
+        RuntimeEvent::ReasoningDelta { .. } => (kind::REASONING, None),
+        RuntimeEvent::TokenDelta { .. } => (kind::WRITING, None),
+        RuntimeEvent::Warning { code, message, .. } => {
+            parent_fwd.forward_warning(code.clone(), message.clone(), Some(label.to_string()));
+            return;
+        }
+        _ => return,
+    };
+
+    // Collapse consecutive same-kind delta signals. Only the delta kinds are
+    // deduped: tool boundaries are low-frequency and must always fire so the
+    // bar picks up the (possibly repeated) tool name.
+    if (activity_kind == kind::REASONING || activity_kind == kind::WRITING)
+        && *last_activity_kind == Some(activity_kind)
+    {
+        return;
+    }
+    *last_activity_kind = Some(activity_kind);
+    parent_fwd.forward_subagent_activity(activity_kind.to_string(), tool, Some(label.to_string()));
 }
 
 #[cfg(test)]
@@ -2153,6 +2178,239 @@ mod tests {
         );
         let got = sink.events.lock().get(&sid).cloned().unwrap_or_default();
         assert_eq!(got, vec!["stream_reset".to_string()]);
+    }
+
+    // -- Subagent status bar: `forward_status_to_parent` (#1180 follow-up) --
+
+    /// One captured `forward_subagent_activity` call:
+    /// (kind, tool, source_agent).
+    type CapturedActivity = (String, Option<String>, Option<String>);
+
+    /// Records every `forward_subagent_activity` / `forward_warning` call and
+    /// asserts (via panics) that NO content-carrying forward method is ever
+    /// invoked — the parent relay must reduce subagent events to status
+    /// signals, never forward reasoning/token text or tool params/results.
+    #[derive(Debug, Default)]
+    struct StatusCapturingForwarder {
+        activity: parking_lot::Mutex<Vec<CapturedActivity>>,
+        /// (code, source_agent) per forwarded warning.
+        warnings: parking_lot::Mutex<Vec<(String, Option<String>)>>,
+    }
+
+    impl EventForwarder for StatusCapturingForwarder {
+        fn forward_tool_start(
+            &self,
+            _: uuid::Uuid,
+            _: String,
+            _: serde_json::Value,
+            _: Option<String>,
+            _: Option<String>,
+        ) {
+            panic!("parent relay must not forward tool_start content (params) to the parent");
+        }
+        fn forward_tool_end(
+            &self,
+            _: uuid::Uuid,
+            _: bool,
+            _: serde_json::Value,
+            _: Option<String>,
+            _: Option<String>,
+        ) {
+            panic!("parent relay must not forward tool_end content (results) to the parent");
+        }
+        fn forward_token_delta(&self, _: String, _: Option<String>) {
+            panic!("parent relay must not forward token text to the parent");
+        }
+        fn forward_reasoning_delta(&self, _: String, _: Option<String>) {
+            panic!("parent relay must not forward reasoning text to the parent");
+        }
+        fn forward_subagent_activity(
+            &self,
+            kind: String,
+            tool: Option<String>,
+            source_agent: Option<String>,
+        ) {
+            self.activity.lock().push((kind, tool, source_agent));
+        }
+        fn forward_stream_reset(&self) {
+            panic!("parent relay must not forward subagent stream resets (#1186)");
+        }
+        fn forward_status(&self, _: String, _: Option<String>) {
+            panic!("parent relay must not forward subagent phase status to the parent");
+        }
+        fn forward_warning(&self, code: String, _: String, source_agent: Option<String>) {
+            self.warnings.lock().push((code, source_agent));
+        }
+        fn forward_run_terminal(&self, _: alms_tools::SubagentRunOutcome) {}
+    }
+
+    fn reasoning_event() -> alms_runtime::RuntimeEvent {
+        alms_runtime::RuntimeEvent::ReasoningDelta {
+            text: "secret chain of thought".to_string(),
+            source_agent: None,
+        }
+    }
+
+    fn token_event() -> alms_runtime::RuntimeEvent {
+        alms_runtime::RuntimeEvent::TokenDelta {
+            delta: "visible output".to_string(),
+            source_agent: None,
+        }
+    }
+
+    fn tool_start_event(tool: &str) -> alms_runtime::RuntimeEvent {
+        alms_runtime::RuntimeEvent::ToolStart {
+            invocation_id: uuid::Uuid::new_v4(),
+            tool: tool.to_string(),
+            params: serde_json::json!({"huge": "payload"}),
+            source_agent: None,
+            task_id: None,
+        }
+    }
+
+    fn tool_end_event() -> alms_runtime::RuntimeEvent {
+        alms_runtime::RuntimeEvent::ToolEnd {
+            invocation_id: uuid::Uuid::new_v4(),
+            ok: true,
+            result: serde_json::json!({"huge": "result"}),
+            source_agent: None,
+            task_id: None,
+        }
+    }
+
+    /// The relay reduces subagent content events to tagged status signals and
+    /// dedups consecutive same-kind deltas: a realistic run (many reasoning
+    /// deltas → tool → many token deltas) produces one signal per activity
+    /// TRANSITION, with the tool name on `tool_start` and the label on every
+    /// signal. Any content-carrying forward panics via the capturing sink.
+    #[test]
+    fn test_forward_status_to_parent_dedups_and_strips_content() {
+        let fwd = StatusCapturingForwarder::default();
+        let mut last: Option<&'static str> = None;
+
+        // Burst of reasoning deltas -> ONE `reasoning` signal.
+        for _ in 0..5 {
+            forward_status_to_parent(&fwd, &reasoning_event(), "reviewer", &mut last);
+        }
+        // Tool boundary -> `tool_start` (with name) then `tool_end`.
+        forward_status_to_parent(&fwd, &tool_start_event("shell"), "reviewer", &mut last);
+        forward_status_to_parent(&fwd, &tool_end_event(), "reviewer", &mut last);
+        // Reasoning resumes after the tool -> a fresh `reasoning` signal
+        // (the tool boundary reset the dedup state).
+        for _ in 0..3 {
+            forward_status_to_parent(&fwd, &reasoning_event(), "reviewer", &mut last);
+        }
+        // Then the answer streams -> ONE `writing` signal.
+        for _ in 0..4 {
+            forward_status_to_parent(&fwd, &token_event(), "reviewer", &mut last);
+        }
+
+        let got = fwd.activity.lock().clone();
+        let label = Some("reviewer".to_string());
+        assert_eq!(
+            got,
+            vec![
+                ("reasoning".to_string(), None, label.clone()),
+                (
+                    "tool_start".to_string(),
+                    Some("shell".to_string()),
+                    label.clone()
+                ),
+                ("tool_end".to_string(), None, label.clone()),
+                ("reasoning".to_string(), None, label.clone()),
+                ("writing".to_string(), None, label.clone()),
+            ],
+            "expected exactly one tagged signal per activity transition"
+        );
+    }
+
+    /// Consecutive tool boundaries always emit (never deduped) — the bar must
+    /// pick up each tool name, including the same tool run twice in a row.
+    #[test]
+    fn test_forward_status_to_parent_tool_boundaries_never_deduped() {
+        let fwd = StatusCapturingForwarder::default();
+        let mut last: Option<&'static str> = None;
+
+        forward_status_to_parent(&fwd, &tool_start_event("shell"), "worker", &mut last);
+        forward_status_to_parent(&fwd, &tool_end_event(), "worker", &mut last);
+        forward_status_to_parent(&fwd, &tool_start_event("shell"), "worker", &mut last);
+        forward_status_to_parent(&fwd, &tool_end_event(), "worker", &mut last);
+
+        let kinds: Vec<String> = fwd
+            .activity
+            .lock()
+            .iter()
+            .map(|(k, _, _)| k.clone())
+            .collect();
+        assert_eq!(
+            kinds,
+            vec!["tool_start", "tool_end", "tool_start", "tool_end"]
+        );
+    }
+
+    /// Warnings still pass through, tagged with the subagent label; the
+    /// suppressed variants (`Status`, `StreamReset`, `ContextDebug`,
+    /// `SubagentStarted`) produce nothing — asserted falsifiably because the
+    /// capturing sink PANICS on any content/status/reset forward.
+    #[test]
+    fn test_forward_status_to_parent_warnings_tagged_and_noise_suppressed() {
+        let fwd = StatusCapturingForwarder::default();
+        let mut last: Option<&'static str> = None;
+
+        forward_status_to_parent(
+            &fwd,
+            &alms_runtime::RuntimeEvent::Warning {
+                code: "SPILL".to_string(),
+                message: "tool output spilled".to_string(),
+                source_agent: None,
+            },
+            "reviewer",
+            &mut last,
+        );
+        forward_status_to_parent(
+            &fwd,
+            &alms_runtime::RuntimeEvent::Status {
+                phase: "calling_llm".to_string(),
+                detail: None,
+            },
+            "reviewer",
+            &mut last,
+        );
+        forward_status_to_parent(
+            &fwd,
+            &alms_runtime::RuntimeEvent::StreamReset {
+                source_agent: Some("reviewer".to_string()),
+            },
+            "reviewer",
+            &mut last,
+        );
+        forward_status_to_parent(
+            &fwd,
+            &alms_runtime::RuntimeEvent::SubagentStarted {
+                tool_invocation_id: uuid::Uuid::new_v4(),
+                subagent_name: None,
+                subagent_session_id: SessionId::new(),
+                background: false,
+            },
+            "reviewer",
+            &mut last,
+        );
+
+        assert_eq!(
+            fwd.warnings.lock().clone(),
+            vec![("SPILL".to_string(), Some("reviewer".to_string()))],
+            "warnings must be forwarded tagged with the subagent label"
+        );
+        assert!(
+            fwd.activity.lock().is_empty(),
+            "suppressed variants must not synthesise activity signals"
+        );
+        // A StreamReset must not clear the dedup state either: the next
+        // same-kind delta after a buffered-fallback re-emit stays deduped
+        // (the bar's label is already correct).
+        forward_status_to_parent(&fwd, &reasoning_event(), "reviewer", &mut last);
+        forward_status_to_parent(&fwd, &reasoning_event(), "reviewer", &mut last);
+        assert_eq!(fwd.activity.lock().len(), 1);
     }
 
     /// #1180 (foreground): a foreground subagent run streams its (untagged) run

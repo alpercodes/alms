@@ -1,6 +1,6 @@
 //! Run creation, execution, and completion — the core run lifecycle.
 
-use super::tools::{RuntimeEventForwarder, forward_runtime_events, route_bg_event};
+use super::tools::{RoutedBgEvent, RuntimeEventForwarder, forward_runtime_events, route_bg_event};
 use super::{RunParams, is_internal_context_id, resolve_agent_config};
 use crate::api_error;
 use crate::server::AppState;
@@ -2064,24 +2064,37 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
                 // stream.
                 //
                 // After the parent run finishes and drops `runtime` (and with
-                // it `invoke_agent_fwd`), the upgrade returns `None`. The
-                // bg subagent's own `ToolStart` / `ToolEnd` still convert to
-                // SSE directly via `route_bg_event` and reach the session
-                // stream regardless of the parent. For `SubagentStarted`,
-                // `route_bg_event` now FALLS BACK to returning the
-                // `subagent_started` `SseEventData` (rather than dropping it),
+                // it `invoke_agent_fwd`), the upgrade returns `None`. The bg
+                // subagent's `subagent_activity` status signals still convert
+                // to SSE directly via `route_bg_event` and reach the session
+                // stream regardless of the parent (the Subagent status bar
+                // must keep updating after the parent turn ends). For
+                // `SubagentStarted`, `route_bg_event` FALLS BACK to returning
+                // a `Persist(subagent_started)` (rather than dropping it),
                 // which we deliver below via `send_session_event` — recovering
                 // the #1105 surface for a bg subagent that started after the
-                // parent turn ended (#1125 A1-3). `send_session_event` is
+                // parent turn ended (#1125 A1-3). Both delivery paths are
                 // independent of `runtime_tx`, so this does not reintroduce
                 // the #1124 deadlock.
                 let upgraded = bg_runtime_fwd.upgrade();
-                let sse = route_bg_event(event, upgraded.as_deref(), bg_run_id, bg_session_id);
-                if let Some(sse) = sse {
-                    bg_state
-                        .run_manager
-                        .send_session_event(bg_session_id, bg_run_id, sse)
-                        .await;
+                match route_bg_event(event, upgraded.as_deref(), bg_run_id, bg_session_id) {
+                    // Durable events (dead-parent `subagent_started` fallback):
+                    // persist to the session event log, then fan out.
+                    Some(RoutedBgEvent::Persist(sse)) => {
+                        bg_state
+                            .run_manager
+                            .send_session_event(bg_session_id, bg_run_id, sse)
+                            .await;
+                    }
+                    // Ephemeral `subagent_activity` status signals: live
+                    // fan-out only — never logged, so a subagent's activity
+                    // cannot bloat the parent's persisted session log.
+                    Some(RoutedBgEvent::Transient(sse)) => {
+                        bg_state
+                            .run_manager
+                            .send_transient_session_event(bg_session_id, sse);
+                    }
+                    None => {}
                 }
             }
         });

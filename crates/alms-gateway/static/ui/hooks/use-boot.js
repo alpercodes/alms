@@ -60,7 +60,7 @@ function loadActiveSession(agentId, agentSessions, preferred) {
  * lightweight existence check succeeds, otherwise `null` so the caller
  * falls back to the agent's visible session list. (#1045)
  *
- * Subagent sessions are reached via SubagentBar's "View session" button,
+ * Subagent sessions are reached by clicking a Subagent status bar chip,
  * the SubagentCompletionCard, or the Runs tab — all paths persist the
  * subagent session id in `alms_active_session_<agentId>` via
  * `saveActiveSession`. Without this resolver, a page reload that finds

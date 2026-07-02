@@ -800,17 +800,16 @@ async fn test_bg_subagent_does_not_block_parent_run_drain() {
         ),
     }
 
-    // The bg subagent then continues to emit its own tool events, which still
+    // The bg subagent then continues to emit its status signals, which still
     // route to SSE even after the parent is gone (the Weak upgrade fails, so
-    // `route_bg_event` is called with `parent_fwd == None` and converts ToolEnd
-    // directly).
+    // `route_bg_event` is called with `parent_fwd == None` and converts the
+    // `SubagentActivity` directly — the status bar keeps updating after the
+    // parent turn ends).
     relay_holds_bg_tx
-        .send(RuntimeEvent::ToolEnd {
-            invocation_id: uuid::Uuid::new_v4(),
-            ok: true,
-            result: serde_json::json!({"done": true}),
+        .send(RuntimeEvent::SubagentActivity {
+            kind: "tool_end".to_string(),
+            tool: None,
             source_agent: Some("worker".to_string()),
-            task_id: None,
         })
         .unwrap();
 
@@ -822,7 +821,7 @@ async fn test_bg_subagent_does_not_block_parent_run_drain() {
         routed.load(std::sync::atomic::Ordering::SeqCst),
         2,
         "bg task must process both the SubagentStarted reroute and the \
-         post-parent-teardown ToolEnd"
+         post-parent-teardown SubagentActivity"
     );
 }
 
@@ -842,20 +841,22 @@ async fn test_bg_subagent_does_not_block_parent_run_drain() {
 /// - `Some(fwd)` (parent alive): reroute through the parent channel, return
 ///   `None` so the caller does NOT also emit on the session stream (one
 ///   delivery, FIFO after the parent's `tool_start`).
-/// - `None` (parent dead): return `Some(subagent_started)` so the caller
-///   delivers it via `send_session_event` (the fallback), carrying the same
-///   `tool_invocation_id` + `subagent_session_id` the live event would.
+/// - `None` (parent dead): return `Some(Persist(subagent_started))` so the
+///   caller delivers it via `send_session_event` (the fallback), carrying the
+///   same `tool_invocation_id` + `subagent_session_id` the live event would.
 ///
 /// Both invariants are asserted here, falsifiably:
 ///   - Parent-alive leg: `route_bg_event` returns `None` AND exactly one
 ///     `SubagentStarted` lands on the parent's runtime channel (no fallback
 ///     SSE). A revert that also emitted on the session stream would make the
 ///     no-double-delivery assertion fail.
-///   - Parent-dead leg: `route_bg_event` returns `Some(SseEventData)` of type
+///   - Parent-dead leg: `route_bg_event` returns `Some(Persist(..))` of type
 ///     `subagent_started`, carrying `tool_invocation_id`, `subagent_session_id`
 ///     and the parent `session_id`; AND nothing lands on the (dead) parent
 ///     channel. A revert to the silent-drop shape returns `None` here and the
-///     fallback-delivery assertion fails.
+///     fallback-delivery assertion fails. `Persist` (not `Transient`) matters:
+///     the fallback is a durable lifecycle marker, so it must go through
+///     `send_session_event` and land in the parent's session event log.
 #[tokio::test]
 async fn test_bg_subagent_started_falls_back_to_session_stream_when_parent_dead() {
     use alms_gateway::runs::tools::route_bg_event;
@@ -981,12 +982,19 @@ async fn test_bg_subagent_started_falls_back_to_session_stream_when_parent_dead(
     );
 
     // The dead-parent leg must produce a `subagent_started` SSE for the caller
-    // to deliver on the session stream — NOT a silent drop.
-    let sse = dead.expect(
+    // to deliver on the session stream — NOT a silent drop. It must be the
+    // Persist route: this fallback is a durable lifecycle marker.
+    let sse = match dead.expect(
         "parent-dead: route_bg_event must FALL BACK to a subagent_started \
          SseEventData (delivered via send_session_event) instead of dropping \
          the event (#1125 A1-3)",
-    );
+    ) {
+        alms_gateway::runs::tools::RoutedBgEvent::Persist(sse) => sse,
+        alms_gateway::runs::tools::RoutedBgEvent::Transient(sse) => panic!(
+            "parent-dead subagent_started fallback must be Persist (durable \
+             lifecycle marker), got Transient({sse:?})"
+        ),
+    };
     assert_eq!(
         sse.event_type, "subagent_started",
         "fallback event must be a subagent_started event"
@@ -1014,42 +1022,42 @@ async fn test_bg_subagent_started_falls_back_to_session_stream_when_parent_dead(
     );
 }
 
-/// Regression test for #1180: a background subagent's `reasoning_delta` events
-/// must be forwarded onto the parent's SESSION stream tagged with
-/// `source_agent`, so the SubagentBar's live-activity tail (#1149 / #1171
-/// `trackSubagentReasoning`) lights up during the run.
+/// Contract test for the Subagent status bar (#1180 follow-up, subsumes
+/// #1186): the parent's stream receives a background subagent's coarse
+/// `subagent_activity` STATUS signal — and never the subagent's content.
 ///
-/// Failure scenario (pre-fix): `route_bg_event` only converted
-/// `ToolStart` / `ToolEnd` / `SubagentStarted`; `ReasoningDelta` fell through
-/// the `_ => None` catch-all and was dropped, so the parent's subagent bar
-/// stayed blank for the entire background run even though the subagent was
-/// actively thinking. (#1171 wired this for the FOREGROUND path only.)
+/// The coordinator relay reduces the subagent's reasoning/token deltas and
+/// tool events to deduplicated `RuntimeEvent::SubagentActivity` signals;
+/// `route_bg_event` must convert those to a **Transient** `subagent_activity`
+/// SSE (live fan-out only, never persisted to the parent's session event
+/// log). The subagent's raw content events must NOT be forwarded at all —
+/// pre-status-bar, every `reasoning_delta` and tool start/end (with full
+/// params/results) was persisted to the parent's session log for content the
+/// UI never displayed.
 ///
 /// Asserts falsifiably:
-///   - `route_bg_event` returns `Some(SseEventData)` of type `reasoning_delta`
-///     (a revert to the dropped `_ => None` behaviour returns `None`, failing
-///     the `.expect`).
-///   - the event keeps the subagent's `source_agent` tag verbatim — this is
-///     the key the frontend uses to tee the delta to the bar and keep it out
-///     of the parent's own reasoning view (#1170 invariant).
-///   - the event carries the bg run id and the reasoning text.
-///   - both parent-liveness legs (`Some(parent_fwd)` and `None`) return the
-///     same `reasoning_delta`: unlike `SubagentStarted`, reasoning deltas are
-///     NOT rerouted through the parent's `runtime_tx` (which dies with the
-///     parent run) — the bar must keep updating after the parent turn ends, so
-///     they always go to the session-stream return value.
+///   - `SubagentActivity` returns `Some(Transient(subagent_activity))` with
+///     the `source_agent` tag, the activity kind, the tool name and the bg
+///     run id — identically on BOTH parent-liveness legs (`Some(parent_fwd)`
+///     and `None`): the signal is never rerouted through the parent's
+///     `runtime_tx` (#1124 constraint; the bar must keep updating after the
+///     parent turn ends). A revert to `Persist` fails the match; a revert to
+///     the `_ => None` drop fails the `.expect`.
+///   - Raw `ReasoningDelta` / `TokenDelta` / `ToolStart` / `ToolEnd` return
+///     `None` — a revert that reintroduces content forwarding onto the parent
+///     stream fails these.
 #[tokio::test]
-async fn test_bg_subagent_reasoning_delta_forwarded_to_parent_session_stream() {
-    use alms_gateway::runs::tools::route_bg_event;
+async fn test_bg_subagent_activity_signal_forwarded_transient_and_content_dropped() {
+    use alms_gateway::runs::tools::{RoutedBgEvent, route_bg_event};
     use alms_runtime::RuntimeEvent;
     use std::sync::Arc;
 
     let bg_run_id = RunId::new();
     let parent_session = SessionId::new();
 
-    // No-op parent forwarder for the parent-alive leg. Reasoning deltas must
-    // NOT be rerouted through it (that path dies with the parent run); they go
-    // straight to the session-stream SSE return value regardless of liveness.
+    // No-op parent forwarder for the parent-alive leg. Status signals must
+    // NOT be rerouted through it (that path dies with the parent run); they
+    // go straight to the session-stream return value regardless of liveness.
     #[derive(Debug)]
     struct NoopForwarder;
     impl alms_tools::EventForwarder for NoopForwarder {
@@ -1079,21 +1087,35 @@ async fn test_bg_subagent_reasoning_delta_forwarded_to_parent_session_stream() {
     }
     let parent_fwd: Arc<dyn alms_tools::EventForwarder> = Arc::new(NoopForwarder);
 
-    let assert_reasoning = |sse: Option<SseEventData>| {
-        let sse = sse.expect(
-            "#1180: route_bg_event must forward a background subagent's \
-             reasoning_delta as a session-stream SseEventData instead of \
-             dropping it via the `_ => None` catch-all",
+    let mk_activity = || RuntimeEvent::SubagentActivity {
+        kind: "tool_start".to_string(),
+        tool: Some("shell".to_string()),
+        source_agent: Some("reviewer".to_string()),
+    };
+
+    let assert_activity = |routed: Option<RoutedBgEvent>| {
+        let routed = routed.expect(
+            "route_bg_event must forward a background subagent's \
+             SubagentActivity as a session-stream SSE instead of dropping it \
+             via the `_ => None` catch-all",
         );
-        assert_eq!(sse.event_type, "reasoning_delta");
+        let sse = match routed {
+            RoutedBgEvent::Transient(sse) => sse,
+            RoutedBgEvent::Persist(sse) => panic!(
+                "subagent_activity must be Transient (live fan-out only, \
+                 never persisted to the parent's session event log), got \
+                 Persist({sse:?})"
+            ),
+        };
+        assert_eq!(sse.event_type, "subagent_activity");
         assert_eq!(
             sse.data["source_agent"].as_str(),
             Some("reviewer"),
-            "forwarded reasoning_delta must keep the subagent's source_agent tag \
-             so the frontend tees it to the SubagentBar (and out of the parent \
-             reasoning view)"
+            "the signal must keep the subagent's source_agent tag so the \
+             frontend routes it to the matching status-bar chip"
         );
-        assert_eq!(sse.data["text"].as_str(), Some("thinking hard"));
+        assert_eq!(sse.data["kind"].as_str(), Some("tool_start"));
+        assert_eq!(sse.data["tool"].as_str(), Some("shell"));
         assert_eq!(
             sse.data["run_id"].as_str(),
             Some(bg_run_id.0.to_string().as_str())
@@ -1101,25 +1123,123 @@ async fn test_bg_subagent_reasoning_delta_forwarded_to_parent_session_stream() {
     };
 
     // Parent-alive leg.
-    assert_reasoning(route_bg_event(
-        RuntimeEvent::ReasoningDelta {
-            text: "thinking hard".to_string(),
-            source_agent: Some("reviewer".to_string()),
-        },
+    assert_activity(route_bg_event(
+        mk_activity(),
         Some(&*parent_fwd),
         bg_run_id,
         parent_session,
     ));
 
     // Parent-dead leg — same result (bar must keep updating after the parent
-    // run ends, so the event is never gated on parent liveness).
-    assert_reasoning(route_bg_event(
-        RuntimeEvent::ReasoningDelta {
-            text: "thinking hard".to_string(),
-            source_agent: Some("reviewer".to_string()),
-        },
+    // run ends, so the signal is never gated on parent liveness).
+    assert_activity(route_bg_event(
+        mk_activity(),
         None,
         bg_run_id,
         parent_session,
     ));
+
+    // The subagent's raw content events must be DROPPED on the parent path —
+    // the parent stream carries subagent status, never subagent content.
+    // (In production the coordinator relay no longer emits these onto the bg
+    // channel at all; this pins the belt-and-braces drop in route_bg_event.)
+    let content_events = [
+        RuntimeEvent::ReasoningDelta {
+            text: "thinking hard".to_string(),
+            source_agent: Some("reviewer".to_string()),
+        },
+        RuntimeEvent::TokenDelta {
+            delta: "output text".to_string(),
+            source_agent: Some("reviewer".to_string()),
+        },
+        RuntimeEvent::ToolStart {
+            invocation_id: uuid::Uuid::new_v4(),
+            tool: "shell".to_string(),
+            params: serde_json::json!({"cmd": "ls"}),
+            source_agent: Some("reviewer".to_string()),
+            task_id: None,
+        },
+        RuntimeEvent::ToolEnd {
+            invocation_id: uuid::Uuid::new_v4(),
+            ok: true,
+            result: serde_json::json!({"output": "big payload"}),
+            source_agent: Some("reviewer".to_string()),
+            task_id: None,
+        },
+    ];
+    for event in content_events {
+        assert!(
+            route_bg_event(event, None, bg_run_id, parent_session).is_none(),
+            "raw subagent content events must never be forwarded onto the \
+             parent's session stream (status-only contract)"
+        );
+    }
+}
+
+/// The `subagent_activity` SSE must be EPHEMERAL end-to-end on the foreground
+/// path too: `send_event` (the chokepoint `forward_runtime_events` uses) must
+/// fan it out to live subscribers WITHOUT logging it to the run or session
+/// event logs — persisted status signals would bloat the parent's session log
+/// once per activity transition for a value that is worthless on replay.
+#[tokio::test]
+async fn test_subagent_activity_sse_is_ephemeral_not_persisted() {
+    let run_manager = alms_gateway::RunManager::new();
+    let run_id = RunId::new();
+    let session_id = SessionId::new();
+
+    // Live session subscriber.
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    run_manager.register_session_sender(session_id, tx);
+
+    let hwm_before = run_manager.latest_session_event_id(session_id).await;
+
+    run_manager
+        .send_event(
+            run_id,
+            session_id,
+            SseEventData::subagent_activity(
+                run_id,
+                "reasoning",
+                None,
+                Some("reviewer".to_string()),
+            ),
+        )
+        .await;
+
+    // Live subscriber receives it, with no persisted event id (the ephemeral
+    // fast-path contract that lets it through the replay dedup filter).
+    let received = rx.recv().await.expect("live subscriber must receive it");
+    assert_eq!(received.event_type, "subagent_activity");
+    assert_eq!(received.data["kind"].as_str(), Some("reasoning"));
+    assert!(
+        received.event_id.is_none(),
+        "ephemeral subagent_activity must not carry a persisted event id"
+    );
+
+    // Nothing was persisted to the session event log (HWM unchanged)...
+    let hwm_after = run_manager.latest_session_event_id(session_id).await;
+    assert_eq!(
+        hwm_before, hwm_after,
+        "subagent_activity must NOT be persisted to the session event log"
+    );
+    // ...nor to the per-run event log.
+    assert!(
+        run_manager.events_from(run_id, 0).await.is_empty(),
+        "subagent_activity must NOT be persisted to the run event log"
+    );
+
+    // Contrast: the transient session path used by the background drain also
+    // fans out without persisting.
+    run_manager.send_transient_session_event(
+        session_id,
+        SseEventData::subagent_activity(run_id, "writing", None, Some("reviewer".to_string())),
+    );
+    let received = rx.recv().await.expect("transient fan-out must deliver");
+    assert_eq!(received.event_type, "subagent_activity");
+    assert!(received.event_id.is_none());
+    assert_eq!(
+        run_manager.latest_session_event_id(session_id).await,
+        hwm_before,
+        "send_transient_session_event must never write the session event log"
+    );
 }
