@@ -1074,6 +1074,8 @@ async fn test_bg_subagent_reasoning_delta_forwarded_to_parent_session_stream() {
         fn forward_token_delta(&self, _: String, _: Option<String>) {}
         fn forward_status(&self, _: String, _: Option<String>) {}
         fn forward_warning(&self, _: String, _: String, _: Option<String>) {}
+        fn forward_stream_reset(&self) {}
+        fn forward_run_terminal(&self, _: alms_tools::SubagentRunOutcome) {}
     }
     let parent_fwd: Arc<dyn alms_tools::EventForwarder> = Arc::new(NoopForwarder);
 
