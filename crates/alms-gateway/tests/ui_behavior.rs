@@ -360,6 +360,53 @@ fn dm_stream_rendering_js_behaviour() {
     run_node_test("dm-stream-rendering.test.mjs");
 }
 
+/// Behavioural coverage for the DM RELOAD render path in
+/// `static/ui/utils/load-session.js`, driven end-to-end against the REAL
+/// `history.js` pipeline (source-rewrite loader; only the API / state-signal
+/// imports are stubbed).
+///
+/// Pins the two reload bugs whose shared root cause was PR #1010's sidebar
+/// split (DM sessions moved from the per-agent `sessions` list into
+/// `crossAgentSessions`, silently breaking `loadSession`'s bare
+/// `sessions.value.find(...)` DM detection):
+///   - Bug 1 — with the DM flag stuck false, `groupDmReasoningBlocks` was
+///     skipped on reload, so persisted DM tool rows rendered as standalone
+///     sibling rows outside the reasoning collapsible and reasoning-text
+///     entries vanished. The tests assert zero escaped tool rows and
+///     correctly-attributed per-run blocks across all three resolution paths
+///     (envelope / cross-agent list / per-agent list).
+///   - Bug 2 — the step-3 in-flight text/reasoning seed (designed to be
+///     DM-skipped: the trailing visible text IS the implicit DM reply,
+///     #1156) ran anyway on a mid-run DM load and seeded the partial reply
+///     as an unsealed perspective-side bubble that then double-rendered
+///     against the delivered `dm_message` (the #1164 mis-attributed
+///     duplicate, resurfacing on reload). The tests assert no unsealed
+///     entry is seeded, `getRunText` never fires for DM sessions, the
+///     SSE cursor stays at the messages HWM, and — as a control — the
+///     non-DM seed path still works.
+///
+/// Also pins the step-5 phase restore ("Chatting with {peer}…" on a
+/// running DM reload) that broke with the same lookup, and — per the Codex
+/// P2 on PR #1193 — the DM SPLIT of step 3: the #1133 terminal-only
+/// reconciliation (the `getRunReasoning` terminal probe → Layer-3
+/// suppress-set add, `activeRunId` clear, stray thinking-row removal) runs
+/// for DM sessions too, so a DM run that finishes inside the load window
+/// (its terminal SSE event swallowed by the messages-GET HWM) cannot
+/// strand the DM view with a stuck active-run marker / "Thinking…" row.
+/// ONLY the in-flight seed (+ its cursor bumps) stays DM-skipped.
+///
+/// Codex P2 #2 (same PR): an envelope-resolved DM is injected into
+/// `crossAgentSessions` (id-guarded, participants carried) so the shared
+/// `activeSession` computed resolves in the envelope-only case — otherwise
+/// `app.js` would render the NORMAL chat view instead of
+/// `DmConversationView` and `use-session-stream::isDmEvent` would
+/// mis-classify live DM events, even though `loadSession` itself knew it
+/// was a DM.
+#[test]
+fn load_session_dm_js_behaviour() {
+    run_node_test("load-session-dm.test.mjs");
+}
+
 /// Behavioural coverage for the Subagent status bar in
 /// `static/ui/state/subagents.js` + the `subagent_activity` / tagged-content
 /// handlers in `static/ui/hooks/use-session-stream.js` and the label mapping

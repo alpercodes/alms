@@ -28,7 +28,7 @@ import { replaceMessages, appendMessage, updateMessage, filterMessages } from '.
 import { activeRunId, runs } from '../state/runs.js';
 import { openSessionStream } from '../hooks/use-session-stream.js';
 import { setAgentPhase, clearAgentPhase, setDmContext } from '../state/agent-status.js';
-import { sessions } from '../state/sessions.js';
+import { sessions, crossAgentSessions } from '../state/sessions.js';
 import { activeAgent } from '../state/agents.js';
 import { getPendingMessage, clearPendingMessage } from '../state/pending-messages.js';
 import { rehydrateSubagentsFromHistory, parentSessionId } from '../state/subagents.js';
@@ -74,6 +74,62 @@ const SESSION_RUNS_RESTORE_LIMIT = 200;
 const AGENT_RUNS_RESTORE_LIMIT = 100;
 
 /**
+ * Resolve the session's metadata envelope (session_type, participants, …)
+ * for `loadSession`'s DM branching.
+ *
+ * Resolution order:
+ *   1. The step-0 `GET /session/{id}` envelope — authoritative, fetched at
+ *      the top of every load.
+ *   2. The per-agent `sessions` list.
+ *   3. The cross-agent `crossAgentSessions` list — REQUIRED for DM /
+ *      notification sessions, which PR #1010 (sidebar accordion split)
+ *      moved OUT of the per-agent `sessions` list into their own
+ *      cross-agent signal.
+ *
+ * The list fallbacks mirror the `activeSession` computed in
+ * `state/sessions.js` and only matter when the envelope fetch failed
+ * (older backend without `GET /session/{id}`, transient error).
+ *
+ * ## Why this helper exists (the #1010 regression behind the DM reload bugs)
+ *
+ * `loadSession` used to resolve the DM flag with a bare
+ * `sessions.value.find(...)`. That was correct when it was written (#690,
+ * 2026-04-13: one flat sidebar list), but PR #1010 (2026-05-09) split DMs
+ * into `crossAgentSessions` — after which the lookup NEVER found a DM
+ * session and `isDmSession` was silently `false` on every load. Three
+ * consumers broke at once:
+ *
+ *   1. `groupDmReasoningBlocks` was skipped, so reloaded DM tool rows
+ *      rendered as standalone sibling rows outside the reasoning
+ *      collapsible (the "ungrouped DM tool" fallback + console.warn in
+ *      DmConversationView) and `dm_reasoning_text` entries vanished
+ *      (no render branch for them outside a block).
+ *   2. The step-3 in-flight text/reasoning rehydration — explicitly
+ *      designed to be SKIPPED for DM sessions — ran anyway on a mid-run
+ *      DM load, seeding the run's partial implicit reply (#1156) as an
+ *      unsealed `type:'agent'` entry with NO `fromAgent`. The DM view
+ *      attributes such entries to the UI-selected perspective agent, so
+ *      when the delivered `dm_message` bubble landed with the real
+ *      sender, the same reply rendered TWICE — once per agent (the #1164
+ *      mis-attributed-duplicate symptom, resurfacing on the reload path).
+ *      `sealLastAgent` then sealed the seed at run end, so the duplicate
+ *      persisted on the finished conversation until the next full reload.
+ *   3. The step-5 phase restore never recognised the DM, so reloading a
+ *      running DM showed the generic "Thinking…" header instead of
+ *      "Chatting with {peer}…".
+ *
+ * @param {string} sessionId
+ * @param {object|null} envelope - step-0 `GET /session/{id}` response
+ * @returns {object|null}
+ */
+function resolveSessionMeta(sessionId, envelope) {
+    return envelope
+        || sessions.value.find(s => s.id === sessionId)
+        || crossAgentSessions.value.find(s => s.id === sessionId)
+        || null;
+}
+
+/**
  * Load a session's runs, chat history, pending approvals, and open SSE stream.
  *
  * Both the boot path and the session-switch path call this function after
@@ -90,6 +146,12 @@ const AGENT_RUNS_RESTORE_LIMIT = 100;
 export async function loadSession(sessionId, opts) {
     const isStale = opts.isStale;
     const logPrefix = opts.logPrefix || 'loadSession';
+
+    // The step-0 metadata envelope, kept for `resolveSessionMeta` so the
+    // DM branching below (grouping, in-flight-seed skip, phase restore)
+    // reads the authoritative `session_type` / `participants` instead of
+    // depending on which sidebar list happens to hold this session.
+    let sessionEnvelope = null;
 
     // Step 0: Fetch the single-session metadata envelope (#1065).
     //
@@ -114,6 +176,7 @@ export async function loadSession(sessionId, opts) {
     try {
         const session = await getSession(sessionId);
         if (isStale()) return;
+        sessionEnvelope = session || null;
 
         // Inject the active session into `sessions.value` when it is an
         // internal type that the `/sessions` filter excludes. Bypasses
@@ -123,6 +186,41 @@ export async function loadSession(sessionId, opts) {
             && INTERNAL_SESSION_TYPES.has(session.session_type)
             && !sessions.value.some(s => s.id === session.id)) {
             sessions.value = [...sessions.value, session];
+        }
+
+        // Inject an envelope-resolved DM into `crossAgentSessions.value`
+        // when it is not already there (Codex P2 #2 on PR #1193 — the
+        // companion of `resolveSessionMeta`). `resolveSessionMeta` fixes
+        // loadSession's LOCAL DM flag, but two other consumers derive
+        // DM-ness from the shared `activeSession` computed (which reads
+        // `sessions` + `crossAgentSessions`, NOT the envelope):
+        //
+        //   - `app.js` picks `DmConversationView` via the `isDmSession`
+        //     computed — with `activeSession` unresolved, a DM loads into
+        //     the NORMAL chat view.
+        //   - `use-session-stream.js::isDmEvent` keys its primary fast
+        //     path off `activeSession.value?.session_type === 'dm'` —
+        //     unresolved means live DM events can mis-classify during the
+        //     attach race.
+        //
+        // In the envelope-only case (fresh reload / deep-link into a DM
+        // before the sidebar's cross-agent fetch lands, or when that fetch
+        // failed) both would disagree with loadSession's own (correct) DM
+        // flag. Injecting the envelope — which carries `session_type` AND
+        // `participants` (`enrich_session_json` is shared between the list
+        // and single-session endpoints, so the shape matches a list entry
+        // and `dmParticipants` / the header label resolve too) — makes all
+        // three consumers agree.
+        //
+        // Sidebar blast radius: none beyond one legitimate row appearing
+        // early. The id-guard prevents duplicates, and the boot path's
+        // wholesale `crossAgentSessions.value = crossAgent` assignment
+        // supersedes the injected entry when the full list lands (the DM
+        // is in that list anyway).
+        if (session
+            && session.session_type === 'dm'
+            && !crossAgentSessions.value.some(s => s.id === session.id)) {
+            crossAgentSessions.value = [...crossAgentSessions.value, session];
         }
 
         // Populate the breadcrumb pointer from the backend. `parent_session_id`
@@ -202,8 +300,17 @@ export async function loadSession(sessionId, opts) {
         const sessionToolCalls = toolCallData.tool_calls || [];
         // Resolve DM flag early so mapHistoryMessages can annotate
         // merged tool entries with isReasoning for DM sessions.
-        const sessionObj = sessions.value.find(s => s.id === sessionId);
-        isDmSession = sessionObj?.session_type === 'dm';
+        //
+        // MUST go through `resolveSessionMeta` (envelope first, then BOTH
+        // sidebar lists): DM sessions live in `crossAgentSessions`, not the
+        // per-agent `sessions` list, since PR #1010 — a bare
+        // `sessions.value.find(...)` here left this flag permanently false
+        // for DMs, skipping the reasoning-block grouping below (tools
+        // rendered as ungrouped sibling rows after reload) and disabling
+        // the step-3 DM seeding skip (the reload mis-attributed-duplicate
+        // bug). See `resolveSessionMeta` for the full regression story.
+        const sessionMeta = resolveSessionMeta(sessionId, sessionEnvelope);
+        isDmSession = sessionMeta?.session_type === 'dm';
 
         const mapped = mapHistoryMessages(rawMsgs, {
             hasActiveRun: !!activeRunId.value,
@@ -404,9 +511,11 @@ export async function loadSession(sessionId, opts) {
         // `lastEventId` past that mark makes the subsequent SSE replay
         // skip exactly the events already reflected in the rehydrated
         // text, so the live append in the `reasoning_delta` handler does
-        // not double-count. Skipped for DM sessions — those route
-        // reasoning through `dmThinkingBuffers` and a separate
-        // dm_reasoning block layout (out of scope for #1043 / #1077).
+        // not double-count. The SEED half of this block is skipped for DM
+        // sessions — those route reasoning through `dmThinkingBuffers` and
+        // a separate dm_reasoning block layout (out of scope for #1043 /
+        // #1077) — but the terminal-only reconciliation is not; see the
+        // "DM split" note below.
         //
         // Race mitigation: re-check the run status from the listRuns
         // snapshot before seeding. If the run terminated between step 1
@@ -420,7 +529,31 @@ export async function loadSession(sessionId, opts) {
         // event-id handoff is still safe to apply because it only
         // advances the SSE cursor past events the UI no longer needs to
         // replay.
-        if (!isDmSession) {
+        //
+        // ## DM split (Codex P2 on PR #1193)
+        //
+        // The block below is intentionally NOT gated on `!isDmSession` as a
+        // whole. Two different concerns live here and only ONE is DM-scoped:
+        //
+        //   - The in-flight text/reasoning SEED (+ its `last_event_id`
+        //     cursor bumps) stays NON-DM ONLY. Under implicit DM replies
+        //     (#1156) the run's trailing visible text IS the reply,
+        //     delivered as the `dm_message` bubble — seeding it here painted
+        //     a perspective-side duplicate (the #1164 symptom on reload),
+        //     and bumping the cursor would swallow replayable events the DM
+        //     live path still needs.
+        //   - The TERMINAL-ONLY reconciliation (#1133 Layers 3 + 4: the
+        //     suppress-set add, the `activeRunId` clear, and the stray
+        //     thinking-row removal) must run for EVERY session type,
+        //     including DM. A DM run that `listRuns` reported as running
+        //     but which finished before the messages GET sampled its HWM
+        //     has its terminal SSE event swallowed by the replay cursor —
+        //     without this reconciliation the DM view is left with a stuck
+        //     active-run marker and a "Thinking…" row until a manual
+        //     reload. The reconciliation reads only the `terminal` flag /
+        //     `seal_event_id` from the reasoning GET and never touches the
+        //     seed surfaces, so it is safe for the DM layout.
+        {
             // Capture the active run-id once. Layer 4 (#1133) may null
             // `activeRunId.value` mid-block when the reasoning GET reports a
             // terminal run, so the GETs below and the dedupe-set add must read
@@ -443,6 +576,14 @@ export async function loadSession(sessionId, opts) {
                 // and would false-positive on a live run. The suppress-set add
                 // (Layer 3) additionally gates on `seal_event_id` history
                 // coverage — see the sub-race A/B note below.
+                //
+                // Runs for DM sessions too — see the "DM split" note above.
+                // For DM the Layer-3 add is defence-in-depth: the stream's
+                // DM delta branch never consults the set, but a replayed
+                // delta that falls through to the non-DM path during the
+                // attach race (activeSession unresolved, `peerRunIds` empty
+                // on a fresh load) is correctly dropped by it instead of
+                // spawning a spurious unsealed bubble.
                 if (reasoningData?.terminal === true) {
                     // Layer 3 (gated on history coverage — #1133 Codex #3 /
                     // sub-race B). This run's reasoning is sealed onto the
@@ -499,29 +640,41 @@ export async function loadSession(sessionId, opts) {
                         m => !(m.type === 'thinking' && m.runId === reasoningRunId)
                     );
                 }
-                if (runStillLive && reasoningData?.text) {
-                    appendMessage({
-                        id: nextMsgId(),
-                        type: 'agent',
-                        role: 'assistant',
-                        text: '',
-                        reasoning: reasoningData.text,
-                        sealed: false,
-                        ts: new Date().toISOString(),
-                    });
-                }
-                if (reasoningData?.last_event_id != null
-                    && (lastEventId == null || reasoningData.last_event_id > lastEventId)) {
-                    lastEventId = reasoningData.last_event_id;
+                // In-flight reasoning seed + cursor bump — NON-DM ONLY (see
+                // the "DM split" note above): the DM layout routes live
+                // reasoning through `dmThinkingBuffers` into the
+                // `dm_reasoning` collapsible, never a chat-pane bubble.
+                if (!isDmSession) {
+                    if (runStillLive && reasoningData?.text) {
+                        appendMessage({
+                            id: nextMsgId(),
+                            type: 'agent',
+                            role: 'assistant',
+                            text: '',
+                            reasoning: reasoningData.text,
+                            sealed: false,
+                            ts: new Date().toISOString(),
+                        });
+                    }
+                    if (reasoningData?.last_event_id != null
+                        && (lastEventId == null || reasoningData.last_event_id > lastEventId)) {
+                        lastEventId = reasoningData.last_event_id;
+                    }
                 }
             } catch (err) {
                 console.warn(`[${logPrefix}] Failed to load in-flight reasoning:`, err);
             }
 
             // Rehydrate the in-flight turn's visible assistant reply text
-            // (#1107). Exact analog of the reasoning rehydration block
-            // above; same MUST-be-last placement and same DM-session
-            // gate. The dedicated endpoint returns the concatenation of
+            // (#1107). Exact analog of the reasoning SEED above; same
+            // MUST-be-last placement, and NON-DM ONLY as a whole — unlike
+            // the reasoning GET, this endpoint serves no terminal-
+            // reconciliation purpose (the `terminal` flag + `seal_event_id`
+            // come from the reasoning GET), so for DM sessions it is
+            // skipped entirely: its only outputs are the seed (the partial
+            // implicit reply — the #1164 duplicate) and a cursor bump the
+            // DM live path must not take.
+            // The dedicated endpoint returns the concatenation of
             // `token_delta` text for the CURRENT TURN ONLY — deltas
             // belonging to already-sealed prior turns are dropped by the
             // backend buffer's per-turn boundary (cleared on parent-agent
@@ -549,32 +702,34 @@ export async function loadSession(sessionId, opts) {
             // an additional unsealed entry would render the text twice
             // until `run_finished` arrives. Skip the seed in that case.
             // The `last_event_id` handoff is still safe to apply.
-            try {
-                const textData = await getRunText(reasoningRunId);
-                if (isStale()) return;
-                if (runStillLive && textData?.text) {
-                    const merged = updateMessage(
-                        m => m.type === 'agent' && !m.sealed,
-                        m => ({ ...m, text: (m.text || '') + textData.text }),
-                    );
-                    if (!merged) {
-                        appendMessage({
-                            id: nextMsgId(),
-                            type: 'agent',
-                            role: 'assistant',
-                            text: textData.text,
-                            reasoning: '',
-                            sealed: false,
-                            ts: new Date().toISOString(),
-                        });
+            if (!isDmSession) {
+                try {
+                    const textData = await getRunText(reasoningRunId);
+                    if (isStale()) return;
+                    if (runStillLive && textData?.text) {
+                        const merged = updateMessage(
+                            m => m.type === 'agent' && !m.sealed,
+                            m => ({ ...m, text: (m.text || '') + textData.text }),
+                        );
+                        if (!merged) {
+                            appendMessage({
+                                id: nextMsgId(),
+                                type: 'agent',
+                                role: 'assistant',
+                                text: textData.text,
+                                reasoning: '',
+                                sealed: false,
+                                ts: new Date().toISOString(),
+                            });
+                        }
                     }
+                    if (textData?.last_event_id != null
+                        && (lastEventId == null || textData.last_event_id > lastEventId)) {
+                        lastEventId = textData.last_event_id;
+                    }
+                } catch (err) {
+                    console.warn(`[${logPrefix}] Failed to load in-flight text:`, err);
                 }
-                if (textData?.last_event_id != null
-                    && (lastEventId == null || textData.last_event_id > lastEventId)) {
-                    lastEventId = textData.last_event_id;
-                }
-            } catch (err) {
-                console.warn(`[${logPrefix}] Failed to load in-flight text:`, err);
             }
         }
     }
@@ -621,7 +776,14 @@ export async function loadSession(sessionId, opts) {
         const isQueued = activeRun && activeRun.status === 'queued';
 
         if (!isQueued) {
-            const session = sessions.value.find(s => s.id === sessionId);
+            // Same `resolveSessionMeta` contract as the step-2 DM flag: a DM
+            // session is only present in `crossAgentSessions` (PR #1010), so
+            // the previous bare `sessions.value.find(...)` never matched and
+            // a running DM reloaded into the generic "Thinking…" header
+            // instead of "Chatting with {peer}…". The envelope also carries
+            // `participants` for DM sessions, so the peer derivation works
+            // even when neither sidebar list has resolved yet.
+            const session = resolveSessionMeta(sessionId, sessionEnvelope);
             if (session && session.session_type === 'dm' && Array.isArray(session.participants)) {
                 // DM session: derive the peer name by finding the participant
                 // that is NOT the active agent, then set the DM context so
