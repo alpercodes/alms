@@ -86,11 +86,26 @@ function loadRealSubagentsAsTempFile() {
             + 'update subagent-status-bar.test.mjs if the import shape changed.'
         );
     }
+    // The cancel-confirm lifecycle hooks (Codex P2, PR #1192) are exercised
+    // end-to-end by subagent-cancel.test.mjs; this suite stubs them as
+    // no-ops so the module loads without pulling in api/sessions.js.
+    const cancelImportRe =
+        /^import\s+\{\s*clearCancelConfirmForSession\s*,\s*dismissSubagentCancel\s*\}\s+from\s+['"][^'"]+['"];?\s*$/m;
+    if (!cancelImportRe.test(src)) {
+        throw new Error(
+            'subagents.js: expected a top-level `import { clearCancelConfirmForSession, '
+            + 'dismissSubagentCancel } from ...` line — '
+            + 'update subagent-status-bar.test.mjs if the import shape changed.'
+        );
+    }
 
     const stubbed = src
         .replace(signalImportRe, SIGNAL_STUB)
         .replace(sessionsImportRe,
-            'const activeSessionId = { get value() { return null; }, set value(_) {} };');
+            'const activeSessionId = { get value() { return null; }, set value(_) {} };')
+        .replace(cancelImportRe,
+            'const clearCancelConfirmForSession = () => {};\n'
+            + 'const dismissSubagentCancel = () => {};');
 
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'alms-sb-real-'));
     const tmpFile = path.join(tmpDir, 'subagents.mjs');

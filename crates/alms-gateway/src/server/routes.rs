@@ -13,8 +13,9 @@ use crate::auth::SSE_ENDPOINT_SEGMENTS;
 use crate::auth_keys;
 use crate::jobs::{cancel_job, create_job, get_job, list_jobs};
 use crate::runs::{
-    cancel_dm, cancel_run, classify_session_type, create_run, get_run_reasoning, get_run_status,
-    get_run_text, get_run_tool_calls, is_internal_context_id, list_runs, stream_run_events,
+    cancel_dm, cancel_run, cancel_subagent, classify_session_type, create_run, get_run_reasoning,
+    get_run_status, get_run_text, get_run_tool_calls, is_internal_context_id, list_runs,
+    stream_run_events,
 };
 use crate::settings::{get_settings, patch_settings};
 use crate::workspace::{get_workspace, open_workspace, update_workspace_file};
@@ -187,6 +188,13 @@ pub(crate) fn protected_router() -> Router<AppState> {
             get(get_session_tool_calls),
         )
         .route("/sessions/{session_id}/cancel-dm", post(cancel_dm))
+        // Session-keyed subagent cancel: the UI knows a subagent's session
+        // id (chips / drill-down view) but not its run id, and subagent runs
+        // have no cancel token in the RunManager — see `cancel_subagent`.
+        .route(
+            "/sessions/{session_id}/subagent/cancel",
+            post(cancel_subagent),
+        )
         .route("/sessions/{agent_id}/{context_id}", get(get_session))
         // Runs (canonical API per spec)
         .route("/runs", get(list_runs).post(create_run))

@@ -209,6 +209,17 @@ pub struct SubagentHandle {
     pub status: TaskStatus,
     pub started_at: chrono::DateTime<chrono::Utc>,
     pub cancel_tx: oneshot::Sender<()>,
+    /// The subagent's own cancellation token — the same child token
+    /// `run_subagent`'s `select!` waits on. Derived in `spawn_subagent`
+    /// (from the parent run's token when present) so it exists before the
+    /// subagent task starts. Firing it cancels JUST this subagent through
+    /// the exact same path as a parent-run cancel cascade, so all terminal
+    /// bookkeeping (status flip, run record update, `run_cancelled` on the
+    /// subagent's own session, `subagent_completed` notification for
+    /// background subagents) runs unchanged. Powers
+    /// [`Coordinator::cancel_subagent_by_session`] / the gateway's
+    /// `POST /sessions/{id}/subagent/cancel` endpoint.
+    pub cancel_token: CancellationToken,
     pub parent_run_id: Option<RunId>,
     pub parent_session_id: SessionId,
     pub parent_agent_id: AgentId,
@@ -499,6 +510,44 @@ impl Coordinator {
             .get_or_create(sub_agent_id, &sub_context_id)
             .id;
 
+        // Derive the subagent's cancellation token HERE (not inside
+        // `run_subagent`) so it can be stored on the handle before the
+        // subagent task starts: `cancel_subagent_by_session` must be able
+        // to cancel a subagent that is still in its Pending window. When a
+        // parent run token exists this is a child token, so the parent-run
+        // cancel cascade is preserved exactly; a user cancel via the handle
+        // fires the same token the `select!` in `run_subagent` waits on.
+        let child_cancel_token = parent_cancel_token
+            .as_ref()
+            .map(|p| p.child_token())
+            .unwrap_or_default();
+
+        // The handle is created and inserted BEFORE `subagent_started` is
+        // emitted below (Tim S2, PR #1192): the moment the UI learns the
+        // subagent's session id, a session-keyed cancel must find a live
+        // handle — emitting first would open a window where an immediate
+        // cancel click 404s spuriously because the handle isn't in the map
+        // yet.
+        let handle = SubagentHandle {
+            task_id,
+            status: TaskStatus::Pending,
+            started_at: chrono::Utc::now(),
+            cancel_tx,
+            cancel_token: child_cancel_token.clone(),
+            parent_run_id,
+            parent_session_id,
+            parent_agent_id,
+            subagent_session_id: sub_session_id,
+            is_background,
+            label: subagent_label(task_id, request.subagent_name.as_deref()),
+            latest_activity: None,
+            result_rx: Some(result_rx),
+            completed_result: None,
+            error_rx: Some(error_rx),
+        };
+
+        self.subagents.insert(task_id, handle);
+
         // #1105: emit `subagent_started` onto the parent's event stream
         // the moment we know the subagent's session id, so the UI's
         // SubagentBar can render the "View session" button live during
@@ -510,7 +559,9 @@ impl Coordinator {
         //      onto `runtime_tx` by the agent loop before
         //      `tool.execute()` ran;
         //   2. `subagent_started` -- queued here, AFTER step 1 by
-        //      FIFO of `runtime_tx`;
+        //      FIFO of `runtime_tx`, and AFTER the cancellable handle
+        //      was inserted into `subagents` above (Tim S2, PR #1192 —
+        //      "UI knows the session id ⇒ handle exists");
         //   3. nested `tool_start` events from inside the subagent --
         //      can only fire once the spawned subagent task below
         //      begins its agent loop, which happens after this point.
@@ -537,25 +588,6 @@ impl Coordinator {
                 is_background,
             );
         }
-
-        let handle = SubagentHandle {
-            task_id,
-            status: TaskStatus::Pending,
-            started_at: chrono::Utc::now(),
-            cancel_tx,
-            parent_run_id,
-            parent_session_id,
-            parent_agent_id,
-            subagent_session_id: sub_session_id,
-            is_background,
-            label: subagent_label(task_id, request.subagent_name.as_deref()),
-            latest_activity: None,
-            result_rx: Some(result_rx),
-            completed_result: None,
-            error_rx: Some(error_rx),
-        };
-
-        self.subagents.insert(task_id, handle);
 
         info!(
             target: "coordinator::subagent_spawned",
@@ -612,7 +644,7 @@ impl Coordinator {
                     project_root,
                     subagent_prompts,
                     completion_tx,
-                    parent_cancel_token,
+                    child_cancel_token,
                     secrets,
                     run_registrar,
                     subagent_self_sink,
@@ -684,6 +716,55 @@ impl Coordinator {
                     })
             })
             .collect()
+    }
+
+    /// Cancel the live subagent running on the given SUBAGENT session.
+    ///
+    /// Session-keyed cancel surface for the gateway's
+    /// `POST /sessions/{session_id}/subagent/cancel` endpoint: the UI's
+    /// subagent chips / subagent-session view know the subagent's session id
+    /// (it is carried by `subagent_started`, the `invoke_agent` result and
+    /// the reload-rehydration path) but not its run id, and the subagent's
+    /// own run id has no entry in the gateway's `cancel_tokens` map — so
+    /// run-keyed `POST /runs/{id}/cancel` cannot cancel a subagent directly.
+    ///
+    /// Fires the handle's [`SubagentHandle::cancel_token`] — the same child
+    /// token `run_subagent`'s `select!` waits on — so cancellation flows
+    /// through the exact same path as a parent-run cancel cascade: the
+    /// handle stays in the map and `run_subagent`'s terminal arm performs
+    /// ALL the usual bookkeeping (status → `Cancelled`, run record update
+    /// via the registrar, `run_cancelled` on the subagent's own session
+    /// stream, and — for background subagents — the `subagent_completed`
+    /// completion notification that renders the parent's chip as
+    /// *Cancelled*).
+    ///
+    /// Only Pending/Running handles match: a session id is reused across
+    /// invocations of a NAMED subagent, but at most one live invocation per
+    /// session exists at a time (`active_named` rejects concurrent
+    /// same-named spawns; unnamed subagents get a fresh session per
+    /// dispatch), so the first live match is the only live match.
+    ///
+    /// Returns `true` when a live subagent was found and its token fired;
+    /// `false` when no live subagent exists for that session (unknown
+    /// session, or the subagent already reached a terminal state). Callers
+    /// map `false` to an HTTP 404.
+    pub fn cancel_subagent_by_session(&self, subagent_session_id: SessionId) -> bool {
+        for entry in self.subagents.iter() {
+            let h = entry.value();
+            if h.subagent_session_id == subagent_session_id
+                && matches!(h.status, TaskStatus::Pending | TaskStatus::Running)
+            {
+                h.cancel_token.cancel();
+                info!(
+                    target: "coordinator::subagent_cancelled_by_session",
+                    task_id = %h.task_id.0,
+                    subagent_session = %subagent_session_id.0,
+                    "Subagent cancellation requested by session id"
+                );
+                return true;
+            }
+        }
+        false
     }
 }
 
@@ -836,6 +917,30 @@ impl Drop for NamedSubagentGuard {
 // Internal subagent runner
 // ---------------------------------------------------------------------------
 
+/// Classify an agent-loop error from `run_subagent`'s run branch into the
+/// task status it must surface as.
+///
+/// `AlmsError::Cancelled` / `AlmsError::CancelledWithToolCalls` are produced
+/// exclusively by the loop observing ITS OWN `CancellationToken` at a
+/// checkpoint (`loop_impl.rs` — iteration boundary, LLM call, tool
+/// execution, approval wait; `agent/mod.rs` wraps the partial-tool-calls
+/// variant) — and the token the subagent's loop holds is exactly
+/// `child_cancel_token`. So a loop error of these variants IS a cancel of
+/// this subagent and must be labelled `TaskStatus::Cancelled`, identically
+/// to the `select!`'s token arm. This makes the cancel labelling
+/// independent of which arm observes the fired token first (Tim, PR #1192
+/// review — the `biased` select alone left a vanishingly-narrow
+/// multi-threaded window where the run branch could win with
+/// `Err(Cancelled)` and mislabel the user cancel as `Failed`).
+///
+/// Every other error is a genuine failure.
+fn subagent_error_status(e: &AlmsError) -> TaskStatus {
+    match e {
+        AlmsError::Cancelled | AlmsError::CancelledWithToolCalls { .. } => TaskStatus::Cancelled,
+        _ => TaskStatus::Failed,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_subagent(
     task_id: TaskId,
@@ -868,7 +973,10 @@ async fn run_subagent(
     project_root: Option<std::path::PathBuf>,
     subagent_prompts: Arc<DashMap<String, String>>,
     completion_tx: Option<mpsc::UnboundedSender<SubagentCompletion>>,
-    parent_cancel_token: Option<CancellationToken>,
+    // The subagent's own cancellation token, derived by `spawn_subagent`
+    // (child of the parent run's token when present) and shared with the
+    // `SubagentHandle` so `cancel_subagent_by_session` can fire it.
+    child_cancel_token: CancellationToken,
     secrets: Option<Arc<parking_lot::RwLock<alms_core::secrets::SecretsStore>>>,
     run_registrar: Option<Arc<dyn RunRegistrar>>,
     subagent_self_sink: Option<Arc<dyn SubagentSelfEventSink>>,
@@ -899,15 +1007,14 @@ async fn run_subagent(
         "Subagent execution started"
     );
 
-    // Create a child cancellation token that fires when EITHER:
-    //   1. The parent run's CancellationToken is cancelled, OR
-    //   2. The explicit `cancel_subagent()` oneshot fires.
-    // This unifies both cancellation paths into a single token that
+    // `child_cancel_token` (derived in `spawn_subagent`, shared with the
+    // SubagentHandle) fires when ANY of:
+    //   1. The parent run's CancellationToken is cancelled (it is a child
+    //      token of the parent's when one exists), OR
+    //   2. `cancel_subagent_by_session()` fires the handle's stored clone, OR
+    //   3. The explicit `cancel_subagent()` oneshot fires (bridged below).
+    // This unifies all cancellation paths into a single token that
     // gets attached to the subagent's AgentRuntime.
-    let child_cancel_token = parent_cancel_token
-        .as_ref()
-        .map(|p| p.child_token())
-        .unwrap_or_default();
 
     // Bridge the oneshot cancel_rx to the child token: when cancel_subagent()
     // sends on the oneshot, we cancel the child token.
@@ -976,11 +1083,24 @@ async fn run_subagent(
     // completion arms remain.
     //
     // #920: the completion arm also returns the structured `AlmsError` (when
-    // the agent loop produced one) so the caller can forward it down the
-    // typed-error oneshot. A cancellation has no underlying `AlmsError` and
-    // uses `None` here — `dispatch()` falls back to the JSON path for it,
-    // exactly as before.
+    // the agent loop produced a FAILURE) so the caller can forward it down
+    // the typed-error oneshot. A cancellation has no typed error and uses
+    // `None` — `dispatch()` falls back to the JSON path for it — regardless
+    // of which arm observed it (the token arm, or the run branch returning
+    // the loop's own `Err(Cancelled)` / `Err(CancelledWithToolCalls)` from
+    // a checkpoint, which `subagent_error_status` classifies as `Cancelled`
+    // rather than `Failed` so the labelling is poll-order-independent).
     let (new_status, result_value, tokens_used, run_output, typed_error) = tokio::select! {
+        // `biased`: poll the cancellation arm FIRST on every wake instead of
+        // in random order, so a cancel requested before (or at) the poll
+        // takes the cheap token arm without running the loop at all. This
+        // is a fast path, not the correctness mechanism: even when the run
+        // branch wins the both-ready race (or the loop observes the token
+        // at one of its own checkpoints mid-run), the `Err` handler below
+        // classifies the loop's `Cancelled` / `CancelledWithToolCalls`
+        // errors as `TaskStatus::Cancelled`, so a user cancel is never
+        // mislabelled as a failure in either order.
+        biased;
         _ = child_cancel_token.cancelled() => {
             info!(
                 target: "subagent::cancelled",
@@ -1005,6 +1125,27 @@ async fn run_subagent(
                         serde_json::json!({"response": run_output.response}),
                         Some(tokens),
                         Some(run_output),
+                        None,
+                    )
+                }
+                Err(e) if subagent_error_status(&e) == TaskStatus::Cancelled => {
+                    // The loop observed the fired token at one of its own
+                    // checkpoints before the token arm above was polled.
+                    // Same outcome shape as the token arm: this is a user
+                    // cancel, not a failure — no typed error (matching the
+                    // token arm's contract; `dispatch()` maps Cancelled to
+                    // its dedicated "Subagent was cancelled" error without
+                    // consulting the typed channel).
+                    info!(
+                        target: "subagent::cancelled",
+                        task_id = %task_id.0,
+                        "Subagent cancelled (observed at a loop checkpoint)"
+                    );
+                    (
+                        TaskStatus::Cancelled,
+                        serde_json::json!({"cancelled": true}),
+                        None,
+                        None,
                         None,
                     )
                 }
@@ -3006,6 +3147,7 @@ mod tests {
                 status,
                 started_at: chrono::Utc::now(),
                 cancel_tx,
+                cancel_token: CancellationToken::new(),
                 parent_run_id: None,
                 parent_session_id: session,
                 parent_agent_id: parent_agent,
@@ -3341,6 +3483,248 @@ mod tests {
         assert!(
             coord.get_status(task_id).is_none(),
             "Handle should be removed after cancel"
+        );
+    }
+
+    // -- (d2) cancel_subagent_by_session — session-keyed user cancel -----------
+    //
+    // The production cancel surface behind `POST /sessions/{id}/subagent/
+    // cancel`. The mock LLM completes synchronously, so instead of racing a
+    // real spawn these tests insert a synthetic handle directly (the tests
+    // module can reach the private `subagents` map) and assert on the
+    // token, which is deterministic. The handle must NOT be removed — the
+    // spawned `run_subagent` task owns the terminal bookkeeping (status
+    // flip, completion notification) and needs the handle to do it.
+
+    /// Build a synthetic SubagentHandle for cancel-by-session tests.
+    /// Returns the handle plus a clone of its cancellation token so the
+    /// test can observe whether `cancel_subagent_by_session` fired it.
+    fn synthetic_handle(
+        task_id: TaskId,
+        subagent_session_id: SessionId,
+        status: TaskStatus,
+    ) -> (SubagentHandle, CancellationToken) {
+        let (cancel_tx, _cancel_rx) = oneshot::channel();
+        let token = CancellationToken::new();
+        let handle = SubagentHandle {
+            task_id,
+            status,
+            started_at: chrono::Utc::now(),
+            cancel_tx,
+            cancel_token: token.clone(),
+            parent_run_id: None,
+            parent_session_id: SessionId::new(),
+            parent_agent_id: AgentId::new(),
+            subagent_session_id,
+            is_background: true,
+            label: format!("subagent-{}", &task_id.0.to_string()[..8]),
+            latest_activity: None,
+            result_rx: None,
+            completed_result: None,
+            error_rx: None,
+        };
+        (handle, token)
+    }
+
+    #[tokio::test]
+    async fn test_cancel_by_session_fires_live_token_and_keeps_handle() {
+        let coord = test_coordinator();
+        let task_id = TaskId::new();
+        let sub_session = SessionId::new();
+        let (handle, token) = synthetic_handle(task_id, sub_session, TaskStatus::Running);
+        coord.subagents.insert(task_id, handle);
+
+        assert!(
+            coord.cancel_subagent_by_session(sub_session),
+            "cancel_subagent_by_session must report true for a live subagent"
+        );
+        assert!(
+            token.is_cancelled(),
+            "the handle's cancellation token must be fired"
+        );
+        // The handle must remain in the map: run_subagent's terminal arm
+        // needs it to flip status and emit the completion notification
+        // (removing it would silently drop the `subagent_completed` /
+        // 'cancelled' path the UI chip relies on).
+        assert!(
+            coord.get_status(task_id).is_some(),
+            "the handle must NOT be removed by a session-keyed cancel"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cancel_by_session_pending_handle_is_cancellable() {
+        // A subagent can be cancelled during its Pending window (spawned,
+        // `run_subagent` not yet marked it Running) — the token exists from
+        // `spawn_subagent` time precisely for this.
+        let coord = test_coordinator();
+        let task_id = TaskId::new();
+        let sub_session = SessionId::new();
+        let (handle, token) = synthetic_handle(task_id, sub_session, TaskStatus::Pending);
+        coord.subagents.insert(task_id, handle);
+
+        assert!(coord.cancel_subagent_by_session(sub_session));
+        assert!(token.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn test_cancel_by_session_unknown_session_returns_false() {
+        let coord = test_coordinator();
+        assert!(
+            !coord.cancel_subagent_by_session(SessionId::new()),
+            "an unknown session must report false (mapped to HTTP 404)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cancel_by_session_terminal_handle_returns_false() {
+        // A terminal handle for the session must not match: named subagents
+        // reuse the session across invocations, and firing a finished
+        // invocation's token would be a no-op at best and misleading (200
+        // for a cancel that cancelled nothing) at worst.
+        let coord = test_coordinator();
+        let task_id = TaskId::new();
+        let sub_session = SessionId::new();
+        let (handle, token) = synthetic_handle(task_id, sub_session, TaskStatus::Completed);
+        coord.subagents.insert(task_id, handle);
+
+        assert!(
+            !coord.cancel_subagent_by_session(sub_session),
+            "a terminal subagent must report false"
+        );
+        assert!(
+            !token.is_cancelled(),
+            "a terminal handle's token must not be fired"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cancel_by_session_after_real_completion_returns_false() {
+        // End-to-end variant of the terminal case: a REAL spawn against the
+        // mock LLM, awaited to completion (status flips before the result
+        // is delivered, so this is deterministic), then a session-keyed
+        // cancel must find no live subagent.
+        let coord = test_coordinator();
+        let request = SubagentRequest {
+            task: "Complete then try to cancel".to_string(),
+            parent_session: test_session_id(),
+            parent_agent_id: test_parent_agent_id(),
+            parent_run_id: None,
+            subagent_name: None,
+            parent_tool_invocation_id: None,
+        };
+        let (task_id, sub_session_id) = coord
+            .spawn_subagent(request, None, false, None)
+            .await
+            .unwrap();
+        let result_rx = coord.take_result_rx(task_id).unwrap();
+        let task_result = result_rx.await.expect("should receive result");
+        assert_eq!(task_result.status, TaskStatus::Completed);
+
+        assert!(
+            !coord.cancel_subagent_by_session(sub_session_id),
+            "a completed subagent's session must report false"
+        );
+    }
+
+    // -- (d3) cancel labelling is poll-order-independent (Tim S1, PR #1192) -----
+    //
+    // `run_subagent`'s run branch can observe a fired token BEFORE the
+    // select's token arm does (the loop's own checkpoints return
+    // `Err(Cancelled)` / `Err(CancelledWithToolCalls)`). Those variants are
+    // produced exclusively by token observation, so the Err handler must
+    // label them `Cancelled`, not `Failed` — otherwise a user cancel's
+    // label would depend on which arm won the race.
+
+    #[test]
+    fn test_subagent_error_status_classifies_cancellation_variants() {
+        assert_eq!(
+            subagent_error_status(&AlmsError::Cancelled),
+            TaskStatus::Cancelled,
+            "a loop-checkpoint Cancelled must label the task Cancelled"
+        );
+        assert_eq!(
+            subagent_error_status(&AlmsError::CancelledWithToolCalls { tool_calls: vec![] }),
+            TaskStatus::Cancelled,
+            "a mid-batch cancel (partial tool calls preserved) is still a cancel"
+        );
+        assert_eq!(
+            subagent_error_status(&AlmsError::Runtime("boom".to_string())),
+            TaskStatus::Failed,
+            "a genuine runtime failure must stay Failed"
+        );
+        assert_eq!(
+            subagent_error_status(&AlmsError::AgentNotFound("x".to_string())),
+            TaskStatus::Failed,
+            "non-cancellation errors must stay Failed"
+        );
+    }
+
+    /// A token that is already fired when the LOOP runs (bypassing
+    /// `run_subagent`'s select entirely by calling `run_agent_loop`
+    /// directly) surfaces as exactly the cancellation variants
+    /// `subagent_error_status` classifies — together the two pin the
+    /// end-to-end property "a token-fired cancel observed by the loop
+    /// yields `TaskStatus::Cancelled`", without racing the instant mock
+    /// LLM mid-run.
+    #[tokio::test]
+    async fn test_loop_observed_cancel_yields_cancelled_status() {
+        let session_manager = Arc::new(SessionManager::new(alms_session::SessionConfig::default()));
+        let llm = LlmClient::new(LlmConfig {
+            mock: true,
+            ..LlmConfig::default()
+        })
+        .unwrap();
+        let task_id = TaskId::new();
+        let request = SubagentRequest {
+            task: "cancelled before the loop starts".to_string(),
+            parent_session: test_session_id(),
+            parent_agent_id: test_parent_agent_id(),
+            parent_run_id: None,
+            subagent_name: None,
+            parent_tool_invocation_id: None,
+        };
+        let (sub_agent_id, sub_context_id) = derive_subagent_identity(task_id, &request);
+        let cancel_token = CancellationToken::new();
+        cancel_token.cancel();
+        let prompts = DashMap::new();
+
+        let result = run_agent_loop(
+            task_id,
+            &request,
+            sub_agent_id,
+            &sub_context_id,
+            &session_manager,
+            &llm,
+            None,
+            None,
+            &AgentConfig::default(),
+            None,
+            None,
+            None,
+            &prompts,
+            cancel_token,
+            None,
+            &alms_core::config::SecurityConfig::default(),
+            false,
+            Arc::new(DashMap::new()),
+        )
+        .await;
+
+        let err = result.expect_err("a pre-cancelled token must abort the loop");
+        assert!(
+            matches!(
+                err,
+                AlmsError::Cancelled | AlmsError::CancelledWithToolCalls { .. }
+            ),
+            "the loop's cancellation checkpoints must surface the token as a \
+             Cancelled-class error (got {err:?}) — these are the variants \
+             `subagent_error_status` maps to TaskStatus::Cancelled"
+        );
+        assert_eq!(
+            subagent_error_status(&err),
+            TaskStatus::Cancelled,
+            "run_subagent's Err handler must label this outcome Cancelled, not Failed"
         );
     }
 

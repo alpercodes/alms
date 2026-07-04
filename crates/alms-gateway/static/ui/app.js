@@ -15,9 +15,11 @@ import { PanelContainer } from './components/panel/index.js';
 import { SettingsModal } from './components/settings-modal.js';
 import { OnboardingView } from './components/onboarding.js';
 import { agents, activeAgent } from './state/agents.js';
-import { isDmSession, isNotificationSession, isInternalSession, activeSession } from './state/sessions.js';
+import { isDmSession, isNotificationSession, isInternalSession, activeSession, activeSessionId } from './state/sessions.js';
 import { SubagentBar } from './components/chat/subagent-bar.js';
 import { parentSessionId, navigateToParentSession } from './state/subagents.js';
+import { activeRunId } from './state/runs.js';
+import { isCancelPending, requestSubagentCancel, dismissSubagentCancel, confirmSubagentCancel } from './state/subagent-cancel.js';
 import { DM_END_REASON_LABELS } from './utils/constants.js';
 import { AgentHeaderBar } from './components/chat/agent-header-bar.js';
 import { DmConversationView } from './components/chat/dm-conversation-view.js';
@@ -143,6 +145,28 @@ function ChatView() {
                     <button class="sa-breadcrumb-btn" onClick=${() => navigateToParentSession()}>
                         \u2190 Back to parent session
                     </button>
+                    ${activeRunId.value && (isCancelPending(activeSessionId.value)
+                        ? html`
+                            <span class="sa-cancel-confirm-group sa-breadcrumb-cancel" role="group"
+                                  aria-label="Confirm cancel subagent"
+                                  onKeyDown=${(e) => { if (e.key === 'Escape') { e.preventDefault(); dismissSubagentCancel(); } }}>
+                                <span class="sa-cancel-confirm-label">Cancel this subagent?</span>
+                                <button class="sa-confirm-btn sa-confirm-yes"
+                                        title="Yes, cancel this subagent"
+                                        onClick=${() => confirmSubagentCancel(activeSessionId.value)}>Yes</button>
+                                <button class="sa-confirm-btn sa-confirm-no"
+                                        title="No, keep it running"
+                                        onClick=${() => dismissSubagentCancel()}>No</button>
+                            </span>
+                        `
+                        : html`
+                            <button class="sa-breadcrumb-cancel-btn sa-breadcrumb-cancel"
+                                    title="Cancel this subagent"
+                                    onClick=${() => requestSubagentCancel(activeSessionId.value)}>
+                                Cancel subagent
+                            </button>
+                        `
+                    )}
                 </div>
             `}
             <div id="messages" role="log" aria-live="polite" ref=${messagesRef}>

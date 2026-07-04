@@ -86,13 +86,29 @@ async function loadSubagentsModule() {
         );
     }
 
+    // The cancel-confirm lifecycle hooks (Codex P2, PR #1192) are exercised
+    // end-to-end by subagent-cancel.test.mjs; these rehydration tests stub
+    // them as no-ops so the module loads without pulling in api/sessions.js.
+    const cancelImportRe =
+        /^import\s+\{\s*clearCancelConfirmForSession\s*,\s*dismissSubagentCancel\s*\}\s+from\s+['"][^'"]+['"];?\s*$/m;
+    if (!cancelImportRe.test(src)) {
+        throw new Error(
+            'subagents.js: expected a top-level `import { clearCancelConfirmForSession, '
+            + 'dismissSubagentCancel } from ...` line — test rewrite would not apply. '
+            + 'Update subagents-rehydrate.test.mjs if the import shape changed.'
+        );
+    }
+
     const stubbed = src
         .replace(signalImportRe, SIGNAL_STUB)
         // `activeSessionId` is only read inside `doSessionSwitch`, which
         // is itself only called from the navigation helpers and is not
         // exercised by these tests. Stubbing with a dummy signal keeps
         // the module load self-contained.
-        .replace(sessionsImportRe, 'const activeSessionId = { get value() { return null; }, set value(_) {} };');
+        .replace(sessionsImportRe, 'const activeSessionId = { get value() { return null; }, set value(_) {} };')
+        .replace(cancelImportRe,
+            'const clearCancelConfirmForSession = () => {};\n'
+            + 'const dismissSubagentCancel = () => {};');
 
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'alms-subagents-test-'));
     const tmpFile = path.join(tmpDir, 'subagents.mjs');

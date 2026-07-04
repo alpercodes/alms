@@ -47,3 +47,18 @@ export const getSessionToolCalls = (sessionId) =>
  */
 export const cancelDm = (sessionId) =>
     post(`/sessions/${sessionId}/cancel-dm`);
+
+/**
+ * Cancel the live subagent running on the given SUBAGENT session.
+ *
+ * Session-keyed (not run-keyed) on purpose: the subagent chips and the
+ * drilled-down subagent view know the subagent's session id, not its run
+ * id — and subagent runs are not cancellable via POST /runs/{id}/cancel
+ * anyway (no cancel token is registered for them server-side).
+ *
+ * Returns { session_id, status: 'cancelling' } on success; rejects with
+ * { status: 404, error: { code: 'NO_LIVE_SUBAGENT' } } when the session
+ * has no live subagent (already finished, or unknown).
+ */
+export const cancelSubagent = (sessionId) =>
+    post(`/sessions/${sessionId}/subagent/cancel`);

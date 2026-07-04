@@ -661,6 +661,58 @@ pub async fn cancel_run(
     })))
 }
 
+/// POST /sessions/{session_id}/subagent/cancel — cancel the live subagent
+/// running on the given SUBAGENT session.
+///
+/// Session-keyed on purpose: the UI's subagent surfaces (the status-bar
+/// chips and the drilled-down subagent session view) carry the subagent's
+/// SESSION id (via `subagent_started`, the `invoke_agent` result and the
+/// reload-rehydration path) but not its run id — and the subagent's own run
+/// id has no entry in `RunManager::cancel_tokens` anyway (`register_run`
+/// via the `RunRegistrar` trait only inserts the run record), so run-keyed
+/// `POST /runs/{run_id}/cancel` returns 409 for subagent runs without
+/// cancelling anything. This endpoint goes through the coordinator's
+/// `SubagentHandle` instead, firing the same child cancellation token the
+/// subagent's `select!` waits on.
+///
+/// Everything downstream is the EXISTING cancellation path: the
+/// coordinator's terminal arm flips the task to `Cancelled`, updates the
+/// run record, seals the subagent's own session with `run_cancelled`, and
+/// (for background subagents) emits the `subagent_completed` notification
+/// with status `cancelled` that renders the parent's status-bar chip as
+/// *Cancelled*. Note the foreground asymmetry: cancelling a FOREGROUND
+/// subagent makes the parent's blocked `invoke_agent` call return an error
+/// (`"Subagent was cancelled"`), so the parent continues with a failed tool
+/// call and its chip renders *Failed* rather than *Cancelled* — the parent
+/// run itself is NOT cancelled either way.
+///
+/// Returns 200 `{"status":"cancelling"}` when a live subagent was found and
+/// its token fired (cancellation completes asynchronously — the terminal
+/// events above follow on the streams), or 404 `NO_LIVE_SUBAGENT` when the
+/// session has no live subagent (unknown session, or the subagent already
+/// reached a terminal state — e.g. a double-click racing natural
+/// completion).
+#[instrument(level = "info", skip(state), fields(session_id = %session_id.0))]
+pub async fn cancel_subagent(
+    State(state): State<AppState>,
+    Path(session_id): Path<SessionId>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    if !state.coordinator.cancel_subagent_by_session(session_id) {
+        return Err(api_error(
+            StatusCode::NOT_FOUND,
+            "NO_LIVE_SUBAGENT",
+            "No live subagent for this session",
+        ));
+    }
+
+    info!("Subagent cancel requested for session {}", session_id.0);
+
+    Ok(Json(serde_json::json!({
+        "session_id": session_id.0.to_string(),
+        "status": "cancelling",
+    })))
+}
+
 /// Cross-validate the resolved per-run `(provider, model, max_input_tokens,
 /// max_tokens)` quadruple against the provider's published context window
 /// (#919).

@@ -855,6 +855,34 @@ The state flip + SSE broadcast on the HTTP boundary is independent of that
 cooperative unwind: the user-visible cancel lands synchronously on the HTTP
 response and on every subscribed SSE feed; the loop's actual exit follows.
 
+### 5.7.1 Cancel a subagent (session-keyed)
+`POST /sessions/{session_id}/subagent/cancel`
+
+Cancels the live subagent running on the given **subagent** session. Returns
+200 with `{"session_id":"...","status":"cancelling"}` when a live
+(pending/running) subagent was found and its cancellation token fired;
+returns 404 with error code `NO_LIVE_SUBAGENT` when the session has no live
+subagent (unknown session, or the subagent already reached a terminal
+state — e.g. a cancel racing natural completion).
+
+Session-keyed rather than run-keyed because the UI's subagent surfaces (the
+status-bar chips and the subagent session view) carry the subagent's session
+id, not its run id — and a subagent's own run id has no cancel token in the
+run manager, so `POST /runs/{run_id}/cancel` returns 409 for subagent runs
+without cancelling anything. Cancelling the **parent** run still cascades to
+its subagents as before; this endpoint cancels one subagent *without*
+touching the parent run.
+
+`"status": "cancelling"` is deliberate: cancellation is cooperative and
+completes asynchronously. The terminal effects follow on the streams — the
+subagent's own session emits `run_cancelled`, its run record flips to
+`Cancelled`, and (for background subagents) the parent session receives a
+`subagent_completed` event with `status: "cancelled"`. Cancelling a
+**foreground** subagent instead surfaces on the parent as the blocked
+`invoke_agent` tool call failing with `"Subagent was cancelled"` (the
+parent run continues and handles the tool error like any other tool
+failure).
+
 ### 5.8 List runs
 `GET /runs?session_id=<uuid>&limit=<n>` — list runs for a session (original behaviour).
 `GET /runs?agent_id=<uuid>&limit=<n>` — list runs across all sessions for an agent.

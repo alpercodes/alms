@@ -1,5 +1,6 @@
 import { signal } from '../deps.js';
 import { activeSessionId } from './sessions.js';
+import { clearCancelConfirmForSession, dismissSubagentCancel } from './subagent-cancel.js';
 
 /**
  * Active subagents and their live status, backing the Subagent status bar.
@@ -220,7 +221,14 @@ function scheduleSubagentRemoval(key) {
     }
     removeTimers[key] = setTimeout(() => {
         delete removeTimers[key];
-        const { [key]: _, ...rest } = activeSubagents.value;
+        const { [key]: removed, ...rest } = activeSubagents.value;
+        // Codex P2 (PR #1192): removing a chip must also drop an armed
+        // cancel-confirm targeting its session — named subagents reuse the
+        // session id, so a surviving confirm would pre-arm the next
+        // invocation's chip.
+        if (removed) {
+            clearCancelConfirmForSession(removed.sessionId);
+        }
         activeSubagents.value = rest;
     }, REMOVE_DELAY_MS);
 }
@@ -590,6 +598,16 @@ export function trackSubagentEnd(name, status, toolInvocationId, subagentSession
     // Unconditional (before the lookup) so a completion for an already-removed
     // chip still evicts.
     pendingActivity.delete(name);
+    // Codex P2 (PR #1192): a terminal subagent must never leave an armed
+    // cancel-confirm behind. Named subagents reuse the SAME session id
+    // across re-invocations, so a confirm armed on this invocation would
+    // otherwise pre-arm the NEXT invocation's chip inside the auto-revert
+    // window — its Yes button would fire with no confirming first click.
+    // Cleared by the event's session id even when the chip is already gone
+    // (mirrors the unconditional pendingActivity eviction above), and again
+    // below by the resolved entry's stored session id (the two can differ
+    // when the event carries no session id).
+    clearCancelConfirmForSession(subagentSessionId);
     const key = resolveSubagentKey(name, toolInvocationId, subagentSessionId);
     if (!key) return;
     // The entry key may have been migrated to the backend label (which is
@@ -597,6 +615,7 @@ export function trackSubagentEnd(name, status, toolInvocationId, subagentSession
     pendingActivity.delete(key);
     const current = activeSubagents.value[key];
     if (!current) return;
+    clearCancelConfirmForSession(current.sessionId);
     activeSubagents.value = {
         ...activeSubagents.value,
         [key]: { ...current, status },
@@ -830,6 +849,10 @@ export function clearAllSubagents() {
     // #1183: drop early activity signals too — a session switch must never
     // apply a previous session's buffered subagent status to the next.
     pendingActivity.clear();
+    // Codex P2 (PR #1192): a session switch also dismisses any armed
+    // cancel-confirm — the armed chip (or drilled-down view) is no longer
+    // on screen, and the pending state must not leak into the next view.
+    dismissSubagentCancel();
     activeSubagents.value = {};
 }
 

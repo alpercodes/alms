@@ -385,3 +385,29 @@ fn dm_stream_rendering_js_behaviour() {
 fn subagent_status_bar_js_behaviour() {
     run_node_test("subagent-status-bar.test.mjs");
 }
+
+/// Behavioural coverage for the subagent cancel-confirm flow in
+/// `static/ui/state/subagent-cancel.js` — the shared decision layer behind
+/// both cancel surfaces (the ✕ on RUNNING Subagent-status-bar chips and the
+/// "Cancel subagent" button in the subagent session view's breadcrumb),
+/// driven against the REAL module with a recording `cancelSubagent` stub.
+///
+/// Pins the confirm contract: arming shows the confirm and makes NO API
+/// call; only an explicit Yes calls the session-keyed cancel endpoint with
+/// the armed session id, exactly once (double-click safe); No / the
+/// auto-revert timer / re-arming another session dismiss with NO call; the
+/// unknown-session-id and terminal-status guards (`showCancelControl`,
+/// nullish-id refusals) never let a cancel fire without a real session id.
+///
+/// Also pins the chip-lifecycle clearing (Codex P2, PR #1192), driven
+/// through the REAL `state/subagents.js` wired to the same cancel-module
+/// instance: the armed confirm is dismissed at the armed subagent's
+/// terminal transition, at chip auto-removal, and on `clearAllSubagents`
+/// (session switch) — named subagents reuse the same session id across
+/// re-invocations, so a surviving confirm would pre-arm the next
+/// invocation's chip and its Yes would live-fire without a confirming
+/// first click. An unrelated subagent's lifecycle never dismisses it.
+#[test]
+fn subagent_cancel_js_behaviour() {
+    run_node_test("subagent-cancel.test.mjs");
+}

@@ -8615,6 +8615,125 @@ async fn subagent_session_messages_endpoint_returns_transcript() {
 }
 
 // ---------------------------------------------------------------------------
+// POST /sessions/{id}/subagent/cancel — session-keyed subagent cancel
+// ---------------------------------------------------------------------------
+
+/// The 404 leg over the PRODUCTION router: a session with no live subagent
+/// must return 404 with the `NO_LIVE_SUBAGENT` error code. Exercising this
+/// through `protected_router()` (rather than calling the handler directly)
+/// pins the route registration — `/sessions/{session_id}/subagent/cancel`
+/// wired to `cancel_subagent` — so the frontend's `cancelSubagent(sessionId)`
+/// helper can't silently 404-on-every-request due to a routing drift.
+#[tokio::test]
+async fn cancel_subagent_endpoint_404_when_no_live_subagent() {
+    use axum::body::Body;
+    use axum::http::Request as HttpRequest;
+    use tower::ServiceExt;
+
+    let (state, shutdown_token, _cr, _tr, _dr) = test_app_state_with_mock_llm();
+
+    let router = crate::server::routes::protected_router().with_state(state);
+    let uri = format!("/sessions/{}/subagent/cancel", SessionId::new().0);
+    let response = router
+        .oneshot(HttpRequest::post(&uri).body(Body::empty()).unwrap())
+        .await
+        .expect("router oneshot should not fail");
+
+    assert_eq!(
+        response.status(),
+        axum::http::StatusCode::NOT_FOUND,
+        "a session with no live subagent must 404"
+    );
+    let body_bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+        .await
+        .expect("read response body");
+    let json: serde_json::Value =
+        serde_json::from_slice(&body_bytes).expect("error body should be JSON");
+    assert_eq!(
+        json["error"]["code"], "NO_LIVE_SUBAGENT",
+        "error code must be NO_LIVE_SUBAGENT; got {json}"
+    );
+
+    shutdown_token.cancel();
+}
+
+/// The 200 leg: cancelling a LIVE subagent through the handler fires its
+/// cancellation token and the subagent actually terminates `Cancelled`.
+///
+/// Determinism note: `#[tokio::test]` uses the current-thread runtime, and
+/// the handler body has no await points before the (synchronous)
+/// `cancel_subagent_by_session` call — so the `tokio::spawn`ed
+/// `run_subagent` task cannot run to completion between `spawn_subagent`
+/// returning and the cancel firing. The handle is still live (Pending) at
+/// cancel time, every time. The subagent then observes the already-fired
+/// token at its first cancellation checkpoint and lands `Cancelled`, which
+/// the awaited `TaskResult` asserts end-to-end.
+#[tokio::test]
+async fn cancel_subagent_endpoint_cancels_live_subagent() {
+    use axum::extract::{Path as AxumPath, State as AxumState};
+
+    let (state, shutdown_token, _cr, _tr, _dr) = test_app_state_with_mock_llm();
+
+    // Spawn a background subagent directly on the coordinator (the same
+    // object the endpoint reaches through `state.coordinator`). Unnamed, so
+    // no registry entry is needed.
+    let request = alms_coordinator::SubagentRequest {
+        task: "long-running background research".to_string(),
+        parent_session: SessionId::new(),
+        parent_agent_id: AgentId::new(),
+        parent_run_id: None,
+        subagent_name: None,
+        parent_tool_invocation_id: None,
+    };
+    let (task_id, sub_session_id) = state
+        .coordinator
+        .spawn_subagent(request, None, true, None)
+        .await
+        .expect("spawn_subagent should succeed");
+    let result_rx = state
+        .coordinator
+        .take_result_rx(task_id)
+        .expect("result receiver should be available");
+
+    // Cancel through the HTTP handler (session-keyed).
+    let response =
+        super::lifecycle::cancel_subagent(AxumState(state.clone()), AxumPath(sub_session_id))
+            .await
+            .expect("cancel of a live subagent must return 200");
+    assert_eq!(
+        response.0["status"], "cancelling",
+        "the 200 body must report status=cancelling"
+    );
+
+    // The subagent must actually terminate Cancelled (not Completed): the
+    // token was fired before its task ever ran, so its first checkpoint
+    // takes the cancellation arm.
+    let task_result = result_rx.await.expect("should receive a task result");
+    assert_eq!(
+        task_result.status,
+        TaskStatus::Cancelled,
+        "the cancelled subagent must land TaskStatus::Cancelled; got {:?}",
+        task_result.status
+    );
+
+    // Idempotence / double-click: the subagent is now terminal, so a second
+    // cancel must report 404 (no live subagent), not 200.
+    let second =
+        super::lifecycle::cancel_subagent(AxumState(state.clone()), AxumPath(sub_session_id)).await;
+    assert!(
+        second.is_err(),
+        "a second cancel after termination must be an error (404)"
+    );
+    assert_eq!(
+        second.unwrap_err().0,
+        axum::http::StatusCode::NOT_FOUND,
+        "the second cancel must be a 404"
+    );
+
+    shutdown_token.cancel();
+}
+
+// ---------------------------------------------------------------------------
 // DM completion gate tests (#1154 implicit replies)
 // ---------------------------------------------------------------------------
 
