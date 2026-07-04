@@ -82,8 +82,20 @@ pub trait EventForwarder: Send + Sync + std::fmt::Debug {
     /// only needs to know *that* the subagent is reasoning / writing / using
     /// a named tool, not *what* it produced (the full content streams to the
     /// subagent's own session, #1184). `tool` is populated only for
-    /// `tool_start`. Deduplicated at the call site: consecutive deltas of the
-    /// same kind produce a single signal.
+    /// `tool_start`; `tool_invocation_id` for the tool kinds (`tool_start` /
+    /// `tool_end`) — the UI counts DISTINCT ids into the chip's tool count
+    /// (#1190), which disambiguates an attach-time snapshot replay (same id
+    /// as the live signal) from parallel invocations of the same tool
+    /// (`run_tool_calls_parallel` — distinct ids, no interposed `tool_end`).
+    /// Deduplicated at the call site: consecutive deltas of the same kind
+    /// produce a single signal.
+    ///
+    /// `parent_tool_invocation_id` is the PARENT `invoke_agent`
+    /// tool-invocation-id (the same id `forward_subagent_started` carries) —
+    /// the chip-resolution correlator (#1190): unnamed subagent chips are
+    /// keyed by it, so the UI resolves the target chip identity-exactly
+    /// instead of first-matching by the task-derived `source_agent` label,
+    /// which cross-attaches status between concurrent unnamed subagents.
     ///
     /// Default is a no-op: a forwarder that ignores it merely shows less
     /// status, so test doubles and single-purpose sinks don't have to opt in.
@@ -91,6 +103,8 @@ pub trait EventForwarder: Send + Sync + std::fmt::Debug {
         &self,
         _kind: String,
         _tool: Option<String>,
+        _tool_invocation_id: Option<Uuid>,
+        _parent_tool_invocation_id: Option<Uuid>,
         _source_agent: Option<String>,
     ) {
     }

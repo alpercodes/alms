@@ -4,7 +4,7 @@ import { activeSessionId } from './sessions.js';
 /**
  * Active subagents and their live status, backing the Subagent status bar.
  * Shape: { [key]: { status, task, toolInvocationId, displayName, startedAt,
- *                   sessionId, activity, toolsUsed } }
+ *                   sessionId, activity, toolsUsed, countedToolIds } }
  *
  * Keys are unique identifiers for each subagent invocation:
  *   - Named subagents use the agent name as the key (e.g. "reviewer").
@@ -38,8 +38,11 @@ import { activeSessionId } from './sessions.js';
  * #1183 startup race) is held in `pendingActivity` and applied once the
  * entry appears.
  *
- * `toolsUsed` counts observed `tool_start` signals, feeding the completion
- * card's tool count.
+ * `toolsUsed` counts observed `tool_start` signals — once per DISTINCT tool
+ * invocation id (`countedToolIds`, #1190) — feeding the completion card's
+ * tool count. Counting distinct ids is what makes the count immune to the
+ * attach-time snapshot replay (same id re-sent per reconnect) without
+ * undercounting parallel same-tool invocations (distinct ids).
  */
 export const activeSubagents = signal({});
 
@@ -55,7 +58,8 @@ export const activeSubagents = signal({});
  * `PENDING_ACTIVITY_MAX_LABELS`, and an entry older than
  * `PENDING_ACTIVITY_MAX_AGE_MS` is discarded at take time so a stale replayed
  * signal can't front-run a later re-invocation. Dropped on `trackSubagentEnd`
- * and `clearAllSubagents`. Values: { kind, tool, updatedAt }.
+ * and `clearAllSubagents`. Values:
+ * { kind, tool, toolInvocationId, parentToolInvocationId, updatedAt }.
  */
 const pendingActivity = new Map();
 
@@ -73,11 +77,17 @@ const PENDING_ACTIVITY_MAX_AGE_MS = 30000;
  * `pendingActivity` doc above. Never creates an `activeSubagents` entry, so
  * the "a late signal must not resurrect a removed chip" invariant holds.
  */
-function bufferEarlyActivity(name, kind, tool) {
+function bufferEarlyActivity(name, kind, tool, toolInvocationId, parentToolInvocationId) {
     // Delete-then-set refreshes Map insertion order, so the cap eviction
     // below always drops the least-recently-written label.
     pendingActivity.delete(name);
-    pendingActivity.set(name, { kind, tool: tool || null, updatedAt: Date.now() });
+    pendingActivity.set(name, {
+        kind,
+        tool: tool || null,
+        toolInvocationId: toolInvocationId || null,
+        parentToolInvocationId: parentToolInvocationId || null,
+        updatedAt: Date.now(),
+    });
     while (pendingActivity.size > PENDING_ACTIVITY_MAX_LABELS) {
         const oldest = pendingActivity.keys().next().value;
         pendingActivity.delete(oldest);
@@ -94,7 +104,12 @@ function takePendingActivity(name) {
     if (!buf) return null;
     pendingActivity.delete(name);
     if (Date.now() - buf.updatedAt > PENDING_ACTIVITY_MAX_AGE_MS) return null;
-    return { kind: buf.kind, tool: buf.tool };
+    return {
+        kind: buf.kind,
+        tool: buf.tool,
+        toolInvocationId: buf.toolInvocationId || null,
+        parentToolInvocationId: buf.parentToolInvocationId || null,
+    };
 }
 
 /**
@@ -112,23 +127,51 @@ function takePendingActivity(name) {
  * signal is the ONLY one — without this fallback the chip would sit on
  * "Starting…" for the whole phase.
  *
- * Fallback: for an unnamed key, consume the OLDEST unnamed-labelled
- * (`subagent-*`) buffer (skipping stale ones). With concurrent unnamed
- * subagents this is a best-effort first-match — the same ambiguity class as
- * `resolveForwardedSubagentKey`'s running-entry fallback, and status is
- * self-correcting on the next live signal. The entry key is NOT migrated
- * here; the next live signal still performs the normal key migration.
+ * Resolution order (mirrors `resolveForwardedSubagentKey`, #1190):
+ *   1. IDENTITY-EXACT: a buffer whose `parentToolInvocationId` equals the
+ *      new entry's parent invoke_agent invocation id. With concurrent
+ *      unnamed subagents this is the only consumption that cannot seed one
+ *      subagent's status onto another's chip.
+ *   2. Direct label hit (named subagents: label === key).
+ *   3. For an unnamed key, the OLDEST unnamed-labelled (`subagent-*`) buffer
+ *      (skipping stale ones) — legacy best-effort first-match for
+ *      correlator-less buffers, the same ambiguity class as
+ *      `resolveForwardedSubagentKey`'s running-entry fallback; status is
+ *      self-correcting on the next live signal. The entry key is NOT
+ *      migrated here; the next live signal still performs the normal key
+ *      migration. Correlator-TAGGED buffers are excluded: they belong to a
+ *      specific invocation, and consuming one for a different entry would
+ *      seed the wrong chip — the exact cross-attach this fix removes.
  *
  * @param {string} key - The new entry's `activeSubagents` key.
- * @returns {{kind: string, tool: string|null}|null}
+ * @param {string|null} [parentToolInvocationId] - The new entry's parent
+ *   invoke_agent tool-invocation-id (the buffer correlator).
+ * @returns {{kind: string, tool: string|null, toolInvocationId: string|null,
+ *            parentToolInvocationId: string|null}|null}
  */
-function takePendingActivityForKey(key) {
-    const direct = takePendingActivity(key);
-    if (direct) return direct;
+function takePendingActivityForKey(key, parentToolInvocationId) {
+    if (parentToolInvocationId) {
+        for (const [label, buf] of pendingActivity) {
+            if (buf.parentToolInvocationId === parentToolInvocationId) {
+                return takePendingActivity(label);
+            }
+        }
+    }
+    // A correlator-TAGGED buffer under this label belongs to a specific
+    // invocation. If it were THIS entry's, the exact scan above would have
+    // consumed it — so reaching here means it is a DIFFERENT invocation's
+    // (e.g. a prior same-named run within the pending window): leave it for
+    // the TTL / completion eviction rather than seed the wrong chip with
+    // stale status (#1190 r4, Codex).
+    if (!pendingActivity.get(key)?.parentToolInvocationId) {
+        const direct = takePendingActivity(key);
+        if (direct) return direct;
+    }
     if (!key.startsWith('subagent-')) return null;
     // Iterate over a snapshot: takePendingActivity deletes while we scan.
     for (const label of [...pendingActivity.keys()]) {
         if (!label.startsWith('subagent-')) continue;
+        if (pendingActivity.get(label)?.parentToolInvocationId) continue;
         const buf = takePendingActivity(label);
         if (buf) return buf;
     }
@@ -149,8 +192,12 @@ const removeTimers = {};
 const REMOVE_DELAY_MS = 15000;
 
 /** Terminal subagent statuses — entries in these states are scheduled for
- *  auto-removal from the bar after `REMOVE_DELAY_MS`. */
-const TERMINAL_STATUSES = new Set(['done', 'fail']);
+ *  auto-removal from the bar after `REMOVE_DELAY_MS`. Matches the status
+ *  strings `subagent_completed` serializes (notifications.rs): a cancelled
+ *  background subagent arrives as `'cancelled'` and must be treated as
+ *  terminal like done/fail — otherwise the chip falls through to its stale
+ *  activity label ("Writing…" / "Starting…") until auto-removal. */
+const TERMINAL_STATUSES = new Set(['done', 'fail', 'cancelled']);
 
 /**
  * Arm (or re-arm) the auto-remove timer for a single subagent entry.
@@ -206,6 +253,34 @@ function rearmTerminalRemoveTimers() {
 }
 
 /**
+ * Derive a new entry's activity seed from a consumed early-signal buffer
+ * (#1183): the display `activity` ({kind, tool} — the buffer's invocation id
+ * is deliberately NOT part of the rendered activity), the initial `toolsUsed`
+ * count, and the set of already-counted tool invocation ids. Seeding the id
+ * into `countedToolIds` is what keeps a later snapshot replay of the SAME
+ * in-progress tool_start (attach-time replay, #1190) from double counting a
+ * buffered tool_start that was already counted here at entry creation.
+ *
+ * @param {{kind: string, tool: string|null, toolInvocationId: string|null,
+ *          parentToolInvocationId: string|null}|null} buffered
+ * @returns {{activity: {kind: string, tool: string|null}|null,
+ *            toolsUsed: number, countedToolIds: Set<string>}}
+ */
+function seedFromBufferedActivity(buffered) {
+    if (!buffered) {
+        return { activity: null, toolsUsed: 0, countedToolIds: new Set() };
+    }
+    const isToolStart = buffered.kind === 'tool_start';
+    return {
+        activity: { kind: buffered.kind, tool: buffered.tool },
+        toolsUsed: isToolStart ? 1 : 0,
+        countedToolIds: (isToolStart && buffered.toolInvocationId)
+            ? new Set([buffered.toolInvocationId])
+            : new Set(),
+    };
+}
+
+/**
  * Track a subagent invocation.
  *
  * @param {string} name - Display name for the subagent chip (from invoke_agent params).
@@ -231,8 +306,12 @@ export function trackSubagentStart(name, task, toolInvocationId) {
     // including an unnamed subagent's backend-labelled buffer (see
     // `takePendingActivityForKey`; the backend dedup means it may be the only
     // signal for a long phase). A buffered tool_start counts toward
-    // `toolsUsed` exactly like the live path in `trackSubagentActivity`.
-    const buffered = takePendingActivityForKey(key);
+    // `toolsUsed` exactly like the live path in `trackSubagentActivity`, and
+    // its invocation id seeds `countedToolIds` so a snapshot replay of the
+    // same in-progress tool can't recount it (#1190).
+    const seed = seedFromBufferedActivity(
+        takePendingActivityForKey(key, toolInvocationId || null),
+    );
     activeSubagents.value = {
         ...activeSubagents.value,
         [key]: {
@@ -242,11 +321,20 @@ export function trackSubagentStart(name, task, toolInvocationId) {
             displayName: name,
             startedAt: Date.now(),
             sessionId: null,
-            activity: buffered,
-            toolsUsed: (buffered && buffered.kind === 'tool_start') ? 1 : 0,
+            activity: seed.activity,
+            toolsUsed: seed.toolsUsed,
+            countedToolIds: seed.countedToolIds,
         },
     };
 }
+
+/**
+ * Sentinel returned by `resolveForwardedSubagentKey` when a signal's
+ * correlator resolves to a TERMINAL entry: the signal belongs to a finished
+ * invocation and must be DISCARDED — not applied, and crucially not buffered
+ * (see the resolver's precedence doc, #1190 r4).
+ */
+const RESOLVE_DROP = Symbol('drop-stale-subagent-signal');
 
 /**
  * Resolve a forwarded `source_agent` label to a live `activeSubagents` entry,
@@ -257,38 +345,120 @@ export function trackSubagentStart(name, task, toolInvocationId) {
  * NAMED subagents that equals the entry key directly. For UNNAMED subagents
  * the entry was registered under `subagent-{toolInvocationId_prefix}` at
  * `tool_start` time but the backend labels forwarded events with
- * `subagent-{task_id_prefix}` (a different id), so we fall back to the first
- * running unnamed entry and migrate it to the backend-assigned key (and its
- * pending removal timer) so subsequent forwarded events for the same subagent
- * match directly.
+ * `subagent-{task_id_prefix}` (a different id).
  *
- * Returns the resolved key, or `null` when no matching entry exists (e.g. the
- * subagent already completed and its chip was auto-removed, or the entry has
- * not been created yet — see the #1183 startup race). A `null` result must
- * never resurrect / create a chip; `trackSubagentActivity` responds to it by
- * buffering the signal (`pendingActivity`), other callers no-op.
+ * Resolution precedence for CORRELATOR-TAGGED signals (#1190 r3/r4 — make
+ * every step identity-exact; the ambiguous first-match loop is never used):
+ *   1. Entry whose stored `toolInvocationId` equals the correlator, RUNNING
+ *      → resolve to it (migrating to the backend label so label-keyed
+ *      operations — buffer eviction, later legacy signals — stay
+ *      consistent). This is the only correct resolver when 2+ UNNAMED
+ *      subagents run concurrently: the correlator-less first-match loop
+ *      below could migrate subagent B's status onto subagent A's chip, and
+ *      the migration STICKS (Codex P2, r3).
+ *   2. Same entry but TERMINAL → return [`RESOLVE_DROP`]: the signal belongs
+ *      to a FINISHED invoke_agent invocation. It must be dropped, NOT
+ *      buffered (Codex P2, r4): a name-keyed buffer would be consumed by the
+ *      NEXT invocation of the same-named subagent inside the 30s pending
+ *      window (`takePendingActivityForKey`'s direct-name lookup at entry
+ *      creation), seeding the fresh chip with the completed run's stale
+ *      activity/tool count. Dropping (rather than resolving) also keeps a
+ *      terminal entry from being migrated, which would orphan its pending
+ *      auto-remove timer.
+ *   3. No entry with that correlator at all → check the entry under the
+ *      EXACT label (only the first-match LOOP is ambiguous; the label hit
+ *      itself is exact — Tim, r4), but gated on its stored id:
+ *        - stored `toolInvocationId` ABSENT → take the label hit. This is
+ *          the nonstandard creation path the fallback exists for (an entry
+ *          created without an id can never id-match), which would otherwise
+ *          buffer every signal forever and pin the chip on "Starting…".
+ *        - stored id PRESENT → [`RESOLVE_DROP`] (Codex P2, r5). It is
+ *          necessarily DIFFERENT (an equal id would have id-matched in
+ *          step 1), so the signal's invocation is gone or replaced — e.g. a
+ *          same-named re-invocation overwrote the entry with a fresh id,
+ *          and this is a delayed straggler from the finished run. Taking
+ *          the label hit would pin the stale activity/tool count onto the
+ *          fresh chip: the exact stale-signal class the correlator exists
+ *          to prevent.
+ *   4. Otherwise → `null` (the caller buffers, #1183).
+ *
+ * Correlator-LESS signals (pre-#1190 backends) keep the legacy order:
+ * direct label hit, then the first running `subagent-*` entry + migration —
+ * ambiguous under concurrency by construction, exactly like
+ * `resolveSubagentKey`'s name fallback.
+ *
+ * Returns the resolved key; `null` when no matching entry exists (the entry
+ * has not been created yet — see the #1183 startup race — and the caller
+ * buffers; a `null` must never resurrect / create a chip); or
+ * [`RESOLVE_DROP`] when the signal provably belongs to a finished invocation
+ * and must be discarded outright.
  *
  * @param {string} name - The backend `source_agent` label.
- * @returns {string|null} the resolved (possibly migrated) entry key.
+ * @param {string|null} [parentToolInvocationId] - The parent invoke_agent
+ *   tool-invocation-id carried by the signal (absent on legacy backends).
+ * @returns {string|symbol|null} the resolved (possibly migrated) entry key,
+ *   `null` (buffer), or `RESOLVE_DROP` (discard).
  */
-function resolveForwardedSubagentKey(name) {
+function resolveForwardedSubagentKey(name, parentToolInvocationId) {
+    if (parentToolInvocationId) {
+        const exact = findSubagentByToolInvocationId(parentToolInvocationId);
+        if (exact) {
+            if (activeSubagents.value[exact]?.status === 'running') {
+                return migrateEntryToBackendLabel(exact, name);
+            }
+            // Terminal id-match: a straggler for a FINISHED invocation.
+            return RESOLVE_DROP;
+        }
+        const labelEntry = activeSubagents.value[name];
+        if (labelEntry) {
+            // Stored correlator ABSENT → nonstandard creation path: the
+            // exact label hit this fallback exists for (r4). A stored id is
+            // necessarily DIFFERENT here (equal would have id-matched
+            // above): the signal's invocation is gone or replaced by a
+            // same-named re-invocation — a straggler. Drop it, or it would
+            // pin the finished run's stale activity/tool count onto the
+            // fresh chip (Codex P2, r5).
+            if (!labelEntry.toolInvocationId) return name;
+            return RESOLVE_DROP;
+        }
+        // NEVER the ambiguous first-match loop for a tagged signal —
+        // attaching it to some other subagent's chip is the r3 bug.
+        return null;
+    }
     if (activeSubagents.value[name]) return name;
     if (name.startsWith('subagent-')) {
         for (const [key, info] of Object.entries(activeSubagents.value)) {
             if (key.startsWith('subagent-') && info.status === 'running') {
-                // Migrate the entry to the backend-assigned key so future
-                // forwarded events match directly.
-                const { [key]: entry, ...rest } = activeSubagents.value;
-                activeSubagents.value = { ...rest, [name]: entry };
-                if (removeTimers[key]) {
-                    clearTimeout(removeTimers[key]);
-                    delete removeTimers[key];
-                }
-                return name;
+                return migrateEntryToBackendLabel(key, name);
             }
         }
     }
     return null;
+}
+
+/**
+ * Move a resolved entry to the backend-assigned `subagent-*` label so future
+ * label-keyed lookups match directly, CLEARING any pending removal timer
+ * under the old key (it is not re-armed under the new one). Safe only for
+ * RUNNING entries — they never have a timer — which is why every caller
+ * filters on `status === 'running'` before migrating: migrating a terminal
+ * entry would silently cancel its auto-removal and strand the chip.
+ * No-op when the entry already lives under that key or when the label is not
+ * an unnamed-style backend label (named subagents: label === key always).
+ *
+ * @param {string} key - The entry's current `activeSubagents` key.
+ * @param {string} name - The backend `source_agent` label.
+ * @returns {string} the entry's key after (possible) migration.
+ */
+function migrateEntryToBackendLabel(key, name) {
+    if (key === name || !name.startsWith('subagent-')) return key;
+    const { [key]: entry, ...rest } = activeSubagents.value;
+    activeSubagents.value = { ...rest, [name]: entry };
+    if (removeTimers[key]) {
+        clearTimeout(removeTimers[key]);
+        delete removeTimers[key];
+    }
+    return name;
 }
 
 /**
@@ -304,9 +474,10 @@ function resolveForwardedSubagentKey(name) {
  * streams to the subagent's OWN session (#1184), reached by clicking the
  * chip.
  *
- * Keying / migration uses `resolveForwardedSubagentKey` so signals from
- * unnamed subagents (whose backend label differs from the start-time key)
- * land on the right entry.
+ * Keying / migration uses `resolveForwardedSubagentKey`: identity-exact via
+ * the signal's `parentToolInvocationId` correlator when present (#1190 —
+ * required for correctness with concurrent unnamed subagents), label /
+ * first-match fallback for legacy correlator-less signals.
  *
  * A signal that cannot be resolved to an entry is BUFFERED, not dropped
  * (#1183, see `pendingActivity`): a background subagent's first signal can
@@ -315,33 +486,71 @@ function resolveForwardedSubagentKey(name) {
  * re-sent until the next kind transition. Buffering never creates an entry,
  * so a gone subagent's late signal can't resurrect a chip.
  *
- * `tool_start` signals also increment the entry's `toolsUsed` counter, which
- * feeds the completion card's tool count.
+ * `tool_start` signals increment the entry's `toolsUsed` counter — which
+ * feeds the completion card's tool count — once per DISTINCT tool invocation
+ * id (idempotency, #1190): an attach-time snapshot replay
+ * (`attach_session_stream` re-sends the CURRENT in-progress tool_start on
+ * every reconnect) carries the SAME id as the live signal and is recognised
+ * instead of recounted, while parallel invocations of the same tool
+ * (`run_tool_calls_parallel` starts non-conflicting calls concurrently — two
+ * same-tool tool_starts with NO interposed tool_end) carry distinct ids and
+ * each count. A name-based heuristic cannot distinguish those two cases;
+ * the id can. Signals from a legacy backend without an id fall back to
+ * counting every tool_start (the pre-#1190 behaviour).
  *
  * @param {string} name - The backend `source_agent` label for the subagent.
  * @param {string} kind - Activity kind: reasoning|writing|tool_start|tool_end.
  * @param {string|null} [tool] - Tool name (only for kind === 'tool_start').
+ * @param {string|null} [toolInvocationId] - The subagent's own (CHILD) tool
+ *   invocation id (tool kinds only) — the `toolsUsed` idempotency key.
+ * @param {string|null} [parentToolInvocationId] - The PARENT invoke_agent
+ *   tool-invocation-id — the chip-resolution correlator (#1190).
  */
-export function trackSubagentActivity(name, kind, tool) {
+export function trackSubagentActivity(name, kind, tool, toolInvocationId, parentToolInvocationId) {
     if (!kind) return;
-    const key = resolveForwardedSubagentKey(name);
+    const key = resolveForwardedSubagentKey(name, parentToolInvocationId);
+    // The correlator matched a TERMINAL entry: a straggler from a finished
+    // invocation. Discard it — buffering would seed a same-named
+    // re-invocation's fresh chip with stale status (#1190 r4).
+    if (key === RESOLVE_DROP) return;
     if (!key) {
         // #1183: the entry doesn't exist yet (startup race) or is gone
         // (late replay). Buffer instead of dropping — applied on entry
         // creation, discarded when stale.
-        bufferEarlyActivity(name, kind, tool);
+        bufferEarlyActivity(name, kind, tool, toolInvocationId, parentToolInvocationId);
         return;
     }
     const current = activeSubagents.value[key];
     if (!current) return;
     // The entry is live now: this signal supersedes any buffered one.
     pendingActivity.delete(name);
+    // Count DISTINCT tool invocation ids (#1190). Defensive `instanceof`:
+    // entries created by this module always carry the set, but re-seeded /
+    // legacy-shaped entries may not.
+    const counted = current.countedToolIds instanceof Set
+        ? current.countedToolIds
+        : new Set();
+    let toolsUsed = current.toolsUsed || 0;
+    let nextCounted = counted;
+    if (kind === 'tool_start') {
+        if (toolInvocationId) {
+            if (!counted.has(toolInvocationId)) {
+                nextCounted = new Set(counted);
+                nextCounted.add(toolInvocationId);
+                toolsUsed += 1;
+            }
+        } else {
+            // Legacy backend without ids: count every tool_start.
+            toolsUsed += 1;
+        }
+    }
     activeSubagents.value = {
         ...activeSubagents.value,
         [key]: {
             ...current,
             activity: { kind, tool: tool || null },
-            toolsUsed: (current.toolsUsed || 0) + (kind === 'tool_start' ? 1 : 0),
+            toolsUsed,
+            countedToolIds: nextCounted,
         },
     };
 }
@@ -371,7 +580,7 @@ export function trackSubagentActivity(name, kind, tool) {
  *      older events without the id keep working unchanged.
  *
  * @param {string} name - The subagent key / display name ("subagent" for unnamed).
- * @param {string} status - Terminal status ('done' | 'fail').
+ * @param {string} status - Terminal status ('done' | 'fail' | 'cancelled').
  * @param {string} [toolInvocationId] - The parent's invoke_agent tool_invocation_id.
  * @param {string} [subagentSessionId] - The completing subagent's session UUID.
  */
@@ -904,9 +1113,12 @@ export function rehydrateSubagentsFromHistory(messages) {
 
         // #1183: same early-signal application as `trackSubagentStart` —
         // forwarded activity signals can beat this rehydrate pass on a
-        // reload (including an unnamed subagent's backend-labelled buffer,
-        // and a buffered tool_start counts toward `toolsUsed`).
-        const buffered = takePendingActivityForKey(key);
+        // reload (including an unnamed subagent's backend-labelled buffer;
+        // a buffered tool_start counts toward `toolsUsed` and seeds
+        // `countedToolIds` so a snapshot replay can't recount it, #1190).
+        const seed = seedFromBufferedActivity(
+            takePendingActivityForKey(key, invocationId || null),
+        );
         additions[key] = {
             status: 'running',
             task,
@@ -914,8 +1126,9 @@ export function rehydrateSubagentsFromHistory(messages) {
             displayName: name,
             startedAt,
             sessionId: subagentSessionId,
-            activity: buffered,
-            toolsUsed: (buffered && buffered.kind === 'tool_start') ? 1 : 0,
+            activity: seed.activity,
+            toolsUsed: seed.toolsUsed,
+            countedToolIds: seed.countedToolIds,
         };
     }
 

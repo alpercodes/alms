@@ -117,14 +117,19 @@
   background: var(--info-muted);
 }
 
-/* ── Subagent breadcrumb (back to parent) ── */
+/* ── Subagent breadcrumb (back to parent) ──
+   Rendered as a full-width bar directly below the internal-session header
+   (a sibling of #messages, not a child), so it sits flush against the
+   header like the app's other stacked header bars. It previously lived
+   INSIDE #messages, where the scroller's `padding: var(--space-4)
+   var(--space-6)` opened a visible gap between the header and the button
+   (and the sticky positioning was needed to keep it pinned while
+   scrolling — no longer, now that it is outside the scroll container). */
 .sa-breadcrumb {
   padding: var(--space-2) var(--space-3);
   border-bottom: 1px solid var(--border-subtle);
   background: var(--surface-1);
-  position: sticky;
-  top: 0;
-  z-index: 5;
+  flex-shrink: 0;
 }
 .sa-breadcrumb-btn {
   background: none;

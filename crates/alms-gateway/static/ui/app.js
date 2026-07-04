@@ -138,14 +138,14 @@ function ChatView() {
                     <span class="internal-session-header-badge">read-only</span>
                 </div>
             `}
+            ${parentSessionId.value && html`
+                <div class="sa-breadcrumb">
+                    <button class="sa-breadcrumb-btn" onClick=${() => navigateToParentSession()}>
+                        \u2190 Back to parent session
+                    </button>
+                </div>
+            `}
             <div id="messages" role="log" aria-live="polite" ref=${messagesRef}>
-                ${parentSessionId.value && html`
-                    <div class="sa-breadcrumb">
-                        <button class="sa-breadcrumb-btn" onClick=${() => navigateToParentSession()}>
-                            \u2190 Back to parent session
-                        </button>
-                    </div>
-                `}
                 ${chatMessages.value.length === 0 && html`
                     <div class="empty-state">
                         ${internalActive

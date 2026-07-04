@@ -657,6 +657,29 @@ test('A1-4: fail-status stuck chip is also swept on rehydrate', () => {
     );
 });
 
+test('cancelled-status stuck chip is also swept on rehydrate (#1189 follow-up P3)', () => {
+    mock.timers.enable({ apis: ['setTimeout'] });
+
+    // "cancelled" is the third terminal status `subagent_completed`
+    // serializes (notifications.rs). Before the fix TERMINAL_STATUSES only
+    // held done/fail, so a cancelled chip that lost its timer in the
+    // session-switch window was never re-armed and stuck on the bar.
+    seedTerminalChipWithoutTimer(mod, 'reviewer', 'cancelled');
+    mock.timers.tick(60000);
+    assert.equal(
+        mod.activeSubagents.value.reviewer.status, 'cancelled',
+        'precondition: stuck cancelled chip survives a tick with no timer',
+    );
+
+    mod.rehydrateSubagentsFromHistory([]);
+
+    mock.timers.tick(15000);
+    assert.equal(
+        mod.activeSubagents.value.reviewer, undefined,
+        'cancelled is terminal — the sweep must re-arm its removal like done/fail',
+    );
+});
+
 test('A1-4: rehydrate runs the sweep even on the empty-history early return', () => {
     mock.timers.enable({ apis: ['setTimeout'] });
 

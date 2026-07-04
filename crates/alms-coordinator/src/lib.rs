@@ -133,6 +133,75 @@ pub struct SubagentCompletion {
     pub parent_tool_invocation_id: Option<Uuid>,
 }
 
+/// A subagent's most recent coarse activity signal, as emitted (post-dedup)
+/// by the subagent→parent relay for the parent's Subagent status bar.
+///
+/// `kind` is one of [`alms_tools::subagent_activity_kind`]; `tool` is the tool
+/// name (populated only for `tool_start`).
+///
+/// Recorded on the [`SubagentHandle`] so the CURRENT status stays queryable
+/// after the live `subagent_activity` SSE signal has fired (#1189 follow-up):
+/// the signal is ephemeral (never persisted/replayed) and deduplicated to one
+/// emission per activity transition, so a session-stream subscriber that
+/// attaches AFTER a transition — page reload, session switch back from the
+/// subagent view, a second tab, an SSE reconnect — would otherwise have no way
+/// to learn what the subagent is doing until the NEXT transition (which, in a
+/// long reasoning/writing phase, can be never). The gateway replays this
+/// snapshot to every newly-attached session stream.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubagentActivity {
+    pub kind: String,
+    pub tool: Option<String>,
+    /// The subagent's tool invocation id (tool kinds only). Recorded so the
+    /// attach-time snapshot replay carries the SAME id as the live signal —
+    /// that identity is what lets the client recognise the replay instead of
+    /// counting it as a new tool invocation (#1190), while parallel
+    /// invocations of the same tool (distinct ids) each count.
+    pub tool_invocation_id: Option<Uuid>,
+    /// The PARENT invoke_agent tool-invocation-id — the chip-resolution
+    /// correlator (#1190 Codex P2): the same id `subagent_started` carries,
+    /// which unnamed subagent chips are keyed by. Recorded so the attach-time
+    /// snapshot replay resolves to the RIGHT chip identity-exactly; the
+    /// task-derived `source_agent` label alone forces a first-match fallback
+    /// that can persistently cross-attach status between concurrent unnamed
+    /// subagents.
+    pub parent_tool_invocation_id: Option<Uuid>,
+}
+
+/// The frontend-facing label the relay tags a subagent's forwarded events
+/// with (`source_agent`): the subagent's registered name, or
+/// `subagent-{task_id_prefix}` for ephemeral/unnamed subagents. Single source
+/// of truth — used by the relay in `run_agent_loop` AND stored on the
+/// [`SubagentHandle`] so [`Coordinator::subagent_activity_snapshot`] reports
+/// the exact label the frontend keys its status-bar chips by.
+fn subagent_label(task_id: TaskId, subagent_name: Option<&str>) -> String {
+    subagent_name
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("subagent-{}", &task_id.0.to_string()[..8]))
+}
+
+/// One entry of [`Coordinator::subagent_activity_snapshot`]: the current
+/// coarse activity of an in-flight subagent, keyed by the `source_agent`
+/// label the frontend routes `subagent_activity` signals by.
+#[derive(Debug, Clone)]
+pub struct SubagentActivitySnapshot {
+    /// The relay's `source_agent` label (see [`subagent_label`]).
+    pub label: String,
+    /// Latest activity kind ([`alms_tools::subagent_activity_kind`]).
+    pub kind: String,
+    /// Tool name (only when `kind == "tool_start"`).
+    pub tool: Option<String>,
+    /// The subagent's tool invocation id (tool kinds only) — replayed
+    /// verbatim so the client's DISTINCT-id tool counting recognises the
+    /// snapshot as the already-counted in-progress invocation (#1190).
+    pub tool_invocation_id: Option<Uuid>,
+    /// The PARENT invoke_agent tool-invocation-id — replayed verbatim so the
+    /// client resolves the target chip identity-exactly (#1190 Codex P2).
+    pub parent_tool_invocation_id: Option<Uuid>,
+    /// The parent run the subagent was spawned from, when known.
+    pub parent_run_id: Option<RunId>,
+}
+
 /// Handle to a running subagent
 #[derive(Debug)]
 pub struct SubagentHandle {
@@ -147,6 +216,15 @@ pub struct SubagentHandle {
     pub subagent_session_id: SessionId,
     /// Whether this was spawned via `dispatch_background` (triggers completion notification).
     pub is_background: bool,
+    /// The relay's `source_agent` label for this subagent (see
+    /// [`subagent_label`]) — the key the frontend's status-bar chips resolve
+    /// forwarded signals by.
+    pub label: String,
+    /// The most recent coarse activity signal the relay emitted for this
+    /// subagent (post-dedup), or `None` before the first signal. Read by
+    /// [`Coordinator::subagent_activity_snapshot`] so a reattaching session
+    /// stream can be brought up to date.
+    pub latest_activity: Option<SubagentActivity>,
     /// Receiver for the final TaskResult — taken by `dispatch()` to await completion.
     pub result_rx: Option<oneshot::Receiver<TaskResult>>,
     /// Stored result for background tasks — set by `run_subagent` on completion
@@ -470,6 +548,8 @@ impl Coordinator {
             parent_agent_id,
             subagent_session_id: sub_session_id,
             is_background,
+            label: subagent_label(task_id, request.subagent_name.as_deref()),
+            latest_activity: None,
             result_rx: Some(result_rx),
             completed_result: None,
             error_rx: Some(error_rx),
@@ -562,6 +642,48 @@ impl Coordinator {
     /// Issue #920.
     pub fn take_error_rx(&self, task_id: TaskId) -> Option<oneshot::Receiver<AlmsError>> {
         self.subagents.get_mut(&task_id)?.error_rx.take()
+    }
+
+    /// The current coarse activity of every IN-FLIGHT subagent whose parent
+    /// session is `parent_session` (#1189 follow-up).
+    ///
+    /// The live `subagent_activity` SSE signal is ephemeral and deduplicated
+    /// to one emission per activity transition, so it only reaches the
+    /// session-stream subscribers attached at the instant of the transition.
+    /// The gateway calls this on every NEW session-stream attach and replays
+    /// the snapshot as synthetic `subagent_activity` events, so a client that
+    /// reattaches mid-phase (page reload, session switch back from the
+    /// subagent view, second tab, SSE reconnect) sees the subagent's current
+    /// status instead of a chip stuck on "Starting…" until the next
+    /// transition.
+    ///
+    /// Only Pending/Running subagents with at least one recorded signal are
+    /// returned — completed ones already surfaced their terminal status via
+    /// `subagent_completed`, and a subagent that has not emitted yet is
+    /// legitimately "Starting…".
+    pub fn subagent_activity_snapshot(
+        &self,
+        parent_session: SessionId,
+    ) -> Vec<SubagentActivitySnapshot> {
+        self.subagents
+            .iter()
+            .filter(|h| {
+                h.parent_session_id == parent_session
+                    && matches!(h.status, TaskStatus::Pending | TaskStatus::Running)
+            })
+            .filter_map(|h| {
+                h.latest_activity
+                    .as_ref()
+                    .map(|activity| SubagentActivitySnapshot {
+                        label: h.label.clone(),
+                        kind: activity.kind.clone(),
+                        tool: activity.tool.clone(),
+                        tool_invocation_id: activity.tool_invocation_id,
+                        parent_tool_invocation_id: activity.parent_tool_invocation_id,
+                        parent_run_id: h.parent_run_id,
+                    })
+            })
+            .collect()
     }
 }
 
@@ -867,7 +989,7 @@ async fn run_subagent(
             );
             (TaskStatus::Cancelled, serde_json::json!({"cancelled": true}), None, None, None)
         }
-        output = run_agent_loop(task_id, &request, sub_agent_id, &sub_context_id, &session_manager, &llm, parent_event_tx, self_event_fwd, &base_agent_config, workspace_dir.as_deref(), data_dir.as_deref(), project_root.as_deref(), &subagent_prompts, child_cancel_token.clone(), secrets.as_ref(), &security_config, is_background) => {
+        output = run_agent_loop(task_id, &request, sub_agent_id, &sub_context_id, &session_manager, &llm, parent_event_tx, self_event_fwd, &base_agent_config, workspace_dir.as_deref(), data_dir.as_deref(), project_root.as_deref(), &subagent_prompts, child_cancel_token.clone(), secrets.as_ref(), &security_config, is_background, subagents.clone()) => {
             match output {
                 Ok(run_output) => {
                     info!(
@@ -1405,6 +1527,11 @@ async fn run_agent_loop(
     secrets: Option<&Arc<parking_lot::RwLock<alms_core::secrets::SecretsStore>>>,
     security_config: &alms_core::config::SecurityConfig,
     is_background: bool,
+    // Shared handle map — the relay records each emitted (post-dedup)
+    // activity signal on this subagent's handle so
+    // `Coordinator::subagent_activity_snapshot` can replay the CURRENT status
+    // to session streams that attach after the signal fired (#1189 follow-up).
+    subagents: Arc<DashMap<TaskId, SubagentHandle>>,
 ) -> AlmsResult<RunOutput> {
     // Derive config based on whether the subagent is named (identity already resolved
     // by the caller via `derive_subagent_identity`).
@@ -1681,12 +1808,16 @@ async fn run_agent_loop(
     // re-emit has no painted partial to duplicate and the subagent's
     // `StreamReset` needs no parent-side retraction.
     if parent_event_tx.is_some() || self_event_tx.is_some() {
-        let label = request
-            .subagent_name
-            .clone()
-            .unwrap_or_else(|| format!("subagent-{}", &task_id.0.to_string()[..8]));
+        let label = subagent_label(task_id, request.subagent_name.as_deref());
+        // Chip-resolution correlator (#1190 Codex P2): the parent's
+        // invoke_agent invocation id, attached to every status signal (and
+        // the recorded snapshot) so the UI resolves the target chip
+        // identity-exactly — the task-derived label alone cross-attaches
+        // status between concurrent unnamed subagents.
+        let parent_inv = request.parent_tool_invocation_id;
         let parent_fwd = parent_event_tx;
         let self_fwd = self_event_tx;
+        let relay_subagents = subagents.clone();
         tokio::spawn(async move {
             use alms_runtime::RuntimeEvent;
             let mut rx = sub_rx;
@@ -1728,12 +1859,23 @@ async fn run_agent_loop(
                     // Everything else reduces to (at most) a deduped
                     // `subagent_activity` status signal or a tagged warning —
                     // see `forward_status_to_parent` for the full mapping and
-                    // the suppression rationale per variant.
+                    // the suppression rationale per variant. The record
+                    // callback stores the signal on the handle so a session
+                    // stream that attaches AFTER this (deduped, ephemeral)
+                    // emission can still learn the subagent's current status
+                    // via `subagent_activity_snapshot` (#1189 follow-up).
+                    // Once per transition — same rate as the signal itself.
                     other => forward_status_to_parent(
                         parent_fwd.as_ref(),
                         &other,
                         &label,
+                        parent_inv,
                         &mut last_activity_kind,
+                        &mut |activity| {
+                            if let Some(mut handle) = relay_subagents.get_mut(&task_id) {
+                                handle.latest_activity = Some(activity.clone());
+                            }
+                        },
                     ),
                 }
             }
@@ -1827,26 +1969,52 @@ fn forward_event_to_self(self_fwd: &dyn EventForwarder, event: &alms_runtime::Ru
 ///     the event by value; it can never reach this borrowing helper in
 ///     production, and ignoring it here keeps the helper total.
 ///
+/// `parent_tool_invocation_id` (the parent invoke_agent invocation id, a
+/// per-subagent constant) is attached to EVERY emitted signal and to the
+/// recorded snapshot: it is the chip-resolution correlator the UI matches
+/// identity-exactly (#1190 Codex P2) — without it, concurrent unnamed
+/// subagents resolve by a first-match label fallback that can persistently
+/// cross-attach one subagent's status to another's chip.
+///
 /// Dedup (`last_activity_kind`): reasoning/token deltas arrive per-chunk, at
 /// high frequency. The bar only changes when the activity *kind* changes, so
 /// consecutive deltas of the same kind collapse into a single signal — the
 /// parent stream sees one event per phase transition instead of one per
 /// chunk. Tool boundaries always emit (they carry / clear the tool name) and
 /// also update the state, so a delta after a tool boundary re-emits its kind.
+///
+/// `record_before_emit` receives each activity signal this function is about
+/// to emit (never suppressed / deduped / warning events), and is invoked
+/// STRICTLY BEFORE the wire emission. The relay uses it to store the signal
+/// on the `SubagentHandle` for [`Coordinator::subagent_activity_snapshot`]
+/// (#1189 follow-up) — the live signal itself is ephemeral and fires at most
+/// once per transition, so it alone cannot serve subscribers that attach
+/// later. The record-then-emit ordering matters (Tim on #1190): if the handle
+/// were updated AFTER the emission, a `subagent_activity_snapshot` read racing
+/// a fresh emission could return the PREVIOUS kind while the live event had
+/// already reached a newly-attached subscriber — the mirror of the reattach
+/// bug, with no correcting re-emit until the next transition. Recording first
+/// makes the snapshot at-least-as-new as anything on the wire.
 fn forward_status_to_parent(
     parent_fwd: &dyn EventForwarder,
     event: &alms_runtime::RuntimeEvent,
     label: &str,
+    parent_tool_invocation_id: Option<Uuid>,
     last_activity_kind: &mut Option<&'static str>,
+    record_before_emit: &mut dyn FnMut(&SubagentActivity),
 ) {
     use alms_runtime::RuntimeEvent;
     use alms_tools::subagent_activity_kind as kind;
 
-    let (activity_kind, tool) = match event {
-        RuntimeEvent::ToolStart { tool, .. } => (kind::TOOL_START, Some(tool.clone())),
-        RuntimeEvent::ToolEnd { .. } => (kind::TOOL_END, None),
-        RuntimeEvent::ReasoningDelta { .. } => (kind::REASONING, None),
-        RuntimeEvent::TokenDelta { .. } => (kind::WRITING, None),
+    let (activity_kind, tool, tool_invocation_id) = match event {
+        RuntimeEvent::ToolStart {
+            invocation_id,
+            tool,
+            ..
+        } => (kind::TOOL_START, Some(tool.clone()), Some(*invocation_id)),
+        RuntimeEvent::ToolEnd { invocation_id, .. } => (kind::TOOL_END, None, Some(*invocation_id)),
+        RuntimeEvent::ReasoningDelta { .. } => (kind::REASONING, None, None),
+        RuntimeEvent::TokenDelta { .. } => (kind::WRITING, None, None),
         RuntimeEvent::Warning { code, message, .. } => {
             parent_fwd.forward_warning(code.clone(), message.clone(), Some(label.to_string()));
             return;
@@ -1863,7 +2031,22 @@ fn forward_status_to_parent(
         return;
     }
     *last_activity_kind = Some(activity_kind);
-    parent_fwd.forward_subagent_activity(activity_kind.to_string(), tool, Some(label.to_string()));
+    let activity = SubagentActivity {
+        kind: activity_kind.to_string(),
+        tool,
+        tool_invocation_id,
+        parent_tool_invocation_id,
+    };
+    // Record BEFORE emitting — see the doc comment above for why the order
+    // is load-bearing.
+    record_before_emit(&activity);
+    parent_fwd.forward_subagent_activity(
+        activity.kind.clone(),
+        activity.tool.clone(),
+        activity.tool_invocation_id,
+        activity.parent_tool_invocation_id,
+        Some(label.to_string()),
+    );
 }
 
 #[cfg(test)]
@@ -1871,6 +2054,13 @@ impl Coordinator {
     /// Get the completed result for a finished background task (test-only).
     pub fn get_completed_result(&self, task_id: TaskId) -> Option<TaskResult> {
         self.subagents.get(&task_id)?.completed_result.clone()
+    }
+
+    /// Get the latest recorded activity signal for a task (test-only) —
+    /// recorded by the relay regardless of task status, unlike
+    /// `subagent_activity_snapshot` which filters to in-flight tasks.
+    pub fn latest_activity_for(&self, task_id: TaskId) -> Option<SubagentActivity> {
+        self.subagents.get(&task_id)?.latest_activity.clone()
     }
 
     /// Cancel a running subagent (test-only).
@@ -2183,8 +2373,15 @@ mod tests {
     // -- Subagent status bar: `forward_status_to_parent` (#1180 follow-up) --
 
     /// One captured `forward_subagent_activity` call:
-    /// (kind, tool, source_agent).
-    type CapturedActivity = (String, Option<String>, Option<String>);
+    /// (kind, tool, tool_invocation_id, parent_tool_invocation_id,
+    /// source_agent).
+    type CapturedActivity = (
+        String,
+        Option<String>,
+        Option<uuid::Uuid>,
+        Option<uuid::Uuid>,
+        Option<String>,
+    );
 
     /// Records every `forward_subagent_activity` / `forward_warning` call and
     /// asserts (via panics) that NO content-carrying forward method is ever
@@ -2228,9 +2425,17 @@ mod tests {
             &self,
             kind: String,
             tool: Option<String>,
+            tool_invocation_id: Option<uuid::Uuid>,
+            parent_tool_invocation_id: Option<uuid::Uuid>,
             source_agent: Option<String>,
         ) {
-            self.activity.lock().push((kind, tool, source_agent));
+            self.activity.lock().push((
+                kind,
+                tool,
+                tool_invocation_id,
+                parent_tool_invocation_id,
+                source_agent,
+            ));
         }
         fn forward_stream_reset(&self) {
             panic!("parent relay must not forward subagent stream resets (#1186)");
@@ -2258,9 +2463,9 @@ mod tests {
         }
     }
 
-    fn tool_start_event(tool: &str) -> alms_runtime::RuntimeEvent {
+    fn tool_start_event(tool: &str, invocation_id: uuid::Uuid) -> alms_runtime::RuntimeEvent {
         alms_runtime::RuntimeEvent::ToolStart {
-            invocation_id: uuid::Uuid::new_v4(),
+            invocation_id,
             tool: tool.to_string(),
             params: serde_json::json!({"huge": "payload"}),
             source_agent: None,
@@ -2268,9 +2473,9 @@ mod tests {
         }
     }
 
-    fn tool_end_event() -> alms_runtime::RuntimeEvent {
+    fn tool_end_event(invocation_id: uuid::Uuid) -> alms_runtime::RuntimeEvent {
         alms_runtime::RuntimeEvent::ToolEnd {
-            invocation_id: uuid::Uuid::new_v4(),
+            invocation_id,
             ok: true,
             result: serde_json::json!({"huge": "result"}),
             source_agent: None,
@@ -2287,22 +2492,64 @@ mod tests {
     fn test_forward_status_to_parent_dedups_and_strips_content() {
         let fwd = StatusCapturingForwarder::default();
         let mut last: Option<&'static str> = None;
+        let shell_inv = uuid::Uuid::new_v4();
+        // The parent invoke_agent invocation id — a per-subagent constant the
+        // relay attaches to EVERY signal for identity-exact chip resolution
+        // (#1190 Codex P2).
+        let parent_inv = Some(uuid::Uuid::new_v4());
 
         // Burst of reasoning deltas -> ONE `reasoning` signal.
         for _ in 0..5 {
-            forward_status_to_parent(&fwd, &reasoning_event(), "reviewer", &mut last);
+            forward_status_to_parent(
+                &fwd,
+                &reasoning_event(),
+                "reviewer",
+                parent_inv,
+                &mut last,
+                &mut |_| {},
+            );
         }
-        // Tool boundary -> `tool_start` (with name) then `tool_end`.
-        forward_status_to_parent(&fwd, &tool_start_event("shell"), "reviewer", &mut last);
-        forward_status_to_parent(&fwd, &tool_end_event(), "reviewer", &mut last);
+        // Tool boundary -> `tool_start` (with name) then `tool_end`, both
+        // carrying the tool's invocation id (#1190 — the UI's toolsUsed
+        // idempotency key).
+        forward_status_to_parent(
+            &fwd,
+            &tool_start_event("shell", shell_inv),
+            "reviewer",
+            parent_inv,
+            &mut last,
+            &mut |_| {},
+        );
+        forward_status_to_parent(
+            &fwd,
+            &tool_end_event(shell_inv),
+            "reviewer",
+            parent_inv,
+            &mut last,
+            &mut |_| {},
+        );
         // Reasoning resumes after the tool -> a fresh `reasoning` signal
         // (the tool boundary reset the dedup state).
         for _ in 0..3 {
-            forward_status_to_parent(&fwd, &reasoning_event(), "reviewer", &mut last);
+            forward_status_to_parent(
+                &fwd,
+                &reasoning_event(),
+                "reviewer",
+                parent_inv,
+                &mut last,
+                &mut |_| {},
+            );
         }
         // Then the answer streams -> ONE `writing` signal.
         for _ in 0..4 {
-            forward_status_to_parent(&fwd, &token_event(), "reviewer", &mut last);
+            forward_status_to_parent(
+                &fwd,
+                &token_event(),
+                "reviewer",
+                parent_inv,
+                &mut last,
+                &mut |_| {},
+            );
         }
 
         let got = fwd.activity.lock().clone();
@@ -2310,17 +2557,39 @@ mod tests {
         assert_eq!(
             got,
             vec![
-                ("reasoning".to_string(), None, label.clone()),
+                (
+                    "reasoning".to_string(),
+                    None,
+                    None,
+                    parent_inv,
+                    label.clone()
+                ),
                 (
                     "tool_start".to_string(),
                     Some("shell".to_string()),
+                    Some(shell_inv),
+                    parent_inv,
                     label.clone()
                 ),
-                ("tool_end".to_string(), None, label.clone()),
-                ("reasoning".to_string(), None, label.clone()),
-                ("writing".to_string(), None, label.clone()),
+                (
+                    "tool_end".to_string(),
+                    None,
+                    Some(shell_inv),
+                    parent_inv,
+                    label.clone()
+                ),
+                (
+                    "reasoning".to_string(),
+                    None,
+                    None,
+                    parent_inv,
+                    label.clone()
+                ),
+                ("writing".to_string(), None, None, parent_inv, label.clone()),
             ],
-            "expected exactly one tagged signal per activity transition"
+            "expected exactly one tagged signal per activity transition, with \
+             the child invocation id on the tool kinds and the parent \
+             correlator on EVERY signal"
         );
     }
 
@@ -2331,21 +2600,53 @@ mod tests {
         let fwd = StatusCapturingForwarder::default();
         let mut last: Option<&'static str> = None;
 
-        forward_status_to_parent(&fwd, &tool_start_event("shell"), "worker", &mut last);
-        forward_status_to_parent(&fwd, &tool_end_event(), "worker", &mut last);
-        forward_status_to_parent(&fwd, &tool_start_event("shell"), "worker", &mut last);
-        forward_status_to_parent(&fwd, &tool_end_event(), "worker", &mut last);
+        let first_inv = uuid::Uuid::new_v4();
+        let second_inv = uuid::Uuid::new_v4();
+        forward_status_to_parent(
+            &fwd,
+            &tool_start_event("shell", first_inv),
+            "worker",
+            None,
+            &mut last,
+            &mut |_| {},
+        );
+        forward_status_to_parent(
+            &fwd,
+            &tool_end_event(first_inv),
+            "worker",
+            None,
+            &mut last,
+            &mut |_| {},
+        );
+        forward_status_to_parent(
+            &fwd,
+            &tool_start_event("shell", second_inv),
+            "worker",
+            None,
+            &mut last,
+            &mut |_| {},
+        );
+        forward_status_to_parent(
+            &fwd,
+            &tool_end_event(second_inv),
+            "worker",
+            None,
+            &mut last,
+            &mut |_| {},
+        );
 
-        let kinds: Vec<String> = fwd
-            .activity
-            .lock()
-            .iter()
-            .map(|(k, _, _)| k.clone())
-            .collect();
+        let got = fwd.activity.lock().clone();
+        let kinds: Vec<String> = got.iter().map(|(k, _, _, _, _)| k.clone()).collect();
         assert_eq!(
             kinds,
             vec!["tool_start", "tool_end", "tool_start", "tool_end"]
         );
+        // The two same-tool invocations carry DISTINCT invocation ids — the
+        // identity the UI counts by (#1190): a re-run (or parallel sibling)
+        // of the same tool is a new invocation, not a replay.
+        assert_eq!(got[0].2, Some(first_inv));
+        assert_eq!(got[2].2, Some(second_inv));
+        assert_ne!(got[0].2, got[2].2);
     }
 
     /// Warnings still pass through, tagged with the subagent label; the
@@ -2365,7 +2666,9 @@ mod tests {
                 source_agent: None,
             },
             "reviewer",
+            None,
             &mut last,
+            &mut |_| {},
         );
         forward_status_to_parent(
             &fwd,
@@ -2374,7 +2677,9 @@ mod tests {
                 detail: None,
             },
             "reviewer",
+            None,
             &mut last,
+            &mut |_| {},
         );
         forward_status_to_parent(
             &fwd,
@@ -2382,7 +2687,9 @@ mod tests {
                 source_agent: Some("reviewer".to_string()),
             },
             "reviewer",
+            None,
             &mut last,
+            &mut |_| {},
         );
         forward_status_to_parent(
             &fwd,
@@ -2393,7 +2700,9 @@ mod tests {
                 background: false,
             },
             "reviewer",
+            None,
             &mut last,
+            &mut |_| {},
         );
 
         assert_eq!(
@@ -2408,9 +2717,97 @@ mod tests {
         // A StreamReset must not clear the dedup state either: the next
         // same-kind delta after a buffered-fallback re-emit stays deduped
         // (the bar's label is already correct).
-        forward_status_to_parent(&fwd, &reasoning_event(), "reviewer", &mut last);
-        forward_status_to_parent(&fwd, &reasoning_event(), "reviewer", &mut last);
+        forward_status_to_parent(
+            &fwd,
+            &reasoning_event(),
+            "reviewer",
+            None,
+            &mut last,
+            &mut |_| {},
+        );
+        forward_status_to_parent(
+            &fwd,
+            &reasoning_event(),
+            "reviewer",
+            None,
+            &mut last,
+            &mut |_| {},
+        );
         assert_eq!(fwd.activity.lock().len(), 1);
+    }
+
+    /// The snapshot recording must land BEFORE the wire emission (Tim on
+    /// #1190): if the handle were updated after the fact, a
+    /// `subagent_activity_snapshot` read racing a fresh emission could return
+    /// the PREVIOUS kind while the live event had already reached a
+    /// newly-attached subscriber — the mirror of the reattach bug, with no
+    /// correcting re-emit until the next transition.
+    #[test]
+    fn test_forward_status_to_parent_records_before_emitting() {
+        /// Forwarder that appends "emit" to a shared order log on the wire
+        /// call; the record callback appends "record".
+        #[derive(Debug)]
+        struct OrderLoggingForwarder {
+            log: Arc<parking_lot::Mutex<Vec<&'static str>>>,
+        }
+        impl EventForwarder for OrderLoggingForwarder {
+            fn forward_tool_start(
+                &self,
+                _: uuid::Uuid,
+                _: String,
+                _: serde_json::Value,
+                _: Option<String>,
+                _: Option<String>,
+            ) {
+            }
+            fn forward_tool_end(
+                &self,
+                _: uuid::Uuid,
+                _: bool,
+                _: serde_json::Value,
+                _: Option<String>,
+                _: Option<String>,
+            ) {
+            }
+            fn forward_token_delta(&self, _: String, _: Option<String>) {}
+            fn forward_subagent_activity(
+                &self,
+                _: String,
+                _: Option<String>,
+                _: Option<uuid::Uuid>,
+                _: Option<uuid::Uuid>,
+                _: Option<String>,
+            ) {
+                self.log.lock().push("emit");
+            }
+            fn forward_stream_reset(&self) {}
+            fn forward_status(&self, _: String, _: Option<String>) {}
+            fn forward_warning(&self, _: String, _: String, _: Option<String>) {}
+            fn forward_run_terminal(&self, _: alms_tools::SubagentRunOutcome) {}
+        }
+
+        let log = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let fwd = OrderLoggingForwarder { log: log.clone() };
+        let mut last: Option<&'static str> = None;
+
+        forward_status_to_parent(
+            &fwd,
+            &token_event(),
+            "reviewer",
+            None,
+            &mut last,
+            &mut |activity| {
+                assert_eq!(activity.kind, "writing");
+                log.lock().push("record");
+            },
+        );
+
+        assert_eq!(
+            *log.lock(),
+            vec!["record", "emit"],
+            "the handle recording must strictly precede the wire emission so \
+             a snapshot read can never lag a live signal"
+        );
     }
 
     /// #1180 (foreground): a foreground subagent run streams its (untagged) run
@@ -2495,6 +2892,199 @@ mod tests {
             "background subagent must stream content + a terminal (run_finished) \
              to its OWN session sink, got {got:?}"
         );
+    }
+
+    // -- Subagent status snapshot (#1189 follow-up) ------------------------------
+
+    /// END-TO-END emission + recording for a REAL background subagent run:
+    /// the mock LLM streams the response word-by-word, the runtime emits
+    /// per-chunk `TokenDelta`s on the subagent's event channel, and the REAL
+    /// relay (spawned by `run_agent_loop`) must (a) reduce them to exactly ONE
+    /// tagged `writing` signal on the parent forwarder and (b) record that
+    /// signal on the SubagentHandle so `subagent_activity_snapshot` can
+    /// replay it to session streams that attach later.
+    ///
+    /// (b) is the regression target for the "chip stuck on Starting…" bug:
+    /// the live signal fires at most once per activity transition and is
+    /// never persisted, so without the handle recording there is nothing left
+    /// for a reattaching client to consume.
+    #[tokio::test]
+    async fn test_bg_dispatch_relay_emits_and_records_latest_activity() {
+        let coord = test_coordinator();
+        let fwd = Arc::new(StatusCapturingForwarder::default());
+        let parent_session = test_session_id();
+        // The parent's invoke_agent invocation id (what InvokeAgentTool
+        // supplies in production) — must ride EVERY status signal and the
+        // recorded snapshot as the chip-resolution correlator (#1190).
+        let parent_inv = uuid::Uuid::new_v4();
+
+        let (task_uuid, _sub_session_id) = coord
+            .dispatch_background(
+                "Background work".to_string(),
+                parent_session,
+                test_parent_agent_id(),
+                None,
+                Some(fwd.clone() as Arc<dyn EventForwarder>),
+                None,
+                None,
+                Some(parent_inv),
+            )
+            .await
+            .expect("dispatch_background should succeed");
+        let tid = TaskId(task_uuid);
+
+        // Wait until the relay has drained the run's deltas: at least one
+        // activity signal captured AND the recording landed on the handle.
+        let mut recorded = None;
+        for _ in 0..100 {
+            recorded = coord.latest_activity_for(tid);
+            if recorded.is_some() && !fwd.activity.lock().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        // (a) The relay emitted exactly one deduplicated `writing` signal
+        // (the mock LLM streams visible tokens only), tagged with the
+        // backend label the frontend keys chips by.
+        let expected_label = format!("subagent-{}", &task_uuid.to_string()[..8]);
+        let got = fwd.activity.lock().clone();
+        assert_eq!(
+            got,
+            vec![(
+                "writing".to_string(),
+                None,
+                None,
+                Some(parent_inv),
+                Some(expected_label.clone())
+            )],
+            "a real streamed run must reduce to one tagged `writing` signal \
+             carrying the parent invoke_agent correlator"
+        );
+
+        // (b) The same signal was recorded on the handle for snapshot replay.
+        assert_eq!(
+            recorded,
+            Some(SubagentActivity {
+                kind: "writing".to_string(),
+                tool: None,
+                tool_invocation_id: None,
+                parent_tool_invocation_id: Some(parent_inv),
+            }),
+            "the relay must record its emitted signal on the SubagentHandle — \
+             without it, a session stream attaching after the (ephemeral, \
+             deduplicated) live signal has no way to learn the subagent's \
+             current status and the chip sticks on 'Starting…'"
+        );
+
+        // The handle's label matches what the signals were tagged with, so
+        // the snapshot resolves to the same chip the live signal targeted.
+        let handle_label = coord.subagents.get(&tid).map(|h| h.label.clone());
+        assert_eq!(handle_label, Some(expected_label));
+    }
+
+    /// `subagent_activity_snapshot` returns the current activity of in-flight
+    /// subagents for the requested parent session ONLY: terminal tasks are
+    /// excluded (their chips already got `subagent_completed`), tasks with no
+    /// recorded signal are excluded (legitimately "Starting…"), and other
+    /// sessions' subagents never leak in.
+    #[tokio::test]
+    async fn test_subagent_activity_snapshot_filters_running_and_session() {
+        let coord = test_coordinator();
+        let session_a = test_session_id();
+        let session_b = test_session_id();
+        let parent_agent = test_parent_agent_id();
+
+        let mk_handle = |status: TaskStatus,
+                         session: SessionId,
+                         label: &str,
+                         activity: Option<SubagentActivity>| {
+            let task_id = TaskId::new();
+            let (cancel_tx, _cancel_rx) = oneshot::channel();
+            SubagentHandle {
+                task_id,
+                status,
+                started_at: chrono::Utc::now(),
+                cancel_tx,
+                parent_run_id: None,
+                parent_session_id: session,
+                parent_agent_id: parent_agent,
+                subagent_session_id: SessionId::new(),
+                is_background: true,
+                label: label.to_string(),
+                latest_activity: activity,
+                result_rx: None,
+                completed_result: None,
+                error_rx: None,
+            }
+        };
+
+        let shell_inv = uuid::Uuid::new_v4();
+        let parent_inv = uuid::Uuid::new_v4();
+        let writing = SubagentActivity {
+            kind: "writing".to_string(),
+            tool: None,
+            tool_invocation_id: None,
+            parent_tool_invocation_id: None,
+        };
+        let using_shell = SubagentActivity {
+            kind: "tool_start".to_string(),
+            tool: Some("shell".to_string()),
+            tool_invocation_id: Some(shell_inv),
+            parent_tool_invocation_id: Some(parent_inv),
+        };
+
+        // In-flight on session A with a recorded signal — the one hit.
+        let running = mk_handle(
+            TaskStatus::Running,
+            session_a,
+            "subagent-aaaaaaaa",
+            Some(writing.clone()),
+        );
+        // In-flight on session A but nothing recorded yet — excluded.
+        let starting = mk_handle(TaskStatus::Running, session_a, "subagent-bbbbbbbb", None);
+        // Terminal on session A — excluded even with a recorded signal.
+        let done = mk_handle(
+            TaskStatus::Completed,
+            session_a,
+            "subagent-cccccccc",
+            Some(writing.clone()),
+        );
+        // In-flight on session B — excluded from session A's snapshot.
+        let other_session = mk_handle(
+            TaskStatus::Running,
+            session_b,
+            "reviewer",
+            Some(using_shell.clone()),
+        );
+
+        for h in [running, starting, done, other_session] {
+            coord.subagents.insert(h.task_id, h);
+        }
+
+        let snap = coord.subagent_activity_snapshot(session_a);
+        assert_eq!(
+            snap.len(),
+            1,
+            "only the in-flight session-A subagent with a recorded signal \
+             belongs in session A's snapshot, got {snap:?}"
+        );
+        assert_eq!(snap[0].label, "subagent-aaaaaaaa");
+        assert_eq!(snap[0].kind, "writing");
+        assert_eq!(snap[0].tool, None);
+
+        let snap_b = coord.subagent_activity_snapshot(session_b);
+        assert_eq!(snap_b.len(), 1);
+        assert_eq!(snap_b[0].label, "reviewer");
+        assert_eq!(snap_b[0].kind, "tool_start");
+        assert_eq!(snap_b[0].tool.as_deref(), Some("shell"));
+        // The recorded ids round-trip into the snapshot verbatim — the
+        // attach-time replay must carry the SAME child id as the live signal
+        // (distinct-id tool counting) and the SAME parent correlator
+        // (identity-exact chip resolution for concurrent unnamed subagents,
+        // #1190).
+        assert_eq!(snap_b[0].tool_invocation_id, Some(shell_inv));
+        assert_eq!(snap_b[0].parent_tool_invocation_id, Some(parent_inv));
     }
 
     // -- (c) #1105 -- spawn_subagent emits SubagentStarted onto parent's stream

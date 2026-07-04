@@ -177,6 +177,8 @@ impl SseEventData {
         run_id: RunId,
         kind: &str,
         tool: Option<String>,
+        tool_invocation_id: Option<uuid::Uuid>,
+        parent_tool_invocation_id: Option<uuid::Uuid>,
         source_agent: Option<String>,
     ) -> Self {
         Self::new(
@@ -185,6 +187,8 @@ impl SseEventData {
                 run_id: run_id.0.to_string(),
                 kind: kind.to_string(),
                 tool,
+                tool_invocation_id: tool_invocation_id.map(|id| id.to_string()),
+                parent_tool_invocation_id: parent_tool_invocation_id.map(|id| id.to_string()),
                 source_agent,
             },
         )
@@ -865,6 +869,19 @@ struct SubagentActivityData {
     kind: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool: Option<String>,
+    /// The subagent's tool invocation id (tool kinds only) — the UI counts
+    /// DISTINCT ids into the chip's `toolsUsed` (#1190), so a snapshot
+    /// replay (same id) is recognised while parallel same-tool invocations
+    /// (distinct ids) each count.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_invocation_id: Option<String>,
+    /// The PARENT invoke_agent tool-invocation-id — the chip-resolution
+    /// correlator (#1190): the same id `subagent_started` carries, which is
+    /// what unnamed subagent chips are keyed by. Lets the UI resolve the
+    /// target chip identity-exactly instead of first-matching by label
+    /// (which cross-attaches status between concurrent unnamed subagents).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parent_tool_invocation_id: Option<String>,
     /// The subagent label the frontend routes the signal by. Always set in
     /// practice; optional to mirror the other tagged payloads.
     #[serde(skip_serializing_if = "Option::is_none")]

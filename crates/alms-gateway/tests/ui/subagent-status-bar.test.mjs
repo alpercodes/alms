@@ -116,6 +116,7 @@ import {
     setSubagentSessionId,
     activeSubagents,
     clearAllSubagents,
+    rehydrateSubagentsFromHistory,
 } from ${JSON.stringify(realSubagentsUrl)};
 
 function signal(initial) {
@@ -190,6 +191,7 @@ export const __test = {
     signal, chatMessages, activeRunId, activeSession, dmParticipants,
     activeAgent, dmPeer, activeSubagents, trackSubagentStart,
     trackSubagentActivity, trackSubagentEnd, clearAllSubagents,
+    rehydrateSubagentsFromHistory,
 };
 `;
 
@@ -322,6 +324,223 @@ test('a subagent_activity for a gone/unknown subagent never creates a chip', () 
         'a signal for an unknown subagent must not resurrect/create a chip');
 });
 
+// ===========================================================================
+// Concurrent UNNAMED subagents: identity-exact chip resolution via the parent
+// invoke_agent correlator (#1190 Codex P2, structural gap). Unnamed chips are
+// keyed by the PARENT invoke_agent tool-invocation-id, but the backend labels
+// signals with the TASK id — a first-match `subagent-*` fallback can migrate
+// subagent B's status onto subagent A's chip, and the migration sticks. The
+// signal now carries `parent_tool_invocation_id` (same id as
+// `subagent_started` / the entry's stored toolInvocationId) so resolution is
+// exact; the label fallback remains only for correlator-less legacy signals.
+// ===========================================================================
+
+test('concurrent unnamed subagents: B\'s signal never lands on A\'s chip (exact correlator resolution)', () => {
+    reset();
+    // Two unnamed subagents in flight concurrently. Iteration order of
+    // activeSubagents follows insertion — A first — which is exactly what
+    // made the first-match fallback grab A's chip for B's signal.
+    T.trackSubagentStart('subagent', 'task A', 'aaaa000011112222');
+    T.trackSubagentStart('subagent', 'task B', 'bbbb000011112222');
+    const keyA = 'subagent-aaaa0000';
+    const keyB = 'subagent-bbbb0000';
+    assert.ok(T.activeSubagents.value[keyA]);
+    assert.ok(T.activeSubagents.value[keyB]);
+
+    const es = openStream('sess-1');
+
+    // B's signal arrives FIRST (arbitrary order — e.g. the attach-time
+    // snapshot replay iterates a DashMap). It carries B's parent correlator
+    // and B's backend task label.
+    es.emit('subagent_activity', {
+        source_agent: 'subagent-btask456', kind: 'writing',
+        parent_tool_invocation_id: 'bbbb000011112222',
+    });
+
+    // A's chip is untouched — B's status must NOT have migrated onto it.
+    const entryA = T.activeSubagents.value[keyA];
+    assert.ok(entryA, 'A\'s chip still lives under its own key');
+    assert.equal(entryA.activity, null,
+        'B\'s activity must never attach to A\'s chip');
+    // B's chip got the status, migrated to B's backend label.
+    const entryB = T.activeSubagents.value['subagent-btask456'];
+    assert.ok(entryB, 'B\'s chip migrated to B\'s backend label');
+    assert.equal(entryB.toolInvocationId, 'bbbb000011112222',
+        'the migrated entry is genuinely B (parent invocation id preserved)');
+    assert.deepEqual(entryB.activity, { kind: 'writing', tool: null });
+    assert.equal(T.activeSubagents.value[keyB], undefined,
+        'B\'s start-time key migrated away');
+
+    // A's signal then lands on A's chip.
+    es.emit('subagent_activity', {
+        source_agent: 'subagent-atask123', kind: 'tool_start', tool: 'shell',
+        tool_invocation_id: 'tid-a1',
+        parent_tool_invocation_id: 'aaaa000011112222',
+    });
+    const migratedA = T.activeSubagents.value['subagent-atask123'];
+    assert.ok(migratedA, 'A\'s chip migrated to A\'s backend label');
+    assert.equal(migratedA.toolInvocationId, 'aaaa000011112222');
+    assert.deepEqual(migratedA.activity, { kind: 'tool_start', tool: 'shell' });
+    assert.equal(migratedA.toolsUsed, 1);
+    // B unchanged by A's signal.
+    assert.deepEqual(T.activeSubagents.value['subagent-btask456'].activity,
+        { kind: 'writing', tool: null });
+});
+
+test('concurrent unnamed subagents: snapshot replay resolves exactly in BOTH orders', () => {
+    for (const order of [['A', 'B'], ['B', 'A']]) {
+        reset();
+        T.trackSubagentStart('subagent', 'task A', 'aaaa000011112222');
+        T.trackSubagentStart('subagent', 'task B', 'bbbb000011112222');
+        const es = openStream('sess-1');
+
+        const signals = {
+            A: {
+                source_agent: 'subagent-atask123', kind: 'tool_start',
+                tool: 'shell', tool_invocation_id: 'tid-a1',
+                parent_tool_invocation_id: 'aaaa000011112222',
+            },
+            B: {
+                source_agent: 'subagent-btask456', kind: 'writing',
+                parent_tool_invocation_id: 'bbbb000011112222',
+            },
+        };
+
+        // Live signals land once...
+        es.emit('subagent_activity', signals[order[0]]);
+        es.emit('subagent_activity', signals[order[1]]);
+        // ...then an EventSource reconnect replays the CURRENT snapshot of
+        // both subagents — again in this order.
+        es.emit('subagent_activity', signals[order[0]]);
+        es.emit('subagent_activity', signals[order[1]]);
+
+        const a = T.activeSubagents.value['subagent-atask123'];
+        const b = T.activeSubagents.value['subagent-btask456'];
+        assert.ok(a, `[order ${order}] A resolves to its own chip`);
+        assert.ok(b, `[order ${order}] B resolves to its own chip`);
+        assert.equal(a.toolInvocationId, 'aaaa000011112222',
+            `[order ${order}] A's chip is keyed to A's parent invocation`);
+        assert.equal(b.toolInvocationId, 'bbbb000011112222',
+            `[order ${order}] B's chip is keyed to B's parent invocation`);
+        assert.deepEqual(a.activity, { kind: 'tool_start', tool: 'shell' },
+            `[order ${order}] A shows A's status`);
+        assert.deepEqual(b.activity, { kind: 'writing', tool: null },
+            `[order ${order}] B shows B's status`);
+        assert.equal(a.toolsUsed, 1,
+            `[order ${order}] the snapshot replay did not recount A's tool`);
+        assert.equal(b.toolsUsed, 0,
+            `[order ${order}] A's tool never leaked onto B's count`);
+        assert.equal(Object.keys(T.activeSubagents.value).length, 2,
+            `[order ${order}] exactly the two chips remain — no ghost entries`);
+    }
+});
+
+test('a signal matching a TERMINAL entry is DROPPED — a same-named re-invocation starts fresh (#1190 r4 Codex P2)', () => {
+    reset();
+    T.trackSubagentStart('reviewer', 'first run', 'inv-1');
+    const es = openStream('sess-1');
+
+    // First invocation uses a tool, then completes.
+    es.emit('subagent_activity', {
+        source_agent: 'reviewer', kind: 'tool_start', tool: 'shell',
+        tool_invocation_id: 'tid-1', parent_tool_invocation_id: 'inv-1',
+    });
+    es.emit('subagent_completed', {
+        subagent_name: 'reviewer', status: 'done',
+        subagent_session_id: 'sub-1', summary: 'ok',
+    });
+    assert.equal(T.activeSubagents.value.reviewer.status, 'done');
+
+    // A stale signal for the FINISHED invocation straggles in (e.g. a
+    // snapshot replay racing completion). Its correlator resolves to the
+    // terminal entry: the signal must be DROPPED — neither applied to the
+    // terminal chip nor buffered under the name. Buffering it is the bug:
+    // the next same-named invocation within the 30s pending window would
+    // consume the name-keyed buffer at entry creation and seed the fresh
+    // chip with the completed run's activity/tool count.
+    es.emit('subagent_activity', {
+        source_agent: 'reviewer', kind: 'tool_start', tool: 'fs_read',
+        tool_invocation_id: 'tid-9', parent_tool_invocation_id: 'inv-1',
+    });
+    assert.equal(T.activeSubagents.value.reviewer.status, 'done');
+    assert.deepEqual(T.activeSubagents.value.reviewer.activity,
+        { kind: 'tool_start', tool: 'shell' },
+        'the terminal chip is untouched by the stale signal');
+    assert.equal(T.activeSubagents.value.reviewer.toolsUsed, 1,
+        'the terminal chip count is untouched by the stale signal');
+
+    // Re-invoke the same-named subagent within the pending window: the
+    // fresh chip must NOT inherit the finished invocation's status.
+    T.trackSubagentStart('reviewer', 'second run', 'inv-2');
+    const fresh = T.activeSubagents.value.reviewer;
+    assert.equal(fresh.status, 'running');
+    assert.equal(fresh.activity, null,
+        'the fresh chip starts on "Starting…" — no stale activity carryover');
+    assert.equal(fresh.toolsUsed, 0,
+        'no stale tool-count carryover from the completed invocation');
+});
+
+test('correlator with no id-match falls back to the EXACT direct label hit — not buffered forever (#1190 r4 Tim)', () => {
+    reset();
+    // Nonstandard creation path: the entry's stored toolInvocationId is
+    // missing (legacy tool_start without an id), so the signal's correlator
+    // can never id-match it — but the label matches directly, which is
+    // itself identity-exact (only the first-match LOOP is ambiguous).
+    T.trackSubagentStart('reviewer', 'task', undefined);
+    assert.equal(T.activeSubagents.value.reviewer.toolInvocationId, null);
+
+    const es = openStream('sess-1');
+    es.emit('subagent_activity', {
+        source_agent: 'reviewer', kind: 'writing',
+        parent_tool_invocation_id: 'inv-X',
+    });
+    assert.deepEqual(T.activeSubagents.value.reviewer.activity,
+        { kind: 'writing', tool: null },
+        'the direct label hit resolves the chip instead of buffering the '
+        + 'signal forever on "Starting…"');
+});
+
+test('a straggler whose correlator mismatches the label entry\'s stored id is DROPPED (#1190 r5 Codex P2)', () => {
+    reset();
+    const es = openStream('sess-1');
+
+    // Invocation inv-1 of the named subagent runs and completes...
+    T.trackSubagentStart('reviewer', 'first run', 'inv-1');
+    es.emit('subagent_completed', {
+        subagent_name: 'reviewer', status: 'done',
+        subagent_session_id: 'sub-1', summary: 'ok',
+    });
+    // ...and inv-2 re-invokes under the same name, OVERWRITING the entry:
+    // the stored toolInvocationId is now inv-2, status running.
+    T.trackSubagentStart('reviewer', 'second run', 'inv-2');
+    assert.equal(T.activeSubagents.value.reviewer.toolInvocationId, 'inv-2');
+    assert.equal(T.activeSubagents.value.reviewer.status, 'running');
+
+    // A delayed/snapshot activity for INV-1 arrives. Its id-match finds
+    // nothing (inv-1's entry is gone), and the entry under the label stores
+    // a DIFFERENT id — so this is provably a straggler from a finished
+    // invocation. It must be DROPPED: taking the label hit would pin inv-1's
+    // stale activity/tool count onto inv-2's fresh chip — the exact
+    // stale-signal class the correlator exists to prevent.
+    es.emit('subagent_activity', {
+        source_agent: 'reviewer', kind: 'tool_start', tool: 'fs_read',
+        tool_invocation_id: 'tid-stale', parent_tool_invocation_id: 'inv-1',
+    });
+    const fresh = T.activeSubagents.value.reviewer;
+    assert.equal(fresh.activity, null,
+        'inv-1\'s stale activity must not land on inv-2\'s fresh chip');
+    assert.equal(fresh.toolsUsed, 0,
+        'inv-1\'s stale tool count must not land on inv-2\'s fresh chip');
+
+    // inv-2's OWN signals still resolve exactly (id-match).
+    es.emit('subagent_activity', {
+        source_agent: 'reviewer', kind: 'writing',
+        parent_tool_invocation_id: 'inv-2',
+    });
+    assert.deepEqual(T.activeSubagents.value.reviewer.activity,
+        { kind: 'writing', tool: null });
+});
+
 test('toolsUsed counts tool_start signals (feeds the completion card)', () => {
     reset();
     T.trackSubagentStart('reviewer', 'task', 'inv-1');
@@ -343,6 +562,132 @@ test('toolsUsed counts tool_start signals (feeds the completion card)', () => {
     const card = T.chatMessages.value.find(m => m.type === 'subagent_completed');
     assert.ok(card, 'completion card rendered');
     assert.equal(card.toolCount, 2, 'completion card reflects the counted tools');
+});
+
+test('parallel same-tool invocations both count — distinct ids, no interposed tool_end (#1190 Codex)', () => {
+    reset();
+    T.trackSubagentStart('reviewer', 'task', 'inv-1');
+    const es = openStream('sess-1');
+
+    // FullControl/Autonomous mode: `run_tool_calls_parallel` starts
+    // non-conflicting tool calls concurrently, so two tool_starts for the
+    // SAME tool can arrive back-to-back with NO interposed tool_end. The old
+    // same-tool/current-activity heuristic collapsed the second one as a
+    // "replay" — undercounting. Distinct invocation ids disambiguate.
+    es.emit('subagent_activity', {
+        source_agent: 'reviewer', kind: 'tool_start', tool: 'shell',
+        tool_invocation_id: 'tid-1',
+    });
+    es.emit('subagent_activity', {
+        source_agent: 'reviewer', kind: 'tool_start', tool: 'shell',
+        tool_invocation_id: 'tid-2',
+    });
+    assert.equal(T.activeSubagents.value.reviewer.toolsUsed, 2,
+        'two parallel invocations of the same tool are two tools');
+});
+
+test('a snapshot-replayed tool_start (same invocation id) does not inflate toolsUsed (#1190 Codex P2 + Tim)', () => {
+    reset();
+    T.trackSubagentStart('reviewer', 'task', 'inv-1');
+    const es = openStream('sess-1');
+
+    es.emit('subagent_activity', {
+        source_agent: 'reviewer', kind: 'tool_start', tool: 'shell',
+        tool_invocation_id: 'tid-1',
+    });
+    assert.equal(T.activeSubagents.value.reviewer.toolsUsed, 1);
+
+    // EventSource reconnect mid-tool: `attach_session_stream` replays the
+    // subagent's CURRENT activity as an ordinary `subagent_activity` — same
+    // invocation id as the live signal, which is what marks it as a replay
+    // rather than a new invocation.
+    es.emit('subagent_activity', {
+        source_agent: 'reviewer', kind: 'tool_start', tool: 'shell',
+        tool_invocation_id: 'tid-1',
+    });
+    assert.equal(T.activeSubagents.value.reviewer.toolsUsed, 1,
+        'an already-counted invocation id must not count again');
+    assert.deepEqual(T.activeSubagents.value.reviewer.activity,
+        { kind: 'tool_start', tool: 'shell' },
+        'the activity itself still refreshes');
+
+    // Repeated reconnects during the same long tool call do not drift.
+    es.emit('subagent_activity', {
+        source_agent: 'reviewer', kind: 'tool_start', tool: 'shell',
+        tool_invocation_id: 'tid-1',
+    });
+    es.emit('subagent_activity', {
+        source_agent: 'reviewer', kind: 'tool_start', tool: 'shell',
+        tool_invocation_id: 'tid-1',
+    });
+    assert.equal(T.activeSubagents.value.reviewer.toolsUsed, 1);
+});
+
+test('distinct sequential tool invocations still count', () => {
+    reset();
+    T.trackSubagentStart('reviewer', 'task', 'inv-1');
+    const es = openStream('sess-1');
+
+    es.emit('subagent_activity', {
+        source_agent: 'reviewer', kind: 'tool_start', tool: 'shell',
+        tool_invocation_id: 'tid-1',
+    });
+    es.emit('subagent_activity', {
+        source_agent: 'reviewer', kind: 'tool_end', tool_invocation_id: 'tid-1',
+    });
+    es.emit('subagent_activity', {
+        source_agent: 'reviewer', kind: 'tool_start', tool: 'shell',
+        tool_invocation_id: 'tid-2',
+    });
+    assert.equal(T.activeSubagents.value.reviewer.toolsUsed, 2,
+        'the same tool re-run under a fresh invocation id is a NEW invocation');
+
+    es.emit('subagent_activity', {
+        source_agent: 'reviewer', kind: 'tool_end', tool_invocation_id: 'tid-2',
+    });
+    es.emit('subagent_activity', {
+        source_agent: 'reviewer', kind: 'tool_start', tool: 'fs_read',
+        tool_invocation_id: 'tid-3',
+    });
+    assert.equal(T.activeSubagents.value.reviewer.toolsUsed, 3,
+        'a different tool counts too');
+});
+
+test('unnamed subagent: buffered early tool_start id survives into the entry — snapshot replay does not double count', () => {
+    reset();
+    const es = openStream('sess-1');
+
+    // Early signal for an UNNAMED subagent (backend task label) arrives
+    // BEFORE the entry exists (#1183) and is buffered WITH its invocation id.
+    es.emit('subagent_activity', {
+        source_agent: 'subagent-deadbeef', kind: 'tool_start', tool: 'shell',
+        tool_invocation_id: 'tid-1',
+    });
+
+    // Entry creation consumes the buffer: toolsUsed seeds to 1 AND the id is
+    // remembered as counted.
+    T.trackSubagentStart('subagent', 'task', 'abcdef0123456789');
+    const startKey = 'subagent-abcdef01';
+    assert.equal(T.activeSubagents.value[startKey].toolsUsed, 1);
+
+    // A reconnect snapshot replays the SAME in-progress tool_start: it must
+    // resolve (key migration) and refresh the status without recounting.
+    es.emit('subagent_activity', {
+        source_agent: 'subagent-deadbeef', kind: 'tool_start', tool: 'shell',
+        tool_invocation_id: 'tid-1',
+    });
+    const migrated = T.activeSubagents.value['subagent-deadbeef'];
+    assert.ok(migrated, 'entry migrated to the backend label');
+    assert.equal(migrated.toolsUsed, 1,
+        'the buffered id was already counted at entry creation — the snapshot '
+        + 'replay must not double count');
+
+    // A genuinely new parallel invocation still counts.
+    es.emit('subagent_activity', {
+        source_agent: 'subagent-deadbeef', kind: 'tool_start', tool: 'shell',
+        tool_invocation_id: 'tid-2',
+    });
+    assert.equal(T.activeSubagents.value['subagent-deadbeef'].toolsUsed, 2);
 });
 
 // ===========================================================================
@@ -623,6 +968,74 @@ test('subagentStatusLabel terminal states override activity', () => {
         subagentStatusLabel({ status: 'fail', activity: { kind: 'tool_start', tool: 'shell' } }),
         'Failed');
     assert.equal(subagentStatusLabel(null), '');
+});
+
+test('cancelled is terminal: label overrides stale activity (#1189 follow-up P3)', () => {
+    // A cancelled background subagent arrives via `subagent_completed` with
+    // status "cancelled" (notifications.rs). Without the dedicated branch the
+    // chip fell through to its stale activity for the whole auto-removal
+    // grace period.
+    assert.equal(
+        subagentStatusLabel({ status: 'cancelled', activity: { kind: 'writing', tool: null } }),
+        'Cancelled',
+        'a cancelled chip must not keep reading "Writing…"');
+    assert.equal(
+        subagentStatusLabel({ status: 'cancelled', activity: null }),
+        'Cancelled',
+        'a cancelled chip must not fall through to "Starting…"');
+});
+
+test('subagent_completed with status "cancelled" ends the chip as Cancelled', () => {
+    reset();
+    T.trackSubagentStart('reviewer', 'review the diff', 'inv-1');
+    const es = openStream('sess-1');
+
+    es.emit('subagent_activity', { source_agent: 'reviewer', kind: 'writing' });
+    es.emit('subagent_completed', {
+        subagent_name: 'reviewer', status: 'cancelled',
+        subagent_session_id: 'sub-sess-1', summary: '',
+    });
+
+    const entry = T.activeSubagents.value.reviewer;
+    assert.equal(entry.status, 'cancelled',
+        'the wire status must land on the entry verbatim');
+    assert.equal(subagentStatusLabel(entry), 'Cancelled',
+        'the chip must read "Cancelled", not the stale "Writing…"');
+});
+
+// ===========================================================================
+// Reattach snapshot (#1189 follow-up): the frontend leg of the fix for the
+// "chip stuck on Starting… while the subagent is actively writing" bug. On a
+// reload / session switch back, history rehydration re-creates the chip with
+// no activity, and the backend replays the subagent's CURRENT status to the
+// newly-attached session stream as a synthetic `subagent_activity` — which
+// must land on the rehydrated chip exactly like a live signal would.
+// ===========================================================================
+
+test('a snapshot signal arriving after reload rehydration updates the chip', () => {
+    reset();
+    // Reload while an unnamed background subagent is mid-write: rehydration
+    // re-creates the chip from the persisted invoke_agent row, with no
+    // activity — "Starting…".
+    T.rehydrateSubagentsFromHistory([
+        { id: 'inv-42', type: 'tool', tool: 'invoke_agent',
+          params: { task: 'long investigation' }, status: 'done',
+          result: { task_id: 'task-1', session_id: 'sub-sess-9' },
+          ts: '2026-07-02T10:00:00Z' },
+    ]);
+    const startKey = 'subagent-' + String('inv-42').slice(0, 8);
+    assert.ok(T.activeSubagents.value[startKey], 'rehydrate re-created the chip');
+    assert.equal(subagentStatusLabel(T.activeSubagents.value[startKey]), 'Starting…');
+
+    // The fresh stream attaches and the backend replays the status snapshot,
+    // tagged with the backend task label (different from the rehydrate key).
+    const es = openStream('sess-1');
+    es.emit('subagent_activity', { source_agent: 'subagent-deadbeef', kind: 'writing' });
+
+    const migrated = T.activeSubagents.value['subagent-deadbeef'];
+    assert.ok(migrated, 'the chip migrated to the backend label');
+    assert.equal(subagentStatusLabel(migrated), 'Writing…',
+        'the reattach snapshot must lift the chip out of "Starting…"');
 });
 
 // ===========================================================================

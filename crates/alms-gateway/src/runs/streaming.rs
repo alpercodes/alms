@@ -148,6 +148,54 @@ pub struct SessionEventsQuery {
     pub last_event_id: Option<String>,
 }
 
+/// Register a new live subscriber on a session's SSE stream and bring it up
+/// to date on in-flight subagent status (#1189 follow-up).
+///
+/// The `subagent_activity` signal that drives the Subagent status bar is
+/// ephemeral (never persisted/replayed) AND deduplicated at the source to one
+/// emission per activity transition — so it only ever reaches the subscribers
+/// attached at the instant of the transition. A client that attaches
+/// mid-phase (page reload, session switch back from the subagent view, a
+/// second tab, an EventSource reconnect) would otherwise render every
+/// in-flight subagent chip as "Starting…" until the subagent's NEXT kind
+/// transition, which during a long reasoning/writing phase can be minutes
+/// away — the exact live symptom this fixes. So after registering the sender
+/// we replay the coordinator's per-subagent activity snapshot as synthetic
+/// `subagent_activity` events on the new channel.
+///
+/// Snapshot events carry no `event_id` (they are live-channel events, never
+/// logged), so they pass the replay dedup filter in `stream_with_replay` and
+/// arrive after any persisted-event replay — the same ordering a genuinely
+/// live signal would have.
+///
+/// Shared by the `stream_session_events` handler and the reattach regression
+/// test so the test exercises the identical attach path the endpoint runs.
+pub(crate) fn attach_session_stream(
+    state: &AppState,
+    session_id: SessionId,
+) -> tokio::sync::mpsc::UnboundedReceiver<SseEventData> {
+    let (tx, rx) = event_channel();
+    state
+        .run_manager
+        .register_session_sender(session_id, tx.clone());
+    for snap in state.coordinator.subagent_activity_snapshot(session_id) {
+        // The frontend routes the signal purely by `source_agent`; `run_id`
+        // is carried for wire-shape parity with live signals (which use the
+        // parent's run id) and falls back to the nil UUID when the spawn
+        // predates run registration.
+        let run_id = snap.parent_run_id.unwrap_or(RunId(uuid::Uuid::nil()));
+        let _ = tx.send(SseEventData::subagent_activity(
+            run_id,
+            &snap.kind,
+            snap.tool,
+            snap.tool_invocation_id,
+            snap.parent_tool_invocation_id,
+            Some(snap.label),
+        ));
+    }
+    rx
+}
+
 /// GET /sessions/{session_id}/events — persistent session-level SSE stream.
 ///
 /// Unlike the per-run endpoint, this stream stays open across runs.
@@ -188,8 +236,7 @@ pub async fn stream_session_events(
         });
     let from_id = last_event_id.map(|id| id + 1).unwrap_or(0);
 
-    let (tx, rx) = event_channel();
-    state.run_manager.register_session_sender(session_id, tx);
+    let rx = attach_session_stream(&state, session_id);
 
     // Replay missed events on reconnect
     let logged_events = state

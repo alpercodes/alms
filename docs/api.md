@@ -698,17 +698,19 @@ Ordering invariant (paired with `tool_start` for `invoke_agent`):
 `subagent_activity`
 Coarse per-subagent status signal for the parent web UI's **Subagent status bar**. Emitted on the parent's stream while a subagent (foreground or background) is running; the coordinator's subagent→parent relay reduces the subagent's runtime events to these signals — the subagent's reasoning/token **text and tool params/results are not forwarded to the parent at all** (the full content streams to the subagent's own session, reachable by clicking the chip). Deduplicated at the source: consecutive deltas of the same kind collapse, so the parent sees roughly one event per activity transition.
 
-Like `status`, this event is **ephemeral**: not persisted to any event log and not replayed on SSE reconnect — the bar re-derives its status from fresh signals after a reload.
+Like `status`, this event is **ephemeral**: not persisted to any event log and not replayed by the `last_event_id` reconnect cursor. Because the source-side dedup means a signal fires at most once per transition, every **new** `GET /sessions/{id}/events` subscription is instead brought up to date at attach time: the gateway replays the CURRENT activity of each in-flight subagent for that session as synthetic `subagent_activity` events (same shape, no event id), so a client that attaches mid-phase — page reload, second tab, SSE reconnect — sees the subagent's live status immediately instead of waiting for its next transition.
 ```json
 {
   "run_id": "<uuid>",
   "kind": "tool_start",
   "tool": "shell",
+  "tool_invocation_id": "<uuid>",
+  "parent_tool_invocation_id": "<uuid>",
   "source_agent": "reviewer"
 }
 ```
 
-`kind` values: `reasoning` (producing extended-thinking output), `writing` (producing visible output tokens), `tool_start` (a tool began executing — the only kind that carries `tool`), `tool_end` (the tool finished). `tool` is omitted on the wire for the other kinds. `source_agent` is the subagent label the UI routes the signal by (for unnamed subagents: `subagent-{task_id_prefix}`).
+`kind` values: `reasoning` (producing extended-thinking output), `writing` (producing visible output tokens), `tool_start` (a tool began executing — the only kind that carries `tool`), `tool_end` (the tool finished). `tool` is omitted on the wire for the other kinds. `source_agent` is the subagent label the UI routes the signal by (for unnamed subagents: `subagent-{task_id_prefix}`). `tool_invocation_id` (tool kinds only, omitted otherwise) is the subagent's own tool-invocation UUID: the UI counts **distinct** ids into the chip's tool count, so an attach-time snapshot replay of the in-progress `tool_start` (which re-sends the **same** id) is recognised rather than recounted, while parallel invocations of the same tool (`run_tool_calls_parallel` — same `tool`, distinct ids, no interposed `tool_end`) each count. `parent_tool_invocation_id` (all kinds; omitted only for legacy spawn paths without one) is the **parent** `invoke_agent` tool-invocation-id — the same id `subagent_started` carries, which unnamed subagent chips are keyed by. The UI resolves the target chip by this correlator **identity-exactly**; without it, resolution falls back to a first-match on the task-derived `source_agent` label, which can persistently attach one concurrent unnamed subagent's status to another's chip on snapshot replay.
 
 `subagent_completed`
 Emitted on the parent's session SSE stream when a background subagent finishes. Foreground subagents do not produce this event because their final response arrives synchronously on the parent's `invoke_agent` `tool_end`; only background subagents go through the completion-notification path. Companion to `subagent_started` — same `subagent_session_id` value, so the frontend can render the "View session" link on the completion card without any additional resolution step.

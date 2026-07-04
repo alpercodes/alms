@@ -19,6 +19,11 @@ export function subagentStatusLabel(info) {
     if (!info) return '';
     if (info.status === 'done') return 'Done';
     if (info.status === 'fail') return 'Failed';
+    // A cancelled background subagent (`subagent_completed` with status
+    // "cancelled", see notifications.rs) is terminal too — without this
+    // branch it would fall through to the stale `activity` label below
+    // ("Writing…" / "Starting…") for its whole auto-removal grace period.
+    if (info.status === 'cancelled') return 'Cancelled';
     const activity = info.activity;
     if (!activity || !activity.kind) return 'Starting…';
     switch (activity.kind) {

@@ -201,6 +201,24 @@ pub enum RuntimeEvent {
         kind: String,
         /// Tool name, populated only for `tool_start`.
         tool: Option<String>,
+        /// The subagent's tool invocation id, populated for the tool kinds
+        /// (`tool_start` / `tool_end`) — carried from the subagent's own
+        /// `ToolStart` / `ToolEnd` events. The UI counts DISTINCT ids into
+        /// the chip's `toolsUsed` (#1190): an attach-time snapshot replay of
+        /// the in-progress `tool_start` re-sends the SAME id (recognised, not
+        /// recounted), while parallel invocations of the same tool
+        /// (`run_tool_calls_parallel`) carry distinct ids and each count —
+        /// which no name-based heuristic can distinguish.
+        tool_invocation_id: Option<uuid::Uuid>,
+        /// The PARENT `invoke_agent` tool-invocation-id — the chip-resolution
+        /// correlator (#1190 Codex P2). Unnamed subagent chips are keyed by
+        /// this id (it is the same id `subagent_started` carries), while the
+        /// backend `source_agent` label is task-id-derived; without the
+        /// correlator, a label-based first-match resolver can persistently
+        /// attach one concurrent unnamed subagent's status to another's chip
+        /// on attach-time snapshot replay. Distinct from `tool_invocation_id`
+        /// above, which is the CHILD tool's id (for tool counting).
+        parent_tool_invocation_id: Option<uuid::Uuid>,
         /// The subagent label this status belongs to. Always `Some` in
         /// practice — the UI routes the signal to the matching status-bar
         /// chip by this label.

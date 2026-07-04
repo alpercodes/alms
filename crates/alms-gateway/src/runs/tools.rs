@@ -81,11 +81,15 @@ impl alms_tools::EventForwarder for RuntimeEventForwarder {
         &self,
         kind: String,
         tool: Option<String>,
+        tool_invocation_id: Option<uuid::Uuid>,
+        parent_tool_invocation_id: Option<uuid::Uuid>,
         source_agent: Option<String>,
     ) {
         let _ = self.tx.send(RuntimeEvent::SubagentActivity {
             kind,
             tool,
+            tool_invocation_id,
+            parent_tool_invocation_id,
             source_agent,
         });
     }
@@ -203,13 +207,22 @@ pub(super) async fn forward_runtime_events(
             RuntimeEvent::SubagentActivity {
                 kind,
                 tool,
+                tool_invocation_id,
+                parent_tool_invocation_id,
                 source_agent,
             } => {
                 run_manager
                     .send_event(
                         run_id,
                         session_id,
-                        SseEventData::subagent_activity(run_id, &kind, tool, source_agent),
+                        SseEventData::subagent_activity(
+                            run_id,
+                            &kind,
+                            tool,
+                            tool_invocation_id,
+                            parent_tool_invocation_id,
+                            source_agent,
+                        ),
                     )
                     .await;
             }
@@ -623,11 +636,15 @@ pub fn route_bg_event(
         RuntimeEvent::SubagentActivity {
             kind,
             tool,
+            tool_invocation_id,
+            parent_tool_invocation_id,
             source_agent,
         } => Some(RoutedBgEvent::Transient(SseEventData::subagent_activity(
             bg_run_id,
             &kind,
             tool,
+            tool_invocation_id,
+            parent_tool_invocation_id,
             source_agent,
         ))),
         // Everything else is dropped. In particular the subagent's raw

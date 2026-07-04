@@ -38,6 +38,7 @@
 .sa-chip.running { border-color: var(--info); color: var(--info); }
 .sa-chip.done { border-color: var(--success); color: var(--success); opacity: 0.7; }
 .sa-chip.fail { border-color: var(--error); color: var(--error); opacity: 0.7; }
+.sa-chip.cancelled { border-color: var(--warning); color: var(--warning); opacity: 0.7; }
 .sa-chip:hover { background: var(--surface-4); }
 .sa-chip-name { font-weight: 600; }
 .sa-chip-status { color: var(--text-muted); }

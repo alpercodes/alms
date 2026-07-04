@@ -809,6 +809,8 @@ async fn test_bg_subagent_does_not_block_parent_run_drain() {
         .send(RuntimeEvent::SubagentActivity {
             kind: "tool_end".to_string(),
             tool: None,
+            tool_invocation_id: Some(uuid::Uuid::new_v4()),
+            parent_tool_invocation_id: Some(uuid::Uuid::new_v4()),
             source_agent: Some("worker".to_string()),
         })
         .unwrap();
@@ -1087,9 +1089,13 @@ async fn test_bg_subagent_activity_signal_forwarded_transient_and_content_droppe
     }
     let parent_fwd: Arc<dyn alms_tools::EventForwarder> = Arc::new(NoopForwarder);
 
+    let activity_inv = uuid::Uuid::new_v4();
+    let parent_inv = uuid::Uuid::new_v4();
     let mk_activity = || RuntimeEvent::SubagentActivity {
         kind: "tool_start".to_string(),
         tool: Some("shell".to_string()),
+        tool_invocation_id: Some(activity_inv),
+        parent_tool_invocation_id: Some(parent_inv),
         source_agent: Some("reviewer".to_string()),
     };
 
@@ -1116,6 +1122,19 @@ async fn test_bg_subagent_activity_signal_forwarded_transient_and_content_droppe
         );
         assert_eq!(sse.data["kind"].as_str(), Some("tool_start"));
         assert_eq!(sse.data["tool"].as_str(), Some("shell"));
+        assert_eq!(
+            sse.data["tool_invocation_id"].as_str(),
+            Some(activity_inv.to_string().as_str()),
+            "the tool invocation id must survive onto the wire — it is the \
+             UI's toolsUsed idempotency key (#1190)"
+        );
+        assert_eq!(
+            sse.data["parent_tool_invocation_id"].as_str(),
+            Some(parent_inv.to_string().as_str()),
+            "the parent invoke_agent correlator must survive onto the wire — \
+             it is the UI's identity-exact chip resolver, without which \
+             concurrent unnamed subagents cross-attach status (#1190)"
+        );
         assert_eq!(
             sse.data["run_id"].as_str(),
             Some(bg_run_id.0.to_string().as_str())
@@ -1201,6 +1220,8 @@ async fn test_subagent_activity_sse_is_ephemeral_not_persisted() {
                 run_id,
                 "reasoning",
                 None,
+                None,
+                None,
                 Some("reviewer".to_string()),
             ),
         )
@@ -1232,7 +1253,14 @@ async fn test_subagent_activity_sse_is_ephemeral_not_persisted() {
     // fans out without persisting.
     run_manager.send_transient_session_event(
         session_id,
-        SseEventData::subagent_activity(run_id, "writing", None, Some("reviewer".to_string())),
+        SseEventData::subagent_activity(
+            run_id,
+            "writing",
+            None,
+            None,
+            None,
+            Some("reviewer".to_string()),
+        ),
     );
     let received = rx.recv().await.expect("transient fan-out must deliver");
     assert_eq!(received.event_type, "subagent_activity");

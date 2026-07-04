@@ -21,6 +21,7 @@ use alms_coordinator::message_bus::{DmEvent, MessageSource, RunTrigger};
 use alms_coordinator::{SubagentCompletion, TaskId, TaskStatus};
 use alms_core::{AgentId, Run, RunId, RunStatus, SessionId, TokenUsage};
 use alms_tools::MessageSender;
+use alms_tools::SubagentDispatcher;
 use alms_tools::message_sender::ConversationEndReason;
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -9376,6 +9377,271 @@ async fn queued_then_cancelled_non_peer_run_does_not_notify() {
     assert!(
         tr.try_recv().is_err(),
         "non-peer queued-cancel must not emit a DM peer notification"
+    );
+
+    shutdown_token.cancel();
+}
+
+// ---------------------------------------------------------------------------
+// 12. Subagent status snapshot on session-stream reattach (#1189 follow-up)
+// ---------------------------------------------------------------------------
+
+/// Build an `AppState` whose LLM streams ONE OpenAI-format content chunk and
+/// then holds the connection open without finishing the response.
+///
+/// This freezes a real subagent run in its "actively writing" state: the
+/// runtime received a `token_delta` (so the coordinator relay emitted — and
+/// recorded — a `writing` activity signal) but the run cannot complete until
+/// the generous `stream_chunk_timeout_secs` fires, long after the test ends.
+/// That is exactly the live condition under which the "chip stuck on
+/// Starting…" bug was reproduced.
+async fn test_app_state_with_streaming_then_stalling_llm() -> (
+    AppState,
+    CancellationToken,
+    mpsc::UnboundedReceiver<SubagentCompletion>,
+    mpsc::Receiver<RunTrigger>,
+    mpsc::Receiver<DmEvent>,
+) {
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let base_url = format!("http://{addr}");
+
+    tokio::spawn(async move {
+        while let Ok((mut sock, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                // One OpenAI-compatible SSE chunk with visible content, then
+                // hold the socket (no finish_reason, no EOF): the client's
+                // stream stays "in flight" for the rest of the test.
+                let chunk = concat!(
+                    "data: {\"id\":\"stall\",\"object\":\"chat.completion.chunk\",",
+                    "\"created\":0,\"model\":\"m\",\"choices\":[{\"index\":0,",
+                    "\"delta\":{\"role\":\"assistant\",\"content\":\"partial answer \"},",
+                    "\"finish_reason\":null}]}\n\n"
+                );
+                let response =
+                    format!("HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\r\n{chunk}");
+                let _ = sock.write_all(response.as_bytes()).await;
+                let _ = sock.flush().await;
+                // Park until the client goes away.
+                std::future::pending::<()>().await;
+            });
+        }
+    });
+
+    let llm_config = alms_runtime::LlmConfig {
+        base_url,
+        api_key: "fake-key-for-test".to_string(),
+        // Generous timeouts: the run must still be mid-stream ("writing")
+        // when the test reattaches — nothing here should fire during the
+        // test window.
+        timeout_secs: 60,
+        stream_chunk_timeout_secs: 60,
+        ..alms_runtime::LlmConfig::default()
+    };
+    let gateway_config = GatewayConfig {
+        llm_config,
+        ..GatewayConfig::default()
+    };
+    let gateway = crate::gateway::Gateway::new(gateway_config).unwrap();
+    let scheduler = Arc::new(alms_runtime::Scheduler::new());
+    let shutdown_token = CancellationToken::new();
+    let (completion_tx, completion_rx) = mpsc::unbounded_channel();
+    let (trigger_tx, trigger_rx) = mpsc::channel(64);
+    let (dm_event_tx, dm_event_rx) = mpsc::channel(64);
+    let state = AppState::new(
+        gateway,
+        scheduler,
+        shutdown_token.clone(),
+        completion_tx,
+        trigger_tx,
+        dm_event_tx,
+    )
+    .unwrap();
+    (
+        state,
+        shutdown_token,
+        completion_rx,
+        trigger_rx,
+        dm_event_rx,
+    )
+}
+
+/// REGRESSION (#1189 follow-up): a session-stream subscriber that attaches
+/// while a background subagent is mid-phase must immediately learn the
+/// subagent's CURRENT activity.
+///
+/// The live `subagent_activity` signal is ephemeral (never persisted or
+/// replayed) and deduplicated at the source to ONE emission per activity
+/// transition, so it only reaches the subscribers attached at that instant.
+/// Before the fix, any client that (re)attached afterwards — page reload,
+/// session switch back from the subagent view, a second tab, an SSE
+/// reconnect — rendered the chip as "Starting…" until the subagent's NEXT
+/// kind transition, even while it was actively writing. This test drives the
+/// REAL end-to-end path: a real background subagent (spawned through the
+/// coordinator) makes a real streaming LLM call that delivers one token and
+/// stalls, the REAL relay emits + records the `writing` signal through the
+/// production bg-event forwarder/drain, and then a NEW subscriber attaches
+/// through the same `attach_session_stream` path the
+/// `GET /sessions/{id}/events` endpoint uses.
+///
+/// With the snapshot replay removed (the pre-fix behaviour), the reattached
+/// subscriber receives nothing and the final assertions fail.
+#[tokio::test]
+async fn reattached_session_stream_receives_subagent_activity_snapshot() {
+    let (state, shutdown_token, _cr, _tr, _dr) =
+        test_app_state_with_streaming_then_stalling_llm().await;
+
+    let parent_agent_id = AgentId::new();
+    let parent_session = state
+        .session_manager
+        .get_or_create(parent_agent_id, "parent-chat");
+    let parent_session_id = parent_session.id;
+
+    // Subscriber attached BEFORE the subagent starts — the control group.
+    // Uses the same attach path; the snapshot is empty at this point (no
+    // subagents yet), so it receives only genuinely live events.
+    let mut early_rx = super::streaming::attach_session_stream(&state, parent_session_id);
+
+    // Production-shaped background event leg: the coordinator relay forwards
+    // status signals into a `RuntimeEventForwarder`, and a drain task routes
+    // them via `route_bg_event` onto the parent's session stream — mirroring
+    // the wiring `execute_run` installs for `invoke_agent` (parent-dead leg,
+    // which is the steady state for a long-lived background subagent).
+    let (bg_tx, mut bg_rx) = mpsc::unbounded_channel::<alms_runtime::RuntimeEvent>();
+    let bg_fwd: Arc<dyn alms_tools::EventForwarder> =
+        Arc::new(super::tools::RuntimeEventForwarder::new(bg_tx));
+    let bg_run_id = RunId::new();
+    let drain_state = state.clone();
+    tokio::spawn(async move {
+        while let Some(event) = bg_rx.recv().await {
+            match super::tools::route_bg_event(event, None, bg_run_id, parent_session_id) {
+                Some(super::tools::RoutedBgEvent::Persist(sse)) => {
+                    drain_state
+                        .run_manager
+                        .send_session_event(parent_session_id, bg_run_id, sse)
+                        .await;
+                }
+                Some(super::tools::RoutedBgEvent::Transient(sse)) => {
+                    drain_state
+                        .run_manager
+                        .send_transient_session_event(parent_session_id, sse);
+                }
+                None => {}
+            }
+        }
+    });
+
+    // REAL background dispatch: real subagent runtime, real (stalling)
+    // streaming LLM call, real relay. `parent_inv` is the parent's
+    // invoke_agent tool-invocation-id — the chip-resolution correlator the
+    // UI matches identity-exactly (#1190 Codex P2).
+    let parent_inv = uuid::Uuid::new_v4();
+    let (task_uuid, _sub_session_id) = state
+        .coordinator
+        .dispatch_background(
+            "Investigate the flaky test".to_string(),
+            parent_session_id,
+            parent_agent_id,
+            None,
+            Some(bg_fwd),
+            None,
+            None,
+            Some(parent_inv),
+        )
+        .await
+        .expect("dispatch_background should succeed");
+
+    // Wait until the subagent is observably WRITING: the stub delivered its
+    // one token, the relay emitted the (single, deduplicated) live signal,
+    // and the recording landed on the handle.
+    let mut attempts = 0;
+    while state
+        .coordinator
+        .subagent_activity_snapshot(parent_session_id)
+        .is_empty()
+    {
+        attempts += 1;
+        assert!(
+            attempts < 200,
+            "subagent never reached the 'writing' state — streaming stub broken?"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    // The attached-at-emission subscriber got the live signal (this leg
+    // always worked — it is what the pre-fix tests modelled).
+    let early_events = drain_events(&mut early_rx);
+    let expected_label = format!("subagent-{}", &task_uuid.to_string()[..8]);
+    assert!(
+        early_events
+            .iter()
+            .any(|e| e.event_type == "subagent_activity"
+                && e.data.get("kind").and_then(|v| v.as_str()) == Some("writing")
+                && e.data.get("source_agent").and_then(|v| v.as_str())
+                    == Some(expected_label.as_str())),
+        "subscriber attached before the transition must receive the live \
+         `writing` signal, got: {:?}",
+        early_events
+            .iter()
+            .map(|e| (&e.event_type, &e.data))
+            .collect::<Vec<_>>()
+    );
+
+    let hwm_before = state
+        .run_manager
+        .latest_session_event_id(parent_session_id)
+        .await;
+
+    // THE REGRESSION: a subscriber attaching AFTER the (once-per-transition,
+    // ephemeral) signal fired. The subagent is still actively writing — the
+    // reattached client must be told so instead of showing "Starting…".
+    let mut reattached_rx = super::streaming::attach_session_stream(&state, parent_session_id);
+    let snapshot_event = reattached_rx
+        .try_recv()
+        .expect("reattached session stream must immediately receive the subagent status snapshot");
+    assert_eq!(snapshot_event.event_type, "subagent_activity");
+    assert_eq!(
+        snapshot_event.data.get("kind").and_then(|v| v.as_str()),
+        Some("writing"),
+        "the snapshot must carry the subagent's CURRENT activity kind"
+    );
+    assert_eq!(
+        snapshot_event
+            .data
+            .get("source_agent")
+            .and_then(|v| v.as_str()),
+        Some(expected_label.as_str()),
+        "the snapshot must be tagged with the same label as the live signals \
+         so it resolves to the same status-bar chip"
+    );
+    assert_eq!(
+        snapshot_event
+            .data
+            .get("parent_tool_invocation_id")
+            .and_then(|v| v.as_str()),
+        Some(parent_inv.to_string().as_str()),
+        "the snapshot must carry the parent invoke_agent correlator so the \
+         UI resolves the chip identity-exactly — with concurrent unnamed \
+         subagents, the label alone first-matches onto the WRONG chip \
+         (#1190 Codex P2)"
+    );
+
+    // Snapshot events keep the live signal's ephemerality contract: no
+    // event id (passes the replay dedup filter) and nothing persisted.
+    assert!(
+        snapshot_event.event_id.is_none(),
+        "snapshot subagent_activity must not carry a persisted event id"
+    );
+    assert_eq!(
+        state
+            .run_manager
+            .latest_session_event_id(parent_session_id)
+            .await,
+        hwm_before,
+        "replaying the snapshot must not write the session event log"
     );
 
     shutdown_token.cancel();

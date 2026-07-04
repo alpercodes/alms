@@ -1417,7 +1417,18 @@ export function openSessionStream(sessionId, opts) {
         // Defensive: a signal without a source label can't be routed to a
         // chip. The backend always tags these.
         if (!data.source_agent) return;
-        trackSubagentActivity(data.source_agent, data.kind, data.tool || null);
+        // `tool_invocation_id` (tool kinds only) is the toolsUsed idempotency
+        // key (#1190): the attach-time snapshot replay re-sends the current
+        // in-progress tool_start with the SAME id, while parallel same-tool
+        // invocations carry distinct ids. `parent_tool_invocation_id` is the
+        // PARENT invoke_agent invocation id — the chip-resolution correlator
+        // that makes unnamed-subagent routing identity-exact (same id as
+        // `subagent_started` / the entry's stored toolInvocationId), so
+        // concurrent unnamed subagents can never cross-migrate onto each
+        // other's chips.
+        trackSubagentActivity(data.source_agent, data.kind, data.tool || null,
+            data.tool_invocation_id || null,
+            data.parent_tool_invocation_id || null);
     });
 
     // -- subagent_started (#1105) --
