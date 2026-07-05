@@ -2628,9 +2628,9 @@ async fn create_run_ignores_stale_per_run_override_fields() {
     // debug_mode: agent's false, NOT the payload's true. The agent record
     // is the single source of truth for debug_mode post-#1003; the stale
     // payload's `debug_mode: true` must not flip the resolved knob on.
-    // (This test seeds a non-system-triggered web session, so the #546
-    // notification-flip does not apply — the snapshot value here is
-    // exactly the agent record's `debug_mode`.)
+    // (The snapshot value here is exactly the agent record's `debug_mode`
+    // — the #546-era notification-flip that could override it for
+    // system-triggered runs was removed.)
     assert!(
         !snapshot.debug_mode,
         "resolved debug_mode must come from the agent record, not the stale payload"
@@ -6353,6 +6353,216 @@ async fn execute_run_mock_mode_skips_budget_validation_on_non_http_path() {
     }
 
     shutdown_token.cancel();
+}
+
+// ---------------------------------------------------------------------------
+// Notification runs honor the per-agent debug_mode toggle (#546 flip removal)
+//
+// A #546-era convenience in `lifecycle::execute_run` used to force
+// `debug_mode = true` for system-triggered non-peer runs landing on a
+// user-facing session (the shape `enqueue_triggered_run` produces for
+// subagent-completion and DM-ended notifications; job completions never
+// create a run — `notify_job_completion` is SSE + marker only). Post-#1003
+// the per-agent `debug_mode` toggle is the single source of truth, and the
+// flip silently overrode a toggle the user had set to off: after a background
+// `invoke_agent` subagent completed, the parent's notification run emitted a
+// `context_debug` SSE event and the UI showed the "Context sent to LLM" row
+// with debug mode disabled. These two tests pin the corrected contract from
+// both sides: debug off ⇒ no context_debug on the notification run; debug on
+// ⇒ the notification run still emits it (the #546 capability, now opt-in).
+// ---------------------------------------------------------------------------
+
+/// Shared driver: seeds a mock-mode state + agent with the given
+/// `debug_mode`, executes a system-triggered non-peer run on a user-facing
+/// session (the subagent-completion notification shape), and returns the
+/// final run record plus the SSE events observed on the session stream.
+async fn drive_notification_run_with_debug_mode(
+    debug_mode: bool,
+) -> (alms_core::Run, Vec<SseEventData>) {
+    use alms_core::registry::AgentRecord;
+    use chrono::Utc;
+
+    // Mock-mode LLM: the run completes deterministically without a provider,
+    // and `finish_run`'s `if self.config.debug_mode` gate is still exercised
+    // (the ContextDebug emission happens after build_context, before the
+    // LLM call).
+    let llm_config = alms_runtime::LlmConfig {
+        mock: true,
+        ..alms_runtime::LlmConfig::default()
+    };
+    let gateway_config = crate::gateway::GatewayConfig {
+        db_path: Some(":memory:".to_string()),
+        llm_config,
+        ..crate::gateway::GatewayConfig::default()
+    };
+    let gateway = crate::gateway::Gateway::new(gateway_config).unwrap();
+    let scheduler = std::sync::Arc::new(alms_runtime::Scheduler::new());
+    let shutdown_token = CancellationToken::new();
+    let (completion_tx, _cr) = mpsc::unbounded_channel();
+    let (trigger_tx, _tr) = mpsc::channel(8);
+    let (dm_event_tx, _dr) = mpsc::channel(8);
+    let state = AppState::new(
+        gateway,
+        scheduler,
+        shutdown_token.clone(),
+        completion_tx,
+        trigger_tx,
+        dm_event_tx,
+    )
+    .unwrap();
+
+    // No per-agent model/provider overrides — the run uses the server-default
+    // mock client unchanged, so nothing can fail before the runtime starts.
+    let agent_id = AgentId::new();
+    let now = Utc::now();
+    let agent = AgentRecord {
+        id: agent_id,
+        name: "notify-debug-gate-agent".into(),
+        description: String::new(),
+        model: None,
+        posture: None,
+        provider: None,
+        telegram_token: None,
+        thinking_budget_tokens: None,
+        reasoning_effort: None,
+        gemini_thinking_budget: None,
+        summary_provider: None,
+        summary_model: None,
+        worktree_mode: alms_core::WorktreeMode::Off,
+        debug_mode,
+        is_default: false,
+        created_at: now,
+        last_active: now,
+    };
+    state
+        .session_manager
+        .store()
+        .expect("SQLite-backed state should have a store")
+        .create_agent(&agent)
+        .expect("agent seed should succeed");
+
+    // User-facing context (no internal prefix) — the exact surface the old
+    // flip targeted (`is_system_triggered && !is_peer_message &&
+    // !is_internal_context_id`).
+    let context_id = "web-notify-debug-gate";
+    let session = state.session_manager.get_or_create(agent_id, context_id);
+    let session_id = session.id;
+
+    // Subscribe BEFORE the run so every SSE event (run_started,
+    // context_debug, ...) is captured. `execute_run` awaits its event
+    // forwarder before returning, so draining afterwards is deterministic.
+    let mut session_rx = subscribe_session(&state, session_id);
+
+    let run = Run::new(session_id, agent_id, "Subagent 'worker' completed.".into());
+    let run_id = run.run_id;
+    state.run_manager.insert_run(run.clone());
+    let cancel_token = CancellationToken::new();
+    state
+        .run_manager
+        .register_cancel_token(run_id, cancel_token.clone());
+
+    super::lifecycle::execute_run(
+        state.clone(),
+        super::RunParams {
+            run_id,
+            session_id,
+            agent_id,
+            input: run.input,
+            context_id: context_id.to_string(),
+            cancel_token,
+            // The subagent-completion notification shape produced by
+            // `enqueue_triggered_run`.
+            is_peer_message: false,
+            is_system_triggered: true,
+            input_pre_persisted: false,
+        },
+    )
+    .await;
+
+    let final_run = state
+        .run_manager
+        .get_run(run_id)
+        .expect("run must still exist after execute_run returns");
+    let events = drain_events(&mut session_rx);
+
+    shutdown_token.cancel();
+    (final_run, events)
+}
+
+/// Regression: with the agent's `debug_mode` OFF, a system-triggered
+/// notification run (subagent completion landing on the parent's user-facing
+/// session) must NOT emit `context_debug` — the old #546 flip forced it on,
+/// which is exactly the "Context sent to LLM row appears with debug mode
+/// disabled" bug.
+#[tokio::test]
+async fn notification_run_with_debug_mode_off_does_not_emit_context_debug() {
+    let (final_run, events) = drive_notification_run_with_debug_mode(false).await;
+
+    // Sanity: the run actually executed (mock mode completes) and the
+    // subscription observed its lifecycle — guards against a vacuous pass
+    // where the run failed before the runtime ever built a context.
+    assert_eq!(
+        final_run.status,
+        RunStatus::Completed,
+        "mock-mode notification run must complete; got {:?} (error: {:?})",
+        final_run.status,
+        final_run.error,
+    );
+    assert!(
+        events.iter().any(|e| e.event_type == "run_started"),
+        "session subscription must observe run_started; got: {:?}",
+        events.iter().map(|e| &e.event_type).collect::<Vec<_>>(),
+    );
+
+    // The resolved snapshot honors the agent record — no force-flip.
+    let snapshot = final_run
+        .resolved_config
+        .as_ref()
+        .expect("running run must have persisted a resolved-config snapshot");
+    assert!(
+        !snapshot.debug_mode,
+        "system-triggered notification runs must not force debug_mode on \
+         (the removed #546 flip); the agent record is the single source of truth"
+    );
+
+    // And the wire never carried the context snapshot.
+    assert!(
+        !events.iter().any(|e| e.event_type == "context_debug"),
+        "no context_debug SSE event may be emitted when the agent's \
+         debug_mode is off, including on the notification path"
+    );
+}
+
+/// Companion opt-in leg: with the agent's `debug_mode` ON, the same
+/// notification run DOES emit `context_debug` — the capability #546 wanted
+/// is preserved, gated behind the per-agent toggle like every other run.
+#[tokio::test]
+async fn notification_run_with_debug_mode_on_emits_context_debug() {
+    let (final_run, events) = drive_notification_run_with_debug_mode(true).await;
+
+    assert_eq!(
+        final_run.status,
+        RunStatus::Completed,
+        "mock-mode notification run must complete; got {:?} (error: {:?})",
+        final_run.status,
+        final_run.error,
+    );
+
+    let snapshot = final_run
+        .resolved_config
+        .as_ref()
+        .expect("running run must have persisted a resolved-config snapshot");
+    assert!(
+        snapshot.debug_mode,
+        "per-agent debug_mode = true must reach the notification run's snapshot"
+    );
+
+    assert!(
+        events.iter().any(|e| e.event_type == "context_debug"),
+        "notification runs must still emit context_debug when the agent \
+         opts in via debug_mode; got: {:?}",
+        events.iter().map(|e| &e.event_type).collect::<Vec<_>>(),
+    );
 }
 
 // ---------------------------------------------------------------------------

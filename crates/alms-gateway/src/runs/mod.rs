@@ -466,12 +466,13 @@ mod config {
             // the resolved config so the runtime emits a `ContextDebug`
             // event on each turn. PATCH-mutable via
             // `PATCH /agents/{id}` so flipping the flag at run-time
-            // takes effect on the next run without a restart. Note:
-            // the system-triggered notification debug-flip in
-            // `lifecycle::execute_run` (#546) runs AFTER this merge
-            // and may force `debug_mode = true` for notification runs
-            // landing on a user-facing session even when the agent
-            // record has it off.
+            // takes effect on the next run without a restart. This
+            // merge is the ONLY gate: the #546-era notification
+            // debug-flip in `lifecycle::execute_run` that used to
+            // force `debug_mode = true` for system-triggered runs on
+            // user-facing sessions was removed — it overrode a toggle
+            // the user had set to off (the "Context sent to LLM" row
+            // appeared on subagent-completion turns with debug off).
             //
             // Merge is monotonic-on (`if true { cfg = true }`) rather
             // than symmetric (`cfg = record.debug_mode || cfg`) by
@@ -629,10 +630,12 @@ mod config {
 
 /// Snapshot the layered run config for triage persistence (#837).
 ///
-/// Called from `lifecycle::execute_run` after `resolve_agent_config`,
-/// `resolve_posture_for_run`, and the system-triggered notification
-/// debug-flip have all settled — i.e. the `agent_config` and `llm` passed
-/// in here carry the values the LLM adapter is about to send on the wire.
+/// Called from `lifecycle::execute_run` after `resolve_agent_config` and
+/// `resolve_posture_for_run` have settled — i.e. the `agent_config` and
+/// `llm` passed in here carry the values the LLM adapter is about to send
+/// on the wire. (The #546-era notification debug-flip that used to settle
+/// before this call was removed — the per-agent `debug_mode` toggle is
+/// now the sole gate for notification runs too.)
 ///
 /// Reads `provider()` and `default_model()` from the resolved
 /// [`alms_runtime::LlmClient`] (which threaded per-agent model / provider
@@ -2213,12 +2216,12 @@ mod tests {
     // gate fires and the `ContextDebug` event is emitted on the next
     // turn. Two pinned cells: per-agent `true` overrides a server-default
     // `false`, and per-agent `false` doesn't accidentally clobber a
-    // server-level `true` (the system-triggered notification debug-flip
-    // in `lifecycle::execute_run` runs AFTER this merge, but a future
-    // refactor that introduced a server-level debug knob would land
-    // here first — pinning the asymmetry now means the merge stays
-    // "monotonic on": we OR per-agent into the server default, never
-    // override it back to false).
+    // server-level `true` (there is no server-level debug knob today,
+    // but a future refactor that introduced one would land here first —
+    // pinning the asymmetry now means the merge stays "monotonic on":
+    // we OR per-agent into the server default, never override it back
+    // to false). This merge is the only debug_mode gate: the #546-era
+    // notification debug-flip in `lifecycle::execute_run` was removed.
     // ===================================================================
 
     #[test]

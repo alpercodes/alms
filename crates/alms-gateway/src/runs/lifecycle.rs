@@ -1395,7 +1395,7 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
     // Resolve the layered run config UP FRONT (#837).
     //
     // The per-agent > server-default merge — including the bootstrap-prompt
-    // swap and the system-triggered notification debug-flip — happens here,
+    // swap and the system-triggered posture override — happens here,
     // **before** the `Queued` → `Running` transition fires. Two reasons:
     //
     // 1. Triage: the resolved snapshot is persisted alongside the
@@ -1642,32 +1642,20 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
             agent_config
         };
 
-    // Enable debug_mode for system-triggered notification runs that land on
-    // a user-facing session.  The context_debug SSE event is ephemeral (not
-    // persisted), so the cost is negligible — and it lets users inspect the
-    // LLM context for notification runs without special client-side plumbing.
-    // (#546 — debug_mode for notification runs)
-    //
-    // The flip happens before the snapshot is taken so the persisted
-    // `resolved_config.debug_mode` reflects the value the runtime
-    // actually uses, including this notification-flip — not just the
-    // raw per-agent record value. (Per-run overrides for `debug_mode`
-    // were removed in the #941 pivot.)
-    let agent_config = if is_system_triggered
-        && !is_peer_message
-        && !is_internal_context_id(&context_id)
-        && !agent_config.debug_mode
-    {
-        let mut cfg = agent_config;
-        cfg.debug_mode = true;
-        debug!(
-            "Run {} is a notification on user-facing session — enabling debug_mode",
-            run_id.0
-        );
-        cfg
-    } else {
-        agent_config
-    };
+    // NOTE on debug_mode for notification runs: a #546-era convenience used
+    // to force `debug_mode = true` here for system-triggered non-peer runs
+    // landing on a user-facing session (subagent-completion and DM-ended
+    // notification runs — job completions never hit this path because
+    // `notify_job_completion` emits SSE + a history marker without creating
+    // a run), because pre-#1003 there was no operator-facing way to
+    // enable the context-debug view for those runs at all. Post-#1003 the
+    // per-agent `debug_mode` toggle is the single source of truth (merged in
+    // `resolve_agent_config`), and the flip silently overrode a toggle the
+    // user had set to off — the "Context sent to LLM" row appeared on the
+    // parent's subagent-completion turn with debug mode disabled. The flip
+    // was removed so notification runs honor the same per-agent gate as
+    // every other run; operators who want the notification-run context can
+    // enable Debug mode on the agent in Settings.
 
     // Snapshot the fully-layered config now that all post-resolution
     // transforms have settled. Fed into both the persisted `Run` row and

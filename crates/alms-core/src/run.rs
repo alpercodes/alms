@@ -83,13 +83,12 @@ pub struct ResolvedRunConfig {
     /// posture additions without breaking older clients.
     pub posture: String,
     /// Effective `debug_mode` flag. Reflects the value the runtime actually
-    /// uses, including the system-triggered notification-run flip
-    /// (#546) — i.e. the post-flip, post-bootstrap value, not the raw
-    /// per-agent record value (which the #546 flip can override to
-    /// `true` for notification runs landing on user-facing sessions).
-    /// Per-run overrides for `debug_mode` were removed in the #941 pivot
-    /// — the per-agent record is now the only operator-facing input
-    /// into this field.
+    /// uses — the per-agent record value merged in `resolve_agent_config`.
+    /// Per-run overrides for `debug_mode` were removed in the #941 pivot,
+    /// and the #546-era flip that forced `true` for system-triggered
+    /// notification runs on user-facing sessions was removed too (it
+    /// overrode the per-agent toggle) — the per-agent record is now the
+    /// only operator-facing input into this field.
     pub debug_mode: bool,
     /// Effective Anthropic extended-thinking budget in tokens (#767).
     /// `0` means extended thinking is disabled for this run; non-zero is
@@ -355,10 +354,11 @@ impl Run {
     /// Attach the layered config snapshot (#837).
     ///
     /// Called at the `Queued` → `Running` transition by the gateway after
-    /// per-agent and server-default config has been merged and any
-    /// system-triggered notification-run debug-flip has settled.
-    /// Idempotent over-writes are allowed but only the first call should
-    /// occur in practice.
+    /// per-agent and server-default config has been merged. (The #546-era
+    /// notification-run debug-flip that used to settle here too was
+    /// removed — the per-agent `debug_mode` toggle is now the sole gate
+    /// for notification runs as well.) Idempotent over-writes are allowed
+    /// but only the first call should occur in practice.
     pub fn set_resolved_config(&mut self, config: ResolvedRunConfig) {
         self.resolved_config = Some(config);
     }

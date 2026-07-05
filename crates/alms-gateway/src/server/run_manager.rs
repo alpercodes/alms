@@ -251,9 +251,8 @@ impl RunManager {
     /// DashMap-locked closure so the persisted snapshot always reflects
     /// the new `Running` status with the snapshot present, never a torn
     /// intermediate state. Used by `lifecycle::execute_run` after the
-    /// per-run > per-agent > server-default layering has settled and the
-    /// notification-run debug-flip has applied — i.e. the values the LLM
-    /// adapter actually uses on the wire.
+    /// per-run > per-agent > server-default layering has settled — i.e.
+    /// the values the LLM adapter actually uses on the wire.
     pub fn mark_run_as_running_with_config(
         &self,
         run_id: RunId,
