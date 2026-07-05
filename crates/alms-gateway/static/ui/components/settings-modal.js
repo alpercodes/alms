@@ -652,7 +652,7 @@ export function SettingsModal({ open, onClose }) {
                         runs continue to use the boot-time snapshot, mirroring the Logging section.
                     </span>
                     <${EditRow} label="Default LLM model"
-                        desc="Model id sent to the resolved provider's wire (e.g. moonshotai/kimi-k2.6, claude-sonnet-4-6, gpt-5.4). Pick from the suggestions list or type any model the provider accepts.">
+                        desc="Model id sent to the resolved provider's wire (e.g. z-ai/glm-5.2, claude-sonnet-4-6, gpt-5.4). Pick from the suggestions list or type any model the provider accepts.">
                         <input class="settings-input settings-input-sm" type="text"
                                list="model-suggestions"
                                placeholder=${defaults.model || 'model id'}

@@ -19,7 +19,7 @@ Providers are declared in `[llm.providers.<name>]` tables. `llm.provider` select
 ```toml
 [llm]
 provider = "openrouter"        # name of a [llm.providers.*] entry
-model    = "moonshotai/kimi-k2.6"
+model    = "z-ai/glm-5.2"
 ```
 
 The sugar names `openai`, `openrouter`, and `anthropic` are auto-populated at config-load time, so classic flat configs (`provider = "openai"` with nothing else) keep working. User-declared entries with the same names override the auto-populated ones.

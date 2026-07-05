@@ -1274,9 +1274,9 @@ Returns current server defaults for UI pre-population.
 **Response 200**
 ```json
 {
-  "version": "0.2.0",
-  "provider": "openai",
-  "model": "openai/gpt-4o",
+  "version": "0.2.4",
+  "provider": "openrouter",
+  "model": "z-ai/glm-5.2",
   "base_url": "https://openrouter.ai/api/v1",
   "max_tokens": 4096,
   "posture": "guarded",
@@ -1286,15 +1286,16 @@ Returns current server defaults for UI pre-population.
   "agent_id": "<uuid>",
   "agents": [{"name": "main", "id": "<uuid>", "is_default": true, "model": null, "needs_bootstrap": false}],
   "workspace_dir": "./.alms/workspace",
+  "llm_providers": ["anthropic", "gemini", "openai", "openrouter"],
   "context": {
     "strategy": "truncate",
     "max_input_tokens": 100000,
     "compact_trigger_pct": 0.80,
     "compact_retain_pct": 0.40,
-    "summary_model": "minimax/minimax-m2.7",
+    "summary_model": "google/gemma-4-31b-it",
+    "summary_provider": "openrouter",
     "run_summary_mode": "llm",
-    "run_summary_budget": 2000,
-    "summary_max_tokens": 1000
+    "run_summary_budget": 2000
   },
   "session": {
     "max_messages": 200,
@@ -1315,6 +1316,9 @@ Returns current server defaults for UI pre-population.
     "timeout_secs": 30,
     "max_output_bytes": null,
     "enabled": ["echo", "fs_edit", "fs_glob", "fs_grep", "fs_list", "fs_read", "fs_write", "http_get", "math", "shell_exec", "invoke_agent", "read_subagent_session", "workspace_write", "list_my_sessions", "read_session", "send_message", "list_agents", "read_messages", "ignore_message"]
+  },
+  "security": {
+    "allow_full_os_access": []
   },
   "llm": {
     "anthropic": {

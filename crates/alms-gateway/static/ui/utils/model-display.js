@@ -79,10 +79,12 @@ const MODELS = {
     // fall through to the raw-id display.  Add stable slugs here as they land.
     'deepseek/deepseek-r1':             { name: 'DeepSeek R1',                provider: 'openrouter' },
     'deepseek/deepseek-chat-v3-0324':   { name: 'DeepSeek Chat v3',           provider: 'openrouter' },
+    'z-ai/glm-5.2':                     { name: 'GLM 5.2',                    provider: 'openrouter' },
     'z-ai/glm-5.1':                     { name: 'GLM 5.1',                    provider: 'openrouter' },
     'minimax/minimax-m2.7':             { name: 'MiniMax M2.7',               provider: 'openrouter' },
     'xiaomi/mimo-v2-pro':               { name: 'MiMo v2-pro',                provider: 'openrouter' },
     'moonshotai/kimi-k2.6':             { name: 'Kimi K2.6',                  provider: 'openrouter' },
+    'google/gemma-4-31b-it':            { name: 'Gemma 4 31B',                provider: 'openrouter' },
 };
 
 /**
@@ -125,12 +127,14 @@ export const MODEL_SUGGESTIONS = [
     'deepseek-r1:7b',
     'llama3.3:70b',
     // OpenRouter (popular picks)
+    'z-ai/glm-5.2',
     'deepseek/deepseek-r1',
     'deepseek/deepseek-chat-v3-0324',
     'z-ai/glm-5.1',
     'minimax/minimax-m2.7',
     'xiaomi/mimo-v2-pro',
     'moonshotai/kimi-k2.6',
+    'google/gemma-4-31b-it',
 ];
 
 // ── Formatters ──────────────────────────────────────────────────────────────

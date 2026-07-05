@@ -17,7 +17,7 @@ provider = "openrouter"
 # provider base URL
 base_url = "https://openrouter.ai/api/v1"
 # model identifier
-model = "moonshotai/kimi-k2.6"
+model = "z-ai/glm-5.2"
 # total per-call request deadline (seconds): connect + headers + full body
 timeout_secs = 600
 # retry count on transient failures
@@ -102,24 +102,30 @@ compact_retain_pct = 0.40
 #   "llm"       - rich summary via agent's model (or summary_model if configured).
 # Override with: ALMS_RUN_SUMMARY_MODE=heuristic
 run_summary_mode = "off"
-# Optional cheaper model for the summary task (issue #866). Falls back to the
-# agent's default model when commented out.
-# summary_model = "minimax/minimax-m2.7"
-# Optional dedicated provider for the summary task. When set, the summary
-# client is re-targeted at this provider via `with_provider_and_secrets` so
+# Cheaper dedicated model for the summary task (issues #866 / #1191).
+# Default: "google/gemma-4-31b-it" on the "openrouter" summary provider —
+# a small non-reasoning model so summaries stay cheap regardless of the
+# agent's own model.
+summary_model = "google/gemma-4-31b-it"
+# Dedicated provider for the summary task. When set, the summary client is
+# re-targeted at this provider via `with_provider_and_secrets` so
 # `summary_model` can be a slug for a different provider than the agent
 # (e.g. agent on Anthropic, summary on OpenRouter). Must reference a
 # configured `[llm.providers.<name>]` block whose API key is resolvable.
-# Leave commented out to inherit the agent's resolved provider.
+summary_provider = "openrouter"
 #
 # IMPORTANT (#871): set `summary_model` and `summary_provider` together.
 # The agent's resolved model belongs to the AGENT's provider namespace
 # and is NOT a safe fallback for the summary provider's wire — `PATCH
-# /settings` rejects this combination, and the runtime applies a leak
-# guard for hand-edited TOML configs that clears the model so the wire
-# fails fast rather than 404'ing on the summary provider with the
-# agent provider's model name.
-# summary_provider = "openrouter"
+# /settings` rejects this combination, hand-edited TOML with only one
+# field set is rejected at boot, and the runtime applies a leak guard
+# that clears the model so the wire fails fast rather than 404'ing on
+# the summary provider with the agent provider's model name.
+#
+# To inherit the agent's resolved provider/model for summaries instead
+# (the pre-v0.2.4 default), clear BOTH fields together:
+#   summary_model = ""
+#   summary_provider = ""
 # Max tokens for episodic run summaries injected into context window.
 # Hard-capped at 15% of max_input_tokens — values above the cap are clamped.
 # Override with: ALMS_RUN_SUMMARY_BUDGET=4000

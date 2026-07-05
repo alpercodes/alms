@@ -395,7 +395,7 @@ static BUDGET_ENV_LOCK: Mutex<()> = Mutex::new(());
 
 #[test]
 fn test_token_budget_default_config_passes() {
-    // Default config: provider=openrouter, model=moonshotai/kimi-k2.6.
+    // Default config: provider=openrouter, model=z-ai/glm-5.2.
     // The table doesn't know that pair → validator must skip → ok.
     let _lock = BUDGET_ENV_LOCK.lock().unwrap();
     let _guard = SingleEnvGuard::remove(ALMS_LLM_BUDGET_VALIDATION);
@@ -1137,27 +1137,23 @@ fn test_load_or_default_resolves_data_dir() {
 #[test]
 fn test_context_config_defaults_episodic() {
     let config = ContextConfig::default();
-    // #872 changed the default from Some("minimax/minimax-m2.7") + None
-    // to None + None so the shipped baseline doesn't sit in the
-    // asymmetric (model-only) shape that the new pair-only validator
-    // would otherwise reject. Operators opt into a dedicated summary
-    // task by setting both fields together.
-    //
-    // Atlas's "default summary model = kimi-k2.6" directive is
-    // satisfied implicitly: when both are None, the summary task
-    // inherits the agent's (provider, model) — and the chat default
-    // is now `(openrouter, moonshotai/kimi-k2.6)`, so summarisation
-    // hits kimi-k2.6 on a fresh boot without an explicit summary pair.
+    // #1191 adopted the alms-test-workspace2 settings as code defaults:
+    // the shipped baseline is now an explicit SYMMETRIC summary pair —
+    // `(openrouter, google/gemma-4-31b-it)` — so a fresh boot summarises
+    // with a small non-reasoning model instead of the agent's (possibly
+    // heavyweight) chat model. The pair-only invariant from #872/#877
+    // still holds: both fields are set together, which the validator
+    // accepts; the asymmetric one-of-two shape remains a load-time error.
     assert_eq!(
-        config.summary_model, None,
-        "summary_model defaults to None — when unset, the summary task \
-         inherits the agent's primary (provider, model), which is now \
-         kimi-k2.6 on openrouter by default"
+        config.summary_model.as_deref(),
+        Some("google/gemma-4-31b-it"),
+        "summary_model defaults to the cheap dedicated summary model (#1191)"
     );
     assert_eq!(
-        config.summary_provider, None,
-        "summary_provider mirrors summary_model — both default to None \
-         post-#872 so the pair-only invariant holds out of the box"
+        config.summary_provider.as_deref(),
+        Some("openrouter"),
+        "summary_provider pairs with summary_model — both default to Some \
+         so the pair-only invariant holds out of the box (#1191)"
     );
     assert_eq!(config.run_summary_mode, RunSummaryMode::Llm);
     assert_eq!(config.run_summary_budget, 2000);
@@ -2084,14 +2080,57 @@ fn test_validation_accepts_both_summary_fields_set() {
 
 #[test]
 fn test_validation_accepts_both_summary_fields_none() {
-    // Default config — both None — is the shipped baseline. Must
-    // continue to validate as OK so the daemon starts out of the box.
-    let config = AlmsConfig::default();
-    assert!(
-        config.context.summary_provider.is_none() && config.context.summary_model.is_none(),
-        "default config has both fields None"
-    );
+    // Both-None is the explicit opt-out shape (inherit the agent's
+    // resolved provider/model for summaries). It was the shipped
+    // baseline from #872 until #1191 flipped the default to an explicit
+    // pair; clearing both together must remain valid.
+    let mut config = AlmsConfig::default();
+    config.context.summary_provider = None;
+    config.context.summary_model = None;
     assert!(config.validate().is_ok());
+}
+
+#[test]
+fn test_validation_accepts_default_summary_pair() {
+    // #1191: the shipped baseline is now an explicit symmetric pair —
+    // `(openrouter, google/gemma-4-31b-it)`. A fresh default config must
+    // validate OK so the daemon starts out of the box.
+    let config = AlmsConfig::default();
+    assert_eq!(
+        config.context.summary_provider.as_deref(),
+        Some("openrouter")
+    );
+    assert_eq!(
+        config.context.summary_model.as_deref(),
+        Some("google/gemma-4-31b-it")
+    );
+    assert!(
+        config.validate().is_ok(),
+        "the default symmetric summary pair must pass the pair-only validator"
+    );
+}
+
+/// PR #1194: `is_compiled_default_summary_pair` distinguishes the stock
+/// #1191 default pair (routine — logged at `debug!`) from an
+/// operator-configured pair (opt-in — logged at `info!`).
+#[test]
+fn test_is_compiled_default_summary_pair() {
+    let d = ContextConfig::default();
+    assert!(ContextConfig::is_compiled_default_summary_pair(
+        d.summary_provider.as_deref(),
+        d.summary_model.as_deref(),
+    ));
+    // Any deviation — different provider, different model, or a cleared
+    // pair — is an operator choice, not the compiled default.
+    assert!(!ContextConfig::is_compiled_default_summary_pair(
+        Some("anthropic"),
+        d.summary_model.as_deref(),
+    ));
+    assert!(!ContextConfig::is_compiled_default_summary_pair(
+        d.summary_provider.as_deref(),
+        Some("minimax/minimax-m2.7"),
+    ));
+    assert!(!ContextConfig::is_compiled_default_summary_pair(None, None));
 }
 
 /// End-to-end: a hand-edited `alms.toml` with `[context]` set to the
@@ -2135,6 +2174,82 @@ summary_model = "minimax/minimax-m2.7"
     assert!(
         err.to_string().contains("summary_model is set"),
         "asymmetric TOML must be rejected at validate(), got: {err}"
+    );
+}
+
+/// #1191 pair-aware default fill: a `[context]` block that does not
+/// mention the summary pair at all inherits the default pair — absence
+/// means "use the default", same as every other `[context]` knob.
+#[test]
+fn test_context_toml_without_summary_pair_inherits_default_pair() {
+    let toml_str = r#"
+[context]
+strategy = "truncate"
+max_input_tokens = 64000
+"#;
+    let cfg: AlmsConfig = toml::from_str(toml_str).expect("TOML parses");
+    assert_eq!(cfg.context.summary_provider.as_deref(), Some("openrouter"));
+    assert_eq!(
+        cfg.context.summary_model.as_deref(),
+        Some("google/gemma-4-31b-it")
+    );
+}
+
+/// #1191 pair-aware default fill: with a `Some` default pair, a naive
+/// per-field `raw.or(default)` would backfill the missing half of an
+/// asymmetric TOML and silently legalise the exact half-configured
+/// state #877's validator rejects. Pin that a one-field-only `[context]`
+/// stays asymmetric through deserialization (the validate() rejection
+/// itself is covered by the `test_asymmetric_summary_toml_*` tests).
+#[test]
+fn test_context_toml_partial_summary_pair_is_not_backfilled() {
+    let toml_str = r#"
+[context]
+summary_provider = "openrouter"
+"#;
+    let cfg: AlmsConfig = toml::from_str(toml_str).expect("TOML parses");
+    assert_eq!(cfg.context.summary_provider.as_deref(), Some("openrouter"));
+    assert_eq!(
+        cfg.context.summary_model, None,
+        "the default summary_model must NOT backfill a partial pair"
+    );
+
+    let toml_str = r#"
+[context]
+summary_model = "minimax/minimax-m2.7"
+"#;
+    let cfg: AlmsConfig = toml::from_str(toml_str).expect("TOML parses");
+    assert_eq!(
+        cfg.context.summary_provider, None,
+        "the default summary_provider must NOT backfill a partial pair"
+    );
+    assert_eq!(
+        cfg.context.summary_model.as_deref(),
+        Some("minimax/minimax-m2.7")
+    );
+}
+
+/// #1191: empty strings are the explicit-clear sentinel (mirroring PATCH
+/// /settings). Setting both to `""` opts back into inheriting the
+/// agent's resolved (provider, model) for summaries — both land as None
+/// and the config validates.
+#[test]
+fn test_context_toml_empty_pair_clears_to_inherit() {
+    let toml_str = r#"
+[llm]
+provider = "openrouter"
+
+[context]
+summary_model = ""
+summary_provider = ""
+"#;
+    let mut cfg: AlmsConfig = toml::from_str(toml_str).expect("TOML parses");
+    cfg.llm.ensure_builtin_providers();
+    assert_eq!(cfg.context.summary_provider, None);
+    assert_eq!(cfg.context.summary_model, None);
+    assert!(
+        cfg.validate().is_ok(),
+        "explicitly cleared pair must validate (inherit-agent-model shape)"
     );
 }
 
@@ -2269,10 +2384,17 @@ fn test_load_or_default_succeeds_with_no_config_file() {
          present (bootstrapping / first-run case). The fail-fast \
          change for #924 must not regress this path.",
     );
-    // Spot-check that the defaults shape is intact.
-    assert!(
-        cfg.context.summary_provider.is_none() && cfg.context.summary_model.is_none(),
-        "default config has both pair fields None"
+    // Spot-check that the defaults shape is intact (#1191: the default
+    // summary pair is the explicit `(openrouter, google/gemma-4-31b-it)`).
+    assert_eq!(
+        cfg.context.summary_provider.as_deref(),
+        Some("openrouter"),
+        "default config ships the symmetric summary pair"
+    );
+    assert_eq!(
+        cfg.context.summary_model.as_deref(),
+        Some("google/gemma-4-31b-it"),
+        "default config ships the symmetric summary pair"
     );
     assert!(
         std::path::Path::new(&cfg.server.data_dir).is_absolute(),
@@ -2319,8 +2441,9 @@ fn test_load_or_default_falls_back_to_defaults_on_unparseable_toml() {
          abort — only validate() failures are fatal under #924",
     );
     assert!(
-        cfg.context.summary_provider.is_none() && cfg.context.summary_model.is_none(),
-        "fallback config should have default summary pair (both None)"
+        cfg.context.summary_provider.as_deref() == Some("openrouter")
+            && cfg.context.summary_model.as_deref() == Some("google/gemma-4-31b-it"),
+        "fallback config should carry the default summary pair (#1191)"
     );
 }
 

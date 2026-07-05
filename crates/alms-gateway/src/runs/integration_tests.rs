@@ -2798,11 +2798,11 @@ async fn create_run_resolves_per_agent_config_for_shared_session_via_requested_a
 /// Per-agent provider switch with NO model on any layer -> structured 400.
 ///
 /// Server default is the test-default `LlmConfig::default()` (provider:
-/// openrouter, default_model: moonshotai/kimi-k2.6, providers: empty).
+/// openrouter, default_model: z-ai/glm-5.2, providers: empty).
 /// Agent record carries `provider: Some("anthropic")` and `model: None`,
 /// and there is no `[llm.providers.anthropic]` entry to supply a model.
 /// This is the canonical #863 leak shape — pre-fix the agent loop would
-/// send Anthropic the OpenRouter `kimi-k2.6` default; pre-#863 it would
+/// send Anthropic the OpenRouter server default; pre-#863 it would
 /// then fall through the empty-clear and Anthropic would 404 on `model: ""`;
 /// post-#863 the gateway returns 400 MISSING_MODEL_AFTER_PROVIDER_SWITCH
 /// before any LLM call.

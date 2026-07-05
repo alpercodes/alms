@@ -731,7 +731,7 @@ impl Default for LlmConfig {
             provider: "openrouter".to_string(),
             api_key: String::new(),
             base_url: "https://openrouter.ai/api/v1".to_string(),
-            default_model: "moonshotai/kimi-k2.6".to_string(),
+            default_model: "z-ai/glm-5.2".to_string(),
             // Mirror of `alms_core::config::LlmConfig` defaults — keep in sync.
             // 600s = per-call HTTP deadline (heavy reasoning models); 180s =
             // per-chunk body-silence guard. See that type's rustdoc (#1163).

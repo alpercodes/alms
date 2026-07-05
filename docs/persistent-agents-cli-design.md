@@ -248,7 +248,7 @@ The `{id_or_name}` path parameter accepts either a UUID or a name slug. Resoluti
 
 ```json
 {
-  "model": "moonshotai/kimi-k2.6",
+  "model": "z-ai/glm-5.2",
   "agents": [
     { "name": "atlas", "id": "a1b2c3...", "is_default": true, "model": null },
     { "name": "researcher", "id": "d4e5f6...", "is_default": false, "model": "anthropic/claude-sonnet-4-20250514" }

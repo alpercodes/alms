@@ -377,7 +377,7 @@ impl Default for LlmConfig {
         Self {
             provider: "openrouter".into(),
             base_url: "https://openrouter.ai/api/v1".into(),
-            model: "moonshotai/kimi-k2.6".into(),
+            model: "z-ai/glm-5.2".into(),
             api_key: None,
             // 10 min — per-call HTTP deadline, not a run cap. Heavy reasoning
             // models (minimax-m3 on openrouter) reason past the old 120s; a
@@ -987,8 +987,9 @@ pub struct ContextConfig {
     pub compact_retain_pct: f32,
     /// Separate (cheaper) model for generating summaries.
     /// Falls back to the agent's default model when `None`.
-    /// Defaults to `minimax/minimax-m2.7` to avoid wasting tokens on
-    /// reasoning models that spend most of their budget on thinking.
+    /// Defaults to `google/gemma-4-31b-it` (on the `openrouter` summary
+    /// provider, see `summary_provider`) — a small non-reasoning model so
+    /// summaries don't burn tokens on thinking (#1191).
     pub summary_model: Option<String>,
     /// Separate provider for generating summaries (#866).
     ///
@@ -999,6 +1000,7 @@ pub struct ContextConfig {
     /// (e.g. agent on Anthropic, summary on OpenRouter). The provider must be
     /// configured under `[llm.providers.<name>]` and have a resolvable API key
     /// (either in the secrets store or via `api_key_env` / `api_key`).
+    /// Defaults to `openrouter` (#1191), pairing with `summary_model`.
     pub summary_provider: Option<String>,
     /// How run summaries are generated for episodic memory.
     /// See [`RunSummaryMode`] for valid values.
@@ -1027,26 +1029,34 @@ impl Default for ContextConfig {
             // when `strategy == "compact"`.
             compact_trigger_pct: 0.80,
             compact_retain_pct: 0.40,
-            // Default to None for both fields (#872). The pre-#872
-            // default paired `summary_model = Some("minimax/...")` with
-            // `summary_provider = None`, which the resolver silently
-            // mapped onto the agent's primary provider — the exact
-            // misconfiguration that produced the `model: not found` 404
-            // in #866. The new pair-only validator rejects that
-            // asymmetric state, so the default ships with both fields
-            // unset; operators opt in by configuring both at once.
+            // Ship an explicit SYMMETRIC summary pair by default (#1191,
+            // adopting the alms-test-workspace2 settings). The pair-only
+            // validator introduced by #872/#877 requires both fields set
+            // together or both unset — the asymmetric (one-of-two) shape
+            // was the misconfiguration behind the #866 `model: not found`
+            // 404 and is still rejected at load time. A symmetric Some
+            // pair is valid: `build_summary_client` re-targets the
+            // summary client at `openrouter` via
+            // `with_provider_and_secrets` and applies the explicit model
+            // last, so the #871 leak guard never fires.
             //
-            // Atlas's "default summary model = kimi-k2.6" directive is
-            // satisfied implicitly by this both-None default: when both
-            // fields are None, the summary task inherits the agent's
-            // resolved (provider, model) pair, which now defaults to
-            // (`openrouter`, `moonshotai/kimi-k2.6`) — so a fresh boot
-            // summarises with kimi-k2.6 without forcing operators to
-            // opt into the symmetric-pair shape. Setting both fields
-            // to something else explicitly still wins on the per-agent
-            // or per-server level via PATCH /settings.
-            summary_model: None,
-            summary_provider: None,
+            // Rationale for a dedicated pair (vs the #872-era both-None
+            // "inherit the agent's model" default): summaries are
+            // low-stakes, high-frequency calls — pinning them to a small
+            // non-reasoning model keeps them cheap regardless of which
+            // (possibly heavyweight) model the agent itself runs.
+            // Operators on a non-OpenRouter agent provider need an
+            // OpenRouter API key for the summary task, or should
+            // reconfigure the pair. Reverting to inherit-the-agent-model
+            // is still possible: clear both fields together (empty
+            // strings via PATCH /settings, or `summary_model = ""` +
+            // `summary_provider = ""` in alms.toml). A PATCH clear is
+            // durable across restarts: `persist_settings` writes the
+            // `""` sentinel into `settings.json` and the boot-time
+            // overrides apply maps it back to `None` instead of letting
+            // this compiled pair resurrect (PR #1194).
+            summary_model: Some("google/gemma-4-31b-it".into()),
+            summary_provider: Some("openrouter".into()),
             run_summary_mode: RunSummaryMode::Llm,
             run_summary_budget: 2000,
             summary_max_tokens: 1000,
@@ -1120,6 +1130,30 @@ impl<'de> Deserialize<'de> for ContextConfig {
             None => defaults.strategy,
         };
 
+        // Pair-aware default fill for the summary pair (#1191). The shipped
+        // default is now a symmetric Some pair, so a naive per-field
+        // `raw.x.or(defaults.x)` would silently backfill the missing half
+        // of a hand-edited asymmetric TOML (`summary_model` set,
+        // `summary_provider` absent, or vice versa) — exactly the
+        // half-configured state the #877 pair-only validator exists to
+        // reject at load time. Rules:
+        //   - both fields absent → inherit the default pair;
+        //   - anything else → taken as written, with `""` (empty string)
+        //     normalised to `None` as an explicit clear, mirroring the
+        //     PATCH /settings sentinel. `summary_model = ""` +
+        //     `summary_provider = ""` therefore opts back into inheriting
+        //     the agent's resolved (provider, model) for summaries, and an
+        //     asymmetric survivor is rejected by `AlmsConfig::validate`.
+        let (summary_model, summary_provider) =
+            if raw.summary_model.is_none() && raw.summary_provider.is_none() {
+                (defaults.summary_model, defaults.summary_provider)
+            } else {
+                (
+                    raw.summary_model.filter(|s| !s.trim().is_empty()),
+                    raw.summary_provider.filter(|s| !s.trim().is_empty()),
+                )
+            };
+
         Ok(ContextConfig {
             strategy,
             max_input_tokens: raw.max_input_tokens.unwrap_or(defaults.max_input_tokens),
@@ -1129,8 +1163,8 @@ impl<'de> Deserialize<'de> for ContextConfig {
             compact_retain_pct: raw
                 .compact_retain_pct
                 .unwrap_or(defaults.compact_retain_pct),
-            summary_model: raw.summary_model.or(defaults.summary_model),
-            summary_provider: raw.summary_provider.or(defaults.summary_provider),
+            summary_model,
+            summary_provider,
             run_summary_mode: raw.run_summary_mode.unwrap_or(defaults.run_summary_mode),
             run_summary_budget: raw
                 .run_summary_budget
@@ -1186,6 +1220,22 @@ fn warn_sliding_summary_alias_once() {
 }
 
 impl ContextConfig {
+    /// True when the given summary `(provider, model)` pair equals the
+    /// compiled-in default pair (#1191).
+    ///
+    /// Since #1191 the shipped default is an explicit `Some` pair, so a
+    /// resolved `Some` summary provider no longer implies the operator
+    /// opted in. Callers that want to distinguish "operator configured a
+    /// dedicated summary provider" (worth an `info!`) from "running on the
+    /// stock default" (routine, `debug!`) use this — shared here so the
+    /// gateway run path and the coordinator subagent path can't drift
+    /// (PR #1194, Tim's nit on #1191).
+    pub fn is_compiled_default_summary_pair(provider: Option<&str>, model: Option<&str>) -> bool {
+        let defaults = Self::default();
+        provider == defaults.summary_provider.as_deref()
+            && model == defaults.summary_model.as_deref()
+    }
+
     /// Normalize episodic memory settings: validate mode and enforce the 15%
     /// budget cap. Called during config loading, before hard validation.
     ///

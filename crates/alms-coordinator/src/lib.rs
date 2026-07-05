@@ -1805,13 +1805,31 @@ async fn run_agent_loop(
                 subagent_summary_model.as_deref(),
                 secrets_guard.as_deref(),
             );
-            info!(
-                task_id = %task_id.0,
-                agent_provider = %subagent_llm.provider(),
-                summary_provider = %provider,
-                summary_model = %subagent_summary_model.as_deref().unwrap_or("<inherit>"),
-                "Subagent inheriting parent summary_provider config (#871)"
-            );
+            // #1191 made `Some(openrouter, gemma)` the compiled default,
+            // so this branch now runs on every stock deployment's subagent
+            // spawns — the default pair is routine and logs at `debug!`;
+            // only an operator-configured pair stays `info!` (PR #1194,
+            // mirroring the gateway run path in `runs/lifecycle.rs`).
+            if alms_core::config::ContextConfig::is_compiled_default_summary_pair(
+                Some(provider),
+                subagent_summary_model.as_deref(),
+            ) {
+                debug!(
+                    task_id = %task_id.0,
+                    agent_provider = %subagent_llm.provider(),
+                    summary_provider = %provider,
+                    summary_model = %subagent_summary_model.as_deref().unwrap_or("<inherit>"),
+                    "Subagent inheriting parent summary_provider config (#871, compiled default pair)"
+                );
+            } else {
+                info!(
+                    task_id = %task_id.0,
+                    agent_provider = %subagent_llm.provider(),
+                    summary_provider = %provider,
+                    summary_model = %subagent_summary_model.as_deref().unwrap_or("<inherit>"),
+                    "Subagent inheriting parent summary_provider config (#871)"
+                );
+            }
             summary_client
         });
 

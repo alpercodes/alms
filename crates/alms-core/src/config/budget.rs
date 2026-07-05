@@ -654,12 +654,21 @@ mod tests {
     fn openrouter_unknown_vendor_returns_none() {
         // OpenRouter exposes a long tail of vendors the table doesn't
         // enumerate (moonshotai, z-ai). They must fall through to None so
-        // the validator doesn't false-positive on a default-shaped boot.
+        // the validator doesn't false-positive on a default-shaped boot —
+        // `z-ai/glm-5.2` is the compiled default model as of #1191.
         assert_eq!(
             provider_context_window("openrouter", "moonshotai/kimi-k2.6"),
             None
         );
         assert_eq!(provider_context_window("openrouter", "z-ai/glm-5.1"), None);
+        assert_eq!(provider_context_window("openrouter", "z-ai/glm-5.2"), None);
+        // The default summary model (#1191) routes through the `google/`
+        // → gemini prefix strip but matches no gemini-* row — must also
+        // fall through to None rather than false-positive at boot.
+        assert_eq!(
+            provider_context_window("openrouter", "google/gemma-4-31b-it"),
+            None
+        );
         // mistralai/, mistral/, meta-llama/, groq/ were enumerated in the
         // prior round but dropped this round (operator scope decision —
         // see module-level "Verification policy"). They must now also

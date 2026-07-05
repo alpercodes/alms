@@ -637,8 +637,14 @@ pub async fn patch_settings(
         //
         // Compute the would-be post-PATCH values without committing them,
         // validate the combined invariant, then commit.
+        //
+        // The clear sentinel is trim-aware (PR #1194, Tim's nit on #1191):
+        // a whitespace-only value clears exactly like `""`, matching the
+        // TOML path (`ContextConfig`'s deserializer filters on
+        // `trim().is_empty()`). Pre-fix, `"  "` slipped past the empty
+        // check and was treated as a provider name / model slug.
         let next_summary_model: Option<String> = match ctx_patch.summary_model.as_ref() {
-            Some(v) if v.is_empty() => None,
+            Some(v) if v.trim().is_empty() => None,
             Some(v) => Some(v.clone()),
             None => ctx.summary_model.clone(),
         };
@@ -649,7 +655,7 @@ pub async fn patch_settings(
         let next_summary_provider_resolved: Option<String> =
             match ctx_patch.summary_provider.as_ref() {
                 None => ctx.summary_provider.clone(),
-                Some(v) if v.is_empty() => None,
+                Some(v) if v.trim().is_empty() => None,
                 Some(v) => {
                     let entry = state.llm_config.providers.get(v);
                     let entry_has_key = entry.is_some_and(|e| e.resolve_api_key().is_some());
@@ -1524,12 +1530,20 @@ pub struct PersistedContextOverrides {
     /// `max_input_tokens` worth of recent verbatim messages.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub compact_retain_pct: Option<f32>,
+    /// Persisted summary model override.
+    /// `None` (absent field) means "fall through to TOML / env / code
+    /// default". `Some(non-empty)` applies as an override. `Some("")` is
+    /// the **explicit-clear sentinel** (PR #1194): the operator cleared
+    /// the summary pair via PATCH and the opt-out must survive restarts —
+    /// without it, the compiled `Some(...)` default pair (#1191) would
+    /// silently resurrect on the next boot.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub summary_model: Option<String>,
     /// Persisted summary provider override (#866).
-    /// `None` means "fall through to TOML / env / code default" — typically
-    /// "inherit agent provider". `Some(provider)` re-targets the summary
-    /// task at that provider on every restart.
+    /// `None` means "fall through to TOML / env / code default".
+    /// `Some(provider)` re-targets the summary task at that provider on
+    /// every restart. `Some("")` is the explicit-clear sentinel — see
+    /// [`Self::summary_model`].
     #[serde(skip_serializing_if = "Option::is_none")]
     pub summary_provider: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1561,11 +1575,21 @@ impl PersistedContextOverrides {
         if let Some(v) = self.compact_retain_pct {
             ctx.compact_retain_pct = v;
         }
-        if self.summary_model.is_some() {
-            ctx.summary_model = self.summary_model.clone();
+        // Summary pair (#1191 / PR #1194): an empty (or whitespace-only)
+        // string is the persisted EXPLICIT-CLEAR sentinel — the operator
+        // cleared the pair via PATCH to restore inherit-agent-model
+        // behaviour, and that opt-out must override the compiled
+        // `Some(...)` default pair on reboot. Map the sentinel back to
+        // `None`; apply `Some(non-empty)` as a normal override; leave a
+        // genuinely absent field (`None`) untouched so the compiled /
+        // TOML value still wins for non-overridden deployments. Mirrors
+        // the TOML clear shape (`summary_model = ""` +
+        // `summary_provider = ""`), whose deserializer trims the same way.
+        if let Some(ref v) = self.summary_model {
+            ctx.summary_model = (!v.trim().is_empty()).then(|| v.clone());
         }
-        if self.summary_provider.is_some() {
-            ctx.summary_provider = self.summary_provider.clone();
+        if let Some(ref v) = self.summary_provider {
+            ctx.summary_provider = (!v.trim().is_empty()).then(|| v.clone());
         }
         if let Some(ref v) = self.run_summary_mode {
             ctx.run_summary_mode = v.clone();
@@ -1797,6 +1821,37 @@ fn persist_settings(state: &AppState) {
     let sess = state.session_config.read();
     let tools = state.tools_config.read();
 
+    // #1191 / PR #1194 (Codex P2, both rounds): the summary pair is
+    // persisted only when it DIFFERS from the compiled default pair.
+    //
+    // - Pair == compiled default → persist BOTH fields as `None` (absent
+    //   on the wire via `skip_serializing_if`). `persist_settings` runs
+    //   after EVERY successful PATCH, so unconditionally snapshotting the
+    //   pair would pin the compiled default into `settings.json` the
+    //   first time an operator PATCHes an *unrelated* knob — and because
+    //   `settings.json` overlays TOML on boot, that pin would clobber the
+    //   documented `alms.toml` `summary_model = ""` /
+    //   `summary_provider = ""` opt-out on every later restart.
+    // - Pair != compiled default → the operator made a choice; persist it
+    //   explicitly for BOTH fields: `Some(value)` for an override,
+    //   `Some("")` for a cleared field (the explicit-clear sentinel — a
+    //   `None` would serialize as absent, meaning "not overridden", and
+    //   the compiled default pair would resurrect on the next boot). A
+    //   cleared pair (`None`/`None`) never equals the compiled `Some`
+    //   pair, so the durable-clear path always takes this branch.
+    let (persist_summary_model, persist_summary_provider) =
+        if alms_core::config::ContextConfig::is_compiled_default_summary_pair(
+            ctx.summary_provider.as_deref(),
+            ctx.summary_model.as_deref(),
+        ) {
+            (None, None)
+        } else {
+            (
+                Some(ctx.summary_model.clone().unwrap_or_default()),
+                Some(ctx.summary_provider.clone().unwrap_or_default()),
+            )
+        };
+
     let persisted = PersistedSettings {
         // Only persist the fields that PATCH /settings exposes for context.
         context: Some(PersistedContextOverrides {
@@ -1805,8 +1860,8 @@ fn persist_settings(state: &AppState) {
             // #869: persist the threshold-based knobs.
             compact_trigger_pct: Some(ctx.compact_trigger_pct),
             compact_retain_pct: Some(ctx.compact_retain_pct),
-            summary_model: ctx.summary_model.clone(),
-            summary_provider: ctx.summary_provider.clone(),
+            summary_model: persist_summary_model,
+            summary_provider: persist_summary_provider,
             // run_summary_mode and run_summary_budget are NOT exposed in
             // PATCH /settings, so we never persist them. This ensures that
             // code-default changes and env-var overrides are always respected.
@@ -2018,19 +2073,21 @@ mod tests {
     fn context_overrides_summary_provider_round_trip() {
         let mut ctx = alms_core::config::ContextConfig::default();
         assert_eq!(
-            ctx.summary_provider, None,
-            "default ContextConfig has summary_provider = None"
+            ctx.summary_provider,
+            Some("openrouter".into()),
+            "default ContextConfig ships the explicit summary pair (#1191)"
         );
 
-        // Setting it on the override applies it.
+        // Setting it on the override applies it — use a provider that
+        // differs from the compiled default so the mutation is observable.
         let overrides = PersistedContextOverrides {
-            summary_provider: Some("openrouter".into()),
+            summary_provider: Some("anthropic".into()),
             ..Default::default()
         };
         overrides.apply_to(&mut ctx);
         assert_eq!(
             ctx.summary_provider,
-            Some("openrouter".into()),
+            Some("anthropic".into()),
             "summary_provider override should land on ContextConfig"
         );
 
@@ -2044,9 +2101,42 @@ mod tests {
         no_op.apply_to(&mut ctx);
         assert_eq!(
             ctx.summary_provider,
-            Some("openrouter".into()),
+            Some("anthropic".into()),
             "PersistedContextOverrides with None summary_provider must not clear the live value"
         );
+    }
+
+    /// #1191 / PR #1194 (Codex P2): `Some("")` on the persisted summary
+    /// pair is the explicit-clear sentinel — `apply_to` must map it to
+    /// `None` so the operator's opt-out overrides the compiled `Some(...)`
+    /// default pair on reboot instead of being resurrected by it.
+    /// Whitespace-only values clear too, matching the TOML deserializer
+    /// and the PATCH handler.
+    #[test]
+    fn context_overrides_empty_string_summary_pair_clears_compiled_default() {
+        for sentinel in ["", "  \t"] {
+            let mut ctx = alms_core::config::ContextConfig::default();
+            assert!(
+                ctx.summary_model.is_some() && ctx.summary_provider.is_some(),
+                "precondition: the compiled default ships an explicit pair (#1191)"
+            );
+            let overrides = PersistedContextOverrides {
+                summary_model: Some(sentinel.into()),
+                summary_provider: Some(sentinel.into()),
+                ..Default::default()
+            };
+            overrides.apply_to(&mut ctx);
+            assert!(
+                ctx.summary_model.is_none(),
+                "sentinel {sentinel:?} must clear summary_model, got {:?}",
+                ctx.summary_model
+            );
+            assert!(
+                ctx.summary_provider.is_none(),
+                "sentinel {sentinel:?} must clear summary_provider, got {:?}",
+                ctx.summary_provider
+            );
+        }
     }
 
     /// Session overrides with partial fields should only overwrite `Some` fields.
@@ -2630,8 +2720,8 @@ mod tests {
             },
         );
         // `AppState::new` seeds `server_llm_default` from
-        // `LlmConfig::default()`, which post-PR #1081 already carries
-        // `(openrouter, moonshotai/kimi-k2.6)` — i.e. the same pair this
+        // `LlmConfig::default()`, which post-#1191 carries
+        // `(openrouter, z-ai/glm-5.2)` — i.e. the same pair this
         // test PATCHes. Force the baseline to a different pair so the
         // "PATCH actually mutated something" sanity check below is
         // meaningful instead of vacuously true.
@@ -2646,7 +2736,7 @@ mod tests {
         // PATCH both fields. With `openrouter` seeded above the provider
         // validator passes and both knobs land on `server_llm_default`.
         let body = PatchSettingsRequest {
-            model: Some("moonshotai/kimi-k2.6".into()),
+            model: Some("z-ai/glm-5.2".into()),
             provider: Some("openrouter".into()),
             ..Default::default()
         };
@@ -2659,7 +2749,7 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
 
         let live = state.server_llm_default.read().clone();
-        assert_eq!(live.model, "moonshotai/kimi-k2.6");
+        assert_eq!(live.model, "z-ai/glm-5.2");
         assert_eq!(live.provider, "openrouter");
         // The baseline should differ from the post-PATCH snapshot in at
         // least one knob — sanity check that the mutation actually
@@ -2673,7 +2763,7 @@ mod tests {
         // re-applies it on the next boot.
         let on_disk = std::fs::read_to_string(settings_path(&state.data_dir)).unwrap();
         let parsed: PersistedSettings = serde_json::from_str(&on_disk).unwrap();
-        assert_eq!(parsed.model.as_deref(), Some("moonshotai/kimi-k2.6"));
+        assert_eq!(parsed.model.as_deref(), Some("z-ai/glm-5.2"));
         assert_eq!(parsed.provider.as_deref(), Some("openrouter"));
     }
 
@@ -2689,8 +2779,8 @@ mod tests {
         // Tim follow-up on #1081: the no-op model guard added in this
         // commit makes `restart_required` conditional on an actual
         // value change. `settings_test_app_state` boots `AppState::new`
-        // which seeds `server_llm_default.model = "moonshotai/kimi-k2.6"`
-        // (the post-#1081 compiled default). PATCHing the same value
+        // which seeds `server_llm_default.model = "z-ai/glm-5.2"`
+        // (the post-#1191 compiled default). PATCHing the same value
         // back is now a true no-op and would not flip
         // `restart_required` — pick a model that differs from the live
         // default so the wire flag is observably set.
@@ -3338,9 +3428,9 @@ mod tests {
              update the assertion below if that changes"
         );
         assert_eq!(
-            gateway_config.llm_config.default_model, "moonshotai/kimi-k2.6",
+            gateway_config.llm_config.default_model, "z-ai/glm-5.2",
             "test relies on LlmConfig::default().default_model being \
-             moonshotai/kimi-k2.6; update the assertion below if that changes"
+             z-ai/glm-5.2; update the assertion below if that changes"
         );
         gateway_config.llm_config.providers.insert(
             "openrouter".into(),
@@ -3401,7 +3491,7 @@ mod tests {
         );
         assert_eq!(
             state.llm.default_model(),
-            "moonshotai/kimi-k2.6",
+            "z-ai/glm-5.2",
             "boot must skip persisted model when its persisted provider is \
              invalid — the model is namespace-specific and would be an \
              unresolvable slug on the fallback provider"
@@ -3412,7 +3502,7 @@ mod tests {
             "server_llm_default.provider must mirror the in-file default"
         );
         assert_eq!(
-            default.model, "moonshotai/kimi-k2.6",
+            default.model, "z-ai/glm-5.2",
             "server_llm_default.model must mirror the in-file default — \
              not the dropped persisted model"
         );
@@ -3420,7 +3510,7 @@ mod tests {
         // GET /settings until the next restart) — both fields must reflect
         // the in-file default pair, not the dropped persisted pair.
         assert_eq!(state.llm_config.provider, "openrouter");
-        assert_eq!(state.llm_config.default_model, "moonshotai/kimi-k2.6");
+        assert_eq!(state.llm_config.default_model, "z-ai/glm-5.2");
     }
 
     /// When the persisted provider is absent (operator pinned only the
@@ -3574,7 +3664,7 @@ mod tests {
         .into_response();
         // Layer-1 budget validator returns 400 (not 422) for
         // INVALID_TOKEN_BUDGET_FOR_PROVIDER. The pre-fix behaviour
-        // would have returned 200 because the boot-time pair
+        // would have returned 200 because the seeded live-default pair
         // (openrouter, kimi-k2.6) is not in the budget table and the
         // validator silently skips unknown pairs.
         unsafe { std::env::remove_var("ALMS_TOKEN_BUDGET_VALIDATION") };
@@ -3583,7 +3673,7 @@ mod tests {
             StatusCode::BAD_REQUEST,
             "PATCH must be rejected by the budget validator against the \
              post-patch (anthropic, claude-haiku-4-5) pair, not the \
-             boot-time (openrouter, kimi-k2.6) pair"
+             seeded (openrouter, kimi-k2.6) live-default pair"
         );
         let body_bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
             .await
@@ -3674,7 +3764,7 @@ mod tests {
             "PATCH must be rejected by the budget validator against the \
              post-patch (anthropic, claude-haiku-4-5) pair the commit path \
              would later persist via the provider-entry fallback, NOT the \
-             boot-time (openrouter, kimi-k2.6) live default"
+             seeded (openrouter, kimi-k2.6) live default"
         );
         let body_bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
             .await
@@ -4523,6 +4613,186 @@ mod tests {
         assert!(cfg.context_config.summary_model.is_none());
     }
 
+    /// PR #1194 (Tim's nit): the PATCH clear sentinel is trim-aware, like
+    /// the TOML path — a whitespace-only value clears the pair instead of
+    /// being treated as a provider name / model slug (pre-fix, `"  "` fell
+    /// through to the provider lookup and 422'd with
+    /// `SUMMARY_PROVIDER_UNKNOWN`).
+    #[tokio::test]
+    async fn patch_treats_whitespace_only_summary_pair_as_clear() {
+        let state = settings_test_app_state_with_openrouter();
+        {
+            let mut agent = state.agent_config.write();
+            agent.context_config.summary_provider = Some("openrouter".into());
+            agent.context_config.summary_model = Some("google/gemma-4-31b-it".into());
+        }
+
+        let body = PatchSettingsRequest {
+            context: Some(PatchContext {
+                summary_provider: Some("  ".into()),
+                summary_model: Some(" \t ".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        use axum::response::IntoResponse;
+        let resp = patch_settings(
+            axum::extract::State(state.clone()),
+            Json(serde_json::to_value(&body).unwrap()),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let cfg = state.agent_config.read();
+        assert!(cfg.context_config.summary_provider.is_none());
+        assert!(cfg.context_config.summary_model.is_none());
+    }
+
+    /// #1191 / PR #1194 (Codex P2) end-to-end round-trip: PATCH clears the
+    /// summary pair → `persist_settings` writes the `""` sentinel for BOTH
+    /// fields (not absent fields) → a simulated reboot applies the persisted
+    /// overrides onto a fresh compiled-default `ContextConfig` → the pair
+    /// stays cleared instead of resurrecting the compiled default.
+    ///
+    /// Pre-fix: the clear was persisted as omitted fields, `apply_to` only
+    /// reapplied `Some` values, and the next boot fell back to
+    /// `Some("google/gemma-4-31b-it")` / `Some("openrouter")` — breaking
+    /// non-OpenRouter deployments that cleared the pair precisely because
+    /// they have no OpenRouter key.
+    #[tokio::test]
+    async fn patch_clear_of_summary_pair_survives_restart() {
+        // ── 1. PATCH ────────────────────────────────────────────────────
+        let mut state = settings_test_app_state_with_openrouter();
+        let tmp = tempfile::tempdir().unwrap();
+        state.data_dir = tmp.path().to_path_buf();
+        {
+            let mut agent = state.agent_config.write();
+            agent.context_config.summary_provider = Some("openrouter".into());
+            agent.context_config.summary_model = Some("google/gemma-4-31b-it".into());
+        }
+
+        let body = PatchSettingsRequest {
+            context: Some(PatchContext {
+                summary_provider: Some(String::new()),
+                summary_model: Some(String::new()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        use axum::response::IntoResponse;
+        let resp = patch_settings(
+            axum::extract::State(state.clone()),
+            Json(serde_json::to_value(&body).unwrap()),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // ── 2. PERSIST ─────────────────────────────────────────────────
+        // The on-disk overrides must carry the EXPLICIT `""` sentinel for
+        // both fields — an absent field would mean "not overridden" on
+        // reload and resurrect the compiled default pair.
+        let raw = std::fs::read_to_string(settings_path(&state.data_dir)).unwrap();
+        let persisted: PersistedSettings = serde_json::from_str(&raw).unwrap();
+        let ctx_overrides = persisted.context.expect("context block must be persisted");
+        assert_eq!(
+            ctx_overrides.summary_model.as_deref(),
+            Some(""),
+            "cleared summary_model must persist as the \"\" sentinel, not an absent field"
+        );
+        assert_eq!(
+            ctx_overrides.summary_provider.as_deref(),
+            Some(""),
+            "cleared summary_provider must persist as the \"\" sentinel, not an absent field"
+        );
+
+        // ── 3. REBOOT ──────────────────────────────────────────────────
+        // `AppState::new` starts from the resolved config (compiled
+        // defaults + TOML + env) and applies the persisted context
+        // overrides on top — replicate exactly that merge here.
+        let mut boot_ctx = alms_core::config::ContextConfig::default();
+        ctx_overrides.apply_to(&mut boot_ctx);
+        assert!(
+            boot_ctx.summary_model.is_none(),
+            "the clear must survive restart — compiled default summary_model resurrected"
+        );
+        assert!(
+            boot_ctx.summary_provider.is_none(),
+            "the clear must survive restart — compiled default summary_provider resurrected"
+        );
+    }
+
+    /// PR #1194 (Codex P2, round 2): `persist_settings` must NOT pin the
+    /// compiled default summary pair into `settings.json`. It runs after
+    /// every successful PATCH, so a PATCH to an *unrelated* knob on a
+    /// deployment that never touched the pair would otherwise persist
+    /// `Some(compiled default)` as an explicit override — which overlays
+    /// TOML on the next boot and clobbers the documented `alms.toml`
+    /// `summary_model = ""` / `summary_provider = ""` opt-out.
+    #[tokio::test]
+    async fn unrelated_patch_does_not_pin_compiled_default_summary_pair() {
+        let mut state = settings_test_app_state();
+        let tmp = tempfile::tempdir().unwrap();
+        state.data_dir = tmp.path().to_path_buf();
+        // Live pair sits at the compiled default (never touched).
+        {
+            let defaults = alms_core::config::ContextConfig::default();
+            let mut agent = state.agent_config.write();
+            agent.context_config.summary_provider = defaults.summary_provider.clone();
+            agent.context_config.summary_model = defaults.summary_model.clone();
+        }
+
+        // PATCH an unrelated knob.
+        let body = PatchSettingsRequest {
+            session: Some(PatchSession {
+                max_messages: Some(4321),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        use axum::response::IntoResponse;
+        let resp = patch_settings(
+            axum::extract::State(state.clone()),
+            Json(serde_json::to_value(&body).unwrap()),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // The persisted context block must leave BOTH summary fields
+        // absent — not pinned to the compiled default.
+        let raw = std::fs::read_to_string(settings_path(&state.data_dir)).unwrap();
+        assert!(
+            !raw.contains("summary_model") && !raw.contains("summary_provider"),
+            "unrelated PATCH must not persist the compiled default summary pair — got: {raw}"
+        );
+        let persisted: PersistedSettings = serde_json::from_str(&raw).unwrap();
+        let ctx_overrides = persisted.context.expect("context block must be persisted");
+        assert_eq!(ctx_overrides.summary_model, None);
+        assert_eq!(ctx_overrides.summary_provider, None);
+
+        // Reboot half: applying these overrides onto a TOML-cleared config
+        // must NOT resurrect the compiled default pair — the exact clobber
+        // this fix prevents.
+        let mut boot_ctx = alms_core::config::ContextConfig {
+            // Simulates the `alms.toml` `""`/`""` opt-out, which the
+            // deserializer normalizes to a cleared pair.
+            summary_model: None,
+            summary_provider: None,
+            ..Default::default()
+        };
+        ctx_overrides.apply_to(&mut boot_ctx);
+        assert!(
+            boot_ctx.summary_model.is_none(),
+            "persisted overrides must not clobber the alms.toml summary_model opt-out"
+        );
+        assert!(
+            boot_ctx.summary_provider.is_none(),
+            "persisted overrides must not clobber the alms.toml summary_provider opt-out"
+        );
+    }
+
     // ── #947: PATCH /settings rejects security knobs ──────────────────
 
     /// Read the JSON body of an axum response into a `serde_json::Value`.
@@ -5129,7 +5399,7 @@ mod tests {
 
         let mut state = settings_test_app_state();
         // Default test state already uses provider=openrouter,
-        // model=moonshotai/kimi-k2.6 — both unknown to the budget table.
+        // model=z-ai/glm-5.2 — both unknown to the budget table.
         // Bump the candidate to a wildly large value to prove "unknown"
         // really does mean "skip" (not "fail open accidentally because
         // the test fixture is small").

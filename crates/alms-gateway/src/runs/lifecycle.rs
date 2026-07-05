@@ -1161,13 +1161,30 @@ fn build_summary_client(
         alms_runtime::build_summary_client(llm, summary_provider, summary_model, Some(secrets));
 
     if let Some(provider) = summary_provider {
-        info!(
-            agent_id = %agent_id,
-            agent_provider = %llm.provider(),
-            summary_provider = %provider,
-            summary_model = %summary_model.unwrap_or("<inherit>"),
-            "Using dedicated provider for summary task (#866)"
-        );
+        // #1191 made `Some(openrouter, gemma)` the compiled default, so
+        // this branch now runs on every stock deployment's runs — only an
+        // operator-configured pair is `info!`-worthy; the default pair is
+        // routine and logs at `debug!` (PR #1194).
+        if alms_core::config::ContextConfig::is_compiled_default_summary_pair(
+            summary_provider,
+            summary_model,
+        ) {
+            debug!(
+                agent_id = %agent_id,
+                agent_provider = %llm.provider(),
+                summary_provider = %provider,
+                summary_model = %summary_model.unwrap_or("<inherit>"),
+                "Using dedicated provider for summary task (#866, compiled default pair)"
+            );
+        } else {
+            info!(
+                agent_id = %agent_id,
+                agent_provider = %llm.provider(),
+                summary_provider = %provider,
+                summary_model = %summary_model.unwrap_or("<inherit>"),
+                "Using dedicated provider for summary task (#866)"
+            );
+        }
     }
 
     switched

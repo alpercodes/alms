@@ -1279,7 +1279,7 @@ mod tests {
         // Provider should not change
         assert_eq!(updated.provider(), "openrouter");
         // The default model should not change either
-        assert_eq!(updated.default_model(), "moonshotai/kimi-k2.6");
+        assert_eq!(updated.default_model(), "z-ai/glm-5.2");
         // The key must have been updated to the new value
         assert_eq!(updated.api_key(), "new-runtime-key");
     }

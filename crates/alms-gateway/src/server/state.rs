@@ -20,7 +20,7 @@ use tokio_util::sync::CancellationToken;
 /// [`AppState::server_llm_default`] for lifetime / propagation rules.
 #[derive(Debug, Clone)]
 pub struct ServerLlmDefault {
-    /// Server-default model id (e.g. `"moonshotai/kimi-k2.6"`).
+    /// Server-default model id (e.g. `"z-ai/glm-5.2"`).
     pub model: String,
     /// Server-default provider name (must be a key in `llm_config.providers`).
     pub provider: String,
