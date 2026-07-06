@@ -1,4 +1,9 @@
-//! Error-marker classification and legacy run-boundary deduplication.
+//! Marker classification and legacy run-boundary deduplication.
+//!
+//! Hosts the two marker predicates the context builder keys on: error
+//! markers (rewritten to surviving `[Error] …` user messages, [`is_error_marker`])
+//! and synthetic display-only lifecycle markers (skipped during history
+//! selection because they are stripped pre-LLM, [`is_stripped_display_marker`]).
 //!
 //! The `persist_error_marker` path in `gateway::runs::markers` (issue #874)
 //! writes synthetic `Role::System` messages tagged with `metadata.kind ==
@@ -40,6 +45,49 @@ pub(super) fn is_error_marker(msg: &Message) -> bool {
         .and_then(|m| m.get("kind"))
         .and_then(|v| v.as_str())
         == Some("error")
+}
+
+/// Returns `true` when the message is a synthetic display-only lifecycle
+/// marker that `normalize::strip_mid_history_system_markers` removes before
+/// the message list reaches the LLM.
+///
+/// These are the markers persisted by `gateway::runs::markers::
+/// persist_lifecycle_marker`: `Role::System` messages tagged with
+/// `metadata.synthetic == true` (job notifications, DM-ended, subagent
+/// completion, …). `session_msg_to_llm` rebuilds them as `role = "system"`
+/// [`LlmMessage`]s (see `rebuild.rs`), which the canonical-shape pass then
+/// strips, so they never reach the provider adapter.
+///
+/// Error markers (`metadata.kind == "error"`) are deliberately excluded:
+/// `session_msg_to_llm` rewrites them into surviving `[Error] …` **user**
+/// messages, so they DO reach the LLM and must keep counting against the
+/// token budget. Gating on the canonical `synthetic` flag (the same flag
+/// `alms_tools::dm_filter::is_synthetic_marker` keys on) keeps the exemption
+/// scoped to genuine display-only markers and never touches real content.
+///
+/// The token-budgeted history-selection strategies ([`super::strategies`])
+/// **skip** these markers entirely rather than selecting them: raising a
+/// display cap (e.g. the #1196 job-summary cap 200 → 4000 chars) then can't
+/// shrink the effective LLM context by charging selection budget for text
+/// that is stripped pre-LLM, and — because the marker never enters the
+/// assembled window — it can never land head-of-window where the strip's
+/// leading-system-prefix carve-out would otherwise leak it (issue #1201).
+pub(super) fn is_stripped_display_marker(msg: &Message) -> bool {
+    // Only Role::System messages are subject to
+    // `strip_mid_history_system_markers`.
+    if msg.role != Role::System {
+        return false;
+    }
+    // Error markers survive as rewritten `user` messages — never exempt them.
+    if is_error_marker(msg) {
+        return false;
+    }
+    // Canonical lifecycle-marker flag.
+    msg.metadata
+        .as_ref()
+        .and_then(|m| m.get("synthetic"))
+        .and_then(|v| v.as_bool())
+        == Some(true)
 }
 
 /// Returns `true` when the message is the lifecycle-layer
@@ -155,6 +203,7 @@ pub(super) fn filter_legacy_duplicate_run_boundary_markers(history: &[Message]) 
 mod tests {
     use super::super::ContextBuilder;
     use super::super::tests::make_msg;
+    use super::{is_error_marker, is_stripped_display_marker};
     use alms_core::{Timestamp, config::ContextConfig};
     use alms_session::{Content, Message, Role};
 
@@ -174,6 +223,75 @@ mod tests {
                 "error": error,
             })),
         }
+    }
+
+    /// Helper: a synthetic display-only lifecycle marker (job / DM-ended /
+    /// subagent completion) — `Role::System` + `synthetic: true` with a
+    /// non-error `type`, exactly the shape `persist_lifecycle_marker` writes.
+    fn make_lifecycle_marker(text: &str, marker_type: &str) -> Message {
+        Message {
+            id: uuid::Uuid::new_v4().to_string(),
+            role: Role::System,
+            content: Content::Text(text.to_string()),
+            timestamp: Timestamp::now(),
+            metadata: Some(serde_json::json!({
+                "synthetic": true,
+                "type": marker_type,
+            })),
+        }
+    }
+
+    /// #1201: job AND notification markers are all synthetic `Role::System`
+    /// lifecycle markers that the canonical pass strips before the LLM call,
+    /// so `is_stripped_display_marker` must classify every variant as exempt
+    /// from the history-selection budget.
+    #[test]
+    fn stripped_display_marker_matches_job_and_notification_markers() {
+        for marker_type in [
+            "job_notification",
+            "dm_ended_notification",
+            "subagent_completion",
+        ] {
+            let marker =
+                make_lifecycle_marker("[Scheduled job: nightly] long summary body", marker_type);
+            assert!(
+                is_stripped_display_marker(&marker),
+                "synthetic lifecycle marker (type={marker_type}) must be exempt from \
+                 history-selection budget"
+            );
+        }
+    }
+
+    /// Error markers (#874) are rewritten to surviving `[Error] …` user
+    /// messages and DO reach the LLM, so they must keep counting against the
+    /// budget — `is_stripped_display_marker` must NOT exempt them even though
+    /// they also carry `synthetic: true`.
+    #[test]
+    fn stripped_display_marker_excludes_error_markers() {
+        let err = make_error_marker("(run failed) boom", "failed", "boom");
+        assert!(is_error_marker(&err), "sanity: fixture is an error marker");
+        assert!(
+            !is_stripped_display_marker(&err),
+            "error markers survive as user messages — must not be exempted from budget"
+        );
+    }
+
+    /// Real content (user / assistant turns, and plain non-synthetic system
+    /// text) must never be exempted — the exemption is scoped strictly to the
+    /// canonical `synthetic` flag so it can never under-count real turns.
+    #[test]
+    fn stripped_display_marker_excludes_real_content() {
+        assert!(!is_stripped_display_marker(&make_msg(Role::User, "hello")));
+        assert!(!is_stripped_display_marker(&make_msg(
+            Role::Assistant,
+            "hi there"
+        )));
+        // A non-synthetic System message is not a lifecycle marker, so it is
+        // not exempted (the conservative direction never under-counts).
+        assert!(!is_stripped_display_marker(&make_msg(
+            Role::System,
+            "plain system text"
+        )));
     }
 
     /// Run-failed error markers (#874) must reach the LLM context as a

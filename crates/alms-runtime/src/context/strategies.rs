@@ -15,6 +15,15 @@
 //! persisted [`Message`] to an [`LlmMessage`] and use
 //! [`super::estimate_llm_message_tokens`] for the budget arithmetic.
 //!
+//! Synthetic display-only markers (see
+//! [`super::error_markers::is_stripped_display_marker`]) are skipped up
+//! front in every walk: `normalize::strip_mid_history_system_markers`
+//! removes them before the LLM call, so they must never enter the selected
+//! window. Including them — even at zero token cost — would both charge
+//! selection budget for text that never reaches the model AND risk one
+//! landing head-of-window, where the strip's leading-system-prefix carve-out
+//! would leak it to the provider (issue #1201).
+//!
 //! Pure free functions — `workspace_root` and (for `build_compact`)
 //! `retain_budget` are threaded in as explicit arguments so the strategies
 //! are independently testable.
@@ -24,6 +33,7 @@ use alms_session::Message;
 use std::path::Path;
 use tracing::warn;
 
+use super::error_markers::is_stripped_display_marker;
 use super::rebuild::session_msg_to_llm;
 use super::{estimate_llm_message_tokens, estimate_tokens};
 
@@ -36,6 +46,12 @@ pub(super) fn build_full(
 ) {
     let mut used = 0;
     for msg in history {
+        // Synthetic display-only markers are stripped before the LLM call, so
+        // they must never enter the selected window (would waste budget and,
+        // if oldest-in-window, leak into the system prefix — #1201).
+        if is_stripped_display_marker(msg) {
+            continue;
+        }
         let llm_msg = session_msg_to_llm(msg, workspace_root);
         let tokens = estimate_llm_message_tokens(&llm_msg);
         if used + tokens > budget {
@@ -71,6 +87,10 @@ pub(super) fn build_truncate(
     // Walk backwards through history, newest-first, until adding the next
     // message would exceed the token budget.
     for msg in history.iter().rev() {
+        // Skip stripped-pre-LLM display markers (#1201) — see build_full.
+        if is_stripped_display_marker(msg) {
+            continue;
+        }
         let llm_msg = session_msg_to_llm(msg, workspace_root);
         let tokens = estimate_llm_message_tokens(&llm_msg);
         if used + tokens > budget {
@@ -133,6 +153,10 @@ pub(super) fn build_compact(
     let mut msg_used = 0;
 
     for msg in history.iter().rev() {
+        // Skip stripped-pre-LLM display markers (#1201) — see build_full.
+        if is_stripped_display_marker(msg) {
+            continue;
+        }
         let llm_msg = session_msg_to_llm(msg, workspace_root);
         let tokens = estimate_llm_message_tokens(&llm_msg) + 4;
         if msg_used + tokens > cap {
@@ -149,7 +173,7 @@ pub(super) fn build_compact(
 #[cfg(test)]
 mod tests {
     use super::super::ContextBuilder;
-    use super::super::tests::make_msg;
+    use super::super::tests::{make_msg, make_msg_with_metadata};
     use alms_core::config::ContextConfig;
     use alms_session::{Message, Role};
 
@@ -374,5 +398,244 @@ mod tests {
             messages.len()
         );
         assert_eq!(messages.last().unwrap().role, "user");
+    }
+
+    /// #1201: a large synthetic display-only marker (job / notification) is
+    /// stripped before the LLM call, so it must NOT consume history-selection
+    /// budget. Placed mid-history, a ~1000-token marker must not evict the
+    /// real conversation turns older than it — every real turn survives.
+    #[test]
+    fn synthetic_marker_does_not_displace_real_history() {
+        // history_budget ≈ max_input_tokens − (system + input + HISTORY_RESERVE)
+        // = 1204 − (~2 + ~2 + 1000) ≈ 200 tokens. Six short real turns fit
+        // easily; the marker alone (~1000 tokens) would not.
+        let config = ContextConfig {
+            strategy: "truncate".into(),
+            max_input_tokens: 1204,
+            ..Default::default()
+        };
+        let builder = ContextBuilder::new(config);
+
+        // ~3 KB job summary ≈ 1000 tokens — the post-#1196 (4000-char cap) shape.
+        let big_summary = "job summary line. ".repeat(170);
+        let marker_text = format!("[Scheduled job: nightly-report] nightly-report\n{big_summary}");
+
+        // Marker sits mid-history: a budget walk that charged its tokens would
+        // break at the marker and drop every turn older than it.
+        let history = vec![
+            make_msg(Role::User, "real turn zero"),
+            make_msg(Role::Assistant, "real turn one"),
+            make_msg(Role::User, "real turn two"),
+            make_msg_with_metadata(
+                Role::System,
+                &marker_text,
+                Some(serde_json::json!({
+                    "synthetic": true,
+                    "type": "job_notification",
+                })),
+            ),
+            make_msg(Role::Assistant, "real turn three"),
+            make_msg(Role::User, "real turn four"),
+            make_msg(Role::Assistant, "real turn five"),
+        ];
+
+        let messages = builder.build("System", &history, "Input", None);
+
+        for needle in [
+            "real turn zero",
+            "real turn one",
+            "real turn two",
+            "real turn three",
+            "real turn four",
+            "real turn five",
+        ] {
+            assert!(
+                messages.iter().any(|m| m.content_str().contains(needle)),
+                "real history turn {needle:?} was evicted — a stripped marker must not \
+                 consume selection budget; got: {:?}",
+                messages
+                    .iter()
+                    .map(|m| (m.role.clone(), m.content_str().to_string()))
+                    .collect::<Vec<_>>()
+            );
+        }
+
+        // The marker is display-only: it must be stripped, not sent to the LLM.
+        assert!(
+            !messages
+                .iter()
+                .any(|m| m.content_str().contains("Scheduled job")),
+            "synthetic marker must be stripped before the LLM call"
+        );
+        assert!(
+            messages[1..].iter().all(|m| m.role != "system"),
+            "no mid-history system marker may survive"
+        );
+    }
+
+    /// Control for #1201: the exemption is specific to synthetic markers. A
+    /// same-sized REAL turn still consumes selection budget and evicts older
+    /// history — proving `selection_token_cost` did not become a blanket
+    /// "ignore large messages".
+    #[test]
+    fn large_real_message_still_consumes_selection_budget() {
+        let config = ContextConfig {
+            strategy: "truncate".into(),
+            max_input_tokens: 1204,
+            ..Default::default()
+        };
+        let builder = ContextBuilder::new(config);
+
+        // Same ~1000-token bulk as the marker test, but a genuine user turn.
+        let big_text = "real bulky content. ".repeat(170);
+        let history = vec![
+            make_msg(Role::User, "real turn zero"),
+            make_msg(Role::Assistant, "real turn one"),
+            make_msg(Role::User, "real turn two"),
+            make_msg(Role::Assistant, &big_text),
+            make_msg(Role::User, "real turn four"),
+            make_msg(Role::Assistant, "real turn five"),
+        ];
+
+        let messages = builder.build("System", &history, "Input", None);
+
+        // Reaching the big real turn in the newest-first walk exhausts the
+        // budget, so the turns older than it are evicted — unlike the marker
+        // case where all real turns survive.
+        assert!(
+            !messages
+                .iter()
+                .any(|m| m.content_str().contains("real turn zero")),
+            "a large real message must still consume selection budget and evict older \
+             history; got: {:?}",
+            messages
+                .iter()
+                .map(|m| m.content_str().to_string())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// #1201 C1 regression: `strip_mid_history_system_markers` only strips
+    /// system messages AFTER the leading system prefix, so a marker that
+    /// entered the selected window as its OLDEST message would extend that
+    /// prefix and leak to the provider. Skipping markers during selection
+    /// closes this by construction — the marker never enters the window.
+    #[test]
+    fn synthetic_marker_never_survives_as_head_of_window() {
+        let config = ContextConfig {
+            strategy: "truncate".into(),
+            max_input_tokens: 32_000,
+            ..Default::default()
+        };
+        let builder = ContextBuilder::new(config);
+
+        let big_summary = "stale job text. ".repeat(80);
+        let marker_text = format!("[Scheduled job: leaky] leaky-job\n{big_summary}");
+
+        // Marker is the OLDEST message; all newer real turns fit the budget,
+        // so a newest-first walk reaches the marker and (pre-fix, at cost 0)
+        // would include it as head-of-window.
+        let history = vec![
+            make_msg_with_metadata(
+                Role::System,
+                &marker_text,
+                Some(serde_json::json!({
+                    "synthetic": true,
+                    "type": "job_notification",
+                })),
+            ),
+            make_msg(Role::User, "real turn one"),
+            make_msg(Role::Assistant, "real turn two"),
+            make_msg(Role::User, "real turn three"),
+        ];
+
+        let messages = builder.build("System", &history, "Input", None);
+
+        // The leading system prefix must be exactly the system prompt — the
+        // marker must not extend it into a surviving second system message.
+        assert_eq!(messages[0].role, "system");
+        assert_eq!(
+            messages[1].role,
+            "user",
+            "marker must not survive as head-of-window and extend the system prefix; got: {:?}",
+            messages
+                .iter()
+                .map(|m| (m.role.clone(), m.content_str().to_string()))
+                .collect::<Vec<_>>()
+        );
+        // And its text must not reach the LLM context anywhere.
+        assert!(
+            !messages.iter().any(|m| {
+                let s = m.content_str();
+                s.contains("Scheduled job") || s.contains("stale job text")
+            }),
+            "marker text must never reach the LLM context"
+        );
+        for needle in ["real turn one", "real turn two", "real turn three"] {
+            assert!(
+                messages.iter().any(|m| m.content_str().contains(needle)),
+                "real turn {needle:?} must be retained"
+            );
+        }
+    }
+
+    /// #1201 (S2): the `compact` strategy skips display markers identically.
+    /// A large mid-history marker must not displace real verbatim tail turns
+    /// and must not reach the LLM. `compact_retain_pct = 1.0` makes the
+    /// retain cap equal the history budget so the arithmetic mirrors the
+    /// truncate case.
+    #[test]
+    fn synthetic_marker_does_not_displace_real_history_compact() {
+        let config = ContextConfig {
+            strategy: "compact".into(),
+            max_input_tokens: 1204,
+            compact_retain_pct: 1.0,
+            ..Default::default()
+        };
+        let builder = ContextBuilder::new(config);
+
+        let big_summary = "job summary line. ".repeat(170);
+        let marker_text = format!("[Scheduled job: nightly] nightly\n{big_summary}");
+
+        let history = vec![
+            make_msg(Role::User, "compact turn zero"),
+            make_msg(Role::Assistant, "compact turn one"),
+            make_msg_with_metadata(
+                Role::System,
+                &marker_text,
+                Some(serde_json::json!({
+                    "synthetic": true,
+                    "type": "job_notification",
+                })),
+            ),
+            make_msg(Role::User, "compact turn two"),
+            make_msg(Role::Assistant, "compact turn three"),
+        ];
+
+        // No prior summary: the verbatim tail is the whole real history.
+        let messages = builder.build("System", &history, "Input", None);
+
+        for needle in [
+            "compact turn zero",
+            "compact turn one",
+            "compact turn two",
+            "compact turn three",
+        ] {
+            assert!(
+                messages.iter().any(|m| m.content_str().contains(needle)),
+                "compact: real turn {needle:?} was evicted — marker must not consume budget; \
+                 got: {:?}",
+                messages
+                    .iter()
+                    .map(|m| (m.role.clone(), m.content_str().to_string()))
+                    .collect::<Vec<_>>()
+            );
+        }
+        assert!(
+            !messages
+                .iter()
+                .any(|m| m.content_str().contains("Scheduled job")),
+            "compact: synthetic marker must be stripped before the LLM call"
+        );
     }
 }
