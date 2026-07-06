@@ -200,7 +200,7 @@ function ChatView() {
                         return html`<${ApprovalCard} key=${m.id} ...${m} />`;
                     }
                     if (m.type === 'job_completed') {
-                        return html`<${JobCompletionCard} key=${m.id} jobName=${m.jobName} status=${m.status} summary=${m.summary} ts=${m.ts} />`;
+                        return html`<${JobCompletionCard} key=${m.id} jobName=${m.jobName} status=${m.status} summary=${m.summary} ts=${m.ts} runId=${m.runId} truncated=${m.truncated} />`;
                     }
                     if (m.type === 'subagent_completed') {
                         return html`<${SubagentCompletionCard} key=${m.id}

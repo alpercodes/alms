@@ -104,7 +104,7 @@ async fn fire_job_run(state: AppState, job_id: JobId) -> alms_core::AlmsResult<(
     // Send a notification to the agent's most recent user-facing session
     // so the user can see that the job ran (even if they weren't watching
     // the hidden job_* session).
-    notify_job_completion(&state, job.agent_id, &job.prompt, run_id).await;
+    notify_job_completion(&state, job.agent_id, &job.prompt, run_id, job_id).await;
 
     // Guard: if the job was cancelled while the run was in progress, do not
     // overwrite the Cancelled status or re-arm the scheduler.
@@ -146,6 +146,9 @@ async fn fire_job_run(state: AppState, job_id: JobId) -> alms_core::AlmsResult<(
     Ok(())
 }
 
+/// Character cap for the job-name label shown on the completion card.
+const JOB_NAME_MAX_CHARS: usize = 60;
+
 /// Send a job-completion notification to the agent's most recent user-facing
 /// session. This makes job runs visible in the chat without creating a full
 /// notification run (which would trigger another LLM call).
@@ -154,30 +157,40 @@ async fn notify_job_completion(
     agent_id: alms_core::AgentId,
     job_prompt: &str,
     run_id: RunId,
+    job_id: JobId,
 ) {
-    // Determine outcome from the completed run.
-    let (status, summary) = match state.run_manager.get_run(run_id) {
+    // Determine outcome from the completed run. `truncated` means "the full
+    // output is longer than `summary` and fetchable via GET /runs/{run_id}" —
+    // only ever true for the Completed arm, where `run.output` is what the
+    // fetch returns. Failed/cancelled summaries are short (and their full text
+    // isn't on `run.output` anyway), so they never signal a fetch.
+    let (status, summary, truncated) = match state.run_manager.get_run(run_id) {
         Some(run) => match run.status {
             RunStatus::Completed => {
                 let output = run.output.unwrap_or_default();
-                let summary: String = if output.len() > 200 {
-                    format!("{}...", output.chars().take(200).collect::<String>())
-                } else {
-                    output
-                };
-                ("success", summary)
+                // Cap at the shared JOB_SUMMARY_MAX_CHARS (4000) instead of the
+                // old 200 so "Show more" reveals a useful chunk inline; the
+                // full output is still fetchable via GET /runs/{run_id} (#1196).
+                let (summary, truncated) =
+                    crate::sse::truncate_chars(&output, crate::sse::JOB_SUMMARY_MAX_CHARS);
+                ("success", summary, truncated)
             }
             RunStatus::Failed => {
                 let err = run.error.unwrap_or_else(|| "unknown error".to_string());
-                ("error", err)
+                // S2 (#1196): cap the error too so a runaway provider error
+                // body can't land untruncated in session history (and so the
+                // marker and SSE surfaces don't diverge). Not fetchable, so the
+                // truncation flag stays false.
+                let (err, _) = crate::sse::truncate_chars(&err, crate::sse::JOB_SUMMARY_MAX_CHARS);
+                ("error", err, false)
             }
-            RunStatus::Cancelled => ("cancelled", "run was cancelled".to_string()),
+            RunStatus::Cancelled => ("cancelled", "run was cancelled".to_string(), false),
             RunStatus::Queued | RunStatus::Running => {
                 // Shouldn't happen — execute_run already returned.
-                ("unknown", "run still in progress".to_string())
+                ("unknown", "run still in progress".to_string(), false)
             }
         },
-        None => ("error", "run record not found".to_string()),
+        None => ("error", "run record not found".to_string(), false),
     };
 
     // Find the agent's most recent user-facing session (exclude internal sessions).
@@ -190,12 +203,19 @@ async fn notify_job_completion(
     };
     let target_session_id = target.id;
 
-    // Truncate the prompt for display.
-    let job_name: String = if job_prompt.len() > 60 {
-        format!("{}...", job_prompt.chars().take(60).collect::<String>())
-    } else {
-        job_prompt.to_string()
-    };
+    // Build the display label for the prompt. Collapse any newlines to spaces
+    // FIRST so the label is single-line: the marker text is
+    // `[Scheduled job {label}] {job_name}\n{summary}`, and the frontend splits
+    // name-vs-summary on the first newline. A prompt with a newline in its
+    // leading ~60 chars would otherwise leak its tail into the summary (#1196
+    // defect b). Truncation is char-based via `truncate_chars`.
+    let single_line_prompt = job_prompt.replace(['\n', '\r'], " ");
+    let (job_name, _) = crate::sse::truncate_chars(&single_line_prompt, JOB_NAME_MAX_CHARS);
+
+    // Deep-link handle to the job's hidden session — the same context id
+    // `fire_job_run` uses (`job_{job_id}`) so consumers can resolve the run's
+    // originating session.
+    let job_session_id = format!("job_{}", job_id.0);
 
     // Send SSE event to the target session so connected UI clients see it.
     state
@@ -203,7 +223,16 @@ async fn notify_job_completion(
         .send_session_event(
             target_session_id,
             alms_core::RunId::new(), // no associated run on this session
-            SseEventData::job_completed(target_session_id, &job_name, status, &summary),
+            SseEventData::job_completed(
+                target_session_id,
+                &job_name,
+                status,
+                &summary,
+                run_id,
+                job_id,
+                &job_session_id,
+                truncated,
+            ),
         )
         .await;
 
@@ -218,7 +247,18 @@ async fn notify_job_completion(
         target_session_id,
         "job_notification",
         format!("[Scheduled job {label}] {job_name}\n{summary}"),
-        serde_json::json!({"job_status": status}),
+        // Deep-link handles (#1196): run_id lets the card fetch the full
+        // persisted output via GET /runs/{run_id}; job_id / job_session_id
+        // identify the firing job and its hidden session. `truncated` is the
+        // authoritative "there is more to fetch" flag the card keys on (the
+        // reload mirror of the SSE field).
+        serde_json::json!({
+            "job_status": status,
+            "run_id": run_id.0.to_string(),
+            "job_id": job_id.0.to_string(),
+            "job_session_id": job_session_id,
+            "truncated": truncated,
+        }),
     );
 
     info!(
@@ -1327,6 +1367,255 @@ mod tests {
         assert_eq!(meta["tool_invocation_id"], parent_inv_id.to_string());
 
         // Clean up: cancel the shutdown token so background tasks (if any) stop.
+        shutdown_token.cancel();
+    }
+
+    // -----------------------------------------------------------------------
+    // #1196 — job-completion summary cap + deep-link handles.
+    // -----------------------------------------------------------------------
+
+    /// Build a minimal AppState for the notification-path tests (no SQLite
+    /// needed — the in-memory session manager and run store suffice).
+    fn build_notification_state() -> (AppState, CancellationToken) {
+        let gateway_config = crate::gateway::GatewayConfig::default();
+        let gateway = crate::gateway::Gateway::new(gateway_config).unwrap();
+        let scheduler = std::sync::Arc::new(alms_runtime::Scheduler::new());
+        let shutdown_token = CancellationToken::new();
+        let (completion_tx, _cr) = mpsc::unbounded_channel();
+        let (trigger_tx, _bus_rx) = mpsc::channel(8);
+        let (dm_event_tx, _dm_event_rx) = mpsc::channel(8);
+        let state = AppState::new(
+            gateway,
+            scheduler,
+            shutdown_token.clone(),
+            completion_tx,
+            trigger_tx,
+            dm_event_tx,
+        )
+        .unwrap();
+        (state, shutdown_token)
+    }
+
+    /// Insert a Completed job run with the given output and return its id.
+    fn insert_completed_job_run(
+        state: &AppState,
+        session_id: SessionId,
+        agent_id: AgentId,
+        job_id: JobId,
+        prompt: &str,
+        output: String,
+    ) -> RunId {
+        let mut run = Run::for_job(session_id, agent_id, prompt.to_string(), job_id);
+        run.status = RunStatus::Completed;
+        run.output = Some(output);
+        let run_id = run.run_id;
+        state.run_manager.insert_run(run);
+        run_id
+    }
+
+    /// Extract the persisted `job_notification` marker's `(text, metadata)`.
+    fn job_marker(state: &AppState, session_id: SessionId) -> (String, serde_json::Value) {
+        let history = state.session_manager.get_history(session_id).unwrap();
+        let marker = history
+            .iter()
+            .find(|m| {
+                m.metadata
+                    .as_ref()
+                    .and_then(|meta| meta.get("type"))
+                    .and_then(|v| v.as_str())
+                    == Some("job_notification")
+            })
+            .expect("job_notification marker must be persisted on the user-facing session");
+        let text = match &marker.content {
+            alms_session::Content::Text(t) => t.clone(),
+            _ => panic!("job marker should be text content"),
+        };
+        (text, marker.metadata.clone().unwrap())
+    }
+
+    /// The persisted marker (and, by the same summary/id values, the SSE
+    /// payload) must carry the full ≤4000-char summary and the run/job
+    /// deep-link handles — not the old 200-char fragment with a bare
+    /// `{job_status}` metadata object.
+    #[tokio::test]
+    async fn job_completion_marker_carries_full_summary_and_ids() {
+        let (state, shutdown_token) = build_notification_state();
+        let agent_id = AgentId::new();
+
+        // A user-facing session so `find_user_facing_session` resolves a target.
+        let web_session_id = state.session_manager.get_or_create(agent_id, "web").id;
+
+        // Output comfortably past the cap so truncation is exercised.
+        let job_id = JobId::new();
+        let long_output = "a".repeat(crate::sse::JOB_SUMMARY_MAX_CHARS + 1000);
+        let run_id = insert_completed_job_run(
+            &state,
+            web_session_id,
+            agent_id,
+            job_id,
+            "nightly digest",
+            long_output,
+        );
+
+        notify_job_completion(&state, agent_id, "nightly digest", run_id, job_id).await;
+
+        let (text, meta) = job_marker(&state, web_session_id);
+
+        // Deep-link handles the frontend needs to fetch the full output.
+        assert_eq!(meta["job_status"], "success");
+        assert_eq!(meta["run_id"], run_id.0.to_string());
+        assert_eq!(meta["job_id"], job_id.0.to_string());
+        assert_eq!(meta["job_session_id"], format!("job_{}", job_id.0));
+        // The authoritative truncation flag — true here because the output is
+        // over the cap; the card keys its fetch-on-expand on this.
+        assert_eq!(meta["truncated"], true);
+
+        // The summary portion (after the name/summary newline) is capped at
+        // JOB_SUMMARY_MAX_CHARS + the "..." ellipsis — far past the old 200.
+        let nl = text
+            .find('\n')
+            .expect("marker has a name/summary delimiter");
+        let summary_part = &text[nl + 1..];
+        assert!(
+            summary_part.ends_with("..."),
+            "an over-cap output must be truncated with an ellipsis"
+        );
+        assert_eq!(
+            summary_part.chars().count(),
+            crate::sse::JOB_SUMMARY_MAX_CHARS + 3,
+            "summary must be capped at 4000 chars (+ ellipsis), not 200"
+        );
+
+        shutdown_token.cancel();
+    }
+
+    /// #1196 defect (b): a job prompt with a newline in its leading chars must
+    /// not leak its tail into the summary. The name is collapsed to a single
+    /// line so the marker's first newline is unambiguously the name/summary
+    /// delimiter.
+    #[tokio::test]
+    async fn job_completion_collapses_newline_in_prompt_name() {
+        let (state, shutdown_token) = build_notification_state();
+        let agent_id = AgentId::new();
+        let web_session_id = state.session_manager.get_or_create(agent_id, "web").id;
+
+        let job_id = JobId::new();
+        let run_id = insert_completed_job_run(
+            &state,
+            web_session_id,
+            agent_id,
+            job_id,
+            "ignored",
+            "short summary".to_string(),
+        );
+
+        // Newline inside the first ~60 chars — the pre-fix bug split here.
+        let prompt = "Line one of the prompt\nLine two continues on past the split point";
+        notify_job_completion(&state, agent_id, prompt, run_id, job_id).await;
+
+        let (text, _meta) = job_marker(&state, web_session_id);
+        let nl = text
+            .find('\n')
+            .expect("marker has a name/summary delimiter");
+        let header = &text[..nl];
+        let summary_part = &text[nl + 1..];
+
+        // Both prompt lines land on the single header line (newline -> space).
+        assert!(header.starts_with("[Scheduled job completed] "));
+        assert!(
+            header.contains("Line one of the prompt Line two"),
+            "prompt newline must collapse to a space on the header line, got: {header}"
+        );
+        // The summary is exactly the run output — no prompt tail leaked in.
+        assert_eq!(
+            summary_part, "short summary",
+            "summary must be exactly the run output, with no prompt-line-2 leak"
+        );
+
+        shutdown_token.cancel();
+    }
+
+    /// A multi-byte output just under the char cap must NOT be flagged as
+    /// truncated: the old `output.len()` (byte length) test would append a
+    /// spurious ellipsis for non-ASCII text even when every char fit (#1196
+    /// defect a). Char-based `truncate_chars` keeps it intact.
+    #[tokio::test]
+    async fn job_completion_summary_is_char_based_not_byte_based() {
+        let (state, shutdown_token) = build_notification_state();
+        let agent_id = AgentId::new();
+        let web_session_id = state.session_manager.get_or_create(agent_id, "web").id;
+
+        // 100 three-byte chars = 300 bytes but only 100 chars — well under the
+        // 4000-char cap, so it must be stored verbatim with no ellipsis.
+        let multibyte = "€".repeat(100);
+        let job_id = JobId::new();
+        let run_id = insert_completed_job_run(
+            &state,
+            web_session_id,
+            agent_id,
+            job_id,
+            "unicode job",
+            multibyte.clone(),
+        );
+
+        notify_job_completion(&state, agent_id, "unicode job", run_id, job_id).await;
+
+        let (text, meta) = job_marker(&state, web_session_id);
+        let nl = text
+            .find('\n')
+            .expect("marker has a name/summary delimiter");
+        let summary_part = &text[nl + 1..];
+        assert_eq!(
+            summary_part, multibyte,
+            "a multi-byte summary under the char cap must be stored verbatim (no byte-vs-char ellipsis)"
+        );
+        assert_eq!(
+            meta["truncated"], false,
+            "an under-cap summary must report truncated=false so the card doesn't fetch"
+        );
+
+        shutdown_token.cancel();
+    }
+
+    /// S2 (#1196): a failed run's error is capped in the marker too (not just
+    /// the SSE), so a runaway provider error body can't land untruncated in
+    /// session history — and `truncated` stays false because the error text
+    /// isn't fetchable via `GET /runs/{run_id}` (that returns `run.output`).
+    #[tokio::test]
+    async fn job_completion_failed_arm_caps_error_and_does_not_signal_fetch() {
+        let (state, shutdown_token) = build_notification_state();
+        let agent_id = AgentId::new();
+        let web_session_id = state.session_manager.get_or_create(agent_id, "web").id;
+
+        // A Failed run with an over-cap error body.
+        let job_id = JobId::new();
+        let mut run = Run::for_job(web_session_id, agent_id, "flaky job".to_string(), job_id);
+        run.status = RunStatus::Failed;
+        run.error = Some("boom ".repeat(crate::sse::JOB_SUMMARY_MAX_CHARS));
+        let run_id = run.run_id;
+        state.run_manager.insert_run(run);
+
+        notify_job_completion(&state, agent_id, "flaky job", run_id, job_id).await;
+
+        let (text, meta) = job_marker(&state, web_session_id);
+        assert_eq!(meta["job_status"], "error");
+        // Error text is NOT fetchable — must not signal a fetch.
+        assert_eq!(meta["truncated"], false);
+
+        let nl = text
+            .find('\n')
+            .expect("marker has a name/summary delimiter");
+        let summary_part = &text[nl + 1..];
+        assert!(
+            summary_part.ends_with("..."),
+            "an over-cap error must be truncated with an ellipsis in the marker"
+        );
+        assert_eq!(
+            summary_part.chars().count(),
+            crate::sse::JOB_SUMMARY_MAX_CHARS + 3,
+            "the failed-arm error must be capped in the marker, not persisted whole"
+        );
+
         shutdown_token.cancel();
     }
 }

@@ -458,3 +458,21 @@ fn subagent_status_bar_js_behaviour() {
 fn subagent_cancel_js_behaviour() {
     run_node_test("subagent-cancel.test.mjs");
 }
+
+/// Pinned regression for issue #1196: a completed scheduled-job card
+/// truncated its summary to 200 chars at write time, so "Show more" revealed
+/// only ~one extra line. The backend fix raises the cap to 4000 and carries
+/// deep-link handles (`run_id`, `job_id`, `job_session_id`) so
+/// `JobCompletionCard` can fetch the full persisted output via
+/// `GET /runs/{run_id}` on expand. The pure-function decision layer in
+/// `static/ui/utils/job-summary.js` (`summaryLooksTruncated`,
+/// `shouldFetchFullOutput`, `resolveDisplayedSummary`) is what the card wires
+/// its fetch-on-expand effect to; this pins that fetch-or-not / which-text
+/// contract, including the graceful fall-back to the stored summary.
+///
+/// The name/summary split robustness and the `run_id` history passthrough are
+/// covered by `history_js_behaviour` (job-marker cases in `history.test.mjs`).
+#[test]
+fn job_summary_js_behaviour() {
+    run_node_test("job-summary.test.mjs");
+}

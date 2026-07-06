@@ -19,17 +19,32 @@ import { DM_END_REASON_LABELS } from './constants.js';
  * @returns {{ jobName: string, status: string, summary: string }}
  */
 function parseJobNotification(content, metadata) {
-    // Match: [Scheduled job completed] My job prompt\nSummary text
-    const match = content.match(/^\[Scheduled job (\w+)\]\s*(.*)/s);
+    const raw = content || '';
+    const mdStatus = metadata && metadata.job_status;
+
+    // The marker is `[Scheduled job {label}] {job_name}\n{summary}`. Split the
+    // FIRST line from the rest up front: the backend guarantees {job_name} is
+    // single-line (it collapses newlines to spaces before building the marker,
+    // #1196), so the header and its label/name live entirely on line one and
+    // everything after the first newline is the summary — which is itself
+    // free to be multi-line markdown. Anchoring the header regex to the first
+    // line (rather than a dotall match + indexOf) keeps a summary that happens
+    // to contain a `[Scheduled job ...]`-looking line from being mis-parsed.
+    const nlIdx = raw.indexOf('\n');
+    const firstLine = nlIdx >= 0 ? raw.slice(0, nlIdx) : raw;
+    const summary = nlIdx >= 0 ? raw.slice(nlIdx + 1).trim() : '';
+
+    const match = firstLine.match(/^\[Scheduled job (\w+)\]\s*(.*)$/);
     if (!match) {
-        const mdStatus = metadata && metadata.job_status;
-        return { jobName: content, status: mdStatus || 'success', summary: '' };
+        // Header didn't match — legacy / malformed marker. Treat the whole
+        // content as the name and surface no summary.
+        return { jobName: raw, status: mdStatus || 'success', summary: '' };
     }
     const label = match[1]; // completed | failed | finished
-    const rest = match[2] || '';
+    const jobName = (match[2] || '').trim();
 
-    // Prefer the authoritative status from metadata when available.
-    const mdStatus = metadata && metadata.job_status;
+    // Prefer the authoritative status from metadata when available; fall back
+    // to the text label for markers persisted before that field existed.
     const status = mdStatus
         ? mdStatus
         : label === 'failed' ? 'error'
@@ -37,16 +52,7 @@ function parseJobNotification(content, metadata) {
         : label === 'finished' ? 'cancelled'
         : 'success';
 
-    // Split on first newline: job name vs summary
-    const nlIdx = rest.indexOf('\n');
-    if (nlIdx >= 0) {
-        return {
-            jobName: rest.slice(0, nlIdx).trim(),
-            status,
-            summary: rest.slice(nlIdx + 1).trim(),
-        };
-    }
-    return { jobName: rest.trim(), status, summary: '' };
+    return { jobName, status, summary };
 }
 
 /**
@@ -234,6 +240,17 @@ export function mapHistoryMessages(msgs, opts) {
                     summary: parsed.summary,
                     ts: m.timestamp || null,
                     metadata: m.metadata || null,
+                    // Deep-link handle (#1196): the run that produced this
+                    // completion, so JobCompletionCard can fetch the full
+                    // persisted output via GET /runs/{run_id} on expand when
+                    // the stored summary was truncated at the cap.
+                    runId: (m.metadata && m.metadata.run_id) || null,
+                    // Authoritative truncation flag (reload mirror of the SSE
+                    // field). Passed through as-is (may be undefined on legacy
+                    // markers, where shouldFetchFullOutput falls back to the
+                    // ellipsis heuristic — and there's no run_id to fetch with
+                    // anyway).
+                    truncated: m.metadata ? m.metadata.truncated : undefined,
                 }, m.timestamp);
                 continue;
             }

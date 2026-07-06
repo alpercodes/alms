@@ -550,3 +550,89 @@ test('#1083: send_message:done-only run with no thinking text still emits a dm_r
         'thinkingText is empty — the render path decides visibility based on (tools || []).length',
     );
 });
+
+// ---------------------------------------------------------------------------
+// #1196: scheduled-job completion markers.
+// ---------------------------------------------------------------------------
+//
+// The backend persists job completions as a synthetic marker with content
+// `[Scheduled job {label}] {job_name}\n{summary}` and metadata carrying
+// {job_status, run_id, job_id, job_session_id}. `mapHistoryMessages` routes
+// these to a `job_completed` entry via `parseJobNotification`. These tests pin
+// the robust name/summary split (job_name is single-line by backend
+// construction, so the first newline is the delimiter; a summary is free to be
+// multi-line) and the run_id passthrough the card uses for fetch-on-expand.
+
+function jobMarker(content, metadata) {
+    return {
+        type: 'text',
+        role: 'system',
+        content,
+        timestamp: '2026-07-06T09:00:00Z',
+        metadata: { synthetic: true, type: 'job_notification', ...metadata },
+    };
+}
+
+test('#1196: job marker splits name/summary and surfaces run_id + truncated', () => {
+    const entries = mapHistoryMessages([
+        jobMarker(
+            '[Scheduled job completed] nightly digest\nDid the thing.\nAnd more detail...',
+            {
+                job_status: 'success',
+                run_id: 'run-abc',
+                job_id: 'job-abc',
+                job_session_id: 'job_abc',
+                truncated: true,
+            },
+        ),
+    ]);
+    assert.equal(entries.length, 1);
+    const e = entries[0];
+    assert.equal(e.type, 'job_completed');
+    assert.equal(e.jobName, 'nightly digest');
+    assert.equal(e.status, 'success');
+    // The multi-line summary (including the backend's trailing ellipsis) is
+    // preserved after the first-newline delimiter.
+    assert.equal(e.summary, 'Did the thing.\nAnd more detail...');
+    assert.equal(e.runId, 'run-abc', 'run_id must ride through to the card for fetch-on-expand');
+    assert.equal(e.truncated, true, 'the authoritative truncated flag must ride through to the card');
+});
+
+test('#1196: a [Scheduled job ...] line inside the summary does not hijack the header', () => {
+    // Robustness: only the FIRST line is matched as the header, so a decoy
+    // header-shaped line in the body cannot steal the name or status.
+    const entries = mapHistoryMessages([
+        jobMarker(
+            '[Scheduled job completed] real job name\n'
+            + 'Report:\n[Scheduled job failed] decoy line in the body',
+            { job_status: 'success', run_id: 'run-def' },
+        ),
+    ]);
+    assert.equal(entries.length, 1);
+    const e = entries[0];
+    assert.equal(e.jobName, 'real job name', 'name comes from the first line only');
+    assert.equal(e.status, 'success', 'status from metadata, not the decoy label');
+    assert.ok(
+        e.summary.includes('[Scheduled job failed] decoy'),
+        'the decoy line stays in the summary body',
+    );
+    assert.equal(e.runId, 'run-def');
+});
+
+test('#1196: legacy job marker without run_id yields runId null (graceful)', () => {
+    // Markers persisted before the deep-link fields existed have no run_id;
+    // the entry must still parse and simply carry runId: null (no fetch).
+    const entries = mapHistoryMessages([
+        jobMarker('[Scheduled job failed] some job\nrun failed: boom', { job_status: 'error' }),
+    ]);
+    assert.equal(entries.length, 1);
+    const e = entries[0];
+    assert.equal(e.type, 'job_completed');
+    assert.equal(e.jobName, 'some job');
+    assert.equal(e.status, 'error');
+    assert.equal(e.summary, 'run failed: boom');
+    assert.equal(e.runId, null);
+    // No truncated field on a legacy marker — passes through as undefined so
+    // shouldFetchFullOutput uses the (moot, runId-less) heuristic fallback.
+    assert.equal(e.truncated, undefined);
+});

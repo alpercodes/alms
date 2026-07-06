@@ -1,4 +1,6 @@
-import { html, useSignal, renderMarkdown } from '../../deps.js';
+import { html, useSignal, useEffect, renderMarkdown } from '../../deps.js';
+import { getRun } from '../../api/runs.js';
+import { shouldFetchFullOutput, resolveDisplayedSummary } from '../../utils/job-summary.js';
 
 /**
  * Collapsible card for scheduled job completion messages.
@@ -7,11 +9,21 @@ import { html, useSignal, renderMarkdown } from '../../deps.js';
  * status badge, formatted summary (with markdown), and timestamp.
  * Long output is collapsed by default with a toggle.
  *
+ * The stored summary is capped by the backend (JOB_SUMMARY_MAX_CHARS = 4000).
+ * When it hits that cap the full agent output still lives on the run record;
+ * on the first expand the card fetches it via GET /runs/{runId} and shows the
+ * complete text, degrading gracefully to the stored summary on any failure
+ * (#1196).
+ *
  * Props:
  *   jobName  - string, the job prompt/name (may be truncated by backend)
  *   status   - 'success' | 'error' | 'cancelled'
- *   summary  - string, the job output (may contain markdown)
- *   ts       - string, ISO 8601 timestamp (optional)
+ *   summary  - string, the job output (may contain markdown; may be truncated)
+ *   ts        - string, ISO 8601 timestamp (optional)
+ *   runId     - string, the run that produced this completion (optional; used
+ *               to fetch the full persisted output on expand)
+ *   truncated - bool, whether the stored summary was capped and the full
+ *               output is fetchable via GET /runs/{runId} (optional)
  */
 
 const COLLAPSE_THRESHOLD = 150;
@@ -47,10 +59,47 @@ function statusIcon(status) {
     }
 }
 
-export function JobCompletionCard({ jobName, status, summary, ts }) {
+export function JobCompletionCard({ jobName, status, summary, ts, runId, truncated }) {
     const expanded = useSignal(false);
+    // Full persisted output, fetched lazily on the first expand when the
+    // stored summary was truncated (#1196). `null` until fetched; the render
+    // falls back to the stored `summary` while null.
+    const fullSummary = useSignal(null);
+    const fetching = useSignal(false);
+
     const isLong = summary && summary.length > COLLAPSE_THRESHOLD;
     const showBody = !isLong || expanded.value;
+
+    // On first expand, fetch the complete output via GET /runs/{runId} — but
+    // only when the stored summary appears truncated and we have a run id.
+    // Any failure (run evicted from memory after a restart, network error)
+    // leaves `fullSummary` as the stored text, so the card degrades to what
+    // it already showed.
+    useEffect(() => {
+        if (!expanded.value) return;
+        if (fullSummary.value !== null || fetching.value) return;
+        if (!shouldFetchFullOutput({ runId, summary, truncated })) return;
+
+        fetching.value = true;
+        let cancelled = false;
+        getRun(runId)
+            .then((run) => {
+                if (cancelled) return;
+                fullSummary.value = resolveDisplayedSummary(summary, run && run.response);
+            })
+            .catch(() => {
+                if (cancelled) return;
+                fullSummary.value = summary || '';
+            })
+            .finally(() => {
+                if (!cancelled) fetching.value = false;
+            });
+        return () => { cancelled = true; };
+    }, [expanded.value, runId, summary, truncated]);
+
+    // Prefer the fetched full output once it lands; otherwise the stored
+    // summary (which may end with the backend's "..." truncation marker).
+    const effectiveSummary = fullSummary.value != null ? fullSummary.value : summary;
 
     const statusCls = `job-card--${status || 'success'}`;
     const time = formatTimestamp(ts);
@@ -62,8 +111,8 @@ export function JobCompletionCard({ jobName, status, summary, ts }) {
     };
 
     // Render summary with markdown for completed jobs
-    const renderedSummary = summary
-        ? renderMarkdown(summary)
+    const renderedSummary = effectiveSummary
+        ? renderMarkdown(effectiveSummary)
         : '';
 
     return html`

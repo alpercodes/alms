@@ -1546,6 +1546,12 @@ export function openSessionStream(sessionId, opts) {
             status: data.status || 'success',
             summary: data.summary || '',
             ts: data.ts || null,
+            // Deep-link handle (#1196): lets JobCompletionCard fetch the full
+            // persisted output via GET /runs/{run_id} when the live summary was
+            // truncated at the cap. `truncated` is the authoritative flag the
+            // card keys its fetch decision on.
+            runId: data.run_id || null,
+            truncated: data.truncated,
         });
     });
 

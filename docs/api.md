@@ -677,12 +677,18 @@ Emitted on the agent's user-facing session when a scheduled job run finishes. Th
   "session_id": "<uuid>",
   "job_name": "Summarize yesterday...",
   "status": "success",
-  "summary": "Truncated output (max 200 chars)...",
+  "summary": "Output truncated at 4000 chars (JOB_SUMMARY_MAX_CHARS)...",
+  "run_id": "<uuid>",
+  "job_id": "<uuid>",
+  "job_session_id": "job_<job-uuid>",
+  "truncated": true,
   "ts": "..."
 }
 ```
 
 `status` values: `"success"`, `"error"`, `"cancelled"`, `"unknown"`.
+
+`run_id` / `job_id` / `job_session_id` (the job's hidden-session **context id**, not a session UUID) are deep-link handles added in #1196. `truncated` is `true` when `summary` was capped at `JOB_SUMMARY_MAX_CHARS` (4000) and the full output is fetchable via `GET /runs/{run_id}` (the run's persisted `response`); the UI keys its fetch-on-expand on this flag rather than sniffing the `...` suffix. Markers persisted before #1196 lack these metadata fields; the UI degrades to the stored summary.
 
 `subagent_started`
 Emitted on the parent's session SSE stream the moment the coordinator creates the subagent's session row, ahead of any nested `tool_start` from inside the subagent. Used by the web UI's Subagent status bar to make the chip navigable (click opens the subagent session) live during a foreground `invoke_agent` run (#1105) — without this event navigation was only possible after `tool_end`, which for foreground subagents means after the subagent has finished. Fires for both foreground and background paths; the event is idempotent on the client (background subagents also carry `session_id` on the `invoke_agent` tool result and the `subagent_completed` event).

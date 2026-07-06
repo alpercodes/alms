@@ -29,6 +29,39 @@ fn next_ephemeral_id() -> String {
     format!("ephemeral-{n}")
 }
 
+/// Character cap for a scheduled-job completion summary carried in both the
+/// persisted `job_notification` marker and the `job_completed` SSE payload.
+///
+/// Set to 4000 to match `runs::notifications::DM_HISTORY_MAX_CHARS` — a
+/// scheduled-job summary and a DM-ended transcript share the same "long
+/// enough to be useful, bounded enough to keep in session history" budget.
+/// When a stored summary reaches this cap the `JobCompletionCard` fetches the
+/// full persisted output via `GET /runs/{id}` on expand (#1196). Both the
+/// backend truncation site (`notify_job_completion`) and this SSE constructor
+/// reference this one const so the two caps can never drift.
+pub(crate) const JOB_SUMMARY_MAX_CHARS: usize = 4000;
+
+/// Truncate `s` to at most `max_chars` **characters** (not bytes), appending an
+/// ellipsis when truncation occurs. Returns `(text, truncated)`.
+///
+/// Char-based on purpose (#1196 defect a): comparing a byte length against a
+/// char-based take flags a multi-byte string as truncated even when every
+/// character fit. `char_indices().nth(max_chars)` yields the byte offset of the
+/// char *after* the first `max_chars` chars — the exact slice boundary — so
+/// exact-length input returns verbatim with `truncated == false`.
+///
+/// Idempotent on its own already-truncated output:
+/// `truncate_chars(prefix_of_max_chars + "...", max)` returns the identical
+/// string with `truncated == true`. That is what lets [`SseEventData::job_completed`]
+/// re-apply the cap defensively without dropping the trailing `...` sentinel
+/// the way a bare `.take()` did (the #1196 C1 double-truncation bug).
+pub(crate) fn truncate_chars(s: &str, max_chars: usize) -> (String, bool) {
+    match s.char_indices().nth(max_chars) {
+        Some((byte_idx, _)) => (format!("{}...", &s[..byte_idx]), true),
+        None => (s.to_string(), false),
+    }
+}
+
 /// Unique identifier for a tool invocation
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolInvocationId(pub Uuid);
@@ -492,19 +525,44 @@ impl SseEventData {
     }
 
     /// Session-level: a scheduled job completed (sent to the agent's user-facing session).
+    ///
+    /// Carries deep-link handles (`run_id`, `job_id`, `job_session_id`) so the
+    /// `JobCompletionCard` can fetch the full persisted output via
+    /// `GET /runs/{run_id}` when the summary was truncated at
+    /// [`JOB_SUMMARY_MAX_CHARS`] (#1196).
+    ///
+    /// `truncated` is the authoritative "there is more to fetch" signal —
+    /// threaded straight through to the card so the fetch decision never
+    /// depends on the fragile `endsWith('...')` heuristic. The summary itself
+    /// is re-capped here with [`truncate_chars`] (ellipsis-preserving,
+    /// idempotent) rather than a bare `.take()`: the old `.take()` dropped the
+    /// trailing `...` on an already-truncated marker summary, so the live SSE
+    /// payload diverged from the persisted marker by exactly three chars (the
+    /// #1196 C1 bug). Keeping the cap ellipsis-aware makes the live and reload
+    /// renders byte-identical.
+    #[allow(clippy::too_many_arguments)]
     pub fn job_completed(
         session_id: alms_core::SessionId,
         job_name: &str,
         status: &str,
         summary: &str,
+        run_id: RunId,
+        job_id: alms_core::JobId,
+        job_session_id: &str,
+        truncated: bool,
     ) -> Self {
+        let (summary, _) = truncate_chars(summary, JOB_SUMMARY_MAX_CHARS);
         Self::new(
             "job_completed",
             JobCompletedData {
                 session_id: session_id.0.to_string(),
                 job_name: job_name.chars().take(100).collect(),
                 status: status.to_string(),
-                summary: summary.chars().take(200).collect(),
+                summary,
+                run_id: run_id.0.to_string(),
+                job_id: job_id.0.to_string(),
+                job_session_id: job_session_id.to_string(),
+                truncated,
                 ts: Utc::now(),
             },
         )
@@ -1082,6 +1140,19 @@ struct JobCompletedData {
     job_name: String,
     status: String,
     summary: String,
+    /// Run that produced this job completion. The frontend fetches the full
+    /// persisted output via `GET /runs/{run_id}` when the summary was
+    /// truncated (#1196).
+    run_id: String,
+    /// Scheduled job that fired this run.
+    job_id: String,
+    /// Context id of the job's hidden session (`job_{job_id}`) — a deep-link
+    /// handle to the run's originating session.
+    job_session_id: String,
+    /// Whether `summary` was truncated at the cap (i.e. the full output is
+    /// longer and fetchable via `GET /runs/{run_id}`). The card keys its
+    /// fetch-on-expand on this rather than sniffing the `...` suffix (#1196).
+    truncated: bool,
     ts: DateTime<Utc>,
 }
 
@@ -1361,11 +1432,18 @@ mod tests {
     #[test]
     fn test_job_completed_event() {
         let session_id = alms_core::SessionId::new();
+        let run_id = RunId::new();
+        let job_id = alms_core::JobId::new();
+        let job_session_id = format!("job_{}", job_id.0);
         let event = SseEventData::job_completed(
             session_id,
             "Summarize yesterday",
             "success",
             "All systems operational. Summary generated.",
+            run_id,
+            job_id,
+            &job_session_id,
+            false,
         );
 
         assert_eq!(event.event_type, "job_completed");
@@ -1378,22 +1456,120 @@ mod tests {
             event.data["summary"],
             "All systems operational. Summary generated."
         );
+        // Deep-link handles (#1196) — the card fetches the full output via
+        // GET /runs/{run_id} when the stored summary was truncated.
+        assert_eq!(event.data["run_id"], run_id.0.to_string());
+        assert_eq!(event.data["job_id"], job_id.0.to_string());
+        assert_eq!(event.data["job_session_id"], job_session_id);
+        assert_eq!(
+            event.data["truncated"], false,
+            "an under-cap summary must report truncated=false"
+        );
         assert!(event.data["ts"].is_string(), "ts should be a string");
     }
 
     #[test]
     fn test_job_completed_truncates_long_fields() {
         let session_id = alms_core::SessionId::new();
+        let run_id = RunId::new();
+        let job_id = alms_core::JobId::new();
         let long_name = "x".repeat(150);
-        let long_summary = "y".repeat(300);
-        let event = SseEventData::job_completed(session_id, &long_name, "error", &long_summary);
+        // Well over the summary cap so truncation is exercised.
+        let long_summary = "y".repeat(JOB_SUMMARY_MAX_CHARS + 500);
+        let event = SseEventData::job_completed(
+            session_id,
+            &long_name,
+            "error",
+            &long_summary,
+            run_id,
+            job_id,
+            "job_deadbeef",
+            true,
+        );
 
-        let name_len = event.data["job_name"].as_str().unwrap().len();
-        let summary_len = event.data["summary"].as_str().unwrap().len();
+        let summary_str = event.data["summary"].as_str().unwrap();
+        let name_len = event.data["job_name"].as_str().unwrap().chars().count();
+        let summary_len = summary_str.chars().count();
         assert!(name_len <= 100, "job_name should be truncated to 100 chars");
+        // The defensive cap keeps the ellipsis, so a raw over-cap input caps to
+        // exactly JOB_SUMMARY_MAX_CHARS chars + the "..." sentinel.
+        assert_eq!(
+            summary_len,
+            JOB_SUMMARY_MAX_CHARS + 3,
+            "an over-cap summary caps to the shared JOB_SUMMARY_MAX_CHARS (4000) + ellipsis, not 200"
+        );
         assert!(
-            summary_len <= 200,
-            "summary should be truncated to 200 chars"
+            summary_str.ends_with("..."),
+            "the constructor's defensive cap must preserve the truncation ellipsis"
+        );
+    }
+
+    /// #1196: a summary comfortably under the cap must survive intact on the
+    /// wire — the old 200-char cap silently dropped the tail of every
+    /// multi-paragraph job summary. Pins that the raised cap actually reaches
+    /// the payload and the id handles ride along.
+    #[test]
+    fn test_job_completed_keeps_summary_under_cap() {
+        let session_id = alms_core::SessionId::new();
+        let run_id = RunId::new();
+        let job_id = alms_core::JobId::new();
+        // 1500 chars: past the old 200 cap, well under the new 4000 cap.
+        let summary = "z".repeat(1500);
+        let event = SseEventData::job_completed(
+            session_id, "nightly", "success", &summary, run_id, job_id, "job_1", false,
+        );
+        assert_eq!(
+            event.data["summary"].as_str().unwrap().chars().count(),
+            1500,
+            "a summary under the cap must not be truncated"
+        );
+        assert_eq!(event.data["truncated"], false);
+    }
+
+    /// #1196 C1 regression — the constructor must NOT drop the trailing `...`
+    /// sentinel on an already-truncated (marker-shaped) summary.
+    ///
+    /// `notify_job_completion` truncates via `truncate_chars`, which appends
+    /// `...` → a 4003-char string, then hands that to the SSE constructor. The
+    /// old bare `summary.chars().take(4000)` re-truncation sliced exactly those
+    /// three trailing dots back off, so the LIVE payload lost the truncation
+    /// cue and the card's fetch-on-expand never fired for live viewers (only a
+    /// reload recovered). This pins that the ellipsis survives the constructor
+    /// AND that the explicit `truncated` flag rides the wire — the two together
+    /// make the fetch decision robust regardless of the string heuristic.
+    #[test]
+    fn test_job_completed_preserves_truncation_sentinel_and_flag() {
+        let session_id = alms_core::SessionId::new();
+        let run_id = RunId::new();
+        let job_id = alms_core::JobId::new();
+        // Marker-shaped input: exactly cap chars followed by the ellipsis.
+        let pretruncated = format!("{}...", "y".repeat(JOB_SUMMARY_MAX_CHARS));
+        assert_eq!(pretruncated.chars().count(), JOB_SUMMARY_MAX_CHARS + 3);
+
+        let event = SseEventData::job_completed(
+            session_id,
+            "nightly",
+            "success",
+            &pretruncated,
+            run_id,
+            job_id,
+            "job_1",
+            true,
+        );
+
+        let summary_str = event.data["summary"].as_str().unwrap();
+        assert!(
+            summary_str.ends_with("..."),
+            "constructor must preserve the `...` sentinel (idempotent re-cap), not slice it off"
+        );
+        assert_eq!(
+            summary_str.chars().count(),
+            JOB_SUMMARY_MAX_CHARS + 3,
+            "idempotent re-cap must return the identical marker-shaped string"
+        );
+        assert_eq!(
+            event.data["truncated"], true,
+            "the explicit truncated flag must ride the wire so the card fetches on expand"
         );
     }
 
