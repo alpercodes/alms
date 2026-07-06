@@ -40,6 +40,7 @@ const {
     isOwnedByActiveAgent,
     sortCrossAgentRows,
     filterChatSessions,
+    filterJobSessions,
 } = await import(url.pathToFileURL(SIDEBAR_GROUPING_PATH).href);
 
 // ---------------------------------------------------------------------
@@ -443,6 +444,44 @@ test('#1100: filterChatSessions preserves backend sort order', () => {
     );
 });
 
+test('#1197: filterChatSessions drops job rows', () => {
+    // `/sessions` unconditionally returns scheduled-job sessions since
+    // #1197 (mirroring the #1100 notification change). Without dropping
+    // them here, an agent whose only session activity is a scheduled
+    // job would skip the boot-flow chat-creation fallback and land in
+    // the read-only job view — the exact failure mode Codex P2 pinned
+    // for notifications on PR #1100.
+    const raw = [
+        { id: 'c1', session_type: 'chat', agent_id: 'agent_a' },
+        { id: 'j1', session_type: 'job', agent_id: 'agent_a', context_id: 'job_abc' },
+        { id: 'n1', session_type: 'notification', agent_id: 'agent_a' },
+    ];
+    assert.deepEqual(
+        filterChatSessions(raw).map(s => s.id),
+        ['c1'],
+    );
+});
+
+test('#1197: filterChatSessions models the "job-only agent" boot edge case', () => {
+    // An agent whose only `/sessions` row is its scheduled-job session
+    // must produce an empty chat list so `loadAgentSessions` enters the
+    // chat-creation fallback instead of booting into the read-only job
+    // view.
+    const jobOnlyResponse = [
+        {
+            id: 'job-sess-1',
+            session_type: 'job',
+            agent_id: 'agent_a',
+            context_id: 'job_5c9f2a11-0000-0000-0000-000000000000',
+            has_active_run: false,
+        },
+    ];
+    const agentSessions = filterChatSessions(jobOnlyResponse);
+    assert.equal(agentSessions.length, 0);
+    const wouldCreateFallbackChat = agentSessions.length === 0;
+    assert.equal(wouldCreateFallbackChat, true);
+});
+
 test('#1100: filterChatSessions returns empty for non-array input', () => {
     // Defensive: `data.sessions` could in theory be `undefined` if the
     // backend ever omits the field. Empty array is the safe fallback —
@@ -504,4 +543,100 @@ test('#1100: filterChatSessions models the "notification-only agent" boot edge c
     // the chat-creation fallback.
     const wouldCreateFallbackChat = agentSessions.length === 0;
     assert.equal(wouldCreateFallbackChat, true);
+});
+
+// ---------------------------------------------------------------------
+// filterJobSessions — sidebar Jobs group source filter (#1197)
+// ---------------------------------------------------------------------
+//
+// Pinned regression target:
+//   - issue #1197 — scheduled-job sessions (`job_{job_id}` context IDs)
+//     are surfaced by `GET /sessions` and rendered in a collapsed
+//     "Jobs" sidebar group sourced from `crossAgentSessions`. This
+//     filter is the group's single source; it must keep exactly the
+//     `job`-typed rows and nothing else. One row per JOB (not per
+//     firing) is a backend property — `fire_job_run` keys every firing
+//     to the same stable `job_{job_id}` session via `get_or_create` —
+//     so the payload can never carry more than one session per job;
+//     the filter just has to not invent or drop rows.
+
+test('#1197: filterJobSessions keeps only job rows', () => {
+    // Realistic cross-agent payload: chats, a DM, a notification and
+    // two different jobs (one per agent). Only the job rows survive.
+    const raw = [
+        { id: 'c1', session_type: 'chat', agent_id: 'agent_a' },
+        { id: 'j1', session_type: 'job', agent_id: 'agent_a', context_id: 'job_aaa' },
+        { id: 'd1', session_type: 'dm', participants: ['alice', 'bob'] },
+        { id: 'n1', session_type: 'notification', agent_id: 'agent_b' },
+        { id: 'j2', session_type: 'job', agent_id: 'agent_b', context_id: 'job_bbb' },
+    ];
+    assert.deepEqual(
+        filterJobSessions(raw).map(s => s.id),
+        ['j1', 'j2'],
+    );
+});
+
+test('#1197: filterJobSessions preserves backend sort order', () => {
+    // The backend returns `last_activity DESC`; the Jobs group renders
+    // rows in that order (no active-agent pinning — unlike DMs /
+    // notifications, job rows keep the raw ordering). Pin it.
+    const raw = [
+        { id: 'j3', session_type: 'job', context_id: 'job_c' },
+        { id: 'c1', session_type: 'chat' },
+        { id: 'j1', session_type: 'job', context_id: 'job_a' },
+        { id: 'j2', session_type: 'job', context_id: 'job_b' },
+    ];
+    assert.deepEqual(
+        filterJobSessions(raw).map(s => s.id),
+        ['j3', 'j1', 'j2'],
+    );
+});
+
+test('#1197: filterJobSessions returns one row per job for a recurring job', () => {
+    // A recurring job that fired 50 times still surfaces as a single
+    // sidebar row because the backend accumulates every firing on the
+    // same stable session — the payload carries ONE session for it.
+    // Model that payload shape and pin the 1:1 row mapping.
+    const raw = [
+        {
+            id: 'job-sess-1',
+            session_type: 'job',
+            agent_id: 'agent_a',
+            context_id: 'job_5c9f2a11-0000-0000-0000-000000000000',
+        },
+    ];
+    const rows = filterJobSessions(raw);
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0].id, 'job-sess-1');
+});
+
+test('#1197: filterJobSessions returns empty for non-array input', () => {
+    assert.deepEqual(filterJobSessions(null), []);
+    assert.deepEqual(filterJobSessions(undefined), []);
+    assert.deepEqual(filterJobSessions('not an array'), []);
+    assert.deepEqual(filterJobSessions({}), []);
+});
+
+test('#1197: filterJobSessions skips null / non-object entries', () => {
+    const raw = [
+        null,
+        { id: 'j1', session_type: 'job', context_id: 'job_a' },
+        undefined,
+        { id: 'c1', session_type: 'chat' },
+    ];
+    assert.deepEqual(
+        filterJobSessions(raw).map(s => s.id),
+        ['j1'],
+    );
+});
+
+test('#1197: filterJobSessions returns a new array (does not mutate input)', () => {
+    const raw = [
+        { id: 'j1', session_type: 'job', context_id: 'job_a' },
+        { id: 'c1', session_type: 'chat' },
+    ];
+    const before = raw.map(s => s.id);
+    const out = filterJobSessions(raw);
+    assert.deepEqual(raw.map(s => s.id), before);
+    assert.notEqual(out, raw);
 });

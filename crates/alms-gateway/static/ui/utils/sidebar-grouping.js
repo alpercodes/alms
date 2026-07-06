@@ -205,12 +205,18 @@ export function sortCrossAgentRows(rows, activeAgentName) {
  *     are a cross-agent surface sourced from `crossAgentSessions` and
  *     do not belong in the per-agent list.
  *
- * The filter is conservative: it drops `notification` only. DMs are
- * already excluded by the per-agent fetch's `include_dms: false`
- * query flag, and job / subagent / episodic types are excluded by the
- * backend's `is_internal_context_id` filter. If a future backend
- * change adds a new always-returned surface, extend the list here
- * (and update the test).
+ * The filter drops `notification` and `job` rows. DMs are already
+ * excluded by the per-agent fetch's `include_dms: false` query flag,
+ * and subagent / episodic types are excluded by the backend's
+ * `is_internal_context_id` filter. `job` joined the list with #1197:
+ * `/sessions` now always returns scheduled-job sessions (they surface
+ * in the sidebar's collapsed Jobs group, sourced from
+ * `crossAgentSessions`) — without dropping them here, an agent whose
+ * only session activity is a scheduled job would skip the boot-flow
+ * chat-creation fallback and land in the read-only job view, the exact
+ * failure mode Codex P2 pinned for notifications on PR #1100. If a
+ * future backend change adds a new always-returned surface, extend the
+ * list here (and update the test).
  *
  * Returns a new array; does not mutate the input.
  *
@@ -219,5 +225,31 @@ export function sortCrossAgentRows(rows, activeAgentName) {
  */
 export function filterChatSessions(sessions) {
     if (!Array.isArray(sessions)) return [];
-    return sessions.filter(s => s && s.session_type !== 'notification');
+    return sessions.filter(s =>
+        s
+        && s.session_type !== 'notification'
+        && s.session_type !== 'job'
+    );
+}
+
+/**
+ * Filter a `/sessions` response down to scheduled-job sessions only
+ * (#1197). Feeds the sidebar's collapsed "Jobs" group, which — like
+ * the Notifications section — is sourced from the cross-agent list so
+ * operators see every agent's job sessions without switching agents.
+ *
+ * One row per JOB, not per firing: the backend keys each scheduled
+ * job to a single stable `job_{job_id}` session that accumulates
+ * history across firings (`fire_job_run` uses `get_or_create`), so
+ * this filter cannot blow up the sidebar however often a recurring
+ * job fires.
+ *
+ * Returns a new array; does not mutate the input.
+ *
+ * @param {Array<object>} sessions Raw `/sessions` payload entries.
+ * @returns {Array<object>}
+ */
+export function filterJobSessions(sessions) {
+    if (!Array.isArray(sessions)) return [];
+    return sessions.filter(s => s && s.session_type === 'job');
 }

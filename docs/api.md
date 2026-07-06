@@ -122,17 +122,17 @@ But channels (Telegram) naturally bring `context_id` (chat id). So MVP should su
 ### 4.1 List sessions
 `GET /sessions`
 
-Returns all active sessions. Truly internal sessions (episodic, subagent,
-job) are excluded by default. Notification sessions (`notifications:*`)
-are always returned and participate in the `agent_id` filter; DM
-sessions are gated on `include_dms`.
+Returns all active sessions. Truly internal sessions (episodic, subagent)
+are excluded by default. Notification (`notifications:*`) and scheduled-job
+(`job_{id}`) sessions are always returned and participate in the `agent_id`
+filter; DM sessions are gated on `include_dms`.
 
 **Query parameters**
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `agent_id` | UUID | _(none)_ | Filter sessions by agent UUID. Applies to chat, notification, and other agent-keyed sessions. Does not apply to DM sessions (they use a nil sentinel agent). |
-| `include_dms` | bool | `false` | When `true`, DM sessions (`dm:*` context IDs) are included alongside regular sessions. Other internal session types remain excluded. |
+| `include_dms` | bool | `false` | When `true`, DM sessions (`dm:*` context IDs) are included alongside regular sessions. Other internal session types (subagent, episodic) remain excluded. |
 
 **Response 200**
 ```json
@@ -169,6 +169,16 @@ sessions are gated on `include_dms`.
       "created_at": "2026-02-11T09:00:00Z",
       "last_activity": "2026-02-11T09:30:00Z",
       "status": "active"
+    },
+    {
+      "session_id": "<uuid>",
+      "agent_id": "<uuid>",
+      "context_id": "job_7f3a1c2e",
+      "session_type": "job",
+      "has_active_run": false,
+      "created_at": "2026-02-11T10:00:00Z",
+      "last_activity": "2026-02-11T10:05:00Z",
+      "status": "active"
     }
   ]
 }
@@ -198,7 +208,7 @@ sessions are gated on `include_dms`.
 > **Note**: DM sessions only appear when `?include_dms=true` is set.
 > DM sessions use `AgentId::nil()` as a sentinel, so the `agent_id` filter does not apply to them.
 > Notification sessions are always included in the response and participate in the `agent_id` filter.
-> Job, subagent, and episodic sessions are always excluded from the listing.
+> Job sessions (`job_{id}`) are always included and participate in the `agent_id` filter (#1197). Subagent and episodic sessions are always excluded from the listing.
 
 ### 4.2 Create session
 `POST /sessions`

@@ -73,6 +73,40 @@
   background: var(--notif-accent-muted);
 }
 
+/* Job divider — info-blue accent, matching .session-type-icon-job and
+ * the internal-session-job header bar (#1197) */
+.session-divider-job .session-section-divider-label {
+  color: var(--info);
+}
+.session-divider-job::after {
+  background: var(--info-muted);
+}
+
+/* ── Collapsible section header (sidebar Jobs group, #1197) ──
+ *
+ * Reuses the .session-section-divider layout but is interactive
+ * (role="button" in the DOM): pointer + hover affordance here, and a
+ * dedicated chevron-rotation rule because the agent-accordion's
+ * rotation selector is scoped to .agent-group-header.expanded and
+ * would not match this divider variant. Transition timing comes from
+ * the shared .agent-group-chevron rule so the two accordions animate
+ * identically. */
+.session-section-toggle {
+  cursor: pointer;
+  user-select: none;
+  transition: background var(--duration-fast);
+}
+.session-section-toggle:hover {
+  background: var(--surface-2);
+}
+.session-section-toggle:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+.session-section-toggle.expanded .agent-group-chevron {
+  transform: rotate(90deg);
+}
+
 /* ── Internal session header bar (notification, job, subagent) ── */
 .internal-session-header {
   display: flex;

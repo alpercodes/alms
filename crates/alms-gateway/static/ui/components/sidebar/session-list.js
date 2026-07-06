@@ -1,5 +1,5 @@
 import { html, batch, useSignal } from '../../deps.js';
-import { sessions, activeSessionId, crossAgentSessions, expandedAgentId } from '../../state/sessions.js';
+import { sessions, activeSessionId, crossAgentSessions, expandedAgentId, jobsGroupExpanded } from '../../state/sessions.js';
 import { agents, activeAgentId, activeAgent } from '../../state/agents.js';
 import { replaceMessages } from '../../state/chat-actions.js';
 import { activeRunId, selectedRunId, runs } from '../../state/runs.js';
@@ -18,6 +18,7 @@ import {
     groupSessionsByAgent,
     isOwnedByActiveAgent,
     sortCrossAgentRows,
+    filterJobSessions,
 } from '../../utils/sidebar-grouping.js';
 
 /**
@@ -119,11 +120,29 @@ function notificationLabel(session) {
 }
 
 /**
+ * Format a scheduled-job session label (#1197).
+ *
+ * Job sessions carry `context_id = "job_{job_id}"` where job_id is a
+ * full uuid — too long for a sidebar row. Render a compact
+ * "job <first-8-chars>" so rows for different jobs stay
+ * distinguishable; the row tooltip carries the full context_id.
+ * Falls back to the raw context_id for anything unexpectedly shaped.
+ */
+function jobLabel(session) {
+    const ctx = session.context_id || '';
+    if (ctx.startsWith('job_') && ctx.length > 4) {
+        return 'job ' + ctx.slice(4, 12);
+    }
+    return ctx || session.id.slice(0, 8);
+}
+
+/**
  * Derive a human-readable label for any session type.
  */
 function sessionLabel(session) {
     if (session.session_type === 'dm') return dmLabel(session);
     if (session.session_type === 'notification') return notificationLabel(session);
+    if (session.session_type === 'job') return jobLabel(session);
     return session.context_id || session.id.slice(0, 8);
 }
 
@@ -133,16 +152,24 @@ function sessionLabel(session) {
  *
  * Notification sessions carry a real `agent_name` set by the backend
  * from the `notifications:{agent}` context_id — that's the recipient
- * agent. DM sessions carry a `participants` array (both agents
- * share the session) so there's no single owner; the row label
- * already shows both names.
+ * agent. Job sessions (#1197) are stored under the owning agent's real
+ * `agent_id`, so the name resolves via the in-memory `agents` list —
+ * the Jobs group is cross-agent, and without the badge two agents'
+ * jobs would render as indistinguishable "job xxxxxxxx" rows. DM
+ * sessions carry a `participants` array (both agents share the
+ * session) so there's no single owner; the row label already shows
+ * both names.
  *
  * Returns null when the session has no clear owning agent or when
  * the field hasn't been enriched (legacy data).
  */
-function notificationOwner(session) {
+function crossAgentOwner(session) {
     if (session.session_type === 'notification' && session.agent_name) {
         return session.agent_name;
+    }
+    if (session.session_type === 'job' && session.agent_id) {
+        const owner = agents.value.find(a => a.id === session.agent_id);
+        return owner ? owner.name : null;
     }
     return null;
 }
@@ -213,11 +240,12 @@ function SessionItem({ session, activeAgentName }) {
 
     const label = sessionLabel(session);
     const typeLabel = session.session_type !== 'chat' ? '\nType: ' + session.session_type : '';
-    // Cross-agent attribution: notifications get an explicit owner
-    // badge so "alice notifications" vs "bob notifications" doesn't
-    // pile up as identical-looking rows when both agents have unread
-    // notifications. DMs already show both participants in the label.
-    const ownerName = notificationOwner(session);
+    // Cross-agent attribution: notifications and job sessions get an
+    // explicit owner badge so identical-looking rows from different
+    // agents ("alice notifications" vs "bob notifications", two
+    // agents' job rows) stay distinguishable. DMs already show both
+    // participants in the label.
+    const ownerName = crossAgentOwner(session);
     const ownedByActive = isOwnedByActiveAgent(session, activeAgentName);
     const ownedClass = ownedByActive ? ' session-item-active-agent' : '';
 
@@ -271,6 +299,49 @@ function SectionDivider({ label, cls, id }) {
     return html`
         <div class="session-section-divider ${cls || ''}" role="presentation" id=${id}>
             <span class="session-section-divider-label">${label}</span>
+        </div>
+    `;
+}
+
+/**
+ * Collapsible header for the sidebar's "Jobs" section (#1197).
+ *
+ * Scheduled-job sessions are surfaced by `GET /sessions` like
+ * notifications, but unlike the always-open Notifications section they
+ * render under a section header that is COLLAPSED by default:
+ * recurring jobs accumulate one long-lived session each and cancelled
+ * one-shots can leave dead sessions, so the group keeps them one click
+ * away instead of crowding the sidebar. (It's still one row per job —
+ * not per firing — see `filterJobSessions`.)
+ *
+ * Interaction contract mirrors `AgentGroupHeader`: `role="button"`,
+ * Enter/Space activation, `aria-expanded`, chevron rotated via the
+ * `.session-section-toggle.expanded .agent-group-chevron` rule in
+ * styles/session-types.css (the agent accordion's rotation selector is
+ * scoped to `.agent-group-header` and doesn't match this divider
+ * variant). The body downstream reuses the `.agent-group-body` grid
+ * transition so the two accordions animate identically.
+ */
+function JobsSectionHeader({ expanded, count, headerId }) {
+    const onToggle = (e) => {
+        e.stopPropagation();
+        jobsGroupExpanded.value = !jobsGroupExpanded.value;
+    };
+    return html`
+        <div class="session-section-divider session-divider-job session-section-toggle ${expanded ? 'expanded' : ''}"
+             id=${headerId}
+             role="button"
+             tabindex="0"
+             aria-expanded=${expanded}
+             title=${expanded ? 'Collapse jobs' : 'Expand jobs'}
+             onClick=${onToggle}
+             onKeyDown=${(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onToggle(e); } }}>
+            <span class="agent-group-chevron" aria-hidden="true">${'\u25B8'}</span>
+            <span class="session-section-divider-label">
+                <span class="session-type-icon session-type-icon-job" aria-hidden="true">${'\u23F0'}</span>
+                Jobs
+            </span>
+            <span class="agent-group-count" title=${count + ' job session' + (count === 1 ? '' : 's')}>${count}</span>
         </div>
     `;
 }
@@ -412,19 +483,21 @@ export function SessionList() {
     //
     // The filter list mirrors backend `is_internal_context_id`
     // (`crates/alms-gateway/src/runs/mod.rs`) one-to-one \u2014 `dm`,
-    // `notification`, `job`, `subagent`, `episodic`. `dm` and
-    // `notification` get their own cross-agent sections rendered below;
-    // `job` / `subagent` / `episodic` are internal-context sessions the
-    // operator should never see as ordinary chat rows. The backend
-    // `/sessions` listing excludes those three by default, so historically
-    // a `!== 'dm' && !== 'notification'` filter was sufficient \u2014 but the
-    // #1065 resolver-led-boot fix in `utils/load-session.js` Step 0
-    // injects internal envelopes directly into `sessions.value` so the
-    // active subagent session can be resolved by `activeSession` /
-    // `isInternalSession`. Without listing every internal type here that
-    // injection would leak subagent/job/episodic rows into the sidebar
-    // (Codex P2 on PR #1074). Keep this list in lock-step with the
-    // backend prefix list if a new internal context_id family is added.
+    // `notification`, `job`, `subagent`, `episodic`. `dm`,
+    // `notification` and (since #1197) `job` get their own cross-agent
+    // sections rendered below; `subagent` / `episodic` are
+    // internal-context sessions the operator should never see as
+    // ordinary chat rows. The backend `/sessions` listing excludes
+    // subagent/episodic by default and now always returns job rows
+    // (#1197) alongside notifications, and the #1065 resolver-led-boot
+    // fix in `utils/load-session.js` Step 0 injects internal envelopes
+    // directly into `sessions.value` so the active subagent session
+    // can be resolved by `activeSession` / `isInternalSession`.
+    // Without listing every internal type here, that injection would
+    // leak subagent/episodic rows \u2014 and job rows would duplicate into
+    // the chat groups (Codex P2 on PR #1074). Keep this list in
+    // lock-step with the backend prefix list if a new internal
+    // context_id family is added.
     const chatSessions = allSessions.filter(s =>
         s.session_type !== 'dm'
         && s.session_type !== 'notification'
@@ -446,24 +519,33 @@ export function SessionList() {
     // using cross-agent data keeps the count truthful for all agents
     // without an extra round-trip.)
     const crossAgentChats = crossAgent.filter(s =>
-        s.session_type !== 'dm' && s.session_type !== 'notification'
+        s.session_type !== 'dm'
+        && s.session_type !== 'notification'
+        && s.session_type !== 'job'
     );
     const crossAgentGrouped = groupSessionsByAgent(crossAgentChats);
 
-    // Cross-agent surfaces: DMs and notifications are aggregated
-    // across all agents from `crossAgentSessions` rather than the
-    // per-agent `sessions` list. Operators want to see incoming DMs
-    // / outgoing notifications regardless of which agent is currently
-    // selected, so these sections always render the full cross-agent
-    // set sorted with active-agent rows pinned to the top.
+    // Cross-agent surfaces: DMs, notifications and job sessions are
+    // aggregated across all agents from `crossAgentSessions` rather
+    // than the per-agent `sessions` list. Operators want to see
+    // incoming DMs / outgoing notifications / scheduled-job activity
+    // regardless of which agent is currently selected, so these
+    // sections always render the full cross-agent set (DMs and
+    // notifications sorted with active-agent rows pinned to the top;
+    // job rows keep the backend's last-activity ordering).
     const dmSessions = sortCrossAgentRows(filteredDmSessions(crossAgent), agentName);
     const notifSessions = sortCrossAgentRows(
         crossAgent.filter(s => s.session_type === 'notification'),
         agentName
     );
+    const jobSessions = filterJobSessions(crossAgent);
+    const jobsExpanded = jobsGroupExpanded.value;
 
     const noAgents = !allAgents || allAgents.length === 0;
-    const noContent = noAgents && dmSessions.length === 0 && notifSessions.length === 0;
+    const noContent = noAgents
+        && dmSessions.length === 0
+        && notifSessions.length === 0
+        && jobSessions.length === 0;
 
     return html`
         <div class="sidebar-section" style="flex:1; min-height:0">
@@ -544,6 +626,21 @@ export function SessionList() {
                         ${notifSessions.map(s => html`
                             <${SessionItem} key=${s.id} session=${s} activeAgentName=${agentName} />
                         `)}
+                    </div>
+                `}
+                ${jobSessions.length > 0 && html`
+                    <${JobsSectionHeader} expanded=${jobsExpanded}
+                                          count=${jobSessions.length}
+                                          headerId="session-section-jobs" />
+                    <div class="agent-group-body"
+                         role="group"
+                         aria-labelledby="session-section-jobs"
+                         data-expanded=${jobsExpanded}>
+                        <div class="agent-group-sessions">
+                            ${jobSessions.map(s => html`
+                                <${SessionItem} key=${s.id} session=${s} activeAgentName=${agentName} />
+                            `)}
+                        </div>
                     </div>
                 `}
             </div>

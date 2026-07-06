@@ -20,11 +20,23 @@ export const activeSessionId = signal(null);
  *
  * Populated alongside `sessions` from a second `listSessions(null, …)`
  * call (no agent filter) — see `fetchCrossAgentSurfaces` in
- * `hooks/use-boot.js`. Internal types (job, subagent, episodic) are
- * excluded by the backend's listing rules; notifications are always
- * included; DMs are gated on the `include_dms` query flag.
+ * `hooks/use-boot.js`. Internal types (subagent, episodic) are
+ * excluded by the backend's listing rules; notifications and
+ * scheduled-job sessions (#1197) are always included; DMs are gated
+ * on the `include_dms` query flag.
  */
 export const crossAgentSessions = signal([]);
+
+/**
+ * Whether the sidebar's "Jobs" section body is expanded (#1197).
+ *
+ * Collapsed by default on purpose: recurring jobs accumulate one
+ * long-lived session each and cancelled one-shots can leave dead
+ * sessions behind — the collapsed group keeps them one click away
+ * without crowding the sidebar. Not persisted across reloads (matches
+ * the agent accordion, which also re-derives its default at boot).
+ */
+export const jobsGroupExpanded = signal(false);
 
 /**
  * Which agent's accordion body is currently expanded in the sidebar

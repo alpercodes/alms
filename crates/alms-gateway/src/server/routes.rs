@@ -286,7 +286,7 @@ async fn health_check() -> impl IntoResponse {
 /// GET /sessions?agent_id=<uuid>&include_dms=true — list sessions.
 ///
 /// By default, excludes the truly internal session types (episodic,
-/// subagent, job) — these are implementation details not shown in the
+/// subagent) — these are implementation details not shown in the
 /// regular UI. Uses the same `INTERNAL_SESSION_PREFIXES` list as
 /// `find_user_facing_session` to keep the filter consistent.
 ///
@@ -297,6 +297,16 @@ async fn health_check() -> impl IntoResponse {
 /// section. They participate in the `agent_id` filter on this endpoint
 /// — when no `agent_id` is supplied the cross-agent fetch picks up
 /// notifications for every agent in the tenant.
+///
+/// Scheduled-job sessions (`job_{job_id}` context IDs) are likewise
+/// **unconditionally included** (#1197). Each scheduled job runs on a
+/// stable per-job session that accumulates history across firings —
+/// surfacing it lets the operator inspect what the job actually did
+/// instead of only seeing the completion marker posted to a user-facing
+/// session. Job sessions render in the sidebar's collapsed "Jobs" group
+/// and participate in the `agent_id` filter the same way notifications
+/// do. Note they remain "internal" for notification-targeting purposes:
+/// `find_user_facing_session` still skips them.
 ///
 /// Optional inclusion flag:
 ///
@@ -348,8 +358,20 @@ async fn list_sessions(
                     continue;
                 }
             }
+            "job" => {
+                // Scheduled-job sessions are always shown in the
+                // sidebar's collapsed "Jobs" group (#1197). Mirrors the
+                // notification arm exactly: no opt-in toggle, same
+                // `agent_id` filter semantics (job sessions are stored
+                // under the owning agent's real id).
+                if let Some(agent_id) = params.agent_id
+                    && session.agent_id != agent_id
+                {
+                    continue;
+                }
+            }
             _ if is_internal => {
-                // Other internal sessions (job, subagent, episodic): always excluded
+                // Other internal sessions (subagent, episodic): always excluded
                 continue;
             }
             _ => {
@@ -1141,6 +1163,124 @@ mod tests {
         assert!(
             body.get("parent_session_id").is_none(),
             "parent_session_id should be omitted for notification sessions"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // GET /sessions — job-session inclusion (#1197)
+    // -----------------------------------------------------------------
+    //
+    // Scheduled jobs run on stable per-job `job_{job_id}` sessions that
+    // used to be filtered out of the sidebar list entirely (the
+    // `_ if is_internal` arm). #1197 surfaces them like notification
+    // sessions: unconditionally included, subject to the `agent_id`
+    // filter. Subagent / episodic sessions must stay excluded.
+
+    /// Drive the `list_sessions` handler and return the parsed
+    /// `sessions` array from the JSON body.
+    async fn invoke_list_sessions(
+        state: AppState,
+        agent_id: Option<AgentId>,
+        include_dms: Option<bool>,
+    ) -> Vec<serde_json::Value> {
+        use axum::body::to_bytes;
+        let resp = list_sessions(
+            axum::extract::State(state),
+            axum::extract::Query(ListSessionsQuery {
+                agent_id,
+                include_dms,
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .expect("body to bytes");
+        let body: serde_json::Value = serde_json::from_slice(&bytes).expect("valid JSON body");
+        body["sessions"].as_array().expect("sessions array").clone()
+    }
+
+    #[tokio::test]
+    async fn list_sessions_includes_job_sessions() {
+        let state = test_app_state();
+        let agent_id = AgentId::new();
+        state.session_manager.get_or_create(agent_id, "web-chat-1");
+        let job_context = format!("job_{}", uuid::Uuid::new_v4());
+        state.session_manager.get_or_create(agent_id, &job_context);
+
+        let sessions = invoke_list_sessions(state, None, None).await;
+
+        let job_row = sessions
+            .iter()
+            .find(|s| s["context_id"] == serde_json::json!(job_context))
+            .unwrap_or_else(|| panic!("job session missing from GET /sessions: {sessions:?}"));
+        assert_eq!(job_row["session_type"], "job");
+        assert_eq!(job_row["agent_id"], serde_json::json!(agent_id));
+        // The chat session is still present alongside it.
+        assert!(
+            sessions.iter().any(|s| s["context_id"] == "web-chat-1"),
+            "chat session missing from GET /sessions: {sessions:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_sessions_applies_agent_id_filter_to_job_sessions() {
+        // Mirror of the notification-arm contract: a per-agent fetch only
+        // returns the job sessions owned by that agent; the cross-agent
+        // fetch (agent_id unset) returns every job session.
+        let state = test_app_state();
+        let agent_a = AgentId::new();
+        let agent_b = AgentId::new();
+        let job_a = format!("job_{}", uuid::Uuid::new_v4());
+        let job_b = format!("job_{}", uuid::Uuid::new_v4());
+        state.session_manager.get_or_create(agent_a, &job_a);
+        state.session_manager.get_or_create(agent_b, &job_b);
+
+        let for_a = invoke_list_sessions(state.clone(), Some(agent_a), None).await;
+        assert!(
+            for_a
+                .iter()
+                .any(|s| s["context_id"] == serde_json::json!(job_a)),
+            "agent A's job session missing from per-agent fetch: {for_a:?}"
+        );
+        assert!(
+            !for_a
+                .iter()
+                .any(|s| s["context_id"] == serde_json::json!(job_b)),
+            "agent B's job session leaked into agent A's fetch: {for_a:?}"
+        );
+
+        let cross = invoke_list_sessions(state, None, None).await;
+        for ctx in [&job_a, &job_b] {
+            assert!(
+                cross
+                    .iter()
+                    .any(|s| s["context_id"] == serde_json::json!(ctx)),
+                "job session {ctx} missing from cross-agent fetch: {cross:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn list_sessions_still_excludes_subagent_and_episodic_sessions() {
+        // The #1197 carve-out is for job sessions only — the other
+        // internal prefixes stay hidden from the sidebar.
+        let state = test_app_state();
+        let agent_id = AgentId::new();
+        let sub_context = format!("subagent_{}", uuid::Uuid::new_v4());
+        state.session_manager.get_or_create(agent_id, &sub_context);
+        state
+            .session_manager
+            .get_or_create(agent_id, "episodic:some-summary");
+
+        let sessions = invoke_list_sessions(state, None, Some(true)).await;
+
+        assert!(
+            !sessions
+                .iter()
+                .any(|s| s["session_type"] == "subagent" || s["session_type"] == "episodic"),
+            "internal subagent/episodic sessions leaked into GET /sessions: {sessions:?}"
         );
     }
 }

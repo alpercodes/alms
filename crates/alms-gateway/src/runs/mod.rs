@@ -90,11 +90,16 @@ struct RunParams {
 /// Prefixes that identify internal (non-user-facing) sessions.
 ///
 /// Sessions whose `context_id` starts with any of these prefixes are excluded
-/// when searching for the user's web-chat session and from the session list
-/// API (sidebar).  This list is the single source of truth for
-/// [`find_user_facing_session`], the `GET /sessions` endpoint,
-/// [`notifications::notify_job_completion`], and
+/// when searching for the user's web-chat session.  This list is the single
+/// source of truth for [`find_user_facing_session`], the `GET /sessions`
+/// endpoint, [`notifications::notify_job_completion`], and
 /// [`notifications::notify_dm_ended_to_webchat`].
+///
+/// Note the `GET /sessions` (sidebar) endpoint carves out exceptions from
+/// this list: `notifications:*` sessions are always returned (Notifications
+/// section) and `job_*` sessions are always returned (collapsed Jobs group,
+/// #1197).  Both remain internal for notification-*targeting* purposes —
+/// a job-completion marker must never land on another job's session.
 const INTERNAL_SESSION_PREFIXES: &[&str] =
     &["job_", "subagent_", "dm:", "notifications:", "episodic:"];
 

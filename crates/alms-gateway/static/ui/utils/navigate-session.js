@@ -59,11 +59,19 @@ export async function navigateToSession(sessionId, opts) {
     // operator's accordion expansion follows because expansion is
     // derived from `activeAgentId` (see session-list.js + use-boot.js).
     //
-    // DM / notification surfaces are explicitly skipped — they live
-    // in their own cross-agent sections regardless of active agent,
-    // so clicking them shouldn't yank the active agent around (the
-    // operator might be reading alice's chat and quickly peeking at
-    // a DM-from-bob; jumping to bob would be intrusive).
+    // DM / notification / job surfaces are explicitly skipped — they
+    // live in their own cross-agent sections regardless of active
+    // agent, so clicking them shouldn't yank the active agent around
+    // (the operator might be reading alice's chat and quickly peeking
+    // at a DM-from-bob; jumping to bob would be intrusive). For job
+    // rows (#1197) the skip is also load-bearing: `loadAgentSessions`
+    // filters job rows out of the per-agent list via
+    // `filterChatSessions`, so a `switchAgent(…, { targetSessionId })`
+    // would fail to find the job session and silently fall back to the
+    // agent's latest chat — the operator's click would open the wrong
+    // session entirely. The direct loadSession path below handles job
+    // sessions correctly (the read-only view resolves the session from
+    // `crossAgentSessions`).
     //
     // Side-effect note: `switchAgent` resets messages / queue / runs
     // / subagents and bumps `selectGeneration`. We then return early —
@@ -76,6 +84,7 @@ export async function navigateToSession(sessionId, opts) {
     if (target
         && target.session_type !== 'dm'
         && target.session_type !== 'notification'
+        && target.session_type !== 'job'
         && target.agent_id
         && activeAgentId.value
         && target.agent_id !== activeAgentId.value
