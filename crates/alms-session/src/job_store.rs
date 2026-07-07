@@ -8,6 +8,22 @@ use dashmap::DashMap;
 use std::sync::Arc;
 use tracing::{info, warn};
 
+/// Outcome of [`JobStore::record_run`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecordRunOutcome {
+    /// The run was recorded and the job updated (and persisted, when a
+    /// SQLite store is attached).
+    Recorded,
+    /// The job is `Cancelled` — the write was refused and nothing was
+    /// mutated. `Cancelled` is absorbing: a later `record_run` must never
+    /// transition a job back out of it (#1202 S1 — a `DELETE /jobs` racing
+    /// the episode-close fanout would otherwise resurrect and re-arm a
+    /// cancelled recurring job).
+    RefusedCancelled,
+    /// No job with this id exists (e.g. deleted mid-flight).
+    NotFound,
+}
+
 /// Manages scheduled jobs in memory, with optional SQLite write-through.
 ///
 /// On startup, all non-cancelled jobs are loaded from SQLite so the scheduler
@@ -123,17 +139,38 @@ impl JobStore {
 
     /// Record that a job fired: update last_run_at, status, and next_run_at atomically.
     ///
-    /// Returns the updated job, or `None` if the job was not found (e.g. deleted mid-flight).
+    /// **`Cancelled` is absorbing (#1202 S1):** if the job is already
+    /// `Cancelled`, the write is refused — nothing is mutated and
+    /// [`RecordRunOutcome::RefusedCancelled`] is returned. This closes the
+    /// cancel-vs-close TOCTOU at the persistence layer: the gateway's
+    /// `close_episode` reads the job's status, `await`s the completion
+    /// fanout, and only then records the run — a `DELETE /jobs` landing in
+    /// that window must not be overwritten back to `Active` (a cancelled
+    /// recurring job would resurrect and re-arm). The status check and the
+    /// mutation happen under one continuous DashMap entry guard, and
+    /// [`Self::cancel`] mutates under the same entry lock, so no interleave
+    /// can slip between check and write regardless of caller timing.
+    ///
+    /// Callers gate their re-arm side effects on
+    /// [`RecordRunOutcome::Recorded`].
     pub fn record_run(
         &self,
         id: JobId,
         ran_at: chrono::DateTime<chrono::Utc>,
         new_status: JobStatus,
         next_run_at: Option<chrono::DateTime<chrono::Utc>>,
-    ) -> AlmsResult<Option<Job>> {
+    ) -> AlmsResult<RecordRunOutcome> {
         let Some(mut entry) = self.jobs.get_mut(&id) else {
-            return Ok(None);
+            return Ok(RecordRunOutcome::NotFound);
         };
+        if entry.status == JobStatus::Cancelled {
+            drop(entry);
+            info!(
+                "Job {} is cancelled — record_run refused (Cancelled is absorbing, #1202 S1)",
+                id.0
+            );
+            return Ok(RecordRunOutcome::RefusedCancelled);
+        }
         entry.last_run_at = Some(ran_at);
         entry.status = new_status;
         entry.next_run_at = next_run_at;
@@ -145,7 +182,7 @@ impl JobStore {
             warn!("Failed to persist record_run for job {}: {}", id.0, e);
         }
         info!("Job {} run recorded (status={:?})", id.0, new_status);
-        Ok(Some(job))
+        Ok(RecordRunOutcome::Recorded)
     }
 
     /// Cancel a job.
@@ -251,6 +288,78 @@ mod tests {
     fn test_cancel_unknown_returns_none() {
         let store = JobStore::new();
         assert_eq!(store.cancel(JobId::new()).unwrap(), None);
+    }
+
+    /// #1202 S1: `Cancelled` is absorbing. A `record_run` landing after a
+    /// cancel — the exact write the cancel-vs-episode-close TOCTOU produces
+    /// when `DELETE /jobs` slips into `close_episode`'s fanout window —
+    /// must be refused with nothing mutated: the job stays `Cancelled`,
+    /// `next_run_at` stays cleared, `last_run_at` stays untouched. Pre-fix
+    /// this overwrote `Cancelled -> Active` and re-set `next_run_at`,
+    /// resurrecting a cancelled recurring job.
+    #[test]
+    fn test_record_run_refuses_to_resurrect_cancelled_job() {
+        let store = JobStore::new();
+        let job = store.create(recurring_req()).unwrap();
+        assert_eq!(store.cancel(job.id).unwrap(), Some(true));
+
+        let outcome = store
+            .record_run(
+                job.id,
+                Utc::now(),
+                JobStatus::Active,
+                Some(Utc::now() + chrono::Duration::minutes(1)),
+            )
+            .unwrap();
+        assert_eq!(
+            outcome,
+            RecordRunOutcome::RefusedCancelled,
+            "record_run on a cancelled job must be refused"
+        );
+
+        let job = store.get(job.id).unwrap();
+        assert_eq!(
+            job.status,
+            JobStatus::Cancelled,
+            "a cancelled job must never transition back to Active"
+        );
+        assert_eq!(
+            job.next_run_at, None,
+            "the refused write must not re-set next_run_at"
+        );
+        assert_eq!(
+            job.last_run_at, None,
+            "the refused write must not touch last_run_at"
+        );
+    }
+
+    /// The normal path still records: status/next_run_at/last_run_at all
+    /// update and the outcome is `Recorded`.
+    #[test]
+    fn test_record_run_records_on_active_job() {
+        let store = JobStore::new();
+        let job = store.create(recurring_req()).unwrap();
+        let next = Utc::now() + chrono::Duration::minutes(1);
+
+        let outcome = store
+            .record_run(job.id, Utc::now(), JobStatus::Active, Some(next))
+            .unwrap();
+        assert_eq!(outcome, RecordRunOutcome::Recorded);
+
+        let job = store.get(job.id).unwrap();
+        assert_eq!(job.status, JobStatus::Active);
+        assert_eq!(job.next_run_at, Some(next));
+        assert!(job.last_run_at.is_some());
+    }
+
+    /// Unknown job id reports `NotFound` (the pre-S1 `None` shape).
+    #[test]
+    fn test_record_run_unknown_job_is_not_found() {
+        let store = JobStore::new();
+        let outcome = store
+            .record_run(JobId::new(), Utc::now(), JobStatus::Active, None)
+            .unwrap();
+        assert_eq!(outcome, RecordRunOutcome::NotFound);
     }
 
     #[test]

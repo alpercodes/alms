@@ -265,12 +265,22 @@ impl MessageSender for MessageBus {
         // the first entry.
         //
         // IMPORTANT: Record a source session unless it is (a) an internal
-        // non-conversational session (notification, subagent, episodic, job),
+        // non-conversational session (notification, subagent, episodic),
         // or (b) the *same* DM session that this send creates — a DM session
         // cannot be its own source.  Other DM sessions ARE valid sources
         // (cross-DM scenario: Alice is in DM-with-Bob and sends to Charlie;
         // the DM-with-Bob session is Alice's source for the Alice→Charlie DM).
         // See #656 (original same-DM guard) and #680 (whitelist overcorrection).
+        //
+        // Job sessions (`job_*`) ARE valid sources as of #1198: a scheduled
+        // job's agent sends DMs from its job session, and the job-episode
+        // model needs the `ConversationEnded` trigger to (a) exist for the
+        // job agent even when IT ends the conversation (the sender
+        // self-notification in `end_conversation` fires only when a source
+        // session is recorded), and (b) route back to the job session so the
+        // agent resumes with its full job context instead of on the invisible
+        // `notifications:{agent}` session. See
+        // docs/jobs-await-completion-design.md § D3.
         if let Some(sid) = sender_session_id {
             let is_valid_source = self
                 .session_manager
@@ -279,10 +289,8 @@ impl MessageSender for MessageBus {
                 .map(|s| {
                     let session_type = alms_core::classify_session_type(&s.context_id);
                     // Reject internal/non-conversational session types.
-                    let not_internal = !matches!(
-                        session_type,
-                        "notification" | "subagent" | "episodic" | "job"
-                    );
+                    let not_internal =
+                        !matches!(session_type, "notification" | "subagent" | "episodic");
                     // Reject the same DM session — it cannot be its own source.
                     let not_same_dm = s.context_id != dm_context;
                     not_internal && not_same_dm

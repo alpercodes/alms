@@ -46,6 +46,11 @@ pub struct AppState {
     pub project_root: std::path::PathBuf,
     /// Job store for scheduled jobs
     pub job_store: Arc<JobStore>,
+    /// Open job episodes (#1198) — deferred-completion tracking for
+    /// scheduled jobs (pending DMs / background subagents, quiescence,
+    /// the 4-hour deadline). In-memory by design for phase 1; see
+    /// `docs/jobs-await-completion-design.md`.
+    pub(crate) job_episodes: Arc<crate::runs::job_episode::JobEpisodeTracker>,
     /// Scheduler for firing jobs at the right time
     pub scheduler: Arc<Scheduler>,
     /// Coordinator for subagent lifecycle management
@@ -423,6 +428,9 @@ impl AppState {
             data_dir,
             project_root,
             job_store,
+            job_episodes: Arc::new(crate::runs::job_episode::JobEpisodeTracker::new(
+                std::time::Duration::from_secs(crate::runs::job_episode::EPISODE_DEADLINE_SECS),
+            )),
             scheduler,
             coordinator,
             shutdown_token: shutdown_token.clone(),

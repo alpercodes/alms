@@ -913,6 +913,63 @@ impl Drop for NamedSubagentGuard {
     }
 }
 
+/// Drop-armed completion guard for background subagents (#1198 step 7).
+///
+/// `run_subagent` emits exactly one [`SubagentCompletion`] on every
+/// *non-panic* exit path (Completed / Failed / Cancelled — see the emission
+/// block near the end of the function). A panic anywhere before that
+/// emission point unwinds the spawned task WITHOUT a completion. Pre-#1198
+/// that stranded the parent's "running" chip forever; under the #1198
+/// job-episode model it would additionally stall a job episode's pending
+/// `Subagent` entry until the episode's 4-hour deadline. This guard closes
+/// the hole: it is armed at the top of `run_subagent` for background tasks
+/// and disarmed immediately after the normal emission block, so its `Drop`
+/// fires the fallback `Failed` completion only on an unwind.
+struct BackgroundCompletionGuard {
+    inner: Option<(
+        mpsc::UnboundedSender<SubagentCompletion>,
+        Box<SubagentCompletion>,
+    )>,
+}
+
+impl BackgroundCompletionGuard {
+    /// Arm the guard with the minimal fallback completion. A `None` tx
+    /// produces a disarmed guard whose `Drop` is a no-op (mirrors the
+    /// `completion_tx` optionality on the normal emission path).
+    fn armed(
+        tx: Option<mpsc::UnboundedSender<SubagentCompletion>>,
+        completion: SubagentCompletion,
+    ) -> Self {
+        Self {
+            inner: tx.map(|tx| (tx, Box::new(completion))),
+        }
+    }
+
+    /// A guard that never fires (foreground tasks).
+    fn disarmed() -> Self {
+        Self { inner: None }
+    }
+
+    /// Normal exit reached — the real completion (when applicable) was
+    /// emitted; make `Drop` a no-op.
+    fn disarm(&mut self) {
+        self.inner = None;
+    }
+}
+
+impl Drop for BackgroundCompletionGuard {
+    fn drop(&mut self) {
+        if let Some((tx, completion)) = self.inner.take() {
+            tracing::warn!(
+                task_id = %completion.task_id.0,
+                "run_subagent unwound without emitting a completion — \
+                 sending panic-fallback Failed completion (#1198 step 7)"
+            );
+            let _ = tx.send(*completion);
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Internal subagent runner
 // ---------------------------------------------------------------------------
@@ -995,6 +1052,43 @@ async fn run_subagent(
     };
 
     let start = std::time::Instant::now();
+
+    // #1198 step 7: arm the panic-completion guard for background tasks.
+    // Foreground callers get their result via the `result_tx` oneshot and do
+    // not consume the completion channel, so the guard stays disarmed there.
+    // The fallback carries the same identity fields as the normal emission
+    // (task_id / parent ids / invocation id) so the gateway's completion
+    // loop and any #1198 episode resolve can correlate it identically.
+    let mut completion_guard = if is_background {
+        let task_desc = {
+            let truncated =
+                truncate_to_char_boundary(&request.task, NOTIFICATION_SUMMARY_MAX_CHARS);
+            if truncated.len() == request.task.len() {
+                request.task.clone()
+            } else {
+                format!("{}…[truncated]", truncated)
+            }
+        };
+        BackgroundCompletionGuard::armed(
+            completion_tx.clone(),
+            SubagentCompletion {
+                task_id,
+                subagent_name: request.subagent_name.clone(),
+                status: TaskStatus::Failed,
+                summary: "subagent task panicked before emitting a completion".to_string(),
+                parent_session_id: request.parent_session,
+                parent_agent_id: request.parent_agent_id,
+                subagent_session_id: sub_session_id,
+                task_description: Some(task_desc),
+                tool_count: None,
+                duration_ms: None,
+                token_usage: None,
+                parent_tool_invocation_id: request.parent_tool_invocation_id,
+            },
+        )
+    } else {
+        BackgroundCompletionGuard::disarmed()
+    };
 
     if let Some(mut handle) = subagents.get_mut(&task_id) {
         handle.status = TaskStatus::Running;
@@ -1325,6 +1419,13 @@ async fn run_subagent(
             );
         }
     }
+
+    // #1198 step 7: normal exit reached — the completion (when applicable)
+    // was emitted above, so the panic guard must not fire on the drop at
+    // function end. Disarmed unconditionally: a background task whose handle
+    // vanished (background_info == None) intentionally emitted nothing, and
+    // the guard must not turn that into a spurious Failed completion.
+    completion_guard.disarm();
 
     // Release the named subagent lock before sending the result, so that
     // callers who receive the result can immediately re-invoke the same name.
@@ -2269,6 +2370,98 @@ mod tests {
 
     fn test_parent_agent_id() -> AgentId {
         AgentId::new()
+    }
+
+    // -- BackgroundCompletionGuard (#1198 step 7) -------------------------------
+
+    fn guard_fallback_completion() -> SubagentCompletion {
+        SubagentCompletion {
+            task_id: TaskId::new(),
+            subagent_name: Some("researcher".to_string()),
+            status: TaskStatus::Failed,
+            summary: "subagent task panicked before emitting a completion".to_string(),
+            parent_session_id: SessionId::new(),
+            parent_agent_id: AgentId::new(),
+            subagent_session_id: SessionId::new(),
+            task_description: Some("investigate the thing".to_string()),
+            tool_count: None,
+            duration_ms: None,
+            token_usage: None,
+            parent_tool_invocation_id: None,
+        }
+    }
+
+    /// An armed guard that is dropped without `disarm()` (the panic-unwind
+    /// shape) must emit exactly one `Failed` completion.
+    #[test]
+    fn completion_guard_emits_failed_on_undisarmed_drop() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let completion = guard_fallback_completion();
+        let expected_task = completion.task_id;
+
+        let guard = BackgroundCompletionGuard::armed(Some(tx), completion);
+        drop(guard);
+
+        let got = rx
+            .try_recv()
+            .expect("armed guard must emit a completion on drop");
+        assert_eq!(got.status, TaskStatus::Failed);
+        assert_eq!(got.task_id, expected_task);
+        assert!(
+            rx.try_recv().is_err(),
+            "guard must emit exactly one completion"
+        );
+    }
+
+    /// `disarm()` (the normal-exit path, called right after the real
+    /// emission block in `run_subagent`) must suppress the fallback — no
+    /// double completion on a healthy run.
+    #[test]
+    fn completion_guard_disarm_suppresses_emission() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut guard = BackgroundCompletionGuard::armed(Some(tx), guard_fallback_completion());
+        guard.disarm();
+        drop(guard);
+        assert!(
+            rx.try_recv().is_err(),
+            "disarmed guard must not emit a completion"
+        );
+    }
+
+    /// Foreground tasks (`disarmed()`) and a missing completion channel
+    /// (`None` tx) both produce a no-op guard.
+    #[test]
+    fn completion_guard_disarmed_and_no_tx_are_noops() {
+        drop(BackgroundCompletionGuard::disarmed());
+        // None tx: armed() degrades to a no-op guard — must not panic.
+        drop(BackgroundCompletionGuard::armed(
+            None,
+            guard_fallback_completion(),
+        ));
+    }
+
+    /// The real failure shape this guard exists for: the task PANICS while
+    /// the guard is armed. The unwind must still deliver the `Failed`
+    /// completion to the receiver (this is what turns "job episode stalls
+    /// until the 4h deadline" into "pending entry resolves in seconds").
+    #[tokio::test]
+    async fn completion_guard_fires_across_panic_unwind() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let completion = guard_fallback_completion();
+        let expected_task = completion.task_id;
+
+        let handle = tokio::spawn(async move {
+            let _guard = BackgroundCompletionGuard::armed(Some(tx), completion);
+            panic!("simulated run_subagent panic before the emission point");
+        });
+        assert!(handle.await.is_err(), "task must have panicked");
+
+        let got = rx
+            .recv()
+            .await
+            .expect("panic unwind must deliver the fallback completion");
+        assert_eq!(got.status, TaskStatus::Failed);
+        assert_eq!(got.task_id, expected_task);
     }
 
     // -- (a) dispatch foreground — success path returns response text -----------

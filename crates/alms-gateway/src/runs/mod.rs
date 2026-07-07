@@ -12,6 +12,7 @@
 pub(crate) mod dm_lifecycle;
 #[cfg(test)]
 mod integration_tests;
+pub(crate) mod job_episode;
 pub(crate) mod lifecycle;
 pub(crate) mod markers;
 pub(crate) mod notifications;
@@ -33,7 +34,8 @@ pub use lifecycle::{
     get_run_text, get_run_tool_calls, list_runs,
 };
 pub(crate) use notifications::{
-    completion_notification_loop, dm_event_loop, run_trigger_loop, scheduler_fire_loop,
+    completion_notification_loop, dm_event_loop, job_episode_sweep_loop, run_trigger_loop,
+    scheduler_fire_loop,
 };
 pub use streaming::{
     SessionEventsQuery, stream_agent_events, stream_run_events, stream_session_events,

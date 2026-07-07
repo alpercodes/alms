@@ -1296,6 +1296,14 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
         run_manager: state.run_manager.clone(),
     };
 
+    // #1198: job-stamped runs (turn-1 `Run::for_job` and episode
+    // continuation runs stamped by `enqueue_triggered_run`) feed the job
+    // episode tracker at EVERY exit of this function — the five sites are
+    // the pre-cancel early exit, the resolve-failure exit, the token-budget
+    // rejection exit, the runtime-construction failure exit, and the common
+    // terminal tail. `finish_episode_run` is a no-op for `None`.
+    let episode_job_id = state.run_manager.get_run(run_id).and_then(|r| r.job_id);
+
     // Early exit if already cancelled (queued-then-cancelled before execution
     // started) or if the server is shutting down.  The shutdown_token check
     // prevents the SessionQueue drain from starting NEW runs during graceful
@@ -1381,6 +1389,11 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
         .await;
 
         info!("Run {} was cancelled before starting", run_id.0);
+        // #1198 exit 1/5: a queued-then-cancelled episode run never
+        // executed, so it opened no async work — feed the tracker with an
+        // empty record set so its in-flight reservation is released (a
+        // missed release stalls the episode until the deadline sweep).
+        super::notifications::finish_episode_run(&state, episode_job_id, run_id, &[]).await;
         // The queue head is advancing — fan out updated positions to any
         // remaining queued runs on this agent (#831).
         broadcast_queue_advance(&state, agent_id).await;
@@ -1505,6 +1518,9 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
             state.run_manager.remove_senders(run_id);
             state.run_manager.remove_cancel_token(run_id);
             state.approval_store.clear_for_run(run_id);
+            // #1198 exit 2/5: release the episode reservation (no tool
+            // calls — the run died before the loop).
+            super::notifications::finish_episode_run(&state, episode_job_id, run_id, &[]).await;
             broadcast_queue_advance(&state, agent_id).await;
             return;
         }
@@ -1604,6 +1620,8 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
         state.run_manager.remove_senders(run_id);
         state.run_manager.remove_cancel_token(run_id);
         state.approval_store.clear_for_run(run_id);
+        // #1198 exit 3/5: release the episode reservation.
+        super::notifications::finish_episode_run(&state, episode_job_id, run_id, &[]).await;
         broadcast_queue_advance(&state, agent_id).await;
         return;
     }
@@ -1855,6 +1873,8 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
             state.run_manager.remove_senders(run_id);
             state.run_manager.remove_cancel_token(run_id);
             state.approval_store.clear_for_run(run_id);
+            // #1198 exit 4/5: release the episode reservation.
+            super::notifications::finish_episode_run(&state, episode_job_id, run_id, &[]).await;
             // The queue head is advancing — fan out updated positions to any
             // remaining queued runs on this agent (#831).
             broadcast_queue_advance(&state, agent_id).await;
@@ -2397,9 +2417,17 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
         }
     };
 
+    // #1198: tool-call records captured per-arm for the episode tail hook
+    // (exit 5/5 below) — the pending-work scan needs the records, and each
+    // arm owns a different vec. Cloned only for job-stamped runs.
+    let mut episode_tool_calls: Vec<alms_core::ToolCallRecord> = Vec::new();
+
     match result {
         Ok(output) => {
             persist_tool_calls(&output.tool_calls);
+            if episode_job_id.is_some() {
+                episode_tool_calls = output.tool_calls.clone();
+            }
 
             // Persist a run-boundary marker so page reloads show "(run
             // completed)" separators. Only for user-facing sessions to
@@ -2779,6 +2807,9 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
             // and the per-run `run_tool_calls` table is keyed on `run_id`, so a
             // double-write is a no-op overwrite of the same rows.
             persist_tool_calls(&tool_calls);
+            if episode_job_id.is_some() {
+                episode_tool_calls = tool_calls.clone();
+            }
 
             // #895 / #1046 / #1052: see the `Cancelled` arm above for
             // the rationale on gating the SSE broadcast on the transition
@@ -2840,6 +2871,9 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
         Err(alms_core::AlmsError::FailedWithToolCalls { source, tool_calls }) => {
             // Persist partial tool call records even though the run failed.
             persist_tool_calls(&tool_calls);
+            if episode_job_id.is_some() {
+                episode_tool_calls = tool_calls.clone();
+            }
 
             // #927 (extends #895): flip the run state to `Failed` BEFORE
             // broadcasting `run_error`. See the `Ok` arm above and the
@@ -3061,6 +3095,16 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
     state.run_manager.remove_cancel_token(run_id);
     // Clean up any stale pending approvals for this run
     state.approval_store.clear_for_run(run_id);
+    // #1198 exit 5/5: the common terminal tail — reached by every match arm
+    // (Ok / Cancelled / CancelledWithToolCalls / FailedWithToolCalls /
+    // generic Err) exactly once per run. Feeds the episode tracker with the
+    // run's tool records (pending-work scan) and, on quiescence, drives
+    // `close_episode` (completion card + record_run + re-arm). Fires AFTER
+    // the run's terminal state was persisted so the card reads the final
+    // status/output.
+    super::notifications::finish_episode_run(&state, episode_job_id, run_id, &episode_tool_calls)
+        .await;
+
     // The queue head is advancing — fan out updated positions to any
     // remaining queued runs on this agent (#831). Emitted once per run
     // regardless of which terminal arm was taken (Ok / Cancelled /

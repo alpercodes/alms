@@ -18,7 +18,8 @@ use crate::auth::{AuthToken, no_cache, require_auth};
 use crate::cron_utils;
 use crate::gateway::Gateway;
 use crate::runs::{
-    completion_notification_loop, dm_event_loop, run_trigger_loop, scheduler_fire_loop,
+    completion_notification_loop, dm_event_loop, job_episode_sweep_loop, run_trigger_loop,
+    scheduler_fire_loop,
 };
 use alms_core::{AlmsResult, JobStatus};
 use alms_runtime::Scheduler;
@@ -147,6 +148,12 @@ pub async fn serve_with_gateway(bind_addr: &str, gateway: Gateway) -> AlmsResult
     let dm_event_state = state.clone();
     let dm_event_handle = tokio::spawn(dm_event_loop(dm_event_rx, dm_event_state));
 
+    // Spawn the job-episode deadline sweep (#1198 D5): force-closes episodes
+    // past their 4-hour deadline with detach-and-complete semantics. Exits
+    // cooperatively on the shutdown token.
+    let episode_sweep_state = state.clone();
+    let episode_sweep_handle = tokio::spawn(job_episode_sweep_loop(episode_sweep_state));
+
     // Use the auth token snapshot from AppState — no mutex lock needed.
     let auth_token = AuthToken(state.auth_token_value.clone());
 
@@ -245,6 +252,12 @@ pub async fn serve_with_gateway(bind_addr: &str, gateway: Gateway) -> AlmsResult
     dm_event_handle.abort();
     dm_event_handle.await.ok();
     info!("DM event loop stopped");
+
+    // The sweep loop selects on the shutdown token, so it is already
+    // exiting — the abort is belt-and-braces against a tick in flight.
+    episode_sweep_handle.abort();
+    episode_sweep_handle.await.ok();
+    info!("Job episode sweep loop stopped");
 
     // Phase 4: Gateway message loop already exiting (token cancelled).
     gateway_handle.await.ok();

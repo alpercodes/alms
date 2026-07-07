@@ -9975,3 +9975,689 @@ async fn reattached_session_stream_receives_subagent_activity_snapshot() {
 
     shutdown_token.cancel();
 }
+
+// ---------------------------------------------------------------------------
+// Job episodes (#1198): deferred completion across DMs / subagents
+// ---------------------------------------------------------------------------
+
+/// Extract the persisted `job_notification` marker's `(text, metadata)` from
+/// a session's history. Mirrors the helper in `notifications::tests`.
+fn job_marker_from(state: &AppState, session_id: SessionId) -> (String, serde_json::Value) {
+    let history = state.session_manager.get_history(session_id).unwrap();
+    let marker = history
+        .iter()
+        .find(|m| {
+            m.metadata
+                .as_ref()
+                .and_then(|meta| meta.get("type"))
+                .and_then(|v| v.as_str())
+                == Some("job_notification")
+        })
+        .expect("job_notification marker must be persisted on the user-facing session");
+    let text = match &marker.content {
+        alms_session::Content::Text(t) => t.clone(),
+        _ => panic!("job marker should be text content"),
+    };
+    (text, marker.metadata.clone().unwrap())
+}
+
+/// Create a recurring job in the store (daily at midnight — never fires
+/// during a test on its own).
+fn create_recurring_job(state: &AppState, agent_id: AgentId, prompt: &str) -> alms_core::JobId {
+    state
+        .job_store
+        .create(alms_core::job::CreateJobRequest {
+            agent_id,
+            prompt: prompt.to_string(),
+            schedule: alms_core::job::JobSchedule::Recurring {
+                cron: "0 0 * * *".to_string(),
+            },
+        })
+        .expect("job creation must succeed")
+        .id
+}
+
+/// The #1198 regression floor: a job whose turn opens no async work must
+/// complete at turn-1 end exactly like the pre-episode flow — completion
+/// card on the user-facing session, `record_run` + re-arm, episode gone.
+///
+/// Runs the REAL pipeline end-to-end: `fire_job_run` -> episode open ->
+/// `execute_run` (mock LLM) -> tail hook -> quiescent close.
+#[tokio::test]
+async fn episode_job_with_no_async_work_completes_at_turn_end() {
+    let (state, shutdown_token, _cr, _tr, _dr) = test_app_state_with_mock_llm();
+    let agent_id = AgentId::new();
+
+    // A user-facing session so the completion card has a target.
+    let web_session_id = state.session_manager.get_or_create(agent_id, "web").id;
+
+    let job_id = create_recurring_job(&state, agent_id, "daily digest");
+
+    super::notifications::fire_job_run(state.clone(), job_id)
+        .await
+        .expect("fire_job_run must succeed");
+
+    // Episode closed at turn end (no pending work).
+    assert!(
+        state.job_episodes.snapshot(job_id).is_none(),
+        "a no-async-work episode must close at turn-1 end"
+    );
+
+    // The completion card was persisted with episode stats (one turn, no
+    // async work, not timed out).
+    let (_text, meta) = job_marker_from(&state, web_session_id);
+    assert_eq!(meta["job_id"], job_id.0.to_string());
+    assert_eq!(meta["episode"]["turns"], 1);
+    assert_eq!(meta["episode"]["dm_count"], 0);
+    assert_eq!(meta["episode"]["subagent_count"], 0);
+    assert_eq!(meta["episode"]["timed_out"], false);
+
+    // The job record was updated and the recurring schedule re-armed.
+    let job = state.job_store.get(job_id).expect("job still exists");
+    assert_eq!(job.status, alms_core::JobStatus::Active);
+    assert!(job.last_run_at.is_some(), "record_run must have fired");
+    assert!(
+        job.next_run_at.expect("re-armed") > chrono::Utc::now(),
+        "no cron tick elapsed during the turn — normal future re-arm"
+    );
+
+    shutdown_token.cancel();
+}
+
+/// #1198 exit 1/5: a queued-then-cancelled episode run (pre-cancel early
+/// exit — it never executes) must still release its in-flight reservation,
+/// closing the episode and running the full close block (card +
+/// `record_run` + re-arm). A missed release here would stall the job until
+/// the 4-hour deadline sweep.
+#[tokio::test]
+async fn episode_precancelled_turn_releases_reservation_and_closes() {
+    let (state, shutdown_token, _cr, _tr, _dr) = test_app_state();
+    let agent_id = AgentId::new();
+    let web_session_id = state.session_manager.get_or_create(agent_id, "web").id;
+    let job_id = create_recurring_job(&state, agent_id, "cancelled before start");
+
+    // Mirror fire_job_run's setup, but cancel the token before execution.
+    let context_id = format!("job_{}", job_id.0);
+    let session_id = state
+        .session_manager
+        .get_or_create(agent_id, &context_id)
+        .id;
+    let run = Run::for_job(
+        session_id,
+        agent_id,
+        "cancelled before start".into(),
+        job_id,
+    );
+    let run_id = run.run_id;
+    state.run_manager.insert_run(run.clone());
+    state
+        .job_episodes
+        .open(job_id, session_id, agent_id, run_id);
+
+    let cancel_token = CancellationToken::new();
+    state
+        .run_manager
+        .register_cancel_token(run_id, cancel_token.clone());
+    cancel_token.cancel();
+
+    super::lifecycle::execute_run(
+        state.clone(),
+        super::RunParams {
+            run_id,
+            session_id,
+            agent_id,
+            input: run.input,
+            context_id,
+            cancel_token,
+            is_peer_message: false,
+            is_system_triggered: true,
+            input_pre_persisted: false,
+        },
+    )
+    .await;
+
+    // The reservation was released and the episode closed.
+    assert!(
+        state.job_episodes.snapshot(job_id).is_none(),
+        "pre-cancelled turn must release its reservation and close the episode"
+    );
+    // The close block ran: card persisted, job recorded + re-armed.
+    let (_text, meta) = job_marker_from(&state, web_session_id);
+    assert_eq!(meta["job_status"], "cancelled");
+    let job = state.job_store.get(job_id).unwrap();
+    assert!(job.last_run_at.is_some());
+    assert_eq!(job.status, alms_core::JobStatus::Active);
+
+    shutdown_token.cancel();
+}
+
+/// #1198 step 5 (DM side): a `ConversationEnded` trigger for the JOB AGENT
+/// whose DM is pending on an open episode must be routed onto the JOB
+/// session (not the trigger's original target) and its continuation run
+/// must carry the episode's `job_id`.
+#[tokio::test]
+async fn conversation_ended_routes_continuation_onto_job_session() {
+    let (state, shutdown_token, _cr, _tr, _dr) = test_app_state_with_sqlite();
+    let (alice_id, bob_id) = seed_alice_bob(&state);
+
+    // Alice's job session + open episode with a pending DM to bob.
+    let job_id = create_recurring_job(&state, alice_id, "ask bob");
+    let job_context = format!("job_{}", job_id.0);
+    let job_session_id = state
+        .session_manager
+        .get_or_create(alice_id, &job_context)
+        .id;
+    let turn1 = RunId::new();
+    state
+        .job_episodes
+        .open(job_id, job_session_id, alice_id, turn1);
+    let dm_session_id = SessionId::deterministic_dm("alice", "bob");
+    assert!(matches!(
+        state
+            .job_episodes
+            .on_run_complete(job_id, turn1, vec![dm_session_id], vec![]),
+        super::job_episode::RunCompletion::Open
+    ));
+
+    // The trigger's original target: alice's invisible notifications session
+    // (the pre-#1198 fallback shape).
+    let notif_session = state
+        .session_manager
+        .get_or_create(alice_id, "notifications:alice");
+
+    let (test_tx, test_rx) = mpsc::channel(8);
+    test_tx
+        .send(RunTrigger {
+            agent_id: alice_id,
+            session_id: notif_session.id,
+            input: "DM ended marker".to_string(),
+            source: MessageSource::ConversationEnded {
+                from_agent: bob_id,
+                from_name: "bob".to_string(),
+                reason: ConversationEndReason::Ignored,
+                source_session_id: None,
+            },
+            context_id: notif_session.context_id.clone(),
+        })
+        .await
+        .unwrap();
+    drop(test_tx);
+    super::notifications::run_trigger_loop(test_rx, state.clone()).await;
+
+    // The continuation run landed on the JOB session, stamped with job_id.
+    let runs = state.run_manager.list_by_session(job_session_id, 10);
+    assert!(
+        !runs.is_empty(),
+        "continuation run must be created on the job session"
+    );
+    assert_eq!(
+        runs[0].job_id,
+        Some(job_id),
+        "continuation run must carry the episode's job_id"
+    );
+    assert!(
+        state
+            .run_manager
+            .list_by_session(notif_session.id, 10)
+            .is_empty(),
+        "the notifications: fallback target must NOT receive the run"
+    );
+
+    shutdown_token.cancel();
+}
+
+/// The agent-match guard: the PEER's `ConversationEnded` trigger (same DM
+/// session, different agent) must NOT consume the episode's pending entry —
+/// its notification run keeps the pre-#1198 routing.
+#[tokio::test]
+async fn conversation_ended_for_peer_does_not_touch_episode() {
+    let (state, shutdown_token, _cr, _tr, _dr) = test_app_state_with_sqlite();
+    let (alice_id, bob_id) = seed_alice_bob(&state);
+
+    let job_id = create_recurring_job(&state, alice_id, "ask bob");
+    let job_session_id = state
+        .session_manager
+        .get_or_create(alice_id, format!("job_{}", job_id.0))
+        .id;
+    let turn1 = RunId::new();
+    state
+        .job_episodes
+        .open(job_id, job_session_id, alice_id, turn1);
+    let dm_session_id = SessionId::deterministic_dm("alice", "bob");
+    state
+        .job_episodes
+        .on_run_complete(job_id, turn1, vec![dm_session_id], vec![]);
+
+    // BOB's trigger for the same conversation end.
+    let bob_notif = state
+        .session_manager
+        .get_or_create(bob_id, "notifications:bob");
+    let (test_tx, test_rx) = mpsc::channel(8);
+    test_tx
+        .send(RunTrigger {
+            agent_id: bob_id,
+            session_id: bob_notif.id,
+            input: "DM ended marker".to_string(),
+            source: MessageSource::ConversationEnded {
+                from_agent: alice_id,
+                from_name: "alice".to_string(),
+                reason: ConversationEndReason::Ignored,
+                source_session_id: None,
+            },
+            context_id: bob_notif.context_id.clone(),
+        })
+        .await
+        .unwrap();
+    drop(test_tx);
+    super::notifications::run_trigger_loop(test_rx, state.clone()).await;
+
+    // Bob's run stays on his own target; alice's pending DM is untouched.
+    let runs = state.run_manager.list_by_session(bob_notif.id, 10);
+    assert!(!runs.is_empty(), "bob's notification run must be created");
+    assert_eq!(runs[0].job_id, None, "bob's run must not be job-stamped");
+    let snap = state
+        .job_episodes
+        .snapshot(job_id)
+        .expect("alice's episode must still be open");
+    assert_eq!(
+        snap["pending_dms"], 1,
+        "the peer's trigger must not consume the episode's pending DM"
+    );
+
+    shutdown_token.cancel();
+}
+
+/// #1198 step 5 (subagent side): a `SubagentCompletion` whose task is
+/// pending on an open episode resolves it — the notification run (already
+/// routed to the parent == job session) is stamped with the job id, and the
+/// #1041 marker-before-SSE ordering is preserved.
+#[tokio::test]
+async fn subagent_completion_resolves_episode_and_stamps_job_id() {
+    let (state, shutdown_token, _cr, _tr, _dr) = test_app_state();
+    let agent_id = AgentId::new();
+
+    let job_id = create_recurring_job(&state, agent_id, "spawn researcher");
+    let job_context = format!("job_{}", job_id.0);
+    let job_session_id = state
+        .session_manager
+        .get_or_create(agent_id, &job_context)
+        .id;
+    let turn1 = RunId::new();
+    state
+        .job_episodes
+        .open(job_id, job_session_id, agent_id, turn1);
+    let task_id = TaskId::new();
+    let subagent_session_id = state
+        .session_manager
+        .get_or_create(AgentId::new(), "subagent")
+        .id;
+    assert!(matches!(
+        state.job_episodes.on_run_complete(
+            job_id,
+            turn1,
+            vec![],
+            vec![(task_id.0, subagent_session_id)]
+        ),
+        super::job_episode::RunCompletion::Open
+    ));
+
+    let (test_tx, test_rx) = mpsc::unbounded_channel();
+    test_tx
+        .send(SubagentCompletion {
+            task_id,
+            subagent_name: Some("researcher".to_string()),
+            status: TaskStatus::Completed,
+            summary: "Done.".to_string(),
+            parent_session_id: job_session_id,
+            parent_agent_id: agent_id,
+            subagent_session_id,
+            task_description: Some("investigate".to_string()),
+            tool_count: Some(1),
+            duration_ms: Some(10),
+            token_usage: None,
+            parent_tool_invocation_id: None,
+        })
+        .unwrap();
+    drop(test_tx);
+    super::notifications::completion_notification_loop(test_rx, state.clone()).await;
+
+    // The continuation run is on the job session and job-stamped.
+    let runs = state.run_manager.list_by_session(job_session_id, 10);
+    assert!(!runs.is_empty(), "continuation run must exist");
+    assert_eq!(runs[0].job_id, Some(job_id));
+
+    // The pending entry was consumed (episode open with 0 pending, or —
+    // if the enqueued continuation already failed fast in the background —
+    // closed entirely). Either way no pending subagent may remain.
+    if let Some(snap) = state.job_episodes.snapshot(job_id) {
+        assert_eq!(snap["pending_subagents"], 0);
+    }
+
+    // #1041 ordering invariant untouched: the marker exists in history.
+    let history = state.session_manager.get_history(job_session_id).unwrap();
+    assert!(
+        history.iter().any(|m| {
+            m.metadata
+                .as_ref()
+                .and_then(|meta| meta.get("type"))
+                .and_then(|v| v.as_str())
+                == Some("subagent_completion")
+        }),
+        "subagent_completion marker must be persisted"
+    );
+
+    shutdown_token.cancel();
+}
+
+/// D5 deadline expiry: `close_episode(_, _, timed_out = true)` completes
+/// the job with the deadline note and detached-count while leaving the
+/// pending work untouched (detach-and-complete — nothing is cancelled).
+/// The sweep's drain half is covered by the tracker unit test
+/// (`take_expired_drains_past_deadline_episodes_with_pending_work`).
+#[tokio::test]
+async fn deadline_close_detaches_and_completes_with_note() {
+    let (state, shutdown_token, _cr, mut trigger_rx, _dr) = test_app_state();
+    let agent_id = AgentId::new();
+    let web_session_id = state.session_manager.get_or_create(agent_id, "web").id;
+    let job_id = create_recurring_job(&state, agent_id, "slow conversation");
+    let job_session_id = state
+        .session_manager
+        .get_or_create(agent_id, format!("job_{}", job_id.0))
+        .id;
+
+    // A completed turn-1 run so the card has a real run to read.
+    let mut run = Run::for_job(job_session_id, agent_id, "slow conversation".into(), job_id);
+    run.status = RunStatus::Completed;
+    run.output = Some("asked bob, waiting".into());
+    let run_id = run.run_id;
+    state.run_manager.insert_run(run);
+
+    // An expired episode with one pending DM (as the sweep would drain it).
+    let pending_dm = SessionId::new();
+    let episode = super::job_episode::JobEpisode {
+        job_id,
+        session_id: job_session_id,
+        agent_id,
+        started_at: chrono::Utc::now() - chrono::Duration::minutes(5),
+        deadline: std::time::Instant::now(),
+        pending_dms: std::iter::once(pending_dm).collect(),
+        pending_subagents: std::collections::HashMap::new(),
+        in_flight_runs: 0,
+        runs: vec![run_id],
+        dm_total: 1,
+        subagent_total: 0,
+        catch_up_queued: false,
+    };
+
+    super::notifications::close_episode(&state, episode, true).await;
+
+    let (text, meta) = job_marker_from(&state, web_session_id);
+    assert!(
+        text.contains("[Episode deadline reached after 4h — 1 pending task(s) detached]"),
+        "deadline close must carry the detach note, got: {text}"
+    );
+    assert_eq!(meta["episode"]["timed_out"], true);
+    assert_eq!(meta["episode"]["detached"], 1);
+
+    // Detach-and-complete: the pending DM was NOT ended — no
+    // ConversationEnded trigger was emitted.
+    assert!(
+        trigger_rx.try_recv().is_err(),
+        "deadline close must not end the pending DM"
+    );
+
+    // The job completed + re-armed normally.
+    let job = state.job_store.get(job_id).unwrap();
+    assert!(job.last_run_at.is_some());
+    assert_eq!(job.status, alms_core::JobStatus::Active);
+
+    shutdown_token.cancel();
+}
+
+/// D6 coalesced catch-up: an episode that outlived >=1 cron tick fires
+/// exactly one immediate catch-up at close (`next_run_at ~= now`), while an
+/// episode that did NOT outlive a tick re-arms for the next future tick.
+#[tokio::test]
+async fn catch_up_fires_when_episode_outlived_cron_tick() {
+    let (state, shutdown_token, _cr, _tr, _dr) = test_app_state();
+    let agent_id = AgentId::new();
+    let _web = state.session_manager.get_or_create(agent_id, "web");
+
+    // Every-minute cron so "outlived a tick" needs only minutes of skew.
+    let make_job = |prompt: &str| {
+        state
+            .job_store
+            .create(alms_core::job::CreateJobRequest {
+                agent_id,
+                prompt: prompt.to_string(),
+                schedule: alms_core::job::JobSchedule::Recurring {
+                    cron: "* * * * *".to_string(),
+                },
+            })
+            .unwrap()
+            .id
+    };
+    let make_episode = |job_id: alms_core::JobId, started_at: chrono::DateTime<chrono::Utc>| {
+        let job_session_id = state
+            .session_manager
+            .get_or_create(agent_id, format!("job_{}", job_id.0))
+            .id;
+        super::job_episode::JobEpisode {
+            job_id,
+            session_id: job_session_id,
+            agent_id,
+            started_at,
+            deadline: std::time::Instant::now(),
+            pending_dms: std::collections::HashSet::new(),
+            pending_subagents: std::collections::HashMap::new(),
+            in_flight_runs: 0,
+            runs: vec![RunId::new()],
+            dm_total: 0,
+            subagent_total: 0,
+            catch_up_queued: false,
+        }
+    };
+
+    // Case 1: episode outlived >=1 tick (started 3 minutes ago).
+    let missed_job = make_job("missed a tick");
+    let episode = make_episode(
+        missed_job,
+        chrono::Utc::now() - chrono::Duration::minutes(3),
+    );
+    super::notifications::close_episode(&state, episode, false).await;
+    let job = state.job_store.get(missed_job).unwrap();
+    let next = job.next_run_at.expect("catch-up must set next_run_at");
+    assert!(
+        next <= chrono::Utc::now() + chrono::Duration::seconds(1),
+        "coalesced catch-up must be due immediately, got {next}"
+    );
+
+    // Case 2: no tick elapsed (started just now) — normal future re-arm.
+    let ontime_job = make_job("on time");
+    let episode = make_episode(ontime_job, chrono::Utc::now());
+    super::notifications::close_episode(&state, episode, false).await;
+    let job = state.job_store.get(ontime_job).unwrap();
+    let next = job.next_run_at.expect("re-arm must set next_run_at");
+    assert!(
+        next > chrono::Utc::now(),
+        "no missed tick — next firing must be in the future, got {next}"
+    );
+
+    shutdown_token.cancel();
+}
+
+/// D7 cancellation teardown: `DELETE /jobs/{id}` on a job with an open
+/// episode ends its pending DM with `UserCancelled` (dm_ended marker +
+/// ConversationEnded triggers) and removes the episode.
+#[tokio::test]
+async fn cancel_job_teardown_ends_pending_dms() {
+    let (state, shutdown_token, _cr, mut trigger_rx, _dr) = test_app_state_with_sqlite();
+    let (alice_id, bob_id) = seed_alice_bob(&state);
+
+    let job_id = create_recurring_job(&state, alice_id, "ask bob then wait");
+    let job_context = format!("job_{}", job_id.0);
+    let job_session_id = state
+        .session_manager
+        .get_or_create(alice_id, &job_context)
+        .id;
+
+    // A REAL conversation via the bus (from the job session — a valid
+    // source post-#1198) so end_conversation has a live pair to end.
+    let receipt = state
+        .message_bus
+        .send(
+            "alice",
+            alice_id,
+            "bob",
+            bob_id,
+            "please review X",
+            Some(job_session_id),
+        )
+        .await
+        .expect("send must succeed");
+    let dm_session_id = receipt.session_id;
+    let _ = trigger_rx.try_recv(); // drain bob's DM trigger
+
+    // Open episode with that DM pending.
+    let turn1 = RunId::new();
+    state
+        .job_episodes
+        .open(job_id, job_session_id, alice_id, turn1);
+    state
+        .job_episodes
+        .on_run_complete(job_id, turn1, vec![dm_session_id], vec![]);
+
+    // DELETE /jobs/{id}.
+    let response = crate::jobs::cancel_job(
+        axum::extract::State(state.clone()),
+        axum::extract::Path(job_id),
+    )
+    .await;
+    use axum::response::IntoResponse as _;
+    assert_eq!(
+        response.into_response().status(),
+        axum::http::StatusCode::NO_CONTENT
+    );
+
+    // Episode gone.
+    assert!(state.job_episodes.snapshot(job_id).is_none());
+
+    // The DM was ended with UserCancelled: dm_ended marker on the DM session.
+    let history = state.session_manager.get_history(dm_session_id).unwrap();
+    let ended = history
+        .iter()
+        .find(|m| {
+            m.metadata
+                .as_ref()
+                .and_then(|meta| meta.get("message_type"))
+                .and_then(|v| v.as_str())
+                == Some("dm_ended")
+        })
+        .expect("teardown must write a dm_ended marker to the DM session");
+    assert_eq!(
+        ended
+            .metadata
+            .as_ref()
+            .unwrap()
+            .get("reason")
+            .and_then(|v| v.as_str()),
+        Some("user_cancelled"),
+        "teardown must end the DM with the UserCancelled reason"
+    );
+
+    // And the peer got a ConversationEnded trigger.
+    let mut saw_conversation_ended = false;
+    while let Ok(trigger) = trigger_rx.try_recv() {
+        if matches!(trigger.source, MessageSource::ConversationEnded { .. }) {
+            saw_conversation_ended = true;
+        }
+    }
+    assert!(
+        saw_conversation_ended,
+        "teardown must emit ConversationEnded trigger(s)"
+    );
+
+    shutdown_token.cancel();
+}
+
+/// S1 (#1202, Tim's review): the widened cancel-vs-close TOCTOU.
+/// `close_episode` reads the job (Cancelled pre-check passes), AWAITS the
+/// completion fanout, then records + re-arms — a `DELETE /jobs` landing in
+/// that window must NOT be overwritten back to `Active` (a cancelled
+/// recurring job would resurrect and re-arm).
+///
+/// Reproduces the lost race deterministically at the exact layer it
+/// happens: take the `job` snapshot while the job is live (as
+/// `close_episode` does before the fanout), land the cancel, then run the
+/// post-fanout `record_and_rearm` with the STALE snapshot — on the
+/// catch-up branch, the resurrection-prone write (`Active`, `next_run_at =
+/// now`). The store's absorbing-`Cancelled` guard must refuse the write
+/// and the `Recorded` gate must skip the scheduler re-arm.
+#[tokio::test]
+async fn delete_jobs_interleaved_with_close_cannot_resurrect_job() {
+    let (state, shutdown_token, _cr, _tr, _dr) = test_app_state();
+    let agent_id = AgentId::new();
+
+    // Every-minute recurring job; episode started 3 minutes ago so
+    // record_and_rearm takes the D6 catch-up branch (Active + due-now —
+    // the exact write that resurrected pre-fix).
+    let job_id = state
+        .job_store
+        .create(alms_core::job::CreateJobRequest {
+            agent_id,
+            prompt: "racy job".to_string(),
+            schedule: alms_core::job::JobSchedule::Recurring {
+                cron: "* * * * *".to_string(),
+            },
+        })
+        .unwrap()
+        .id;
+
+    // The stale snapshot close_episode holds across its fanout await.
+    let job_snapshot = state.job_store.get(job_id).expect("job is live");
+    assert_ne!(job_snapshot.status, alms_core::JobStatus::Cancelled);
+
+    let job_session_id = state
+        .session_manager
+        .get_or_create(agent_id, format!("job_{}", job_id.0))
+        .id;
+    let episode = super::job_episode::JobEpisode {
+        job_id,
+        session_id: job_session_id,
+        agent_id,
+        started_at: chrono::Utc::now() - chrono::Duration::minutes(3),
+        deadline: std::time::Instant::now(),
+        pending_dms: std::collections::HashSet::new(),
+        pending_subagents: std::collections::HashMap::new(),
+        in_flight_runs: 0,
+        runs: vec![RunId::new()],
+        dm_total: 0,
+        subagent_total: 0,
+        catch_up_queued: false,
+    };
+
+    // The interleaved DELETE /jobs lands INSIDE close_episode's window
+    // (after the pre-check read above, before the record write below).
+    assert_eq!(state.job_store.cancel(job_id).unwrap(), Some(true));
+
+    // close_episode's post-fanout tail runs with the stale snapshot.
+    super::notifications::record_and_rearm(&state, &job_snapshot, &episode).await;
+
+    // The job must stay Cancelled — not resurrected, not re-armed.
+    let job = state.job_store.get(job_id).expect("job still in store");
+    assert_eq!(
+        job.status,
+        alms_core::JobStatus::Cancelled,
+        "a DELETE interleaved with episode close must leave the job Cancelled (S1)"
+    );
+    assert_eq!(
+        job.next_run_at, None,
+        "the refused write must not re-arm next_run_at"
+    );
+    assert_eq!(
+        job.last_run_at, None,
+        "the refused write must not touch last_run_at"
+    );
+
+    shutdown_token.cancel();
+}

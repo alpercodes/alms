@@ -1,10 +1,12 @@
 //! DM notification routing, scheduler integration, and trigger loops.
 
+use super::job_episode::{self, EPISODE_DEADLINE_SECS, RunCompletion};
 use super::{RunParams, find_user_facing_session};
 use crate::cron_utils;
 use crate::server::AppState;
 use crate::sse::SseEventData;
 use alms_core::{JobId, JobSchedule, JobStatus, Run, RunId, RunStatus, SessionId};
+use alms_session::job_store::RecordRunOutcome;
 use alms_tools::message_sender::ConversationEndReason;
 use chrono::Utc;
 use tokio::sync::mpsc;
@@ -44,8 +46,11 @@ pub(crate) async fn scheduler_fire_loop(mut rx: mpsc::UnboundedReceiver<JobId>, 
 }
 
 /// Create and execute an agent run triggered by a scheduled job.
+///
+/// `pub(super)` so the sibling `integration_tests` module can exercise the
+/// full fire -> episode-open -> turn -> close pipeline end-to-end (#1198).
 #[instrument(level = "info", skip(state), fields(job_id = %job_id))]
-async fn fire_job_run(state: AppState, job_id: JobId) -> alms_core::AlmsResult<()> {
+pub(super) async fn fire_job_run(state: AppState, job_id: JobId) -> alms_core::AlmsResult<()> {
     // Look up the job — it may have been cancelled between scheduling and firing.
     let Some(job) = state.job_store.get(job_id) else {
         info!("Skipping fired job — not found in store");
@@ -53,6 +58,15 @@ async fn fire_job_run(state: AppState, job_id: JobId) -> alms_core::AlmsResult<(
     };
     if job.status == JobStatus::Cancelled {
         info!("Skipping fired job — already cancelled");
+        return Ok(());
+    }
+
+    // #1198 D6 defensive guard: a firing that lands while the job's episode
+    // is still open (unreachable under re-arm-at-close, but a future
+    // scheduler change or a bootstrap past-due re-fire could produce it) is
+    // absorbed into the episode's coalesced catch-up dirty-bit instead of
+    // overlapping on the shared job session.
+    if state.job_episodes.absorb_fire_if_open(job_id) {
         return Ok(());
     }
 
@@ -77,6 +91,15 @@ async fn fire_job_run(state: AppState, job_id: JobId) -> alms_core::AlmsResult<(
         .await;
     info!("Job fired -> run {}", run_id.0);
 
+    // #1198: open the job episode BEFORE the first turn executes. From here
+    // on, completion bookkeeping (card + record_run + recurring re-arm) is
+    // owned by `close_episode`, driven by `finish_episode_run` at every
+    // `execute_run` exit — the episode stays open across triggered DMs and
+    // background subagents until quiescence or the 4-hour deadline.
+    state
+        .job_episodes
+        .open(job_id, session_id, job.agent_id, run_id);
+
     // Execute the run (awaits completion; errors are handled inside execute_run).
     // Register the token so scheduled job runs are cancellable via POST /runs/{id}/cancel
     // in addition to the job-level DELETE /jobs/{id} path.
@@ -100,50 +123,266 @@ async fn fire_job_run(state: AppState, job_id: JobId) -> alms_core::AlmsResult<(
     )
     .await;
 
+    // #1198: the post-run block (completion card + record_run + re-arm)
+    // moved to `close_episode`, invoked by the episode hook inside
+    // `execute_run` when the episode reaches quiescence — which, for a
+    // turn with no async work, is right here at turn-1 end (behavior
+    // identical to the pre-#1198 flow).
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Job episodes (#1198): deferred completion, quiescence, deadline sweep
+// ---------------------------------------------------------------------------
+
+/// Completion-card statistics for a closed episode.
+pub(super) struct EpisodeCloseStats {
+    pub turns: usize,
+    pub dm_count: usize,
+    pub subagent_count: usize,
+    pub timed_out: bool,
+    /// Pending items left open at a deadline-forced close (0 for
+    /// quiescent closes). Detach-and-complete: these keep running on
+    /// their own lifecycle.
+    pub detached: usize,
+}
+
+/// Feed one episode-run exit into the tracker and run the close side
+/// effects when the episode reaches quiescence.
+///
+/// MUST be called from **every** `execute_run` exit for job-stamped runs —
+/// the five sites are the pre-cancel early exit, the resolve-failure exit,
+/// the token-budget rejection exit, the runtime-construction failure exit,
+/// and the common terminal tail. A missed exit leaks the episode's
+/// `in_flight_runs` reservation and stalls the close until the deadline
+/// sweep (see the design doc, step 4).
+pub(super) async fn finish_episode_run(
+    state: &AppState,
+    job_id: Option<JobId>,
+    run_id: RunId,
+    tool_calls: &[alms_core::ToolCallRecord],
+) {
+    let Some(job_id) = job_id else { return };
+    let opened_dms = job_episode::dms_opened(tool_calls);
+    let opened_subagents = job_episode::subagents_spawned(tool_calls);
+    match state
+        .job_episodes
+        .on_run_complete(job_id, run_id, opened_dms, opened_subagents)
+    {
+        RunCompletion::Closed(episode) => {
+            info!(
+                job_id = %job_id,
+                run_id = %run_id.0,
+                turns = episode.runs.len(),
+                "Job episode quiescent — closing"
+            );
+            close_episode(state, *episode, false).await;
+        }
+        RunCompletion::Open => {
+            debug!(
+                job_id = %job_id,
+                run_id = %run_id.0,
+                "Episode run completed — episode stays open (pending work / in-flight runs)"
+            );
+        }
+        RunCompletion::Untracked => {}
+    }
+}
+
+/// Close a job episode: completion card, `record_run`, and the recurring
+/// re-arm / coalesced catch-up (D6). `timed_out` marks a deadline-forced
+/// close (D5 detach-and-complete) — the card carries a deadline note and
+/// the pending items are left running.
+///
+/// Owns what used to be `fire_job_run`'s post-run block, generalized from
+/// "after the one turn" to "after the whole episode".
+pub(super) async fn close_episode(
+    state: &AppState,
+    episode: job_episode::JobEpisode,
+    timed_out: bool,
+) {
+    let job_id = episode.job_id;
+
+    // Guard: if the job was cancelled (or deleted) while the episode was
+    // open, do not notify / overwrite the Cancelled status / re-arm.
+    // Generalizes the pre-#1198 cancelled-during-run guard.
+    let Some(job) = state.job_store.get(job_id) else {
+        info!(job_id = %job_id, "Job disappeared during episode — skipping close");
+        return;
+    };
+    if job.status == JobStatus::Cancelled {
+        info!(job_id = %job_id, "Job was cancelled during episode — skipping close");
+        return;
+    }
+
+    // The card's run handle is the episode's final run (turn 1 when no
+    // async work happened — the pre-#1198 shape).
+    let last_run = episode
+        .runs
+        .last()
+        .copied()
+        .unwrap_or_else(alms_core::RunId::new);
+    let stats = EpisodeCloseStats {
+        turns: episode.runs.len(),
+        dm_count: episode.dm_total,
+        subagent_count: episode.subagent_total,
+        timed_out,
+        detached: episode.pending_count(),
+    };
+
     // -- Job completion notification --
     // Send a notification to the agent's most recent user-facing session
     // so the user can see that the job ran (even if they weren't watching
     // the hidden job_* session).
-    notify_job_completion(&state, job.agent_id, &job.prompt, run_id, job_id).await;
+    notify_job_completion(
+        state,
+        job.agent_id,
+        &job.prompt,
+        last_run,
+        job_id,
+        Some(&stats),
+    )
+    .await;
 
-    // Guard: if the job was cancelled while the run was in progress, do not
-    // overwrite the Cancelled status or re-arm the scheduler.
-    if state
-        .job_store
-        .get(job_id)
-        .map(|j| j.status == JobStatus::Cancelled)
-        .unwrap_or(true)
-    {
-        info!("Job was cancelled during run, skipping post-run update");
-        return Ok(());
-    }
+    // Update the job record and re-arm. The S1 guard (#1202, Tim's review):
+    // `notify_job_completion` above AWAITED between the Cancelled pre-check
+    // and this write — a `DELETE /jobs` landing in that window used to flip
+    // the job `Cancelled -> Active` and re-arm it (a cancelled recurring
+    // job resurrected). The store's absorbing-`Cancelled` guard now refuses
+    // the stale write, and every re-arm below is gated on `Recorded`.
+    record_and_rearm(state, &job, &episode).await;
+}
 
-    // Update job record after run completes.
+/// Record the episode's run on the job and re-arm recurring schedules —
+/// the D6 coalesced catch-up when >=1 cron tick elapsed during the
+/// episode, otherwise the normal next-tick arm.
+///
+/// Split out of [`close_episode`] so the S1 race shape is directly
+/// testable: the caller holds a `job` snapshot read BEFORE the completion
+/// fanout, and a `DELETE /jobs` may have landed since. Correctness does
+/// not depend on the snapshot's freshness — `JobStore::record_run`'s
+/// absorbing-`Cancelled` guard refuses the stale write atomically (same
+/// entry lock as `cancel`), and the `Recorded` gate here skips the
+/// scheduler re-arm on refusal.
+pub(super) async fn record_and_rearm(
+    state: &AppState,
+    job: &alms_core::job::Job,
+    episode: &job_episode::JobEpisode,
+) {
+    let job_id = episode.job_id;
     let now = Utc::now();
-    let (new_status, next_run_at) = match &job.schedule {
-        JobSchedule::Once { .. } => (JobStatus::Cancelled, None),
-        JobSchedule::Recurring { cron } => {
-            let next = cron_utils::next_after(cron, now);
-            if next.is_none() {
-                warn!("Recurring cron '{}' has no future occurrences", cron);
+    match &job.schedule {
+        JobSchedule::Once { .. } => {
+            // Target status is Cancelled (a spent one-shot). A refusal means
+            // a DELETE won the race and the job is already Cancelled — the
+            // same terminal state either way; nothing to re-arm.
+            match state
+                .job_store
+                .record_run(job_id, now, JobStatus::Cancelled, None)
+            {
+                Ok(RecordRunOutcome::Recorded) => {}
+                Ok(outcome) => {
+                    info!(job_id = %job_id, ?outcome, "record_run not applied at episode close")
+                }
+                Err(e) => error!(job_id = %job_id, "Failed to record job run: {e}"),
             }
-            (JobStatus::Active, next)
         }
-    };
-
-    state
-        .job_store
-        .record_run(job_id, now, new_status, next_run_at)?;
-
-    // Re-arm recurring jobs with the next computed fire time.
-    if let Some(next) = next_run_at {
-        let delay = (next - now).to_std().unwrap_or(std::time::Duration::ZERO);
-        let instant = tokio::time::Instant::now() + delay;
-        state.scheduler.schedule_once(job_id, instant).await;
-        info!("Recurring job re-armed for {}", next);
+        JobSchedule::Recurring { cron } => {
+            // D6: coalesced catch-up. If at least one cron tick elapsed
+            // while the episode was open (or the defensive fire-path guard
+            // absorbed a firing), fire exactly ONE catch-up now — missed
+            // ticks never queue individually (identical prompts; see the
+            // design doc § D6).
+            let missed = episode.catch_up_queued
+                || cron_utils::next_after(cron, episode.started_at)
+                    .map(|t| t <= now)
+                    .unwrap_or(false);
+            if missed {
+                match state
+                    .job_store
+                    .record_run(job_id, now, JobStatus::Active, Some(now))
+                {
+                    Ok(RecordRunOutcome::Recorded) => {
+                        // Route through the scheduler with a zero delay so the
+                        // catch-up reuses the normal fire path (cancellation
+                        // checks, per-agent queueing, the absorb guard).
+                        state
+                            .scheduler
+                            .schedule_once(job_id, tokio::time::Instant::now())
+                            .await;
+                        info!(
+                            job_id = %job_id,
+                            "Episode outlived >=1 cron tick — coalesced catch-up fired (D6)"
+                        );
+                    }
+                    Ok(outcome) => {
+                        info!(
+                            job_id = %job_id,
+                            ?outcome,
+                            "Job cancelled/removed during episode close — catch-up skipped (S1)"
+                        );
+                    }
+                    Err(e) => error!(job_id = %job_id, "Failed to record job run: {e}"),
+                }
+            } else {
+                let next = cron_utils::next_after(cron, now);
+                if next.is_none() {
+                    warn!("Recurring cron '{}' has no future occurrences", cron);
+                }
+                match state
+                    .job_store
+                    .record_run(job_id, now, JobStatus::Active, next)
+                {
+                    Ok(RecordRunOutcome::Recorded) => {
+                        if let Some(next) = next {
+                            let delay = (next - now).to_std().unwrap_or(std::time::Duration::ZERO);
+                            let instant = tokio::time::Instant::now() + delay;
+                            state.scheduler.schedule_once(job_id, instant).await;
+                            info!("Recurring job re-armed for {}", next);
+                        }
+                    }
+                    Ok(outcome) => {
+                        info!(
+                            job_id = %job_id,
+                            ?outcome,
+                            "Job cancelled/removed during episode close — re-arm skipped (S1)"
+                        );
+                    }
+                    Err(e) => error!(job_id = %job_id, "Failed to record job run: {e}"),
+                }
+            }
+        }
     }
+}
 
-    Ok(())
+/// The D5 deadline sweep: force-close episodes past their 4-hour deadline
+/// with detach-and-complete semantics (the job completes with a deadline
+/// note; still-live pending work keeps running, never force-cancelled).
+///
+/// Races degrade gracefully: a run completing after the sweep removed its
+/// episode reports `Untracked` and finishes as a plain run; a later
+/// DM/subagent resolution misses and falls back to default routing.
+pub(crate) async fn job_episode_sweep_loop(state: AppState) {
+    let mut ticker = tokio::time::interval(std::time::Duration::from_secs(
+        job_episode::EPISODE_SWEEP_INTERVAL_SECS,
+    ));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            _ = state.shutdown_token.cancelled() => break,
+            _ = ticker.tick() => {
+                for episode in state.job_episodes.take_expired() {
+                    warn!(
+                        job_id = %episode.job_id,
+                        pending = episode.pending_count(),
+                        in_flight_runs = episode.in_flight_runs,
+                        "Job episode deadline reached — detach-and-complete (#1198 D5)"
+                    );
+                    close_episode(&state, episode, true).await;
+                }
+            }
+        }
+    }
 }
 
 /// Character cap for the job-name label shown on the completion card.
@@ -158,32 +397,21 @@ async fn notify_job_completion(
     job_prompt: &str,
     run_id: RunId,
     job_id: JobId,
+    episode: Option<&EpisodeCloseStats>,
 ) {
-    // Determine outcome from the completed run. `truncated` means "the full
-    // output is longer than `summary` and fetchable via GET /runs/{run_id}" —
-    // only ever true for the Completed arm, where `run.output` is what the
-    // fetch returns. Failed/cancelled summaries are short (and their full text
-    // isn't on `run.output` anyway), so they never signal a fetch.
-    let (status, summary, truncated) = match state.run_manager.get_run(run_id) {
+    // Determine the outcome from the completed run. `fetchable` marks the
+    // Completed arm — the only case where the full text lives on
+    // `run.output` and is therefore retrievable via GET /runs/{run_id}
+    // (#1196). Failed/cancelled text isn't fetchable, so those arms never
+    // signal a fetch regardless of capping.
+    let (status, raw_summary, fetchable) = match state.run_manager.get_run(run_id) {
         Some(run) => match run.status {
-            RunStatus::Completed => {
-                let output = run.output.unwrap_or_default();
-                // Cap at the shared JOB_SUMMARY_MAX_CHARS (4000) instead of the
-                // old 200 so "Show more" reveals a useful chunk inline; the
-                // full output is still fetchable via GET /runs/{run_id} (#1196).
-                let (summary, truncated) =
-                    crate::sse::truncate_chars(&output, crate::sse::JOB_SUMMARY_MAX_CHARS);
-                ("success", summary, truncated)
-            }
-            RunStatus::Failed => {
-                let err = run.error.unwrap_or_else(|| "unknown error".to_string());
-                // S2 (#1196): cap the error too so a runaway provider error
-                // body can't land untruncated in session history (and so the
-                // marker and SSE surfaces don't diverge). Not fetchable, so the
-                // truncation flag stays false.
-                let (err, _) = crate::sse::truncate_chars(&err, crate::sse::JOB_SUMMARY_MAX_CHARS);
-                ("error", err, false)
-            }
+            RunStatus::Completed => ("success", run.output.unwrap_or_default(), true),
+            RunStatus::Failed => (
+                "error",
+                run.error.unwrap_or_else(|| "unknown error".to_string()),
+                false,
+            ),
             RunStatus::Cancelled => ("cancelled", "run was cancelled".to_string(), false),
             RunStatus::Queued | RunStatus::Running => {
                 // Shouldn't happen — execute_run already returned.
@@ -192,6 +420,35 @@ async fn notify_job_completion(
         },
         None => ("error", "run record not found".to_string(), false),
     };
+
+    // #1198 D5: a deadline-forced close prepends a note so the card (and
+    // the persisted marker) say WHY the job completed with work still
+    // open. The run-derived status is kept — the final turn itself may
+    // have succeeded; only the episode's wait was cut short.
+    //
+    // N1 (Tim on #1202): the note is applied BEFORE the cap. The SSE
+    // constructor re-caps its summary at the same JOB_SUMMARY_MAX_CHARS —
+    // capping first and prepending after made an at-cap deadline close
+    // diverge between the live SSE payload (note pushed the text over the
+    // cap, tail re-clipped) and the persisted marker (kept the full text).
+    // Composing first and capping once keeps both surfaces byte-identical.
+    let raw_summary = match episode {
+        Some(stats) if stats.timed_out => format!(
+            "[Episode deadline reached after {}h — {} pending task(s) detached]\n{raw_summary}",
+            EPISODE_DEADLINE_SECS / 3600,
+            stats.detached,
+        ),
+        _ => raw_summary,
+    };
+
+    // Single cap for both surfaces: JOB_SUMMARY_MAX_CHARS (4000, #1196) so
+    // "Show more" reveals a useful chunk inline while a runaway output (or
+    // provider error body — S2 #1196) can't land untruncated in session
+    // history. `truncated` keeps the #1196 contract: "the full output is
+    // fetchable via GET /runs/{run_id}" — only the Completed arm signals it.
+    let (summary, capped) =
+        crate::sse::truncate_chars(&raw_summary, crate::sse::JOB_SUMMARY_MAX_CHARS);
+    let truncated = fetchable && capped;
 
     // Find the agent's most recent user-facing session (exclude internal sessions).
     let Some(target) = find_user_facing_session(&state.session_manager, agent_id) else {
@@ -252,13 +509,27 @@ async fn notify_job_completion(
         // identify the firing job and its hidden session. `truncated` is the
         // authoritative "there is more to fetch" flag the card keys on (the
         // reload mirror of the SSE field).
-        serde_json::json!({
-            "job_status": status,
-            "run_id": run_id.0.to_string(),
-            "job_id": job_id.0.to_string(),
-            "job_session_id": job_session_id,
-            "truncated": truncated,
-        }),
+        {
+            let mut meta = serde_json::json!({
+                "job_status": status,
+                "run_id": run_id.0.to_string(),
+                "job_id": job_id.0.to_string(),
+                "job_session_id": job_session_id,
+                "truncated": truncated,
+            });
+            // #1198: episode stats (additive — pre-episode markers simply
+            // lack the key, and consumers treat it as optional).
+            if let Some(stats) = episode {
+                meta["episode"] = serde_json::json!({
+                    "turns": stats.turns,
+                    "dm_count": stats.dm_count,
+                    "subagent_count": stats.subagent_count,
+                    "timed_out": stats.timed_out,
+                    "detached": stats.detached,
+                });
+            }
+            meta
+        },
     );
 
     info!(
@@ -564,6 +835,22 @@ pub(crate) async fn completion_notification_loop(
 
         let notification = format_completion_notification(&completion);
 
+        // #1198 step 5: resolve this completion against open job episodes.
+        // A hit removes the pending `Subagent` entry and RESERVES the
+        // continuation run in the same atomic step (no quiescence can fire
+        // in the gap). Routing needs no override here — the parent session
+        // of a job-dispatched subagent IS the job session. A miss (episode
+        // already closed by the deadline sweep or cancellation) degrades to
+        // the plain pre-#1198 notification run.
+        let episode_route = state.job_episodes.resolve_subagent(completion.task_id.0);
+        if let Some(ref route) = episode_route {
+            info!(
+                job_id = %route.job_id,
+                task_id = %completion.task_id.0,
+                "Subagent completion resolved to open job episode — continuation run"
+            );
+        }
+
         info!(
             session_id = %session_id.0,
             task_id = %completion.task_id.0,
@@ -579,8 +866,12 @@ pub(crate) async fn completion_notification_loop(
             context_id,
             "subagent".to_string(),
             false, // subagent completion — not a peer message
+            episode_route.as_ref().map(|r| r.job_id),
         )
         .await;
+        if let Some(route) = episode_route {
+            state.job_episodes.note_run(route.job_id, run_id);
+        }
 
         debug!(
             run_id = %run_id.0,
@@ -596,6 +887,7 @@ pub(crate) async fn completion_notification_loop(
 ///
 /// Shared helper for [`completion_notification_loop`] and [`run_trigger_loop`],
 /// which both follow the same create-register-enqueue pattern.
+#[allow(clippy::too_many_arguments)] // internal helper; params mirror RunParams + the #1198 job stamp
 async fn enqueue_triggered_run(
     state: &AppState,
     agent_id: alms_core::AgentId,
@@ -604,8 +896,13 @@ async fn enqueue_triggered_run(
     context_id: String,
     source_label: String,
     is_peer_message: bool,
+    // #1198: when this run continues a job episode, its Run record is
+    // stamped with the job id so `cancel_runs_for_job` covers it and the
+    // episode hook inside `execute_run` engages at every exit.
+    job_id: Option<JobId>,
 ) -> RunId {
-    let run = Run::new(session_id, agent_id, input.clone());
+    let mut run = Run::new(session_id, agent_id, input.clone());
+    run.job_id = job_id;
     let run_id = run.run_id;
     state.run_manager.insert_run(run);
 
@@ -889,7 +1186,7 @@ pub(crate) async fn run_trigger_loop(
         // a notification run (which must NOT get the DM addendum).
         // `dm_peer_name` is captured for DM runs so we can forward a
         // lightweight activity event to the agent's webchat session (#651).
-        let (source_label, is_peer, input, dm_peer_name) = match &trigger.source {
+        let (source_label, is_peer, input, dm_peer_name, episode_route) = match &trigger.source {
             MessageSource::Agent { from_name, .. } => (
                 format!("peer:{from_name}"),
                 true,
@@ -897,9 +1194,10 @@ pub(crate) async fn run_trigger_loop(
                 // through so the Run record has a copy.
                 trigger.input,
                 Some(from_name.clone()),
+                None,
             ),
             MessageSource::SubagentCompletion => {
-                ("subagent".to_string(), false, trigger.input, None)
+                ("subagent".to_string(), false, trigger.input, None, None)
             }
             MessageSource::ConversationEnded {
                 from_name,
@@ -1053,6 +1351,19 @@ pub(crate) async fn run_trigger_loop(
                     }
                 });
 
+                // #1198 step 5: resolve this DM terminal signal against open
+                // job episodes. Hits only for the JOB AGENT's trigger (the
+                // same DM session appears in both participants' triggers —
+                // the agent check inside `resolve_dm` keeps the peer's
+                // continuation out of the job). A hit atomically removes
+                // the pending entry and reserves the continuation run; the
+                // routing override below then pins the run to the job
+                // session so the agent resumes with its full job context.
+                let episode_route = peer_name_resolved.as_ref().and_then(|peer_name| {
+                    let dm_session_id = SessionId::deterministic_dm(from_name, peer_name);
+                    state.job_episodes.resolve_dm(dm_session_id, agent_id)
+                });
+
                 (
                     format!("notification:dm_ended:{from_name}"),
                     // NOT a peer message — the notification run should not get
@@ -1068,8 +1379,28 @@ pub(crate) async fn run_trigger_loop(
                         conversation_history.as_deref(),
                     ),
                     None,
+                    episode_route,
                 )
             }
+        };
+
+        // #1198 routing override: a resolved episode DM pins the
+        // continuation run to the JOB session (superseding the
+        // `source_sessions`-derived target — see design doc § D3 for why
+        // the tracker, not the bus, is the primary router). On a miss the
+        // pre-#1198 routing applies byte-for-byte.
+        let (session_id, context_id, episode_job_id) = match episode_route {
+            Some(route) => {
+                info!(
+                    job_id = %route.job_id,
+                    dm_target = %session_id.0,
+                    job_session = %route.job_session_id.0,
+                    "ConversationEnded resolved to open job episode — routing \
+                     continuation onto the job session (#1198)"
+                );
+                (route.job_session_id, route.context_id, Some(route.job_id))
+            }
+            None => (session_id, context_id, None),
         };
 
         info!(
@@ -1079,7 +1410,7 @@ pub(crate) async fn run_trigger_loop(
             "RunTrigger -> creating run"
         );
 
-        enqueue_triggered_run(
+        let run_id = enqueue_triggered_run(
             &state,
             agent_id,
             session_id,
@@ -1087,8 +1418,12 @@ pub(crate) async fn run_trigger_loop(
             context_id.clone(),
             source_label,
             is_peer,
+            episode_job_id,
         )
         .await;
+        if let Some(job_id) = episode_job_id {
+            state.job_episodes.note_run(job_id, run_id);
+        }
 
         // Forward a lightweight "DM activity started" event to the agent's
         // webchat session so the status bar can show "Chatting with {peer}".
@@ -1457,7 +1792,7 @@ mod tests {
             long_output,
         );
 
-        notify_job_completion(&state, agent_id, "nightly digest", run_id, job_id).await;
+        notify_job_completion(&state, agent_id, "nightly digest", run_id, job_id, None).await;
 
         let (text, meta) = job_marker(&state, web_session_id);
 
@@ -1511,7 +1846,7 @@ mod tests {
 
         // Newline inside the first ~60 chars — the pre-fix bug split here.
         let prompt = "Line one of the prompt\nLine two continues on past the split point";
-        notify_job_completion(&state, agent_id, prompt, run_id, job_id).await;
+        notify_job_completion(&state, agent_id, prompt, run_id, job_id, None).await;
 
         let (text, _meta) = job_marker(&state, web_session_id);
         let nl = text
@@ -1558,7 +1893,7 @@ mod tests {
             multibyte.clone(),
         );
 
-        notify_job_completion(&state, agent_id, "unicode job", run_id, job_id).await;
+        notify_job_completion(&state, agent_id, "unicode job", run_id, job_id, None).await;
 
         let (text, meta) = job_marker(&state, web_session_id);
         let nl = text
@@ -1573,6 +1908,67 @@ mod tests {
             meta["truncated"], false,
             "an under-cap summary must report truncated=false so the card doesn't fetch"
         );
+
+        shutdown_token.cancel();
+    }
+
+    /// N1 (#1202, Tim's review): the deadline note is composed BEFORE the
+    /// 4000-char cap. With an at-cap output, the persisted marker summary
+    /// must be exactly `JOB_SUMMARY_MAX_CHARS + "..."` INCLUDING the note —
+    /// pre-fix the note was prepended after the cap, so the marker exceeded
+    /// the cap while the SSE constructor re-clipped its copy: the two
+    /// surfaces diverged by the tail.
+    #[tokio::test]
+    async fn deadline_note_is_applied_before_the_cap() {
+        let (state, shutdown_token) = build_notification_state();
+        let agent_id = AgentId::new();
+        let web_session_id = state.session_manager.get_or_create(agent_id, "web").id;
+
+        // Output exactly at the cap so ANY prepended note must displace tail
+        // chars rather than exceed the cap.
+        let job_id = JobId::new();
+        let at_cap_output = "a".repeat(crate::sse::JOB_SUMMARY_MAX_CHARS);
+        let run_id = insert_completed_job_run(
+            &state,
+            web_session_id,
+            agent_id,
+            job_id,
+            "slow job",
+            at_cap_output,
+        );
+
+        let stats = EpisodeCloseStats {
+            turns: 2,
+            dm_count: 1,
+            subagent_count: 0,
+            timed_out: true,
+            detached: 1,
+        };
+        notify_job_completion(&state, agent_id, "slow job", run_id, job_id, Some(&stats)).await;
+
+        let (text, meta) = job_marker(&state, web_session_id);
+        let nl = text.find('\n').expect("name/summary delimiter");
+        let summary_part = &text[nl + 1..];
+
+        // The note leads the summary...
+        assert!(
+            summary_part
+                .starts_with("[Episode deadline reached after 4h — 1 pending task(s) detached]"),
+            "deadline note must lead the summary, got: {}",
+            &summary_part[..summary_part.len().min(120)]
+        );
+        // ...and the composed summary is capped at exactly the shared cap —
+        // the same string the SSE constructor's re-cap would produce, so
+        // live and reload surfaces are byte-identical.
+        assert_eq!(
+            summary_part.chars().count(),
+            crate::sse::JOB_SUMMARY_MAX_CHARS + 3,
+            "note + output must be capped ONCE at JOB_SUMMARY_MAX_CHARS (+ ellipsis)"
+        );
+        assert!(summary_part.ends_with("..."));
+        // Output is on run.output -> fetchable -> truncated signals the fetch.
+        assert_eq!(meta["truncated"], true);
+        assert_eq!(meta["episode"]["timed_out"], true);
 
         shutdown_token.cancel();
     }
@@ -1595,7 +1991,7 @@ mod tests {
         let run_id = run.run_id;
         state.run_manager.insert_run(run);
 
-        notify_job_completion(&state, agent_id, "flaky job", run_id, job_id).await;
+        notify_job_completion(&state, agent_id, "flaky job", run_id, job_id, None).await;
 
         let (text, meta) = job_marker(&state, web_session_id);
         assert_eq!(meta["job_status"], "error");

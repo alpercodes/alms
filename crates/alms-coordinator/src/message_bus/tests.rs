@@ -2297,21 +2297,17 @@ async fn test_cross_dm_source_session_recorded() {
     );
 }
 
-/// Internal session types (notification, subagent, episodic, job) must NOT
+/// Internal session types (notification, subagent, episodic) must NOT
 /// be recorded as source sessions, even after #680 relaxed the whitelist
-/// to a denylist.
+/// to a denylist. Job sessions were removed from this list in #1198 —
+/// they are now legitimate DM sources (see the companion tests below).
 #[tokio::test]
 async fn test_internal_session_types_not_recorded_as_source() {
     let (bus, mut rx) = setup();
     let alice_id = AgentId::new();
     let bob_id = AgentId::new();
 
-    let internal_contexts = [
-        "notifications:alice",
-        "subagent_research",
-        "episodic:main",
-        "job_550e8400-e29b-41d4-a716-446655440000",
-    ];
+    let internal_contexts = ["notifications:alice", "subagent_research", "episodic:main"];
 
     for ctx in &internal_contexts {
         let internal_session = SessionId::new();
@@ -2339,6 +2335,123 @@ async fn test_internal_session_types_not_recorded_as_source() {
         bus.depths.remove(&dm_context_id("alice", "bob"));
         bus.last_activity.remove(&dm_context_id("alice", "bob"));
     }
+}
+
+/// #1198 (D3): a `job_*` session IS a valid DM source. When the job agent
+/// sends from its job session and the PEER ends the conversation, the job
+/// agent's `ConversationEnded` trigger must route back to the job session
+/// (not fall back to the invisible `notifications:{agent}` session).
+#[tokio::test]
+async fn test_job_session_recorded_as_source_and_routes_peer_end() {
+    let (bus, mut rx) = setup();
+    let alice_id = AgentId::new();
+    let bob_id = AgentId::new();
+
+    // Alice (the job agent) sends from her job session.
+    let job_session = SessionId::new();
+    let job_context = "job_550e8400-e29b-41d4-a716-446655440000";
+    bus.session_manager
+        .get_or_create_shared(job_session, job_context);
+    bus.send(
+        "alice",
+        alice_id,
+        "bob",
+        bob_id,
+        "Please review X",
+        Some(job_session),
+    )
+    .await
+    .unwrap();
+    let _ = rx.try_recv(); // drain send trigger
+
+    // The job session must be recorded as alice's source for this pair.
+    let key = (dm_context_id("alice", "bob"), "alice".to_string());
+    assert_eq!(
+        bus.source_sessions.get(&key).map(|e| *e.value()),
+        Some(job_session),
+        "job session must be recorded as a DM source (#1198 D3)"
+    );
+
+    // Bob ends the conversation — alice's notification must route to the
+    // job session with the job context.
+    bus.end_conversation(
+        "bob",
+        bob_id,
+        "alice",
+        alice_id,
+        ConversationEndReason::Ignored,
+    )
+    .await
+    .unwrap();
+
+    let trigger = rx.try_recv().expect("alice should get a notification");
+    assert_eq!(trigger.agent_id, alice_id);
+    assert_eq!(
+        trigger.session_id, job_session,
+        "ConversationEnded for the job agent must route to the job session"
+    );
+    assert_eq!(trigger.context_id, job_context);
+    match &trigger.source {
+        MessageSource::ConversationEnded {
+            source_session_id, ..
+        } => assert_eq!(*source_session_id, Some(job_session)),
+        other => panic!("expected ConversationEnded, got {:?}", other),
+    }
+}
+
+/// #1198 (D3): when the JOB AGENT ends the conversation itself
+/// (`ignore_message` during a DM turn), the sender self-notification —
+/// which only fires when a source session is recorded — must now fire and
+/// route to the job session. Pre-#1198 the job session was rejected as a
+/// source, so the job agent got NO resume turn at all on this path.
+#[tokio::test]
+async fn test_job_agent_self_end_gets_self_notification_on_job_session() {
+    let (bus, mut rx) = setup();
+    let alice_id = AgentId::new();
+    let bob_id = AgentId::new();
+
+    let job_session = SessionId::new();
+    let job_context = "job_650e8400-e29b-41d4-a716-446655440001";
+    bus.session_manager
+        .get_or_create_shared(job_session, job_context);
+    bus.send(
+        "alice",
+        alice_id,
+        "bob",
+        bob_id,
+        "Please review Y",
+        Some(job_session),
+    )
+    .await
+    .unwrap();
+    let _ = rx.try_recv(); // drain send trigger
+
+    // Alice (the job agent) ends the conversation herself.
+    bus.end_conversation(
+        "alice",
+        alice_id,
+        "bob",
+        bob_id,
+        ConversationEndReason::Ignored,
+    )
+    .await
+    .unwrap();
+
+    // Two triggers: the peer's (bob, falls back to notifications:) and
+    // alice's self-notification routed to the job session.
+    let mut alice_trigger = None;
+    while let Ok(trigger) = rx.try_recv() {
+        if trigger.agent_id == alice_id {
+            alice_trigger = Some(trigger);
+        }
+    }
+    let alice_trigger = alice_trigger
+        .expect("job agent must receive a self-notification when it ends its own DM (#1198)");
+    assert_eq!(
+        alice_trigger.session_id, job_session,
+        "self-notification must route to the job session"
+    );
+    assert_eq!(alice_trigger.context_id, job_context);
 }
 
 /// **MANDATORY safety test (issue #685)**:

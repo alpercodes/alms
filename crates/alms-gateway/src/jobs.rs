@@ -17,7 +17,7 @@ use axum::{
     response::IntoResponse,
 };
 use chrono::Utc;
-use tracing::warn;
+use tracing::{info, warn};
 
 /// POST /jobs
 pub async fn create_job(
@@ -77,9 +77,25 @@ pub async fn create_job(
     (StatusCode::CREATED, Json(serde_json::json!(job))).into_response()
 }
 
+/// Serialize a job, attaching the open-episode snapshot (#1198 step 8)
+/// when the job's episode is still in flight. Jobs with no open episode
+/// keep the pre-#1198 wire shape (no `episode` key).
+fn job_json(state: &AppState, job: &alms_core::job::Job) -> serde_json::Value {
+    let mut value = serde_json::json!(job);
+    if let Some(episode) = state.job_episodes.snapshot(job.id) {
+        value["episode"] = episode;
+    }
+    value
+}
+
 /// GET /jobs
 pub async fn list_jobs(State(state): State<AppState>) -> impl IntoResponse {
-    let jobs = state.job_store.list();
+    let jobs: Vec<serde_json::Value> = state
+        .job_store
+        .list()
+        .iter()
+        .map(|job| job_json(&state, job))
+        .collect();
     Json(serde_json::json!({ "jobs": jobs }))
 }
 
@@ -89,7 +105,7 @@ pub async fn get_job(
     Path(job_id): Path<JobId>,
 ) -> impl IntoResponse {
     match state.job_store.get(job_id) {
-        Some(job) => Json(serde_json::json!(job)).into_response(),
+        Some(job) => Json(job_json(&state, &job)).into_response(),
         None => api_error(StatusCode::NOT_FOUND, "NOT_FOUND", "job not found").into_response(),
     }
 }
@@ -104,8 +120,19 @@ pub async fn cancel_job(
             // Also cancel in the scheduler so it doesn't fire again.
             state.scheduler.cancel(job_id).await;
 
+            // #1198 D7: remove the episode FIRST so in-flight run exits and
+            // pending DM/subagent resolutions no-op (Untracked / miss), then
+            // tear down its pending work: end open DMs with UserCancelled
+            // (the peer gets the standard ended-notification instead of
+            // being stranded) and cancel running background subagents.
+            if let Some(episode) = state.job_episodes.remove(job_id) {
+                teardown_episode(&state, episode).await;
+            }
+
             // Cancel any in-progress run that was spawned by this job so
             // we stop burning tokens on work the operator intended to halt.
+            // Covers turn-1 runs AND episode continuation runs — both carry
+            // the job id (#1198 step 5 stamping).
             // (cancel_runs_for_job logs each cancelled run individually)
             state.run_manager.cancel_runs_for_job(job_id);
 
@@ -119,5 +146,101 @@ pub async fn cancel_job(
         .into_response(),
         Ok(None) => api_error(StatusCode::NOT_FOUND, "NOT_FOUND", "job not found").into_response(),
         Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR", e).into_response(),
+    }
+}
+
+/// Tear down a cancelled job's open episode (#1198 D7).
+///
+/// - **Pending DMs**: cancel active runs on the DM session and call
+///   `end_conversation(UserCancelled)` so the peer receives the standard
+///   ended-notification. Unlike the D5 deadline (detach-and-complete),
+///   ending the DM here is unambiguously right — the operator explicitly
+///   killed the job.
+/// - **Pending subagents**: fire the session-keyed cancel; the resulting
+///   `SubagentCompletion(Cancelled)` finds no episode (already removed)
+///   and degrades to a plain notification run on the job session.
+///
+/// Best-effort throughout: resolution failures are logged and skipped —
+/// the depth-expiry sweep remains the eventual fallback for a DM whose
+/// participants cannot be resolved.
+async fn teardown_episode(state: &AppState, episode: crate::runs::job_episode::JobEpisode) {
+    use alms_tools::message_sender::{ConversationEndReason, MessageSender as _};
+
+    for dm_session_id in &episode.pending_dms {
+        // Stop any in-flight turn on the DM session first.
+        let cancelled = state.run_manager.cancel_runs_for_session(*dm_session_id);
+        if cancelled > 0 {
+            info!(
+                dm_session = %dm_session_id.0,
+                cancelled,
+                "Cancelled active DM runs during job-episode teardown"
+            );
+        }
+
+        // Resolve the pair from the DM session's context id and end the
+        // conversation with the job agent as the sender.
+        let Ok(session) = state.session_manager.get(*dm_session_id) else {
+            warn!(
+                dm_session = %dm_session_id.0,
+                "Pending DM session not found during teardown — skipping end_conversation"
+            );
+            continue;
+        };
+        let Some((name_a, name_b)) = alms_core::dm_participants(&session.context_id) else {
+            warn!(
+                dm_session = %dm_session_id.0,
+                context_id = %session.context_id,
+                "Pending DM session has a non-DM context — skipping end_conversation"
+            );
+            continue;
+        };
+        let Some(store) = state.session_manager.store() else {
+            warn!("No agent store available — skipping end_conversation during teardown");
+            continue;
+        };
+        let (Ok(Some(rec_a)), Ok(Some(rec_b))) = (
+            store.load_agent_by_name(name_a),
+            store.load_agent_by_name(name_b),
+        ) else {
+            warn!(
+                dm_session = %dm_session_id.0,
+                "Could not resolve both DM participants during teardown — skipping"
+            );
+            continue;
+        };
+        let (sender, peer) = if rec_a.id == episode.agent_id {
+            (rec_a, rec_b)
+        } else {
+            (rec_b, rec_a)
+        };
+        if let Err(e) = state
+            .message_bus
+            .end_conversation(
+                &sender.name,
+                sender.id,
+                &peer.name,
+                peer.id,
+                ConversationEndReason::UserCancelled,
+            )
+            .await
+        {
+            warn!(
+                dm_session = %dm_session_id.0,
+                error = %e,
+                "end_conversation failed during job-episode teardown"
+            );
+        }
+    }
+
+    for (task_id, subagent_session) in &episode.pending_subagents {
+        let fired = state
+            .coordinator
+            .cancel_subagent_by_session(*subagent_session);
+        info!(
+            task_id = %task_id,
+            subagent_session = %subagent_session.0,
+            fired,
+            "Cancelled pending background subagent during job-episode teardown"
+        );
     }
 }

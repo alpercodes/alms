@@ -671,7 +671,7 @@ Cross-session event forwarded to the agent's user-facing webchat session when a 
 ```
 
 `job_completed`
-Emitted on the agent's user-facing session when a scheduled job run finishes. The event is informational only (no new LLM run is triggered).
+Emitted on the agent's user-facing session when a scheduled job's **episode closes** (#1198) — quiescence or the 4-hour deadline — not at each run's end: a job whose first turn starts a DM or background subagent emits this only once the whole arc settles (see section 7.1.1). The event is informational only (no new LLM run is triggered).
 ```json
 {
   "session_id": "<uuid>",
@@ -688,7 +688,9 @@ Emitted on the agent's user-facing session when a scheduled job run finishes. Th
 
 `status` values: `"success"`, `"error"`, `"cancelled"`, `"unknown"`.
 
-`run_id` / `job_id` / `job_session_id` (the job's hidden-session **context id**, not a session UUID) are deep-link handles added in #1196. `truncated` is `true` when `summary` was capped at `JOB_SUMMARY_MAX_CHARS` (4000) and the full output is fetchable via `GET /runs/{run_id}` (the run's persisted `response`); the UI keys its fetch-on-expand on this flag rather than sniffing the `...` suffix. Markers persisted before #1196 lack these metadata fields; the UI degrades to the stored summary.
+`run_id` / `job_id` / `job_session_id` (the job's hidden-session **context id**, not a session UUID) are deep-link handles added in #1196. Under episodes (#1198), `run_id` is the episode's **final** run. `truncated` is `true` when `summary` was capped at `JOB_SUMMARY_MAX_CHARS` (4000) and the full output is fetchable via `GET /runs/{run_id}` (the run's persisted `response`); the UI keys its fetch-on-expand on this flag rather than sniffing the `...` suffix. On a deadline-forced close the summary is prefixed with an `[Episode deadline reached ...]` note (composed before the cap, so the SSE payload and the persisted marker stay byte-identical). Markers persisted before #1196 lack these metadata fields; the UI degrades to the stored summary.
+
+The persisted `job_notification` marker's metadata additionally carries an optional `episode` object (#1198) — `{"turns", "dm_count", "subagent_count", "timed_out", "detached"}` — describing the closed episode. It is metadata-only for now (the SSE payload is unchanged and the UI does not render it yet); markers persisted before #1198 lack the key.
 
 `subagent_started`
 Emitted on the parent's session SSE stream the moment the coordinator creates the subagent's session row, ahead of any nested `tool_start` from inside the subagent. Used by the web UI's Subagent status bar to make the chip navigable (click opens the subagent session) live during a foreground `invoke_agent` run (#1105) — without this event navigation was only possible after `tool_end`, which for foreground subagents means after the subagent has finished. Fires for both foreground and background paths; the event is idempotent on the client (background subagents also carry `session_id` on the `invoke_agent` tool result and the `subagent_completed` event).
@@ -1106,10 +1108,42 @@ Cronjobs are “autonomy with persistence”. Even if implementation is minimal,
 }
 ```
 
+### 7.1.1 Job episodes (#1198)
+
+A firing opens a **job episode**: the job stays active until the agent's full
+multi-step task is done — across DMs it starts (`send_message`) and background
+subagents it dispatches (`invoke_agent(background=true)`) — not just its first
+turn. The completion notification, `record_run`, and the recurring re-arm all
+fire at **episode close**: quiescence (a turn ends with no pending DMs /
+subagents and no queued follow-up run) or the 4-hour deadline
+(detach-and-complete: the job completes with a deadline note; still-live
+pending work keeps running on its own lifecycle). Recurring firings that
+become due while an episode is open **queue** — coalesced into exactly one
+immediate catch-up at close. See `docs/jobs-await-completion-design.md`.
+
+`GET /jobs` and `GET /jobs/{job_id}` include an `episode` object while one is
+open (absent otherwise):
+
+```json
+{
+  "id": "<uuid>",
+  "status": "active",
+  "episode": {
+    "started_at": "2026-07-06T10:00:00Z",
+    "pending_dms": 1,
+    "pending_subagents": 0,
+    "in_flight_runs": 0,
+    "runs": 2,
+    "catch_up_queued": false,
+    "deadline_remaining_secs": 13800
+  }
+}
+```
+
 ### 7.2 Cancel a job
 `DELETE /jobs/{job_id}`
 
-Cancels a scheduled job, removes it from the scheduler, and cancels any in-progress runs that were spawned by the job.
+Cancels a scheduled job, removes it from the scheduler, and cancels any in-progress runs that were spawned by the job — including episode continuation runs. An open episode is torn down: pending DM conversations are ended with the `user_cancelled` reason (the peer gets the standard ended-notification) and pending background subagents are cancelled (#1198).
 
 **Response 204** — job cancelled successfully (no body).
 

@@ -21,6 +21,7 @@ This is the entrypoint to ALMS documentation.
 - `agent-ux-requirements.md` — Alper's UX requirements (config, context, workspace, tokens)
 - `autonomous-subagents-design.md` — recursive spawning, progress reporting, cost budgets
 - `persistent-agents-cli-design.md` — named agents, CLI management, registry
+- `jobs-await-completion-design.md` — scheduled-job lifecycle: job episodes stay active across triggered DMs + background subagents (#1198) — *APPROVED, phase 1 implemented*
 
 ## Communication
 
