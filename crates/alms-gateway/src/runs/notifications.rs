@@ -858,7 +858,7 @@ pub(crate) async fn completion_notification_loop(
             "Subagent completion -> creating notification run"
         );
 
-        let run_id = enqueue_triggered_run(
+        let Some(run_id) = enqueue_triggered_run(
             &state,
             agent_id,
             session_id,
@@ -868,10 +868,12 @@ pub(crate) async fn completion_notification_loop(
             false, // subagent completion — not a peer message
             episode_route.as_ref().map(|r| r.job_id),
         )
-        .await;
-        if let Some(route) = episode_route {
-            state.job_episodes.note_run(route.job_id, run_id);
-        }
+        .await
+        else {
+            // #1206: cancelled-job teardown — the completion is recorded in
+            // history (marker + SSE above) but burns no LLM turn.
+            continue;
+        };
 
         debug!(
             run_id = %run_id.0,
@@ -882,13 +884,42 @@ pub(crate) async fn completion_notification_loop(
     }
 }
 
-/// Creates a run, registers it, sends the SSE `run_created` event, and
-/// enqueues the run at low priority for execution.
+/// Returns the job id when `context_id` addresses a job session
+/// (`job_{uuid}`) whose job the operator cancelled via `DELETE /jobs/{id}`
+/// — the target shape of the teardown-spawned orphan runs from #1206.
+///
+/// Keys on the `operator_cancelled_jobs` intent set, **NOT** on
+/// `JobStatus::Cancelled` (Codex P2 on PR #1210, confirmed by Tim):
+/// `JobStatus` has no `Completed` variant (#763), so a normally-spent
+/// one-shot is ALSO recorded as `Cancelled` by `record_and_rearm`'s `Once`
+/// arm. Status-keyed suppression would silently drop the late results of a
+/// one-shot's deadline-detached work (subagent completions and DM-ended
+/// fallbacks landing on the job session) — breaking D5's documented
+/// "detach, deliver late via an orphan run" contract.
+fn operator_cancelled_job_for_context(state: &AppState, context_id: &str) -> Option<JobId> {
+    let raw = context_id.strip_prefix("job_")?;
+    let job_id = JobId(uuid::Uuid::parse_str(raw).ok()?);
+    state
+        .operator_cancelled_jobs
+        .contains(&job_id)
+        .then_some(job_id)
+}
+
+/// Creates a run, registers it (including the #1207 episode `note_run`
+/// stamp for job-episode continuations), sends the SSE `run_created` event,
+/// and enqueues the run at low priority for execution.
 ///
 /// Shared helper for [`completion_notification_loop`] and [`run_trigger_loop`],
 /// which both follow the same create-register-enqueue pattern.
+///
+/// Returns `None` (no run created) when the target is the session of an
+/// **operator-cancelled** job — see the #1206 suppression comment inside.
+///
+/// `pub(super)` for the #1207 regression test in `integration_tests`,
+/// which pins the "run id noted on the episode before this returns"
+/// contract.
 #[allow(clippy::too_many_arguments)] // internal helper; params mirror RunParams + the #1198 job stamp
-async fn enqueue_triggered_run(
+pub(super) async fn enqueue_triggered_run(
     state: &AppState,
     agent_id: alms_core::AgentId,
     session_id: SessionId,
@@ -900,11 +931,57 @@ async fn enqueue_triggered_run(
     // stamped with the job id so `cancel_runs_for_job` covers it and the
     // episode hook inside `execute_run` engages at every exit.
     job_id: Option<JobId>,
-) -> RunId {
+) -> Option<RunId> {
+    // #1206 (Tim's S3 on PR #1202): suppress post-teardown orphan runs.
+    // `DELETE /jobs` tears down an open episode by ending its pending DMs
+    // (the DM-sender self-notification trigger routes back onto the job
+    // session via D3) and cancelling its pending subagents (the
+    // `SubagentCompletion(Cancelled)` notification's parent session IS the
+    // job session). Both notification runs are created HERE, asynchronously,
+    // AFTER `cancel_runs_for_job` already swept — so merely stamping them
+    // with the job id could not stop them from burning a turn post-kill.
+    //
+    // The suppression keys on OPERATOR-CANCEL INTENT (the
+    // `operator_cancelled_jobs` set populated only by `DELETE /jobs`), not
+    // on job lifecycle status — see `operator_cancelled_job_for_context`.
+    // Consequences of that keying:
+    //
+    // - Deadline-detached episodes (D5) always deliver their late results:
+    //   a detached subagent/DM completing after the 4h sweep produces the
+    //   documented orphan run on the job session — for RECURRING jobs
+    //   (re-armed `Active`) and for spent ONE-SHOTS (recorded `Cancelled`
+    //   by the #763 status quirk, but never operator-cancelled) alike.
+    // - A run targeting the session of an operator-killed job serves no
+    //   one (the completion card is never coming), so it is suppressed.
+    //   If an episode resolve reserved a continuation for a run suppressed
+    //   here (DELETE racing a terminal signal), the reservation is moot —
+    //   `cancel_job` removes the episode unconditionally, before its first
+    //   await.
+    if let Some(cancelled_job) = operator_cancelled_job_for_context(state, &context_id) {
+        info!(
+            job_id = %cancelled_job,
+            session_id = %session_id.0,
+            source = %source_label,
+            "Suppressing triggered run targeting an operator-cancelled job's session (#1206)"
+        );
+        return None;
+    }
+
     let mut run = Run::new(session_id, agent_id, input.clone());
     run.job_id = job_id;
     let run_id = run.run_id;
     state.run_manager.insert_run(run);
+
+    // #1207 (Tim's S4 on PR #1202): record an episode continuation's run id
+    // IMMEDIATELY after the run exists — before the enqueue below could
+    // possibly execute (and instantly terminate) it. Pre-fix `note_run` was
+    // called by the callers after this function returned, so an instantly-
+    // terminating continuation could close the episode before its id was
+    // noted, leaving the closed episode's `runs` set — and with it the
+    // completion card's `turns` count / deep-link — missing the final id.
+    if let Some(job_id) = job_id {
+        state.job_episodes.note_run(job_id, run_id);
+    }
 
     // Mirror the `create_run` reconstruction: `SessionQueue::pending_count`
     // only counts items still *waiting* in the queue -- the currently-
@@ -962,7 +1039,7 @@ async fn enqueue_triggered_run(
         }),
     );
 
-    run_id
+    Some(run_id)
 }
 
 /// Template for subagent completion notifications, loaded at compile time from
@@ -1186,7 +1263,7 @@ pub(crate) async fn run_trigger_loop(
         // a notification run (which must NOT get the DM addendum).
         // `dm_peer_name` is captured for DM runs so we can forward a
         // lightweight activity event to the agent's webchat session (#651).
-        let (source_label, is_peer, input, dm_peer_name, episode_route) = match &trigger.source {
+        let (source_label, is_peer, input, dm_peer_name, episode_routes) = match &trigger.source {
             MessageSource::Agent { from_name, .. } => (
                 format!("peer:{from_name}"),
                 true,
@@ -1194,11 +1271,15 @@ pub(crate) async fn run_trigger_loop(
                 // through so the Run record has a copy.
                 trigger.input,
                 Some(from_name.clone()),
-                None,
+                Vec::new(),
             ),
-            MessageSource::SubagentCompletion => {
-                ("subagent".to_string(), false, trigger.input, None, None)
-            }
+            MessageSource::SubagentCompletion => (
+                "subagent".to_string(),
+                false,
+                trigger.input,
+                None,
+                Vec::new(),
+            ),
             MessageSource::ConversationEnded {
                 from_name,
                 reason,
@@ -1355,14 +1436,22 @@ pub(crate) async fn run_trigger_loop(
                 // job episodes. Hits only for the JOB AGENT's trigger (the
                 // same DM session appears in both participants' triggers —
                 // the agent check inside `resolve_dm` keeps the peer's
-                // continuation out of the job). A hit atomically removes
-                // the pending entry and reserves the continuation run; the
-                // routing override below then pins the run to the job
+                // continuation out of the job). Each hit atomically removes
+                // the pending entry and reserves a continuation run; the
+                // routing override below then pins each run to its job
                 // session so the agent resumes with its full job context.
-                let episode_route = peer_name_resolved.as_ref().and_then(|peer_name| {
-                    let dm_session_id = SessionId::deterministic_dm(from_name, peer_name);
-                    state.job_episodes.resolve_dm(dm_session_id, agent_id)
-                });
+                //
+                // #1205: `resolve_dm` returns EVERY episode pending on the
+                // DM session (the deterministic session id means two jobs
+                // of the same agent can await the same conversation) — one
+                // continuation run is enqueued per resolved episode.
+                let episode_routes = peer_name_resolved
+                    .as_ref()
+                    .map(|peer_name| {
+                        let dm_session_id = SessionId::deterministic_dm(from_name, peer_name);
+                        state.job_episodes.resolve_dm(dm_session_id, agent_id)
+                    })
+                    .unwrap_or_default();
 
                 (
                     format!("notification:dm_ended:{from_name}"),
@@ -1379,50 +1468,61 @@ pub(crate) async fn run_trigger_loop(
                         conversation_history.as_deref(),
                     ),
                     None,
-                    episode_route,
+                    episode_routes,
                 )
             }
         };
 
-        // #1198 routing override: a resolved episode DM pins the
+        // #1198 routing override: a resolved episode DM pins its
         // continuation run to the JOB session (superseding the
         // `source_sessions`-derived target — see design doc § D3 for why
         // the tracker, not the bus, is the primary router). On a miss the
         // pre-#1198 routing applies byte-for-byte.
-        let (session_id, context_id, episode_job_id) = match episode_route {
-            Some(route) => {
-                info!(
-                    job_id = %route.job_id,
-                    dm_target = %session_id.0,
-                    job_session = %route.job_session_id.0,
-                    "ConversationEnded resolved to open job episode — routing \
-                     continuation onto the job session (#1198)"
-                );
-                (route.job_session_id, route.context_id, Some(route.job_id))
-            }
-            None => (session_id, context_id, None),
+        //
+        // #1205: one run target per resolved episode — when two episodes
+        // of the same agent were pending on the ended DM session, BOTH get
+        // their continuation (each on its own job session, stamped with its
+        // own job id). The trigger's original target receives a run only
+        // when no episode resolved.
+        let run_targets: Vec<(SessionId, String, Option<JobId>)> = if episode_routes.is_empty() {
+            vec![(session_id, context_id.clone(), None)]
+        } else {
+            episode_routes
+                .into_iter()
+                .map(|route| {
+                    info!(
+                        job_id = %route.job_id,
+                        dm_target = %session_id.0,
+                        job_session = %route.job_session_id.0,
+                        "ConversationEnded resolved to open job episode — routing \
+                         continuation onto the job session (#1198)"
+                    );
+                    (route.job_session_id, route.context_id, Some(route.job_id))
+                })
+                .collect()
         };
 
-        info!(
-            session_id = %session_id.0,
-            agent_id = %agent_id.0,
-            source = %source_label,
-            "RunTrigger -> creating run"
-        );
+        for (session_id, run_context_id, episode_job_id) in run_targets {
+            info!(
+                session_id = %session_id.0,
+                agent_id = %agent_id.0,
+                source = %source_label,
+                "RunTrigger -> creating run"
+            );
 
-        let run_id = enqueue_triggered_run(
-            &state,
-            agent_id,
-            session_id,
-            input,
-            context_id.clone(),
-            source_label,
-            is_peer,
-            episode_job_id,
-        )
-        .await;
-        if let Some(job_id) = episode_job_id {
-            state.job_episodes.note_run(job_id, run_id);
+            // The #1207 episode `note_run` stamp happens inside
+            // `enqueue_triggered_run`, right after the run is inserted.
+            enqueue_triggered_run(
+                &state,
+                agent_id,
+                session_id,
+                input.clone(),
+                run_context_id,
+                source_label.clone(),
+                is_peer,
+                episode_job_id,
+            )
+            .await;
         }
 
         // Forward a lightweight "DM activity started" event to the agent's

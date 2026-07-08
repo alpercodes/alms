@@ -247,33 +247,45 @@ impl JobEpisodeTracker {
     }
 
     /// Resolve a DM terminal signal (`ConversationEnded`) against open
-    /// episodes. Hits only when `dm_session_id` is pending on an episode
-    /// whose agent is `agent_id` — the same DM session appears in the
-    /// triggers of BOTH participants, and only the job agent's trigger may
-    /// consume the pending entry (the peer's continuation belongs to the
-    /// peer, not to the job).
+    /// episodes. Hits only for episodes whose agent is `agent_id` and whose
+    /// pending set contains `dm_session_id` — the same DM session appears
+    /// in the triggers of BOTH participants, and only the job agent's
+    /// trigger may consume the pending entries (the peer's continuation
+    /// belongs to the peer, not to the job).
     ///
-    /// On a hit the pending entry is removed and a continuation run is
+    /// Resolves **every** matching episode, not just one (#1205): DM
+    /// sessions are deterministic per agent pair, so two open episodes of
+    /// the same agent can both be pending on the same DM session (two jobs
+    /// each messaged the same peer). A single `ConversationEnded` means the
+    /// conversation on that session is over for ALL of them — resolving
+    /// only the HashMap-order winner would strand the loser's pending entry
+    /// until the 4h deadline backstop. The caller enqueues one continuation
+    /// run per returned route.
+    ///
+    /// On each hit the pending entry is removed and a continuation run is
     /// **reserved** (`in_flight_runs += 1`) in the same atomic step, so a
     /// concurrent `on_run_complete` can never observe "pending empty, no
-    /// in-flight" in the gap before the continuation run is enqueued. The
-    /// caller MUST follow up with `note_run` once the run id exists.
+    /// in-flight" in the gap before the continuation run is enqueued.
+    /// `note_run` fires inside `enqueue_triggered_run` as soon as each run
+    /// id exists (#1207).
     pub(crate) fn resolve_dm(
         &self,
         dm_session_id: SessionId,
         agent_id: AgentId,
-    ) -> Option<ContinuationRoute> {
+    ) -> Vec<ContinuationRoute> {
         let mut eps = self.episodes.lock();
-        let ep = eps
-            .values_mut()
-            .find(|ep| ep.agent_id == agent_id && ep.pending_dms.contains(&dm_session_id))?;
-        ep.pending_dms.remove(&dm_session_id);
-        ep.in_flight_runs += 1;
-        Some(ContinuationRoute {
-            job_id: ep.job_id,
-            job_session_id: ep.session_id,
-            context_id: format!("job_{}", ep.job_id.0),
-        })
+        eps.values_mut()
+            .filter(|ep| ep.agent_id == agent_id && ep.pending_dms.contains(&dm_session_id))
+            .map(|ep| {
+                ep.pending_dms.remove(&dm_session_id);
+                ep.in_flight_runs += 1;
+                ContinuationRoute {
+                    job_id: ep.job_id,
+                    job_session_id: ep.session_id,
+                    context_id: format!("job_{}", ep.job_id.0),
+                }
+            })
+            .collect()
     }
 
     /// Resolve a background-subagent terminal signal (`SubagentCompletion`)
@@ -293,8 +305,11 @@ impl JobEpisodeTracker {
         })
     }
 
-    /// Record a continuation run's id after `enqueue_triggered_run` created
-    /// it (the reservation was already taken by the resolve call).
+    /// Record a continuation run's id (the reservation was already taken by
+    /// the resolve call). Called by `enqueue_triggered_run` immediately
+    /// after the run is inserted — BEFORE the run is enqueued for execution
+    /// (#1207) — so an instantly-terminating continuation can never close
+    /// the episode with its own id missing from `runs`.
     pub(crate) fn note_run(&self, job_id: JobId, run_id: RunId) {
         if let Some(ep) = self.episodes.lock().get_mut(&job_id) {
             ep.runs.push(run_id);
@@ -458,12 +473,15 @@ mod tests {
         }
 
         // The DM reaches its terminal state — resolve + reserve.
-        let route = t
-            .resolve_dm(dm, agent_id)
-            .expect("pending DM must resolve for the episode agent");
-        assert_eq!(route.job_id, job_id);
-        assert_eq!(route.job_session_id, job_session);
-        assert_eq!(route.context_id, format!("job_{}", job_id.0));
+        let routes = t.resolve_dm(dm, agent_id);
+        assert_eq!(
+            routes.len(),
+            1,
+            "pending DM must resolve for the episode agent"
+        );
+        assert_eq!(routes[0].job_id, job_id);
+        assert_eq!(routes[0].job_session_id, job_session);
+        assert_eq!(routes[0].context_id, format!("job_{}", job_id.0));
 
         // Between resolve and the continuation run there is a reservation —
         // no close can fire (nothing completes in the gap by construction;
@@ -501,7 +519,7 @@ mod tests {
         ));
 
         // dm_a resolves; its continuation completes → still open (dm_b + task).
-        t.resolve_dm(dm_a, agent_id).expect("dm_a resolves");
+        assert_eq!(t.resolve_dm(dm_a, agent_id).len(), 1, "dm_a resolves");
         let c1 = RunId::new();
         t.note_run(job_id, c1);
         assert!(matches!(
@@ -519,7 +537,7 @@ mod tests {
         ));
 
         // dm_b resolves; quiescent continuation → closed.
-        t.resolve_dm(dm_b, agent_id).expect("dm_b resolves");
+        assert_eq!(t.resolve_dm(dm_b, agent_id).len(), 1, "dm_b resolves");
         let c3 = RunId::new();
         t.note_run(job_id, c3);
         match t.on_run_complete(job_id, c3, vec![], vec![]) {
@@ -544,7 +562,7 @@ mod tests {
             RunCompletion::Open
         ));
 
-        t.resolve_dm(dm_a, agent_id).unwrap();
+        assert_eq!(t.resolve_dm(dm_a, agent_id).len(), 1);
         let c1 = RunId::new();
         t.note_run(job_id, c1);
         // The continuation starts a NEW DM.
@@ -554,7 +572,7 @@ mod tests {
             RunCompletion::Open
         ));
 
-        t.resolve_dm(dm_b, agent_id).unwrap();
+        assert_eq!(t.resolve_dm(dm_b, agent_id).len(), 1);
         let c2 = RunId::new();
         t.note_run(job_id, c2);
         assert!(matches!(
@@ -580,13 +598,13 @@ mod tests {
 
         // The PEER's trigger (different agent id) must miss.
         assert!(
-            t.resolve_dm(dm, AgentId::new()).is_none(),
+            t.resolve_dm(dm, AgentId::new()).is_empty(),
             "peer's trigger must not consume the episode's pending DM"
         );
         // The job agent's trigger hits.
-        assert!(t.resolve_dm(dm, agent_id).is_some());
+        assert_eq!(t.resolve_dm(dm, agent_id).len(), 1);
         // Second resolution (duplicate end) misses — entry consumed.
-        assert!(t.resolve_dm(dm, agent_id).is_none());
+        assert!(t.resolve_dm(dm, agent_id).is_empty());
     }
 
     /// Repeat sends to the same DM pair are idempotent (set semantics): one
@@ -600,12 +618,79 @@ mod tests {
             t.on_run_complete(job_id, run1, vec![dm, dm], vec![]),
             RunCompletion::Open
         ));
-        t.resolve_dm(dm, agent_id).expect("one entry to resolve");
+        assert_eq!(t.resolve_dm(dm, agent_id).len(), 1, "one entry to resolve");
         let c1 = RunId::new();
         t.note_run(job_id, c1);
         match t.on_run_complete(job_id, c1, vec![], vec![]) {
             RunCompletion::Closed(ep) => assert_eq!(ep.dm_total, 1),
             other => panic!("expected Closed, got {other:?}"),
+        }
+    }
+
+    /// #1205 (Tim's S2 on PR #1202): two open episodes of the SAME agent
+    /// both pending the SAME deterministic DM session — a single
+    /// `ConversationEnded` must resolve BOTH (the conversation on that
+    /// session is over for both jobs). Pre-fix only the HashMap-order
+    /// winner resolved and the loser hung until the 4h deadline.
+    #[test]
+    fn resolve_dm_resolves_all_episodes_pending_on_same_session() {
+        let t = tracker();
+        let agent_id = AgentId::new();
+        let dm = SessionId::new();
+
+        // Two jobs for the same agent, each with an open episode pending
+        // on the same DM session (both messaged the same peer).
+        let mut jobs = Vec::new();
+        for _ in 0..2 {
+            let job_id = JobId::new();
+            let session_id = SessionId::new();
+            let run1 = RunId::new();
+            t.open(job_id, session_id, agent_id, run1);
+            assert!(matches!(
+                t.on_run_complete(job_id, run1, vec![dm], vec![]),
+                RunCompletion::Open
+            ));
+            jobs.push((job_id, session_id));
+        }
+
+        // One ConversationEnded resolves BOTH episodes, each with its own
+        // route (own job session, own job id).
+        let mut routes = t.resolve_dm(dm, agent_id);
+        assert_eq!(
+            routes.len(),
+            2,
+            "both episodes pending on the DM session must resolve"
+        );
+        routes.sort_by_key(|r| r.job_id.0);
+        let mut expected: Vec<ContinuationRoute> = jobs
+            .iter()
+            .map(|(job_id, session_id)| ContinuationRoute {
+                job_id: *job_id,
+                job_session_id: *session_id,
+                context_id: format!("job_{}", job_id.0),
+            })
+            .collect();
+        expected.sort_by_key(|r| r.job_id.0);
+        assert_eq!(routes, expected);
+
+        // Duplicate end: both entries consumed.
+        assert!(t.resolve_dm(dm, agent_id).is_empty());
+
+        // Each episode's reserved continuation closes its own episode —
+        // neither hangs to the deadline.
+        for (job_id, _) in jobs {
+            let cont = RunId::new();
+            t.note_run(job_id, cont);
+            match t.on_run_complete(job_id, cont, vec![], vec![]) {
+                RunCompletion::Closed(ep) => {
+                    assert_eq!(ep.job_id, job_id);
+                    assert!(
+                        ep.runs.contains(&cont),
+                        "continuation run must be recorded on its episode"
+                    );
+                }
+                other => panic!("episode for {job_id:?} must close, got {other:?}"),
+            }
         }
     }
 
@@ -618,7 +703,7 @@ mod tests {
         let dm = SessionId::new();
         t.on_run_complete(job_id, run1, vec![dm], vec![]);
         t.remove(job_id).expect("episode removed (cancel path)");
-        assert!(t.resolve_dm(dm, agent_id).is_none());
+        assert!(t.resolve_dm(dm, agent_id).is_empty());
         assert!(t.resolve_subagent(Uuid::new_v4()).is_none());
     }
 

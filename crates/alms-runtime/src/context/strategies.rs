@@ -475,8 +475,8 @@ mod tests {
 
     /// Control for #1201: the exemption is specific to synthetic markers. A
     /// same-sized REAL turn still consumes selection budget and evicts older
-    /// history — proving `selection_token_cost` did not become a blanket
-    /// "ignore large messages".
+    /// history — proving the `is_stripped_display_marker` skip did not
+    /// become a blanket "ignore large messages".
     #[test]
     fn large_real_message_still_consumes_selection_budget() {
         let config = ContextConfig {

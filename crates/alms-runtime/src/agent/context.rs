@@ -1,5 +1,6 @@
 use crate::context::{
     ContextBuilder, HISTORY_RESERVE, estimate_session_message_tokens, estimate_tokens,
+    is_stripped_display_marker,
 };
 use crate::events::PHASE_SUMMARIZING;
 use crate::llm_types::*;
@@ -338,7 +339,20 @@ impl AgentRuntime {
         // Early-out cheap path: if the uncovered tail's token estimate is
         // below the trigger threshold there is no work to do. This is the
         // hot path on every turn — short-circuit before we walk the tail.
-        let uncovered_tokens: usize = uncovered.iter().map(estimate_session_message_tokens).sum();
+        //
+        // #1204(a): synthetic display-only markers (job notifications,
+        // DM-ended, subagent completion — see
+        // `context::is_stripped_display_marker`) are stripped before the
+        // LLM call, so they cost the context window nothing. Counting them
+        // here (they can be ~1000 tokens each since the #1196 cap raise)
+        // would fire compaction earlier than the real content warrants.
+        // Same exemption as history selection (#1201/#1203); error markers
+        // and real turns are never exempt.
+        let uncovered_tokens: usize = uncovered
+            .iter()
+            .filter(|m| !is_stripped_display_marker(m))
+            .map(estimate_session_message_tokens)
+            .sum();
         if uncovered_tokens < trigger_tokens {
             return Ok(current);
         }
@@ -352,7 +366,14 @@ impl AgentRuntime {
         // nothing fits in the retain budget).
         let mut keep_start_idx = history.len();
         for (i, m) in uncovered.iter().enumerate().rev() {
-            let t = estimate_session_message_tokens(m);
+            // #1204(a): display-only markers are free here too — a large
+            // marker near the tail must not eat the retain budget and push
+            // real turns into the compress range prematurely.
+            let t = if is_stripped_display_marker(m) {
+                0
+            } else {
+                estimate_session_message_tokens(m)
+            };
             if keep_tokens + t > retain_tokens {
                 break;
             }
@@ -363,6 +384,39 @@ impl AgentRuntime {
         let compress_end = keep_start_idx;
         let to_compress = &history[current.messages_covered..compress_end];
         if to_compress.is_empty() {
+            return Ok(current);
+        }
+
+        // #1204(b): exclude synthetic display-only markers from the
+        // summarizer transcript. They are stripped before every LLM call,
+        // but the rolling summary DOES reach the LLM — serializing marker
+        // text verbatim here would bake it into the summary (content
+        // pollution, the worse half of #1204). The predicate matches only
+        // `synthetic: true` non-error `Role::System` markers, so real
+        // content is never filtered.
+        let transcript_sources: Vec<&alms_session::Message> = to_compress
+            .iter()
+            .filter(|m| !is_stripped_display_marker(m))
+            .collect();
+        if transcript_sources.is_empty() {
+            // The compress range is exclusively display-only markers.
+            // Unreachable under the enforced `compact_retain_pct + 0.10 <=
+            // compact_trigger_pct` invariant (the trigger only fires on
+            // real content, and the retain walk keeps at most
+            // `retain_tokens` of it), but kept as a defensive branch:
+            // advance coverage past the markers WITHOUT an LLM call — they
+            // carry no LLM-visible content, so there is nothing to
+            // summarize and skipping them permanently loses nothing.
+            debug!(
+                target: "alms.context",
+                skipped = to_compress.len(),
+                covered = compress_end,
+                "Compact strategy: compress range was all display-only markers — \
+                 advanced coverage without a summarization call"
+            );
+            current.messages_covered = compress_end;
+            current.updated_at = Some(alms_core::Timestamp::now());
+            session_manager.update_summary(session_id, current.clone())?;
             return Ok(current);
         }
 
@@ -389,7 +443,7 @@ impl AgentRuntime {
         let self_name = self.agent_name.as_deref();
         let mut has_agent_labels = false;
 
-        let transcript: String = to_compress
+        let transcript: String = transcript_sources
             .iter()
             .map(|m| {
                 let from = m
@@ -477,5 +531,261 @@ impl AgentRuntime {
         );
 
         Ok(current)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::llm_client::LlmClient;
+    use crate::tools::ToolRegistry;
+    use alms_core::config::ContextConfig;
+    use alms_core::{AgentId, Timestamp};
+    use alms_session::{Content, Message, Role, SessionConfig};
+
+    /// Mock-LLM runtime with a `compact` context config sized so the token
+    /// math in these tests is easy to reason about:
+    /// `max_input_tokens = 1000`, defaults `compact_trigger_pct = 0.80` /
+    /// `compact_retain_pct = 0.40` → with `overhead_tokens = 0` the trigger
+    /// is 800 tokens and the verbatim retain window is 400 tokens.
+    fn compact_runtime() -> AgentRuntime {
+        let config = crate::agent::AgentConfig {
+            context_config: ContextConfig {
+                strategy: "compact".into(),
+                max_input_tokens: 1000,
+                summary_model: None,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        AgentRuntime {
+            agent_id: AgentId::new(),
+            config,
+            llm: LlmClient::new(LlmConfig {
+                mock: true,
+                ..LlmConfig::default()
+            })
+            .unwrap(),
+            summary_llm: None,
+            tools: ToolRegistry::new(),
+            workspace: None,
+            event_sender: None,
+            run_id: None,
+            cancel_token: None,
+            resolved_sandbox_root: None,
+            shell_unrestricted: true,
+            shell_default_env: std::collections::HashMap::new(),
+            shell_permissions: alms_core::config::ShellPermissions::default(),
+            shell_classification_mode: alms_core::config::ShellClassificationMode::default(),
+            shell_spill_policy: alms_sandbox::shell::spill::ShellSpillPolicy::disabled(),
+            tool_output_truncate_policy:
+                crate::tool_output_truncate::ToolOutputTruncatePolicy::disabled(),
+            extra_fs_read_roots: Vec::new(),
+            agent_name: None,
+            dm_implicit_reply: false,
+        }
+    }
+
+    fn make_msg(role: Role, text: &str) -> Message {
+        Message {
+            id: uuid::Uuid::new_v4().to_string(),
+            role,
+            content: Content::Text(text.to_string()),
+            timestamp: Timestamp::now(),
+            metadata: None,
+        }
+    }
+
+    /// Synthetic display-only lifecycle marker — the exact shape
+    /// `gateway::runs::markers::persist_lifecycle_marker` writes
+    /// (`Role::System` + `synthetic: true`, non-error type).
+    fn make_lifecycle_marker(text: &str) -> Message {
+        Message {
+            id: uuid::Uuid::new_v4().to_string(),
+            role: Role::System,
+            content: Content::Text(text.to_string()),
+            timestamp: Timestamp::now(),
+            metadata: Some(serde_json::json!({
+                "synthetic": true,
+                "type": "job_notification",
+            })),
+        }
+    }
+
+    fn empty_summary() -> ContextSummary {
+        ContextSummary {
+            text: String::new(),
+            messages_covered: 0,
+            updated_at: None,
+        }
+    }
+
+    /// ~100 tokens of real content per message (`estimate_tokens` = len/3).
+    fn real_turn(i: usize) -> String {
+        format!("real turn {i} — {}", "conversation content. ".repeat(14))
+    }
+
+    /// #1204(a): synthetic display-only markers must not count toward the
+    /// compaction trigger. Real content sits well under the 800-token
+    /// trigger; adding ~2000 tokens of marker text on top must NOT fire
+    /// compaction (the markers are stripped before every LLM call, so the
+    /// context the LLM sees is unchanged by them).
+    #[tokio::test]
+    async fn markers_do_not_trip_compaction_trigger() {
+        let runtime = compact_runtime();
+        let session_manager = SessionManager::new(SessionConfig::default());
+        let session = session_manager.get_or_create(runtime.agent_id, "test");
+
+        // ~600 tokens of real content (6 x ~100) — below the 800 trigger.
+        let mut history: Vec<Message> = (0..6)
+            .map(|i| {
+                make_msg(
+                    if i % 2 == 0 {
+                        Role::User
+                    } else {
+                        Role::Assistant
+                    },
+                    &real_turn(i),
+                )
+            })
+            .collect();
+        // ~2000 tokens of display-only marker text (2 x ~1000) — the #1196
+        // job-summary shape. Naively counted this pushes the estimate to
+        // ~2600 >> 800 and compaction fires early.
+        for _ in 0..2 {
+            history.insert(
+                2,
+                make_lifecycle_marker(&format!(
+                    "[Scheduled job: nightly report] {}",
+                    "summary marker body. ".repeat(143)
+                )),
+            );
+        }
+
+        let result = runtime
+            .maybe_summarize(&session_manager, session.id, &history, empty_summary(), 0)
+            .await
+            .expect("maybe_summarize must succeed");
+
+        assert_eq!(
+            result.messages_covered, 0,
+            "display-only markers must not fire compaction — the real \
+             content is under the trigger threshold"
+        );
+        assert!(
+            result.text.is_empty(),
+            "no summary may be generated when only markers push the estimate \
+             over the trigger; got: {:?}",
+            result.text
+        );
+    }
+
+    /// Control for #1204(a): the SAME bulk as the marker test, but as real
+    /// user turns, must still fire compaction — proving the exemption is
+    /// scoped to synthetic markers and did not become a blanket "ignore
+    /// large messages".
+    #[tokio::test]
+    async fn same_sized_real_content_still_trips_compaction_trigger() {
+        let runtime = compact_runtime();
+        let session_manager = SessionManager::new(SessionConfig::default());
+        let session = session_manager.get_or_create(runtime.agent_id, "test");
+
+        let mut history: Vec<Message> = (0..6)
+            .map(|i| {
+                make_msg(
+                    if i % 2 == 0 {
+                        Role::User
+                    } else {
+                        Role::Assistant
+                    },
+                    &real_turn(i),
+                )
+            })
+            .collect();
+        // Same ~2000-token bulk, but genuine content.
+        for _ in 0..2 {
+            history.insert(
+                2,
+                make_msg(
+                    Role::User,
+                    &format!("big real message: {}", "important detail. ".repeat(180)),
+                ),
+            );
+        }
+
+        let result = runtime
+            .maybe_summarize(&session_manager, session.id, &history, empty_summary(), 0)
+            .await
+            .expect("maybe_summarize must succeed");
+
+        assert!(
+            result.messages_covered > 0,
+            "a same-sized REAL message must still count toward the trigger \
+             and fire compaction"
+        );
+        assert!(
+            !result.text.is_empty(),
+            "compaction must produce a summary for real content"
+        );
+    }
+
+    /// #1204(b): marker text must not be serialized into the summarizer
+    /// transcript. The mock LLM echoes the transcript back (`[mock] {last
+    /// user message}`), so the persisted rolling summary directly reveals
+    /// what the summarizer was shown.
+    #[tokio::test]
+    async fn markers_excluded_from_summarizer_transcript() {
+        let runtime = compact_runtime();
+        let session_manager = SessionManager::new(SessionConfig::default());
+        let session = session_manager.get_or_create(runtime.agent_id, "test");
+
+        // ~1000 tokens of real content (10 x ~100) — over the 800 trigger.
+        // The retain walk keeps the newest ~400 tokens verbatim, so the
+        // oldest turns (and the marker placed among them) land in the
+        // compress range.
+        let mut history: Vec<Message> = (0..10)
+            .map(|i| {
+                make_msg(
+                    if i % 2 == 0 {
+                        Role::User
+                    } else {
+                        Role::Assistant
+                    },
+                    &real_turn(i),
+                )
+            })
+            .collect();
+        history.insert(
+            1,
+            make_lifecycle_marker(
+                "[Scheduled job: nightly report completed] UNIQUE-MARKER-SENTINEL",
+            ),
+        );
+
+        let result = runtime
+            .maybe_summarize(&session_manager, session.id, &history, empty_summary(), 0)
+            .await
+            .expect("maybe_summarize must succeed");
+
+        assert!(
+            result.messages_covered > 0,
+            "sanity: real content over the trigger must fire compaction"
+        );
+        assert!(
+            result.text.contains("real turn 0"),
+            "real content in the compress range must reach the summarizer; \
+             summary: {:?}",
+            result.text
+        );
+        assert!(
+            !result.text.contains("UNIQUE-MARKER-SENTINEL"),
+            "display-only marker text must never enter the summarizer \
+             transcript (it would be baked into the rolling summary, which \
+             DOES reach the LLM); summary: {:?}",
+            result.text
+        );
+        // The persisted copy must match the returned one.
+        let persisted = session_manager.get_summary(session.id).unwrap();
+        assert!(!persisted.text.contains("UNIQUE-MARKER-SENTINEL"));
     }
 }

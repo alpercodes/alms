@@ -51,6 +51,21 @@ pub struct AppState {
     /// the 4-hour deadline). In-memory by design for phase 1; see
     /// `docs/jobs-await-completion-design.md`.
     pub(crate) job_episodes: Arc<crate::runs::job_episode::JobEpisodeTracker>,
+    /// Jobs cancelled by the operator via `DELETE /jobs/{id}` (#1206
+    /// follow-up, Codex P2 on PR #1210). The #1206 orphan-run suppression
+    /// keys on membership here — the operator's *intent* — NOT on
+    /// `JobStatus::Cancelled`, because `JobStatus` has no `Completed`
+    /// variant (#763) and a normally-spent one-shot is also recorded as
+    /// `Cancelled`. Keying on status would silently drop the late results
+    /// of a one-shot's deadline-detached work (D5's "leave running"
+    /// contract delivers those via an orphan run on the job session).
+    ///
+    /// In-memory lifetime is correct, not a compromise: the suppressed
+    /// phenomena are in-flight triggers/completions, which don't survive a
+    /// daemon restart either (#1159 B12) — a restart clearing the set
+    /// loses nothing. Entries are never removed; job ids are tiny and
+    /// operator cancels are rare.
+    pub(crate) operator_cancelled_jobs: Arc<dashmap::DashSet<alms_core::JobId>>,
     /// Scheduler for firing jobs at the right time
     pub scheduler: Arc<Scheduler>,
     /// Coordinator for subagent lifecycle management
@@ -431,6 +446,7 @@ impl AppState {
             job_episodes: Arc::new(crate::runs::job_episode::JobEpisodeTracker::new(
                 std::time::Duration::from_secs(crate::runs::job_episode::EPISODE_DEADLINE_SECS),
             )),
+            operator_cancelled_jobs: Arc::new(dashmap::DashSet::new()),
             scheduler,
             coordinator,
             shutdown_token: shutdown_token.clone(),

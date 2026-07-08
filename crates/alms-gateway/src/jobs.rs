@@ -117,17 +117,26 @@ pub async fn cancel_job(
 ) -> impl IntoResponse {
     match state.job_store.cancel(job_id) {
         Ok(Some(true)) => {
-            // Also cancel in the scheduler so it doesn't fire again.
-            state.scheduler.cancel(job_id).await;
+            // -- Teardown-critical mutations, all SYNCHRONOUS --
+            //
+            // Everything up to the first `.await` below runs even if the
+            // client disconnects mid-request (Tim's S3 on PR #1210: an
+            // axum handler future dropped at an await point simply stops —
+            // a Cancelled job must never be left with a live episode,
+            // uncancelled runs, or missing suppression intent). Keep new
+            // teardown-critical state changes ABOVE the first await.
+
+            // #1206 follow-up (Codex P2 on PR #1210): record the
+            // *operator's* cancel intent. The orphan-run suppression in
+            // `enqueue_triggered_run` keys on this set — NOT on
+            // `JobStatus::Cancelled`, which a normally-spent one-shot also
+            // carries (#763: `JobStatus` has no `Completed` variant).
+            state.operator_cancelled_jobs.insert(job_id);
 
             // #1198 D7: remove the episode FIRST so in-flight run exits and
-            // pending DM/subagent resolutions no-op (Untracked / miss), then
-            // tear down its pending work: end open DMs with UserCancelled
-            // (the peer gets the standard ended-notification instead of
-            // being stranded) and cancel running background subagents.
-            if let Some(episode) = state.job_episodes.remove(job_id) {
-                teardown_episode(&state, episode).await;
-            }
+            // pending DM/subagent resolutions no-op (Untracked / miss); its
+            // pending work is torn down below.
+            let episode = state.job_episodes.remove(job_id);
 
             // Cancel any in-progress run that was spawned by this job so
             // we stop burning tokens on work the operator intended to halt.
@@ -135,6 +144,21 @@ pub async fn cancel_job(
             // the job id (#1198 step 5 stamping).
             // (cancel_runs_for_job logs each cancelled run individually)
             state.run_manager.cancel_runs_for_job(job_id);
+
+            // -- Best-effort async teardown --
+
+            // Also cancel in the scheduler so it doesn't fire again. (A
+            // stray firing after a dropped handler is absorbed by the fire
+            // path's own Cancelled check.)
+            state.scheduler.cancel(job_id).await;
+
+            // Tear down the episode's pending work: end open DMs with
+            // UserCancelled (the peer gets the standard ended-notification
+            // instead of being stranded) and cancel running background
+            // subagents.
+            if let Some(episode) = episode {
+                teardown_episode(&state, episode).await;
+            }
 
             StatusCode::NO_CONTENT.into_response()
         }

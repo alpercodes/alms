@@ -72,7 +72,14 @@ pub(super) fn is_error_marker(msg: &Message) -> bool {
 /// that is stripped pre-LLM, and — because the marker never enters the
 /// assembled window — it can never land head-of-window where the strip's
 /// leading-system-prefix carve-out would otherwise leak it (issue #1201).
-pub(super) fn is_stripped_display_marker(msg: &Message) -> bool {
+///
+/// The compaction path (`agent::context::maybe_summarize`, issue #1204)
+/// keys on the same predicate: markers are excluded from the trigger /
+/// retain token estimates AND from the summarizer transcript, so their
+/// text can neither fire compaction early nor get baked verbatim into
+/// the rolling summary (which DOES reach the LLM). `pub(crate)` — re-
+/// exported from `super` for that cross-module caller.
+pub(crate) fn is_stripped_display_marker(msg: &Message) -> bool {
     // Only Role::System messages are subject to
     // `strip_mid_history_system_markers`.
     if msg.role != Role::System {

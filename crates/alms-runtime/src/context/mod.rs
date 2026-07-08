@@ -59,6 +59,11 @@ mod perspective;
 mod rebuild;
 mod strategies;
 
+// #1204: the compaction path in `agent::context::maybe_summarize` must key
+// on the same canonical display-marker predicate the history-selection
+// strategies use (#1203), so the two exemptions can never drift apart.
+pub(crate) use error_markers::is_stripped_display_marker;
+
 /// Token reserve subtracted from `max_input_tokens` when computing the
 /// effective history budget, on top of the system prompt, current input,
 /// and episodic summaries.

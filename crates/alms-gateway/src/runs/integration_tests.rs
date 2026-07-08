@@ -10017,6 +10017,45 @@ fn create_recurring_job(state: &AppState, agent_id: AgentId, prompt: &str) -> al
         .id
 }
 
+fn create_once_job(state: &AppState, agent_id: AgentId, prompt: &str) -> alms_core::JobId {
+    state
+        .job_store
+        .create(alms_core::job::CreateJobRequest {
+            agent_id,
+            prompt: prompt.to_string(),
+            schedule: alms_core::job::JobSchedule::Once {
+                run_at: chrono::Utc::now(),
+            },
+        })
+        .expect("job creation must succeed")
+        .id
+}
+
+/// Drive a job into the normally-SPENT one-shot state: `record_and_rearm`'s
+/// `Once` arm records it as `JobStatus::Cancelled` because `JobStatus` has
+/// no `Completed` variant (the #763 quirk). Mirrors the exact store write
+/// that arm performs (`record_run(.., Cancelled, None)`).
+fn spend_one_shot(state: &AppState, job_id: alms_core::JobId) {
+    state
+        .job_store
+        .record_run(
+            job_id,
+            chrono::Utc::now(),
+            alms_core::JobStatus::Cancelled,
+            None,
+        )
+        .expect("record_run must succeed");
+    assert_eq!(
+        state.job_store.get(job_id).unwrap().status,
+        alms_core::JobStatus::Cancelled,
+        "sanity: a spent one-shot carries JobStatus::Cancelled (#763)"
+    );
+    assert!(
+        !state.operator_cancelled_jobs.contains(&job_id),
+        "sanity: a spent one-shot was never operator-cancelled"
+    );
+}
+
 /// The #1198 regression floor: a job whose turn opens no async work must
 /// complete at turn-1 end exactly like the pre-episode flow — completion
 /// card on the user-facing session, `record_run` + re-arm, episode gone.
@@ -10201,6 +10240,179 @@ async fn conversation_ended_routes_continuation_onto_job_session() {
             .list_by_session(notif_session.id, 10)
             .is_empty(),
         "the notifications: fallback target must NOT receive the run"
+    );
+
+    shutdown_token.cancel();
+}
+
+/// #1205 (Tim's S2 on PR #1202): TWO open episodes of the same agent both
+/// pending the same deterministic DM session — one `ConversationEnded`
+/// trigger must produce a continuation run for BOTH episodes (each on its
+/// own job session, stamped with its own job id). Pre-fix only the
+/// HashMap-order winner resolved; the loser's episode hung until the 4h
+/// deadline backstop.
+#[tokio::test]
+async fn conversation_ended_resolves_all_episodes_pending_on_same_dm() {
+    let (state, shutdown_token, _cr, _tr, _dr) = test_app_state_with_sqlite();
+    let (alice_id, _bob_id) = seed_alice_bob(&state);
+
+    // Two jobs for alice, each with an open episode pending on the SAME
+    // deterministic alice<->bob DM session.
+    let dm_session_id = SessionId::deterministic_dm("alice", "bob");
+    let mut jobs = Vec::new();
+    for prompt in ["ask bob (job 1)", "ask bob (job 2)"] {
+        let job_id = create_recurring_job(&state, alice_id, prompt);
+        let job_session_id = state
+            .session_manager
+            .get_or_create(alice_id, format!("job_{}", job_id.0))
+            .id;
+        let turn1 = RunId::new();
+        state
+            .job_episodes
+            .open(job_id, job_session_id, alice_id, turn1);
+        assert!(matches!(
+            state
+                .job_episodes
+                .on_run_complete(job_id, turn1, vec![dm_session_id], vec![]),
+            super::job_episode::RunCompletion::Open
+        ));
+        jobs.push((job_id, job_session_id));
+    }
+
+    // A single ConversationEnded trigger for alice (the fallback target is
+    // her invisible notifications session).
+    let notif_session = state
+        .session_manager
+        .get_or_create(alice_id, "notifications:alice");
+    let (test_tx, test_rx) = mpsc::channel(8);
+    test_tx
+        .send(RunTrigger {
+            agent_id: alice_id,
+            session_id: notif_session.id,
+            input: "DM ended marker".to_string(),
+            source: MessageSource::ConversationEnded {
+                from_agent: _bob_id,
+                from_name: "bob".to_string(),
+                reason: ConversationEndReason::Ignored,
+                source_session_id: None,
+            },
+            context_id: notif_session.context_id.clone(),
+        })
+        .await
+        .unwrap();
+    drop(test_tx);
+    super::notifications::run_trigger_loop(test_rx, state.clone()).await;
+
+    // BOTH job sessions received a continuation run stamped with their own
+    // job id — no episode is left waiting for the deadline.
+    for (job_id, job_session_id) in &jobs {
+        let runs = state.run_manager.list_by_session(*job_session_id, 10);
+        assert!(
+            !runs.is_empty(),
+            "job {job_id:?} must receive a continuation run on its job session"
+        );
+        assert_eq!(
+            runs[0].job_id,
+            Some(*job_id),
+            "continuation run must carry its own episode's job_id"
+        );
+    }
+    // The fallback target received nothing.
+    assert!(
+        state
+            .run_manager
+            .list_by_session(notif_session.id, 10)
+            .is_empty(),
+        "the notifications: fallback target must NOT receive a run when \
+         episodes resolved"
+    );
+    // Neither episode still has a pending DM entry.
+    for (job_id, _) in &jobs {
+        if let Some(snap) = state.job_episodes.snapshot(*job_id) {
+            assert_eq!(
+                snap["pending_dms"], 0,
+                "job {job_id:?} must have no pending DM left after the end signal"
+            );
+        }
+        // A `None` snapshot means the continuation already executed and
+        // closed the episode — equally correct (nothing pending).
+    }
+
+    shutdown_token.cancel();
+}
+
+/// #1207 (Tim's S4 on PR #1202): an episode continuation's run id must be
+/// recorded on the episode BEFORE `enqueue_triggered_run` returns — it is
+/// noted right after `insert_run`, before the run is handed to the agent
+/// queue. Pre-fix the callers noted the id only after the enqueue call
+/// returned, so an instantly-terminating continuation could close the
+/// episode with its final run id missing from `runs` (wrong `turns` count
+/// and completion-card deep-link — cosmetic, but pinned here so the
+/// ordering can't regress).
+#[tokio::test]
+async fn triggered_run_id_noted_on_episode_before_enqueue_returns() {
+    let (state, shutdown_token, _cr, _tr, _dr) = test_app_state();
+    let agent_id = AgentId::new();
+
+    let job_id = create_recurring_job(&state, agent_id, "long task");
+    let job_context = format!("job_{}", job_id.0);
+    let job_session_id = state
+        .session_manager
+        .get_or_create(agent_id, &job_context)
+        .id;
+    // Open the episode and park a pending-subagent entry (turn-1 "opened"
+    // a subagent that never completes in this test). The non-empty pending
+    // set makes quiescence STRUCTURALLY impossible, so the episode stays
+    // open even if the enqueued continuation executes to termination
+    // before the assertions below. (Tim's S1 on PR #1210: `in_flight_runs`
+    // alone would NOT guarantee that — `enqueue_low` spawns a real handler
+    // task, and only the current-thread test runtime plus the absence of
+    // an await between the enqueue and the snapshot kept the pre-hardened
+    // shape deterministic.)
+    let turn1 = RunId::new();
+    state
+        .job_episodes
+        .open(job_id, job_session_id, agent_id, turn1);
+    assert!(matches!(
+        state.job_episodes.on_run_complete(
+            job_id,
+            turn1,
+            vec![],
+            vec![(uuid::Uuid::new_v4(), SessionId::new())]
+        ),
+        super::job_episode::RunCompletion::Open
+    ));
+
+    let run_id = super::notifications::enqueue_triggered_run(
+        &state,
+        agent_id,
+        job_session_id,
+        "continuation input".to_string(),
+        job_context,
+        "notification:dm_ended:test".to_string(),
+        false,
+        Some(job_id),
+    )
+    .await
+    .expect("run must be created (job is not cancelled)");
+
+    // The contract under test: the run id is already on the episode when
+    // enqueue_triggered_run returns.
+    let snap = state
+        .job_episodes
+        .snapshot(job_id)
+        .expect("episode must still be open (pending subagent parked)");
+    assert_eq!(
+        snap["runs"], 2,
+        "the continuation run id must be noted on the episode before \
+         enqueue_triggered_run returns (turn1 + continuation)"
+    );
+    // And the run record carries the job stamp (#1198), so
+    // cancel_runs_for_job / the episode exit hook cover it.
+    assert_eq!(
+        state.run_manager.get_run(run_id).and_then(|r| r.job_id),
+        Some(job_id),
+        "continuation run must be job-stamped"
     );
 
     shutdown_token.cancel();
@@ -10575,6 +10787,265 @@ async fn cancel_job_teardown_ends_pending_dms() {
     assert!(
         saw_conversation_ended,
         "teardown must emit ConversationEnded trigger(s)"
+    );
+
+    shutdown_token.cancel();
+}
+
+/// #1206 (Tim's S3 on PR #1202): `DELETE /jobs` teardown spawns
+/// notification runs asynchronously — the DM-sender self-notification
+/// routed back onto the job session (via D3 source-session routing) and the
+/// `SubagentCompletion(Cancelled)` notification whose parent session IS the
+/// job session. Both are created AFTER `cancel_runs_for_job` already swept,
+/// so pre-fix they were unstamped orphans that each burned an LLM turn
+/// post-kill. Post-fix they are suppressed at the source: after the
+/// teardown-emitted signals are processed, NO live/queued run exists for
+/// the job. The peer's own ended-notification (not on a job session) must
+/// still be created.
+#[tokio::test]
+async fn cancel_job_teardown_leaves_no_runs_for_the_job() {
+    let (state, shutdown_token, _cr, mut trigger_rx, _dr) = test_app_state_with_sqlite();
+    let (alice_id, bob_id) = seed_alice_bob(&state);
+
+    let job_id = create_recurring_job(&state, alice_id, "ask bob and spawn researcher");
+    let job_context = format!("job_{}", job_id.0);
+    let job_session_id = state
+        .session_manager
+        .get_or_create(alice_id, &job_context)
+        .id;
+
+    // A real conversation via the bus, sent FROM the job session (a valid
+    // source post-#1198/D3) — so the teardown's end_conversation emits the
+    // sender self-notification trigger targeting the JOB session.
+    let receipt = state
+        .message_bus
+        .send(
+            "alice",
+            alice_id,
+            "bob",
+            bob_id,
+            "please review X",
+            Some(job_session_id),
+        )
+        .await
+        .expect("send must succeed");
+    let dm_session_id = receipt.session_id;
+    let _ = trigger_rx.try_recv(); // drain bob's DM-delivery trigger
+
+    // A pending background subagent on the same episode.
+    let task_id = TaskId::new();
+    let sub_session_id = state
+        .session_manager
+        .get_or_create(AgentId::new(), "subagent")
+        .id;
+
+    // Open the episode with the DM AND the subagent pending.
+    let turn1 = RunId::new();
+    state
+        .job_episodes
+        .open(job_id, job_session_id, alice_id, turn1);
+    assert!(matches!(
+        state.job_episodes.on_run_complete(
+            job_id,
+            turn1,
+            vec![dm_session_id],
+            vec![(task_id.0, sub_session_id)]
+        ),
+        super::job_episode::RunCompletion::Open
+    ));
+
+    // DELETE /jobs/{id}.
+    let response = crate::jobs::cancel_job(
+        axum::extract::State(state.clone()),
+        axum::extract::Path(job_id),
+    )
+    .await;
+    use axum::response::IntoResponse as _;
+    assert_eq!(
+        response.into_response().status(),
+        axum::http::StatusCode::NO_CONTENT
+    );
+    assert!(state.job_episodes.snapshot(job_id).is_none());
+
+    // Process the teardown-emitted ConversationEnded triggers exactly as
+    // production's run_trigger_loop would — alice's self-notification
+    // (targeting the job session) and bob's peer notification.
+    let (replay_tx, replay_rx) = mpsc::channel(8);
+    let mut teardown_triggers = 0;
+    while let Ok(trigger) = trigger_rx.try_recv() {
+        if matches!(trigger.source, MessageSource::ConversationEnded { .. }) {
+            teardown_triggers += 1;
+            replay_tx.send(trigger).await.unwrap();
+        }
+    }
+    assert!(
+        teardown_triggers >= 2,
+        "teardown must emit ConversationEnded triggers for sender and peer, \
+         got {teardown_triggers}"
+    );
+    drop(replay_tx);
+    super::notifications::run_trigger_loop(replay_rx, state.clone()).await;
+
+    // Process the SubagentCompletion(Cancelled) the teardown's subagent
+    // cancel produces, exactly as production's completion loop would.
+    let (test_tx, test_rx) = mpsc::unbounded_channel();
+    test_tx
+        .send(SubagentCompletion {
+            task_id,
+            subagent_name: Some("researcher".to_string()),
+            status: TaskStatus::Cancelled,
+            summary: "Cancelled.".to_string(),
+            parent_session_id: job_session_id,
+            parent_agent_id: alice_id,
+            subagent_session_id: sub_session_id,
+            task_description: Some("investigate".to_string()),
+            tool_count: Some(0),
+            duration_ms: Some(5),
+            token_usage: None,
+            parent_tool_invocation_id: None,
+        })
+        .unwrap();
+    drop(test_tx);
+    super::notifications::completion_notification_loop(test_rx, state.clone()).await;
+
+    // THE invariant: DELETE /jobs leaves no live/queued run for the job —
+    // neither job-stamped nor unstamped-on-the-job-session.
+    let job_runs = state.run_manager.list_by_session(job_session_id, 50);
+    assert!(
+        job_runs.is_empty(),
+        "no run may be spawned on the cancelled job's session by teardown \
+         signals; got {job_runs:?}"
+    );
+
+    // Scoping guard: the PEER's ended-notification (not on a job session)
+    // must still be created — the suppression may not eat legitimate
+    // notifications.
+    let bob_notif_session = SessionId::deterministic("notifications:bob");
+    let bob_runs = state.run_manager.list_by_session(bob_notif_session, 10);
+    assert!(
+        !bob_runs.is_empty(),
+        "the peer's DM-ended notification run must still be created"
+    );
+
+    shutdown_token.cancel();
+}
+
+/// Codex P2 on PR #1210 (confirmed by Tim): the #1206 suppression must key
+/// on OPERATOR-CANCEL INTENT, not on `JobStatus::Cancelled` — a normally-
+/// spent one-shot is ALSO recorded as `Cancelled` (#763: no `Completed`
+/// variant). Scenario: a one-shot dispatches a bg subagent, hits the 4h
+/// deadline, D5 detach-and-complete closes the episode (job recorded
+/// `Cancelled` = spent), the subagent keeps running and later completes for
+/// real. Its late `SubagentCompletion` lands on the job session and MUST
+/// still produce a notification run (the documented D5 "detach, deliver
+/// late via an orphan run" contract) — pre-fix it was silently suppressed
+/// and the agent never processed the detached result.
+#[tokio::test]
+async fn spent_one_shot_detached_subagent_completion_not_suppressed() {
+    let (state, shutdown_token, _cr, _tr, _dr) = test_app_state();
+    let agent_id = AgentId::new();
+
+    let job_id = create_once_job(&state, agent_id, "one shot with detached subagent");
+    let job_context = format!("job_{}", job_id.0);
+    let job_session_id = state
+        .session_manager
+        .get_or_create(agent_id, &job_context)
+        .id;
+
+    // The D5 deadline close already happened: episode gone (never opened
+    // here — resolve must miss), job recorded as spent.
+    spend_one_shot(&state, job_id);
+
+    // The detached subagent completes for REAL (Completed, not Cancelled).
+    let (test_tx, test_rx) = mpsc::unbounded_channel();
+    test_tx
+        .send(SubagentCompletion {
+            task_id: TaskId::new(),
+            subagent_name: Some("researcher".to_string()),
+            status: TaskStatus::Completed,
+            summary: "Late detached result.".to_string(),
+            parent_session_id: job_session_id,
+            parent_agent_id: agent_id,
+            subagent_session_id: state
+                .session_manager
+                .get_or_create(AgentId::new(), "subagent")
+                .id,
+            task_description: Some("investigate".to_string()),
+            tool_count: Some(3),
+            duration_ms: Some(50),
+            token_usage: None,
+            parent_tool_invocation_id: None,
+        })
+        .unwrap();
+    drop(test_tx);
+    super::notifications::completion_notification_loop(test_rx, state.clone()).await;
+
+    // The late result IS delivered: a notification run exists on the job
+    // session (unstamped — the documented D5 orphan-run shape).
+    let runs = state.run_manager.list_by_session(job_session_id, 10);
+    assert!(
+        !runs.is_empty(),
+        "a spent one-shot's detached subagent result must NOT be suppressed \
+         (suppression keys on operator intent, not lifecycle status)"
+    );
+    assert_eq!(
+        runs[0].job_id, None,
+        "the late orphan run is unstamped (episode long gone)"
+    );
+
+    shutdown_token.cancel();
+}
+
+/// The DM half of the Codex P2 scenario: a one-shot's deadline-detached DM
+/// ends AFTER the D5 close (job recorded spent = `Cancelled`). The late
+/// `ConversationEnded`'s D3 fallback routes the notification run onto the
+/// job session (the sender's source session) — it must NOT be suppressed.
+#[tokio::test]
+async fn spent_one_shot_detached_dm_ended_not_suppressed() {
+    let (state, shutdown_token, _cr, _tr, _dr) = test_app_state_with_sqlite();
+    let (alice_id, bob_id) = seed_alice_bob(&state);
+
+    let job_id = create_once_job(&state, alice_id, "one shot that DMs bob");
+    let job_context = format!("job_{}", job_id.0);
+    let job_session_id = state
+        .session_manager
+        .get_or_create(alice_id, &job_context)
+        .id;
+
+    spend_one_shot(&state, job_id);
+
+    // The late ConversationEnded for the JOB AGENT, in the D3 fallback
+    // shape: the bus routed the sender self-notification to the source
+    // session — the job session. The episode is long gone, so resolve_dm
+    // misses and the pre-#1198 routing (this trigger's target) applies.
+    let (test_tx, test_rx) = mpsc::channel(8);
+    test_tx
+        .send(RunTrigger {
+            agent_id: alice_id,
+            session_id: job_session_id,
+            input: "DM ended marker".to_string(),
+            source: MessageSource::ConversationEnded {
+                from_agent: bob_id,
+                from_name: "bob".to_string(),
+                reason: ConversationEndReason::Ignored,
+                source_session_id: Some(job_session_id),
+            },
+            context_id: job_context.clone(),
+        })
+        .await
+        .unwrap();
+    drop(test_tx);
+    super::notifications::run_trigger_loop(test_rx, state.clone()).await;
+
+    let runs = state.run_manager.list_by_session(job_session_id, 10);
+    assert!(
+        !runs.is_empty(),
+        "a spent one-shot's detached DM-ended notification must NOT be \
+         suppressed (suppression keys on operator intent, not lifecycle status)"
+    );
+    assert_eq!(
+        runs[0].job_id, None,
+        "the late orphan run is unstamped (episode long gone)"
     );
 
     shutdown_token.cancel();
