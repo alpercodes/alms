@@ -1,5 +1,6 @@
 import { html, useSignal, useRef, useEffect, renderMarkdown } from '../../deps.js';
 import { activeAgent } from '../../state/agents.js';
+import { activeSessionOwnerName } from '../../state/sessions.js';
 import { filterMessages } from '../../state/chat-actions.js';
 import { fmtMessageTime } from '../../utils/format.js';
 import { decorateCodeBlocks } from '../../utils/decorate-code-blocks.js';
@@ -79,10 +80,19 @@ function MarkdownBody({ html: htmlStr }) {
 
 export function Message({ type, role, text, sealed, fromAgent, reasoning, ts }) {
     const cls = type === 'user' ? 'user' : 'agent';
-    const agentName = activeAgent.value?.name;
+    // Prefer the agent that OWNS the active session over the sidebar's
+    // active agent (#1212): job/subagent sessions are cross-agent
+    // read-only surfaces that don't switch the active agent when opened,
+    // so `activeAgent` can point at a completely different agent while
+    // the operator reads agent A's job session. For ordinary chat
+    // sessions the owner IS the active agent, so nothing changes; when
+    // the owner can't be resolved (DM sessions, boot races) we fall back
+    // to the previous behaviour.
+    const agentName = activeSessionOwnerName.value || activeAgent.value?.name;
     // DM messages carry a fromAgent name — use it as the label so the
     // user can see which agent sent the message.  Falls back to the
-    // active agent name for normal assistant messages. (#546)
+    // session-owner / active agent name for normal assistant messages.
+    // (#546, #1212)
     const label = type === 'user' ? '>'
         : fromAgent ? `${fromAgent} $`
         : (agentName ? `${agentName} $` : '$');

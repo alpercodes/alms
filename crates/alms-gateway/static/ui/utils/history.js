@@ -251,6 +251,16 @@ export function mapHistoryMessages(msgs, opts) {
                     // ellipsis heuristic — and there's no run_id to fetch with
                     // anyway).
                     truncated: m.metadata ? m.metadata.truncated : undefined,
+                    // Deep-link handles (#1213/#1217, reload mirror of the SSE
+                    // fields) for the card's "Go to job session" button.
+                    // `jobSessionUuid` is the job session's REAL SessionId —
+                    // what the button navigates by (GET /session/{id} resolves
+                    // it). Null on markers persisted before #1217, so the
+                    // button simply doesn't render for them. `jobSessionId` is
+                    // the `job_{job_id}` context handle, kept for identity only
+                    // and NOT a valid navigation target.
+                    jobSessionUuid: (m.metadata && m.metadata.job_session_uuid) || null,
+                    jobSessionId: (m.metadata && m.metadata.job_session_id) || null,
                 }, m.timestamp);
                 continue;
             }

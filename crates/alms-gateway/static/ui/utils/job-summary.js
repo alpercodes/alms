@@ -48,6 +48,27 @@ export function shouldFetchFullOutput({ runId, summary, truncated } = {}) {
 }
 
 /**
+ * Resolve the target the "Go to job session" button should navigate to.
+ *
+ * The button MUST navigate by the job session's real `SessionId` UUID
+ * (`jobSessionUuid`, added #1217) — the value `GET /session/{id}`
+ * (`Path<SessionId>`) can resolve. The legacy `jobSessionId` field is the
+ * job's *context handle* (`job_{jobId}`), which is NOT a SessionId and 400s
+ * at the session endpoint (the #1213 bug). So it is deliberately never used
+ * as a navigation target: a marker carrying only the context handle (persisted
+ * before #1217) resolves to `null` and the button simply doesn't render,
+ * rather than rendering a button that fails on click.
+ *
+ * @param {{ jobSessionUuid?: unknown }} [args]
+ * @returns {string|null} a real SessionId to navigate to, or null.
+ */
+export function resolveJobSessionTarget({ jobSessionUuid } = {}) {
+    return typeof jobSessionUuid === 'string' && jobSessionUuid.length > 0
+        ? jobSessionUuid
+        : null;
+}
+
+/**
  * Choose the text to display given the stored (possibly truncated) summary and
  * a fetch result. Prefers a non-empty fetched full output; otherwise falls
  * back to the stored summary so a failed / empty fetch degrades gracefully.

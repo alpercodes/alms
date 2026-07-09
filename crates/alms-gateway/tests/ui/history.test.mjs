@@ -582,6 +582,7 @@ test('#1196: job marker splits name/summary and surfaces run_id + truncated', ()
                 run_id: 'run-abc',
                 job_id: 'job-abc',
                 job_session_id: 'job_abc',
+                job_session_uuid: '11111111-2222-3333-4444-555555555555',
                 truncated: true,
             },
         ),
@@ -596,6 +597,16 @@ test('#1196: job marker splits name/summary and surfaces run_id + truncated', ()
     assert.equal(e.summary, 'Did the thing.\nAnd more detail...');
     assert.equal(e.runId, 'run-abc', 'run_id must ride through to the card for fetch-on-expand');
     assert.equal(e.truncated, true, 'the authoritative truncated flag must ride through to the card');
+    // The context handle is kept for identity, but the button navigates by the
+    // REAL SessionId (`job_session_uuid`), not this handle (#1217).
+    assert.equal(
+        e.jobSessionId, 'job_abc',
+        'job_session_id (context handle) must ride through for identity (#1213)',
+    );
+    assert.equal(
+        e.jobSessionUuid, '11111111-2222-3333-4444-555555555555',
+        'job_session_uuid (real SessionId) must ride through — the button navigates by it (#1217)',
+    );
 });
 
 test('#1196: a [Scheduled job ...] line inside the summary does not hijack the header', () => {
@@ -635,4 +646,8 @@ test('#1196: legacy job marker without run_id yields runId null (graceful)', () 
     // No truncated field on a legacy marker — passes through as undefined so
     // shouldFetchFullOutput uses the (moot, runId-less) heuristic fallback.
     assert.equal(e.truncated, undefined);
+    // No job_session_id / job_session_uuid on a legacy marker — both are null,
+    // so the card's "Go to job session" button does not render (#1213/#1217).
+    assert.equal(e.jobSessionId, null);
+    assert.equal(e.jobSessionUuid, null);
 });

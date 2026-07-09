@@ -531,6 +531,11 @@ impl SseEventData {
     /// `GET /runs/{run_id}` when the summary was truncated at
     /// [`JOB_SUMMARY_MAX_CHARS`] (#1196).
     ///
+    /// `job_session_uuid` is the job session's **real** `SessionId` (resolved
+    /// from the `job_{job_id}` context handle at emission time). It is what the
+    /// "Go to job session" button navigates to — the `job_session_id` context
+    /// handle is not a `SessionId` and 400s at `GET /session/{id}` (#1217).
+    ///
     /// `truncated` is the authoritative "there is more to fetch" signal —
     /// threaded straight through to the card so the fetch decision never
     /// depends on the fragile `endsWith('...')` heuristic. The summary itself
@@ -549,6 +554,7 @@ impl SseEventData {
         run_id: RunId,
         job_id: alms_core::JobId,
         job_session_id: &str,
+        job_session_uuid: Option<&str>,
         truncated: bool,
     ) -> Self {
         let (summary, _) = truncate_chars(summary, JOB_SUMMARY_MAX_CHARS);
@@ -562,6 +568,7 @@ impl SseEventData {
                 run_id: run_id.0.to_string(),
                 job_id: job_id.0.to_string(),
                 job_session_id: job_session_id.to_string(),
+                job_session_uuid: job_session_uuid.map(str::to_string),
                 truncated,
                 ts: Utc::now(),
             },
@@ -1147,8 +1154,17 @@ struct JobCompletedData {
     /// Scheduled job that fired this run.
     job_id: String,
     /// Context id of the job's hidden session (`job_{job_id}`) — a deep-link
-    /// handle to the run's originating session.
+    /// handle to the run's originating session. NOTE: this is the context
+    /// handle, **not** a `SessionId`; it is not resolvable by
+    /// `GET /session/{id}`. Navigate with `job_session_uuid` instead (#1217).
     job_session_id: String,
+    /// The job session's **real** `SessionId` (UUID) — the value the
+    /// `GET /session/{id}` endpoint (`Path<SessionId>`) resolves, so the
+    /// "Go to job session" button can navigate straight to it (#1217).
+    /// `None` when the hidden session can't be resolved (e.g. evicted),
+    /// in which case the card simply doesn't render the button.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    job_session_uuid: Option<String>,
     /// Whether `summary` was truncated at the cap (i.e. the full output is
     /// longer and fetchable via `GET /runs/{run_id}`). The card keys its
     /// fetch-on-expand on this rather than sniffing the `...` suffix (#1196).
@@ -1435,6 +1451,7 @@ mod tests {
         let run_id = RunId::new();
         let job_id = alms_core::JobId::new();
         let job_session_id = format!("job_{}", job_id.0);
+        let job_session_uuid = alms_core::SessionId::new();
         let event = SseEventData::job_completed(
             session_id,
             "Summarize yesterday",
@@ -1443,6 +1460,7 @@ mod tests {
             run_id,
             job_id,
             &job_session_id,
+            Some(&job_session_uuid.0.to_string()),
             false,
         );
 
@@ -1461,6 +1479,14 @@ mod tests {
         assert_eq!(event.data["run_id"], run_id.0.to_string());
         assert_eq!(event.data["job_id"], job_id.0.to_string());
         assert_eq!(event.data["job_session_id"], job_session_id);
+        // #1217: the button navigates by the job session's REAL SessionId
+        // (UUID), not the `job_{id}` context handle. It must be present and
+        // must NOT equal the context handle.
+        assert_eq!(
+            event.data["job_session_uuid"],
+            job_session_uuid.0.to_string()
+        );
+        assert_ne!(event.data["job_session_uuid"], job_session_id);
         assert_eq!(
             event.data["truncated"], false,
             "an under-cap summary must report truncated=false"
@@ -1484,6 +1510,7 @@ mod tests {
             run_id,
             job_id,
             "job_deadbeef",
+            None,
             true,
         );
 
@@ -1516,7 +1543,7 @@ mod tests {
         // 1500 chars: past the old 200 cap, well under the new 4000 cap.
         let summary = "z".repeat(1500);
         let event = SseEventData::job_completed(
-            session_id, "nightly", "success", &summary, run_id, job_id, "job_1", false,
+            session_id, "nightly", "success", &summary, run_id, job_id, "job_1", None, false,
         );
         assert_eq!(
             event.data["summary"].as_str().unwrap().chars().count(),
@@ -1554,6 +1581,7 @@ mod tests {
             run_id,
             job_id,
             "job_1",
+            None,
             true,
         );
 

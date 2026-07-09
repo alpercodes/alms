@@ -23,7 +23,10 @@ pub struct ListMySessionsTool {
     session_manager: Arc<SessionManager>,
     agent_id: AgentId,
     /// Current session ID -- excluded by default so the agent does not
-    /// list the session it is currently running in.
+    /// list the session it is currently running in. Note (#1214): a scheduled
+    /// job runs ON its own `job_{id}` session, so an agent calling this from
+    /// inside a job run won't see that job session unless it passes
+    /// `include_current: true` (or calls from a different session).
     current_session_id: SessionId,
     /// Agent name, used to derive peer names in DM sessions.
     agent_name: String,
@@ -77,7 +80,7 @@ impl Tool for ListMySessionsTool {
                 },
                 "include_current": {
                     "type": "boolean",
-                    "description": "Whether to include the current session in the list. Default: false."
+                    "description": "Whether to include the current session in the list. Default: false. Note: a scheduled job runs on its own session, so set this true to see the current job session when calling from inside a job run."
                 }
             }
         })
@@ -442,6 +445,84 @@ mod tests {
             .iter()
             .any(|s| s["context_type"].as_str() == Some("dm"));
         assert!(has_dm, "DM session should appear in the listing");
+    }
+
+    #[tokio::test]
+    async fn test_includes_job_sessions() {
+        // Regression test for #1214: an agent's own `job_{id}` sessions are
+        // stored under the agent's real id (`fire_job_run` uses
+        // `get_or_create(job.agent_id, "job_{id}")`) and are NOT internal
+        // per `is_internal_session`, so they must appear in the listing.
+        let mgr = Arc::new(make_manager());
+        let agent_id = AgentId::new();
+        let current = mgr.get_or_create(agent_id, "current-ctx");
+        mgr.get_or_create(agent_id, "web-chat");
+        let job_ctx = format!("job_{}", uuid::Uuid::new_v4());
+        mgr.get_or_create(agent_id, &job_ctx);
+
+        let tool = make_tool(mgr, agent_id, current.id);
+        let result = tool.execute(serde_json::json!({})).await.unwrap();
+
+        assert_eq!(
+            result["showing"], 2,
+            "Should show web-chat + the agent's own job session"
+        );
+        let sessions = result["sessions"].as_array().unwrap();
+        let job = sessions
+            .iter()
+            .find(|s| s["context_type"].as_str() == Some("job"))
+            .expect("the agent's own job session must appear in the listing");
+        assert_eq!(job["context_id"], job_ctx.as_str());
+    }
+
+    #[tokio::test]
+    async fn test_current_job_session_hidden_by_default_visible_with_include_current() {
+        // #1214 follow-up (Tim): an agent that calls `list_my_sessions` from
+        // INSIDE its own job run does NOT see that job session by default,
+        // because the current session is excluded unless `include_current` is
+        // set — and a job run's session IS the current session. This is the
+        // intended current-session exclusion, not a bug, but it is the likely
+        // real-world explanation for a "my job session is missing" report, so
+        // pin both halves: hidden when current + default, visible with
+        // include_current: true.
+        let mgr = Arc::new(make_manager());
+        let agent_id = AgentId::new();
+
+        // The job session is the CURRENT session (the run executes on it).
+        let job_ctx = format!("job_{}", uuid::Uuid::new_v4());
+        let job_session = mgr.get_or_create(agent_id, &job_ctx);
+        mgr.get_or_create(agent_id, "web-chat");
+
+        let tool = make_tool(mgr.clone(), agent_id, job_session.id);
+
+        // Default (include_current: false): the current job session is hidden.
+        let result = tool.execute(serde_json::json!({})).await.unwrap();
+        assert_eq!(
+            result["showing"], 1,
+            "the current job session is excluded by default"
+        );
+        let sessions = result["sessions"].as_array().unwrap();
+        assert!(
+            sessions
+                .iter()
+                .all(|s| s["context_id"].as_str() != Some(job_ctx.as_str())),
+            "the current job session must NOT appear when include_current is false"
+        );
+        assert_eq!(sessions[0]["context_id"], "web-chat");
+
+        // include_current: true surfaces the current job session.
+        let result = tool
+            .execute(serde_json::json!({"include_current": true}))
+            .await
+            .unwrap();
+        assert_eq!(result["showing"], 2);
+        let sessions = result["sessions"].as_array().unwrap();
+        assert!(
+            sessions
+                .iter()
+                .any(|s| s["context_id"].as_str() == Some(job_ctx.as_str())),
+            "include_current: true must surface the current job session"
+        );
     }
 
     #[tokio::test]

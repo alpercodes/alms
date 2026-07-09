@@ -474,6 +474,18 @@ async fn notify_job_completion(
     // originating session.
     let job_session_id = format!("job_{}", job_id.0);
 
+    // #1217: the context handle above is NOT a `SessionId` — `GET /session/{id}`
+    // (`Path<SessionId>`) can't resolve it, so the card's "Go to job session"
+    // button 400s when it navigates by the handle. Resolve the job session's
+    // real random `SessionId` here (the same `(agent_id, "job_{id}")` key
+    // `fire_job_run` created it under) and emit THAT so the button navigates
+    // by a value the session endpoint accepts. `None` if the hidden session
+    // isn't resident (e.g. evicted) — the card then just omits the button.
+    let job_session_uuid = state
+        .session_manager
+        .session_id_for_context(agent_id, &job_session_id)
+        .map(|sid| sid.0.to_string());
+
     // Send SSE event to the target session so connected UI clients see it.
     state
         .run_manager
@@ -488,6 +500,7 @@ async fn notify_job_completion(
                 run_id,
                 job_id,
                 &job_session_id,
+                job_session_uuid.as_deref(),
                 truncated,
             ),
         )
@@ -506,15 +519,19 @@ async fn notify_job_completion(
         format!("[Scheduled job {label}] {job_name}\n{summary}"),
         // Deep-link handles (#1196): run_id lets the card fetch the full
         // persisted output via GET /runs/{run_id}; job_id / job_session_id
-        // identify the firing job and its hidden session. `truncated` is the
-        // authoritative "there is more to fetch" flag the card keys on (the
-        // reload mirror of the SSE field).
+        // identify the firing job and its hidden session. `job_session_uuid`
+        // (#1217) is the hidden session's real `SessionId` — the reload mirror
+        // of the SSE field, and the value the card's "Go to job session"
+        // button navigates by (the `job_session_id` context handle is not a
+        // `SessionId`). `truncated` is the authoritative "there is more to
+        // fetch" flag the card keys on (the reload mirror of the SSE field).
         {
             let mut meta = serde_json::json!({
                 "job_status": status,
                 "run_id": run_id.0.to_string(),
                 "job_id": job_id.0.to_string(),
                 "job_session_id": job_session_id,
+                "job_session_uuid": job_session_uuid,
                 "truncated": truncated,
             });
             // #1198: episode stats (additive — pre-episode markers simply
@@ -1919,6 +1936,81 @@ mod tests {
             summary_part.chars().count(),
             crate::sse::JOB_SUMMARY_MAX_CHARS + 3,
             "summary must be capped at 4000 chars (+ ellipsis), not 200"
+        );
+
+        shutdown_token.cancel();
+    }
+
+    /// #1217 (Tim C1): the card's "Go to job session" button must navigate by
+    /// the job session's REAL `SessionId` — a value `GET /session/{id}`
+    /// (`Path<SessionId>`) can resolve — not the `job_{id}` context handle
+    /// (which 400s). This exercises the RESOLUTION, not just string threading:
+    /// it stands up the hidden job session exactly as `fire_job_run` does
+    /// (`get_or_create(agent_id, "job_{id}")`), fires the notification, and
+    /// pins that the emitted `job_session_uuid` equals that session's real id,
+    /// parses back to it, and is distinct from the context handle.
+    #[tokio::test]
+    async fn job_completion_emits_resolvable_job_session_uuid() {
+        let (state, shutdown_token) = build_notification_state();
+        let agent_id = AgentId::new();
+
+        // The user-facing session the card renders on.
+        let web_session_id = state.session_manager.get_or_create(agent_id, "web").id;
+
+        // The hidden job session — created under the SAME (agent_id, context)
+        // key `fire_job_run` uses, so it carries its own random SessionId.
+        let job_id = JobId::new();
+        let job_ctx = format!("job_{}", job_id.0);
+        let real_job_session_id = state.session_manager.get_or_create(agent_id, &job_ctx).id;
+
+        let run_id = insert_completed_job_run(
+            &state,
+            web_session_id,
+            agent_id,
+            job_id,
+            "nightly digest",
+            "done".to_string(),
+        );
+
+        notify_job_completion(&state, agent_id, "nightly digest", run_id, job_id, None).await;
+
+        let (_text, meta) = job_marker(&state, web_session_id);
+
+        // The context handle is preserved (identity/debug), but it is NOT a
+        // SessionId — navigating by it is the bug being fixed.
+        assert_eq!(meta["job_session_id"], job_ctx);
+
+        // The button's navigation target: the hidden session's REAL id.
+        let emitted_uuid = meta["job_session_uuid"]
+            .as_str()
+            .expect("job_session_uuid must be present when the hidden session is resident");
+        assert_eq!(
+            emitted_uuid,
+            real_job_session_id.0.to_string(),
+            "the emitted uuid must be the hidden job session's real SessionId"
+        );
+        assert_ne!(
+            emitted_uuid, job_ctx,
+            "the navigation target must not be the `job_{{id}}` context handle"
+        );
+
+        // RESOLUTION: the emitted value parses as a UUID and, keyed through the
+        // session manager, resolves to the same session — exactly the path
+        // `GET /session/{id}` (`Path<SessionId>`) takes. The `job_{id}` context
+        // handle would fail the UUID parse (a 400), so this round-trip is what
+        // was broken before the fix.
+        let parsed = SessionId(
+            uuid::Uuid::parse_str(emitted_uuid).expect("job_session_uuid must be a valid UUID"),
+        );
+        assert_eq!(parsed, real_job_session_id);
+        assert_eq!(
+            state.session_manager.get(parsed).unwrap().context_id,
+            job_ctx,
+            "the emitted uuid must resolve to the hidden job session"
+        );
+        assert!(
+            uuid::Uuid::parse_str(&job_ctx).is_err(),
+            "sanity: the context handle is NOT a UUID — navigating by it 400s"
         );
 
         shutdown_token.cancel();

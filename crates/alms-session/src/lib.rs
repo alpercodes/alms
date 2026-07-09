@@ -93,6 +93,20 @@ impl SessionManager {
         self.sessions.contains_key(key)
     }
 
+    /// Look up an existing session's real `SessionId` by its
+    /// `(agent_id, context_id)` key **without creating one**.
+    ///
+    /// Unlike [`get_or_create`](Self::get_or_create) this is a pure read with
+    /// no side effects. It exists for callers that hold a well-known context
+    /// handle (e.g. a job's hidden `job_{job_id}` session) and need the random
+    /// `SessionId` behind it — the value `GET /session/{id}` (`Path<SessionId>`)
+    /// can actually resolve, since the context id is not itself a session id
+    /// (#1217).
+    pub fn session_id_for_context(&self, agent_id: AgentId, context_id: &str) -> Option<SessionId> {
+        let key = (agent_id, context_id.to_string());
+        self.sessions.get(&key).map(|s| s.id)
+    }
+
     /// Get or create a session.
     ///
     /// Uses `DashMap::entry()` to make the check-and-insert atomic, preventing

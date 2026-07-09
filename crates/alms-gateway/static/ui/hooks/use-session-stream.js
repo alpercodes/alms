@@ -1552,6 +1552,13 @@ export function openSessionStream(sessionId, opts) {
             // card keys its fetch decision on.
             runId: data.run_id || null,
             truncated: data.truncated,
+            // Deep-link handles (#1213/#1217): the job's hidden session.
+            // `jobSessionUuid` is the REAL SessionId the "Go to job session"
+            // button navigates by (what GET /session/{id} resolves);
+            // `jobSessionId` is the `job_{job_id}` context handle, kept for
+            // identity only and NOT used as a navigation target.
+            jobSessionUuid: data.job_session_uuid || null,
+            jobSessionId: data.job_session_id || null,
         });
     });
 

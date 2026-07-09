@@ -98,3 +98,23 @@
 .job-card-toggle:hover {
   text-decoration: underline;
 }
+/* Actions row under the summary: the Show more/less toggle and the
+   "Go to job session" deep-link button (#1213) sit side by side. */
+.job-card-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--space-4);
+}
+/* Deep-link button (#1213) — matches the toggle's link-style treatment. */
+.job-card-goto {
+  background: none;
+  border: none;
+  cursor: pointer;
+  font-family: var(--font-mono);
+  font-size: var(--text-2xs);
+  color: var(--info);
+  padding: 0;
+}
+.job-card-goto:hover {
+  text-decoration: underline;
+}

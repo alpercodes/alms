@@ -681,6 +681,7 @@ Emitted on the agent's user-facing session when a scheduled job's **episode clos
   "run_id": "<uuid>",
   "job_id": "<uuid>",
   "job_session_id": "job_<job-uuid>",
+  "job_session_uuid": "<uuid>",
   "truncated": true,
   "ts": "..."
 }
@@ -688,7 +689,7 @@ Emitted on the agent's user-facing session when a scheduled job's **episode clos
 
 `status` values: `"success"`, `"error"`, `"cancelled"`, `"unknown"`.
 
-`run_id` / `job_id` / `job_session_id` (the job's hidden-session **context id**, not a session UUID) are deep-link handles added in #1196. Under episodes (#1198), `run_id` is the episode's **final** run. `truncated` is `true` when `summary` was capped at `JOB_SUMMARY_MAX_CHARS` (4000) and the full output is fetchable via `GET /runs/{run_id}` (the run's persisted `response`); the UI keys its fetch-on-expand on this flag rather than sniffing the `...` suffix. On a deadline-forced close the summary is prefixed with an `[Episode deadline reached ...]` note (composed before the cap, so the SSE payload and the persisted marker stay byte-identical). Markers persisted before #1196 lack these metadata fields; the UI degrades to the stored summary.
+`run_id` / `job_id` / `job_session_id` (the job's hidden-session **context id**, not a session UUID) are deep-link handles added in #1196. Under episodes (#1198), `run_id` is the episode's **final** run. `job_session_uuid` (#1217) is the hidden job session's **real `SessionId`** — resolved from the `job_{job_id}` context handle at emission time — and is the value the "Go to job session" button navigates to (`GET /session/{id}` accepts a `SessionId`, not the `job_session_id` context handle, which 400s). It is omitted (SSE) / `null` (marker metadata) when the hidden session can't be resolved, and absent on markers persisted before #1217; the card then just doesn't render the button. `truncated` is `true` when `summary` was capped at `JOB_SUMMARY_MAX_CHARS` (4000) and the full output is fetchable via `GET /runs/{run_id}` (the run's persisted `response`); the UI keys its fetch-on-expand on this flag rather than sniffing the `...` suffix. On a deadline-forced close the summary is prefixed with an `[Episode deadline reached ...]` note (composed before the cap, so the SSE payload and the persisted marker stay byte-identical). Markers persisted before #1196 lack these metadata fields; the UI degrades to the stored summary.
 
 The persisted `job_notification` marker's metadata additionally carries an optional `episode` object (#1198) — `{"turns", "dm_count", "subagent_count", "timed_out", "detached"}` — describing the closed episode. It is metadata-only for now (the SSE payload is unchanged and the UI does not render it yet); markers persisted before #1198 lack the key.
 

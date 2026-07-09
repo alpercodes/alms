@@ -15,7 +15,7 @@ import { PanelContainer } from './components/panel/index.js';
 import { SettingsModal } from './components/settings-modal.js';
 import { OnboardingView } from './components/onboarding.js';
 import { agents, activeAgent } from './state/agents.js';
-import { isDmSession, isNotificationSession, isInternalSession, activeSession, activeSessionId } from './state/sessions.js';
+import { isDmSession, isNotificationSession, isInternalSession, activeSession, activeSessionId, activeSessionOwnerName } from './state/sessions.js';
 import { SubagentBar } from './components/chat/subagent-bar.js';
 import { parentSessionId, navigateToParentSession } from './state/subagents.js';
 import { activeRunId } from './state/runs.js';
@@ -109,10 +109,17 @@ function ChatView() {
     const notifActive = isNotificationSession.value;
     const session = activeSession.value;
 
-    // Label for the internal session header
+    // Label for the internal session header. Job sessions carry the
+    // OWNING agent's name (#1212) — the Jobs sidebar group is
+    // cross-agent, so without it the banner can't tell whose job the
+    // operator is reading. Resolved via `activeSessionOwnerName`
+    // (session envelope agent_id -> agents list), mirroring the
+    // "{agent} notifications" treatment on notification sessions.
+    const ownerName = activeSessionOwnerName.value;
     const internalLabel = notifActive
         ? (session?.agent_name ? session.agent_name + ' notifications' : 'Notification session')
-        : session?.session_type === 'job' ? 'Job session'
+        : session?.session_type === 'job'
+            ? (ownerName ? ownerName + ' job session' : 'Job session')
         : session?.session_type === 'subagent' ? 'Subagent session'
         : 'Internal session';
     const internalIcon = notifActive ? '\u26A1' : session?.session_type === 'job' ? '\u23F0' : '\u2699';
@@ -200,7 +207,7 @@ function ChatView() {
                         return html`<${ApprovalCard} key=${m.id} ...${m} />`;
                     }
                     if (m.type === 'job_completed') {
-                        return html`<${JobCompletionCard} key=${m.id} jobName=${m.jobName} status=${m.status} summary=${m.summary} ts=${m.ts} runId=${m.runId} truncated=${m.truncated} />`;
+                        return html`<${JobCompletionCard} key=${m.id} jobName=${m.jobName} status=${m.status} summary=${m.summary} ts=${m.ts} runId=${m.runId} truncated=${m.truncated} jobSessionUuid=${m.jobSessionUuid} jobSessionId=${m.jobSessionId} />`;
                     }
                     if (m.type === 'subagent_completed') {
                         return html`<${SubagentCompletionCard} key=${m.id}
@@ -213,7 +220,11 @@ function ChatView() {
                         // messages so they render on the correct side. (#546)
                         const isDmImage = !!(m.fromAgent);
                         const cls = (m.role === 'user' && !isDmImage) ? 'user' : 'agent';
-                        const agentName = activeAgent.value?.name;
+                        // Session owner first (#1212) — same rationale as the
+                        // Message label: cross-agent surfaces (job/subagent)
+                        // don't switch the active agent, so `activeAgent`
+                        // can name the wrong agent.
+                        const agentName = activeSessionOwnerName.value || activeAgent.value?.name;
                         const label = (m.role === 'user' && !isDmImage) ? '>'
                             : m.fromAgent ? `${m.fromAgent} $`
                             : (agentName ? `${agentName} $` : '$');

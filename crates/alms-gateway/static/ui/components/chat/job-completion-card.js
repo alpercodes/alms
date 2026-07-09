@@ -1,6 +1,7 @@
 import { html, useSignal, useEffect, renderMarkdown } from '../../deps.js';
 import { getRun } from '../../api/runs.js';
-import { shouldFetchFullOutput, resolveDisplayedSummary } from '../../utils/job-summary.js';
+import { shouldFetchFullOutput, resolveDisplayedSummary, resolveJobSessionTarget } from '../../utils/job-summary.js';
+import { navigateToSession } from '../../utils/navigate-session.js';
 
 /**
  * Collapsible card for scheduled job completion messages.
@@ -24,6 +25,18 @@ import { shouldFetchFullOutput, resolveDisplayedSummary } from '../../utils/job-
  *               to fetch the full persisted output on expand)
  *   truncated - bool, whether the stored summary was capped and the full
  *               output is fetchable via GET /runs/{runId} (optional)
+ *   jobSessionUuid - string, the job session's REAL `SessionId` (UUID),
+ *               optional; carried by the SSE payload / marker metadata since
+ *               #1217. When present, renders a "Go to job session" button that
+ *               jumps to the job session via the shared `navigateToSession`
+ *               path. This is the value `GET /session/{id}` resolves — the
+ *               button navigates by it, NOT by the `job_{jobId}` context handle
+ *               (which is not a SessionId and 400s; the #1213 bug fixed in
+ *               #1217). Markers persisted before #1217 lack this field, so the
+ *               button simply doesn't render for them.
+ *   jobSessionId - string, the job's hidden-session context handle
+ *               (`job_{jobId}`), optional; kept for identity/debug only. NOT a
+ *               SessionId and never used as a navigation target (#1217).
  */
 
 const COLLAPSE_THRESHOLD = 150;
@@ -59,7 +72,7 @@ function statusIcon(status) {
     }
 }
 
-export function JobCompletionCard({ jobName, status, summary, ts, runId, truncated }) {
+export function JobCompletionCard({ jobName, status, summary, ts, runId, truncated, jobSessionUuid, jobSessionId }) {
     const expanded = useSignal(false);
     // Full persisted output, fetched lazily on the first expand when the
     // stored summary was truncated (#1196). `null` until fetched; the render
@@ -110,6 +123,20 @@ export function JobCompletionCard({ jobName, status, summary, ts, runId, truncat
         expanded.value = !expanded.value;
     };
 
+    // Jump to the job's hidden session (#1213). Navigate by the job session's
+    // REAL SessionId (`jobSessionUuid`) — the value GET /session/{id} resolves.
+    // Navigating by the `job_{id}` context handle (`jobSessionId`) 400s, which
+    // was the #1213 bug fixed in #1217. Uses the shared in-app navigator (same
+    // path as the sidebar Jobs group / runs-tab), which deliberately skips the
+    // cross-agent auto-switch for job sessions — see utils/navigate-session.js.
+    const jobSessionTarget = resolveJobSessionTarget({ jobSessionUuid });
+    const gotoJobSession = (e) => {
+        e.stopPropagation();
+        if (jobSessionTarget) {
+            navigateToSession(jobSessionTarget, { logPrefix: 'job-card' });
+        }
+    };
+
     // Render summary with markdown for completed jobs
     const renderedSummary = effectiveSummary
         ? renderMarkdown(effectiveSummary)
@@ -133,9 +160,18 @@ export function JobCompletionCard({ jobName, status, summary, ts, runId, truncat
                                 ${summary.slice(0, COLLAPSE_THRESHOLD)}...
                             </div>`
                     }
+                </div>
+            `}
+            ${(isLong || jobSessionTarget) && html`
+                <div class="job-card-actions">
                     ${isLong && html`
                         <button class="job-card-toggle" onClick=${toggle}>
                             ${expanded.value ? 'Show less' : 'Show more'}
+                        </button>
+                    `}
+                    ${jobSessionTarget && html`
+                        <button class="job-card-goto" onClick=${gotoJobSession}>
+                            Go to job session →
                         </button>
                     `}
                 </div>

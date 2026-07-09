@@ -27,6 +27,7 @@ const {
     summaryLooksTruncated,
     shouldFetchFullOutput,
     resolveDisplayedSummary,
+    resolveJobSessionTarget,
     TRUNCATION_ELLIPSIS,
 } = await import(url.pathToFileURL(JOB_SUMMARY_PATH).href);
 
@@ -129,4 +130,42 @@ test('#1196: resolveDisplayedSummary falls back to the stored summary on empty/f
 test('#1196: resolveDisplayedSummary never returns null/undefined', () => {
     assert.equal(resolveDisplayedSummary(undefined, undefined), '');
     assert.equal(resolveDisplayedSummary(null, null), '');
+});
+
+// ---------------------------------------------------------------------------
+// resolveJobSessionTarget (#1217)
+// ---------------------------------------------------------------------------
+//
+// Regression for Tim's C1 on PR #1217: the "Go to job session" button was
+// wired to `jobSessionId`, which is the job's CONTEXT handle (`job_{jobId}`),
+// not a SessionId. `navigateToSession` -> GET /session/{id} (`Path<SessionId>`)
+// can't parse the handle, so the button 400'd and the session never loaded.
+// The fix carries the job session's REAL SessionId as `jobSessionUuid` and
+// navigates by that. These tests exercise the navigation-target RESOLUTION
+// (which id the button navigates to) — not merely that a string threads
+// through — so a regression back to the context handle is caught.
+
+test('#1217: resolveJobSessionTarget returns the real SessionId (jobSessionUuid)', () => {
+    const uuid = '11111111-2222-3333-4444-555555555555';
+    assert.equal(resolveJobSessionTarget({ jobSessionUuid: uuid }), uuid);
+});
+
+test('#1217: resolveJobSessionTarget never navigates by the job_{id} context handle', () => {
+    // The crux of the bug: even when the (broken) context handle is present,
+    // it must NOT become the navigation target. Absent a real uuid the button
+    // resolves to null and simply doesn't render — better than a 400 on click.
+    assert.equal(resolveJobSessionTarget({ jobSessionId: 'job_abc' }), null);
+    // And when both are present the uuid wins — the handle is never used.
+    const uuid = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
+    const target = resolveJobSessionTarget({ jobSessionUuid: uuid, jobSessionId: 'job_abc' });
+    assert.equal(target, uuid);
+    assert.notEqual(target, 'job_abc');
+});
+
+test('#1217: resolveJobSessionTarget is defensive against missing/blank input', () => {
+    assert.equal(resolveJobSessionTarget(), null);
+    assert.equal(resolveJobSessionTarget({}), null);
+    assert.equal(resolveJobSessionTarget({ jobSessionUuid: null }), null);
+    assert.equal(resolveJobSessionTarget({ jobSessionUuid: '' }), null);
+    assert.equal(resolveJobSessionTarget({ jobSessionUuid: 42 }), null);
 });

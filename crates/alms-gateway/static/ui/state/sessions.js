@@ -1,4 +1,6 @@
 import { signal, computed } from '../deps.js';
+import { agents } from './agents.js';
+import { sessionOwnerName } from '../utils/session-owner.js';
 
 export const sessions = signal([]);
 export const activeSessionId = signal(null);
@@ -97,6 +99,20 @@ export const isInternalSession = computed(() => {
         || s.session_type === 'job'
         || s.session_type === 'subagent';
 });
+
+/**
+ * Name of the agent that OWNS the active session, or null when there is
+ * no single owner (DM sessions, unresolved boot state). See
+ * `utils/session-owner.js` for the derivation and the #1212 rationale:
+ * job/subagent/notification sessions are cross-agent surfaces that do
+ * NOT switch the active agent when opened, so attribution derived from
+ * `activeAgent` can show a different agent's name. Consumers should use
+ * this with an `activeAgent` fallback:
+ * `activeSessionOwnerName.value || activeAgent.value?.name`.
+ */
+export const activeSessionOwnerName = computed(() =>
+    sessionOwnerName(activeSession.value, agents.value)
+);
 
 /**
  * Participants of the active DM session (empty array for non-DM sessions).
