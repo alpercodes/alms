@@ -37,10 +37,43 @@ function getSessionMeta(session) {
     return SESSION_TYPE_META[session.session_type] || SESSION_TYPE_META.chat;
 }
 
-function hasActiveRun(sessionId) {
-    if (sessionId === activeSessionId.value && activeRunId.value) return true;
-    const bg = bgRuns.value[sessionId];
-    return bg && !bg.finished;
+/**
+ * Whether a session row should render the blinking active-run dot.
+ *
+ * PURE function of its inputs — the reactive signals are read by the
+ * CALLER (`SessionItem`) directly in its render body and passed in. That
+ * is load-bearing for reactivity, not a style choice:
+ *
+ * Pre-#1211 this read `bgRuns.value` / `activeRunId.value` *inside* the
+ * helper. `SessionItem` therefore only subscribed to `activeSessionId`
+ * (read in its body for `isActive`) reliably; its subscription to
+ * `bgRuns` existed solely through this buried nested read. Under
+ * @preact/signals@1.3.0 that left non-selected rows effectively
+ * un-subscribed from live `bgRuns` changes, so a `session_activity_started`
+ * event on ANOTHER session never re-rendered its row — the dot stayed
+ * dark until an unrelated signal (`activeSessionId`, i.e. clicking the
+ * row) forced a re-render. That is exactly the #1211 symptom: the dot
+ * only lit on the currently-selected session. Backend emission of
+ * `session_activity_started` for every run (lifecycle.rs) and the
+ * `bgRuns` seed were already correct; the gap was purely that the row
+ * did not reactively CONSULT them.
+ *
+ * Taking the values as arguments forces the reads into the component
+ * body, matching the direct-body-read pattern the rest of the UI uses to
+ * stay reliably reactive under @preact/signals (see agent-header-bar.js
+ * and app.js, which both moved signal reads out of indirection for the
+ * same reason).
+ *
+ * @param {string} sessionId
+ * @param {string|null} activeSessionIdValue - `activeSessionId.value`
+ * @param {string|null} activeRunIdValue - `activeRunId.value`
+ * @param {Object<string, {runId: string|null, finished: boolean}>} bgRunsValue - `bgRuns.value`
+ * @returns {boolean}
+ */
+function hasActiveRun(sessionId, activeSessionIdValue, activeRunIdValue, bgRunsValue) {
+    if (sessionId === activeSessionIdValue && activeRunIdValue) return true;
+    const bg = bgRunsValue[sessionId];
+    return !!(bg && !bg.finished);
 }
 
 // Sidebar entry point — delegates to the shared in-app navigator
@@ -177,7 +210,21 @@ function crossAgentOwner(session) {
 function SessionItem({ session, activeAgentName }) {
     const confirming = useSignal(false);
     const deleteTimer = useSignal(null);
-    const isActive = session.id === activeSessionId.value;
+    const activeSessionIdValue = activeSessionId.value;
+    const isActive = session.id === activeSessionIdValue;
+    // Read the active-run signals in the component BODY (not only inside
+    // hasActiveRun) so @preact/signals reliably subscribes this row to
+    // both `activeRunId` and `bgRuns`. Without the body-level reads the
+    // dot only lit on the selected session (#1211) — see hasActiveRun's
+    // doc comment. All three values are always read (JS evaluates the
+    // arguments eagerly), so the subscription can't drop out via
+    // short-circuiting inside the predicate.
+    const hasRun = hasActiveRun(
+        session.id,
+        activeSessionIdValue,
+        activeRunId.value,
+        bgRuns.value,
+    );
     const meta = getSessionMeta(session);
     const typeClass = meta.cls ? ' session-item-' + meta.cls : '';
 
@@ -250,7 +297,7 @@ function SessionItem({ session, activeAgentName }) {
     const ownedClass = ownedByActive ? ' session-item-active-agent' : '';
 
     return html`
-        <div class="session-item${typeClass}${ownedClass} ${isActive ? 'active' : ''} ${hasActiveRun(session.id) ? 'has-run' : ''}"
+        <div class="session-item${typeClass}${ownedClass} ${isActive ? 'active' : ''} ${hasRun ? 'has-run' : ''}"
              role="option"
              aria-selected=${isActive}
              tabindex="0"
