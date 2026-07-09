@@ -517,12 +517,17 @@ impl MessageSender for MessageBus {
         //   session if available, otherwise to `notifications:{peer_name}`.
         //
         // - **Sender** (the agent that ended the conversation): gets a
-        //   notification run ONLY if they have a source session (meaning
-        //   they initiated the DM from a user-facing session). This
-        //   ensures the user watching the initiator's web-chat sees the
-        //   notification with the conversation transcript. Agents without
-        //   a source session (pure DM recipients) do NOT get a
-        //   self-notification.
+        //   self-notification whenever there is a "human side" to this
+        //   conversation -- i.e. EITHER agent initiated from a source
+        //   session. It is routed to the sender's OWN source session when
+        //   it has one (#556 initiator-ends / #1198 D3 job-ends), otherwise
+        //   to `notifications:{sender_name}` (#1215 receiver-ends): a pure
+        //   recipient that ENDS the DM must still be notified in its
+        //   notification session, mirroring how the peer trigger routes a
+        //   source-less peer. When NEITHER agent has a source session (both
+        //   DM-triggered / internal) the sender gets NO self-notification --
+        //   there is no user watching either side and firing one would break
+        //   the "exactly one trigger per end" idempotency/atomicity guards.
         //
         // Both lookups must happen BEFORE `remove_source_sessions_for_dm`
         // cleans up the map.
@@ -578,6 +583,9 @@ impl MessageSender for MessageBus {
                 from_agent: sender_agent_id,
                 from_name: sender_name.to_string(),
                 reason: reason.clone(),
+                // Peer notification: `from_name` (the sender) IS the ender, so
+                // "Agent {from_name} ended the conversation" is correct.
+                self_notification: false,
                 source_session_id: peer_source_session,
             },
             context_id: target_context_id,
@@ -592,39 +600,70 @@ impl MessageSender for MessageBus {
             );
         }
 
-        // --- Emit RunTrigger for the sender (initiator notification, #556) ---
+        // --- Emit RunTrigger for the sender (self-notification, #556 / #1215) ---
         //
-        // When the sender has a source session, they initiated the DM from
-        // a user-facing session and the user expects to see the conversation
-        // outcome there. Without this trigger, the initiator only receives a
-        // lightweight SSE marker (via notify_dm_ended_to_webchat) but no
-        // actual notification run with the conversation transcript.
+        // The sender (the agent that ended the conversation) is notified
+        // whenever EITHER agent has a source session -- i.e. this was a
+        // "real" DM with a human side, not a purely internal/DM-triggered
+        // exchange:
         //
-        // Pure DM recipients (no source session) do NOT get a self-notification
-        // because there is no user-facing session to route it to.
-        if let Some(source_sid) = sender_source_session {
-            let ctx = self
-                .session_manager
-                .get(source_sid)
-                .ok()
-                .map(|s| s.context_id.clone())
-                .unwrap_or_else(|| format!("notifications:{sender_name}"));
-            info!(
-                sender = %sender_name,
-                source_session = %source_sid.0,
-                "Routing self-notification to sender's source session (#556)"
-            );
+        // - Sender HAS a source session: route to it, so the user watching
+        //   that session sees the outcome with the conversation transcript
+        //   (#556 initiator-ends; #1198 D3 job-ends -> resumes on the job
+        //   session with full job context, source_session_id = Some).
+        //
+        // - Sender has NO source session but the PEER does: this is the
+        //   #1215 receiver-ends case. Route to `notifications:{sender_name}`
+        //   with source_session_id = None, mirroring how the peer trigger
+        //   routes a source-less peer. The gateway then surfaces the
+        //   DM-ended banner on the receiver's web-chat (if any) instead of
+        //   the receiver getting NOTHING.
+        //
+        // - NEITHER agent has a source session: no self-notification (the
+        //   `both source-less` gate). Both notifications would be invisible
+        //   `notifications:` runs with no user watching, and emitting one
+        //   would double the trigger count, breaking the "exactly one
+        //   trigger per end" idempotency/atomicity guarantees.
+        if sender_source_session.is_some() || peer_source_session.is_some() {
+            let (sender_target_session_id, sender_target_context_id, sender_source_field) =
+                if let Some(source_sid) = sender_source_session {
+                    let ctx = self
+                        .session_manager
+                        .get(source_sid)
+                        .ok()
+                        .map(|s| s.context_id.clone())
+                        .unwrap_or_else(|| format!("notifications:{sender_name}"));
+                    info!(
+                        sender = %sender_name,
+                        source_session = %source_sid.0,
+                        "Routing self-notification to sender's source session (#556)"
+                    );
+                    (source_sid, ctx, Some(source_sid))
+                } else {
+                    let ctx = format!("notifications:{sender_name}");
+                    let sid = SessionId::deterministic(&ctx);
+                    info!(
+                        sender = %sender_name,
+                        "Routing source-less ender's self-notification to \
+                         notifications:{sender_name} (#1215 receiver-ends)"
+                    );
+                    (sid, ctx, None)
+                };
             let sender_trigger = RunTrigger {
                 agent_id: sender_agent_id,
-                session_id: source_sid,
+                session_id: sender_target_session_id,
                 input,
                 source: MessageSource::ConversationEnded {
                     from_agent: peer_agent_id,
                     from_name: peer_name.to_string(),
                     reason,
-                    source_session_id: Some(source_sid),
+                    // Self-notification: the RECIPIENT (sender) ended the DM
+                    // and `from_name` is the PEER, so the formatter must use
+                    // self-appropriate wording and never blame the peer (#1215).
+                    self_notification: true,
+                    source_session_id: sender_source_field,
                 },
-                context_id: ctx,
+                context_id: sender_target_context_id,
             };
             // Bounded send with back-pressure (#842 / B11).
             if let Err(e) = self.run_trigger_tx.send(sender_trigger).await {

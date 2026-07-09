@@ -1596,6 +1596,14 @@ export function openSessionStream(sessionId, opts) {
         const data = JSON.parse(e.data);
         const peer = data.peer || 'unknown';
         const reason = DM_END_REASON_LABELS[data.reason] || data.reason || 'conversation ended';
+        // #1215/#1218: the web-chat forward sets `suppress_banner` when the
+        // DM-end notification RUN is itself the visible notification in this
+        // chat (the reloadable marker is suppressed for the same reason). We
+        // still clear the phase below, but skip rendering a live `dm_ended`
+        // banner so a live viewer sees only the run, not run + banner (the live
+        // half of "initiator gets both"). DM-session emissions never set this
+        // flag, so the DM-session-view banner is unaffected.
+        const suppressBanner = data.suppress_banner === true;
         // B10 (#1154): the backend may intentionally emit MULTIPLE
         // `dm_conversation_ended` events for a SINGLE conversation-end (see
         // `runs/dm_lifecycle.rs` — both the depth/ignore trigger path and the
@@ -1645,7 +1653,7 @@ export function openSessionStream(sessionId, opts) {
                 break;
             }
         }
-        if (!alreadyEnded) {
+        if (!suppressBanner && !alreadyEnded) {
             appendMessage({
                 id: nextMsgId(), type: 'dm_ended', peer, reason, contextId,
             });

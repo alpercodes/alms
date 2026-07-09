@@ -1198,8 +1198,14 @@ async fn test_initiator_gets_self_notification_when_ending_dm() {
         MessageSource::ConversationEnded {
             from_name,
             source_session_id,
+            self_notification,
             ..
         } => {
+            assert!(
+                self_notification,
+                "the ender's self-notification must set self_notification=true so \
+                 the formatter does not blame the peer (#1215)"
+            );
             assert_eq!(from_name, "bob", "from_name should be the peer");
             assert_eq!(
                 *source_session_id,
@@ -1214,16 +1220,36 @@ async fn test_initiator_gets_self_notification_when_ending_dm() {
     assert!(rx.try_recv().is_err(), "should not have any more triggers");
 }
 
-/// When a pure DM recipient (no source session) ends the conversation,
-/// they should NOT receive a self-notification (no source session to
-/// route it to). Only the peer gets notified.
+// -----------------------------------------------------------------------
+// #1215: DM-end notifications must reach BOTH agents exactly once,
+// regardless of which agent ends the conversation.
+//
+// Intended flow (Alper): the initiating agent (with a source session) is
+// notified in that source session; the receiving agent (no source
+// session) is notified in its `notifications:{name}` session. Neither
+// side gets a duplicate.
+//
+// Pre-fix, when the *receiver* ended the DM its self-notification was
+// skipped whenever it had no source session, so a receiver that ended the
+// conversation got NOTHING ("receiver gets none"). The routing rule these
+// tests pin down: when at least one agent has a source session, the ender
+// ALWAYS gets a self-notification too -- routed to its source session when
+// it has one, else to `notifications:{ender}`.
+// -----------------------------------------------------------------------
+
+/// #1215 (receiver ends): a pure recipient (no source session) that ENDS
+/// the DM must still be notified in its `notifications:{name}` session,
+/// and the initiator (with a source session) must be notified in that
+/// source session -- each exactly once. Pre-fix the recipient's
+/// self-notification was skipped (no source session) so the receiver that
+/// ended the conversation got nothing.
 #[tokio::test]
-async fn test_recipient_no_self_notification_when_ending_dm() {
+async fn test_recipient_ends_gets_notification_in_notification_session() {
     let (bus, mut rx) = setup();
     let alice_id = AgentId::new();
     let bob_id = AgentId::new();
 
-    // Alice sends from her web-chat session.
+    // Alice initiates from her web-chat session (she has a source session).
     let alice_session = SessionId::new();
     bus.session_manager
         .get_or_create_shared(alice_session, "web-chat-alice");
@@ -1239,13 +1265,13 @@ async fn test_recipient_no_self_notification_when_ending_dm() {
     .unwrap();
     let _ = rx.try_recv(); // drain send trigger
 
-    // Bob replies without a source session (pure DM recipient).
+    // Bob replies from within the DM session (pure recipient, no source).
     bus.send("bob", bob_id, "alice", alice_id, "Hi Alice!", None)
         .await
         .unwrap();
     let _ = rx.try_recv(); // drain send trigger
 
-    // Bob (the recipient, no source session) ends the conversation.
+    // Bob (the receiver, no source session) ends the conversation.
     bus.end_conversation(
         "bob",
         bob_id,
@@ -1256,20 +1282,183 @@ async fn test_recipient_no_self_notification_when_ending_dm() {
     .await
     .unwrap();
 
-    // Only one trigger: Alice's notification (peer) goes to her source session.
-    let peer_trigger = rx
-        .try_recv()
-        .expect("should have received peer notification for alice");
-    assert_eq!(peer_trigger.agent_id, alice_id);
-    assert_eq!(
-        peer_trigger.session_id, alice_session,
-        "alice's notification should go to her source session"
-    );
+    // Collect both triggers, keyed by agent.
+    let mut alice_trigger = None;
+    let mut bob_trigger = None;
+    let mut extra = 0;
+    while let Ok(t) = rx.try_recv() {
+        if t.agent_id == alice_id {
+            alice_trigger = Some(t);
+        } else if t.agent_id == bob_id {
+            bob_trigger = Some(t);
+        } else {
+            extra += 1;
+        }
+    }
 
-    // No self-notification for Bob (he has no source session).
+    // Initiator (alice) -> her source session (peer notification).
+    let alice_trigger = alice_trigger.expect("initiator must be notified in her source session");
+    assert_eq!(
+        alice_trigger.session_id, alice_session,
+        "initiator's notification should go to her source session"
+    );
+    assert_eq!(alice_trigger.context_id, "web-chat-alice");
+    // The peer notification (to the non-ender) keeps self_notification=false:
+    // its from_name IS the ender, so "Agent {ender} ended" is correct there.
+    match &alice_trigger.source {
+        MessageSource::ConversationEnded {
+            self_notification, ..
+        } => assert!(
+            !self_notification,
+            "the peer notification must NOT be flagged as a self-notification"
+        ),
+        other => panic!("expected ConversationEnded, got {:?}", other),
+    }
+
+    // Receiver (bob) -> his notification session (#1215). Pre-fix this
+    // trigger was never emitted -> "receiver gets none".
+    let bob_trigger =
+        bob_trigger.expect("receiver that ends the DM must still be notified (#1215)");
+    assert_eq!(
+        bob_trigger.context_id, "notifications:bob",
+        "receiver's notification should fall back to notifications:bob"
+    );
+    assert_eq!(
+        bob_trigger.session_id,
+        SessionId::deterministic("notifications:bob")
+    );
+    match &bob_trigger.source {
+        MessageSource::ConversationEnded {
+            from_name,
+            source_session_id,
+            self_notification,
+            ..
+        } => {
+            assert!(
+                self_notification,
+                "the source-less receiver that ENDS the DM must also get a \
+                 self-notification flagged self_notification=true (#1215)"
+            );
+            assert_eq!(from_name, "alice", "notification is about the peer, alice");
+            assert!(
+                source_session_id.is_none(),
+                "receiver has no source session -> None"
+            );
+        }
+        other => panic!("expected ConversationEnded, got {:?}", other),
+    }
+
+    assert_eq!(
+        extra, 0,
+        "exactly one trigger per agent -- neither side gets a duplicate"
+    );
+}
+
+/// #1215 (initiator ends): guards that fixing the receiver-ends case did
+/// not disturb the already-correct initiator-ends direction. The
+/// initiator (source session) is notified in that source session and the
+/// receiver (no source) in its notification session -- each exactly once.
+#[tokio::test]
+async fn test_1215_initiator_ends_both_sides_notified_once() {
+    let (bus, mut rx) = setup();
+    let alice_id = AgentId::new();
+    let bob_id = AgentId::new();
+
+    let alice_session = SessionId::new();
+    bus.session_manager
+        .get_or_create_shared(alice_session, "web-chat-alice");
+    bus.send(
+        "alice",
+        alice_id,
+        "bob",
+        bob_id,
+        "Hello Bob!",
+        Some(alice_session),
+    )
+    .await
+    .unwrap();
+    let _ = rx.try_recv();
+    bus.send("bob", bob_id, "alice", alice_id, "Hi Alice!", None)
+        .await
+        .unwrap();
+    let _ = rx.try_recv();
+
+    // Alice (the initiator) ends the conversation.
+    bus.end_conversation(
+        "alice",
+        alice_id,
+        "bob",
+        bob_id,
+        ConversationEndReason::Ignored,
+    )
+    .await
+    .unwrap();
+
+    let mut alice_trigger = None;
+    let mut bob_trigger = None;
+    let mut extra = 0;
+    while let Ok(t) = rx.try_recv() {
+        if t.agent_id == alice_id {
+            alice_trigger = Some(t);
+        } else if t.agent_id == bob_id {
+            bob_trigger = Some(t);
+        } else {
+            extra += 1;
+        }
+    }
+
+    let alice_trigger = alice_trigger.expect("initiator notified in her source session");
+    assert_eq!(alice_trigger.session_id, alice_session);
+    assert_eq!(alice_trigger.context_id, "web-chat-alice");
+
+    let bob_trigger = bob_trigger.expect("receiver notified in his notification session");
+    assert_eq!(bob_trigger.context_id, "notifications:bob");
+
+    assert_eq!(extra, 0, "exactly one trigger per agent -- no duplicates");
+}
+
+/// #1215 gate: when NEITHER agent has a source session (both were
+/// DM-triggered / internal), the ender gets NO self-notification -- only
+/// the peer is notified. This preserves the "exactly one trigger per end"
+/// idempotency/atomicity guarantees relied on by the concurrency tests
+/// (both agents' notifications would be invisible `notifications:` runs
+/// anyway, with no user watching either side).
+#[tokio::test]
+async fn test_1215_both_source_less_ender_gets_no_self_notification() {
+    let (bus, mut rx) = setup();
+    let alice_id = AgentId::new();
+    let bob_id = AgentId::new();
+
+    // Both send without a source session (both pure DM-triggered).
+    bus.send("alice", alice_id, "bob", bob_id, "Hello!", None)
+        .await
+        .unwrap();
+    let _ = rx.try_recv();
+    bus.send("bob", bob_id, "alice", alice_id, "Hi!", None)
+        .await
+        .unwrap();
+    let _ = rx.try_recv();
+
+    // Alice ends.
+    bus.end_conversation(
+        "alice",
+        alice_id,
+        "bob",
+        bob_id,
+        ConversationEndReason::Ignored,
+    )
+    .await
+    .unwrap();
+
+    // Exactly one trigger: the peer (bob) -> notifications:bob. Alice (the
+    // ender) gets NO self-notification because the peer is also source-less.
+    let peer_trigger = rx.try_recv().expect("peer must be notified");
+    assert_eq!(peer_trigger.agent_id, bob_id);
+    assert_eq!(peer_trigger.context_id, "notifications:bob");
     assert!(
         rx.try_recv().is_err(),
-        "bob should NOT receive a self-notification (no source session)"
+        "a source-less ender must NOT get a self-notification when the peer \
+         is also source-less (preserves the exactly-one-trigger invariant)"
     );
 }
 

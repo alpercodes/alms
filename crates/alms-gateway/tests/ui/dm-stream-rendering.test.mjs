@@ -88,7 +88,10 @@ const activeSubagents = signal({});
 // agent-status (inert beyond what handlers call)
 const agentPhase = signal({ phase: null, detail: null });
 function setAgentPhase() {}
-function clearAgentPhase() {}
+// Observable so tests can assert the phase-clear runs even when the live
+// dm_ended banner is suppressed (#1215/#1218).
+const clearAgentPhaseCalls = signal(0);
+function clearAgentPhase() { clearAgentPhaseCalls.value++; }
 function setDmContext() {}
 function revertPhase() {}
 const dmPeer = signal(null);
@@ -119,7 +122,7 @@ function getSealedReasoningRunIds(id) { return __sealedSets.get(id) || null; }
 function clearSealedReasoningRunIds(id) { __sealedSets.delete(id); }
 
 // Test hooks — exported so the harness can reach the live signals.
-export const __test = { signal, chatMessages, activeRunId, activeSession, dmParticipants, activeAgent, dmPeer };
+export const __test = { signal, chatMessages, activeRunId, activeSession, dmParticipants, activeAgent, dmPeer, clearAgentPhaseCalls };
 `;
 
 /**
@@ -222,6 +225,7 @@ function reset() {
     T.dmParticipants.value = [];
     T.activeAgent.value = null;
     T.dmPeer.value = null;
+    T.clearAgentPhaseCalls.value = 0;
     mod.dmThinkingBuffers.value = new Map();
     // Fully tear down any open stream so module-private per-run state does not
     // leak between tests. `closeSessionStream` clears `dmPendingReplyBuffers`
@@ -415,6 +419,45 @@ test('#1154 B10: a genuinely different conversation (different peer) still rende
 
     const banners = T.chatMessages.value.filter(m => m.type === 'dm_ended');
     assert.equal(banners.length, 2, 'distinct conversations must each render a banner');
+});
+
+// ---------------------------------------------------------------------------
+// #1215/#1218: suppress_banner decouples the live banner from the phase-clear.
+// The web-chat forward sets it when the DM-end notification RUN is itself the
+// visible notification in that chat; the frontend must then clear the phase
+// but render NO banner (the live half of "initiator gets both"). DM-session
+// emissions never set the flag, so their banner still renders.
+// ---------------------------------------------------------------------------
+
+test('#1215/#1218: suppress_banner=true clears the phase but renders NO live banner', () => {
+    reset();
+    T.activeSession.value = { session_type: 'web' };
+    const es = openStream('sess-1');
+
+    es.emit('dm_conversation_ended', {
+        peer: 'bob', reason: 'ignored', context_id: 'dm:alice:bob', suppress_banner: true,
+    });
+
+    const banners = T.chatMessages.value.filter(m => m.type === 'dm_ended');
+    assert.equal(banners.length, 0,
+        'suppress_banner=true must NOT append a live dm_ended banner (the run is the notification)');
+    assert.ok(T.clearAgentPhaseCalls.value >= 1,
+        'the phase must STILL clear when the banner is suppressed');
+});
+
+test('#1215/#1218: a DM-session emission (no suppress_banner) still renders the banner and clears', () => {
+    reset();
+    T.activeSession.value = { session_type: 'dm' };
+    const es = openStream('sess-1');
+
+    es.emit('dm_conversation_ended', {
+        peer: 'bob', reason: 'ignored', context_id: 'dm:alice:bob',
+    });
+
+    const banners = T.chatMessages.value.filter(m => m.type === 'dm_ended');
+    assert.equal(banners.length, 1,
+        'without suppress_banner the DM-session-view banner must still render');
+    assert.ok(T.clearAgentPhaseCalls.value >= 1, 'phase clears as before');
 });
 
 // ---------------------------------------------------------------------------

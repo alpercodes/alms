@@ -763,6 +763,7 @@ async fn dm_conversation_ended_trigger_creates_notification_and_marker() {
                 from_agent: sender_agent_id,
                 from_name: "alice".to_string(),
                 reason: ConversationEndReason::Ignored,
+                self_notification: false,
                 source_session_id: None,
             },
             context_id: notif_context_id.clone(),
@@ -817,12 +818,378 @@ async fn dm_conversation_ended_trigger_creates_notification_and_marker() {
 
     // Verify SSE events were forwarded to the web-chat session.
     let web_events = drain_events(&mut web_rx);
+    let ended = web_events
+        .iter()
+        .find(|e| e.event_type == "dm_conversation_ended")
+        .unwrap_or_else(|| {
+            panic!(
+                "expected a dm_conversation_ended SSE event on the web-chat session; got: {:?}",
+                web_events.iter().map(|e| &e.event_type).collect::<Vec<_>>()
+            )
+        });
+    // A pure-recipient forward persists the marker (the run is on the invisible
+    // notifications: session), so it must NOT suppress the live banner either.
+    assert_ne!(
+        ended.data.get("suppress_banner").and_then(|v| v.as_bool()),
+        Some(true),
+        "pure-recipient forward must not set suppress_banner (the banner is the \
+         one visible indicator)"
+    );
+
+    shutdown_token.cancel();
+}
+
+/// #1215: when a `ConversationEnded` trigger carries a `source_session_id`
+/// (the agent initiated/ended from a user-facing session), the notification
+/// RUN is routed to that source session and is itself the visible
+/// notification there. The gateway must uphold BOTH:
+///
+/// 1. The redundant persisted `dm_ended_notification` banner marker is
+///    SKIPPED — otherwise the DM-end renders twice ("initiator gets both").
+/// 2. The lightweight `dm_conversation_ended` SSE is STILL forwarded to the
+///    web-chat so the "Chatting with {peer}" status clears (Tim's C1 on
+///    #1218). It is the ONLY path that reaches the web-chat, and the
+///    notification run re-asserts the DM phase (#688) rather than clearing
+///    it — so dropping the SSE with the marker would strand the status bar.
+#[tokio::test]
+async fn dm_conversation_ended_with_source_session_clears_phase_but_skips_marker() {
+    let (state, shutdown_token, _cr, _tr, _dr) = test_app_state();
+
+    let agent_id = AgentId::new();
+    let sender_agent_id = AgentId::new();
+
+    // The agent has a user-facing source session (its web-chat). The
+    // MessageBus routes the notification run here and sets source_session_id.
+    let source_session = state.session_manager.get_or_create(agent_id, "web");
+    let source_session_id = source_session.id;
+    let source_context_id = source_session.context_id.clone();
+
+    // Subscribe to the source session so we can observe the phase-clear SSE.
+    let mut src_rx = subscribe_session(&state, source_session_id);
+
+    // Build a ConversationEnded trigger WITH a source session, mirroring how
+    // the MessageBus emits the initiator/self notification.
+    let (test_tx, test_rx) = mpsc::channel(8);
+    test_tx
+        .send(RunTrigger {
+            agent_id,
+            session_id: source_session_id,
+            input: "DM ended by alice".to_string(),
+            source: MessageSource::ConversationEnded {
+                from_agent: sender_agent_id,
+                from_name: "alice".to_string(),
+                reason: ConversationEndReason::Ignored,
+                self_notification: false,
+                source_session_id: Some(source_session_id),
+            },
+            context_id: source_context_id,
+        })
+        .await
+        .unwrap();
+    drop(test_tx);
+
+    super::notifications::run_trigger_loop(test_rx, state.clone()).await;
+
+    // The notification run still fires on the source session (#556 preserved).
+    let runs = state.run_manager.list_by_session(source_session_id, 10);
     assert!(
-        web_events
-            .iter()
-            .any(|e| e.event_type == "dm_conversation_ended"),
-        "expected a dm_conversation_ended SSE event on the web-chat session; got: {:?}",
-        web_events.iter().map(|e| &e.event_type).collect::<Vec<_>>()
+        !runs.is_empty(),
+        "the #556 self-notification run must still be created on the source session"
+    );
+    assert_eq!(runs[0].agent_id, agent_id);
+
+    // (1) NO redundant dm_ended_notification banner marker is persisted to
+    // the source session — the run is the single visible notification there.
+    let history = state
+        .session_manager
+        .get_history(source_session_id)
+        .unwrap_or_default();
+    let banner_markers = history
+        .iter()
+        .filter(|m| {
+            m.metadata.as_ref().is_some_and(|meta| {
+                meta.get("type").and_then(|v| v.as_str()) == Some("dm_ended_notification")
+            })
+        })
+        .count();
+    assert_eq!(
+        banner_markers, 0,
+        "no dm_ended_notification banner should be persisted when the run \
+         already lands in the user-facing source session (#1215 initiator-gets-both)"
+    );
+
+    // (2) But the dm_conversation_ended SSE IS forwarded to the source session
+    // so the web-chat clears the "Chatting with {peer}" phase (Tim's C1). The
+    // reason here is `Ignored` and there is no agent registry, so the only
+    // possible source of this event on the source session is the phase-clear
+    // forward inside notify_dm_ended_to_webchat.
+    let src_events = drain_events(&mut src_rx);
+    let ended = src_events
+        .iter()
+        .find(|e| e.event_type == "dm_conversation_ended")
+        .unwrap_or_else(|| {
+            panic!(
+                "the phase-clear dm_conversation_ended SSE must still reach the source \
+                 session even when the marker is suppressed; got: {:?}",
+                src_events.iter().map(|e| &e.event_type).collect::<Vec<_>>()
+            )
+        });
+    // ...and it carries suppress_banner=true: suppressing the marker must also
+    // suppress the LIVE banner, so a live viewer sees only the notification run
+    // (the live half of "initiator gets both", #1215).
+    assert_eq!(
+        ended.data.get("suppress_banner").and_then(|v| v.as_bool()),
+        Some(true),
+        "suppressing the reloadable marker must also suppress the live banner"
+    );
+
+    shutdown_token.cancel();
+}
+
+/// #1218 P2 (the #1202 job-as-DM-source interaction): when a scheduled job is
+/// the DM source, `source_session_id = Some(job_session_id)` but the job
+/// session is INTERNAL (`job_*`), so the notification run is routed to the job
+/// session, NOT the agent's web-chat. The operator watching the web-chat must
+/// therefore STILL get the persisted `dm_ended_notification` banner — there is
+/// no visible run there to stand in for it. The marker is suppressed ONLY when
+/// the source session IS the marker target; a `job_*` source is never the
+/// user-facing target, so the banner persists.
+#[tokio::test]
+async fn dm_conversation_ended_job_source_persists_webchat_marker() {
+    let (state, shutdown_token, _cr, _tr, _dr) = test_app_state();
+
+    let agent_id = AgentId::new();
+    let sender_agent_id = AgentId::new();
+
+    // The DM source is the job's (internal) session — where the notification
+    // run is routed, NOT the web-chat.
+    let job_session = state
+        .session_manager
+        .get_or_create(agent_id, "job_550e8400-e29b-41d4-a716-446655440000");
+    let job_session_id = job_session.id;
+    let job_context_id = job_session.context_id.clone();
+
+    // The agent also has a user-facing web-chat that the operator is watching.
+    let web_session = state.session_manager.get_or_create(agent_id, "web");
+    let web_session_id = web_session.id;
+
+    let (test_tx, test_rx) = mpsc::channel(8);
+    test_tx
+        .send(RunTrigger {
+            agent_id,
+            session_id: job_session_id,
+            input: "DM ended by alice".to_string(),
+            source: MessageSource::ConversationEnded {
+                from_agent: sender_agent_id,
+                from_name: "alice".to_string(),
+                reason: ConversationEndReason::Ignored,
+                self_notification: false,
+                source_session_id: Some(job_session_id),
+            },
+            context_id: job_context_id,
+        })
+        .await
+        .unwrap();
+    drop(test_tx);
+
+    super::notifications::run_trigger_loop(test_rx, state.clone()).await;
+
+    // The DM-ended banner MUST be persisted to the web-chat: the notification
+    // run went to the internal job session, so the web-chat has no visible run
+    // to replace the banner. Pre-fix (persist_marker = source.is_none()) this
+    // was suppressed -> operator saw a transient phase-clear but nothing
+    // reloadable and no run (#1218 P2).
+    let web_history = state
+        .session_manager
+        .get_history(web_session_id)
+        .unwrap_or_default();
+    let banner_markers = web_history
+        .iter()
+        .filter(|m| {
+            m.metadata.as_ref().is_some_and(|meta| {
+                meta.get("type").and_then(|v| v.as_str()) == Some("dm_ended_notification")
+            })
+        })
+        .count();
+    assert_eq!(
+        banner_markers, 1,
+        "a job-as-DM-source DM-end must persist the web-chat banner (the run is \
+         routed to the internal job session, not the web-chat) — #1218 P2"
+    );
+
+    shutdown_token.cancel();
+}
+
+/// #1218 P2 (second): `notify_dm_ended_to_webchat` targets the agent's
+/// MOST-RECENT user-facing session, which can differ from the source session
+/// the run is routed to when the agent has more than one user-facing chat.
+/// The marker must still be persisted to the target chat — otherwise that
+/// chat gets neither the run (it is in the source chat) nor a reloadable
+/// banner, only a transient SSE. The marker is suppressed ONLY when the
+/// source session IS the exact marker target (`source_session_id == target`),
+/// which is the identity check that subsumes the earlier internal-source case.
+#[tokio::test]
+async fn dm_conversation_ended_source_differs_from_marker_target_persists_marker() {
+    let (state, shutdown_token, _cr, _tr, _dr) = test_app_state();
+
+    let agent_id = AgentId::new();
+    let sender_agent_id = AgentId::new();
+
+    // The agent has TWO user-facing sessions.
+    let web_a = state.session_manager.get_or_create(agent_id, "web-a");
+    let web_b = state.session_manager.get_or_create(agent_id, "web-b");
+
+    // Discover the actual marker target (the most-recent user-facing session)
+    // and pick a DIFFERENT user-facing session as the DM source, so the check
+    // is deterministic regardless of last-activity ordering.
+    let target = super::find_user_facing_session(&state.session_manager, agent_id)
+        .expect("agent has user-facing sessions");
+    let target_id = target.id;
+    let (source_id, source_ctx) = if target_id == web_a.id {
+        (web_b.id, "web-b")
+    } else {
+        (web_a.id, "web-a")
+    };
+    assert_ne!(
+        source_id, target_id,
+        "source must differ from the marker target"
+    );
+
+    let (test_tx, test_rx) = mpsc::channel(8);
+    test_tx
+        .send(RunTrigger {
+            agent_id,
+            session_id: source_id,
+            input: "DM ended by alice".to_string(),
+            source: MessageSource::ConversationEnded {
+                from_agent: sender_agent_id,
+                from_name: "alice".to_string(),
+                reason: ConversationEndReason::Ignored,
+                self_notification: false,
+                source_session_id: Some(source_id),
+            },
+            context_id: source_ctx.to_string(),
+        })
+        .await
+        .unwrap();
+    drop(test_tx);
+
+    super::notifications::run_trigger_loop(test_rx, state.clone()).await;
+
+    // The banner MUST land on the marker target: the run is in the source
+    // chat (a different session), so the target chat has no visible run to
+    // replace the banner. Pre-fix (marker suppressed whenever the source was
+    // user-facing) the target chat got only a transient SSE (#1218 P2).
+    let target_history = state
+        .session_manager
+        .get_history(target_id)
+        .unwrap_or_default();
+    let banner_markers = target_history
+        .iter()
+        .filter(|m| {
+            m.metadata.as_ref().is_some_and(|meta| {
+                meta.get("type").and_then(|v| v.as_str()) == Some("dm_ended_notification")
+            })
+        })
+        .count();
+    assert_eq!(
+        banner_markers, 1,
+        "marker must persist to the most-recent user-facing session when the DM \
+         source is a DIFFERENT user-facing chat than the target (#1218 P2)"
+    );
+
+    shutdown_token.cancel();
+}
+
+/// #1218 P2 (#3, the ordering / #1205 episode-routing case): when an open job
+/// episode awaits the SAME DM that a user-facing web-chat also sourced, the
+/// #1205 episode override REROUTES the notification run to the job session.
+/// The web-chat is then not a run target, so its reloadable banner must
+/// persist — otherwise the operator watching the web-chat gets neither the run
+/// (it went to the job session) nor a marker, only a transient SSE. This is
+/// why the web-chat forward is deferred until the FINAL `run_targets` are
+/// known: keying persistence on `source_session_id` alone (pre-fix) suppressed
+/// the marker here because source == the web-chat target.
+#[tokio::test]
+async fn dm_conversation_ended_episode_rerouted_run_persists_webchat_marker() {
+    let (state, shutdown_token, _cr, _tr, _dr) = test_app_state_with_sqlite();
+
+    // Register alice + bob so peer-name resolution (bob) works and resolve_dm
+    // can compute the deterministic DM session id.
+    let (alice_id, bob_id) = seed_alice_bob(&state);
+
+    // bob has a user-facing web-chat (the DM source AND the marker target) ...
+    let web_session = state.session_manager.get_or_create(bob_id, "web");
+    let web_session_id = web_session.id;
+
+    // ... and an open job episode awaiting the alice<->bob DM.
+    let job_id = alms_core::JobId::new();
+    let job_ctx = format!("job_{}", job_id.0);
+    let job_session = state.session_manager.get_or_create(bob_id, &job_ctx);
+    let job_session_id = job_session.id;
+    let turn1 = alms_core::RunId::new();
+    state
+        .job_episodes
+        .open(job_id, job_session_id, bob_id, turn1);
+    let dm_session_id = SessionId::deterministic_dm("alice", "bob");
+    let _ = state
+        .job_episodes
+        .on_run_complete(job_id, turn1, vec![dm_session_id], vec![]);
+
+    // ConversationEnded for bob, sourced from bob's web-chat. Episode routing
+    // supersedes the web-chat target and sends the run to the job session.
+    let (test_tx, test_rx) = mpsc::channel(8);
+    test_tx
+        .send(RunTrigger {
+            agent_id: bob_id,
+            session_id: web_session_id,
+            input: "DM ended by alice".to_string(),
+            source: MessageSource::ConversationEnded {
+                from_agent: alice_id,
+                from_name: "alice".to_string(),
+                reason: ConversationEndReason::Ignored,
+                self_notification: false,
+                source_session_id: Some(web_session_id),
+            },
+            context_id: "web".to_string(),
+        })
+        .await
+        .unwrap();
+    drop(test_tx);
+
+    super::notifications::run_trigger_loop(test_rx, state.clone()).await;
+
+    // The continuation run went to the JOB session (episode routing fired) ...
+    let job_runs = state.run_manager.list_by_session(job_session_id, 10);
+    assert!(
+        !job_runs.is_empty(),
+        "episode routing must send the continuation run to the job session"
+    );
+    // ... and NOT to the web-chat.
+    let web_runs = state.run_manager.list_by_session(web_session_id, 10);
+    assert!(
+        web_runs.is_empty(),
+        "the run must NOT land on the web-chat when episode routing reroutes it"
+    );
+
+    // So the web-chat still needs the reloadable banner: it must be persisted
+    // even though the DM source == the web-chat target (#1218 P2 ordering).
+    let web_history = state
+        .session_manager
+        .get_history(web_session_id)
+        .unwrap_or_default();
+    let banner_markers = web_history
+        .iter()
+        .filter(|m| {
+            m.metadata.as_ref().is_some_and(|meta| {
+                meta.get("type").and_then(|v| v.as_str()) == Some("dm_ended_notification")
+            })
+        })
+        .count();
+    assert_eq!(
+        banner_markers, 1,
+        "marker must persist to the web-chat when the run is rerouted to a job \
+         session by #1205 episode routing (#1218 P2 ordering)"
     );
 
     shutdown_token.cancel();
@@ -871,6 +1238,7 @@ async fn dm_depth_exceeded_graceful_without_agent_registry() {
                 from_agent: sender_agent_id,
                 from_name: "alice".to_string(),
                 reason: ConversationEndReason::DepthExceeded,
+                self_notification: false,
                 source_session_id: None,
             },
             context_id: notif_context_id.clone(),
@@ -938,6 +1306,7 @@ async fn notification_stays_on_invisible_session_when_no_source() {
                 from_agent: sender_agent_id,
                 from_name: "alice".to_string(),
                 reason: ConversationEndReason::Ignored,
+                self_notification: false,
                 source_session_id: None, // <-- pure recipient, no source session
             },
             context_id: notif_session.context_id.clone(),
@@ -992,6 +1361,7 @@ async fn notification_uses_source_session_when_present() {
                 from_agent: sender_agent_id,
                 from_name: "alice".to_string(),
                 reason: ConversationEndReason::Ignored,
+                self_notification: false,
                 source_session_id: Some(source_session_id),
             },
             context_id: source_session.context_id.clone(),
@@ -2084,6 +2454,7 @@ fn dm_ended_notification_includes_history_when_available() {
         "alice",
         ConversationEndReason::Ignored,
         Some(history),
+        false,
     );
 
     assert!(
@@ -2108,6 +2479,7 @@ fn dm_ended_notification_fallback_without_history() {
         "alice",
         ConversationEndReason::Ignored,
         None,
+        false,
     );
 
     assert!(
@@ -2129,11 +2501,13 @@ fn dm_ended_notification_distinguishes_reasons() {
         "alice",
         ConversationEndReason::Ignored,
         None,
+        false,
     );
     let depth = super::notifications::format_dm_ended_notification(
         "alice",
         ConversationEndReason::DepthExceeded,
         None,
+        false,
     );
 
     // Both should mention alice.
@@ -10214,6 +10588,7 @@ async fn conversation_ended_routes_continuation_onto_job_session() {
                 from_agent: bob_id,
                 from_name: "bob".to_string(),
                 reason: ConversationEndReason::Ignored,
+                self_notification: false,
                 source_session_id: None,
             },
             context_id: notif_session.context_id.clone(),
@@ -10294,6 +10669,7 @@ async fn conversation_ended_resolves_all_episodes_pending_on_same_dm() {
                 from_agent: _bob_id,
                 from_name: "bob".to_string(),
                 reason: ConversationEndReason::Ignored,
+                self_notification: false,
                 source_session_id: None,
             },
             context_id: notif_session.context_id.clone(),
@@ -10454,6 +10830,7 @@ async fn conversation_ended_for_peer_does_not_touch_episode() {
                 from_agent: alice_id,
                 from_name: "alice".to_string(),
                 reason: ConversationEndReason::Ignored,
+                self_notification: false,
                 source_session_id: None,
             },
             context_id: bob_notif.context_id.clone(),
@@ -11028,6 +11405,7 @@ async fn spent_one_shot_detached_dm_ended_not_suppressed() {
                 from_agent: bob_id,
                 from_name: "bob".to_string(),
                 reason: ConversationEndReason::Ignored,
+                self_notification: false,
                 source_session_id: Some(job_session_id),
             },
             context_id: job_context.clone(),

@@ -555,23 +555,35 @@ async fn notify_job_completion(
     );
 }
 
-/// Forward a `dm_conversation_ended` event to the agent's user-facing
-/// web-chat session so the human watching that session sees a notification.
+/// Forward a `dm_conversation_ended` signal to the agent's user-facing
+/// web-chat session. Two separable concerns:
 ///
-/// Without this, the `dm_conversation_ended` SSE event only lands on the DM
-/// session's SSE stream (which the user is typically not watching) and the
-/// notification run executes on a `notifications:` session (also invisible
-/// to the web-chat).
+/// - The `dm_conversation_ended` SSE event is emitted **unconditionally**.
+///   It is the ONLY path that clears the "Chatting with {peer}" status on
+///   the web-chat (`clearAgentPhase`): `dm_lifecycle.rs` emits
+///   `dm_conversation_ended` on the DM-session stream (which the operator is
+///   not viewing), and the source-session notification run *re-asserts* the
+///   DM phase (#688 preservation) rather than clearing it. So the phase-clear
+///   is not optional for any agent whose DM has ended (#1215 C1).
 ///
-/// This mirrors `notify_job_completion`: find the most recent user-facing
-/// session, emit an SSE event, and persist a marker message so it survives
-/// page reloads.
+/// - A persisted `dm_ended_notification` marker is the reloadable visible
+///   "DM ended" banner. It is persisted UNLESS the resolved user-facing
+///   `target` is itself one of `run_target_session_ids` — i.e. unless the
+///   notification run lands on this exact chat, where the run is already the
+///   visible notification and a marker would duplicate it ("initiator gets
+///   both", #1215). Keying on the FINAL run targets (computed AFTER the #1205
+///   episode-routing override) makes the predicate complete over every case:
+///   a pure recipient (run on the invisible `notifications:` session), an
+///   internal `job_*` source, a DIFFERENT user-facing chat than the target,
+///   or an episode-rerouted run on a job session — in all of them `target` is
+///   not among the run targets, so the marker persists (#1218 P2).
 pub(super) async fn notify_dm_ended_to_webchat(
     state: &AppState,
     agent_id: alms_core::AgentId,
     peer_name: &str,
     reason: &str,
     context_id: &str,
+    run_target_session_ids: &[SessionId],
 ) {
     info!(
         agent_id = %agent_id,
@@ -590,42 +602,63 @@ pub(super) async fn notify_dm_ended_to_webchat(
     };
     let target_session_id = target.id;
 
-    // Emit SSE event on the web-chat session so connected UI clients see it.
+    // Decide marker persistence FIRST: suppress it when the notification run
+    // lands on THIS exact target session (target is among the run targets),
+    // because then the run is already the visible notification here and a
+    // marker would duplicate it ("initiator gets both", #1215). Persist in
+    // every other case: pure recipient (run on the invisible notifications:
+    // session), an internal job_* source, a DIFFERENT user-facing chat than
+    // this target, or an episode-rerouted run on a job session (#1205) -- in
+    // all of them the run is elsewhere, so the web-chat needs the marker
+    // (#1218 P2).
+    let persist_marker = !run_target_session_ids.contains(&target_session_id);
+
+    // Emit the phase-clear SSE (unconditional -- the C1 fix: the only path
+    // that clears "Chatting with {peer}" on the web-chat). `suppress_banner`
+    // mirrors the marker decision: whenever the marker is suppressed, the LIVE
+    // `dm_ended` banner is suppressed too, so a live viewer of a source-having
+    // chat sees only the notification run, not run + banner (the live half of
+    // "initiator gets both", #1215). DM-session emitters never set this, so the
+    // DM-session-view banner is unaffected.
     let dummy_run_id = RunId::new();
     state
         .run_manager
         .send_session_event(
             target_session_id,
             dummy_run_id,
-            SseEventData::dm_conversation_ended(
+            SseEventData::dm_conversation_ended_webchat(
                 target_session_id,
                 "system",
                 peer_name,
                 reason,
                 context_id,
+                !persist_marker,
             ),
         )
         .await;
 
-    // Persist a marker message so it appears on reload.
-    let reason_text = match reason {
-        "ignored" => "no further replies".to_string(),
-        "depth_exceeded" => "message limit reached".to_string(),
-        other => other.to_string(),
-    };
-    super::markers::persist_lifecycle_marker(
-        &state.session_manager,
-        target_session_id,
-        "dm_ended_notification",
-        format!("[DM conversation ended] Conversation with {peer_name} ended ({reason_text})."),
-        serde_json::json!({
-            "peer": peer_name,
-            "reason": reason,
-            "context_id": context_id,
-        }),
-    );
+    // Persist the reloadable marker (same condition as the banner suppression).
+    if persist_marker {
+        let reason_text = match reason {
+            "ignored" => "no further replies".to_string(),
+            "depth_exceeded" => "message limit reached".to_string(),
+            other => other.to_string(),
+        };
+        super::markers::persist_lifecycle_marker(
+            &state.session_manager,
+            target_session_id,
+            "dm_ended_notification",
+            format!("[DM conversation ended] Conversation with {peer_name} ended ({reason_text})."),
+            serde_json::json!({
+                "peer": peer_name,
+                "reason": reason,
+                "context_id": context_id,
+            }),
+        );
+    }
 
     info!(
+        persist_marker,
         "DM ended notification forwarded to web-chat session {} (peer={peer_name}, reason={reason})",
         target_session_id.0
     );
@@ -1118,34 +1151,69 @@ const DM_ENDED_NO_HISTORY_TEMPLATE: &str =
 /// Format a human-readable notification message for a DM conversation ending.
 ///
 /// This is used by `run_trigger_loop` when it receives a
-/// `MessageSource::ConversationEnded` trigger.  The notification tells the
-/// peer agent that the DM conversation has ended, includes the reason, and
-/// — when `conversation_history` is provided — embeds the full DM
-/// transcript so the agent can act immediately without calling
-/// `read_messages`.
+/// `MessageSource::ConversationEnded` trigger, and — when `conversation_history`
+/// is provided — embeds the full DM transcript so the agent can act immediately
+/// without calling `read_messages`.
+///
+/// `self_notification` selects the phrasing (#1215):
+///
+/// - `false` (peer notification): `from_name` IS the agent that ended the DM,
+///   so "Agent {from_name} ended the conversation" correctly tells the OTHER
+///   party who ended it.
+/// - `true` (the ender's own self-notification, #556 / #1215): the RECIPIENT is
+///   the ender and `from_name` is the PEER, so we must NOT attribute the ending
+///   to `from_name`. Uses self-appropriate "Your DM conversation with
+///   {from_name} has ended" phrasing instead.
 pub(super) fn format_dm_ended_notification(
     from_name: &str,
     reason: ConversationEndReason,
     conversation_history: Option<&str>,
+    self_notification: bool,
 ) -> String {
-    let reason_text = match &reason {
-        ConversationEndReason::Ignored => {
-            format!("Agent \"{from_name}\" ended the conversation (chose not to reply).")
+    let reason_text = if self_notification {
+        // The recipient IS the ender — never blame `from_name` (the peer).
+        match &reason {
+            ConversationEndReason::Ignored => {
+                format!(
+                    "Your DM conversation with agent \"{from_name}\" has ended (you chose not to reply)."
+                )
+            }
+            ConversationEndReason::DepthExceeded => {
+                format!(
+                    "Your DM conversation with agent \"{from_name}\" ended \
+                     because the maximum message depth was reached."
+                )
+            }
+            ConversationEndReason::UserCancelled => {
+                "Your DM conversation was cancelled by the user.".to_string()
+            }
+            ConversationEndReason::Errored { message } => {
+                format!(
+                    "Your DM conversation with agent \"{from_name}\" ended \
+                     because the run failed: {message}"
+                )
+            }
         }
-        ConversationEndReason::DepthExceeded => {
-            format!(
-                "The conversation with agent \"{from_name}\" was terminated \
-                 because the maximum message depth was reached."
-            )
-        }
-        ConversationEndReason::UserCancelled => {
-            "The DM conversation was cancelled by the user.".to_string()
-        }
-        ConversationEndReason::Errored { message } => {
-            format!(
-                "The conversation with agent \"{from_name}\" ended because \
-                 the run failed: {message}"
-            )
+    } else {
+        match &reason {
+            ConversationEndReason::Ignored => {
+                format!("Agent \"{from_name}\" ended the conversation (chose not to reply).")
+            }
+            ConversationEndReason::DepthExceeded => {
+                format!(
+                    "The conversation with agent \"{from_name}\" was terminated \
+                     because the maximum message depth was reached."
+                )
+            }
+            ConversationEndReason::UserCancelled => {
+                "The DM conversation was cancelled by the user.".to_string()
+            }
+            ConversationEndReason::Errored { message } => {
+                format!(
+                    "The conversation with agent \"{from_name}\" ended because \
+                     the run failed: {message}"
+                )
+            }
         }
     };
 
@@ -1275,6 +1343,13 @@ pub(crate) async fn run_trigger_loop(
         let agent_id = trigger.agent_id;
         let context_id = trigger.context_id;
 
+        // #1218 P2 (#3): the ConversationEnded arm stashes what the web-chat
+        // DM-ended forward needs — `(from_name, reason_str, dm_context)` — and
+        // the forward itself is deferred until AFTER the final run routing
+        // (`run_targets`) is known, so the marker persists unless the run
+        // itself lands on the marker target (see the forward below the match).
+        let mut dm_ended_webchat: Option<(String, String, String)> = None;
+
         // Build a source label for SSE `run_created` events and determine
         // whether this is a peer DM run (which needs the DM addendum) or
         // a notification run (which must NOT get the DM addendum).
@@ -1300,7 +1375,7 @@ pub(crate) async fn run_trigger_loop(
             MessageSource::ConversationEnded {
                 from_name,
                 reason,
-                source_session_id,
+                self_notification,
                 ..
             } => {
                 // Resolve the peer (notification recipient) name for SSE
@@ -1359,65 +1434,24 @@ pub(crate) async fn run_trigger_loop(
                     }
                 }
 
-                // -- No rerouting for pure recipients --
+                // -- Stash the web-chat DM-ended forward (made after routing) --
                 //
-                // When `source_session_id` is `None`, the agent was a pure
-                // DM recipient who never called `send_message` from a
-                // user-facing session.  The notification run stays on the
-                // invisible `notifications:{agent}` session so it does NOT
-                // pollute the agent's web-chat with the user.
-                //
-                // The visual "DM ended" indicator is handled separately by
-                // `notify_dm_ended_to_webchat` below, which sends a
-                // lightweight SSE event + marker message to the web-chat
-                // without creating a full LLM notification run there.
-                //
-                // When `source_session_id` IS present (the agent initiated
-                // the DM from a user-facing session), the MessageBus already
-                // set the trigger's `session_id` to that source session, so
-                // the notification run appears in the correct chat.
-                if source_session_id.is_none() {
-                    debug!(
-                        agent_id = %agent_id.0,
-                        "No source session for agent — notification run will \
-                         execute on invisible notifications: session (agent was pure recipient)"
-                    );
-                }
-
-                // -- Forward dm_conversation_ended to the agent's web-chat --
-                //
-                // Every agent that receives a ConversationEnded trigger
-                // needs the visual DM-ended indicator on their web-chat
-                // session.  This covers:
-                //
-                // - **Peer** (the other agent in the DM): always receives
-                //   a ConversationEnded trigger, needs the banner (#497).
-                //
-                // - **Sender** (the agent that called ignore_message):
-                //   receives a self-notification trigger (#556) and gets
-                //   the banner here.  The ignore_message path in
-                //   execute_run (lifecycle.rs) does NOT call
-                //   notify_dm_ended_to_webchat — it defers to this path
-                //   to avoid duplicates.
-                //
-                // For depth_exceeded, both the recipient and the
-                // sender (when the sender has a source session) get
-                // ConversationEnded triggers — `end_conversation`
-                // emits both (#556).
+                // The forward is deferred until the FINAL run routing is known
+                // (#1218 P2 #3). The reloadable `dm_ended_notification` marker
+                // must be suppressed only when the notification RUN itself lands
+                // on the marker target, and the #1205 episode-routing override
+                // below can reroute the run to a job session AFTER this arm. So
+                // we stash the fields here and forward once `run_targets` is
+                // built. The phase-clear SSE (the C1 fix — the only path that
+                // clears "Chatting with {peer}" on the web-chat) is emitted
+                // there too, still unconditionally.
                 {
                     let reason_str = reason.to_string();
                     let dm_context = peer_name_resolved
                         .as_ref()
                         .map(|peer_name| alms_core::dm_context_id(from_name, peer_name))
                         .unwrap_or_default();
-                    notify_dm_ended_to_webchat(
-                        &state,
-                        agent_id,
-                        from_name,
-                        &reason_str,
-                        &dm_context,
-                    )
-                    .await;
+                    dm_ended_webchat = Some((from_name.clone(), reason_str, dm_context));
                 }
 
                 // -- Fetch DM conversation history (#429) --
@@ -1483,6 +1517,7 @@ pub(crate) async fn run_trigger_loop(
                         from_name,
                         reason.clone(),
                         conversation_history.as_deref(),
+                        *self_notification,
                     ),
                     None,
                     episode_routes,
@@ -1518,6 +1553,30 @@ pub(crate) async fn run_trigger_loop(
                 })
                 .collect()
         };
+
+        // #1218 P2 (#3): forward the DM-ended signal to the agent's web-chat
+        // now that the FINAL run routing is known. The `dm_conversation_ended`
+        // phase-clear SSE is emitted unconditionally (the C1 fix — the only
+        // path that clears "Chatting with {peer}" on the web-chat). The
+        // reloadable `dm_ended_notification` marker persists UNLESS the marker
+        // target (`find_user_facing_session`) is itself one of the run targets
+        // — i.e. unless the notification run is already the visible
+        // notification in that same chat. When #1205 episode routing reroutes
+        // the run to a job session, the web-chat is not a run target, so the
+        // marker persists.
+        if let Some((from_name, reason_str, dm_context)) = dm_ended_webchat {
+            let run_target_ids: Vec<SessionId> =
+                run_targets.iter().map(|(sid, _, _)| *sid).collect();
+            notify_dm_ended_to_webchat(
+                &state,
+                agent_id,
+                &from_name,
+                &reason_str,
+                &dm_context,
+                &run_target_ids,
+            )
+            .await;
+        }
 
         for (session_id, run_context_id, episode_job_id) in run_targets {
             info!(
@@ -1662,6 +1721,7 @@ mod tests {
                     from_agent: sender_agent_id,
                     from_name: "alice".to_string(),
                     reason: ConversationEndReason::Ignored,
+                    self_notification: false,
                     source_session_id: None,
                 },
                 context_id: notif_context_id.clone(),

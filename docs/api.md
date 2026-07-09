@@ -633,6 +633,8 @@ Emitted on the DM session SSE stream when a DM conversation between two agents e
 
 `reason` values: `"ignored"` (agent called `ignore_message`), `"depth_exceeded"` (MAX_DM_DEPTH reached), `"user_cancelled"` (operator cancelled the run via `POST /runs/{id}/cancel` or `POST /sessions/{id}/cancel-dm`), `"errored"` (the run failed mid-flight — LLM error, tool error, posture trip, etc.).
 
+`suppress_banner` (optional boolean, default `false`, omitted from the wire when `false`): present and `true` ONLY on the cross-session copy forwarded to an agent's user-facing web-chat (see `notify_dm_ended_to_webchat`) when the DM-end notification run is itself the visible notification in that same chat — so the reloadable `dm_ended_notification` marker is suppressed too. When `true`, clients must still clear any "Chatting with {peer}" DM status but must NOT render a "conversation ended" banner (the run is the single notification — avoids the live half of "initiator gets both"). Every DM-session-stream emission omits this field and always renders the banner. See #1215 / #1218.
+
 Note: If both agents call `ignore_message` simultaneously, duplicate `dm_conversation_ended` events may be emitted for the same session. Clients should handle duplicates gracefully.
 
 `dm_activity_started`

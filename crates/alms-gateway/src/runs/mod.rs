@@ -1770,7 +1770,8 @@ mod tests {
 
     #[test]
     fn test_dm_ended_notification_ignored_no_history() {
-        let msg = format_dm_ended_notification("alice", ConversationEndReason::Ignored, None);
+        let msg =
+            format_dm_ended_notification("alice", ConversationEndReason::Ignored, None, false);
         assert!(
             msg.starts_with("[DM conversation ended]"),
             "notification should start with the DM ended prefix"
@@ -1791,7 +1792,8 @@ mod tests {
 
     #[test]
     fn test_dm_ended_notification_depth_exceeded_no_history() {
-        let msg = format_dm_ended_notification("bob", ConversationEndReason::DepthExceeded, None);
+        let msg =
+            format_dm_ended_notification("bob", ConversationEndReason::DepthExceeded, None, false);
         assert!(
             msg.starts_with("[DM conversation ended]"),
             "notification should start with the DM ended prefix"
@@ -1812,7 +1814,7 @@ mod tests {
 
     #[test]
     fn test_dm_ended_notification_is_not_empty() {
-        let msg = format_dm_ended_notification("x", ConversationEndReason::Ignored, None);
+        let msg = format_dm_ended_notification("x", ConversationEndReason::Ignored, None, false);
         assert!(
             msg.len() > 50,
             "notification should be a substantive message, not a stub"
@@ -1822,8 +1824,12 @@ mod tests {
     #[test]
     fn test_dm_ended_notification_with_history() {
         let history = "[10:00] alice: Hello Bob\n[10:01] bob: Hi Alice, what's up?";
-        let msg =
-            format_dm_ended_notification("alice", ConversationEndReason::Ignored, Some(history));
+        let msg = format_dm_ended_notification(
+            "alice",
+            ConversationEndReason::Ignored,
+            Some(history),
+            false,
+        );
         assert!(
             msg.starts_with("[DM conversation ended]"),
             "notification should start with the DM ended prefix"
@@ -1848,10 +1854,60 @@ mod tests {
 
     #[test]
     fn test_dm_ended_notification_empty_history_falls_back() {
-        let msg = format_dm_ended_notification("alice", ConversationEndReason::Ignored, Some(""));
+        let msg =
+            format_dm_ended_notification("alice", ConversationEndReason::Ignored, Some(""), false);
         assert!(
             msg.contains("read_messages"),
             "empty history string should fall back to read_messages hint"
+        );
+    }
+
+    /// #1215: the ender's self-notification must NOT attribute the ending to
+    /// the PEER. For a self-notification `from_name` is the peer (the other
+    /// party), but the RECIPIENT is the agent that ended the DM — so a
+    /// peer-blaming phrasing is always wrong for it.
+    #[test]
+    fn test_dm_ended_self_notification_ignored_does_not_blame_peer() {
+        let msg = format_dm_ended_notification("alice", ConversationEndReason::Ignored, None, true);
+        assert!(
+            !msg.contains("Agent \"alice\" ended the conversation"),
+            "self-notification must NOT say the peer (alice) ended it; got: {msg}"
+        );
+        assert!(
+            msg.contains("Your DM conversation with agent \"alice\""),
+            "self-notification should use self-appropriate phrasing naming the \
+             peer only as the other party"
+        );
+        assert!(
+            msg.starts_with("[DM conversation ended]"),
+            "still uses the DM-ended template"
+        );
+    }
+
+    /// #1215: same non-misattribution for the depth-exceeded reason.
+    #[test]
+    fn test_dm_ended_self_notification_depth_does_not_blame_peer() {
+        let msg =
+            format_dm_ended_notification("bob", ConversationEndReason::DepthExceeded, None, true);
+        assert!(
+            !msg.contains("Agent \"bob\" ended"),
+            "self-notification must NOT attribute the ending to the peer (bob); got: {msg}"
+        );
+        assert!(
+            msg.contains("Your DM conversation with agent \"bob\""),
+            "self-notification should use self-appropriate phrasing"
+        );
+    }
+
+    /// #1215 guard: the PEER notification (self_notification=false) is
+    /// unchanged — it correctly tells the OTHER party that the ender ended it.
+    #[test]
+    fn test_dm_ended_peer_notification_still_names_ender() {
+        let ignored =
+            format_dm_ended_notification("alice", ConversationEndReason::Ignored, None, false);
+        assert!(
+            ignored.contains("Agent \"alice\" ended the conversation (chose not to reply)"),
+            "peer notification must still say the ender (alice) ended it; got: {ignored}"
         );
     }
 

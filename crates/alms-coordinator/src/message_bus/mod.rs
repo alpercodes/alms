@@ -123,6 +123,13 @@ pub enum MessageSource {
         from_agent: AgentId,
         from_name: String,
         reason: ConversationEndReason,
+        /// `true` for the ender's own self-notification (#556 / #1215): the
+        /// RECIPIENT is the agent that ended the DM, and `from_name` is the
+        /// PEER. The formatter must then use self-appropriate wording and must
+        /// NEVER attribute the ending to `from_name`. `false` for the peer
+        /// notification (the normal case), where `from_name` IS the ender and
+        /// "Agent {from_name} ended the conversation" is correct.
+        self_notification: bool,
         /// The session the target agent was in when they first called
         /// `send_message` for this DM pair (e.g. `web-chat-12345`).
         /// If present, the notification run is routed to this session so

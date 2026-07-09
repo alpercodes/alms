@@ -639,7 +639,10 @@ impl SseEventData {
     /// Session-level: a DM conversation between two agents has ended.
     ///
     /// Emitted on the DM session SSE stream so the web UI can show a
-    /// "conversation ended" indicator. See Phase 6 of #384.
+    /// "conversation ended" indicator. See Phase 6 of #384. Always renders
+    /// the live banner (`suppress_banner = false`); the banner-suppressing
+    /// variant is [`Self::dm_conversation_ended_webchat`], used only by the
+    /// web-chat forward.
     pub fn dm_conversation_ended(
         session_id: alms_core::SessionId,
         ended_by: &str,
@@ -656,6 +659,40 @@ impl SseEventData {
                 reason: reason.to_string(),
                 context_id: context_id.to_string(),
                 ts: Utc::now(),
+                suppress_banner: false,
+            },
+        )
+    }
+
+    /// The web-chat forward of a DM-end (`notify_dm_ended_to_webchat`).
+    ///
+    /// Identical to [`Self::dm_conversation_ended`] but with an explicit
+    /// `suppress_banner`: when `true` the frontend clears the "Chatting with
+    /// {peer}" phase WITHOUT rendering a live `dm_ended` banner. The web-chat
+    /// forward sets this to `!persist_marker`, so whenever the reloadable
+    /// marker is suppressed (the run is already the visible notification in
+    /// that chat) the live banner is suppressed too — killing the live half of
+    /// "initiator gets both" (#1215) while keeping the phase-clear
+    /// unconditional (#1218 C1). DM-session emitters must NOT use this — they
+    /// always render the banner — hence the separate constructor.
+    pub fn dm_conversation_ended_webchat(
+        session_id: alms_core::SessionId,
+        ended_by: &str,
+        peer: &str,
+        reason: &str,
+        context_id: &str,
+        suppress_banner: bool,
+    ) -> Self {
+        Self::new(
+            "dm_conversation_ended",
+            DmConversationEndedData {
+                session_id: session_id.0.to_string(),
+                ended_by: ended_by.to_string(),
+                peer: peer.to_string(),
+                reason: reason.to_string(),
+                context_id: context_id.to_string(),
+                ts: Utc::now(),
+                suppress_banner,
             },
         )
     }
@@ -1197,6 +1234,13 @@ struct DmMessageData {
     ts: DateTime<Utc>,
 }
 
+/// serde helper: omit a `bool` field from the wire when it is `false`, so the
+/// `dm_conversation_ended` shape is byte-identical for every emitter that does
+/// NOT opt into banner suppression (all DM-session emitters).
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
 #[derive(Debug, Serialize)]
 struct DmConversationEndedData {
     session_id: String,
@@ -1205,6 +1249,14 @@ struct DmConversationEndedData {
     reason: String,
     context_id: String,
     ts: DateTime<Utc>,
+    /// #1215 / #1218: when `true`, the frontend clears the DM phase but does
+    /// NOT render a live `dm_ended` banner. Set ONLY by the web-chat forward
+    /// (`dm_conversation_ended_webchat`) in the marker-suppression case, so a
+    /// source-having agent's web-chat is not shown a banner AND the run at the
+    /// same time (the live half of "initiator gets both"). Omitted (⇒ `false`)
+    /// for every DM-session emission, which must still render the banner.
+    #[serde(default, skip_serializing_if = "is_false")]
+    suppress_banner: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -1735,6 +1787,51 @@ mod tests {
         assert_eq!(event.data["reason"], "depth_exceeded");
         assert_eq!(event.data["context_id"], "dm:alice:bob");
         assert!(event.data["ts"].is_string(), "ts should be a string");
+    }
+
+    #[test]
+    fn test_dm_conversation_ended_suppress_banner_wire_shape() {
+        let session_id = alms_core::SessionId::new();
+
+        // Default constructor (DM-session emitters): banner NOT suppressed, and
+        // the field is OMITTED from the wire so the shape is unchanged.
+        let default = SseEventData::dm_conversation_ended(
+            session_id,
+            "alice",
+            "bob",
+            "ignored",
+            "dm:alice:bob",
+        );
+        assert!(
+            default.data.get("suppress_banner").is_none(),
+            "suppress_banner must be omitted (⇒ false) for DM-session emissions"
+        );
+
+        // Web-chat forward, suppress = true: field present and true.
+        let suppressed = SseEventData::dm_conversation_ended_webchat(
+            session_id,
+            "alice",
+            "bob",
+            "ignored",
+            "dm:alice:bob",
+            true,
+        );
+        assert_eq!(suppressed.event_type, "dm_conversation_ended");
+        assert_eq!(suppressed.data["suppress_banner"], true);
+
+        // Web-chat forward, suppress = false: field omitted, same as default.
+        let not_suppressed = SseEventData::dm_conversation_ended_webchat(
+            session_id,
+            "alice",
+            "bob",
+            "ignored",
+            "dm:alice:bob",
+            false,
+        );
+        assert!(
+            not_suppressed.data.get("suppress_banner").is_none(),
+            "suppress_banner=false must be omitted from the wire"
+        );
     }
 
     #[test]
