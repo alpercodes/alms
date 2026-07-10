@@ -9,11 +9,34 @@ use crate::event_log::{AgentEventLogManager, EventLogManager, LoggedEvent};
 use crate::sse::SseEventData;
 use alms_core::{AgentId, Run, RunId, SessionId};
 use dashmap::DashMap;
+use parking_lot::Mutex;
+use std::collections::HashMap;
+use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::task::{Context, Poll};
 use tokio::sync::mpsc;
+use tokio_stream::Stream;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
+
+/// Fixed internal key for the DEDICATED [`RunManager::activity_event_log`]
+/// instance that backs the global cross-agent session-activity feed
+/// (`GET /events/session-activity`, #1211).
+///
+/// Its value is irrelevant to correctness: `activity_event_log` is a
+/// SEPARATE `AgentEventLogManager` from the per-agent `agent_event_log`, and
+/// the global feed's subscribers live in a SEPARATE `activity_senders` list
+/// — never in the `AgentId`-indexed `agent_senders` map. That separation is
+/// deliberate and load-bearing: `ALMS_AGENT_ID`, the sidecar loader, and the
+/// registry all accept an ARBITRARY agent UUID, so any key shared with the
+/// per-agent namespace could be claimed by a real agent and (a) leak every
+/// other agent's activity onto its supposedly agent-scoped
+/// `/agents/{id}/events` feed and (b) make its own activity skip the mirror.
+/// Keeping the activity feed in its own namespace makes that whole collision
+/// class impossible by construction. Private — never routed or accepted as
+/// an agent id.
+const ACTIVITY_LOG_KEY: AgentId = AgentId(uuid::Uuid::from_bytes([0xAC; 16]));
 
 /// Per-run accumulator of in-flight visible-reply text for the current
 /// parent-agent turn (#1107).
@@ -35,6 +58,37 @@ pub struct RunTextBuffer {
     pub last_session_event_id: Option<u64>,
 }
 
+/// Live subscription to the global session-activity feed.
+///
+/// Dropping the stream unregisters its sender immediately, so idle browser
+/// disconnects and agent switches cannot accumulate stale subscribers.
+pub(crate) struct ActivitySubscription {
+    id: u64,
+    receiver: mpsc::UnboundedReceiver<SseEventData>,
+    senders: Arc<Mutex<HashMap<u64, mpsc::UnboundedSender<SseEventData>>>>,
+}
+
+impl Stream for ActivitySubscription {
+    type Item = SseEventData;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        self.receiver.poll_recv(cx)
+    }
+}
+
+impl ActivitySubscription {
+    #[cfg(test)]
+    pub(crate) fn try_recv(&mut self) -> Result<SseEventData, mpsc::error::TryRecvError> {
+        self.receiver.try_recv()
+    }
+}
+
+impl Drop for ActivitySubscription {
+    fn drop(&mut self) {
+        self.senders.lock().remove(&self.id);
+    }
+}
+
 /// Run manager for tracking runs and their event streams
 #[derive(Debug, Clone)]
 pub struct RunManager {
@@ -53,6 +107,25 @@ pub struct RunManager {
     /// Agent-scoped event log for `Last-Event-Id` reconnect on the
     /// agent-scoped feed.
     pub agent_event_log: AgentEventLogManager,
+    /// Subscriber list for the GLOBAL cross-agent session-activity feed
+    /// (`GET /events/session-activity`, #1211). A DEDICATED namespace,
+    /// separate from the `AgentId`-indexed `agent_senders` map, so no
+    /// operator-supplied agent id can ever collide with it and leak
+    /// cross-agent activity onto a per-agent feed. Held behind a
+    /// `parking_lot::Mutex` — only ever locked for brief, await-free
+    /// insert / send / remove sections. Each entry is removed by its
+    /// [`ActivitySubscription`] drop guard as soon as the HTTP stream closes.
+    activity_senders: Arc<Mutex<HashMap<u64, mpsc::UnboundedSender<SseEventData>>>>,
+    next_activity_subscription_id: Arc<AtomicU64>,
+    /// Serializes authoritative session-activity snapshots with global event
+    /// logging, so concurrent run transitions cannot publish an older
+    /// `has_active_run` value after a newer one.
+    activity_event_gate: Arc<tokio::sync::Mutex<()>>,
+    /// Event log backing `Last-Event-Id` replay on the global activity feed
+    /// (#1211). A dedicated `AgentEventLogManager` instance (separate from
+    /// `agent_event_log`), keyed internally by [`ACTIVITY_LOG_KEY`]. Reuses
+    /// the agent-log machinery for the `AGENT_EVENT_LOG_MAX` bound + replay.
+    activity_event_log: AgentEventLogManager,
     /// Per-run accumulator of in-flight visible-reply text (#1107).
     ///
     /// `token_delta` SSE events are deliberately *not* persisted to either
@@ -87,6 +160,10 @@ impl RunManager {
             session_event_log: crate::event_log::SessionEventLogManager::new(),
             agent_senders: Arc::new(DashMap::new()),
             agent_event_log: AgentEventLogManager::new(),
+            activity_senders: Arc::new(Mutex::new(HashMap::new())),
+            next_activity_subscription_id: Arc::new(AtomicU64::new(1)),
+            activity_event_gate: Arc::new(tokio::sync::Mutex::new(())),
+            activity_event_log: AgentEventLogManager::new(),
             run_text_buffers: Arc::new(DashMap::new()),
             in_flight: Arc::new(AtomicUsize::new(0)),
             drain_notify: Arc::new(tokio::sync::Notify::new()),
@@ -782,13 +859,46 @@ impl RunManager {
     /// Filtering is performed at the sender map: only subscribers to
     /// `agent_id`'s feed receive the event. Subscribers to other agents'
     /// feeds (or no feed at all) are unaffected.
+    ///
+    /// **#1211 global mirror:** `session_activity_*` events are ALSO
+    /// mirrored onto the global cross-agent activity feed via
+    /// [`send_activity_event`](Self::send_activity_event) so the web UI
+    /// sidebar can light the active-run dot on sessions owned by ANY agent
+    /// (jobs, DMs, and other agents' sessions surfaced in the sidebar's
+    /// cross-agent sections), not just the operator's currently-active
+    /// agent. The per-agent fan-out below stays scoped — its isolation is
+    /// relied on by other consumers — and the global feed lives in a
+    /// SEPARATE namespace (`activity_senders` / `activity_event_log`), so
+    /// per-agent replay and isolation are unaffected.
     pub async fn send_agent_event(
         &self,
         agent_id: AgentId,
         run_id: RunId,
         session_id: SessionId,
-        event: SseEventData,
+        mut event: SseEventData,
     ) {
+        // Mirror session-activity onto the global cross-agent feed BEFORE the
+        // per-agent fan-out consumes `event`. Unconditional for
+        // `session_activity_*` — there is deliberately NO `agent_id` guard:
+        // the global feed is a separate namespace (no recursion possible),
+        // and an operator MAY legitimately set an agent's id (via
+        // `ALMS_AGENT_ID`, the sidecar, or the registry) to any UUID, so
+        // every agent's activity — including a hypothetical id-collision —
+        // must still reach the global feed.
+        if event.event_type.starts_with("session_activity") {
+            let _activity_guard = self.activity_event_gate.lock().await;
+            if let Some(data) = event.data.as_object_mut() {
+                data.insert(
+                    "has_active_run".to_string(),
+                    serde_json::Value::Bool(self.has_active_runs(session_id)),
+                );
+            }
+            self.send_activity_event(run_id, session_id, event.clone())
+                .await;
+        }
+
+        // Per-agent fan-out (#856), unchanged: log to the agent-scoped event
+        // log and deliver to that agent's `/agents/{id}/events` subscribers.
         let event_id = self
             .agent_event_log
             .log_event(
@@ -811,9 +921,62 @@ impl RunManager {
         }
     }
 
+    /// Log + fan out a `session_activity_*` event onto the GLOBAL cross-agent
+    /// activity feed (`GET /events/session-activity`, #1211).
+    ///
+    /// Uses the DEDICATED `activity_senders` list + `activity_event_log`
+    /// instance, never the `AgentId`-indexed per-agent maps, so no
+    /// operator-supplied agent id can collide with the feed and leak activity
+    /// across the per-agent isolation boundary. The event-log reuse gives
+    /// `Last-Event-Id` replay and the `AGENT_EVENT_LOG_MAX` bound for free.
+    async fn send_activity_event(&self, run_id: RunId, session_id: SessionId, event: SseEventData) {
+        let event_id = self
+            .activity_event_log
+            .log_event(
+                ACTIVITY_LOG_KEY,
+                run_id,
+                session_id,
+                &event.event_type,
+                event.data.clone(),
+            )
+            .await;
+        let mut tagged = event;
+        tagged.event_id = Some(event_id);
+
+        // Brief, await-free critical section — the lock is never held across
+        // an `.await` (the log write above already completed).
+        let mut senders = self.activity_senders.lock();
+        senders.retain(|_, sender| sender.send(tagged.clone()).is_ok());
+    }
+
+    /// Subscribe to the global cross-agent session-activity feed.
+    ///
+    /// The returned stream unregisters itself on drop, including when the
+    /// browser disconnects before any further activity is broadcast.
+    pub(crate) fn subscribe_activity(&self) -> ActivitySubscription {
+        let id = self
+            .next_activity_subscription_id
+            .fetch_add(1, Ordering::Relaxed);
+        let (sender, receiver) = mpsc::unbounded_channel();
+        self.activity_senders.lock().insert(id, sender);
+        ActivitySubscription {
+            id,
+            receiver,
+            senders: Arc::clone(&self.activity_senders),
+        }
+    }
+
     /// Get agent-scoped events from a specific ID for SSE reconnect (#856).
     pub async fn agent_events_from(&self, agent_id: AgentId, from_id: u64) -> Vec<LoggedEvent> {
         self.agent_event_log.events_from(agent_id, from_id).await
+    }
+
+    /// Get global cross-agent session-activity events from a specific ID for
+    /// SSE reconnect (#1211). Backs `Last-Event-Id` replay on the global feed.
+    pub async fn activity_events_from(&self, from_id: u64) -> Vec<LoggedEvent> {
+        self.activity_event_log
+            .events_from(ACTIVITY_LOG_KEY, from_id)
+            .await
     }
 
     /// Close all active SSE sender channels (per-run, per-session, per-agent).
@@ -829,10 +992,17 @@ impl RunManager {
         self.event_senders.clear();
         self.session_senders.clear();
         self.agent_senders.clear();
-        if run_count + session_count + agent_count > 0 {
+        // Global cross-agent activity feed (#1211) — dedicated sender list.
+        let activity_count = {
+            let mut senders = self.activity_senders.lock();
+            let n = senders.len();
+            senders.clear();
+            n
+        };
+        if run_count + session_count + agent_count + activity_count > 0 {
             info!(
-                "Closed {} per-run, {} per-session, and {} per-agent SSE sender(s) for shutdown",
-                run_count, session_count, agent_count
+                "Closed {} per-run, {} per-session, {} per-agent, and {} activity SSE sender(s) for shutdown",
+                run_count, session_count, agent_count, activity_count
             );
         }
     }
@@ -1722,5 +1892,87 @@ mod tests {
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].event_type, "session_activity_started");
         assert_eq!(events[1].event_type, "session_activity_ended");
+    }
+
+    /// The global feed publishes the authoritative session-level predicate,
+    /// not a last-event-wins interpretation of one run's terminal event.
+    #[tokio::test]
+    async fn test_activity_events_are_cardinality_safe_for_overlapping_runs() {
+        let rm = RunManager::new();
+        let agent_a = AgentId::new();
+        let agent_b = AgentId::new();
+        let session_id = SessionId::new();
+        let mut subscription = rm.subscribe_activity();
+
+        let run_a = Run::new(session_id, agent_a, "a".into());
+        let run_a_id = run_a.run_id;
+        rm.insert_run(run_a);
+        rm.mark_run_as_running(run_a_id);
+        rm.send_agent_event(
+            agent_a,
+            run_a_id,
+            session_id,
+            SseEventData::session_activity_started(session_id, run_a_id, agent_a),
+        )
+        .await;
+        let started_a = subscription.try_recv().expect("first start event");
+        assert_eq!(started_a.data["has_active_run"], true);
+
+        let run_b = Run::new(session_id, agent_b, "b".into());
+        let run_b_id = run_b.run_id;
+        rm.insert_run(run_b);
+        rm.mark_run_as_running(run_b_id);
+        rm.send_agent_event(
+            agent_b,
+            run_b_id,
+            session_id,
+            SseEventData::session_activity_started(session_id, run_b_id, agent_b),
+        )
+        .await;
+        let started_b = subscription.try_recv().expect("second start event");
+        assert_eq!(started_b.data["has_active_run"], true);
+
+        assert!(rm.mark_run_as_completed(run_a_id, "done a".into(), Default::default()));
+        rm.send_agent_event(
+            agent_a,
+            run_a_id,
+            session_id,
+            SseEventData::session_activity_ended(session_id, run_a_id, agent_a),
+        )
+        .await;
+        let ended_a = subscription.try_recv().expect("first end event");
+        assert_eq!(
+            ended_a.data["has_active_run"], true,
+            "the second run keeps the session active"
+        );
+
+        assert!(rm.mark_run_as_completed(run_b_id, "done b".into(), Default::default()));
+        rm.send_agent_event(
+            agent_b,
+            run_b_id,
+            session_id,
+            SseEventData::session_activity_ended(session_id, run_b_id, agent_b),
+        )
+        .await;
+        let ended_b = subscription.try_recv().expect("final end event");
+        assert_eq!(
+            ended_b.data["has_active_run"], false,
+            "the final run clears the session activity"
+        );
+    }
+
+    #[test]
+    fn test_activity_subscriptions_unregister_on_drop_without_broadcast() {
+        let rm = RunManager::new();
+
+        for _ in 0..100 {
+            let subscription = rm.subscribe_activity();
+            assert_eq!(rm.activity_senders.lock().len(), 1);
+            drop(subscription);
+            assert!(
+                rm.activity_senders.lock().is_empty(),
+                "dropping an idle subscription must unregister it immediately"
+            );
+        }
     }
 }

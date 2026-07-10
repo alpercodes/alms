@@ -842,6 +842,16 @@ impl RunEventStream {
         receiver: mpsc::UnboundedReceiver<SseEventData>,
         replay: Vec<SseEventData>,
     ) -> Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>> {
+        Self::stream_with_replay_source(UnboundedReceiverStream::new(receiver), replay)
+    }
+
+    pub fn stream_with_replay_source<S>(
+        live_stream: S,
+        replay: Vec<SseEventData>,
+    ) -> Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>>
+    where
+        S: tokio_stream::Stream<Item = SseEventData> + Send + 'static,
+    {
         // Track the highest event_id in the replay set so we can deduplicate
         // events that arrive on both the replay snapshot and the live channel
         // (possible because we register-before-replay to close the race gap).
@@ -865,7 +875,7 @@ impl RunEventStream {
             Ok::<_, Infallible>(event)
         }));
 
-        let live_stream = UnboundedReceiverStream::new(receiver)
+        let live_stream = live_stream
             .filter(move |data| {
                 // Skip events already delivered during replay
                 !matches!(data.event_id, Some(id) if id <= max_replay_id)

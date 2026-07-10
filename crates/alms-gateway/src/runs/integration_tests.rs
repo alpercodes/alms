@@ -4553,6 +4553,224 @@ async fn agent_session_activity_feed_filters_by_agent_id() {
     shutdown_token.cancel();
 }
 
+/// Subscribe to the GLOBAL cross-agent session-activity feed (#1211) —
+/// mirrors what `stream_session_activity` (`GET /events/session-activity`)
+/// registers, the feed the web UI sidebar subscribes to for the active-run
+/// dot across every agent's sessions.
+fn subscribe_activity(state: &AppState) -> crate::server::ActivitySubscription {
+    state.run_manager.subscribe_activity()
+}
+
+fn drain_activity_events(
+    subscription: &mut crate::server::ActivitySubscription,
+) -> Vec<SseEventData> {
+    let mut events = Vec::new();
+    while let Ok(event) = subscription.try_recv() {
+        events.push(event);
+    }
+    events
+}
+
+/// Drive a REAL run to completion through the full `execute_run` path
+/// (mock LLM) so the `session_activity_started` / `_ended` lifecycle events
+/// fire exactly as they do in production. Used by the #1211 activity-feed
+/// regression tests.
+async fn drive_activity_run(
+    state: &AppState,
+    agent_id: AgentId,
+    session_id: SessionId,
+    ctx: &str,
+    input: &str,
+) {
+    let run = Run::new(session_id, agent_id, input.to_string());
+    let run_id = run.run_id;
+    state.run_manager.insert_run(run.clone());
+    let cancel_token = CancellationToken::new();
+    state
+        .run_manager
+        .register_cancel_token(run_id, cancel_token.clone());
+    super::lifecycle::execute_run(
+        state.clone(),
+        super::RunParams {
+            run_id,
+            session_id,
+            agent_id,
+            input: run.input,
+            context_id: ctx.to_string(),
+            cancel_token,
+            is_peer_message: false,
+            is_system_triggered: false,
+            input_pre_persisted: false,
+        },
+    )
+    .await;
+}
+
+/// The set of `session_id`s a feed saw a `session_activity_started` for.
+fn started_session_ids(events: &[SseEventData]) -> std::collections::HashSet<String> {
+    events
+        .iter()
+        .filter(|e| e.event_type == "session_activity_started")
+        .filter_map(|e| e.data.get("session_id").and_then(|v| v.as_str()))
+        .map(|s| s.to_string())
+        .collect()
+}
+
+/// Regression pin for #1211 (root cause located by live repro): the sidebar
+/// surfaces sessions owned by agents OTHER than the currently-active one
+/// (the cross-agent Jobs / Direct-messages / Notifications sections), but
+/// the per-agent feed (`GET /agents/{id}/events`) is scoped to a single
+/// agent — so a run on another agent's session never reached the active
+/// agent's feed and its active-run dot never lit unless the row was
+/// selected.
+///
+/// This drives REAL runs (mock LLM, full `execute_run`) on two agents and
+/// asserts:
+///
+/// - The **global** activity feed (`/events/session-activity`) receives
+///   `session_activity_started` for runs on BOTH agents' sessions — the
+///   delivery the sidebar needs.
+/// - The **per-agent** feed for agent A receives ONLY agent A's activity —
+///   the (intentional, unchanged) per-agent scoping that made the global
+///   feed necessary in the first place. Agent B's activity is exactly what
+///   the pre-fix live repro observed missing from A's feed.
+#[tokio::test]
+async fn cross_agent_activity_reaches_global_feed_not_per_agent_feed() {
+    let (state, shutdown_token, _cr, _tr, _dr) = test_app_state_with_mock_llm();
+
+    let agent_a = AgentId::new();
+    let agent_b = AgentId::new();
+
+    let sess_a = state
+        .session_manager
+        .get_or_create(agent_a, "chat-a-other")
+        .id;
+    let sess_b = state.session_manager.get_or_create(agent_b, "job_b").id;
+
+    // The active agent A's per-agent feed (what the sidebar subscribed to
+    // pre-#1211) and the global cross-agent feed (post-#1211).
+    let mut feed_a = subscribe_agent(&state, agent_a);
+    let mut feed_global = subscribe_activity(&state);
+
+    // Run on agent A's OWN session, then on agent B's session.
+    drive_activity_run(&state, agent_a, sess_a, "chat-a-other", "hi from A other").await;
+    drive_activity_run(&state, agent_b, sess_b, "job_b", "hi from B job").await;
+
+    let global_started = started_session_ids(&drain_activity_events(&mut feed_global));
+    let per_agent_a_started = started_session_ids(&drain_events(&mut feed_a));
+
+    // The global feed carries BOTH agents' activity — this is what lets the
+    // sidebar light the dot on a cross-agent (agent B) session.
+    assert!(
+        global_started.contains(&sess_a.0.to_string()),
+        "global activity feed must carry agent A's session activity; saw {global_started:?}"
+    );
+    assert!(
+        global_started.contains(&sess_b.0.to_string()),
+        "global activity feed must carry agent B's (cross-agent) session activity — \
+         this is the #1211 delivery the per-agent feed could not provide; saw {global_started:?}"
+    );
+
+    // The per-agent feed stays scoped: A sees its own, never B's. (B's
+    // absence here is exactly the pre-fix repro: the sidebar, subscribed
+    // only to A's feed, never learned about B's active run.)
+    assert!(
+        per_agent_a_started.contains(&sess_a.0.to_string()),
+        "agent A's per-agent feed must carry its own activity; saw {per_agent_a_started:?}"
+    );
+    assert!(
+        !per_agent_a_started.contains(&sess_b.0.to_string()),
+        "agent A's per-agent feed must NOT carry agent B's activity (per-agent scoping is \
+         intentional and unchanged); saw {per_agent_a_started:?}"
+    );
+
+    shutdown_token.cancel();
+}
+
+/// Isolation regression for the #1220 review (Codex): the global
+/// session-activity feed must live in its own namespace so NO agent id can
+/// collide with it — not even the `acacacac-…` value an earlier draft used
+/// as a shared `agent_senders` key. `ALMS_AGENT_ID` / the sidecar / the
+/// registry all accept an arbitrary UUID, so an operator could name an agent
+/// exactly that. This drives real runs with an agent whose id IS that value
+/// and asserts the two failure modes a shared namespace would have caused:
+///
+/// - **No leak:** the colliding-id agent's own `/agents/{id}/events` feed
+///   must NOT receive another agent's `session_activity_*` (the per-agent
+///   isolation boundary holds even for this id).
+/// - **No skipped mirror:** the colliding-id agent's OWN activity must still
+///   reach the global feed (the mirror is unconditional — no `agent_id`
+///   guard that a colliding id could trip).
+#[tokio::test]
+async fn global_activity_feed_isolated_from_agent_with_colliding_id() {
+    let (state, shutdown_token, _cr, _tr, _dr) = test_app_state_with_mock_llm();
+
+    // The exact value an earlier draft used as the shared activity-feed key.
+    // An operator can legitimately set an agent to this id.
+    let colliding = AgentId(uuid::Uuid::from_bytes([0xAC; 16]));
+    let other = AgentId::new();
+
+    let sess_colliding = state
+        .session_manager
+        .get_or_create(colliding, "chat-collide")
+        .id;
+    let sess_other = state.session_manager.get_or_create(other, "job-other").id;
+
+    // The colliding-id agent's own per-agent feed + the global feed.
+    let mut feed_colliding = subscribe_agent(&state, colliding);
+    let mut feed_global = subscribe_activity(&state);
+
+    // A run on a DIFFERENT agent's session.
+    drive_activity_run(&state, other, sess_other, "job-other", "hi from other").await;
+
+    let colliding_pa = started_session_ids(&drain_events(&mut feed_colliding));
+    let global_after_other = started_session_ids(&drain_activity_events(&mut feed_global));
+
+    // No leak: the other agent's activity must NOT land on the colliding-id
+    // agent's per-agent feed (pre-fix, a shared namespace would have leaked
+    // EVERY agent's activity here).
+    assert!(
+        !colliding_pa.contains(&sess_other.0.to_string()),
+        "per-agent isolation must hold even for the colliding id — the other agent's \
+         activity must NOT reach it; saw {colliding_pa:?}"
+    );
+    // The global feed does carry it (sanity — it's cross-agent).
+    assert!(
+        global_after_other.contains(&sess_other.0.to_string()),
+        "global feed must carry the other agent's activity; saw {global_after_other:?}"
+    );
+
+    // Now a run on the COLLIDING-id agent's OWN session.
+    drive_activity_run(
+        &state,
+        colliding,
+        sess_colliding,
+        "chat-collide",
+        "hi from collide",
+    )
+    .await;
+
+    let global_after_collide = started_session_ids(&drain_activity_events(&mut feed_global));
+    let colliding_pa_own = started_session_ids(&drain_events(&mut feed_colliding));
+
+    // No skipped mirror: the colliding-id agent's OWN activity must still
+    // reach the global feed (pre-fix, an `agent_id == ACTIVITY_FEED_KEY`
+    // guard would have skipped it).
+    assert!(
+        global_after_collide.contains(&sess_colliding.0.to_string()),
+        "the colliding-id agent's own activity must still mirror to the global feed \
+         (the mirror is unconditional); saw {global_after_collide:?}"
+    );
+    // And it does reach its own per-agent feed (ordinary behaviour).
+    assert!(
+        colliding_pa_own.contains(&sess_colliding.0.to_string()),
+        "the colliding-id agent's own per-agent feed must carry its own activity; \
+         saw {colliding_pa_own:?}"
+    );
+
+    shutdown_token.cancel();
+}
+
 /// Pre-cancellation in `execute_run` emits a synthetic
 /// `session_activity_ended` (without a paired `session_activity_started`)
 /// so the sidebar's snapshot-derived "active" indicator clears (#888).
@@ -6521,6 +6739,7 @@ async fn execute_run_rejects_overbudget_resolved_config_on_non_http_path() {
     state
         .run_manager
         .register_cancel_token(run_id, cancel_token.clone());
+    let mut activity_feed = subscribe_activity(&state);
 
     let in_flight_before = state.run_manager.in_flight_count();
 
@@ -6543,6 +6762,28 @@ async fn execute_run_rejects_overbudget_resolved_config_on_non_http_path() {
         },
     )
     .await;
+    // PR #1220 review regression: the budget-rejection arm must emit its
+    // terminal activity after flipping Queued -> Failed. Otherwise the
+    // authoritative snapshot still sees this run as active and leaves the
+    // sidebar dot stuck.
+    let activity_events = drain_activity_events(&mut activity_feed);
+    let run_id_text = run_id.0.to_string();
+    let ended = activity_events
+        .iter()
+        .find(|event| {
+            event.event_type == "session_activity_ended"
+                && event.data.get("run_id").and_then(|value| value.as_str())
+                    == Some(run_id_text.as_str())
+        })
+        .expect("budget-rejected run must publish terminal session activity");
+    assert_eq!(
+        ended
+            .data
+            .get("has_active_run")
+            .and_then(|value| value.as_bool()),
+        Some(false),
+        "budget-rejected run terminal activity must carry the settled false predicate",
+    );
 
     // 1. Terminal status is Failed — the budget arm fired before any LLM
     //    call. NOT Cancelled (would mean the cancel-token early-exit fired

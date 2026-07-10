@@ -227,25 +227,31 @@ async function loadAgentSessions(agentId, preferredSessionId) {
         // Seed cross-session activity indicators (#856) from the
         // `has_active_run` snapshot so the sidebar's yellow dot shows
         // up immediately on boot / agent switch / reload-mid-run, even
-        // before the first SSE event arrives on the agent feed.
+        // before the first SSE event arrives on the global activity feed.
         //
-        // Tim observation on PR #1100: this iterates `agentSessions`,
-        // which is already chat-only after `filterChatSessions` above.
-        // Notification rows always carry `has_active_run = false`
-        // anyway (notifications never run), but keeping the filter
-        // upstream of this loop means any future consumer of
-        // `agentSessions` doesn't have to remember the contract.
+        // #1211: seed from the active agent's chat sessions AND the
+        // cross-agent surfaces (`crossAgent`). The sidebar renders
+        // cross-agent Jobs / DMs owned by OTHER agents, and those can
+        // have a live run at boot/switch time — seeding only
+        // `agentSessions` (Tim's PR #1100 note: chat-only after
+        // `filterChatSessions`) left their dot dark until the row was
+        // selected. `crossAgent` carries `has_active_run` for every
+        // surfaced session (notifications are always `false` — they
+        // never run — so including them is harmless), and duplicate ids
+        // across the two lists collapse to the same `bgRuns` entry.
         const seedBg = {};
-        for (const s of agentSessions) {
+        for (const s of [...agentSessions, ...crossAgent]) {
             if (s.has_active_run) {
                 seedBg[s.id] = { runId: null, finished: false };
             }
         }
         bgRuns.value = seedBg;
 
-        // Open the agent-scoped SSE feed so subsequent transitions
-        // (`session_activity_started` / `session_activity_ended`)
-        // update bgRuns live.  Closes any previously open stream.
+        // Open the global cross-agent activity SSE feed so subsequent
+        // transitions (`session_activity_started` / `session_activity_ended`)
+        // update bgRuns live.  Closes any previously open stream. `agentId`
+        // is passed only as the teardown/reopen scoping token (#1211 — the
+        // feed itself is global, not per-agent).
         openAgentEventsStream(agentId);
 
         // If a caller-supplied `preferredSessionId` was passed (cross-agent

@@ -38,7 +38,8 @@ pub(crate) use notifications::{
     scheduler_fire_loop,
 };
 pub use streaming::{
-    SessionEventsQuery, stream_agent_events, stream_run_events, stream_session_events,
+    SessionEventsQuery, stream_agent_events, stream_run_events, stream_session_activity,
+    stream_session_events,
 };
 pub(crate) use subagent_self_sink::GatewaySubagentSelfSink;
 

@@ -1581,6 +1581,17 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
                 ),
             )
             .await;
+        // Flip the run before publishing terminal session activity so
+        // `send_agent_event` snapshots the authoritative post-transition
+        // `has_active_run` value. Keep `run_error` first: clients rely on
+        // that pre-existing rejection-message wire ordering (#919).
+        // #1046 / #1052: bool intentionally ignored - this pre-flight arm
+        // runs before worker dispatch. If cancellation won concurrently,
+        // the terminal state is already absorbing and the activity snapshot
+        // below is still false for this run.
+        let _ = state
+            .run_manager
+            .mark_run_as_failed(run_id, message.clone());
         state
             .run_manager
             .send_agent_event(
@@ -1591,16 +1602,8 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
             )
             .await;
         // #1046 / #1052: bool intentionally ignored — this is the
-        // pre-flight token-budget rejection path that fires before the
-        // run is even dispatched to a worker, so no concurrent path
-        // could have raced and won the state flip. The `run_error` SSE
-        // above is the pre-existing #895 violation (broadcast first then
-        // flip) preserved here to keep the rejection-message wire shape
-        // stable for clients branching on
-        // `INVALID_TOKEN_BUDGET_FOR_PROVIDER`.
-        let _ = state
-            .run_manager
-            .mark_run_as_failed(run_id, message.clone());
+        // pre-flight rejection path before worker dispatch. The state flip
+        // now happens above the terminal activity emission (#1220 review).
 
         // B4 (#1154): notify the DM peer when a peer-triggered DM run is
         // rejected by the token-budget validator — same rationale as the

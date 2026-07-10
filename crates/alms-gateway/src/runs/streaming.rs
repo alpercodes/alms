@@ -361,3 +361,68 @@ pub async fn stream_agent_events(
 
     Ok(RunEventStream::stream_with_replay(rx, replay_events).into_response())
 }
+
+/// GET /events/session-activity — GLOBAL cross-agent session-activity feed
+/// (#1211).
+///
+/// Carries `session_activity_started` / `session_activity_ended` for runs
+/// across **every** agent's sessions. The web UI sidebar surfaces sessions
+/// owned by agents OTHER than the currently-active one — the cross-agent
+/// Jobs / Direct-messages / Notifications sections — so a single per-agent
+/// feed (`GET /agents/{id}/events`) cannot light their active-run dot: a
+/// run on another agent's session never reaches the active agent's feed.
+/// This global feed closes that gap; the frontend subscribes to it (instead
+/// of the per-agent feed) to drive `bgRuns` and the sidebar's blinking dot.
+///
+/// Backed by a DEDICATED global sender list + event log (separate from the
+/// per-agent maps, so no operator-supplied agent id can collide with it and
+/// leak activity across the per-agent isolation boundary), reusing the
+/// agent event-log machinery so `Last-Event-Id` replay and graceful
+/// shutdown work identically. There is no per-agent path parameter and
+/// hence no registry existence check — the feed is global and any
+/// authenticated client may subscribe.
+///
+/// Supports `Last-Event-Id` header for browser auto-reconnect plus
+/// `?last_event_id=<n>` query parameter for the initial connection.
+#[instrument(level = "info", skip(state, headers, query))]
+pub async fn stream_session_activity(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<SessionEventsQuery>,
+) -> impl IntoResponse {
+    // Query parameter takes precedence over header (the header is only
+    // sent by the browser on automatic reconnects).
+    let last_event_id = query
+        .last_event_id
+        .as_deref()
+        .and_then(|v| v.parse::<u64>().ok())
+        .or_else(|| {
+            headers
+                .get("last-event-id")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.parse::<u64>().ok())
+        });
+    let from_id = last_event_id.map(|id| id + 1).unwrap_or(0);
+
+    let subscription = state.run_manager.subscribe_activity();
+
+    let logged_events = state.run_manager.activity_events_from(from_id).await;
+    let replay_events: Vec<SseEventData> = logged_events
+        .into_iter()
+        .map(|e| SseEventData {
+            event_type: e.event_type,
+            data: e.data,
+            ts: e.ts,
+            event_id: Some(e.event_id),
+        })
+        .collect();
+
+    if !replay_events.is_empty() {
+        info!(
+            "Replaying {} global session-activity events",
+            replay_events.len()
+        );
+    }
+
+    RunEventStream::stream_with_replay_source(subscription, replay_events).into_response()
+}

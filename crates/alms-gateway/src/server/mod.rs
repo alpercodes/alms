@@ -11,6 +11,8 @@ pub(crate) mod routes;
 mod run_manager;
 mod state;
 
+#[cfg(test)]
+pub(crate) use run_manager::ActivitySubscription;
 pub use run_manager::RunManager;
 pub use state::{AppState, ServerLlmDefault};
 

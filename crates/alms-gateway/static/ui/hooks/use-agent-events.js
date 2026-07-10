@@ -1,24 +1,32 @@
 /**
- * Agent-scoped SSE stream — drives the cross-session activity indicator
- * on the sidebar (#856).
+ * Global cross-agent session-activity SSE stream — drives the
+ * cross-session active-run indicator (blinking yellow dot) on the sidebar
+ * (#856, made cross-agent in #1211).
  *
- * Opens a single EventSource to `/agents/{agentId}/events` per active
- * agent. The feed carries `session_activity_started` /
- * `session_activity_ended` events for runs across **all** of the agent's
- * sessions, which lets the sidebar light up the yellow blinking dot on
- * any session — not just the currently-viewed one.
+ * Opens a single EventSource to `/events/session-activity`. Unlike the
+ * per-agent feed (`/agents/{id}/events`) this stream carries
+ * `session_activity_started` / `session_activity_ended` for runs across
+ * **every** agent's sessions. That is load-bearing: the sidebar surfaces
+ * sessions owned by agents OTHER than the currently-active one — the
+ * cross-agent Jobs / Direct-messages / Notifications sections — so a
+ * per-agent feed could never light their dot (#1211: a run on another
+ * agent's session never reached the active agent's feed, so the dot only
+ * lit on the currently-selected session).
  *
  * Lifecycle:
  *   1. `boot()` / `switchAgent()` calls `openAgentEventsStream(agentId)`
- *      after seeding `bgRuns` from the `has_active_run` snapshot returned
+ *      after seeding `bgRuns` from the `has_active_run` snapshot of BOTH
+ *      the active agent's sessions AND the cross-agent surfaces returned
  *      by `GET /sessions`.
- *   2. While open, `session_activity_started` writes `bgRuns[sessionId]`,
- *      `session_activity_ended` removes it. `hasActiveRun()` in
+ *   2. While open, both activity event types apply the backend's
+ *      authoritative `has_active_run` value. This keeps overlapping runs
+ *      cardinality-safe. `hasActiveRun()` in
  *      `session-list.js` reads `bgRuns` to decide whether to render the
  *      `.has-run` class.
- *   3. `switchAgent()` calls `closeAgentEventsStream()` before opening
- *      the new agent's feed; `bgRuns` is cleared and re-seeded from the
- *      new agent's `/sessions` snapshot.
+ *   3. `switchAgent()` calls `closeAgentEventsStream()` before reopening;
+ *      `bgRuns` is cleared and re-seeded from the fresh snapshot. The feed
+ *      is global, so `agentId` is retained only as the teardown/reopen
+ *      scoping token (not part of the URL).
  *
  * The synthetic-`ended` semantics from the backend (pre-cancelled runs
  * emit only `session_activity_ended` without a paired `started`) are
@@ -34,7 +42,8 @@
  *     (`openSessionStream`) which handles the chat view's events.
  */
 
-import { setBgRun, removeBgRun } from '../state/queue.js';
+import { listSessions } from '../api/sessions.js';
+import { bgRuns, setBgRun, removeBgRun } from '../state/queue.js';
 import {
     markStreamDead,
     clearStreamDead,
@@ -54,6 +63,41 @@ let lastSeenEventId = null;
  * Suggestion 1).
  */
 let backoffTimer = null;
+
+/**
+ * Apply one activity transition using the backend's authoritative
+ * session-level predicate. The event type is only a compatibility fallback
+ * for an older gateway that does not yet send `has_active_run`.
+ */
+function applyActivityEvent(type, data) {
+    if (!data.session_id) return;
+
+    const hasActiveRun = typeof data.has_active_run === 'boolean'
+        ? data.has_active_run
+        : type === 'session_activity_started';
+
+    if (hasActiveRun) {
+        setBgRun(data.session_id, {
+            // An ended event can still report session activity when another
+            // overlapping run remains. Its own run_id is terminal, not the
+            // identity of the remaining run, so do not expose it as active.
+            runId: type === 'session_activity_ended' ? null : (data.run_id || null),
+            finished: false,
+        });
+    } else {
+        removeBgRun(data.session_id);
+    }
+}
+
+function applyActivitySnapshot(data) {
+    const seed = {};
+    for (const session of data.sessions || []) {
+        if (session.has_active_run) {
+            seed[session.id] = { runId: null, finished: false };
+        }
+    }
+    bgRuns.value = seed;
+}
 
 /**
  * Open the agent-scoped SSE stream.  Closes any previously open stream
@@ -85,13 +129,53 @@ export function openAgentEventsStream(agentId, opts) {
     if (token) params.set('token', token);
     if (opts && opts.lastEventId != null) params.set('last_event_id', String(opts.lastEventId));
     const qs = params.toString();
-    const url = `/agents/${agentId}/events${qs ? '?' + qs : ''}`;
+    // Global cross-agent feed (#1211) — NOT `/agents/${agentId}/events`.
+    // `agentId` is retained above only as the teardown/reopen scoping
+    // token (see `activeAgentId` and the onerror reopen guard), not as
+    // part of the URL: the sidebar needs activity for sessions owned by
+    // every agent it surfaces, so the feed cannot be scoped per agent.
+    const url = `/events/session-activity${qs ? '?' + qs : ''}`;
 
     const es = new EventSource(url);
     activeAgentEs = es;
     activeAgentId = agentId;
     retryCount = 0;
     lastSeenEventId = (opts && opts.lastEventId != null) ? opts.lastEventId : null;
+    let hasOpened = false;
+    let reconciling = false;
+    let bufferedActivity = [];
+
+    const dispatchActivity = (type, data) => {
+        if (reconciling) {
+            bufferedActivity.push({ type, data });
+            return;
+        }
+        applyActivityEvent(type, data);
+    };
+
+    const reconcileActivity = async () => {
+        if (reconciling || es !== activeAgentEs) return;
+        reconciling = true;
+        bufferedActivity = [];
+
+        let snapshot = null;
+        try {
+            snapshot = await listSessions(null, { includeDms: true });
+        } catch (err) {
+            console.error('[agent-events] activity reconciliation failed:', err);
+        }
+
+        if (es !== activeAgentEs) return;
+        if (snapshot) applyActivitySnapshot(snapshot);
+
+        const pending = bufferedActivity;
+        bufferedActivity = [];
+        reconciling = false;
+        for (const event of pending) {
+            applyActivityEvent(event.type, event.data);
+        }
+    };
+
     // Defer clearing the dead flag until the connection actually
     // opens — see the `'open'` listener below. Constructing the
     // EventSource is optimistic; clearing here would briefly hide
@@ -101,7 +185,12 @@ export function openAgentEventsStream(agentId, opts) {
     // (#907 review, Suggestion 2).
     es.addEventListener('open', () => {
         if (es !== activeAgentEs) return;
+        const shouldReconcile = hasOpened || Boolean(opts && opts.reconcileOnOpen);
+        hasOpened = true;
         clearStreamDead('agent-events');
+        if (shouldReconcile) {
+            void reconcileActivity();
+        }
     });
 
     /**
@@ -125,17 +214,12 @@ export function openAgentEventsStream(agentId, opts) {
 
     on('session_activity_started', (e) => {
         const data = JSON.parse(e.data);
-        if (!data.session_id) return;
-        setBgRun(data.session_id, { runId: data.run_id || null, finished: false });
+        dispatchActivity('session_activity_started', data);
     });
 
     on('session_activity_ended', (e) => {
         const data = JSON.parse(e.data);
-        if (!data.session_id) return;
-        // Idempotent: pre-cancelled runs emit `ended` without a paired
-        // `started`, so `bgRuns[session_id]` may not exist. removeBgRun
-        // is a no-op in that case.
-        removeBgRun(data.session_id);
+        dispatchActivity('session_activity_ended', data);
     });
 
     es.onerror = () => {
@@ -164,7 +248,10 @@ export function openAgentEventsStream(agentId, opts) {
                 backoffTimer = null;
                 // Only reopen if this agent is still the active one.
                 if (activeAgentId === reopenAgentId) {
-                    openAgentEventsStream(reopenAgentId, { lastEventId: reopenLastId });
+                    openAgentEventsStream(reopenAgentId, {
+                        lastEventId: reopenLastId,
+                        reconcileOnOpen: true,
+                    });
                 }
             }, delay);
         }
@@ -182,7 +269,10 @@ function reconnectAgentEventsStream() {
     const aid = activeAgentId;
     const replayId = lastSeenEventId;
     if (aid) {
-        openAgentEventsStream(aid, { lastEventId: replayId });
+        openAgentEventsStream(aid, {
+            lastEventId: replayId,
+            reconcileOnOpen: true,
+        });
     } else {
         // No active agent — nothing to reconnect to. Clear the dead
         // flag so the banner reflects reality.

@@ -42,6 +42,11 @@ fn is_sse_endpoint(path: &str) -> bool {
     // canonical SSE list.
     match segments.as_slice() {
         [first, _id, "events"] => SSE_ENDPOINT_SEGMENTS.contains(first),
+        // Global cross-agent session-activity feed (#1211). Parameterless
+        // (no `{id}`), so it isn't derived from SSE_ENDPOINT_SEGMENTS —
+        // whitelisted explicitly. Uses `?token=` like the other SSE feeds
+        // because the browser `EventSource` API cannot set custom headers.
+        ["events", "session-activity"] => true,
         _ => false,
     }
 }
@@ -138,6 +143,11 @@ mod tests {
         for path in crate::server::routes::sse_route_paths() {
             router = router.route(&path, get(dummy));
         }
+        // Global cross-agent session-activity feed (#1211). Parameterless,
+        // so it isn't part of the segment-derived sse_route_paths(); register
+        // it explicitly to mirror production (routes.rs) and exercise the
+        // is_sse_endpoint whitelist arm for it.
+        router = router.route("/events/session-activity", get(dummy));
         router
             .layer(middleware::from_fn(require_auth))
             .layer(Extension(AuthToken(token.map(String::from))))
@@ -303,6 +313,52 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    // --- Global cross-agent session-activity feed (#1211) ---
+
+    #[tokio::test]
+    async fn test_bearer_header_accepted_on_session_activity_sse() {
+        let resp = app(Some("secret"))
+            .oneshot(
+                HttpRequest::get("/events/session-activity")
+                    .header("Authorization", "Bearer secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_query_param_accepted_on_session_activity_sse() {
+        // The browser `EventSource` cannot set headers, so the global
+        // activity feed must accept `?token=` like the other SSE feeds.
+        let resp = app(Some("secret"))
+            .oneshot(
+                HttpRequest::get("/events/session-activity?token=secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_query_param_wrong_token_on_session_activity_returns_401() {
+        // The whitelist accepts the `?token=` form on this endpoint but must
+        // still enforce the value — a wrong token is rejected.
+        let resp = app(Some("secret"))
+            .oneshot(
+                HttpRequest::get("/events/session-activity?token=wrong")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]

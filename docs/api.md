@@ -191,7 +191,7 @@ filter; DM sessions are gated on `include_dms`.
 | `session_type` | string | Session type derived from the `context_id`. Always present. See table below. |
 | `participants` | string[] | Participant names parsed from the DM context ID (e.g. `["alice", "bob"]`). Only present when `session_type` is `"dm"`. |
 | `agent_name` | string | Agent name extracted from the notification context ID (e.g. `"alice"` from `"notifications:alice"`). Only present when `session_type` is `"notification"`. |
-| `has_active_run` | bool | `true` if any queued or running run is currently tied to this session, `false` otherwise. Drives the sidebar's "active" indicator on the initial load and after SSE reconnect. Always present. Pairs with the agent-scoped SSE feed (`GET /agents/{agent_id}/events`, section 5.9) which emits live `session_activity_started` / `session_activity_ended` transitions between calls to this endpoint. See #856. |
+| `has_active_run` | bool | `true` if any queued or running run is currently tied to this session, `false` otherwise. Drives the sidebar's "active" indicator on the initial load and after SSE reconnect. Always present. Pairs with the global session-activity SSE feed (`GET /events/session-activity`, section 5.10) which emits live `session_activity_started` / `session_activity_ended` transitions across every agent's sessions between calls to this endpoint (originally the per-agent feed of section 5.9, #856; made cross-agent in #1211). |
 
 **`session_type` values**
 
@@ -997,6 +997,11 @@ sender map (#887).
 
 #### Event types
 
+Both event types include `has_active_run`, the backend's authoritative
+post-transition answer to whether any queued or running run remains on that
+session. Consumers should set or clear session activity from this boolean,
+not from the individual event type.
+
 `session_activity_started`
 Emitted when a run on any of the agent's sessions transitions out of
 `Queued` and starts executing. Pairs 1:1 with `session_activity_ended`
@@ -1006,6 +1011,7 @@ when the run actually executes.
   "session_id": "<uuid>",
   "run_id": "<uuid>",
   "agent_id": "<uuid>",
+  "has_active_run": true,
   "ts": "..."
 }
 ```
@@ -1015,16 +1021,15 @@ Emitted when a run on any of the agent's sessions reaches a terminal
 state (completed, failed, or cancelled). Always paired with a prior
 `session_activity_started`, **except** for the pre-cancellation path:
 when a queued run is cancelled before it starts executing, the feed
-emits an `ended` without a paired `started` so the sidebar's
-snapshot-derived `has_active_run: true` indicator clears. Consumers
-should treat the snapshot from `GET /sessions` as the source of truth
-for "indicator on" and `ended` as the universal "indicator off" signal
-(#888).
+emits an `ended` without a paired `started` (#888). An `ended` event
+can also carry `has_active_run: true` when another overlapping run remains
+queued or running on the same session.
 ```json
 {
   "session_id": "<uuid>",
   "run_id": "<uuid>",
   "agent_id": "<uuid>",
+  "has_active_run": false,
   "ts": "..."
 }
 ```
@@ -1040,6 +1045,52 @@ log counters.
 > restart. After a restart, clients should open the SSE stream without a
 > `last_event_id` parameter and rely on `GET /sessions` to repopulate
 > any sidebar indicators.
+
+> **Cross-agent activity:** this feed is scoped to a single agent, so it
+> cannot surface activity on sessions owned by *other* agents. The web UI
+> sidebar (which renders cross-agent Jobs / Direct-messages / Notifications
+> sections) subscribes to the **global** feed in section 5.10 instead. This
+> per-agent feed remains for agent-scoped consumers that want isolation.
+
+### 5.10 Stream global session activity (SSE)
+`GET /events/session-activity`
+
+Persistent **global, cross-agent** SSE feed carrying `session_activity_started`
+/ `session_activity_ended` for runs across **every** agent's sessions. Unlike
+the per-agent feed (section 5.9), it is not scoped to one agent, so it can
+light the web UI sidebar's active-run indicator on sessions owned by *any*
+agent — the cross-agent Jobs / Direct-messages / Notifications sections a
+per-agent feed can never cover (#1211).
+
+The feed is served from a dedicated broadcast namespace (separate from the
+per-agent sender map and event log), so no agent id can collide with it and
+leak cross-agent activity onto a per-agent feed. There is no `{agent_id}`
+path parameter and hence no registry existence check — any authenticated
+client may subscribe.
+
+**Response 200**
+- `Content-Type: text/event-stream`
+
+#### Event types
+Identical payloads to section 5.9 — `session_activity_started` and
+`session_activity_ended`, each carrying `session_id`, `run_id`, `agent_id`,
+`ts`, and `has_active_run`. The boolean is the backend's authoritative
+post-transition answer to whether *any* queued or running run remains on the
+session; consumers must use it instead of treating every individual
+`session_activity_ended` as session inactivity. The `agent_id` field
+identifies the owning agent of the session whose activity changed (which may
+differ from the agent the
+operator is currently viewing).
+
+#### Reconnect
+Supported via `Last-Event-ID` header or `?last_event_id=<n>` query parameter
+(the query parameter takes precedence). Event IDs are scoped to this feed's
+own event log — separate from the per-run, per-session, and per-agent
+counters. The bounded log can truncate an old cursor, and the log is
+in-memory so its IDs reset on daemon restart. Clients must reconcile from
+`GET /sessions` (`has_active_run`) whenever a connection reopens. The web
+UI does this while buffering replayed/live activity events, then applies
+those events after the snapshot so no transition during the request is lost.
 
 ---
 
@@ -1694,7 +1745,7 @@ Path parameter `{id_or_name}` accepts either a UUID or a name slug (same as othe
 Bearer token authentication. Enabled when `ALMS_AUTH_TOKEN` is set.
 
 - `Authorization: Bearer <token>` header required on all endpoints except `GET /health`
-- SSE endpoints (`/runs/{id}/events`, `/sessions/{id}/events`, `/agents/{id}/events`) also accept `?token=<token>` query parameter, since the browser `EventSource` API cannot set custom headers
+- SSE endpoints (`/runs/{id}/events`, `/sessions/{id}/events`, `/agents/{id}/events`, `/events/session-activity`) also accept `?token=<token>` query parameter, since the browser `EventSource` API cannot set custom headers
 - Query-string auth is rejected on all non-SSE routes to prevent credential leakage into server logs, browser history, and HTTP `Referer` headers
 - Single shared token configured via env var (never in config files)
 

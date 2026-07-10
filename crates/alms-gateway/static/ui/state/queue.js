@@ -3,8 +3,9 @@ import { signal } from '../deps.js';
 // Foreground message queue (messages waiting to be sent after current run finishes)
 export const messageQueue = signal([]);
 
-// Background runs: { [sessionId]: { runId, finished } }
-// Populated by use-agent-events.js (live SSE) and use-boot.js (snapshot seed).
+// Background session activity: { [sessionId]: { runId, finished } }.
+// `runId` is the most recent started run when known, or null when seeded from
+// a snapshot / retained by an ended event because another run remains active.
 // Drives the sidebar's cross-session activity dot via hasActiveRun() in
 // session-list.js. See #856 / #909.
 export const bgRuns = signal({});

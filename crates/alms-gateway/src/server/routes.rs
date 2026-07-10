@@ -252,6 +252,15 @@ pub(crate) fn protected_router() -> Router<AppState> {
             "/agents/{id_or_name}/timeline",
             get(crate::timeline::get_agent_timeline),
         )
+        // Global cross-agent session-activity SSE feed (#1211). Unlike the
+        // per-agent `/agents/{id}/events` feed, this is not parameterised by
+        // agent, so it can't be derived from SSE_ENDPOINT_SEGMENTS (which
+        // builds `/{seg}/{id}/events` paths). Its query-string auth is
+        // whitelisted directly in `auth::is_sse_endpoint`.
+        .route(
+            "/events/session-activity",
+            get(crate::runs::stream_session_activity),
+        )
         .route("/ws", get(websocket_handler));
 
     // SSE streaming endpoints — registered from the canonical

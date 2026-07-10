@@ -91,8 +91,15 @@ export const useSignal = (v) => ({ value: v });
     // Copy real source files preserving relative-import structure.
     const stateDir = path.join(dir, 'state');
     const hooksDir = path.join(dir, 'hooks');
+    const apiDir = path.join(dir, 'api');
     await fs.mkdir(stateDir, { recursive: true });
     await fs.mkdir(hooksDir, { recursive: true });
+    await fs.mkdir(apiDir, { recursive: true });
+    await fs.writeFile(
+        path.join(apiDir, 'sessions.js'),
+        'export const listSessions = async () => ({ sessions: [] });\n',
+        'utf8',
+    );
     await fs.copyFile(
         path.join(UI_ROOT, 'state', 'queue.js'),
         path.join(stateDir, 'queue.js'),
