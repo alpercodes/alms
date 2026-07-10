@@ -115,6 +115,16 @@ pub async fn cancel_job(
     State(state): State<AppState>,
     Path(job_id): Path<JobId>,
 ) -> impl IntoResponse {
+    // Avoid allocating a per-job gate for arbitrary unknown ids. JobStore
+    // retains job records for the daemon lifetime, so a known job cannot
+    // disappear between this preflight and the gated transition below.
+    if state.job_store.get(job_id).is_none() {
+        return api_error(StatusCode::NOT_FOUND, "NOT_FOUND", "job not found").into_response();
+    }
+    // Linearize cancellation with completion only through the terminal status
+    // transition. The guard is released before the separate trigger sweep.
+    let job_completion_cancellation_gate = state.job_completion_cancellation_gate(job_id);
+    let job_completion_cancellation_guard = job_completion_cancellation_gate.lock().await;
     match state.job_store.cancel(job_id) {
         Ok(Some(true)) => {
             // -- Teardown-critical mutations, all SYNCHRONOUS --
@@ -125,6 +135,10 @@ pub async fn cancel_job(
             // a Cancelled job must never be left with a live episode,
             // uncancelled runs, or missing suppression intent). Keep new
             // teardown-critical state changes ABOVE the first await.
+
+            // The terminal status transition is committed. Do not nest the
+            // async completion guard with the non-async trigger guard below.
+            drop(job_completion_cancellation_guard);
 
             // Serialize the cancellation intent and sweep with a triggered
             // run's pre-enqueue check. The gate is released before the first

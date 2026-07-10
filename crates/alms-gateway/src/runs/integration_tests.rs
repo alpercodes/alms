@@ -11789,3 +11789,179 @@ async fn delete_jobs_interleaved_with_close_cannot_resurrect_job() {
 
     shutdown_token.cancel();
 }
+
+fn completed_episode(
+    state: &AppState,
+    agent_id: AgentId,
+    job_id: alms_core::JobId,
+) -> super::job_episode::JobEpisode {
+    let session_id = state
+        .session_manager
+        .get_or_create(agent_id, format!("job_{}", job_id.0))
+        .id;
+    let mut run = Run::for_job(session_id, agent_id, "scheduled work".into(), job_id);
+    let run_id = run.run_id;
+    run.mark_running();
+    assert!(run.mark_completed("done".into(), TokenUsage::default()));
+    state.run_manager.insert_run(run);
+
+    super::job_episode::JobEpisode {
+        job_id,
+        session_id,
+        agent_id,
+        started_at: chrono::Utc::now(),
+        deadline: std::time::Instant::now(),
+        pending_dms: std::collections::HashSet::new(),
+        pending_subagents: std::collections::HashMap::new(),
+        in_flight_runs: 0,
+        runs: vec![run_id],
+        dm_total: 0,
+        subagent_total: 0,
+        catch_up_queued: false,
+    }
+}
+
+fn has_job_marker(state: &AppState, session_id: SessionId, job_id: alms_core::JobId) -> bool {
+    state
+        .session_manager
+        .get_history(session_id)
+        .unwrap()
+        .iter()
+        .any(|message| {
+            message.metadata.as_ref().is_some_and(|metadata| {
+                metadata.get("type").and_then(|value| value.as_str()) == Some("job_notification")
+                    && metadata.get("job_id").and_then(|value| value.as_str())
+                        == Some(job_id.0.to_string().as_str())
+            })
+        })
+}
+
+/// Poll a future exactly once while its job gate is held. This registers the
+/// mutex waiter in Tokio's FIFO queue without relying on task scheduling or
+/// sleeps, making the winner order in the race tests deterministic.
+fn assert_pending_on_job_gate<F: std::future::Future>(mut future: std::pin::Pin<&mut F>) {
+    let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+    assert!(
+        future.as_mut().poll(&mut context).is_pending(),
+        "future must wait while the job completion/cancellation gate is held"
+    );
+}
+
+/// PR #1222 regression: when DELETE is first in the per-job gate queue, it
+/// must make the job terminal before close observes the status. No completion
+/// card may be persisted after the operator's cancellation wins.
+#[tokio::test]
+async fn cancel_wins_before_episode_close_without_completion_card() {
+    use axum::{extract::Path, extract::State, response::IntoResponse};
+
+    let (state, shutdown_token, _cr, _tr, _dr) = test_app_state();
+    let agent_id = AgentId::new();
+    let web_session_id = state.session_manager.get_or_create(agent_id, "web").id;
+    let job_id = create_recurring_job(&state, agent_id, "cancel wins");
+    let episode = completed_episode(&state, agent_id, job_id);
+
+    let gate = state.job_completion_cancellation_gate(job_id);
+    let guard = gate.lock().await;
+    let mut cancel = Box::pin(crate::jobs::cancel_job(State(state.clone()), Path(job_id)));
+    assert_pending_on_job_gate(cancel.as_mut());
+    let mut close = Box::pin(super::notifications::close_episode(&state, episode, false));
+    assert_pending_on_job_gate(close.as_mut());
+
+    drop(guard);
+    let response = cancel.await.into_response();
+    assert_eq!(response.status(), axum::http::StatusCode::NO_CONTENT);
+    close.await;
+
+    assert_eq!(
+        state.job_store.get(job_id).unwrap().status,
+        alms_core::JobStatus::Cancelled
+    );
+    assert!(
+        !has_job_marker(&state, web_session_id, job_id),
+        "a cancellation that wins the gate must suppress the completion card"
+    );
+
+    shutdown_token.cancel();
+}
+
+/// PR #1222 regression: when close is first in the per-job gate queue, its
+/// card and record update complete atomically with respect to DELETE. The
+/// subsequent cancellation is valid, but it cannot erase the visible result
+/// of work that finished first.
+#[tokio::test]
+async fn episode_close_wins_before_cancel_and_keeps_completion_card() {
+    use axum::{extract::Path, extract::State, response::IntoResponse};
+
+    let (state, shutdown_token, _cr, _tr, _dr) = test_app_state();
+    let agent_id = AgentId::new();
+    let web_session_id = state.session_manager.get_or_create(agent_id, "web").id;
+    let job_id = create_recurring_job(&state, agent_id, "completion wins");
+    let episode = completed_episode(&state, agent_id, job_id);
+
+    let gate = state.job_completion_cancellation_gate(job_id);
+    let guard = gate.lock().await;
+    let mut close = Box::pin(super::notifications::close_episode(&state, episode, false));
+    assert_pending_on_job_gate(close.as_mut());
+    let mut cancel = Box::pin(crate::jobs::cancel_job(State(state.clone()), Path(job_id)));
+    assert_pending_on_job_gate(cancel.as_mut());
+
+    drop(guard);
+    close.await;
+    let response = cancel.await.into_response();
+    assert_eq!(response.status(), axum::http::StatusCode::NO_CONTENT);
+
+    let (_text, metadata) = job_marker_from(&state, web_session_id);
+    assert_eq!(metadata["job_id"], job_id.0.to_string());
+    assert_eq!(
+        state.job_store.get(job_id).unwrap().status,
+        alms_core::JobStatus::Cancelled,
+        "DELETE may cancel the recurring job after its completed episode is visible"
+    );
+
+    shutdown_token.cancel();
+}
+
+/// A slow completion/cancellation arbitration on job A must not introduce
+/// head-of-line blocking for an unrelated job B.
+#[tokio::test]
+async fn blocked_job_gate_does_not_delay_unrelated_job_cancellation() {
+    use axum::{extract::Path, extract::State, response::IntoResponse};
+
+    let (state, shutdown_token, _cr, _tr, _dr) = test_app_state();
+    let agent_id = AgentId::new();
+    let blocked_job_id = create_recurring_job(&state, agent_id, "blocked job");
+    let independent_job_id = create_recurring_job(&state, agent_id, "independent job");
+
+    let blocked_gate = state.job_completion_cancellation_gate(blocked_job_id);
+    let blocked_guard = blocked_gate.lock().await;
+    let independent_cancel =
+        crate::jobs::cancel_job(State(state.clone()), Path(independent_job_id));
+    let response = tokio::time::timeout(std::time::Duration::from_secs(1), independent_cancel)
+        .await
+        .expect("an unrelated job must not wait for another job's gate")
+        .into_response();
+    assert_eq!(response.status(), axum::http::StatusCode::NO_CONTENT);
+    assert_eq!(
+        state.job_store.get(independent_job_id).unwrap().status,
+        alms_core::JobStatus::Cancelled
+    );
+
+    let gate_count = state.job_completion_cancellation_gates.len();
+    let response = crate::jobs::cancel_job(State(state.clone()), Path(alms_core::JobId::new()))
+        .await
+        .into_response();
+    assert_eq!(response.status(), axum::http::StatusCode::NOT_FOUND);
+    assert_eq!(
+        state.job_completion_cancellation_gates.len(),
+        gate_count,
+        "unknown job ids must not grow the per-job gate registry"
+    );
+
+    drop(blocked_guard);
+    let response = crate::jobs::cancel_job(State(state.clone()), Path(blocked_job_id))
+        .await
+        .into_response();
+    assert_eq!(response.status(), axum::http::StatusCode::NO_CONTENT);
+
+    shutdown_token.cancel();
+}

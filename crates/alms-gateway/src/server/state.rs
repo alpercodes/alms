@@ -74,6 +74,16 @@ pub struct AppState {
     /// the run and cancels its already-registered token before it can spend a
     /// turn. See `jobs::cancel_job` and `runs::notifications::enqueue_triggered_run`.
     pub(crate) job_trigger_cancellation_gate: Arc<parking_lot::Mutex<()>>,
+    /// Per-job arbitration between a completion notification and
+    /// `DELETE /jobs/{id}`.
+    ///
+    /// A completion holds its job's gate through notification fanout;
+    /// cancellation holds the same gate through the terminal status
+    /// transition. Unrelated jobs use distinct gates and never block each
+    /// other. Entries intentionally have the same lifetime as the retained
+    /// `JobStore` records, so registry growth is bounded by job cardinality.
+    pub(crate) job_completion_cancellation_gates:
+        Arc<dashmap::DashMap<alms_core::JobId, Arc<tokio::sync::Mutex<()>>>>,
     /// Scheduler for firing jobs at the right time
     pub scheduler: Arc<Scheduler>,
     /// Coordinator for subagent lifecycle management
@@ -140,6 +150,16 @@ pub struct AppState {
 }
 
 impl AppState {
+    pub(crate) fn job_completion_cancellation_gate(
+        &self,
+        job_id: alms_core::JobId,
+    ) -> Arc<tokio::sync::Mutex<()>> {
+        self.job_completion_cancellation_gates
+            .entry(job_id)
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    }
+
     pub fn new(
         gateway: Gateway,
         scheduler: Arc<Scheduler>,
@@ -456,6 +476,7 @@ impl AppState {
             )),
             operator_cancelled_jobs: Arc::new(dashmap::DashSet::new()),
             job_trigger_cancellation_gate: Arc::new(parking_lot::Mutex::new(())),
+            job_completion_cancellation_gates: Arc::new(dashmap::DashMap::new()),
             scheduler,
             coordinator,
             shutdown_token: shutdown_token.clone(),

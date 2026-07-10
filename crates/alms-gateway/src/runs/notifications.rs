@@ -203,6 +203,11 @@ pub(super) async fn close_episode(
 ) {
     let job_id = episode.job_id;
 
+    // A completion and DELETE /jobs are mutually exclusive visible outcomes.
+    // Hold the gate through the notification fanout so a cancellation cannot
+    // win after the pre-check yet before the card is emitted.
+    let job_completion_cancellation_gate = state.job_completion_cancellation_gate(job_id);
+    let job_completion_cancellation_guard = job_completion_cancellation_gate.lock().await;
     // Guard: if the job was cancelled (or deleted) while the episode was
     // open, do not notify / overwrite the Cancelled status / re-arm.
     // Generalizes the pre-#1198 cancelled-during-run guard.
@@ -251,6 +256,7 @@ pub(super) async fn close_episode(
     // job resurrected). The store's absorbing-`Cancelled` guard now refuses
     // the stale write, and every re-arm below is gated on `Recorded`.
     record_and_rearm(state, &job, &episode).await;
+    drop(job_completion_cancellation_guard);
 }
 
 /// Record the episode's run on the job and re-arm recurring schedules —
