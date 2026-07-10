@@ -11306,6 +11306,44 @@ async fn cancel_job_teardown_leaves_no_runs_for_the_job() {
 
     shutdown_token.cancel();
 }
+/// A trigger that began just before `DELETE /jobs` may already have inserted
+/// an un-stamped (D5-style) run on the job session. The cancellation sweep
+/// must still cancel its registered token; otherwise that continuation can
+/// be queued after the DELETE and spend a turn despite operator intent.
+#[tokio::test]
+async fn cancel_job_cancels_unstamped_run_on_its_job_session() {
+    use axum::{extract::Path, extract::State, response::IntoResponse};
+
+    let (state, shutdown_token, _cr, _tr, _dr) = test_app_state();
+    let agent_id = AgentId::new();
+    let job_id = create_recurring_job(&state, agent_id, "race a terminal DM trigger");
+    let job_session_id = state
+        .session_manager
+        .get_or_create(agent_id, format!("job_{}", job_id.0))
+        .id;
+
+    // This is intentionally not job-stamped: it models a terminal trigger
+    // that no longer resolved to a live episode, so `cancel_runs_for_job`
+    // alone cannot find it.
+    let run = Run::new(job_session_id, agent_id, "late trigger".to_string());
+    let run_id = run.run_id;
+    let token = CancellationToken::new();
+    state
+        .run_manager
+        .register_cancel_token(run_id, token.clone());
+    state.run_manager.insert_run(run);
+
+    let response = crate::jobs::cancel_job(State(state.clone()), Path(job_id))
+        .await
+        .into_response();
+    assert_eq!(response.status(), axum::http::StatusCode::NO_CONTENT);
+    assert!(
+        token.is_cancelled(),
+        "operator cancellation must cancel an un-stamped run on its job session"
+    );
+
+    shutdown_token.cancel();
+}
 
 /// Codex P2 on PR #1210 (confirmed by Tim): the #1206 suppression must key
 /// on OPERATOR-CANCEL INTENT, not on `JobStatus::Cancelled` — a normally-

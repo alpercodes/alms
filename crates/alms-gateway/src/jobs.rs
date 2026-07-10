@@ -126,24 +126,48 @@ pub async fn cancel_job(
             // uncancelled runs, or missing suppression intent). Keep new
             // teardown-critical state changes ABOVE the first await.
 
-            // #1206 follow-up (Codex P2 on PR #1210): record the
-            // *operator's* cancel intent. The orphan-run suppression in
-            // `enqueue_triggered_run` keys on this set — NOT on
-            // `JobStatus::Cancelled`, which a normally-spent one-shot also
-            // carries (#763: `JobStatus` has no `Completed` variant).
-            state.operator_cancelled_jobs.insert(job_id);
+            // Serialize the cancellation intent and sweep with a triggered
+            // run's pre-enqueue check. The gate is released before the first
+            // await below, so cancellation either suppresses the trigger or
+            // cancels its already-registered token before it can spend a turn.
+            let episode = {
+                let _gate = state.job_trigger_cancellation_gate.lock();
 
-            // #1198 D7: remove the episode FIRST so in-flight run exits and
-            // pending DM/subagent resolutions no-op (Untracked / miss); its
-            // pending work is torn down below.
-            let episode = state.job_episodes.remove(job_id);
+                // #1206 follow-up (Codex P2 on PR #1210): record the
+                // *operator's* cancel intent. The orphan-run suppression in
+                // `enqueue_triggered_run` keys on this set — NOT on
+                // `JobStatus::Cancelled`, which a normally-spent one-shot also
+                // carries (#763: `JobStatus` has no `Completed` variant).
+                state.operator_cancelled_jobs.insert(job_id);
 
-            // Cancel any in-progress run that was spawned by this job so
-            // we stop burning tokens on work the operator intended to halt.
-            // Covers turn-1 runs AND episode continuation runs — both carry
-            // the job id (#1198 step 5 stamping).
-            // (cancel_runs_for_job logs each cancelled run individually)
-            state.run_manager.cancel_runs_for_job(job_id);
+                // #1198 D7: remove the episode FIRST so in-flight run exits and
+                // pending DM/subagent resolutions no-op (Untracked / miss); its
+                // pending work is torn down below.
+                let episode = state.job_episodes.remove(job_id);
+
+                // Cancel any in-progress run that was spawned by this job so
+                // we stop burning tokens on work the operator intended to halt.
+                // Covers turn-1 runs AND episode continuation runs — both carry
+                // the job id (#1198 step 5 stamping).
+                // (cancel_runs_for_job logs each cancelled run individually)
+                state.run_manager.cancel_runs_for_job(job_id);
+
+                // A late, no-longer-episode continuation intentionally has no
+                // job stamp (D5's detached-result contract), but it still runs
+                // on this job's session. Cancel that shape too when the
+                // operator explicitly kills the job; otherwise a trigger that
+                // won the gate just before this handler could escape the
+                // job-id sweep and spend a turn after cancellation.
+                if let Some(job) = state.job_store.get(job_id)
+                    && let Some(session_id) = state
+                        .session_manager
+                        .session_id_for_context(job.agent_id, &format!("job_{}", job_id.0))
+                {
+                    state.run_manager.cancel_runs_for_session(session_id);
+                }
+
+                episode
+            };
 
             // -- Best-effort async teardown --
 

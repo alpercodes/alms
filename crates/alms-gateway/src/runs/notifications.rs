@@ -1007,6 +1007,9 @@ pub(super) async fn enqueue_triggered_run(
     //   here (DELETE racing a terminal signal), the reservation is moot —
     //   `cancel_job` removes the episode unconditionally, before its first
     //   await.
+    // Serialize this intent check and token registration with DELETE /jobs.
+    let cancel_token = CancellationToken::new();
+    let job_trigger_cancellation_gate = state.job_trigger_cancellation_gate.lock();
     if let Some(cancelled_job) = operator_cancelled_job_for_context(state, &context_id) {
         info!(
             job_id = %cancelled_job,
@@ -1020,6 +1023,9 @@ pub(super) async fn enqueue_triggered_run(
     let mut run = Run::new(session_id, agent_id, input.clone());
     run.job_id = job_id;
     let run_id = run.run_id;
+    state
+        .run_manager
+        .register_cancel_token(run_id, cancel_token.clone());
     state.run_manager.insert_run(run);
 
     // #1207 (Tim's S4 on PR #1202): record an episode continuation's run id
@@ -1048,6 +1054,7 @@ pub(super) async fn enqueue_triggered_run(
     // inside `SessionQueue`.
     let agent_running = state.run_manager.agent_has_running_run(agent_id);
     let queued_behind = state.agent_queue.pending_count(&agent_id) + usize::from(agent_running);
+    drop(job_trigger_cancellation_gate);
     state
         .run_manager
         .send_session_event(
@@ -1056,11 +1063,6 @@ pub(super) async fn enqueue_triggered_run(
             SseEventData::run_created(run_id, session_id, true, Some(source_label), queued_behind),
         )
         .await;
-
-    let cancel_token = CancellationToken::new();
-    state
-        .run_manager
-        .register_cancel_token(run_id, cancel_token.clone());
 
     let state_clone = state.clone();
     state.agent_queue.enqueue_low(

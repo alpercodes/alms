@@ -66,6 +66,14 @@ pub struct AppState {
     /// loses nothing. Entries are never removed; job ids are tiny and
     /// operator cancels are rare.
     pub(crate) operator_cancelled_jobs: Arc<dashmap::DashSet<alms_core::JobId>>,
+    /// Serializes a job cancellation's intent/cancellation sweep with a
+    /// triggered run's pre-enqueue cancellation check (#1210 follow-up).
+    ///
+    /// The critical section contains no `await`: a trigger either sees the
+    /// operator-cancel intent before it creates a run, or cancellation sees
+    /// the run and cancels its already-registered token before it can spend a
+    /// turn. See `jobs::cancel_job` and `runs::notifications::enqueue_triggered_run`.
+    pub(crate) job_trigger_cancellation_gate: Arc<parking_lot::Mutex<()>>,
     /// Scheduler for firing jobs at the right time
     pub scheduler: Arc<Scheduler>,
     /// Coordinator for subagent lifecycle management
@@ -447,6 +455,7 @@ impl AppState {
                 std::time::Duration::from_secs(crate::runs::job_episode::EPISODE_DEADLINE_SECS),
             )),
             operator_cancelled_jobs: Arc::new(dashmap::DashSet::new()),
+            job_trigger_cancellation_gate: Arc::new(parking_lot::Mutex::new(())),
             scheduler,
             coordinator,
             shutdown_token: shutdown_token.clone(),
