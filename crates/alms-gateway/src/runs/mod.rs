@@ -63,6 +63,7 @@ use alms_core::{RunId, SessionId};
 use tokio_util::sync::CancellationToken;
 
 /// Bundled parameters for [`lifecycle::execute_run`], avoiding a long positional argument list.
+#[derive(Clone)]
 struct RunParams {
     run_id: RunId,
     session_id: SessionId,

@@ -18,7 +18,11 @@ All file/line references verified against `develop` @ `c4c313b`.
 
 ### 1. Job firing and completion are one `await`
 
-`scheduler_fire_loop` (`crates/alms-gateway/src/runs/notifications.rs:24-44`) receives fired `JobId`s and enqueues `fire_job_run` on the per-agent `SessionQueue` (`state.agent_queue.enqueue(job.agent_id, …)`).
+`scheduler_fire_loop` (`crates/alms-gateway/src/runs/notifications.rs`) receives
+fired `JobId`s, waits for bounded per-agent admission with
+`state.agent_queue.reserve(job.agent_id)`, then submits `fire_job_run` as
+normal-priority queue work. The waiting call stays on the dedicated scheduler
+producer task; it is never made from inside queue work.
 
 `fire_job_run` (`notifications.rs:48-147`) then does, in order:
 

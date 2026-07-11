@@ -1,225 +1,500 @@
-//! Per-session work queue — guarantees FIFO execution within a session key
-//! while allowing concurrent execution across different sessions.
+//! Bounded per-key work scheduling.
 //!
-//! Supports two priority levels: normal (user runs) and low (notification runs).
-//! Low-priority items only execute when no normal-priority items are pending.
-//! Under sustained normal-priority load, low-priority items are intentionally
-//! starved — user messages always take precedence over notifications.
+//! Queue slots are created with one atomic DashMap entry operation, so
+//! concurrent first submissions for one key cannot create two workers.
 
-use dashmap::DashMap;
+use dashmap::{DashMap, mapref::entry::Entry};
+use futures::FutureExt;
+use parking_lot::Mutex;
 use std::collections::VecDeque;
-use std::fmt::Debug;
+use std::fmt::{self, Debug};
 use std::future::Future;
 use std::hash::Hash;
+use std::panic::AssertUnwindSafe;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use tokio::sync::mpsc;
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio::time::{Duration, timeout};
 use tokio_util::sync::CancellationToken;
 use tracing::debug;
 
-/// A boxed future representing a unit of work to execute.
-type WorkItem = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
+pub const MAX_PENDING_PER_KEY: usize = 64;
+pub const MAX_PENDING_TOTAL: usize = 1024;
+const IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 
-/// A tagged work item with priority.
-enum PriorityItem {
-    Normal(WorkItem),
-    Low(WorkItem),
+pub type WorkItem = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdmissionError {
+    PerKeyFull,
+    GlobalFull,
+    ShuttingDown,
+    DispatchClosed,
 }
 
-/// Per-key sequential work queue.
+#[derive(Debug, Clone, Copy)]
+struct QueueLimits {
+    per_key: usize,
+    total: usize,
+}
+
+impl Default for QueueLimits {
+    fn default() -> Self {
+        Self {
+            per_key: MAX_PENDING_PER_KEY,
+            total: MAX_PENDING_TOTAL,
+        }
+    }
+}
+
+struct AdmittedItem {
+    work: WorkItem,
+    _key_permit: OwnedSemaphorePermit,
+    _global_permit: OwnedSemaphorePermit,
+}
+
+enum PriorityItem {
+    Normal(AdmittedItem),
+    Low(AdmittedItem),
+}
+
+#[derive(Default)]
+struct PendingCounts {
+    normal: usize,
+    low: usize,
+}
+
+impl PendingCounts {
+    fn total(&self) -> usize {
+        self.normal + self.low
+    }
+}
+
+/// One key's dispatch state.
 ///
-/// Each unique key gets a dedicated handler task that processes work items
-/// one at a time. Normal-priority items are processed before low-priority
-/// ones. Different keys process concurrently.
-///
-/// Idle handlers self-terminate after 5 minutes and clean up their DashMap entry.
-/// On shutdown (cancellation token), remaining items are drained before exit.
-#[derive(Debug)]
-pub struct SessionQueue<K: Hash + Eq + Clone + Send + Sync + Debug + 'static> {
-    senders: Arc<DashMap<K, mpsc::UnboundedSender<PriorityItem>>>,
-    /// Tracks how many items are pending (enqueued but not yet started) per key.
-    pending_counts: Arc<DashMap<K, Arc<AtomicUsize>>>,
+/// Idle retirement and shutdown drain rely on the slot having exactly the
+/// map reference plus the worker reference when unused. Do not retain an
+/// extra `Arc<QueueSlot>` outside admission/reservation paths.
+struct QueueSlot {
+    sender: mpsc::Sender<PriorityItem>,
+    capacity: Arc<Semaphore>,
+    pending: Mutex<PendingCounts>,
+    changed: Notify,
+}
+
+struct QueueInner<K> {
+    slots: DashMap<K, Arc<QueueSlot>>,
+    global_capacity: Arc<Semaphore>,
+    limits: QueueLimits,
     shutdown: CancellationToken,
 }
 
-impl<K: Hash + Eq + Clone + Send + Sync + Debug + 'static> SessionQueue<K> {
+struct SlotUse {
+    slot: Arc<QueueSlot>,
+}
+
+impl Drop for SlotUse {
+    fn drop(&mut self) {
+        self.slot.changed.notify_one();
+    }
+}
+
+/// Capacity atomically admitted for one queue key.
+///
+/// Callers submit synchronously before their next await. Dropping a
+/// reservation releases both capacity permits.
+pub struct Reservation {
+    slot: Arc<QueueSlot>,
+    key_permit: Option<OwnedSemaphorePermit>,
+    global_permit: Option<OwnedSemaphorePermit>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DispatchReceipt {
+    queued_ahead: usize,
+}
+
+impl DispatchReceipt {
+    pub fn queued_ahead(&self) -> usize {
+        self.queued_ahead
+    }
+}
+
+impl Debug for Reservation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Reservation").finish_non_exhaustive()
+    }
+}
+
+impl Reservation {
+    pub fn submit(self, work: WorkItem) -> Result<DispatchReceipt, AdmissionError> {
+        self.dispatch(work, false)
+    }
+
+    pub fn submit_low(self, work: WorkItem) -> Result<DispatchReceipt, AdmissionError> {
+        self.dispatch(work, true)
+    }
+
+    fn dispatch(mut self, work: WorkItem, low: bool) -> Result<DispatchReceipt, AdmissionError> {
+        let key = self.key_permit.take().expect("key permit");
+        let global = self.global_permit.take().expect("global permit");
+        let item = AdmittedItem {
+            work,
+            _key_permit: key,
+            _global_permit: global,
+        };
+        let item = if low {
+            PriorityItem::Low(item)
+        } else {
+            PriorityItem::Normal(item)
+        };
+
+        let mut pending = self.slot.pending.lock();
+        let queued_ahead = if low {
+            let ahead = pending.total();
+            pending.low += 1;
+            ahead
+        } else {
+            let ahead = pending.normal;
+            pending.normal += 1;
+            ahead
+        };
+        if self.slot.sender.try_send(item).is_err() {
+            if low {
+                pending.low -= 1;
+            } else {
+                pending.normal -= 1;
+            }
+            return Err(AdmissionError::DispatchClosed);
+        }
+        drop(pending);
+        Ok(DispatchReceipt { queued_ahead })
+    }
+}
+
+impl Drop for Reservation {
+    fn drop(&mut self) {
+        self.slot.changed.notify_one();
+    }
+}
+
+pub struct SessionQueue<K>
+where
+    K: Hash + Eq + Clone + Send + Sync + Debug + 'static,
+{
+    inner: Arc<QueueInner<K>>,
+}
+
+impl<K> Debug for SessionQueue<K>
+where
+    K: Hash + Eq + Clone + Send + Sync + Debug + 'static,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SessionQueue")
+            .field("slots", &self.inner.slots.len())
+            .field("limits", &self.inner.limits)
+            .finish()
+    }
+}
+
+impl<K> SessionQueue<K>
+where
+    K: Hash + Eq + Clone + Send + Sync + Debug + 'static,
+{
     pub fn new(shutdown: CancellationToken) -> Self {
+        Self::with_queue_limits(shutdown, QueueLimits::default())
+    }
+
+    fn with_queue_limits(shutdown: CancellationToken, limits: QueueLimits) -> Self {
+        assert!(limits.per_key > 0, "per-key queue limit must be positive");
+        assert!(limits.total > 0, "global queue limit must be positive");
         Self {
-            senders: Arc::new(DashMap::new()),
-            pending_counts: Arc::new(DashMap::new()),
-            shutdown,
+            inner: Arc::new(QueueInner {
+                slots: DashMap::new(),
+                global_capacity: Arc::new(Semaphore::new(limits.total)),
+                limits,
+                shutdown,
+            }),
         }
     }
 
-    /// Enqueue a normal-priority work item (user runs).
-    pub fn enqueue(&self, key: K, work: WorkItem) {
-        self.enqueue_item(key, PriorityItem::Normal(work));
+    /// Attempt admission without waiting.
+    pub fn try_reserve(&self, key: K) -> Result<Reservation, AdmissionError> {
+        if self.inner.shutdown.is_cancelled() {
+            return Err(AdmissionError::ShuttingDown);
+        }
+
+        let slot = SlotUse {
+            slot: self.slot_for(key),
+        };
+        let key_permit = slot
+            .slot
+            .capacity
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| AdmissionError::PerKeyFull)?;
+        let global_permit = self
+            .inner
+            .global_capacity
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| AdmissionError::GlobalFull)?;
+
+        if self.inner.shutdown.is_cancelled() {
+            return Err(AdmissionError::ShuttingDown);
+        }
+
+        Ok(Self::reservation(
+            Arc::clone(&slot.slot),
+            key_permit,
+            global_permit,
+        ))
     }
 
-    /// Enqueue a low-priority work item (notification runs).
-    /// Low-priority items execute only when no normal items are pending.
-    pub fn enqueue_low(&self, key: K, work: WorkItem) {
-        self.enqueue_item(key, PriorityItem::Low(work));
+    /// Wait for bounded admission.
+    ///
+    /// Per-key capacity is acquired before global capacity so one saturated
+    /// key cannot reserve the global pool while it waits.
+    ///
+    /// This waiting API must never be called from inside a work item on this
+    /// queue. A work item waiting for capacity on its own saturated key would
+    /// prevent the worker from advancing and releasing that capacity.
+    pub async fn reserve(&self, key: K) -> Result<Reservation, AdmissionError> {
+        if self.inner.shutdown.is_cancelled() {
+            return Err(AdmissionError::ShuttingDown);
+        }
+
+        let slot = SlotUse {
+            slot: self.slot_for(key),
+        };
+        let key_permit = tokio::select! {
+            permit = slot.slot.capacity.clone().acquire_owned() => {
+                permit.map_err(|_| AdmissionError::ShuttingDown)?
+            }
+            _ = self.inner.shutdown.cancelled() => {
+                return Err(AdmissionError::ShuttingDown);
+            }
+        };
+        let global_permit = tokio::select! {
+            permit = self.inner.global_capacity.clone().acquire_owned() => {
+                permit.map_err(|_| AdmissionError::ShuttingDown)?
+            }
+            _ = self.inner.shutdown.cancelled() => {
+                return Err(AdmissionError::ShuttingDown);
+            }
+        };
+
+        if self.inner.shutdown.is_cancelled() {
+            return Err(AdmissionError::ShuttingDown);
+        }
+
+        Ok(Self::reservation(
+            Arc::clone(&slot.slot),
+            key_permit,
+            global_permit,
+        ))
     }
 
-    /// Returns the number of items currently pending (enqueued but not yet
-    /// started) for the given key.
+    /// Accepted items for a key that have not started.
+    #[cfg(test)]
     pub fn pending_count(&self, key: &K) -> usize {
-        self.pending_counts
+        self.inner
+            .slots
             .get(key)
-            .map(|c| c.load(Ordering::Relaxed))
+            .map(|slot| slot.pending.lock().total())
             .unwrap_or(0)
     }
 
-    fn enqueue_item(&self, key: K, item: PriorityItem) {
-        // Increment pending count.
-        self.pending_counts
-            .entry(key.clone())
-            .or_insert_with(|| Arc::new(AtomicUsize::new(0)))
-            .fetch_add(1, Ordering::Relaxed);
-
-        if let Some(sender) = self.senders.get(&key) {
-            match sender.send(item) {
-                Ok(()) => return,
-                Err(mpsc::error::SendError(returned_item)) => {
-                    drop(sender);
-                    self.senders.remove(&key);
-                    self.spawn_handler(key, returned_item);
-                    return;
-                }
-            }
-        }
-        self.spawn_handler(key, item);
+    #[cfg(test)]
+    pub fn enqueue(&self, key: K, work: WorkItem) {
+        self.try_reserve(key)
+            .expect("test queue admission")
+            .submit(work)
+            .expect("test queue dispatch");
     }
 
-    fn spawn_handler(&self, key: K, first_item: PriorityItem) {
-        let (tx, rx) = mpsc::unbounded_channel();
-        let _ = tx.send(first_item);
+    #[cfg(test)]
+    pub fn enqueue_low(&self, key: K, work: WorkItem) {
+        self.try_reserve(key)
+            .expect("test queue admission")
+            .submit_low(work)
+            .expect("test queue dispatch");
+    }
 
-        let senders = Arc::clone(&self.senders);
-        let pending_counts = Arc::clone(&self.pending_counts);
-        let pending = self
-            .pending_counts
-            .entry(key.clone())
-            .or_insert_with(|| Arc::new(AtomicUsize::new(0)))
-            .clone();
-        let shutdown = self.shutdown.clone();
-        let handler_key = key.clone();
-        tokio::spawn(async move {
-            handler_loop(handler_key, rx, senders, pending, pending_counts, shutdown).await;
-        });
+    fn reservation(
+        slot: Arc<QueueSlot>,
+        key_permit: OwnedSemaphorePermit,
+        global_permit: OwnedSemaphorePermit,
+    ) -> Reservation {
+        Reservation {
+            slot,
+            key_permit: Some(key_permit),
+            global_permit: Some(global_permit),
+        }
+    }
 
-        self.senders.insert(key, tx);
+    fn slot_for(&self, key: K) -> Arc<QueueSlot> {
+        match self.inner.slots.entry(key.clone()) {
+            Entry::Occupied(entry) => Arc::clone(entry.get()),
+            Entry::Vacant(entry) => {
+                let (sender, receiver) = mpsc::channel(self.inner.limits.per_key);
+                let slot = Arc::new(QueueSlot {
+                    sender,
+                    capacity: Arc::new(Semaphore::new(self.inner.limits.per_key)),
+                    pending: Mutex::new(PendingCounts::default()),
+                    changed: Notify::new(),
+                });
+                entry.insert(Arc::clone(&slot));
+                tokio::spawn(queue_worker(
+                    key,
+                    Arc::clone(&slot),
+                    receiver,
+                    Arc::clone(&self.inner),
+                ));
+                slot
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn for_test(shutdown: CancellationToken, per_key: usize, total: usize) -> Self {
+        Self::with_queue_limits(shutdown, QueueLimits { per_key, total })
+    }
+
+    #[cfg(test)]
+    fn pending_total(&self) -> usize {
+        self.inner.limits.total - self.inner.global_capacity.available_permits()
+    }
+
+    #[cfg(test)]
+    fn slot_count(&self) -> usize {
+        self.inner.slots.len()
     }
 }
 
-/// Sequential handler loop for a single key with priority support.
-///
-/// Drains all normal-priority items before processing any low-priority ones.
-/// This ensures user messages are always processed before notification runs.
-async fn handler_loop<K: Hash + Eq + Clone + Send + Sync + Debug + 'static>(
-    key: K,
-    mut rx: mpsc::UnboundedReceiver<PriorityItem>,
-    senders: Arc<DashMap<K, mpsc::UnboundedSender<PriorityItem>>>,
-    pending: Arc<AtomicUsize>,
-    pending_counts: Arc<DashMap<K, Arc<AtomicUsize>>>,
-    shutdown: CancellationToken,
+async fn execute_item(slot: &QueueSlot, item: AdmittedItem, low: bool) {
+    let AdmittedItem {
+        work,
+        _key_permit: key_permit,
+        _global_permit: global_permit,
+    } = item;
+    {
+        let mut pending = slot.pending.lock();
+        if low {
+            pending.low -= 1;
+        } else {
+            pending.normal -= 1;
+        }
+    }
+    slot.changed.notify_one();
+    drop(key_permit);
+    drop(global_permit);
+    if AssertUnwindSafe(work).catch_unwind().await.is_err() {
+        tracing::error!("Session queue work item panicked; continuing worker");
+    }
+}
+
+fn push_item(
+    item: PriorityItem,
+    normal: &mut VecDeque<AdmittedItem>,
+    low: &mut VecDeque<AdmittedItem>,
 ) {
-    let idle_timeout = Duration::from_secs(300);
-    let mut low_queue: VecDeque<WorkItem> = VecDeque::new();
+    match item {
+        PriorityItem::Normal(item) => normal.push_back(item),
+        PriorityItem::Low(item) => low.push_back(item),
+    }
+}
+
+fn retire_idle_slot<K>(inner: &QueueInner<K>, key: &K, slot: &Arc<QueueSlot>) -> bool
+where
+    K: Hash + Eq,
+{
+    inner
+        .slots
+        .remove_if(key, |_, current| {
+            Arc::ptr_eq(current, slot)
+                && current.pending.lock().total() == 0
+                // The map and worker are the only owners when no admission
+                // call, waiting admission, or reservation is in flight.
+                && Arc::strong_count(current) == 2
+        })
+        .is_some()
+}
+
+fn remove_shutdown_slot<K>(inner: &QueueInner<K>, key: &K, slot: &Arc<QueueSlot>)
+where
+    K: Hash + Eq,
+{
+    inner
+        .slots
+        .remove_if(key, |_, current| Arc::ptr_eq(current, slot));
+}
+
+async fn queue_worker<K>(
+    key: K,
+    slot: Arc<QueueSlot>,
+    mut receiver: mpsc::Receiver<PriorityItem>,
+    inner: Arc<QueueInner<K>>,
+) where
+    K: Hash + Eq + Clone + Send + Sync + Debug + 'static,
+{
+    let mut normal = VecDeque::new();
+    let mut low = VecDeque::new();
+    let mut shutting_down = false;
 
     loop {
-        // First: drain any pending normal items before touching low-priority.
-        // try_recv is non-blocking — picks up items that arrived while we
-        // were executing the previous work item.
-        let mut got_normal = false;
-        while let Ok(item) = rx.try_recv() {
-            match item {
-                PriorityItem::Normal(work) => {
-                    pending.fetch_sub(1, Ordering::Relaxed);
-                    work.await;
-                    got_normal = true;
-                }
-                PriorityItem::Low(work) => {
-                    low_queue.push_back(work);
-                }
-            }
+        while let Ok(item) = receiver.try_recv() {
+            push_item(item, &mut normal, &mut low);
         }
 
-        // If we processed normal items, loop back to check for more
-        // (they may have arrived while we were awaiting).
-        if got_normal {
+        if let Some(item) = normal.pop_front() {
+            execute_item(&slot, item, false).await;
+            continue;
+        }
+        if let Some(item) = low.pop_front() {
+            execute_item(&slot, item, true).await;
             continue;
         }
 
-        // No normal items pending — process one low-priority item if available.
-        if let Some(low_work) = low_queue.pop_front() {
-            pending.fetch_sub(1, Ordering::Relaxed);
-            low_work.await;
-            continue;
-        }
-
-        // Nothing pending — wait for new items (with timeout and shutdown).
-        tokio::select! {
-            biased;
-
-            _ = shutdown.cancelled() => {
-                debug!(key = ?key, "Session queue handler shutting down, draining remaining items");
-                rx.close();
-                while let Some(item) = rx.recv().await {
-                    pending.fetch_sub(1, Ordering::Relaxed);
-                    match item {
-                        PriorityItem::Normal(work) | PriorityItem::Low(work) => work.await,
-                    }
-                }
-                for work in low_queue.drain(..) {
-                    pending.fetch_sub(1, Ordering::Relaxed);
-                    work.await;
-                }
-                senders.remove(&key);
-                pending_counts.remove(&key);
+        if shutting_down {
+            let changed = slot.changed.notified();
+            if slot.pending.lock().total() == 0 && Arc::strong_count(&slot) == 2 {
+                receiver.close();
+                debug!(key = ?key, "Session queue drained during shutdown");
+                remove_shutdown_slot(&inner, &key, &slot);
                 break;
             }
 
-            result = timeout(idle_timeout, rx.recv()) => {
-                match result {
-                    Ok(Some(PriorityItem::Normal(work))) => {
-                        pending.fetch_sub(1, Ordering::Relaxed);
-                        work.await;
+            tokio::select! {
+                received = receiver.recv() => {
+                    if let Some(item) = received {
+                        push_item(item, &mut normal, &mut low);
                     }
-                    Ok(Some(PriorityItem::Low(work))) => {
-                        // Defer: loop back to check for normal items first.
-                        // Don't decrement yet — item hasn't started executing.
-                        low_queue.push_back(work);
-                    }
+                }
+                _ = changed => {}
+            }
+            continue;
+        }
+
+        tokio::select! {
+            biased;
+
+            _ = inner.shutdown.cancelled() => {
+                shutting_down = true;
+            }
+
+            received = timeout(IDLE_TIMEOUT, receiver.recv()) => {
+                match received {
+                    Ok(Some(item)) => push_item(item, &mut normal, &mut low),
                     Ok(None) => {
-                        // Channel closed — drain any remaining low-priority items.
-                        debug!(key = ?key, "Session queue handler exiting: channel closed");
-                        for work in low_queue.drain(..) {
-                            pending.fetch_sub(1, Ordering::Relaxed);
-                            work.await;
-                        }
-                        senders.remove(&key);
-                        pending_counts.remove(&key);
+                        remove_shutdown_slot(&inner, &key, &slot);
                         break;
                     }
                     Err(_) => {
-                        debug!(key = ?key, "Session queue handler exiting: idle timeout");
-                        senders.remove(&key);
-                        pending_counts.remove(&key);
-                        while let Ok(item) = rx.try_recv() {
-                            pending.fetch_sub(1, Ordering::Relaxed);
-                            match item {
-                                PriorityItem::Normal(work) | PriorityItem::Low(work) => work.await,
-                            }
+                        if retire_idle_slot(&inner, &key, &slot) {
+                            debug!(key = ?key, "Session queue retired after idle timeout");
+                            break;
                         }
-                        for work in low_queue.drain(..) {
-                            pending.fetch_sub(1, Ordering::Relaxed);
-                            work.await;
-                        }
-                        break;
                     }
                 }
             }
@@ -231,260 +506,323 @@ async fn handler_loop<K: Hash + Eq + Clone + Send + Sync + Debug + 'static>(
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use tokio::sync::Barrier;
+    use tokio::sync::{Barrier, oneshot};
 
-    #[tokio::test]
-    async fn same_key_executes_sequentially() {
-        let shutdown = CancellationToken::new();
-        let queue = SessionQueue::<u64>::new(shutdown);
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_first_admission_creates_one_serial_worker() {
+        const ITEMS: usize = 128;
+        let queue = Arc::new(SessionQueue::for_test(
+            CancellationToken::new(),
+            ITEMS,
+            ITEMS,
+        ));
+        let start = Arc::new(Barrier::new(ITEMS + 1));
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let (done_tx, mut done_rx) = mpsc::channel(ITEMS);
+        let mut producers = Vec::new();
 
-        let counter = Arc::new(AtomicUsize::new(0));
-        let (tx, mut rx) = mpsc::unbounded_channel::<(usize, usize)>();
-
-        for _ in 0..3 {
-            let c = Arc::clone(&counter);
-            let tx = tx.clone();
-            queue.enqueue(
-                1,
-                Box::pin(async move {
-                    let start = c.fetch_add(1, Ordering::SeqCst);
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                    let end = c.fetch_add(1, Ordering::SeqCst);
-                    let _ = tx.send((start, end));
-                }),
-            );
+        for _ in 0..ITEMS {
+            let queue = Arc::clone(&queue);
+            let start = Arc::clone(&start);
+            let active = Arc::clone(&active);
+            let peak = Arc::clone(&peak);
+            let done_tx = done_tx.clone();
+            producers.push(tokio::spawn(async move {
+                start.wait().await;
+                queue
+                    .try_reserve(7)
+                    .expect("admission")
+                    .submit(Box::pin(async move {
+                        let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                        peak.fetch_max(now, Ordering::SeqCst);
+                        tokio::task::yield_now().await;
+                        active.fetch_sub(1, Ordering::SeqCst);
+                        done_tx.send(()).await.expect("done receiver");
+                    }))
+                    .expect("dispatch");
+            }));
         }
-        drop(tx);
 
-        let mut results = Vec::new();
-        while let Some(r) = rx.recv().await {
-            results.push(r);
+        start.wait().await;
+        for producer in producers {
+            producer.await.expect("producer task");
+        }
+        drop(done_tx);
+        for _ in 0..ITEMS {
+            done_rx.recv().await.expect("completed item");
         }
 
-        assert_eq!(results.len(), 3);
-        for i in 1..results.len() {
-            assert!(
-                results[i].0 > results[i - 1].1,
-                "Item {} started ({}) before item {} ended ({})",
-                i,
-                results[i].0,
-                i - 1,
-                results[i - 1].1
-            );
-        }
+        assert_eq!(peak.load(Ordering::SeqCst), 1);
+        assert_eq!(queue.slot_count(), 1);
     }
 
     #[tokio::test]
     async fn different_keys_execute_concurrently() {
-        let shutdown = CancellationToken::new();
-        let queue = SessionQueue::<u64>::new(shutdown);
+        let queue = SessionQueue::for_test(CancellationToken::new(), 2, 4);
+        let rendezvous = Arc::new(Barrier::new(3));
 
-        let barrier = Arc::new(Barrier::new(2));
-        let (tx, mut rx) = mpsc::unbounded_channel::<u64>();
-
-        for key in [1u64, 2u64] {
-            let b = Arc::clone(&barrier);
-            let tx = tx.clone();
-            queue.enqueue(
-                key,
-                Box::pin(async move {
-                    b.wait().await;
-                    let _ = tx.send(key);
-                }),
-            );
+        for key in [1, 2] {
+            let rendezvous = Arc::clone(&rendezvous);
+            queue
+                .try_reserve(key)
+                .expect("admission")
+                .submit(Box::pin(async move {
+                    rendezvous.wait().await;
+                }))
+                .expect("dispatch");
         }
-        drop(tx);
 
-        let mut results = Vec::new();
-        while let Some(r) = rx.recv().await {
-            results.push(r);
-        }
-        results.sort();
-        assert_eq!(results, vec![1, 2]);
+        rendezvous.wait().await;
     }
 
     #[tokio::test]
-    async fn low_priority_deferred_behind_normal() {
-        let shutdown = CancellationToken::new();
-        let queue = SessionQueue::<u64>::new(shutdown);
-
-        let (tx, mut rx) = mpsc::unbounded_channel::<&'static str>();
-
-        // Enqueue: normal blocks on gate, then low, then normal.
-        // Expected order: normal1, normal2, low
-        let (gate_tx, gate_rx) = tokio::sync::oneshot::channel::<()>();
-
-        let tx1 = tx.clone();
-        queue.enqueue(
-            1,
-            Box::pin(async move {
-                let _ = gate_rx.await; // block until gate opens
-                let _ = tx1.send("normal1");
-            }),
-        );
-
-        // Yield to let the handler task start processing normal1 (blocked on gate)
-        tokio::task::yield_now().await;
-        tokio::task::yield_now().await;
-
-        let tx2 = tx.clone();
-        queue.enqueue_low(
-            1,
-            Box::pin(async move {
-                let _ = tx2.send("low");
-            }),
-        );
-
-        let tx3 = tx.clone();
-        queue.enqueue(
-            1,
-            Box::pin(async move {
-                let _ = tx3.send("normal2");
-            }),
-        );
-
-        // Unblock normal1
-        let _ = gate_tx.send(());
-        drop(tx);
-
-        let mut results = Vec::new();
-        while let Some(r) = rx.recv().await {
-            results.push(r);
-        }
-
+    async fn capacity_is_bounded_and_drop_rolls_back() {
+        let queue = SessionQueue::for_test(CancellationToken::new(), 2, 3);
+        let first = queue.try_reserve(1).expect("first");
+        let second = queue.try_reserve(1).expect("second");
         assert_eq!(
-            results,
-            vec!["normal1", "normal2", "low"],
-            "Low-priority item should execute after all normal items"
+            queue.try_reserve(1).expect_err("per-key full"),
+            AdmissionError::PerKeyFull
         );
+
+        let other_key = queue.try_reserve(2).expect("global final slot");
+        assert_eq!(
+            queue.try_reserve(3).expect_err("global full"),
+            AdmissionError::GlobalFull
+        );
+        assert_eq!(queue.pending_total(), 3);
+
+        drop(second);
+        drop(other_key);
+        assert_eq!(queue.pending_total(), 1);
+        drop(first);
+        assert_eq!(queue.pending_total(), 0);
     }
 
     #[tokio::test]
-    async fn idle_timeout_cleans_up() {
-        tokio::time::pause();
+    async fn positions_linearize_at_submission_and_respect_priority() {
+        let queue = SessionQueue::for_test(CancellationToken::new(), 4, 4);
+        let first = queue.try_reserve(1).expect("first");
+        let second = queue.try_reserve(1).expect("second");
+        let first_receipt = first.submit(Box::pin(async {})).expect("first dispatch");
+        let second_receipt = second.submit(Box::pin(async {})).expect("second dispatch");
+        assert_eq!(first_receipt.queued_ahead(), 0);
+        assert_eq!(second_receipt.queued_ahead(), 1);
 
-        let shutdown = CancellationToken::new();
-        let queue = SessionQueue::<u64>::new(shutdown);
-
-        let (tx, mut rx) = mpsc::unbounded_channel::<()>();
-        queue.enqueue(
-            42,
-            Box::pin(async move {
-                let _ = tx.send(());
-            }),
-        );
-
-        rx.recv().await;
-
-        tokio::time::advance(Duration::from_secs(301)).await;
-        tokio::task::yield_now().await;
-        tokio::task::yield_now().await;
-
-        assert!(
-            !queue.senders.contains_key(&42),
-            "senders entry should be removed after idle timeout"
-        );
-        assert!(
-            !queue.pending_counts.contains_key(&42),
-            "pending_counts entry should be removed after idle timeout"
-        );
+        let low = queue.try_reserve(2).expect("low");
+        let normal = queue.try_reserve(2).expect("normal");
+        let low_receipt = low.submit_low(Box::pin(async {})).expect("low dispatch");
+        let normal_receipt = normal.submit(Box::pin(async {})).expect("normal dispatch");
+        assert_eq!(low_receipt.queued_ahead(), 0);
+        assert_eq!(normal_receipt.queued_ahead(), 0);
     }
 
     #[tokio::test]
-    async fn re_enqueue_after_idle_eviction() {
-        tokio::time::pause();
+    async fn waiting_admission_proceeds_after_capacity_is_released() {
+        let queue = Arc::new(SessionQueue::for_test(CancellationToken::new(), 1, 1));
+        let held = queue.try_reserve(1).expect("held reservation");
+        let waiter = {
+            let queue = Arc::clone(&queue);
+            tokio::spawn(async move { queue.reserve(1).await })
+        };
 
-        let shutdown = CancellationToken::new();
-        let queue = SessionQueue::<u64>::new(shutdown);
-
-        let (tx1, mut rx1) = mpsc::unbounded_channel::<u8>();
-        queue.enqueue(
-            1,
-            Box::pin(async move {
-                let _ = tx1.send(1);
-            }),
-        );
-        rx1.recv().await;
-
-        tokio::time::advance(Duration::from_secs(301)).await;
         tokio::task::yield_now().await;
-        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished());
+        drop(held);
 
-        let (tx2, mut rx2) = mpsc::unbounded_channel::<u8>();
-        queue.enqueue(
-            1,
-            Box::pin(async move {
-                let _ = tx2.send(2);
-            }),
-        );
-
-        let val = rx2.recv().await.unwrap();
-        assert_eq!(val, 2);
+        let admitted = waiter
+            .await
+            .expect("waiter task")
+            .expect("waiting admission");
+        drop(admitted);
+        assert_eq!(queue.pending_total(), 0);
     }
 
     #[tokio::test]
-    async fn shutdown_drains_remaining() {
-        let shutdown = CancellationToken::new();
-        let queue = SessionQueue::<u64>::new(shutdown.clone());
-        let executed = Arc::new(AtomicUsize::new(0));
+    async fn normal_priority_overtakes_buffered_low_priority() {
+        let queue = SessionQueue::for_test(CancellationToken::new(), 3, 3);
+        let (gate_tx, gate_rx) = oneshot::channel();
+        let (order_tx, mut order_rx) = mpsc::channel(3);
 
-        let (gate_tx, gate_rx) = tokio::sync::oneshot::channel::<()>();
-        let e = Arc::clone(&executed);
-        queue.enqueue(
-            1,
-            Box::pin(async move {
+        let first_tx = order_tx.clone();
+        queue
+            .try_reserve(1)
+            .expect("first")
+            .submit(Box::pin(async move {
                 let _ = gate_rx.await;
-                e.fetch_add(1, Ordering::SeqCst);
-            }),
-        );
+                first_tx.send("first").await.expect("order receiver");
+            }))
+            .expect("first dispatch");
+        tokio::task::yield_now().await;
 
-        let e = Arc::clone(&executed);
-        queue.enqueue(
-            1,
-            Box::pin(async move {
-                e.fetch_add(1, Ordering::SeqCst);
-            }),
-        );
+        let low_tx = order_tx.clone();
+        queue
+            .try_reserve(1)
+            .expect("low")
+            .submit_low(Box::pin(async move {
+                low_tx.send("low").await.expect("order receiver");
+            }))
+            .expect("low dispatch");
+        queue
+            .try_reserve(1)
+            .expect("normal")
+            .submit(Box::pin(async move {
+                order_tx.send("normal").await.expect("order receiver");
+            }))
+            .expect("normal dispatch");
 
-        shutdown.cancel();
-        let _ = gate_tx.send(());
-
-        tokio::time::sleep(Duration::from_millis(50)).await;
-
-        assert_eq!(
-            executed.load(Ordering::SeqCst),
-            2,
-            "Both items should have been drained on shutdown"
-        );
+        gate_tx.send(()).expect("release first");
+        assert_eq!(order_rx.recv().await, Some("first"));
+        assert_eq!(order_rx.recv().await, Some("normal"));
+        assert_eq!(order_rx.recv().await, Some("low"));
     }
 
     #[tokio::test]
-    async fn pending_counts_cleaned_up_on_shutdown() {
+    async fn in_flight_reservation_prevents_idle_eviction() {
+        tokio::time::pause();
+        let queue = SessionQueue::for_test(CancellationToken::new(), 2, 2);
+        let reservation = queue.try_reserve(9).expect("reservation");
+
+        tokio::task::yield_now().await;
+        tokio::time::advance(IDLE_TIMEOUT + Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(queue.slot_count(), 1);
+
+        let (done_tx, done_rx) = oneshot::channel();
+        reservation
+            .submit(Box::pin(async move {
+                done_tx.send(()).expect("done receiver");
+            }))
+            .expect("dispatch after idle boundary");
+        done_rx.await.expect("work completed");
+
+        tokio::task::yield_now().await;
+        tokio::time::advance(IDLE_TIMEOUT + Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(queue.slot_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn stale_worker_cleanup_cannot_remove_replacement_slot() {
         let shutdown = CancellationToken::new();
-        let queue = SessionQueue::<u64>::new(shutdown.clone());
+        let queue = SessionQueue::for_test(shutdown.clone(), 2, 2);
+        let stale = queue.slot_for(5);
+        queue.inner.slots.remove(&5);
+        let replacement = queue.slot_for(5);
+        assert!(!Arc::ptr_eq(&stale, &replacement));
 
-        let (tx, mut rx) = mpsc::unbounded_channel::<()>();
-        queue.enqueue(
-            99,
-            Box::pin(async move {
-                let _ = tx.send(());
-            }),
-        );
-
-        // Wait for the item to execute.
-        rx.recv().await;
-
-        // Signal shutdown so the handler drains and exits.
+        remove_shutdown_slot(&queue.inner, &5, &stale);
+        let current = queue.inner.slots.get(&5).expect("replacement slot");
+        assert!(Arc::ptr_eq(current.value(), &replacement));
+        drop(current);
         shutdown.cancel();
-        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 
-        assert!(
-            !queue.pending_counts.contains_key(&99),
-            "pending_counts entry should be removed after shutdown"
+    #[tokio::test]
+    async fn reservation_accepted_before_shutdown_can_still_submit() {
+        let shutdown = CancellationToken::new();
+        let queue = SessionQueue::for_test(shutdown.clone(), 1, 1);
+        let reservation = queue.try_reserve(1).expect("accepted reservation");
+        let (done_tx, done_rx) = oneshot::channel();
+
+        shutdown.cancel();
+        tokio::task::yield_now().await;
+        reservation
+            .submit(Box::pin(async move {
+                done_tx.send(()).expect("done receiver");
+            }))
+            .expect("accepted work must dispatch during drain");
+
+        done_rx.await.expect("accepted work drained");
+    }
+
+    #[tokio::test]
+    async fn shutdown_cleans_up_cancelled_admission_waiter() {
+        let shutdown = CancellationToken::new();
+        let queue = Arc::new(SessionQueue::for_test(shutdown.clone(), 1, 1));
+        let held = queue.try_reserve(1).expect("held reservation");
+        let waiter = {
+            let queue = Arc::clone(&queue);
+            tokio::spawn(async move { queue.reserve(1).await })
+        };
+        tokio::task::yield_now().await;
+
+        shutdown.cancel();
+        assert_eq!(
+            waiter.await.expect("waiter task").expect_err("shutdown"),
+            AdmissionError::ShuttingDown
         );
-        assert!(
-            !queue.senders.contains_key(&99),
-            "senders entry should be removed after shutdown"
+        drop(held);
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        assert_eq!(queue.slot_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn panicking_work_does_not_poison_key_worker() {
+        let queue = SessionQueue::for_test(CancellationToken::new(), 2, 2);
+        let (done_tx, done_rx) = oneshot::channel();
+        queue
+            .try_reserve(1)
+            .expect("panic admission")
+            .submit(Box::pin(async {
+                panic!("intentional queue test panic");
+            }))
+            .expect("panic dispatch");
+        queue
+            .try_reserve(1)
+            .expect("following admission")
+            .submit(Box::pin(async move {
+                done_tx.send(()).expect("done receiver");
+            }))
+            .expect("following dispatch");
+
+        done_rx.await.expect("worker continued after panic");
+    }
+
+    #[tokio::test]
+    async fn shutdown_preserves_priority_and_rejects_new_work() {
+        let shutdown = CancellationToken::new();
+        let queue = SessionQueue::for_test(shutdown.clone(), 3, 3);
+        let (gate_tx, gate_rx) = oneshot::channel();
+        let (order_tx, mut order_rx) = mpsc::channel(3);
+
+        let first_tx = order_tx.clone();
+        queue
+            .try_reserve(1)
+            .expect("first")
+            .submit(Box::pin(async move {
+                let _ = gate_rx.await;
+                first_tx.send("first").await.expect("order receiver");
+            }))
+            .expect("first dispatch");
+        tokio::task::yield_now().await;
+
+        let low_tx = order_tx.clone();
+        queue
+            .try_reserve(1)
+            .expect("low")
+            .submit_low(Box::pin(async move {
+                low_tx.send("low").await.expect("order receiver");
+            }))
+            .expect("low dispatch");
+        queue
+            .try_reserve(1)
+            .expect("normal")
+            .submit(Box::pin(async move {
+                order_tx.send("normal").await.expect("order receiver");
+            }))
+            .expect("normal dispatch");
+
+        shutdown.cancel();
+        gate_tx.send(()).expect("release first");
+        assert_eq!(order_rx.recv().await, Some("first"));
+        assert_eq!(order_rx.recv().await, Some("normal"));
+        assert_eq!(order_rx.recv().await, Some("low"));
+        assert_eq!(
+            queue.try_reserve(1).expect_err("shutdown rejection"),
+            AdmissionError::ShuttingDown
         );
     }
 }

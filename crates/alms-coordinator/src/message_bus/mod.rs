@@ -48,12 +48,9 @@ const DEPTH_EXPIRY_SECS: u64 = 1800;
 ///
 /// Was an unbounded channel — a runaway producer (e.g. a tight DM ping-pong
 /// or a burst of `ConversationEnded` notifications) could grow it without
-/// limit. Bounded so producers apply back-pressure instead; senders use
-/// `Sender::send().await` and therefore never drop a trigger when the buffer
-/// is full. 1024 is generous headroom for normal peak load — the consumer
-/// (`run_trigger_loop`) drains it continuously, so the buffer only fills
-/// under sustained bursts, at which point back-pressure is the correct
-/// behaviour (slow the producer, never lose a DM turn).
+/// limit. Producers reserve capacity before mutating DM state. A full buffer
+/// therefore produces an explicit, side-effect-free delivery error instead
+/// of blocking an agent run that may be needed to free gateway queue space.
 pub const RUN_TRIGGER_CHANNEL_CAPACITY: usize = 1024;
 
 /// Buffer capacity for the bounded `DmEvent` channel (#842 / B11).

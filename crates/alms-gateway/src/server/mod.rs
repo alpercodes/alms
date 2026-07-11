@@ -94,9 +94,9 @@ pub async fn serve_with_gateway(bind_addr: &str, gateway: Gateway) -> AlmsResult
     let (completion_tx, completion_rx) =
         tokio::sync::mpsc::unbounded_channel::<alms_coordinator::SubagentCompletion>();
 
-    // Bounded channels (#842 / B11): producers apply back-pressure instead
-    // of growing without limit. `MessageBus` pushes with `send().await` so a
-    // full buffer slows the producer rather than dropping a DM trigger.
+    // Bounded channels (#842 / B11): MessageBus reserves run-trigger capacity
+    // before mutating durable DM state and returns an explicit error when
+    // saturated. DM SSE decoration is best-effort and drops on saturation.
     let (run_trigger_tx, run_trigger_rx) =
         tokio::sync::mpsc::channel::<alms_coordinator::message_bus::RunTrigger>(
             alms_coordinator::message_bus::RUN_TRIGGER_CHANNEL_CAPACITY,

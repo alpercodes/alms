@@ -73,6 +73,12 @@ pub(crate) struct JobEpisode {
     pub(crate) in_flight_runs: usize,
     /// Every run that belonged to the episode, in order (turn 1 first).
     pub(crate) runs: Vec<RunId>,
+    /// Runs whose in-flight reservation has already been released.
+    ///
+    /// The domain panic guard may retry completion after `execute_run`
+    /// reached its normal terminal tail. Tracking identities makes that
+    /// retry idempotent instead of decrementing a concurrent continuation.
+    pub(crate) finished_runs: HashSet<RunId>,
     /// Lifetime totals for the completion-card stats.
     pub(crate) dm_total: usize,
     pub(crate) subagent_total: usize,
@@ -180,6 +186,7 @@ impl JobEpisodeTracker {
             pending_subagents: HashMap::new(),
             in_flight_runs: 1,
             runs: vec![turn1_run],
+            finished_runs: HashSet::new(),
             dm_total: 0,
             subagent_total: 0,
             catch_up_queued: false,
@@ -213,6 +220,15 @@ impl JobEpisodeTracker {
             );
             return RunCompletion::Untracked;
         };
+
+        if !ep.finished_runs.insert(run_id) {
+            debug!(
+                job_id = %job_id,
+                run_id = %run_id.0,
+                "Ignoring duplicate episode run completion"
+            );
+            return RunCompletion::Open;
+        }
 
         if ep.in_flight_runs == 0 {
             // Bookkeeping violation — every decrement must pair with a
@@ -577,6 +593,39 @@ mod tests {
         t.note_run(job_id, c2);
         assert!(matches!(
             t.on_run_complete(job_id, c2, vec![], vec![]),
+            RunCompletion::Closed(_)
+        ));
+    }
+
+    /// A panic caught after the normal terminal tail may call completion a
+    /// second time for the same run. It must not release the reservation
+    /// held by a concurrently queued continuation.
+    #[test]
+    fn duplicate_completion_does_not_consume_continuation_reservation() {
+        let t = tracker();
+        let (job_id, _, agent_id, run1) = open_episode(&t);
+        let dm = SessionId::new();
+
+        assert!(matches!(
+            t.on_run_complete(job_id, run1, vec![dm], vec![]),
+            RunCompletion::Open
+        ));
+        assert_eq!(t.resolve_dm(dm, agent_id).len(), 1);
+
+        let continuation = RunId::new();
+        t.note_run(job_id, continuation);
+        assert!(matches!(
+            t.on_run_complete(job_id, run1, vec![], vec![]),
+            RunCompletion::Open
+        ));
+        assert_eq!(
+            t.snapshot(job_id).unwrap()["in_flight_runs"],
+            1,
+            "duplicate completion must leave the continuation reservation intact"
+        );
+
+        assert!(matches!(
+            t.on_run_complete(job_id, continuation, vec![], vec![]),
             RunCompletion::Closed(_)
         ));
     }

@@ -4,6 +4,7 @@ use super::tools::{RoutedBgEvent, RuntimeEventForwarder, forward_runtime_events,
 use super::{RunParams, is_internal_context_id, resolve_agent_config};
 use crate::api_error;
 use crate::server::AppState;
+use crate::session_queue::AdmissionError;
 use crate::sse::SseEventData;
 use alms_core::{
     AgentId, AlmsError, CreateRunRequest, CreateRunResponse, Run, RunId, RunInput, RunStatus,
@@ -14,11 +15,14 @@ use alms_tools::message_sender::ConversationEndReason;
 use axum::{
     Json,
     extract::{Path, Query, State},
-    http::StatusCode,
+    http::{HeaderValue, StatusCode, header::RETRY_AFTER},
+    response::{IntoResponse, Response},
 };
 use chrono::Utc;
+use futures::FutureExt;
 use serde::Deserialize;
 use serde::Serialize;
+use std::panic::AssertUnwindSafe;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, instrument, warn};
@@ -838,6 +842,68 @@ fn pre_flight_token_budget(
     }
 }
 
+#[derive(Debug)]
+pub struct RunCreationErrorBody(pub serde_json::Value, Option<HeaderValue>);
+
+impl From<Json<serde_json::Value>> for RunCreationErrorBody {
+    fn from(body: Json<serde_json::Value>) -> Self {
+        Self(body.0, None)
+    }
+}
+
+impl IntoResponse for RunCreationErrorBody {
+    fn into_response(self) -> Response {
+        let mut response = Json(self.0).into_response();
+        if let Some(retry_after) = self.1 {
+            response.headers_mut().insert(RETRY_AFTER, retry_after);
+        }
+        response
+    }
+}
+
+fn run_creation_api_error(
+    status: StatusCode,
+    code: &str,
+    message: &str,
+) -> (StatusCode, RunCreationErrorBody) {
+    let (status, body) = api_error(status, code, message);
+    (status, body.into())
+}
+
+pub(super) fn queue_admission_error(error: AdmissionError) -> (StatusCode, RunCreationErrorBody) {
+    match error {
+        AdmissionError::PerKeyFull => (
+            StatusCode::TOO_MANY_REQUESTS,
+            RunCreationErrorBody(
+                serde_json::json!({
+                    "error_code": "AGENT_QUEUE_FULL",
+                    "message": "This agent has reached its pending run limit",
+                    "retryable": true,
+                    "retry_after_ms": 1000,
+                }),
+                Some(HeaderValue::from_static("1")),
+            ),
+        ),
+        AdmissionError::GlobalFull => (
+            StatusCode::TOO_MANY_REQUESTS,
+            RunCreationErrorBody(
+                serde_json::json!({
+                    "error_code": "GATEWAY_QUEUE_FULL",
+                    "message": "The gateway has reached its pending run limit",
+                    "retryable": true,
+                    "retry_after_ms": 1000,
+                }),
+                Some(HeaderValue::from_static("1")),
+            ),
+        ),
+        AdmissionError::ShuttingDown | AdmissionError::DispatchClosed => run_creation_api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "QUEUE_UNAVAILABLE",
+            "Run queue is unavailable while the gateway is shutting down",
+        ),
+    }
+}
+
 /// POST /runs - Create a new run
 ///
 /// Per API spec: Returns 201 Created with { run_id, session_id, status: "queued", ts }
@@ -845,11 +911,11 @@ fn pre_flight_token_budget(
 pub async fn create_run(
     State(state): State<AppState>,
     Json(req): Json<CreateRunRequest>,
-) -> Result<(StatusCode, Json<CreateRunResponse>), (StatusCode, Json<serde_json::Value>)> {
+) -> Result<(StatusCode, Json<CreateRunResponse>), (StatusCode, RunCreationErrorBody)> {
     let session = match state.session_manager.get(req.session_id) {
         Ok(session) => session,
         Err(_) => {
-            return Err(api_error(
+            return Err(run_creation_api_error(
                 StatusCode::NOT_FOUND,
                 "NOT_FOUND",
                 "Session not found",
@@ -865,7 +931,7 @@ pub async fn create_run(
     let is_shared_session = session_agent_id.is_nil();
     let agent_id = match req.agent_id {
         Some(requested) if requested != session_agent_id && !is_shared_session => {
-            return Err(api_error(
+            return Err(run_creation_api_error(
                 StatusCode::BAD_REQUEST,
                 "AGENT_SESSION_MISMATCH",
                 "Session belongs to a different agent",
@@ -873,7 +939,7 @@ pub async fn create_run(
         }
         Some(requested) => requested,
         None if is_shared_session => {
-            return Err(api_error(
+            return Err(run_creation_api_error(
                 StatusCode::BAD_REQUEST,
                 "AGENT_ID_REQUIRED",
                 "Shared sessions require agent_id so per-agent config can be resolved",
@@ -892,7 +958,7 @@ pub async fn create_run(
 
     // Reject new runs during shutdown.
     if state.shutdown_token.is_cancelled() {
-        return Err(api_error(
+        return Err(run_creation_api_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "SHUTTING_DOWN",
             "Server is shutting down",
@@ -925,7 +991,8 @@ pub async fn create_run(
                             triggered via send_message, not POST /runs.",
                 "session_id": session_id.0.to_string(),
                 "context_id": context_id.as_str(),
-            })),
+            }))
+            .into(),
         ));
     }
 
@@ -976,15 +1043,24 @@ pub async fn create_run(
                         "agent_id": ag.0.to_string(),
                         "new_provider": new_provider,
                         "prev_provider": prev_provider,
-                    })),
+                    }))
+                    .into(),
                 ));
             }
             Ok(resolved) => {
                 // #919 per-run token-budget validation.
-                pre_flight_token_budget(agent_id, &resolved.agent_config, &resolved.llm)?;
+                pre_flight_token_budget(agent_id, &resolved.agent_config, &resolved.llm)
+                    .map_err(|(status, body)| (status, body.into()))?;
             }
         }
     }
+
+    // Admission is the linearization point for queue position and happens
+    // before any run, message, cancellation-token, or SSE side effect.
+    let reservation = state
+        .agent_queue
+        .try_reserve(agent_id)
+        .map_err(queue_admission_error)?;
 
     state.run_manager.insert_run(run.clone());
 
@@ -1024,17 +1100,55 @@ pub async fn create_run(
         }
     };
 
+    // Dispatch before the first await after durable side effects. If the
+    // request is dropped while publishing run_created, dropping start_tx
+    // releases the queued work instead of stranding it.
+    let cancel_token = CancellationToken::new();
+    state
+        .run_manager
+        .register_cancel_token(run_id, cancel_token.clone());
+    let (start_tx, start_rx) = tokio::sync::oneshot::channel();
+    let state_clone = state.clone();
+    let receipt = match reservation.submit(Box::pin(async move {
+        let _ = start_rx.await;
+        execute_run_guarded(
+            state_clone,
+            RunParams {
+                run_id,
+                session_id,
+                agent_id,
+                input: run.input,
+                context_id,
+                cancel_token,
+                is_peer_message: false,
+                is_system_triggered: false,
+                input_pre_persisted,
+            },
+        )
+        .await;
+    })) {
+        Ok(receipt) => receipt,
+        Err(error) => {
+            let _ = state
+                .run_manager
+                .mark_run_as_failed(run_id, "Run queue closed before dispatch".to_string());
+            state.run_manager.remove_cancel_token(run_id);
+            return Err(queue_admission_error(error));
+        }
+    };
+    let agent_running = state.run_manager.agent_has_running_run(agent_id);
+    let queued_behind = receipt.queued_ahead() + usize::from(agent_running);
+
     // Notify session-level SSE subscribers that a new run was created.
     //
     // `queued_behind` tells the UI how many runs are ahead of this one so
     // it can show "Queued -- waiting for agent..." instead of a misleading
     // "Thinking...".
     //
-    // `SessionQueue::pending_count` counts items still *waiting* to be
-    // picked up by the handler -- the currently-executing work item has
-    // already been dequeued and its counter decremented.  So we also add 1
-    // if the agent has a `Running` run, to catch the common case of a busy
-    // agent with nothing else queued behind it yet.
+    // The dispatch receipt counts submitted normal-priority work at the same
+    // linearization point that orders the channel. Low-priority notification
+    // work is excluded because this user run overtakes it. The active run has
+    // already left the pending queue, so add it separately.
     //
     // Known residual race: there is a narrow sub-millisecond TOCTOU window
     // between `pending.fetch_sub(1)` inside the queue handler and
@@ -1046,51 +1160,28 @@ pub async fn create_run(
     // in-flight counter inside `SessionQueue` that is incremented on
     // dequeue (before `work.await`) and decremented after the work
     // future resolves; considered low priority.
-    let agent_running = state.run_manager.agent_has_running_run(agent_id);
-    let queued_behind = state.agent_queue.pending_count(&agent_id) + usize::from(agent_running);
-    state
-        .run_manager
-        .send_session_event(
-            session_id,
-            run_id,
-            SseEventData::run_created(
-                run_id,
+    // The detached task owns both event publication and the start gate.
+    // Dropping the HTTP request cannot cancel run_created while allowing
+    // the queued work to advance to run_started.
+    let event_state = state.clone();
+    let event_task = tokio::spawn(async move {
+        event_state
+            .run_manager
+            .send_session_event(
                 session_id,
-                false,
-                Some("user".to_string()),
-                queued_behind,
-            ),
-        )
-        .await;
-
-    // Create per-run cancellation token BEFORE enqueue so cancelling a
-    // queued-but-not-yet-started run works.
-    let cancel_token = CancellationToken::new();
-    state
-        .run_manager
-        .register_cancel_token(run_id, cancel_token.clone());
-
-    let state_clone = state.clone();
-    state.agent_queue.enqueue(
-        agent_id,
-        Box::pin(async move {
-            execute_run(
-                state_clone,
-                RunParams {
+                run_id,
+                SseEventData::run_created(
                     run_id,
                     session_id,
-                    agent_id,
-                    input: run.input,
-                    context_id,
-                    cancel_token,
-                    is_peer_message: false,
-                    is_system_triggered: false,
-                    input_pre_persisted,
-                },
+                    false,
+                    Some("user".to_string()),
+                    queued_behind,
+                ),
             )
             .await;
-        }),
-    );
+        let _ = start_tx.send(());
+    });
+    let _ = event_task.await;
 
     let response = CreateRunResponse {
         run_id,
@@ -3114,6 +3205,91 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
     // CancelledWithToolCalls / FailedWithToolCalls / generic Err).
     broadcast_queue_advance(&state, agent_id).await;
     // `_in_flight_guard` dropped here — signals drain waiters that this run is done.
+}
+
+/// Execute one admitted run behind a domain-level panic boundary.
+///
+/// The keyed queue also catches panics so one bad item cannot kill its worker,
+/// but only this layer has enough context to reconcile the run's durable and
+/// observable state. Keeping the cleanup here prevents a caught panic from
+/// leaving a run, cancellation token, or activity indicator permanently live.
+pub(super) async fn execute_run_guarded(state: AppState, params: RunParams) {
+    let execution = execute_run(state.clone(), params.clone());
+    execute_run_guarded_future(state, params, execution).await;
+}
+
+pub(super) async fn execute_run_guarded_future<F>(state: AppState, params: RunParams, execution: F)
+where
+    F: std::future::Future<Output = ()>,
+{
+    let run_id = params.run_id;
+    let session_id = params.session_id;
+    let agent_id = params.agent_id;
+    let context_id = params.context_id.clone();
+    let is_peer_message = params.is_peer_message;
+    let episode_job_id = state.run_manager.get_run(run_id).and_then(|run| run.job_id);
+
+    if AssertUnwindSafe(execution).catch_unwind().await.is_ok() {
+        return;
+    }
+
+    const PANIC_REASON: &str = "Run panicked during execution";
+    error!(run_id = %run_id.0, %session_id, "{PANIC_REASON}");
+
+    let transitioned = state
+        .run_manager
+        .mark_run_as_failed(run_id, PANIC_REASON.to_string());
+    if transitioned {
+        state
+            .run_manager
+            .send_event(
+                run_id,
+                session_id,
+                SseEventData::run_error(run_id, PANIC_REASON),
+            )
+            .await;
+
+        if let Err(end_error) = super::dm_lifecycle::handle_dm_run_failure(
+            &state,
+            &run_id,
+            &session_id,
+            agent_id,
+            None,
+            &context_id,
+            is_peer_message,
+            ConversationEndReason::Errored {
+                message: PANIC_REASON.to_string(),
+            },
+        )
+        .await
+        {
+            warn!(
+                error = %end_error,
+                run_id = %run_id.0,
+                "Failed to reconcile DM after run panic"
+            );
+        }
+    }
+
+    // This is intentionally unconditional. A panic can land after the
+    // terminal state transition but before the normal activity-ended
+    // publication; ended events are run-idempotent for consumers.
+    state
+        .run_manager
+        .send_agent_event(
+            agent_id,
+            run_id,
+            session_id,
+            SseEventData::session_activity_ended(session_id, run_id, agent_id),
+        )
+        .await;
+
+    state.run_manager.remove_senders(run_id);
+    state.run_manager.purge_terminal_senders();
+    state.run_manager.remove_cancel_token(run_id);
+    state.approval_store.clear_for_run(run_id);
+    super::notifications::finish_episode_run(&state, episode_job_id, run_id, &[]).await;
+    broadcast_queue_advance(&state, agent_id).await;
 }
 
 /// GET /runs/{run_id} - Get run status

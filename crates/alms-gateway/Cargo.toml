@@ -17,6 +17,7 @@ axum.workspace = true
 chrono.workspace = true
 cron.workspace = true
 dashmap.workspace = true
+futures.workspace = true
 parking_lot.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true

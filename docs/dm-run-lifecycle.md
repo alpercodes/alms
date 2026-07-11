@@ -117,7 +117,12 @@ Agent A emits a batch of three tool calls: `send_message`, `fs_read`, `shell`. W
 ### Timing
 
 - All three futures start concurrently.
-- `send_message.execute` is trivial work: DB lookup + `MessageBus::send` (SQLite writes + two `mpsc::UnboundedSender::send` calls). It typically completes in microseconds and returns the delivery receipt long before `shell` finishes echoing or `fs_read` reads a file.
+- `send_message.execute` performs a DB lookup plus `MessageBus::send`: SQLite
+  persistence, non-blocking reservation of bounded run-trigger capacity, and
+  a best-effort bounded DM SSE event. Trigger saturation returns an explicit
+  error before DM state changes; SSE-event saturation drops only the live
+  decoration. A successful call returns after persistence and trigger commit,
+  without waiting for the recipient run to start.
 - Side effects on B happen synchronously inside `send_message.execute`: by the time `send_message` resolves, the DM message is already in the DB and the `RunTrigger` is already on the channel. There is no waiting for B to accept anything.
 
 ### Does B's run overtake A's still-running batch?
@@ -149,8 +154,18 @@ If the batch contains both `send_message` and `ignore_message`, `detect_dm_confl
 
 ## Known hazards and open questions
 
-1. **Trigger channel is unbounded** (`server/mod.rs:94`). A misbehaving agent (or one stuck in a feedback loop that the depth counter has not caught yet) can pile up `RunTrigger`s faster than `run_trigger_loop` processes them. Same for `dm_event_tx`. Tracked separately as #842 — bounded channel with backpressure / drop policy.
-2. **Source-session TOCTOU at `end_conversation`** (`bus.rs:349-460`). The comment acknowledges the atomicity scheme: `depths.remove` is the winner gate. Two agents ending simultaneously: one runs the full end flow, one sees `was_active=false` and returns `Ok`. Known duplicate risk: `dm_lifecycle.rs:161-170` notes that duplicate `dm_conversation_ended` SSE events may still fire; the frontend must dedupe.
+1. **Bounded trigger saturation is explicit.** The run-trigger channel is
+   capped at 1,024 entries. `MessageBus` reserves the exact trigger
+   cardinality before mutating DM state, so saturation returns a retryable
+   internal tool error without persisting a message, consuming depth, or
+   writing an end marker. The DM-event channel is also bounded, but its SSE
+   decoration is best-effort and drops on saturation.
+2. **DM-pair transactions serialize send/end/expiry.** A per-pair async mutex
+   covers depth/source state, marker persistence, and trigger commit. Concurrent
+   ends therefore produce one marker/trigger transaction; the later caller
+   observes the consumed state and returns `Ok`. Idle mutex entries are
+   identity-pruned after the last user releases them, so retaining this safety
+   boundary does not create an ever-growing pair map.
 3. **`queued_behind` undercount TOCTOU** (`run_manager.rs:363-376`, also cited in `lifecycle.rs:383-392`). Narrow window between `pending.fetch_sub` and `mark_run_as_running` where both read `false`. A new `create_run` during that window reports `0 queued` — UI shows "Thinking" instead of "Queued". Documented, bounded by executor dispatch latency.
 4. **Notification-run ordering when A and B send to each other simultaneously.** Alice-sends-during-Bob-run and Bob-sends-during-Alice-run can interleave such that Alice processes Bob's reply before Alice's current run even finishes emitting its own `send_message` tool result. No correctness issue (runs on A are serialized), but the DM session log reads chronologically out-of-intent. Tracked separately as #843.
 5. **Recipient missing vs. error**: `SendMessageTool::execute` returns a `Value` error object (not `Err`) when the recipient is not found. This lets the LLM recover gracefully. But `MessageBus::send` returns `SendError::SelfMessage` / `DepthExceeded` as real errors, which are mapped to JSON objects in the tool too. Internal errors become `SandboxError::Io` — a real tool failure. This asymmetry is intentional but worth calling out for anyone adding new error variants.

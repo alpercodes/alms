@@ -388,6 +388,38 @@ Notes:
 }
 ```
 
+**Response 429** (bounded run queue):
+
+```json
+{
+  "error_code": "AGENT_QUEUE_FULL",
+  "message": "This agent has reached its pending run limit",
+  "retryable": true,
+  "retry_after_ms": 1000
+}
+```
+
+The gateway admits at most 64 pending runs for one agent and 1,024 pending
+runs across all agents. Active runs do not count against these pending limits.
+If the per-agent limit is available but the global limit is full, error_code is
+GATEWAY_QUEUE_FULL instead. Admission happens before the run record, input
+message, cancellation token, or run_created event is created, so a 429 has no
+durable or streaming side effects. The response also carries
+`Retry-After: 1`; clients should wait at least `retry_after_ms` before
+retrying and should apply their own exponential backoff for repeated
+rejections.
+
+**Response 503** (queue unavailable):
+```json
+{
+  "error_code": "QUEUE_UNAVAILABLE",
+  "message": "Run queue is unavailable while the gateway is shutting down"
+}
+```
+
+The admission point returns this response when shutdown has begun or the queue
+worker can no longer accept dispatch. No run-side effects are created.
+
 **Response 400** (DM session, #1156):
 ```json
 {

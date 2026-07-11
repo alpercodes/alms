@@ -196,7 +196,9 @@ A new component that lives in `alms-coordinator` (or a new `alms-bus` crate if n
 pub struct MessageBus {
     session_manager: Arc<SessionManager>,
     /// Channel to trigger runs on the gateway.
-    run_trigger_tx: mpsc::UnboundedSender<RunTrigger>,
+    run_trigger_tx: mpsc::Sender<RunTrigger>,
+    /// Best-effort live-view decoration; bounded and dropped on saturation.
+    dm_event_tx: Option<mpsc::Sender<DmEvent>>,
     /// Per-DM-pair depth tracker: "dm:a:b" -> (last_sender_name, depth).
     /// Depth increments each time the sender changes within the same pair.
     depths: DashMap<String, (String, u32)>,

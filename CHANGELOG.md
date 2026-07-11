@@ -34,6 +34,19 @@ Per-release notes for ALMS, with an emphasis on **operator-facing changes** — 
 
 ### Notable changes
 
+- **Atomic, bounded per-agent run admission** (PR #1223): the gateway now
+  admits at most 64 pending runs per agent and 1,024 across the daemon while
+  retaining normal-before-low priority and draining accepted work at shutdown.
+  `POST /runs` rejects saturation before any run, message, cancellation
+  token, or SSE side effect with `429 AGENT_QUEUE_FULL` /
+  `GATEWAY_QUEUE_FULL`, a `retry_after_ms` body field, and
+  `Retry-After: 1`; shutdown/unavailable dispatch returns
+  `503 QUEUE_UNAVAILABLE`. Internal DM trigger capacity is reserved before
+  persistence: saturation now returns an explicit error instead of waiting
+  for channel capacity. Depth-overflow and `end_conversation` preserve
+  retryable state when trigger capacity is unavailable, and a closed trigger
+  channel no longer leaves a marker without its notification run.
+
 - **Sidebar active-run dot now lights on cross-agent sessions** (#1211 / PR #1220): the web UI's blinking active-run indicator previously only lit on the *currently-viewed* session — a run on a session owned by another agent (a scheduled **Job**, a **DM**, or another agent's chat surfaced in the sidebar's cross-agent sections) never lit its dot until you clicked into it. Root cause: the sidebar subscribed only to the *active agent's* per-agent SSE feed (`GET /agents/{id}/events`), which by design never carries other agents' activity. **New endpoint:** `GET /events/session-activity` (see `docs/api.md` § 5.10) — a global, cross-agent SSE feed carrying `session_activity_started` / `session_activity_ended` across every agent's sessions, served from a dedicated broadcast namespace (separate from the per-agent sender map + event log, so no operator-supplied agent id can collide with it and leak activity across the per-agent isolation boundary). The sidebar now subscribes to it and seeds its indicators from every surfaced session. No config or wire-break — the per-agent feed (§ 5.9) is unchanged and remains for agent-scoped consumers.
   - Both the per-agent and global `session_activity_*` payloads now include the additive `has_active_run` boolean: the backend's authoritative post-transition answer for the whole session. Consumers must use it instead of treating every individual `session_activity_ended` as inactivity, because overlapping runs can share one session.
 

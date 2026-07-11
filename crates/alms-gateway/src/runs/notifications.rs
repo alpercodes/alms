@@ -13,7 +13,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, instrument, warn};
 
-use super::lifecycle::execute_run;
+use super::lifecycle::execute_run_guarded;
 
 // ---------------------------------------------------------------------------
 // Scheduler integration
@@ -21,8 +21,9 @@ use super::lifecycle::execute_run;
 
 /// Receives fired job IDs from the scheduler and dispatches agent runs.
 ///
-/// Each fired job is handled in its own spawned task so a slow run does not
-/// block the fire loop from processing subsequent firings.
+/// Admission is awaited on this dedicated producer task. The admitted run
+/// executes as queue work, so the loop can receive the next firing once the
+/// work is submitted without spawning an unbounded task per firing.
 pub(crate) async fn scheduler_fire_loop(mut rx: mpsc::UnboundedReceiver<JobId>, state: AppState) {
     while let Some(job_id) = rx.recv().await {
         // Resolve session for queue keying so jobs on the same session
@@ -34,14 +35,17 @@ pub(crate) async fn scheduler_fire_loop(mut rx: mpsc::UnboundedReceiver<JobId>, 
             continue;
         }
         let state_clone = state.clone();
-        state.agent_queue.enqueue(
-            job.agent_id,
-            Box::pin(async move {
-                if let Err(e) = fire_job_run(state_clone, job_id).await {
-                    error!("Job {} run dispatch failed: {}", job_id, e);
-                }
-            }),
-        );
+        let Ok(reservation) = state.agent_queue.reserve(job.agent_id).await else {
+            break;
+        };
+        if let Err(error) = reservation.submit(Box::pin(async move {
+            if let Err(e) = fire_job_run(state_clone, job_id).await {
+                error!("Job {} run dispatch failed: {}", job_id, e);
+            }
+        })) {
+            warn!(?error, %job_id, "Scheduled job queue closed before dispatch");
+            break;
+        }
     }
 }
 
@@ -107,7 +111,7 @@ pub(super) async fn fire_job_run(state: AppState, job_id: JobId) -> alms_core::A
     state
         .run_manager
         .register_cancel_token(run_id, cancel_token.clone());
-    execute_run(
+    execute_run_guarded(
         state.clone(),
         RunParams {
             run_id,
@@ -968,6 +972,12 @@ fn operator_cancelled_job_for_context(state: &AppState, context_id: &str) -> Opt
 /// Shared helper for [`completion_notification_loop`] and [`run_trigger_loop`],
 /// which both follow the same create-register-enqueue pattern.
 ///
+/// These producers intentionally wait on one shared queue-consumer loop.
+/// Saturation for one agent can therefore delay other agents on that producer,
+/// preserving producer FIFO ordering at the cost of cross-agent head-of-line
+/// blocking. Callers must remain dedicated producer tasks; never invoke this
+/// waiting admission path from inside a queue work item.
+///
 /// Returns `None` (no run created) when the target is the session of an
 /// **operator-cancelled** job — see the #1206 suppression comment inside.
 ///
@@ -988,6 +998,21 @@ pub(super) async fn enqueue_triggered_run(
     // episode hook inside `execute_run` engages at every exit.
     job_id: Option<JobId>,
 ) -> Option<RunId> {
+    // Wait before taking the cancellation gate or creating any run state.
+    // Internal triggers are durable work and must not be silently dropped
+    // when the bounded queue is temporarily saturated.
+    let reservation = match state.agent_queue.reserve(agent_id).await {
+        Ok(reservation) => reservation,
+        Err(error) => {
+            warn!(
+                ?error,
+                agent_id = %agent_id.0,
+                "Triggered run queue unavailable"
+            );
+            return None;
+        }
+    };
+
     // #1206 (Tim's S3 on PR #1202): suppress post-teardown orphan runs.
     // `DELETE /jobs` tears down an open episode by ending its pending DMs
     // (the DM-sender self-notification trigger routes back onto the job
@@ -1045,11 +1070,9 @@ pub(super) async fn enqueue_triggered_run(
         state.job_episodes.note_run(job_id, run_id);
     }
 
-    // Mirror the `create_run` reconstruction: `SessionQueue::pending_count`
-    // only counts items still *waiting* in the queue -- the currently-
-    // executing work item has already been dequeued and its counter
-    // decremented. Add 1 if the agent has a `Running` run so the UI gets
-    // an accurate `queued_behind` for notification/trigger runs too.
+    // The low-priority dispatch receipt counts all submitted normal and low
+    // work ahead at the channel linearization point. Add the active run,
+    // which has already left the pending queue.
     //
     // Note: there is a narrow sub-millisecond TOCTOU window between
     // `pending.fetch_sub(1)` inside the queue handler and
@@ -1058,44 +1081,65 @@ pub(super) async fn enqueue_triggered_run(
     // window is bounded by executor dispatch latency and is considered
     // acceptable; closing it would require a separate in-flight counter
     // inside `SessionQueue`.
-    let agent_running = state.run_manager.agent_has_running_run(agent_id);
-    let queued_behind = state.agent_queue.pending_count(&agent_id) + usize::from(agent_running);
     drop(job_trigger_cancellation_gate);
-    state
-        .run_manager
-        .send_session_event(
-            session_id,
-            run_id,
-            SseEventData::run_created(run_id, session_id, true, Some(source_label), queued_behind),
+
+    let (start_tx, start_rx) = tokio::sync::oneshot::channel();
+    let state_clone = state.clone();
+    let receipt = match reservation.submit_low(Box::pin(async move {
+        let _ = start_rx.await;
+        execute_run_guarded(
+            state_clone,
+            RunParams {
+                run_id,
+                session_id,
+                agent_id,
+                input,
+                context_id,
+                cancel_token,
+                is_peer_message,
+                is_system_triggered: true,
+                input_pre_persisted: false,
+            },
         )
         .await;
+    })) {
+        Ok(receipt) => receipt,
+        Err(error) => {
+            let _ = state
+                .run_manager
+                .mark_run_as_failed(run_id, "Run queue closed before dispatch".to_string());
+            state.run_manager.remove_cancel_token(run_id);
+            finish_episode_run(state, job_id, run_id, &[]).await;
+            warn!(
+                ?error,
+                run_id = %run_id.0,
+                "Triggered run queue closed before dispatch"
+            );
+            return None;
+        }
+    };
+    let agent_running = state.run_manager.agent_has_running_run(agent_id);
+    let queued_behind = receipt.queued_ahead() + usize::from(agent_running);
 
-    let state_clone = state.clone();
-    state.agent_queue.enqueue_low(
-        agent_id,
-        Box::pin(async move {
-            execute_run(
-                state_clone,
-                RunParams {
+    let event_state = state.clone();
+    let event_task = tokio::spawn(async move {
+        event_state
+            .run_manager
+            .send_session_event(
+                session_id,
+                run_id,
+                SseEventData::run_created(
                     run_id,
                     session_id,
-                    agent_id,
-                    input,
-                    context_id,
-                    cancel_token,
-                    is_peer_message,
-                    // All runs via enqueue_triggered_run are system-triggered
-                    // (no human watching), so Guarded posture is overridden.
-                    is_system_triggered: true,
-                    // System-triggered runs persist their own input through
-                    // the notification or peer-message paths, so no gateway-
-                    // side pre-persistence is needed here.
-                    input_pre_persisted: false,
-                },
+                    true,
+                    Some(source_label),
+                    queued_behind,
+                ),
             )
             .await;
-        }),
-    );
+        let _ = start_tx.send(());
+    });
+    let _ = event_task.await;
 
     Some(run_id)
 }

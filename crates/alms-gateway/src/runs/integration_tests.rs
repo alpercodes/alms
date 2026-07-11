@@ -3626,6 +3626,166 @@ async fn create_run_reports_queued_behind_when_agent_is_running() {
     );
 }
 
+#[tokio::test]
+async fn run_panic_is_reconciled_to_failed_and_cleans_activity_state() {
+    let (state, _shutdown, _completion_rx, _trigger_rx, _dm_rx) = test_app_state();
+    let agent_id = AgentId::new();
+    let session_id = SessionId::new();
+    let run = Run::new(session_id, agent_id, "panic".to_string());
+    let run_id = run.run_id;
+    let cancel_token = CancellationToken::new();
+    state.run_manager.insert_run(run);
+    state
+        .run_manager
+        .register_cancel_token(run_id, cancel_token.clone());
+    let mut activity = subscribe_agent(&state, agent_id);
+
+    super::lifecycle::execute_run_guarded_future(
+        state.clone(),
+        super::RunParams {
+            run_id,
+            session_id,
+            agent_id,
+            input: "panic".to_string(),
+            context_id: "web".to_string(),
+            cancel_token,
+            is_peer_message: false,
+            is_system_triggered: false,
+            input_pre_persisted: false,
+        },
+        async { panic!("synthetic queued work panic") },
+    )
+    .await;
+
+    let failed = state.run_manager.get_run(run_id).expect("run retained");
+    assert_eq!(failed.status, RunStatus::Failed);
+    assert_eq!(
+        failed.error.as_deref(),
+        Some("Run panicked during execution")
+    );
+    assert!(
+        !state.run_manager.cancel_run(run_id),
+        "panic reconciliation must remove the cancellation token"
+    );
+    assert!(!state.run_manager.has_active_runs(session_id));
+
+    let ended = activity.try_recv().expect("activity-ended event");
+    assert_eq!(ended.event_type, "session_activity_ended");
+    assert_eq!(
+        ended.data["run_id"].as_str(),
+        Some(run_id.0.to_string().as_str())
+    );
+}
+
+#[tokio::test]
+async fn late_cleanup_panic_does_not_reclassify_a_completed_run_as_failed() {
+    let (state, _shutdown, _completion_rx, _trigger_rx, _dm_rx) = test_app_state();
+    let agent_id = AgentId::new();
+    let session_id = SessionId::new();
+    let run = Run::new(session_id, agent_id, "complete".to_string());
+    let run_id = run.run_id;
+    state.run_manager.insert_run(run);
+    state.run_manager.mark_run_as_running(run_id);
+    assert!(state.run_manager.mark_run_as_completed(
+        run_id,
+        "done".to_string(),
+        Default::default()
+    ));
+
+    super::lifecycle::execute_run_guarded_future(
+        state.clone(),
+        super::RunParams {
+            run_id,
+            session_id,
+            agent_id,
+            input: "complete".to_string(),
+            context_id: "web".to_string(),
+            cancel_token: CancellationToken::new(),
+            is_peer_message: false,
+            is_system_triggered: false,
+            input_pre_persisted: false,
+        },
+        async { panic!("synthetic late cleanup panic") },
+    )
+    .await;
+
+    let completed = state.run_manager.get_run(run_id).expect("run retained");
+    assert_eq!(completed.status, RunStatus::Completed);
+    assert_eq!(completed.output.as_deref(), Some("done"));
+    assert!(completed.error.is_none());
+}
+
+#[tokio::test]
+async fn full_agent_queue_rejects_before_run_side_effects() {
+    use alms_core::{CreateRunRequest, RunInput};
+    use axum::Json;
+    use axum::extract::State;
+
+    let (state, shutdown_token, _cr, _tr, _dr) = test_app_state();
+    let agent_id = AgentId::new();
+    let session = state.session_manager.get_or_create(agent_id, "web");
+    let session_id = session.id;
+    let mut events = subscribe_session(&state, session_id);
+
+    let held: Vec<_> = (0..crate::session_queue::MAX_PENDING_PER_KEY)
+        .map(|_| {
+            state
+                .agent_queue
+                .try_reserve(agent_id)
+                .expect("fill per-agent capacity")
+        })
+        .collect();
+    let messages_before = state
+        .session_manager
+        .get_history(session_id)
+        .expect("session history")
+        .len();
+
+    let request = CreateRunRequest {
+        session_id,
+        agent_id: None,
+        input: RunInput::Text {
+            text: "must be rejected cleanly".into(),
+        },
+    };
+    let Err((status, body)) =
+        super::lifecycle::create_run(State(state.clone()), Json(request)).await
+    else {
+        panic!("saturated queue must reject the request");
+    };
+
+    assert_eq!(status, axum::http::StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(body.0["error_code"], "AGENT_QUEUE_FULL");
+    assert!(state.run_manager.list_by_session(session_id, 10).is_empty());
+    assert_eq!(
+        state
+            .session_manager
+            .get_history(session_id)
+            .expect("session history")
+            .len(),
+        messages_before
+    );
+    assert!(
+        drain_events(&mut events)
+            .iter()
+            .all(|event| event.event_type != "run_created")
+    );
+
+    drop(held);
+    shutdown_token.cancel();
+}
+
+#[test]
+fn queue_admission_429_includes_retry_after_header() {
+    let response = axum::response::IntoResponse::into_response(
+        super::lifecycle::queue_admission_error(crate::session_queue::AdmissionError::PerKeyFull),
+    );
+    assert_eq!(
+        response.headers().get(axum::http::header::RETRY_AFTER),
+        Some(&axum::http::HeaderValue::from_static("1"))
+    );
+}
+
 // ---------------------------------------------------------------------------
 // handle_dm_run_failure tests
 //
@@ -11214,6 +11374,7 @@ async fn deadline_close_detaches_and_completes_with_note() {
         pending_subagents: std::collections::HashMap::new(),
         in_flight_runs: 0,
         runs: vec![run_id],
+        finished_runs: std::collections::HashSet::new(),
         dm_total: 1,
         subagent_total: 0,
         catch_up_queued: false,
@@ -11282,6 +11443,7 @@ async fn catch_up_fires_when_episode_outlived_cron_tick() {
             pending_subagents: std::collections::HashMap::new(),
             in_flight_runs: 0,
             runs: vec![RunId::new()],
+            finished_runs: std::collections::HashSet::new(),
             dm_total: 0,
             subagent_total: 0,
             catch_up_queued: false,
@@ -11759,6 +11921,7 @@ async fn delete_jobs_interleaved_with_close_cannot_resurrect_job() {
         pending_subagents: std::collections::HashMap::new(),
         in_flight_runs: 0,
         runs: vec![RunId::new()],
+        finished_runs: std::collections::HashSet::new(),
         dm_total: 0,
         subagent_total: 0,
         catch_up_queued: false,
@@ -11815,6 +11978,7 @@ fn completed_episode(
         pending_subagents: std::collections::HashMap::new(),
         in_flight_runs: 0,
         runs: vec![run_id],
+        finished_runs: std::collections::HashSet::new(),
         dm_total: 0,
         subagent_total: 0,
         catch_up_queued: false,

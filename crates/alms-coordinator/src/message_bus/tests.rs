@@ -1772,11 +1772,10 @@ async fn test_send_after_end_starts_fresh_conversation() {
 // DM lifecycle integration tests (#393 -- Phase 9 of #384)
 // -----------------------------------------------------------------------
 
-/// F2.1: When the run_trigger_tx receiver is dropped (gateway shut down),
-/// end_conversation should still return Ok — the trigger send failure is
-/// logged but not propagated.
+/// A closed trigger channel rejects conversation end before marker/depth
+/// mutation, so retrying cannot duplicate terminal state.
 #[tokio::test]
-async fn test_end_conversation_trigger_channel_dropped_returns_ok() {
+async fn test_end_conversation_trigger_channel_dropped_has_no_side_effects() {
     let session_manager = Arc::new(alms_session::SessionManager::new(SessionConfig::default()));
     let (tx, rx) = mpsc::channel(16);
     let bus = Arc::new(MessageBus::new(session_manager, tx));
@@ -1792,8 +1791,6 @@ async fn test_end_conversation_trigger_channel_dropped_returns_ok() {
     // Drop the receiver to simulate the gateway shutting down.
     drop(rx);
 
-    // end_conversation should still succeed — the RunTrigger send failure
-    // is logged but does not cause an error return.
     let result = bus
         .end_conversation(
             "alice",
@@ -1804,33 +1801,160 @@ async fn test_end_conversation_trigger_channel_dropped_returns_ok() {
         )
         .await;
 
-    assert!(
-        result.is_ok(),
-        "end_conversation should return Ok even when trigger channel is dropped, got: {:?}",
-        result
-    );
+    assert!(matches!(result, Err(SendError::Internal(_))));
 
-    // The dm_ended marker should still have been written to the session.
+    // The original message remains, but no end marker or depth reset occurs.
+    // The caller can retry the whole end operation when capacity recovers.
     let session_id = SessionId::deterministic_dm("alice", "bob");
     let history = bus.session_manager.get_history(session_id).unwrap();
-    let marker = history.last().unwrap();
-    let meta = marker.metadata.as_ref().unwrap();
-    assert_eq!(meta["message_type"], "dm_ended");
-    assert_eq!(meta["ended_by"], "alice");
+    assert_eq!(history.len(), 1);
 
-    // Depth counter should still have been reset.
     let dm_ctx = dm_context_id("alice", "bob");
+    assert!(bus.depths.contains_key(&dm_ctx));
+}
+
+#[tokio::test]
+async fn full_dm_event_channel_does_not_block_message_delivery() {
+    let session_manager = Arc::new(alms_session::SessionManager::new(SessionConfig::default()));
+    let (trigger_tx, mut trigger_rx) = mpsc::channel(4);
+    let (dm_event_tx, mut dm_event_rx) = mpsc::channel(1);
+    let bus = MessageBus::new(session_manager, trigger_tx).with_dm_event_channel(dm_event_tx);
+    let alice_id = AgentId::new();
+    let bob_id = AgentId::new();
+
+    bus.send("alice", alice_id, "bob", bob_id, "first", None)
+        .await
+        .unwrap();
+    trigger_rx.try_recv().unwrap();
+
+    tokio::time::timeout(
+        std::time::Duration::from_millis(100),
+        bus.send("alice", alice_id, "bob", bob_id, "second", None),
+    )
+    .await
+    .expect("a full best-effort DM event channel must not apply back-pressure")
+    .unwrap();
+    trigger_rx.try_recv().unwrap();
+
+    let event = dm_event_rx
+        .try_recv()
+        .expect("first event remains buffered");
+    assert_eq!(event.message, "first");
     assert!(
-        !bus.depths.contains_key(&dm_ctx),
-        "depth counter should still be reset even when trigger channel is dropped"
+        dm_event_rx.try_recv().is_err(),
+        "the saturated decoration channel should drop the later event"
     );
 }
 
-/// F2.1 (variant): When the trigger channel is dropped, send() should
-/// still succeed for normal messages — the trigger failure is logged but
-/// the delivery receipt is returned.
 #[tokio::test]
-async fn test_send_trigger_channel_dropped_still_returns_receipt() {
+async fn idle_pair_transaction_entries_are_pruned() {
+    let (bus, mut trigger_rx) = setup();
+    let alice_id = AgentId::new();
+
+    for index in 0..100 {
+        let peer_name = format!("peer-{index}");
+        bus.send("alice", alice_id, &peer_name, AgentId::new(), "hello", None)
+            .await
+            .unwrap();
+        trigger_rx.try_recv().unwrap();
+        assert_eq!(
+            bus.transactions.len(),
+            0,
+            "an idle pair mutex must be removed promptly"
+        );
+    }
+}
+
+#[tokio::test]
+async fn end_boundary_precedes_a_concurrent_new_conversation() {
+    let (bus, _rx) = setup();
+    let alice_id = AgentId::new();
+    let bob_id = AgentId::new();
+    let source = bus.session_manager.get_or_create(alice_id, "web");
+
+    bus.send(
+        "alice",
+        alice_id,
+        "bob",
+        bob_id,
+        "old conversation",
+        Some(source.id),
+    )
+    .await
+    .unwrap();
+
+    let context = dm_context_id("alice", "bob");
+    let transaction = Arc::new(tokio::sync::Mutex::new(()));
+    bus.transactions
+        .insert(context.clone(), Arc::clone(&transaction));
+    let guard = transaction.lock().await;
+
+    let end_bus = Arc::clone(&bus);
+    let (end_started_tx, end_started_rx) = tokio::sync::oneshot::channel();
+    let end = tokio::spawn(async move {
+        let _ = end_started_tx.send(());
+        end_bus
+            .end_conversation(
+                "bob",
+                bob_id,
+                "alice",
+                alice_id,
+                ConversationEndReason::Ignored,
+            )
+            .await
+    });
+    end_started_rx.await.unwrap();
+    tokio::task::yield_now().await;
+
+    let send_bus = Arc::clone(&bus);
+    let (send_started_tx, send_started_rx) = tokio::sync::oneshot::channel();
+    let new_send = tokio::spawn(async move {
+        let _ = send_started_tx.send(());
+        send_bus
+            .send(
+                "alice",
+                alice_id,
+                "bob",
+                bob_id,
+                "new conversation",
+                Some(source.id),
+            )
+            .await
+    });
+    send_started_rx.await.unwrap();
+    tokio::task::yield_now().await;
+    assert!(!end.is_finished());
+    assert!(!new_send.is_finished());
+
+    drop(guard);
+    end.await.unwrap().unwrap();
+    new_send.await.unwrap().unwrap();
+
+    let session_id = SessionId::deterministic_dm("alice", "bob");
+    let history = bus.session_manager.get_history(session_id).unwrap();
+    let message_types: Vec<_> = history
+        .iter()
+        .map(|message| {
+            message
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata["message_type"].as_str())
+                .unwrap_or("")
+        })
+        .collect();
+    assert_eq!(message_types, ["dm", "dm_ended", "dm"]);
+    assert_eq!(
+        bus.source_sessions
+            .get(&(context, "alice".to_string()))
+            .map(|entry| *entry.value()),
+        Some(source.id),
+        "the old end must not delete the new conversation's source route"
+    );
+}
+
+/// A closed trigger channel rejects a normal send before session/depth state.
+#[tokio::test]
+async fn test_send_trigger_channel_dropped_has_no_side_effects() {
     let session_manager = Arc::new(alms_session::SessionManager::new(SessionConfig::default()));
     let (tx, rx) = mpsc::channel(16);
     let bus = Arc::new(MessageBus::new(session_manager, tx));
@@ -1841,76 +1965,49 @@ async fn test_send_trigger_channel_dropped_still_returns_receipt() {
     let alice_id = AgentId::new();
     let bob_id = AgentId::new();
 
-    // send() should still succeed — the message is persisted to the
-    // session even though the RunTrigger can't be delivered.
-    let receipt = bus
+    let result = bus
         .send("alice", alice_id, "bob", bob_id, "Hello!", None)
         .await;
 
     assert!(
-        receipt.is_ok(),
-        "send() should return Ok even when trigger channel is dropped, got: {:?}",
-        receipt
+        matches!(result, Err(SendError::Internal(_))),
+        "closed trigger channel must be an explicit delivery error: {result:?}"
     );
 
-    // The message should still be in the session.
+    // Trigger capacity is reserved before the DM session or depth state is
+    // mutated, so the caller can retry without duplicating input.
     let session_id = SessionId::deterministic_dm("alice", "bob");
-    let history = bus.session_manager.get_history(session_id).unwrap();
-    assert_eq!(history.len(), 1);
-    assert_eq!(history[0].metadata.as_ref().unwrap()["from_agent"], "alice");
+    assert!(bus.session_manager.get_history(session_id).is_err());
+    assert!(!bus.depths.contains_key(&dm_context_id("alice", "bob")));
 }
 
-/// B11 (#842 / #1154): the bounded `RunTrigger` channel must NOT drop
-/// triggers under buffer pressure — `MessageBus::send` uses
-/// `Sender::send().await`, so when the buffer is full the sender applies
-/// back-pressure (awaits a free slot) instead of losing a DM turn. Here the
-/// channel capacity (1) is far smaller than the number of sends; with a
-/// concurrent consumer draining slowly, every trigger must still arrive.
+/// Saturation is explicit and side-effect free. This avoids reentrant
+/// backpressure while preserving the invariant that no persisted DM lacks a
+/// corresponding trigger.
 #[tokio::test]
-async fn test_bounded_run_trigger_channel_applies_backpressure_no_drop() {
+async fn test_bounded_run_trigger_channel_rejects_before_side_effects() {
     let session_manager = Arc::new(alms_session::SessionManager::new(SessionConfig::default()));
-    // Capacity 1 — deliberately tiny so the producer must block on a full
-    // buffer if the consumer falls behind.
     let (tx, mut rx) = mpsc::channel::<RunTrigger>(1);
     let bus = Arc::new(MessageBus::new(session_manager, tx));
 
     let a = AgentId::new();
     let b = AgentId::new();
+    bus.send("alice", a, "bob", b, "first", None)
+        .await
+        .expect("first trigger fills channel");
 
-    // Producer: alternate alice<->bob so each send is a distinct depth step
-    // and produces a trigger. Run it as a task so the consumer can interleave.
-    const N: usize = 12;
-    let producer = {
-        let bus = Arc::clone(&bus);
-        tokio::spawn(async move {
-            for i in 0..N {
-                if i % 2 == 0 {
-                    bus.send("alice", a, "bob", b, "ping", None).await.unwrap();
-                } else {
-                    bus.send("bob", b, "alice", a, "pong", None).await.unwrap();
-                }
-            }
-        })
-    };
+    let rejected = bus.send("bob", b, "alice", a, "second", None).await;
+    assert!(matches!(rejected, Err(SendError::Internal(_))));
 
-    // Consumer: drain with a small delay so the bounded buffer fills and the
-    // producer is forced to await free slots (exercising back-pressure).
-    let mut received = 0usize;
-    while received < N {
-        match rx.recv().await {
-            Some(_trigger) => {
-                received += 1;
-                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-            }
-            None => break,
-        }
-    }
-
-    producer.await.unwrap();
-    assert_eq!(
-        received, N,
-        "every RunTrigger must be delivered under back-pressure — none dropped"
-    );
+    let session_id = SessionId::deterministic_dm("alice", "bob");
+    let history = bus.session_manager.get_history(session_id).unwrap();
+    assert_eq!(history.len(), 1);
+    assert!(matches!(
+        &history[0].content,
+        alms_session::Content::Text(text) if text == "first"
+    ));
+    assert_eq!(bus.depths.get("dm:alice:bob").unwrap().value().1, 1);
+    assert!(rx.recv().await.is_some());
 }
 
 /// Full round-trip: ignore_message flow (end_conversation with Ignored
@@ -2137,24 +2234,14 @@ async fn test_depth_exceeded_full_roundtrip_lifecycle() {
 /// then the session check returns early). The key assertion is that
 /// send() returns DepthExceeded regardless.
 #[tokio::test]
-async fn test_depth_exceeded_returns_depth_exceeded_even_when_end_conversation_noop() {
+async fn test_full_trigger_channel_does_not_advance_depth() {
     let session_manager = Arc::new(alms_session::SessionManager::new(SessionConfig::default()));
-    let (tx, rx) = mpsc::channel(16);
+    let (tx, _rx) = mpsc::channel(MAX_DM_DEPTH as usize);
     let bus = Arc::new(MessageBus::new(session_manager, tx));
-
-    // Drop the receiver so trigger sends will fail silently.
-    drop(rx);
 
     let a = AgentId::new();
     let b = AgentId::new();
-
-    // Exhaust the depth counter.
     exhaust_depth(&bus, a, b).await;
-
-    // Next send should return DepthExceeded. The end_conversation call
-    // inside send() will proceed (session exists from exhaust_depth
-    // messages), but the trigger send will fail because rx is dropped.
-    // Crucially, send() must still return DepthExceeded, not an internal error.
     let (next_sender, next_id, peer_name, peer_id) = overflow_sender(a, b);
 
     let err = bus
@@ -2162,19 +2249,34 @@ async fn test_depth_exceeded_returns_depth_exceeded_even_when_end_conversation_n
         .await
         .unwrap_err();
 
-    assert!(
-        matches!(err, SendError::DepthExceeded),
-        "send() should return DepthExceeded even when end_conversation trigger fails, got: {:?}",
-        err
-    );
+    assert!(matches!(err, SendError::Internal(_)));
 
-    // The depth counter should still have been reset (end_conversation
-    // runs depths.remove() before the trigger send that fails).
     let dm_ctx = dm_context_id("alice", "bob");
-    assert!(
-        !bus.depths.contains_key(&dm_ctx),
-        "depth should still be reset even when trigger channel is dropped"
-    );
+    assert_eq!(bus.depths.get(&dm_ctx).unwrap().value().1, MAX_DM_DEPTH);
+}
+
+#[tokio::test]
+async fn depth_overflow_reuses_single_free_slot_for_terminal_trigger() {
+    let session_manager = Arc::new(alms_session::SessionManager::new(SessionConfig::default()));
+    let (tx, mut rx) = mpsc::channel(MAX_DM_DEPTH as usize + 1);
+    let bus = Arc::new(MessageBus::new(session_manager, tx));
+    let a = AgentId::new();
+    let b = AgentId::new();
+    exhaust_depth(&bus, a, b).await;
+
+    let (next_sender, next_id, peer_name, peer_id) = overflow_sender(a, b);
+    let err = bus
+        .send(next_sender, next_id, peer_name, peer_id, "overflow", None)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, SendError::DepthExceeded));
+    assert!(!bus.depths.contains_key(&dm_context_id("alice", "bob")));
+
+    let mut triggers = 0;
+    while rx.try_recv().is_ok() {
+        triggers += 1;
+    }
+    assert_eq!(triggers, MAX_DM_DEPTH as usize + 1);
 }
 
 /// S1 resilience (variant): simultaneous depth-exceeded from both sides.

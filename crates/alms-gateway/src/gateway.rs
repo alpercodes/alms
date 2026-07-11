@@ -733,14 +733,15 @@ impl Gateway {
                     // Telegram runs only after a daemon restart. This is
                     // pre-existing behaviour for the context / session / tools
                     // sections and is documented in `docs/api.md` § 10.2.
-                    let secrets_guard = self.secrets.read();
-                    let resolved = match crate::runs::resolve_agent_config(
-                        agent_id,
-                        &self.session_manager,
-                        &self.config.agent_config,
-                        &self.llm,
-                        Some(&secrets_guard),
-                    ) {
+                    let resolved = {
+                        let secrets_guard = self.secrets.read();
+                        match crate::runs::resolve_agent_config(
+                            agent_id,
+                            &self.session_manager,
+                            &self.config.agent_config,
+                            &self.llm,
+                            Some(&secrets_guard),
+                        ) {
                         Ok(r) => r,
                         Err(e) => {
                             // #863: per-agent provider override with no model
@@ -755,8 +756,8 @@ impl Gateway {
                             );
                             continue;
                         }
+                        }
                     };
-                    drop(secrets_guard);
                     // Bootstrap detection: first-time agents get the
                     // bootstrap interview prompt instead of their default.
                     let mut agent_config = resolved.agent_config;
@@ -865,9 +866,10 @@ impl Gateway {
                     let runtime = Arc::new(runtime);
                     let sm = Arc::clone(&self.session_manager);
                     let name_for_ctx = effective_name;
-                    agent_queue.enqueue(
-                        agent_id,
-                        Box::pin(async move {
+                    let Ok(reservation) = agent_queue.reserve(agent_id).await else {
+                        break;
+                    };
+                    if let Err(error) = reservation.submit(Box::pin(async move {
                             process_telegram_message(
                                 runtime,
                                 sm,
@@ -876,8 +878,14 @@ impl Gateway {
                                 &name_for_ctx,
                             )
                             .await;
-                        }),
-                    );
+                        })) {
+                        warn!(
+                            ?error,
+                            agent_id = %agent_id.0,
+                            "Telegram run queue closed before dispatch"
+                        );
+                        break;
+                    }
                 }
                 _ = token.cancelled() => {
                     info!("Shutdown signal received, stopping message loop");
