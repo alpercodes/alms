@@ -18,6 +18,7 @@ mod agents;
 mod audit;
 mod jobs;
 mod messages;
+mod migrations;
 mod runs;
 mod session_summaries;
 mod sessions;
@@ -27,6 +28,7 @@ mod test_helpers;
 mod timeline;
 mod tool_calls;
 
+pub use migrations::CURRENT_SCHEMA_VERSION;
 pub use timeline::{TimelineEvent, TimelinePage};
 pub use tool_calls::SessionToolCall;
 
@@ -48,11 +50,9 @@ use std::sync::Arc;
 // Schema
 // ---------------------------------------------------------------------------
 
-const SCHEMA: &str = "
-PRAGMA journal_mode=WAL;
-PRAGMA foreign_keys=ON;
-PRAGMA busy_timeout=5000;
-
+// Frozen inputs to migration 1. Once a migration ships, extend the schema by
+// appending a new migration; never update these definitions in place.
+const V1_BASELINE_SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS sessions (
     id            TEXT PRIMARY KEY,
     agent_id      TEXT NOT NULL,
@@ -123,8 +123,6 @@ CREATE TABLE IF NOT EXISTS agents (
     debug_mode             INTEGER NOT NULL DEFAULT 0
 );
 
-CREATE INDEX IF NOT EXISTS idx_agents_is_default ON agents(is_default);
-
 CREATE TABLE IF NOT EXISTS runs (
     run_id            TEXT PRIMARY KEY,
     session_id        TEXT NOT NULL,
@@ -143,9 +141,6 @@ CREATE TABLE IF NOT EXISTS runs (
     resolved_config   TEXT
 );
 
-CREATE INDEX IF NOT EXISTS idx_runs_session_id ON runs(session_id);
-CREATE INDEX IF NOT EXISTS idx_runs_agent_id ON runs(agent_id);
-
 CREATE TABLE IF NOT EXISTS run_tool_calls (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     run_id     TEXT NOT NULL,
@@ -160,9 +155,6 @@ CREATE TABLE IF NOT EXISTS run_tool_calls (
     from_agent TEXT
 );
 
-CREATE INDEX IF NOT EXISTS idx_run_tool_calls_run ON run_tool_calls(run_id, seq);
-CREATE INDEX IF NOT EXISTS idx_run_tool_calls_session ON run_tool_calls(session_id);
-
 CREATE TABLE IF NOT EXISTS session_summaries (
     agent_id     TEXT NOT NULL,
     session_id   TEXT NOT NULL REFERENCES sessions(id),
@@ -173,6 +165,15 @@ CREATE TABLE IF NOT EXISTS session_summaries (
     PRIMARY KEY (agent_id, session_id)
 );
 
+";
+
+const V1_BASELINE_INDEXES: &str = "
+CREATE INDEX IF NOT EXISTS idx_agents_is_default ON agents(is_default);
+CREATE INDEX IF NOT EXISTS idx_messages_session_seq ON messages(session_id, seq);
+CREATE INDEX IF NOT EXISTS idx_runs_session_id ON runs(session_id);
+CREATE INDEX IF NOT EXISTS idx_runs_agent_id ON runs(agent_id);
+CREATE INDEX IF NOT EXISTS idx_run_tool_calls_run ON run_tool_calls(run_id, seq);
+CREATE INDEX IF NOT EXISTS idx_run_tool_calls_session ON run_tool_calls(session_id);
 CREATE INDEX IF NOT EXISTS idx_session_summaries_agent
     ON session_summaries(agent_id, updated_at DESC);
 ";
@@ -201,125 +202,11 @@ impl Clone for SqliteStore {
 }
 
 impl SqliteStore {
-    /// Open or create a SQLite database at `path`.
+    /// Open or create a SQLite database at the supplied path.
     pub fn open<P: AsRef<Path>>(path: P) -> AlmsResult<Self> {
-        let conn =
+        let mut conn =
             Connection::open(path).map_err(|e| AlmsError::Runtime(format!("SQLite open: {e}")))?;
-        conn.execute_batch(SCHEMA)
-            .map_err(|e| AlmsError::Runtime(format!("SQLite schema init: {e}")))?;
-        // Auto-migrate: add provider column if missing (existing DBs).
-        let _ = conn.execute_batch("ALTER TABLE agents ADD COLUMN provider TEXT;");
-        // Auto-migrate: add seq column for stable message ordering (existing DBs).
-        let _ = conn.execute_batch(
-            "ALTER TABLE messages ADD COLUMN seq INTEGER NOT NULL DEFAULT 0;\
-             UPDATE messages SET seq = rowid WHERE seq = 0;",
-        );
-        // Auto-migrate: add (session_id, seq) index for message ordering queries.
-        let _ = conn.execute_batch(
-            "CREATE INDEX IF NOT EXISTS idx_messages_session_seq ON messages(session_id, seq);",
-        );
-        // Auto-migrate: add telegram_token column for per-agent Telegram bots.
-        let _ = conn.execute_batch("ALTER TABLE agents ADD COLUMN telegram_token TEXT;");
-        // Auto-migrate: add thinking_budget_tokens column for per-agent
-        // Anthropic extended-thinking opt-in (issue #767). NULL means
-        // "inherit the server default from [llm.anthropic]"; any integer
-        // (including 0) is an explicit per-agent override.
-        let _ = conn.execute_batch("ALTER TABLE agents ADD COLUMN thinking_budget_tokens INTEGER;");
-        // Auto-migrate: add reasoning_effort column for per-agent
-        // OpenAI-compat reasoning-model opt-in (issue #768). NULL means
-        // "inherit the server default from [llm.openai]"; a string
-        // ("low"/"medium"/"high"/"minimal") is an explicit per-agent
-        // override. Stored as TEXT to match the `ReasoningEffort` enum's
-        // lowercase serde wire format.
-        let _ = conn.execute_batch("ALTER TABLE agents ADD COLUMN reasoning_effort TEXT;");
-        // Auto-migrate: add gemini_thinking_budget column for per-agent
-        // Gemini extended-thinking opt-in (issue #794). NULL means
-        // "inherit the server default from [llm.gemini]"; any integer
-        // (including 0) is an explicit per-agent override.
-        let _ = conn.execute_batch("ALTER TABLE agents ADD COLUMN gemini_thinking_budget INTEGER;");
-        // Auto-migrate: add summary_provider / summary_model columns for
-        // per-agent summary-task overrides (issue #872). NULL on either
-        // means "fall through to the server-level [context] settings";
-        // both must be set together (PATCH validator enforces the pair
-        // invariant). Additive, reversible: existing rows stay NULL on
-        // both columns and behave identically to today's server-level
-        // path.
-        let _ = conn.execute_batch("ALTER TABLE agents ADD COLUMN summary_provider TEXT;");
-        let _ = conn.execute_batch("ALTER TABLE agents ADD COLUMN summary_model TEXT;");
-        // Auto-migrate: add worktree_mode column for per-agent git worktree
-        // isolation (issue #946). NULL on existing rows is treated as
-        // `WorktreeMode::Off` by `parse_agent_row` so the column is
-        // backward-compatible — agents created before #946 keep their
-        // project-root sandbox without any operator action.
-        let _ = conn.execute_batch("ALTER TABLE agents ADD COLUMN worktree_mode TEXT;");
-        // Auto-migrate: add debug_mode column for per-agent context-window
-        // inspection toggle (issue #1003). Existing rows default to `0`
-        // (disabled) — Debug mode was previously a per-run override that
-        // was removed in #941; restoring it on the agent record means
-        // agents created before #1003 keep their pre-#1003 behaviour
-        // (no context_debug SSE event emitted) without any operator
-        // action. NOT NULL DEFAULT 0 matches the schema for new DBs.
-        let _ = conn
-            .execute_batch("ALTER TABLE agents ADD COLUMN debug_mode INTEGER NOT NULL DEFAULT 0;");
-        // Auto-migrate: add run_tool_calls table for per-run tool call storage.
-        let _ = conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS run_tool_calls (\
-                 id         INTEGER PRIMARY KEY AUTOINCREMENT, \
-                 run_id     TEXT NOT NULL, \
-                 session_id TEXT, \
-                 seq        INTEGER NOT NULL, \
-                 role       TEXT NOT NULL, \
-                 tool_name  TEXT, \
-                 tool_id    TEXT, \
-                 params     TEXT, \
-                 result     TEXT, \
-                 timestamp  TEXT NOT NULL, \
-                 from_agent TEXT\
-             ); \
-             CREATE INDEX IF NOT EXISTS idx_run_tool_calls_run \
-                 ON run_tool_calls(run_id, seq);",
-        );
-        // Auto-migrate: add from_agent column to run_tool_calls for existing
-        // DBs so the frontend fallback merge path can attribute DM reasoning
-        // blocks to the correct agent (see #696).
-        let _ = conn.execute_batch("ALTER TABLE run_tool_calls ADD COLUMN from_agent TEXT;");
-        // Auto-migrate: add session_id column to run_tool_calls (B9(b), #1154)
-        // so a tool-call row stays attributable to its session even if the
-        // `runs` row is later removed. Existing rows keep `session_id = NULL`
-        // and are still found via the `runs` join in
-        // `load_tool_calls_for_session` (backward-compat branch).
-        let _ = conn.execute_batch("ALTER TABLE run_tool_calls ADD COLUMN session_id TEXT;");
-        let _ = conn.execute_batch(
-            "CREATE INDEX IF NOT EXISTS idx_run_tool_calls_session \
-                 ON run_tool_calls(session_id);",
-        );
-        // Auto-migrate: add session_summaries table for cross-session episodic memory.
-        let _ = conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS session_summaries (\
-                 agent_id     TEXT NOT NULL, \
-                 session_id   TEXT NOT NULL REFERENCES sessions(id), \
-                 summary      TEXT NOT NULL DEFAULT '', \
-                 last_run_id  TEXT, \
-                 updated_at   TEXT NOT NULL, \
-                 source_label TEXT, \
-                 PRIMARY KEY (agent_id, session_id)\
-             ); \
-             CREATE INDEX IF NOT EXISTS idx_session_summaries_agent \
-                 ON session_summaries(agent_id, updated_at DESC);",
-        );
-        // Auto-migrate: add source_label column to session_summaries (existing DBs).
-        let _ = conn.execute_batch("ALTER TABLE session_summaries ADD COLUMN source_label TEXT;");
-        // Auto-migrate: add parent_run_id column to runs for subagent run visibility.
-        let _ = conn.execute_batch("ALTER TABLE runs ADD COLUMN parent_run_id TEXT;");
-        // Auto-migrate: add index on runs(agent_id) for timeline queries.
-        let _ =
-            conn.execute_batch("CREATE INDEX IF NOT EXISTS idx_runs_agent_id ON runs(agent_id);");
-        // Auto-migrate: add resolved_config column for the layered run-config
-        // snapshot (#837). Stored as a JSON-encoded TEXT blob — the column
-        // is NULL for runs created before the snapshot was wired up so the
-        // backward-compat surface is "old rows hydrate with `resolved_config:
-        // None`" without explicit handling.
-        let _ = conn.execute_batch("ALTER TABLE runs ADD COLUMN resolved_config TEXT;");
+        migrations::configure_and_apply(&mut conn)?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
         })
@@ -327,13 +214,17 @@ impl SqliteStore {
 
     /// Open an in-memory database (for tests).
     pub fn open_in_memory() -> AlmsResult<Self> {
-        let conn = Connection::open_in_memory()
+        let mut conn = Connection::open_in_memory()
             .map_err(|e| AlmsError::Runtime(format!("SQLite open_in_memory: {e}")))?;
-        conn.execute_batch(SCHEMA)
-            .map_err(|e| AlmsError::Runtime(format!("SQLite schema init: {e}")))?;
+        migrations::configure_and_apply(&mut conn)?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
         })
+    }
+
+    /// Return the latest successfully committed schema migration.
+    pub fn schema_version(&self) -> AlmsResult<u32> {
+        migrations::read_schema_version(&self.conn.lock())
     }
 }
 
@@ -625,9 +516,9 @@ fn parse_run_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Run> {
     // `row.get::<_, Option<String>>(14)?` would also handle the NULL
     // cleanly — `?` and `.ok().flatten()` are technically equivalent for
     // the NULL case. The permissive form is kept as defense-in-depth: if
-    // a future schema change drops or renames the column (or the
-    // best-effort `ALTER TABLE ADD COLUMN` migration above ever stops
-    // running on some path), the strict `?` would propagate
+    // a future schema change drops or renames the column (which the
+    // versioned migration runner rejects, but a manually altered database
+    // can still produce), the strict `?` would propagate
     // `InvalidColumnIndex` / `InvalidColumnName` and poison every row
     // hydration; `.ok().flatten()` collapses both "missing column" and
     // "NULL cell" into `resolved_config: None` so triage degrades

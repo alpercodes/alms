@@ -14,6 +14,7 @@ This is the entrypoint to ALMS documentation.
 - `api.md` — HTTP/SSE API contract
 - `security-model.md` — capabilities, approvals, guardrails
 - `events-and-audit.md` — event streams, approvals, audit invariants
+- `database-migrations.md` — SQLite schema versions, compatibility, backup, and rollback
 
 ## Agent runtime
 

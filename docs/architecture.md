@@ -189,6 +189,10 @@ See `docs/config.md` for copy-paste provider examples. API keys are resolved in 
 
 Owns conversation history and workspace state. Backed by **SQLite** (`./.alms/alms.db`) for durable persistence of sessions, audit events, scheduled jobs, and the agent registry.
 
+Schema changes use ordered, transactional migrations with a durable
+`schema_migrations` history and fail closed on unknown future versions. See
+[Database migrations, compatibility, and rollback](database-migrations.md).
+
 **On-disk layout (post-#945 / #946 — workspace v2):**
 
 ```

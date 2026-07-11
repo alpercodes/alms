@@ -34,6 +34,16 @@ Per-release notes for ALMS, with an emphasis on **operator-facing changes** — 
 
 ### Notable changes
 
+- **Transactional, versioned SQLite migrations** (PR #1224): startup now
+  records ordered schema changes in `schema_migrations`, applies each step
+  together with its version row in one `BEGIN IMMEDIATE` transaction, and
+  rejects migration gaps or databases newer than the binary supports. Schema
+  2 adds backward-compatible lifecycle revision and terminal-reason columns
+  for runs and jobs. File-backed databases must now successfully enable WAL;
+  filesystems that previously caused SQLite to fall back silently to
+  rollback-journal mode will fail startup and must be moved to a WAL-capable
+  volume. See `docs/database-migrations.md` for backup, compatibility, and
+  rollback guidance.
 - **Atomic, bounded per-agent run admission** (PR #1223): the gateway now
   admits at most 64 pending runs per agent and 1,024 across the daemon while
   retaining normal-before-low priority and draining accepted work at shutdown.

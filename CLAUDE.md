@@ -49,6 +49,7 @@ crates/
   alms-coordinator/  # Multi-agent orchestration — pure hierarchy, real AgentRuntime loops
   alms-session/      # Session management, SQLite persistence, episodic summary storage
                      #   sqlite/session_summaries.rs — per-session episodic summary persistence
+                     #   sqlite/migrations.rs — ordered transactional schema migrations
   alms-sandbox/      # Builtin native tools (echo, math, http_get, shell, fs_*, etc.) + tool registry
   alms-channel/      # Channel adapters (Telegram polling implemented)
   alms-cli/          # CLI entrypoint (clap) — gateway, health, agent/session/run/job management

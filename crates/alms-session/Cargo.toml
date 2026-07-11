@@ -20,3 +20,4 @@ tracing.workspace = true
 [dev-dependencies]
 # Pulls tokio's `test-util` feature (paused-clock test helpers) — see #1158.
 tokio-test.workspace = true
+tempfile = "3"
