@@ -114,16 +114,22 @@ const messageSchema = z.discriminatedUnion("type", [
 const sessionRunSchema = z
   .object({
     run_id: uuidSchema,
+    session_id: uuidSchema,
+    agent_id: uuidSchema,
     status: runStatusSchema,
-    session_id: uuidSchema.optional(),
-    agent_id: uuidSchema.optional(),
+    lifecycle_revision: uintSchema,
+    terminal_reason: z.string().optional(),
     response: z.string().optional(),
     error: z.string().optional(),
-    started_at: timestampSchema.nullable().optional(),
-    completed_at: timestampSchema.nullable().optional(),
-    ts: timestampSchema.optional(),
-    usage: usageSchema.nullable().optional(),
+    started_at: timestampSchema.nullable(),
+    ended_at: timestampSchema.nullable(),
+    usage: usageSchema.nullable(),
+    ts: timestampSchema,
+    job_id: uuidSchema.nullable(),
+    parent_run_id: uuidSchema.optional(),
+    tool_call_count: uintSchema.optional(),
     queue_position: positiveUintSchema.optional(),
+    resolved_config: objectPayloadSchema.optional(),
   })
   .passthrough();
 
@@ -216,10 +222,7 @@ const subagentActivitySchema = z
 const runErrorSchema = z
   .object({
     run_id: uuidSchema,
-    error: z.union([
-      z.string(),
-      z.object({ code: stringSchema, message: stringSchema }).passthrough(),
-    ]),
+    error: z.object({ code: stringSchema, message: stringSchema }).passthrough(),
   })
   .passthrough();
 
@@ -319,7 +322,7 @@ const sseSchemaEntries = [
       .object({
         run_id: uuidSchema,
         approval_id: uuidSchema,
-        capability: jsonSchema,
+        capability: stringSchema,
         request: jsonSchema,
         source_agent: stringSchema.optional(),
       })
@@ -913,7 +916,12 @@ function parseAtBoundary<T>(boundary: string, schema: ZodType<T>, input: unknown
 }
 
 export function parseSsePayload(type: string, input: unknown): unknown {
-  const schema = sseSchemas.get(type) ?? objectPayloadSchema;
+  const schema = sseSchemas.get(type);
+  if (!schema) {
+    throw new ContractViolation(`SSE ${type}`, [
+      { code: "custom", path: [], message: "event type is not contracted" },
+    ]);
+  }
   return parseAtBoundary(`SSE ${type}`, schema, input);
 }
 
@@ -924,7 +932,9 @@ export function parseApiResponse(path: string, method: string, input: unknown): 
     (candidate) => candidate.method === normalizedMethod && candidate.matches(url),
   );
   if (!contract) {
-    return parseAtBoundary(`${normalizedMethod} ${url.pathname}`, objectPayloadSchema, input);
+    throw new ContractViolation(`${normalizedMethod} ${url.pathname}`, [
+      { code: "custom", path: [], message: "route is not contracted" },
+    ]);
   }
   return parseAtBoundary(contract.boundary, contract.schema, input);
 }

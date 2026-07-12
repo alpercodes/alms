@@ -117,6 +117,7 @@ const __calls = {
     phase: [],
 };
 function openSessionStream(sessionId, opts) { __calls.streamOpens.push({ sessionId, opts }); }
+function registerSessionContractReconciler(reconciler) { globalThis.__lsReconciler = reconciler; }
 function setAgentPhase(phase, detail) { __calls.phase.push(['setAgentPhase', phase, detail ?? null]); }
 function clearAgentPhase() { __calls.phase.push(['clearAgentPhase']); }
 function setDmContext(peer) { __calls.phase.push(['setDmContext', peer]); }
@@ -124,6 +125,7 @@ function setDmContext(peer) { __calls.phase.push(['setDmContext', peer]); }
 // ---- sessions / agents state ----
 const sessions = signal([]);
 const crossAgentSessions = signal([]);
+const activeSessionId = signal(null);
 const activeAgent = signal(null);
 
 // ---- inert helpers ----

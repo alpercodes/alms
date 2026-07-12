@@ -165,6 +165,18 @@ async function loadHook(api = { listSessions: async () => ({ sessions: [] }) }) 
     const stub = makeSignalStub();
     const created = installEventSourceStub();
     installLocalStorageStub();
+    globalThis.__almsContracts = {
+        parseSseJsonPayload(type, raw) {
+            const payload = JSON.parse(raw);
+            if (
+                (type === 'session_activity_started' || type === 'session_activity_ended')
+                && typeof payload.has_active_run !== 'boolean'
+            ) {
+                throw new Error('has_active_run must be boolean');
+            }
+            return payload;
+        },
+    };
     globalThis.__agentEventsGlobalApi__ = api;
     const { dir, hookPath, queuePath } = await installHarness(stub);
     // Import the hook (cache-busted so each test gets fresh module state)
@@ -464,33 +476,33 @@ test('native reconnect after event-log restart clears stale state and accepts re
     );
 });
 
-test('malformed global SSE JSON is rejected before activity state mutates', async () => {
-    active = await loadHook();
+test('invalid numeric activity frame reconciles and resumes after that frame', async () => {
+    let snapshotCalls = 0;
+    active = await loadHook({
+        async listSessions() {
+            snapshotCalls++;
+            return { sessions: [] };
+        },
+    });
     const { openAgentEventsStream } = active.mod;
     const { bgRuns } = active.queue;
-    let bridgeCalls = 0;
     const originalConsoleError = console.error;
     console.error = () => {};
-    globalThis.__almsContracts = {
-        parseSseJsonPayload(type, raw) {
-            bridgeCalls++;
-            assert.equal(type, 'session_activity_started');
-            assert.equal(raw, '{bad json');
-            throw new Error('visible contract violation');
-        },
-    };
 
     try {
         openAgentEventsStream('agent-1');
-        active.created[0]._emitRaw('session_activity_started', '{bad json', 1);
+        active.created[0]._emit('session_activity_started', {
+            session_id: 'invalid-session',
+            run_id: 'invalid-run',
+            has_active_run: 'yes',
+        }, 41);
+        await new Promise(resolve => setImmediate(resolve));
     } finally {
         console.error = originalConsoleError;
     }
 
-    assert.equal(bridgeCalls, 1, 'the raw frame must pass through the guarded bridge');
-    assert.deepEqual(
-        bgRuns.value,
-        {},
-        'the activity handler must not run after malformed JSON is rejected',
-    );
+    assert.equal(snapshotCalls, 1, 'a rejected frame must trigger an authoritative snapshot');
+    assert.deepEqual(bgRuns.value, {}, 'the rejected activity must never mutate state');
+    assert.equal(active.created.length, 2, 'the stream reopens after snapshot reconciliation');
+    assert.match(active.created[1].url, /last_event_id=41/);
 });

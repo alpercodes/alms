@@ -2334,7 +2334,7 @@ fn forward_status_to_parent(
         activity.tool.clone(),
         activity.tool_invocation_id,
         activity.parent_tool_invocation_id,
-        Some(label.to_string()),
+        label.to_string(),
     );
 }
 
@@ -2761,7 +2761,7 @@ mod tests {
         Option<String>,
         Option<uuid::Uuid>,
         Option<uuid::Uuid>,
-        Option<String>,
+        String,
     );
 
     /// Records every `forward_subagent_activity` / `forward_warning` call and
@@ -2808,7 +2808,7 @@ mod tests {
             tool: Option<String>,
             tool_invocation_id: Option<uuid::Uuid>,
             parent_tool_invocation_id: Option<uuid::Uuid>,
-            source_agent: Option<String>,
+            source_agent: String,
         ) {
             self.activity.lock().push((
                 kind,
@@ -3157,7 +3157,7 @@ mod tests {
                 _: Option<String>,
                 _: Option<uuid::Uuid>,
                 _: Option<uuid::Uuid>,
-                _: Option<String>,
+                _: String,
             ) {
                 self.log.lock().push("emit");
             }
@@ -3337,7 +3337,7 @@ mod tests {
                 None,
                 None,
                 Some(parent_inv),
-                Some(expected_label.clone())
+                expected_label.clone()
             )],
             "a real streamed run must reduce to one tagged `writing` signal \
              carrying the parent invoke_agent correlator"

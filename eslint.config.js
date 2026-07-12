@@ -1,4 +1,4 @@
-import eslint from "@eslint/js";
+﻿import eslint from "@eslint/js";
 import tseslint from "typescript-eslint";
 
 export default tseslint.config(
@@ -11,6 +11,28 @@ export default tseslint.config(
   },
   eslint.configs.recommended,
   ...tseslint.configs.recommendedTypeChecked,
+  {
+    ...tseslint.configs.disableTypeChecked,
+    files: [
+      "crates/alms-gateway/static/ui/api/client.js",
+      "crates/alms-gateway/static/ui/hooks/use-agent-events.js",
+      "crates/alms-gateway/static/ui/hooks/use-session-stream.js",
+    ],
+    languageOptions: {
+      globals: {
+        URLSearchParams: "readonly",
+        console: "readonly",
+        document: "readonly",
+        EventSource: "readonly",
+        fetch: "readonly",
+        localStorage: "readonly",
+        requestAnimationFrame: "readonly",
+        cancelAnimationFrame: "readonly",
+        setTimeout: "readonly",
+        clearTimeout: "readonly",
+      },
+    },
+  },
   {
     files: ["frontend/**/*.{ts,tsx}", "vite.config.ts", "playwright.config.ts"],
     languageOptions: {

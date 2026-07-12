@@ -30,6 +30,9 @@ jobs:
     - name: Install frontend dependencies
       run: npm ci
 
+    - name: Audit frontend dependencies
+      run: npm run ui:audit
+
     - name: Typecheck, lint, format, and unit test
       run: npm run ui:check
 

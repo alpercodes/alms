@@ -872,6 +872,78 @@ mod tests {
     use crate::server::AppState;
     use alms_core::Run;
 
+    async fn response_body(response: axum::response::Response) -> Vec<u8> {
+        axum::body::to_bytes(response.into_body(), 4 * 1024 * 1024)
+            .await
+            .expect("embedded response body")
+            .to_vec()
+    }
+
+    #[tokio::test]
+    async fn embedded_ui_serves_index_and_every_bundled_asset_with_mime_types() {
+        let index = serve_embedded_index().await;
+        assert_eq!(index.status(), StatusCode::OK);
+        assert_eq!(
+            index.headers().get(header::CONTENT_TYPE).unwrap(),
+            "text/html"
+        );
+        assert_eq!(
+            index.headers().get(header::CACHE_CONTROL).unwrap(),
+            "no-store"
+        );
+        let index_html = String::from_utf8(response_body(index).await).unwrap();
+
+        let mut referenced_assets = 0;
+        for prefix in ["src=\"/ui/", "href=\"/ui/"] {
+            for tail in index_html.split(prefix).skip(1) {
+                let path = tail.split('"').next().unwrap();
+                assert!(
+                    UiAssets::get(path).is_some(),
+                    "index references missing embedded asset: {path}"
+                );
+                referenced_assets += 1;
+            }
+        }
+        assert!(
+            referenced_assets >= 2,
+            "index should reference built JS and CSS assets"
+        );
+
+        for asset in UiAssets::iter() {
+            let response = serve_embedded_file(asset.as_ref());
+            assert_eq!(response.status(), StatusCode::OK, "failed asset: {asset}");
+            assert!(
+                response.headers().get(header::CONTENT_TYPE).is_some(),
+                "asset has no MIME type: {asset}"
+            );
+            assert!(
+                !response_body(response).await.is_empty(),
+                "empty asset: {asset}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn embedded_ui_spa_fallback_and_missing_asset_behavior_are_distinct() {
+        let fallback = serve_embedded_file("sessions/deep-link");
+        assert_eq!(fallback.status(), StatusCode::OK);
+        assert_eq!(
+            fallback.headers().get(header::CONTENT_TYPE).unwrap(),
+            "text/html"
+        );
+        assert!(!response_body(fallback).await.is_empty());
+
+        let missing = serve_embedded_file("assets/not-present.js");
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+
+        for response in [
+            serve_embedded_index().await,
+            serve_embedded_asset(Path(String::new())).await,
+        ] {
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+    }
+
     /// Build a minimal `AppState` with in-memory session storage. Matches
     /// `runs::integration_tests::test_app_state` but lives here so the
     /// `routes` test module is self-contained.

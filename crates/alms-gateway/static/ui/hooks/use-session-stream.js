@@ -286,6 +286,17 @@ let sawTokenDelta = false;
  */
 let lastSeenEventId = null;
 
+let sessionContractReconciler = null;
+
+/**
+ * Register the authoritative reload used after a malformed persisted frame.
+ * Kept as an injected callback to avoid coupling the stream module to the
+ * much larger session-loader dependency graph.
+ */
+export function registerSessionContractReconciler(reconciler) {
+    sessionContractReconciler = reconciler;
+}
+
 function flushDeltaBuffer() {
     flushTimer = null;
     if (!deltaBuffer) return;
@@ -419,10 +430,8 @@ function sealLastAgent() {
  * Stays open across runs -- all events for this session arrive here.
  *
  * @param {string} sessionId
- * @param {object} [opts]
- * @param {number} [opts.lastEventId] -- skip replay of events up to (and
- *   including) this ID. Used when the client already loaded history via
- *   the REST API and only needs new live events going forward.
+ * @param {{ lastEventId?: number, sealedReasoningRunIds?: Set<string> }} [opts]
+ *   Replay cursor and load-time reasoning dedupe state.
  */
 export function openSessionStream(sessionId, opts) {
     // Recover the reasoning-dedupe suppress-set (#1135) BEFORE the internal
@@ -598,6 +607,29 @@ export function openSessionStream(sessionId, opts) {
      */
     const SEEN_IDS_MAX = 2500;
     const seenEventIds = new Set();
+    let contractRecovering = false;
+
+    const recoverFromContractViolation = async (eventId, error) => {
+        if (contractRecovering || streamGeneration !== selectGeneration) return;
+        contractRecovering = true;
+        es.close();
+        console.error('[session-events] rejected live event; reconciling:', error);
+
+        if (!sessionContractReconciler) {
+            markStreamDead('session');
+            return;
+        }
+
+        try {
+            // Reload REST snapshots before reopening. The malformed frame is
+            // used as the minimum cursor so it is not replayed forever; all
+            // later persisted frames replay onto the authoritative snapshot.
+            await sessionContractReconciler(sessionId, eventId);
+        } catch (reconcileError) {
+            console.error('[session-events] contract reconciliation failed:', reconcileError);
+            markStreamDead('session');
+        }
+    };
 
     /**
      * Wrap an event handler to track the highest seen SSE event ID and
@@ -617,21 +649,22 @@ export function openSessionStream(sessionId, opts) {
         if (streamGeneration !== selectGeneration) return;
 
         const id = e.lastEventId;
-        // Track highest numeric ID for manual reconnect
-        if (id && /^\d+$/.test(id)) {
-            lastSeenEventId = id;
-        }
-        // Deduplicate: skip events we have already processed (but always
-        // allow ephemeral events through -- they are never replayed and
-        // their IDs are not stored in the set).
-        if (id && !id.startsWith('ephemeral-')) {
-            if (seenEventIds.has(id)) return;
-            seenEventIds.add(id);
-            // Prevent unbounded growth (#510): once the set exceeds the
-            // cap, evict the oldest ~20% of entries.  Set preserves
-            // insertion order, so we delete from the front to shed stale
-            // IDs while keeping recent ones that a browser auto-reconnect
-            // replay would contain.
+        const numericId = id && /^\d+$/.test(id) ? Number(id) : null;
+        const shouldRemember = id && !id.startsWith('ephemeral-');
+        if (shouldRemember && seenEventIds.has(id)) return;
+
+        try {
+            const contracts = globalThis.__almsContracts;
+            if (!contracts) throw new Error('Frontend contract bridge is not installed');
+            const validated = contracts.parseSseJsonPayload(type, e.data);
+            handler({ data: validated, lastEventId: e.lastEventId });
+
+            // Commit replay bookkeeping only after validation and state
+            // mutation succeed. Otherwise a malformed frame would be skipped
+            // forever while leaving the UI at its pre-event state.
+            if (numericId != null) lastSeenEventId = id;
+            if (shouldRemember) seenEventIds.add(id);
+
             if (seenEventIds.size > SEEN_IDS_MAX) {
                 const evictCount = Math.floor(SEEN_IDS_MAX * 0.2);
                 let i = 0;
@@ -641,18 +674,18 @@ export function openSessionStream(sessionId, opts) {
                 }
                 console.debug('[sse-dedup] evicted', evictCount, 'stale IDs, size:', seenEventIds.size);
             }
+        } catch (err) {
+            const recoveryCursor = numericId != null
+                ? numericId
+                : (/^\d+$/.test(String(lastSeenEventId)) ? Number(lastSeenEventId) : null);
+            void recoverFromContractViolation(recoveryCursor, err);
         }
-        const contracts = globalThis.__almsContracts;
-        const validated = contracts
-            ? contracts.parseSseJsonPayload(type, e.data)
-            : JSON.parse(e.data);
-        handler({ data: JSON.stringify(validated), lastEventId: e.lastEventId });
     });
 
     // -- run_created: a new run was created on this session --
     on('run_created', (e) => {
-        const data = JSON.parse(e.data);
-        const queuedBehind = data.queued_behind || 0;
+        const data = e.data;
+        const queuedBehind = data.queued_behind;
         sawTokenDelta = false;
         bumpRunListGeneration();
 
@@ -667,10 +700,8 @@ export function openSessionStream(sessionId, opts) {
             setDmContext(data.source.slice(5));
             // Record the run as a DM run so `isDmEvent` classifies its deltas
             // correctly even before `activeSession` resolves or a `dm_reasoning`
-            // block exists (#1162 attach race). Keyed by run_id; falls back to
-            // `activeRunId` only for legacy backends that omit run_id on the wire.
-            const peerRunId = data.run_id || activeRunId.value;
-            if (peerRunId) peerRunIds.add(peerRunId);
+            // block exists (#1162 attach race). The contracted run_id is its stable key.
+            peerRunIds.add(data.run_id);
         }
 
         // Take the DM block-creation path whenever this run is known to be a DM
@@ -690,7 +721,7 @@ export function openSessionStream(sessionId, opts) {
         // it from history.
         const isDmRun = isDm || isPeerSource;
 
-        if (isDmRun && data.run_id) {
+        if (isDmRun) {
             // DM sessions with queued runs: show a thinking indicator with
             // queue state instead of a live reasoning block. The reasoning
             // block will be created when run_started fires. (#691)
@@ -786,7 +817,7 @@ export function openSessionStream(sessionId, opts) {
 
     // -- run_started: the run has been dequeued and is now executing --
     on('run_started', (e) => {
-        const data = JSON.parse(e.data);
+        const data = e.data;
         // Gate via `isDmEvent` (run_id-aware) rather than a bare `activeSession`
         // read, mirroring the delta / run_finished handlers (#1162 attach race).
         // `run_started` carries no `source`, so it cannot re-detect `peer:` on
@@ -797,7 +828,7 @@ export function openSessionStream(sessionId, opts) {
         // queued-run analogue of the non-queued `run_created` drop fixed above).
         const isDm = isDmEvent(data.run_id);
 
-        if (isDm && data.run_id) {
+        if (isDm) {
             // DM session: replace the queued thinking indicator with a
             // live reasoning block now that the run is actually executing.
             // Extract the source from the queued thinking indicator (set
@@ -857,16 +888,13 @@ export function openSessionStream(sessionId, opts) {
     //
     // The run is identified by `data.run_id`, which both the `run_created`
     // SSE handler and the `loadSession` reload path stamp onto the
-    // thinking-indicator message. A defensive `!m.runId` fallback handles
-    // any legacy / unstamped indicator (sessions only ever have one queued
-    // run on screen at a time, so the fallback can't update the wrong row).
+    // thinking-indicator message. The contracted run_id provides exact routing.
     on('run_queue_position', (e) => {
-        const data = JSON.parse(e.data);
-        const position = typeof data.position === 'number' ? data.position : 0;
-        if (position <= 0) return; // defensive -- backend never emits 0
+        const data = e.data;
+        const position = data.position;
         updateMessage(
             m => m.type === 'thinking' && m.queuedBehind > 0
-                && (m.runId === data.run_id || !m.runId),
+                && m.runId === data.run_id,
             m => ({ ...m, queuedBehind: position }),
         );
     });
@@ -877,7 +905,7 @@ export function openSessionStream(sessionId, opts) {
     // routing ever changes, the header bar would flash subagent phases
     // and a source_agent guard would need to be added here.
     on('status', (e) => {
-        const data = JSON.parse(e.data);
+        const data = e.data;
         console.debug('[status]', data.phase, data.detail || '');
 
         // During DM runs, ALL phases are replaced with "Chatting with
@@ -894,7 +922,7 @@ export function openSessionStream(sessionId, opts) {
 
     // -- token_delta --
     on('token_delta', (e) => {
-        const data = JSON.parse(e.data);
+        const data = e.data;
         if (data.source_agent) return; // suppress subagent interleaving
         // S3 (#1154): gate via `isDmEvent` (run_id-aware), not a bare
         // `activeSession` read. On a reconnect that replays buffered events
@@ -904,7 +932,7 @@ export function openSessionStream(sessionId, opts) {
         // bubble (the #685 symptom). `isDmEvent` ORs in the event-driven
         // proof (a live `dm_reasoning` block for this run) so the delta stays
         // on the DM path regardless of attach/reconnect ordering.
-        const isDm = isDmEvent(data.run_id || activeRunId.value);
+        const isDm = isDmEvent(data.run_id);
         if (isDm) {
             // INVARIANT (cross-layer, #1156 Option C): treating EVERY DM
             // `token_delta` as the discard-on-end pending reply is correct only
@@ -936,15 +964,12 @@ export function openSessionStream(sessionId, opts) {
             // `handleRunEnd` nulls `activeRunId` for the FIRST run to end),
             // so keying on the mutable `activeRunId` lands one agent's
             // text in the other agent's collapsible. The wire-level `run_id`
-            // is the authoritative owner of the delta. Fall back to
-            // `activeRunId.value` only for legacy backends that omit it.
-            const runId = data.run_id || activeRunId.value;
-            if (runId) {
-                dmPendingReplyBuffers.set(
-                    runId,
-                    (dmPendingReplyBuffers.get(runId) || '') + data.delta,
-                );
-            }
+            // is the authoritative owner of the delta.
+            const runId = data.run_id;
+            dmPendingReplyBuffers.set(
+                runId,
+                (dmPendingReplyBuffers.get(runId) || '') + data.delta,
+            );
             return;
         }
         sawTokenDelta = true;
@@ -959,7 +984,7 @@ export function openSessionStream(sessionId, opts) {
     // Accumulate per-run reasoning text into a buffer attached to the
     // live agent message so `ReasoningPanel` can render it collapsed.
     on('reasoning_delta', (e) => {
-        const data = JSON.parse(e.data);
+        const data = e.data;
         if (data.source_agent) {
             // Subagent reasoning is suppressed from the PARENT's main chat /
             // reasoning view — it must never leak into the parent run's
@@ -978,7 +1003,7 @@ export function openSessionStream(sessionId, opts) {
         // reconnect-replay reason as the token_delta handler above — a bare
         // `activeSession` read would misroute a replayed DM `reasoning_delta`
         // into the non-DM path and spawn a spurious unsealed bubble.
-        const isDm = isDmEvent(data.run_id || activeRunId.value);
+        const isDm = isDmEvent(data.run_id);
         if (isDm) {
             // For DM sessions: reasoning IS the canonical collapsible content,
             // so accumulate it directly into `dmThinkingBuffers` (unlike the
@@ -1002,15 +1027,12 @@ export function openSessionStream(sessionId, opts) {
             // B8 (#1154): bucket by the event's own `run_id`, not the mutable
             // `activeRunId.value`. See the token_delta handler above — two
             // overlapping DM runs would otherwise cross-contaminate each
-            // other's collapsible. Fall back to `activeRunId` only for legacy
-            // backends that omit `run_id` on the wire.
-            const runId = data.run_id || activeRunId.value;
-            if (runId) {
-                const prev = dmThinkingBuffers.value;
-                const next = new Map(prev);
-                next.set(runId, (next.get(runId) || '') + delta);
-                dmThinkingBuffers.value = next;
-            }
+            // other's collapsible.
+            const runId = data.run_id;
+            const prev = dmThinkingBuffers.value;
+            const next = new Map(prev);
+            next.set(runId, (next.get(runId) || '') + delta);
+            dmThinkingBuffers.value = next;
             return;
         }
         // Load-time terminal-scoped dedupe guard (#1133, Layer 3). For a run
@@ -1079,7 +1101,7 @@ export function openSessionStream(sessionId, opts) {
     // rebuilds a single clean render that matches reload (live === reload, the
     // #1164 invariant).
     on('stream_reset', (e) => {
-        const data = JSON.parse(e.data);
+        const data = e.data;
         // Subagent stream resets never reach here (the coordinator suppresses
         // them — the parent paints no subagent content at all now: the status
         // bar renders only coarse `subagent_activity` labels, so there is no
@@ -1087,19 +1109,19 @@ export function openSessionStream(sessionId, opts) {
         // so a future forwarding change can't clear the PARENT's partial by
         // mistake.
         if (data.source_agent) return;
-        const runId = data.run_id || activeRunId.value || null;
+        const runId = data.run_id;
         batch(() => {
             // 1. Visible reply partial (DM path): the per-run pending buffer the
             //    `token_delta` handler accumulates. The re-emitted token_delta
             //    refills it; run end discards it (it is the implicit reply).
-            if (runId) dmPendingReplyBuffers.delete(runId);
+            dmPendingReplyBuffers.delete(runId);
 
             // 2. Partial reasoning painted into the live DM collapsible. Clear
             //    only this run's bucket — the re-emitted reasoning_delta refills
             //    it. The `dm_reasoning` block entry in chatMessages stays (it is
             //    the collapsible container, sealed on run end), so the live
             //    block simply shows empty thinking until the re-emit lands.
-            if (runId && dmThinkingBuffers.value.has(runId)) {
+            if (dmThinkingBuffers.value.has(runId)) {
                 const next = new Map(dmThinkingBuffers.value);
                 next.delete(runId);
                 dmThinkingBuffers.value = next;
@@ -1130,9 +1152,9 @@ export function openSessionStream(sessionId, opts) {
     on('tool_start', (e) => {
         batch(() => {
             flushDeltaBuffer();
-            const data = JSON.parse(e.data);
-            const toolId = data.tool_invocation_id || data.call_id || nextMsgId();
-            const runId = data.run_id || activeRunId.value || null;
+            const data = e.data;
+            const toolId = data.tool_invocation_id;
+            const runId = data.run_id;
             // Diagnostic: log tool count before insertion for #501 investigation.
             const toolCountBefore = chatMessages.value.filter(m => m.type === 'tool').length;
             console.debug('[tool_start]', data.tool, 'id=' + toolId,
@@ -1249,7 +1271,7 @@ export function openSessionStream(sessionId, opts) {
     // -- tool_end --
     on('tool_end', (e) => {
         batch(() => {
-            const data = JSON.parse(e.data);
+            const data = e.data;
             const matchId = data.tool_invocation_id;
             const status = data.ok ? 'done' : 'fail';
 
@@ -1279,7 +1301,7 @@ export function openSessionStream(sessionId, opts) {
             // resolved; tool_end must look inside the blocks under the same
             // condition or it would fall through to the standalone-message
             // path and fail to find the (correctly grouped) tool.
-            const isDm = isDmEvent(data.run_id || activeRunId.value || null);
+            const isDm = isDmEvent(data.run_id);
             if (isDm && matchId && !data.source_agent) {
                 let dmFound = false;
                 transformMessages(prev => {
@@ -1388,7 +1410,7 @@ export function openSessionStream(sessionId, opts) {
         batch(() => {
             flushDeltaBuffer();
             sealLastAgent();
-            const data = JSON.parse(e.data);
+            const data = e.data;
             // Deduplicate: skip if an approval card with this ID already exists.
             // This can happen when the approval was reconstructed from the REST
             // API on session switch and then replayed by the SSE stream.
@@ -1417,10 +1439,9 @@ export function openSessionStream(sessionId, opts) {
     // activity transition. The bar renders the latest signal as a concise
     // label; the subagent's actual content streams to its OWN session (#1184).
     on('subagent_activity', (e) => {
-        const data = JSON.parse(e.data);
+        const data = e.data;
         // Defensive: a signal without a source label can't be routed to a
         // chip. The backend always tags these.
-        if (!data.source_agent) return;
         // `tool_invocation_id` (tool kinds only) is the toolsUsed idempotency
         // key (#1190): the attach-time snapshot replay re-sends the current
         // in-progress tool_start with the SAME id, while parallel same-tool
@@ -1442,13 +1463,6 @@ export function openSessionStream(sessionId, opts) {
     // status bar chip can navigate to the subagent session live (i.e. while
     // the subagent is still running).
     //
-    // Pre-#1105 backends do not emit this event. The handler is a no-op
-    // when the payload is missing fields, so older backends just keep the
-    // legacy behaviour (chip becomes clickable at tool_end for foreground
-    // subagents, unchanged for background subagents — those still arrive via
-    // the invoke_agent tool_end `{task_id, session_id}` result and via the
-    // `subagent_completed` event below).
-    //
     // Payload shape (per #1105 issue body):
     //   { subagent_name, tool_invocation_id, subagent_session_id }
     //
@@ -1469,9 +1483,8 @@ export function openSessionStream(sessionId, opts) {
     // incorrect drill-down links.
     on('subagent_started', (e) => {
         batch(() => {
-            const data = JSON.parse(e.data);
-            const sessionId = data.subagent_session_id || null;
-            if (!sessionId) return;
+            const data = e.data;
+            const sessionId = data.subagent_session_id;
             const name = data.subagent_name
                 || findSubagentByToolInvocationId(data.tool_invocation_id);
             if (!name) {
@@ -1487,7 +1500,7 @@ export function openSessionStream(sessionId, opts) {
     // -- subagent_completed --
     on('subagent_completed', (e) => {
         batch(() => {
-            const data = JSON.parse(e.data);
+            const data = e.data;
             const name = data.subagent_name || 'subagent';
             const status = data.status || 'done';
             const sessionId = data.subagent_session_id || null;
@@ -1542,7 +1555,7 @@ export function openSessionStream(sessionId, opts) {
 
     // -- job_completed --
     on('job_completed', (e) => {
-        const data = JSON.parse(e.data);
+        const data = e.data;
         appendMessage({
             id: nextMsgId(),
             type: 'job_completed',
@@ -1571,7 +1584,7 @@ export function openSessionStream(sessionId, opts) {
         batch(() => {
             flushDeltaBuffer();
             sealLastAgent();
-            const data = JSON.parse(e.data);
+            const data = e.data;
             // Insert the message as an agent-role DM message with fromAgent
             // metadata so the DM conversation view can render it on the
             // correct side. Use type 'agent' to match what mapHistoryMessages
@@ -1597,7 +1610,7 @@ export function openSessionStream(sessionId, opts) {
 
     // -- dm_conversation_ended --
     on('dm_conversation_ended', (e) => {
-        const data = JSON.parse(e.data);
+        const data = e.data;
         const peer = data.peer || 'unknown';
         const reason = DM_END_REASON_LABELS[data.reason] || data.reason || 'conversation ended';
         // #1215/#1218: the web-chat forward sets `suppress_banner` when the
@@ -1673,7 +1686,7 @@ export function openSessionStream(sessionId, opts) {
     // Forwarded from the DM session to the webchat session so the UI can
     // show "Chatting with {peer}..." even when viewing the main session.
     on('dm_activity_started', (e) => {
-        const data = JSON.parse(e.data);
+        const data = e.data;
         if (data.peer) {
             setDmContext(data.peer);
         }
@@ -1686,7 +1699,7 @@ export function openSessionStream(sessionId, opts) {
     // Tool-level detail (e.g. "Running shell...") is visible when viewing
     // the DM session directly, not from the webchat session.
     on('dm_activity_status', (e) => {
-        const data = JSON.parse(e.data);
+        const data = e.data;
         const peer = dmPeer.value || data.peer;
         if (peer) {
             setAgentPhase('dm', peer);
@@ -1699,7 +1712,7 @@ export function openSessionStream(sessionId, opts) {
     // dm_conversation_ended arrives (signalling the entire conversation
     // is over) or until a non-DM run starts on this session.
     on('dm_activity_ended', (e) => {
-        const data = JSON.parse(e.data);
+        const data = e.data;
         const peer = dmPeer.value || data.peer;
         // Keep showing "Chatting with..." -- the DM is still active
         // (the peer agent may be formulating its next reply).
@@ -1722,7 +1735,7 @@ export function openSessionStream(sessionId, opts) {
     // execution) or immediately after deny (`user_denied: true` result,
     // #1109 — the run then terminates via `run_cancelled`).
     on('approval_resolved', (e) => {
-        const data = JSON.parse(e.data);
+        const data = e.data;
         filterMessages(
             m => !(m.type === 'approval' && m.approvalId === data.approval_id),
         );
@@ -1740,7 +1753,7 @@ export function openSessionStream(sessionId, opts) {
     // `null`); the renderer falls back to "agent" in that case.
     on('context_debug', (e) => {
         batch(() => {
-            const data = JSON.parse(e.data);
+            const data = e.data;
             appendMessage({
                 id: nextMsgId(),
                 type: 'context_debug',
@@ -1760,7 +1773,7 @@ export function openSessionStream(sessionId, opts) {
     // chat -- they are visible via the Subagent status bar drill-down into the
     // subagent's own session.  (#602)
     on('run_warning', (e) => {
-        const data = JSON.parse(e.data);
+        const data = e.data;
         if (data.source_agent) return;
         batch(() => {
             flushDeltaBuffer();
@@ -1777,7 +1790,7 @@ export function openSessionStream(sessionId, opts) {
         batch(() => {
             flushDeltaBuffer();
             sealLastAgent();
-            const data = e.data ? JSON.parse(e.data) : {};
+            const data = e.data;
 
             // Build the approval-resolution-and-append phase via
             // transformMessages so it results in a single signal write.

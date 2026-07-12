@@ -67,22 +67,15 @@ let backoffTimer = null;
 
 /**
  * Apply one activity transition using the backend's authoritative
- * session-level predicate. The event type is only a compatibility fallback
- * for an older gateway that does not yet send `has_active_run`.
+ * session-level predicate.
  */
 function applyActivityEvent(type, data) {
-    if (!data.session_id) return;
-
-    const hasActiveRun = typeof data.has_active_run === 'boolean'
-        ? data.has_active_run
-        : type === 'session_activity_started';
-
-    if (hasActiveRun) {
+    if (data.has_active_run) {
         setBgRun(data.session_id, {
             // An ended event can still report session activity when another
             // overlapping run remains. Its own run_id is terminal, not the
             // identity of the remaining run, so do not expose it as active.
-            runId: type === 'session_activity_ended' ? null : (data.run_id || null),
+            runId: type === 'session_activity_ended' ? null : data.run_id,
             finished: false,
         });
     } else {
@@ -105,9 +98,8 @@ function applyActivitySnapshot(data) {
  * first so only one is active at a time.
  *
  * @param {string} agentId
- * @param {object} [opts]
- * @param {number|string} [opts.lastEventId] — replay cursor (used by
- *   the internal retry path)
+ * @param {{ lastEventId?: number|string, streamEpoch?: string, reconcileOnOpen?: boolean }} [opts]
+ *   Replay and reconciliation options.
  */
 export function openAgentEventsStream(agentId, opts) {
     const requestedEpoch = (opts && opts.streamEpoch != null)
@@ -141,6 +133,7 @@ export function openAgentEventsStream(agentId, opts) {
     // every agent it surfaces, so the feed cannot be scoped per agent.
     const url = `/events/session-activity${qs ? '?' + qs : ''}`;
 
+    /** @type {EventSource & { _reconciliationRetryTimer?: number | null }} */
     const es = new EventSource(url);
     activeAgentEs = es;
     activeAgentId = agentId;
@@ -153,6 +146,7 @@ export function openAgentEventsStream(agentId, opts) {
     let queuedReconciliation = false;
     let queuedReplayCeiling = null;
     let reconciliationRetryCount = 0;
+    let contractRecovering = false;
 
     const dispatchActivity = (type, data, eventId) => {
         if (reconciling) {
@@ -250,43 +244,71 @@ export function openAgentEventsStream(agentId, opts) {
         }
     });
 
+    const recoverFromContractViolation = async (eventId, error) => {
+        if (contractRecovering || es !== activeAgentEs) return;
+        contractRecovering = true;
+        es.close();
+        console.error('[agent-events] rejected live event; reconciling:', error);
+
+        try {
+            const snapshot = await listSessions(null, { includeDms: true });
+            if (es !== activeAgentEs) return;
+            applyActivitySnapshot(snapshot);
+
+            // A malformed frame cannot become valid on replay. Skip only
+            // that frame after replacing local state with the authoritative
+            // snapshot; stream_state reconciles the retained tail.
+            activeAgentEs = null;
+            openAgentEventsStream(agentId, {
+                lastEventId: eventId,
+                streamEpoch: lastSeenStreamEpoch,
+                reconcileOnOpen: true,
+            });
+        } catch (snapshotError) {
+            console.error('[agent-events] contract reconciliation failed:', snapshotError);
+            markStreamDead('agent-events');
+        }
+    };
+
     /**
-     * Wrap a handler so we (a) discard events for a stale stream
-     * (the agent may have been switched between the EventSource
-     * dispatch and the handler executing) and (b) track the highest
-     * numeric event ID for manual reconnect.
+     * Validate before mutation and advance the replay cursor only after
+     * the event has been handled successfully.
      */
     const on = (type, handler) => es.addEventListener(type, (e) => {
         if (es !== activeAgentEs) return;
         const id = e.lastEventId;
-        if (id && /^\d+$/.test(id)) {
-            lastSeenEventId = id;
-        }
+        const numericId = id && /^\d+$/.test(id) ? Number(id) : null;
         try {
             const contracts = globalThis.__almsContracts;
-            const validated = contracts
-                ? contracts.parseSseJsonPayload(type, e.data)
-                : JSON.parse(e.data);
-            handler({ data: JSON.stringify(validated), lastEventId: e.lastEventId });
+            if (!contracts) throw new Error('Frontend contract bridge is not installed');
+            const validated = contracts.parseSseJsonPayload(type, e.data);
+            handler({ data: validated, lastEventId: e.lastEventId });
+            if (numericId != null) lastSeenEventId = id;
         } catch (err) {
-            console.error('[agent-events]', type, 'handler failed:', err);
+            if (numericId != null) {
+                void recoverFromContractViolation(numericId, err);
+            } else {
+                console.error('[agent-events]', type, 'handler failed:', err);
+                es.close();
+                markStreamDead('agent-events');
+            }
         }
     });
 
     on('session_activity_started', (e) => {
-        const data = JSON.parse(e.data);
+        const data = e.data;
         const eventId = /^\d+$/.test(e.lastEventId) ? Number(e.lastEventId) : null;
         dispatchActivity('session_activity_started', data, eventId);
     });
 
     on('session_activity_ended', (e) => {
-        const data = JSON.parse(e.data);
+        const data = e.data;
         const eventId = /^\d+$/.test(e.lastEventId) ? Number(e.lastEventId) : null;
         dispatchActivity('session_activity_ended', data, eventId);
     });
 
     on('stream_state', (e) => {
-        const data = JSON.parse(e.data);
+        const data = e.data;
         const epochChanged = Boolean(
             lastSeenStreamEpoch
             && data.stream_epoch

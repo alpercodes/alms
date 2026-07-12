@@ -26,9 +26,9 @@ import { normalizeApproval } from './approvals.js';
 import { chatMessages, nextMsgId } from '../state/chat.js';
 import { replaceMessages, appendMessage, updateMessage, filterMessages } from '../state/chat-actions.js';
 import { activeRunId, runs } from '../state/runs.js';
-import { openSessionStream } from '../hooks/use-session-stream.js';
+import { openSessionStream, registerSessionContractReconciler } from '../hooks/use-session-stream.js';
 import { setAgentPhase, clearAgentPhase, setDmContext } from '../state/agent-status.js';
-import { sessions, crossAgentSessions } from '../state/sessions.js';
+import { sessions, crossAgentSessions, activeSessionId } from '../state/sessions.js';
 import { activeAgent } from '../state/agents.js';
 import { getPendingMessage, clearPendingMessage } from '../state/pending-messages.js';
 import { rehydrateSubagentsFromHistory, parentSessionId } from '../state/subagents.js';
@@ -272,7 +272,7 @@ export async function loadSession(sessionId, opts) {
     // parallel.  The tool call records enrich tool rows for DM sessions
     // where tool calls are stored only in run_tool_calls, not in
     // session_messages.  (#609, #632, #634)
-    let lastEventId = null;
+    let lastEventId = opts.minimumLastEventId ?? null;
     // Hoisted so step 3 (in-flight reasoning rehydration for #1043) can
     // branch on session type without re-deriving it.
     let isDmSession = false;
@@ -412,6 +412,7 @@ export async function loadSession(sessionId, opts) {
     } catch (err) {
         if (isStale()) return;
         replaceMessages([{ id: nextMsgId(), type: 'error', text: `Failed to load message history: ${err.error?.message || err.message || 'unknown error'}` }]);
+        if (opts.requireAuthoritativeSnapshot) throw err;
     }
 
     // Step 3: If a run is in-progress, append a thinking indicator and
@@ -875,3 +876,12 @@ async function restoreGlobalAgentPhase(agentId, sessionId, isStale, logPrefix) {
         clearAgentPhase();
     }
 }
+
+registerSessionContractReconciler(async (sessionId, rejectedEventId) => {
+    await loadSession(sessionId, {
+        isStale: () => activeSessionId.value !== sessionId,
+        logPrefix: 'contract-reconcile',
+        minimumLastEventId: rejectedEventId,
+        requireAuthoritativeSnapshot: true,
+    });
+});

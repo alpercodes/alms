@@ -49,10 +49,7 @@ describe("typed compatibility boundary", () => {
     expect(screen.getByRole("alert")).toHaveTextContent("has_active_run");
   });
 
-  it("keeps unknown SSE types object-shaped during incremental migration", () => {
-    expect(parseSsePayload("future_event", { value: 1 })).toEqual({ value: 1 });
-    expect(() => parseSsePayload("future_event", ["not", "an", "object"])).toThrow(
-      ContractViolation,
-    );
+  it("rejects unknown SSE types instead of bypassing the contract boundary", () => {
+    expect(() => parseSsePayload("future_event", { value: 1 })).toThrow(ContractViolation);
   });
 });

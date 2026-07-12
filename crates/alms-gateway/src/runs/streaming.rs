@@ -212,7 +212,7 @@ pub(crate) fn attach_session_stream(
             snap.tool,
             snap.tool_invocation_id,
             snap.parent_tool_invocation_id,
-            Some(snap.label),
+            snap.label,
         )) {
             // Session subscriptions are lossless, so this can only happen if
             // the receiver closed during attachment. Stop immediately rather

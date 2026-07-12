@@ -130,8 +130,8 @@ describe("guarded raw JSON wrappers", () => {
     const state = { agents: ["unchanged"] };
 
     await expect(
-      apiFetch<{ agents: string[] }>("/settings").then((response) => {
-        state.agents = response.agents;
+      apiFetch("/settings").then((response) => {
+        state.agents = (response as { agents: string[] }).agents;
       }),
     ).rejects.toThrow(ContractViolation);
 
@@ -164,6 +164,6 @@ describe("guarded raw JSON wrappers", () => {
       vi.fn(() => Promise.resolve({ ok: true, status: 204 } as Response)),
     );
 
-    await expect(apiFetch<null>(`/jobs/${runId}`, { method: "DELETE" })).resolves.toBeNull();
+    await expect(apiFetch(`/jobs/${runId}`, { method: "DELETE" })).resolves.toBeNull();
   });
 });

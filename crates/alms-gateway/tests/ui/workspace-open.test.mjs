@@ -93,6 +93,11 @@ async function loadWorkspaceApi() {
         setItem(k, v) { this._data[k] = String(v); },
         removeItem(k) { delete this._data[k]; },
     };
+    globalThis.__almsContracts = {
+        parseApiJsonResponse(_path, _method, raw) {
+            return JSON.parse(raw);
+        },
+    };
 
     const mod = await import(
         url.pathToFileURL(path.join(apiSubdir, 'workspace.js')).href

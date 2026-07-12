@@ -83,7 +83,7 @@ impl alms_tools::EventForwarder for RuntimeEventForwarder {
         tool: Option<String>,
         tool_invocation_id: Option<uuid::Uuid>,
         parent_tool_invocation_id: Option<uuid::Uuid>,
-        source_agent: Option<String>,
+        source_agent: String,
     ) {
         let _ = self.tx.send(RuntimeEvent::SubagentActivity {
             kind,
