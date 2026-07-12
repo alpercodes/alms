@@ -2934,7 +2934,7 @@ mod tests {
         }
 
         let got = fwd.activity.lock().clone();
-        let label = Some("reviewer".to_string());
+        let label = "reviewer".to_string();
         assert_eq!(
             got,
             vec![
