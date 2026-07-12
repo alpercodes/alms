@@ -36,10 +36,11 @@ use tracing::info;
 
 /// Static UI assets embedded into the binary at compile time.
 ///
-/// During release builds every file under `static/ui/` is baked into the
-/// binary so the server works from any working directory.
+/// The Vite production build under `static/ui-dist/` is checked in and baked
+/// into the binary, so the server works from any working directory without a
+/// runtime Node.js dependency.
 #[derive(Embed)]
-#[folder = "static/ui/"]
+#[folder = "static/ui-dist/"]
 struct UiAssets;
 
 /// Routes that do NOT require authentication

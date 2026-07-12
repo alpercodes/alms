@@ -16,6 +16,8 @@ This is the entrypoint to ALMS documentation.
 - `events-and-audit.md` — event streams, approvals, audit invariants
 - `database-migrations.md` — SQLite schema versions, compatibility, backup, and rollback
 
+- `frontend.md` - Vite/TypeScript build, runtime contract boundary, and incremental migration
+
 ## Agent runtime
 
 - `agent-runtime-design.md` — config, context builder, workspace subsystems
@@ -48,4 +50,4 @@ are in `_archive/`. They are preserved for historical reference.
 
 ---
 
-*Last updated 2026-03-31.*
+*Last updated 2026-07-12.*

@@ -263,7 +263,12 @@ export function openAgentEventsStream(agentId, opts) {
             lastSeenEventId = id;
         }
         try {
-            handler(e);
+            const payload = JSON.parse(e.data);
+            const contracts = globalThis.__almsContracts;
+            const validated = contracts
+                ? contracts.parseSsePayload(type, payload)
+                : payload;
+            handler({ data: JSON.stringify(validated), lastEventId: e.lastEventId });
         } catch (err) {
             console.error('[agent-events]', type, 'handler failed:', err);
         }

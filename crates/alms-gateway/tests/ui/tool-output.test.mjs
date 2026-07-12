@@ -14,7 +14,7 @@
 // Strategy
 // --------
 // `tool-output.js` imports `html` (htm + Preact `h`) from `../deps.js`.
-// htm is a CDN ES module not vendored into the repo, so we can't `import`
+// htm is bundled for the browser but not loaded by this Node harness, so we can't `import`
 // it under Node. Instead we stub `html` with a deterministic tagged-
 // template helper that turns the template strings + interpolated values
 // into a plain "VNode-like" tree we can walk in assertions:

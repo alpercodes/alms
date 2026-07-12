@@ -29,8 +29,10 @@ use swc_ecma_ast::EsVersion;
 use swc_ecma_parser::{EsSyntax, Parser, Syntax, lexer::Lexer};
 use walkdir::WalkDir;
 
-/// Root of the embedded UI tree (relative to the crate manifest).
+/// Root of the editable legacy UI source tree (relative to the crate manifest).
 const UI_RELATIVE_ROOT: &str = "static/ui";
+/// Root of the reproducible Vite output embedded by the gateway.
+const UI_DIST_RELATIVE_ROOT: &str = "static/ui-dist";
 
 /// Single parse failure, surfaced from `collect_parse_errors`.
 struct ParseFailure {
@@ -168,6 +170,37 @@ fn static_ui_modules_parse_cleanly() {
             inspected
         ));
         panic!("{report}");
+    }
+}
+
+#[test]
+fn built_ui_bundle_is_present_and_self_contained() {
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let dist_root = manifest_dir.join(UI_DIST_RELATIVE_ROOT);
+    let index_path = dist_root.join("index.html");
+    let index = std::fs::read_to_string(&index_path)
+        .unwrap_or_else(|e| panic!("expected built UI at {}: {e}", index_path.display()));
+
+    assert!(
+        !index.contains("esm.sh"),
+        "production UI must bundle dependencies instead of relying on a CDN"
+    );
+    assert!(
+        index.contains("/ui/assets/"),
+        "built index must reference Vite assets under /ui/: {index}"
+    );
+
+    for token in index.split('"') {
+        let Some(relative) = token.strip_prefix("/ui/") else {
+            continue;
+        };
+        if !relative.starts_with("assets/") {
+            continue;
+        }
+        assert!(
+            dist_root.join(relative).is_file(),
+            "built index references missing asset {relative}"
+        );
     }
 }
 

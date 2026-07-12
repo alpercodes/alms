@@ -321,3 +321,11 @@ This program does not:
   authoritative run/job transition APIs, monotonic revisions, revision-aware
   SQLite upserts, stale coordinator snapshot rejection, and deterministic
   lifecycle race regressions.
+- Phase 3 merged as PR #1225.
+- Phase 4 merged as PR #1226 with epoch-aware replay-gap recovery,
+  authoritative activity reconciliation, prompt subscriber cleanup, and
+  explicit bounded-versus-lossless feed semantics.
+- Post-Phase-4 develop is tagged as v0.2.4-pre-frontend-migration.
+- Phase 5 is implemented on codex/phase5-typed-frontend with a reproducible
+  Vite build, strict TypeScript/Zod compatibility boundary, committed
+  Rust-embedded assets, and Vitest/Playwright gates.

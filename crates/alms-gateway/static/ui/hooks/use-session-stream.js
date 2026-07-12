@@ -642,7 +642,12 @@ export function openSessionStream(sessionId, opts) {
                 console.debug('[sse-dedup] evicted', evictCount, 'stale IDs, size:', seenEventIds.size);
             }
         }
-        handler(e);
+        const payload = JSON.parse(e.data);
+        const contracts = globalThis.__almsContracts;
+        const validated = contracts
+            ? contracts.parseSsePayload(type, payload)
+            : payload;
+        handler({ data: JSON.stringify(validated), lastEventId: e.lastEventId });
     });
 
     // -- run_created: a new run was created on this session --

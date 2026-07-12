@@ -12,6 +12,38 @@ env:
   ALMS_LLM_MOCK: "1"
 
 jobs:
+  frontend:
+    name: Frontend
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install pinned Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version-file: .node-version
+        cache: npm
+
+    - name: Install pinned npm
+      run: npm install --global npm@11.18.0
+
+    - name: Install frontend dependencies
+      run: npm ci
+
+    - name: Typecheck, lint, format, and unit test
+      run: npm run ui:check
+
+    - name: Verify reproducible frontend build
+      run: |
+        npm run ui:build
+        git diff --exit-code -- crates/alms-gateway/static/ui-dist
+
+    - name: Install Chromium
+      run: npx playwright install --with-deps chromium
+
+    - name: Run browser smoke tests
+      run: npm run ui:test:e2e
+
   ci:
     name: CI
     runs-on: ubuntu-latest

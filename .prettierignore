@@ -1,0 +1,4 @@
+node_modules/
+crates/alms-gateway/static/ui/
+crates/alms-gateway/static/ui-dist/
+target/

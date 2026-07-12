@@ -2,7 +2,7 @@
 //
 // `history.js` is a browser ES module that imports from a sibling state
 // module which in turn pulls in `deps.js` (preact + signals + htm + marked +
-// dompurify via the import-map in `index.html`). None of that is reachable
+// dompurify through the Vite bundle). None of that is reachable
 // from Node, so this test loads the module's source as text and rewrites the
 // two top-level imports (`nextMsgId` from `state/chat.js`, `DM_END_REASON_LABELS`
 // from `./constants.js`) with locally-defined stubs / inlined values. The

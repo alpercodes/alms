@@ -51,3 +51,16 @@
 @import url("styles/session-types.css");
 @import url("styles/reasoning-panel.css");
 @import url("styles/stream-banner.css");
+
+.contract-error-banner {
+    position: relative;
+    z-index: 10000;
+    display: flex;
+    gap: 0.75rem;
+    align-items: center;
+    padding: 0.75rem 1rem;
+    color: #7f1d1d;
+    background: #fef2f2;
+    border-bottom: 1px solid #fecaca;
+    font-size: 0.875rem;
+}

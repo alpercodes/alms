@@ -1,4 +1,4 @@
-.PHONY: all fmt clippy test check ci
+.PHONY: all fmt clippy test check ci frontend-install frontend-build frontend-check frontend-test-e2e
 
 # Default target - run all checks
 all: fmt clippy test
@@ -40,7 +40,7 @@ check:
 	cargo check --all
 
 # Full CI pipeline (what CI runs)
-ci: fmt-check clippy test build-release
+ci: frontend-check fmt-check clippy test build-release
 	@echo "==> All CI checks passed"
 
 # Build release binary (CI includes this)
@@ -52,6 +52,24 @@ build-release:
 build:
 	@echo "==> Building release binary"
 	cargo build --release
+
+frontend-install:
+	@echo "==> Installing pinned frontend dependencies"
+	npm ci
+
+frontend-build:
+	@echo "==> Building embedded frontend assets"
+	npm run ui:build
+
+frontend-check:
+	@echo "==> Checking typed frontend"
+	npm run ui:check
+	npm run ui:build
+	git diff --exit-code -- crates/alms-gateway/static/ui-dist
+
+frontend-test-e2e:
+	@echo "==> Running frontend browser smoke tests"
+	npm run ui:test:e2e
 
 # Clean build artifacts
 clean:
