@@ -219,6 +219,7 @@ function reconnectStream(sessionId) {
 
 /** Reset all stub signals between tests. */
 function reset() {
+    delete globalThis.__almsContracts;
     T.chatMessages.value = [];
     T.activeRunId.value = null;
     T.activeSession.value = null;
@@ -1114,4 +1115,31 @@ test('#1157 reconnect: a session SWITCH does NOT carry pending text into the new
     assert.ok(block, 'a reasoning block exists in session B');
     assert.equal(block.thinkingText, '',
         'session A pending text must NOT carry across a session switch and promote into session B');
+});
+
+test('malformed session SSE JSON is rejected before chat state mutates', () => {
+    reset();
+    let bridgeCalls = 0;
+    globalThis.__almsContracts = {
+        parseSseJsonPayload(type, raw) {
+            bridgeCalls++;
+            assert.equal(type, 'token_delta');
+            assert.equal(raw, '{bad json');
+            throw new Error('visible contract violation');
+        },
+    };
+    const es = openStream('session-contract-test');
+
+    assert.throws(
+        () => es.emit('token_delta', '{bad json'),
+        /visible contract violation/,
+    );
+    assert.equal(bridgeCalls, 1, 'the raw frame must pass through the guarded bridge');
+    assert.deepEqual(
+        T.chatMessages.value,
+        [],
+        'the token handler must not run after malformed JSON is rejected',
+    );
+
+    reset();
 });

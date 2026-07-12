@@ -1,5 +1,7 @@
 import { expect, test } from "@playwright/test";
 
+import { settingsFixture } from "./fixtures";
+
 const agentId = "11111111-1111-4111-8111-111111111111";
 const sessionId = "22222222-2222-4222-8222-222222222222";
 
@@ -11,20 +13,7 @@ test("loads the existing dashboard through the bundled typed entrypoint", async 
 
     if (path === "/settings") {
       await route.fulfill({
-        json: {
-          agents: [
-            {
-              id: agentId,
-              name: "atlas",
-              is_default: true,
-              has_telegram: false,
-              worktree_mode: "off",
-              debug_mode: false,
-              created_at: "2026-07-12T10:00:00Z",
-              last_active: "2026-07-12T10:00:00Z",
-            },
-          ],
-        },
+        json: settingsFixture(agentId),
       });
       return;
     }

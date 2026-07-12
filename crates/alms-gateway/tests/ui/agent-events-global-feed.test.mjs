@@ -123,6 +123,10 @@ function installEventSourceStub() {
             const evt = { data: JSON.stringify(dataObj), lastEventId: id != null ? String(id) : '' };
             for (const fn of this._listeners[type] || []) fn(evt);
         }
+        _emitRaw(type, data, id) {
+            const evt = { data, lastEventId: id != null ? String(id) : '' };
+            for (const fn of this._listeners[type] || []) fn(evt);
+        }
     }
     StubEventSource.CLOSED = 2;
     StubEventSource.CONNECTING = 0;
@@ -154,6 +158,7 @@ afterEach(async () => {
     delete globalThis.__agentEventsGlobalApi__;
     delete globalThis.EventSource;
     delete globalThis.localStorage;
+    delete globalThis.__almsContracts;
 });
 
 async function loadHook(api = { listSessions: async () => ({ sessions: [] }) }) {
@@ -456,5 +461,36 @@ test('native reconnect after event-log restart clears stale state and accepts re
     assert.ok(
         bgRuns.value['fresh-after-restart'],
         'the reset event ID is buffered and applied after reconciliation',
+    );
+});
+
+test('malformed global SSE JSON is rejected before activity state mutates', async () => {
+    active = await loadHook();
+    const { openAgentEventsStream } = active.mod;
+    const { bgRuns } = active.queue;
+    let bridgeCalls = 0;
+    const originalConsoleError = console.error;
+    console.error = () => {};
+    globalThis.__almsContracts = {
+        parseSseJsonPayload(type, raw) {
+            bridgeCalls++;
+            assert.equal(type, 'session_activity_started');
+            assert.equal(raw, '{bad json');
+            throw new Error('visible contract violation');
+        },
+    };
+
+    try {
+        openAgentEventsStream('agent-1');
+        active.created[0]._emitRaw('session_activity_started', '{bad json', 1);
+    } finally {
+        console.error = originalConsoleError;
+    }
+
+    assert.equal(bridgeCalls, 1, 'the raw frame must pass through the guarded bridge');
+    assert.deepEqual(
+        bgRuns.value,
+        {},
+        'the activity handler must not run after malformed JSON is rejected',
     );
 });

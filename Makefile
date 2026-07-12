@@ -61,11 +61,12 @@ frontend-build:
 	@echo "==> Building embedded frontend assets"
 	npm run ui:build
 
-frontend-check:
+frontend-check: frontend-install
 	@echo "==> Checking typed frontend"
 	npm run ui:check
 	npm run ui:build
 	git diff --exit-code -- crates/alms-gateway/static/ui-dist
+	test -z "$$(git status --porcelain=v1 --untracked-files=all -- crates/alms-gateway/static/ui-dist)"
 
 frontend-test-e2e:
 	@echo "==> Running frontend browser smoke tests"

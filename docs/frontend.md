@@ -16,10 +16,11 @@ rewriting the legacy Preact modules.
 The source `index.html` loads `typed-entry.ts` before the existing
 `app.js`. The entry installs `globalThis.__almsContracts`, which lets
 existing JavaScript opt into strict Zod validation without a flag-day rewrite.
-The central API client validates responses through that bridge. Both SSE hooks
-validate every payload before their existing handlers mutate state. Known
-recovery and activity events have specific schemas; unmigrated event types
-must at least remain object-shaped.
+The central API client and both SSE hooks decode raw JSON inside that guarded
+boundary, then validate every payload before existing handlers mutate state.
+All currently consumed REST surfaces and SSE event types have explicit schemas;
+only genuinely unknown future routes or event types use the object-shaped
+compatibility fallback.
 
 Contract failures are logged, rejected, and shown in a visible alert. They do
 not continue into the legacy state stores.
@@ -41,8 +42,9 @@ npm run ui:test:e2e
 ```
 
 `npm run ui:build` replaces `static/ui-dist/`. Commit the generated output
-with its source change. CI rebuilds it and fails if the committed assets drift.
-`make ci` includes the non-browser frontend gates; Playwright is available as
+with its source change. CI rebuilds it and fails for tracked drift or omitted
+untracked chunks. `make ci` installs the pinned frontend dependencies and runs
+the non-browser frontend gates; Playwright is available as
 `make frontend-test-e2e` and runs in the dedicated GitHub frontend job.
 
 ## Migration rule

@@ -23,10 +23,13 @@ export async function apiFetch(path, opts = {}) {
     }
     // 204 No Content
     if (res.status === 204) return null;
-    const payload = await res.json();
     const contracts = globalThis.__almsContracts;
-    if (!contracts) return payload;
-    return contracts.parseApiResponse(path, opts.method || "GET", payload);
+    if (!contracts) return res.json();
+    return contracts.parseApiJsonResponse(
+        path,
+        opts.method || 'GET',
+        await res.text(),
+    );
 }
 
 export const get = (path) => apiFetch(path);

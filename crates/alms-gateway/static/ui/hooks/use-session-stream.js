@@ -642,11 +642,10 @@ export function openSessionStream(sessionId, opts) {
                 console.debug('[sse-dedup] evicted', evictCount, 'stale IDs, size:', seenEventIds.size);
             }
         }
-        const payload = JSON.parse(e.data);
         const contracts = globalThis.__almsContracts;
         const validated = contracts
-            ? contracts.parseSsePayload(type, payload)
-            : payload;
+            ? contracts.parseSseJsonPayload(type, e.data)
+            : JSON.parse(e.data);
         handler({ data: JSON.stringify(validated), lastEventId: e.lastEventId });
     });
 
