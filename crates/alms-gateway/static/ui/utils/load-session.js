@@ -141,6 +141,9 @@ function resolveSessionMeta(sessionId, envelope) {
  *   initiated (wraps the caller's generation counter check). Checked at
  *   every async boundary to discard stale fetches.
  * @param {string} [opts.logPrefix='loadSession'] - Label for diagnostic log messages
+ * @param {boolean} [opts.requireAuthoritativeSnapshot=false] - Fail closed
+ *   when any cursor-relevant snapshot request fails. Used when recovering
+ *   from a rejected SSE frame before advancing past that frame.
  * @returns {Promise<void>}
  */
 export async function loadSession(sessionId, opts) {
@@ -238,6 +241,7 @@ export async function loadSession(sessionId, opts) {
         // may not render, but the session itself still loads via the
         // existing messages / runs / SSE path below.
         console.warn(`[${logPrefix}] Failed to fetch session metadata:`, err);
+        if (opts.requireAuthoritativeSnapshot) throw err;
     }
 
     // Step 1: Fetch runs and restore activeRunId for any in-progress run.
@@ -263,8 +267,9 @@ export async function loadSession(sessionId, opts) {
         if (active) {
             activeRunId.value = active.run_id;
         }
-    } catch {
+    } catch (err) {
         if (isStale()) return;
+        if (opts.requireAuthoritativeSnapshot) throw err;
         runs.value = [];
     }
 
@@ -291,6 +296,7 @@ export async function loadSession(sessionId, opts) {
             getSessionToolCalls(sessionId).catch(err => {
                 // Non-fatal: the endpoint may not exist on older backends.
                 console.warn(`[${logPrefix}] Failed to load session tool calls:`, err);
+                if (opts.requireAuthoritativeSnapshot) throw err;
                 return { tool_calls: [] };
             }),
         ]);
@@ -452,6 +458,7 @@ export async function loadSession(sessionId, opts) {
                     }
                 } catch (err) {
                     console.warn(`[${logPrefix}] Failed to load queue position:`, err);
+                    if (opts.requireAuthoritativeSnapshot) throw err;
                 }
             }
             // Stamp runId so the live `run_queue_position` SSE handler can
@@ -483,6 +490,7 @@ export async function loadSession(sessionId, opts) {
             }
         } catch (err) {
             console.warn(`[${logPrefix}] Failed to load pending approvals:`, err);
+            if (opts.requireAuthoritativeSnapshot) throw err;
         }
 
         // Rehydrate the in-flight turn's extended-thinking text (#1043,
@@ -664,6 +672,7 @@ export async function loadSession(sessionId, opts) {
                 }
             } catch (err) {
                 console.warn(`[${logPrefix}] Failed to load in-flight reasoning:`, err);
+                if (opts.requireAuthoritativeSnapshot) throw err;
             }
 
             // Rehydrate the in-flight turn's visible assistant reply text
@@ -730,6 +739,7 @@ export async function loadSession(sessionId, opts) {
                     }
                 } catch (err) {
                     console.warn(`[${logPrefix}] Failed to load in-flight text:`, err);
+                    if (opts.requireAuthoritativeSnapshot) throw err;
                 }
             }
         }

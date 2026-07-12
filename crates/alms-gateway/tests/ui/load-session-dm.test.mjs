@@ -573,3 +573,43 @@ test('phase restore: running DM run restores setDmContext(peer) instead of gener
     assert.equal(dmContextCalls[0][1], 'bob',
         'the peer is the participant that is not the active agent');
 });
+
+// ---------------------------------------------------------------------------
+// Strict malformed-frame reconciliation must never reopen from partial state.
+// ---------------------------------------------------------------------------
+
+test('strict reconciliation keeps stream closed when the runs snapshot fails', async () => {
+    reset();
+    globalThis.__lsApi = makeApi({
+        getSession: async () => DM_ENVELOPE,
+        listRuns: async () => { throw new Error('runs unavailable'); },
+    });
+
+    await assert.rejects(
+        () => mod.loadSession(DM_SESSION_ID, {
+            isStale: () => false,
+            logPrefix: 'strict-test',
+            requireAuthoritativeSnapshot: true,
+        }),
+        /runs unavailable/,
+    );
+    assert.equal(T.__calls.streamOpens.length, 0);
+});
+
+test('strict DM reconciliation keeps stream closed when tool-call history fails', async () => {
+    reset();
+    globalThis.__lsApi = makeApi({
+        getSession: async () => DM_ENVELOPE,
+        getSessionToolCalls: async () => { throw new Error('tool snapshot unavailable'); },
+    });
+
+    await assert.rejects(
+        () => mod.loadSession(DM_SESSION_ID, {
+            isStale: () => false,
+            logPrefix: 'strict-test',
+            requireAuthoritativeSnapshot: true,
+        }),
+        /tool snapshot unavailable/,
+    );
+    assert.equal(T.__calls.streamOpens.length, 0);
+});
