@@ -5,12 +5,12 @@
 //! senders, in-flight counters for graceful shutdown, and optional SQLite
 //! persistence.
 
-use crate::event_log::{AgentEventLogManager, EventLogManager, LoggedEvent};
+use crate::event_log::{AgentEventLogManager, EventLogManager, LoggedEvent, ReplayWindow};
 use crate::sse::SseEventData;
 use alms_core::{AgentId, Run, RunId, RunTransition, SessionId, TransitionOutcome};
 use dashmap::{DashMap, mapref::entry::Entry};
-use parking_lot::Mutex;
 use std::collections::HashMap;
+use std::hash::Hash;
 use std::pin::Pin;
 use std::sync::Arc;
 #[cfg(test)]
@@ -60,52 +60,192 @@ pub struct RunTextBuffer {
     pub last_session_event_id: Option<u64>,
 }
 
-/// Live subscription to the global session-activity feed.
-///
-/// Dropping the stream unregisters its sender immediately, so idle browser
-/// disconnects and agent switches cannot accumulate stale subscribers.
-pub(crate) struct ActivitySubscription {
-    id: u64,
-    receiver: mpsc::UnboundedReceiver<SseEventData>,
-    senders: Arc<Mutex<HashMap<u64, mpsc::UnboundedSender<SseEventData>>>>,
+const SSE_SUBSCRIBER_BUFFER: usize = 256;
+
+#[derive(Debug, Clone)]
+pub(crate) enum SubscriptionSender {
+    /// Replayable feeds can evict a slow consumer and let it recover from its
+    /// persisted cursor without losing semantic state.
+    Bounded(mpsc::Sender<SseEventData>),
+    /// Run/session feeds also carry live-only deltas. They must preserve
+    /// delivery until disconnect because replay cannot reconstruct them.
+    Lossless(mpsc::UnboundedSender<SseEventData>),
 }
 
-impl Stream for ActivitySubscription {
+#[derive(Debug)]
+enum SubscriptionReceiver {
+    Bounded(mpsc::Receiver<SseEventData>),
+    Lossless(mpsc::UnboundedReceiver<SseEventData>),
+}
+
+#[derive(Debug, Clone, Copy)]
+enum SubscriptionDelivery {
+    Bounded,
+    Lossless,
+}
+
+type SubscriberMap<K> = Arc<DashMap<K, HashMap<u64, SubscriptionSender>>>;
+
+/// Live SSE subscription with prompt unregister-on-drop cleanup.
+///
+/// Run/session streams use lossless channels because they contain transient
+/// events that cannot be replayed. Agent/global-activity streams are bounded
+/// because every semantic event is logged and recoverable after eviction.
+/// All variants use the same drop guard, so an idle disconnect cannot leave a
+/// sender behind until the next event.
+pub struct ManagedSubscription<K>
+where
+    K: Eq + Hash + Clone,
+{
+    id: u64,
+    key: K,
+    receiver: SubscriptionReceiver,
+    senders: SubscriberMap<K>,
+}
+
+impl<K> Stream for ManagedSubscription<K>
+where
+    K: Eq + Hash + Clone + Unpin,
+{
     type Item = SseEventData;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        self.receiver.poll_recv(cx)
+        match &mut self.receiver {
+            SubscriptionReceiver::Bounded(receiver) => receiver.poll_recv(cx),
+            SubscriptionReceiver::Lossless(receiver) => receiver.poll_recv(cx),
+        }
     }
 }
 
-impl ActivitySubscription {
+impl<K> ManagedSubscription<K>
+where
+    K: Eq + Hash + Clone,
+{
+    /// Queue a synthetic attach-time snapshot through this subscription.
+    pub(crate) fn try_send(&self, event: SseEventData) -> bool {
+        self.senders
+            .get(&self.key)
+            .and_then(|senders| senders.get(&self.id).cloned())
+            .is_some_and(|sender| match sender {
+                SubscriptionSender::Bounded(sender) => sender.try_send(event).is_ok(),
+                SubscriptionSender::Lossless(sender) => sender.send(event).is_ok(),
+            })
+    }
+
     #[cfg(test)]
     pub(crate) fn try_recv(&mut self) -> Result<SseEventData, mpsc::error::TryRecvError> {
-        self.receiver.try_recv()
+        match &mut self.receiver {
+            SubscriptionReceiver::Bounded(receiver) => receiver.try_recv(),
+            SubscriptionReceiver::Lossless(receiver) => receiver.try_recv(),
+        }
+    }
+
+    pub async fn recv(&mut self) -> Option<SseEventData> {
+        match &mut self.receiver {
+            SubscriptionReceiver::Bounded(receiver) => receiver.recv().await,
+            SubscriptionReceiver::Lossless(receiver) => receiver.recv().await,
+        }
     }
 }
 
-impl Drop for ActivitySubscription {
+impl<K> Drop for ManagedSubscription<K>
+where
+    K: Eq + Hash + Clone,
+{
     fn drop(&mut self) {
-        self.senders.lock().remove(&self.id);
+        if let Entry::Occupied(mut entry) = self.senders.entry(self.key.clone()) {
+            entry.get_mut().remove(&self.id);
+            if entry.get().is_empty() {
+                entry.remove();
+            }
+        }
+    }
+}
+
+fn subscribe_to<K>(
+    senders: &SubscriberMap<K>,
+    next_subscription_id: &AtomicU64,
+    key: K,
+    delivery: SubscriptionDelivery,
+) -> ManagedSubscription<K>
+where
+    K: Eq + Hash + Clone,
+{
+    let id = next_subscription_id.fetch_add(1, Ordering::Relaxed);
+    let (sender, receiver) = match delivery {
+        SubscriptionDelivery::Bounded => {
+            let (sender, receiver) = mpsc::channel(SSE_SUBSCRIBER_BUFFER);
+            (
+                SubscriptionSender::Bounded(sender),
+                SubscriptionReceiver::Bounded(receiver),
+            )
+        }
+        SubscriptionDelivery::Lossless => {
+            let (sender, receiver) = mpsc::unbounded_channel();
+            (
+                SubscriptionSender::Lossless(sender),
+                SubscriptionReceiver::Lossless(receiver),
+            )
+        }
+    };
+    senders.entry(key.clone()).or_default().insert(id, sender);
+    ManagedSubscription {
+        id,
+        key,
+        receiver,
+        senders: Arc::clone(senders),
+    }
+}
+
+fn fan_out_to<K>(senders: &SubscriberMap<K>, key: K, event: &SseEventData)
+where
+    K: Eq + Hash + Clone,
+{
+    let Entry::Occupied(mut entry) = senders.entry(key) else {
+        return;
+    };
+    let mut slow = 0usize;
+    entry.get_mut().retain(|_, sender| match sender {
+        SubscriptionSender::Bounded(sender) => match sender.try_send(event.clone()) {
+            Ok(()) => true,
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                slow += 1;
+                false
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => false,
+        },
+        SubscriptionSender::Lossless(sender) => sender.send(event.clone()).is_ok(),
+    });
+    if entry.get().is_empty() {
+        entry.remove();
+    }
+    if slow > 0 {
+        tracing::warn!(
+            dropped_subscribers = slow,
+            buffer_capacity = SSE_SUBSCRIBER_BUFFER,
+            "Dropped slow SSE subscribers after their bounded buffers filled"
+        );
     }
 }
 
 /// Run manager for tracking runs and their event streams
 #[derive(Debug, Clone)]
 pub struct RunManager {
-    pub event_senders: Arc<DashMap<RunId, Vec<mpsc::UnboundedSender<SseEventData>>>>,
+    /// Random identity for this gateway lifetime. SSE clients use it to
+    /// distinguish a valid cursor from one minted before a restart.
+    stream_epoch: uuid::Uuid,
+    pub(crate) event_senders: SubscriberMap<RunId>,
     pub(crate) runs: Arc<DashMap<RunId, Run>>,
     /// In-memory event log for SSE reconnect during current process lifetime.
     /// Events are lost on restart — this does **not** provide cross-restart durability.
     pub event_log: EventLogManager,
     /// Session-level event senders for persistent SSE streams.
-    pub session_senders: Arc<DashMap<SessionId, Vec<mpsc::UnboundedSender<SseEventData>>>>,
+    pub(crate) session_senders: SubscriberMap<SessionId>,
     /// Session-level event log for reconnect support.
     pub session_event_log: crate::event_log::SessionEventLogManager,
     /// Agent-scoped event senders for the per-agent SSE feed
     /// (`GET /agents/{agent_id}/events`, #856).
-    pub agent_senders: Arc<DashMap<AgentId, Vec<mpsc::UnboundedSender<SseEventData>>>>,
+    pub(crate) agent_senders: SubscriberMap<AgentId>,
     /// Agent-scoped event log for `Last-Event-Id` reconnect on the
     /// agent-scoped feed.
     pub agent_event_log: AgentEventLogManager,
@@ -113,12 +253,10 @@ pub struct RunManager {
     /// (`GET /events/session-activity`, #1211). A DEDICATED namespace,
     /// separate from the `AgentId`-indexed `agent_senders` map, so no
     /// operator-supplied agent id can ever collide with it and leak
-    /// cross-agent activity onto a per-agent feed. Held behind a
-    /// `parking_lot::Mutex` — only ever locked for brief, await-free
-    /// insert / send / remove sections. Each entry is removed by its
-    /// [`ActivitySubscription`] drop guard as soon as the HTTP stream closes.
-    activity_senders: Arc<Mutex<HashMap<u64, mpsc::UnboundedSender<SseEventData>>>>,
-    next_activity_subscription_id: Arc<AtomicU64>,
+    /// cross-agent activity onto a per-agent feed. Each entry is removed by its
+    /// [`ManagedSubscription`] drop guard as soon as the HTTP stream closes.
+    activity_senders: SubscriberMap<()>,
+    next_subscription_id: Arc<AtomicU64>,
     /// Serializes authoritative session-activity snapshots with global event
     /// logging, so concurrent run transitions cannot publish an older
     /// `has_active_run` value after a newer one.
@@ -157,6 +295,7 @@ pub struct RunManager {
 impl RunManager {
     pub fn new() -> Self {
         Self {
+            stream_epoch: uuid::Uuid::new_v4(),
             event_senders: Arc::new(DashMap::new()),
             runs: Arc::new(DashMap::new()),
             event_log: EventLogManager::new(),
@@ -164,8 +303,8 @@ impl RunManager {
             session_event_log: crate::event_log::SessionEventLogManager::new(),
             agent_senders: Arc::new(DashMap::new()),
             agent_event_log: AgentEventLogManager::new(),
-            activity_senders: Arc::new(Mutex::new(HashMap::new())),
-            next_activity_subscription_id: Arc::new(AtomicU64::new(1)),
+            activity_senders: Arc::new(DashMap::new()),
+            next_subscription_id: Arc::new(AtomicU64::new(1)),
             activity_event_gate: Arc::new(tokio::sync::Mutex::new(())),
             activity_event_log: AgentEventLogManager::new(),
             run_text_buffers: Arc::new(DashMap::new()),
@@ -176,6 +315,10 @@ impl RunManager {
             #[cfg(test)]
             fail_next_persistence: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    pub fn stream_epoch(&self) -> uuid::Uuid {
+        self.stream_epoch
     }
 
     /// Set the SQLite store for run persistence.
@@ -263,8 +406,13 @@ impl RunManager {
         }
     }
 
-    pub fn register_sender(&self, run_id: RunId, sender: mpsc::UnboundedSender<SseEventData>) {
-        self.event_senders.entry(run_id).or_default().push(sender);
+    pub fn subscribe_run(&self, run_id: RunId) -> ManagedSubscription<RunId> {
+        subscribe_to(
+            &self.event_senders,
+            &self.next_subscription_id,
+            run_id,
+            SubscriptionDelivery::Lossless,
+        )
     }
 
     pub fn remove_senders(&self, run_id: RunId) {
@@ -880,14 +1028,7 @@ impl RunManager {
             }
         }
 
-        if let Some(mut senders) = self.event_senders.get_mut(&run_id) {
-            let before = senders.len();
-            senders.retain(|sender| sender.send(event.clone()).is_ok());
-            let pruned = before - senders.len();
-            if pruned > 0 {
-                tracing::debug!(run_id = %run_id.0, pruned, "Pruned dead SSE subscriber(s)");
-            }
-        }
+        fan_out_to(&self.event_senders, run_id, &event);
 
         // Per-session fan-out: forward to session subscribers.
         // Skip session event LOG for ephemeral events (token_delta, status,
@@ -910,13 +1051,7 @@ impl RunManager {
             e
         };
 
-        if let Some(mut senders) = self.session_senders.get_mut(&session_id) {
-            senders.retain(|sender| sender.send(session_event.clone()).is_ok());
-            if senders.is_empty() {
-                drop(senders);
-                self.session_senders.remove(&session_id);
-            }
-        }
+        fan_out_to(&self.session_senders, session_id, &session_event);
     }
 
     /// Send a session-only event (not associated with a specific run).
@@ -933,13 +1068,7 @@ impl RunManager {
         let mut tagged = event;
         tagged.event_id = Some(session_event_id);
 
-        if let Some(mut senders) = self.session_senders.get_mut(&session_id) {
-            senders.retain(|sender| sender.send(tagged.clone()).is_ok());
-            if senders.is_empty() {
-                drop(senders);
-                self.session_senders.remove(&session_id);
-            }
-        }
+        fan_out_to(&self.session_senders, session_id, &tagged);
     }
 
     /// Fan a session-only event out to live session subscribers WITHOUT
@@ -952,34 +1081,27 @@ impl RunManager {
     /// through — the same contract as `send_event`'s ephemeral fast path.
     /// Synchronous: pure in-memory fan-out, no log I/O to await.
     pub fn send_transient_session_event(&self, session_id: SessionId, event: SseEventData) {
-        if let Some(mut senders) = self.session_senders.get_mut(&session_id) {
-            senders.retain(|sender| sender.send(event.clone()).is_ok());
-            if senders.is_empty() {
-                drop(senders);
-                self.session_senders.remove(&session_id);
-            }
-        }
+        fan_out_to(&self.session_senders, session_id, &event);
     }
 
-    pub fn register_session_sender(
-        &self,
-        session_id: SessionId,
-        sender: mpsc::UnboundedSender<SseEventData>,
-    ) {
-        self.session_senders
-            .entry(session_id)
-            .or_default()
-            .push(sender);
+    pub fn subscribe_session(&self, session_id: SessionId) -> ManagedSubscription<SessionId> {
+        subscribe_to(
+            &self.session_senders,
+            &self.next_subscription_id,
+            session_id,
+            SubscriptionDelivery::Lossless,
+        )
     }
 
     /// Register an SSE sender for the agent-scoped feed
     /// (`GET /agents/{agent_id}/events`, #856).
-    pub fn register_agent_sender(
-        &self,
-        agent_id: AgentId,
-        sender: mpsc::UnboundedSender<SseEventData>,
-    ) {
-        self.agent_senders.entry(agent_id).or_default().push(sender);
+    pub fn subscribe_agent(&self, agent_id: AgentId) -> ManagedSubscription<AgentId> {
+        subscribe_to(
+            &self.agent_senders,
+            &self.next_subscription_id,
+            agent_id,
+            SubscriptionDelivery::Bounded,
+        )
     }
 
     /// Send an agent-scoped event to the per-agent SSE feed and persist
@@ -1041,13 +1163,7 @@ impl RunManager {
         let mut tagged = event;
         tagged.event_id = Some(event_id);
 
-        if let Some(mut senders) = self.agent_senders.get_mut(&agent_id) {
-            senders.retain(|sender| sender.send(tagged.clone()).is_ok());
-            if senders.is_empty() {
-                drop(senders);
-                self.agent_senders.remove(&agent_id);
-            }
-        }
+        fan_out_to(&self.agent_senders, agent_id, &tagged);
     }
 
     /// Log + fan out a `session_activity_*` event onto the GLOBAL cross-agent
@@ -1072,27 +1188,20 @@ impl RunManager {
         let mut tagged = event;
         tagged.event_id = Some(event_id);
 
-        // Brief, await-free critical section — the lock is never held across
-        // an `.await` (the log write above already completed).
-        let mut senders = self.activity_senders.lock();
-        senders.retain(|_, sender| sender.send(tagged.clone()).is_ok());
+        fan_out_to(&self.activity_senders, (), &tagged);
     }
 
     /// Subscribe to the global cross-agent session-activity feed.
     ///
     /// The returned stream unregisters itself on drop, including when the
     /// browser disconnects before any further activity is broadcast.
-    pub(crate) fn subscribe_activity(&self) -> ActivitySubscription {
-        let id = self
-            .next_activity_subscription_id
-            .fetch_add(1, Ordering::Relaxed);
-        let (sender, receiver) = mpsc::unbounded_channel();
-        self.activity_senders.lock().insert(id, sender);
-        ActivitySubscription {
-            id,
-            receiver,
-            senders: Arc::clone(&self.activity_senders),
-        }
+    pub fn subscribe_activity(&self) -> ManagedSubscription<()> {
+        subscribe_to(
+            &self.activity_senders,
+            &self.next_subscription_id,
+            (),
+            SubscriptionDelivery::Bounded,
+        )
     }
 
     /// Get agent-scoped events from a specific ID for SSE reconnect (#856).
@@ -1108,6 +1217,40 @@ impl RunManager {
             .await
     }
 
+    pub async fn run_replay_window(
+        &self,
+        run_id: RunId,
+        last_event_id: Option<u64>,
+    ) -> ReplayWindow {
+        self.event_log.replay_window(run_id, last_event_id).await
+    }
+
+    pub async fn session_replay_window(
+        &self,
+        session_id: SessionId,
+        last_event_id: Option<u64>,
+    ) -> ReplayWindow {
+        self.session_event_log
+            .replay_window(session_id, last_event_id)
+            .await
+    }
+
+    pub async fn agent_replay_window(
+        &self,
+        agent_id: AgentId,
+        last_event_id: Option<u64>,
+    ) -> ReplayWindow {
+        self.agent_event_log
+            .replay_window(agent_id, last_event_id)
+            .await
+    }
+
+    pub async fn activity_replay_window(&self, last_event_id: Option<u64>) -> ReplayWindow {
+        self.activity_event_log
+            .replay_window(ACTIVITY_LOG_KEY, last_event_id)
+            .await
+    }
+
     /// Close all active SSE sender channels (per-run, per-session, per-agent).
     ///
     /// Dropping the senders causes the corresponding `UnboundedReceiverStream`
@@ -1115,19 +1258,15 @@ impl RunManager {
     /// shutdown to complete instead of waiting indefinitely for long-lived
     /// SSE connections.
     pub fn close_all_senders(&self) {
-        let run_count = self.event_senders.len();
-        let session_count = self.session_senders.len();
-        let agent_count = self.agent_senders.len();
+        let run_count: usize = self.event_senders.iter().map(|entry| entry.len()).sum();
+        let session_count: usize = self.session_senders.iter().map(|entry| entry.len()).sum();
+        let agent_count: usize = self.agent_senders.iter().map(|entry| entry.len()).sum();
         self.event_senders.clear();
         self.session_senders.clear();
         self.agent_senders.clear();
         // Global cross-agent activity feed (#1211) — dedicated sender list.
-        let activity_count = {
-            let mut senders = self.activity_senders.lock();
-            let n = senders.len();
-            senders.clear();
-            n
-        };
+        let activity_count: usize = self.activity_senders.iter().map(|entry| entry.len()).sum();
+        self.activity_senders.clear();
         if run_count + session_count + agent_count + activity_count > 0 {
             info!(
                 "Closed {} per-run, {} per-session, {} per-agent, and {} activity SSE sender(s) for shutdown",
@@ -1270,10 +1409,8 @@ mod tests {
         let run_id = RunId::new();
         let session_id = SessionId::new();
 
-        let (tx1, mut rx1) = mpsc::unbounded_channel();
-        let (tx2, mut rx2) = mpsc::unbounded_channel();
-        rm.register_sender(run_id, tx1);
-        rm.register_sender(run_id, tx2);
+        let mut rx1 = rm.subscribe_run(run_id);
+        let mut rx2 = rm.subscribe_run(run_id);
 
         rm.send_event(run_id, session_id, SseEventData::connected(run_id))
             .await;
@@ -1285,18 +1422,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_dead_subscriber_pruned() {
+    async fn test_dropped_subscriber_unregisters_immediately() {
         let rm = RunManager::new();
         let run_id = RunId::new();
         let session_id = SessionId::new();
 
-        let (tx_alive, mut rx_alive) = mpsc::unbounded_channel();
-        let (tx_dead, rx_dead) = mpsc::unbounded_channel();
-        rm.register_sender(run_id, tx_alive);
-        rm.register_sender(run_id, tx_dead);
-
-        // Drop the dead receiver so its sender becomes closed
+        let mut rx_alive = rm.subscribe_run(run_id);
+        let rx_dead = rm.subscribe_run(run_id);
+        assert_eq!(rm.event_senders.get(&run_id).unwrap().len(), 2);
         drop(rx_dead);
+        assert_eq!(rm.event_senders.get(&run_id).unwrap().len(), 1);
 
         rm.send_event(run_id, session_id, SseEventData::connected(run_id))
             .await;
@@ -1308,9 +1443,7 @@ mod tests {
             .expect("alive subscriber should receive");
         assert_eq!(e.event_type, "connected");
 
-        // Dead sender should have been pruned — only 1 sender left
-        let senders = rm.event_senders.get(&run_id).unwrap();
-        assert_eq!(senders.len(), 1);
+        assert_eq!(rm.event_senders.get(&run_id).unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -1318,10 +1451,8 @@ mod tests {
         let rm = RunManager::new();
         let run_id = RunId::new();
 
-        let (tx1, _rx1) = mpsc::unbounded_channel();
-        let (tx2, _rx2) = mpsc::unbounded_channel();
-        rm.register_sender(run_id, tx1);
-        rm.register_sender(run_id, tx2);
+        let _rx1 = rm.subscribe_run(run_id);
+        let _rx2 = rm.subscribe_run(run_id);
 
         assert!(rm.event_senders.contains_key(&run_id));
         rm.remove_senders(run_id);
@@ -1609,10 +1740,8 @@ mod tests {
         assert!(rm.mark_run_as_completed(done_id, "output".into(), Default::default()));
 
         // Register senders for both.
-        let (tx1, _rx1) = mpsc::unbounded_channel();
-        let (tx2, _rx2) = mpsc::unbounded_channel();
-        rm.register_sender(active_id, tx1);
-        rm.register_sender(done_id, tx2);
+        let _rx1 = rm.subscribe_run(active_id);
+        let _rx2 = rm.subscribe_run(done_id);
 
         assert!(rm.event_senders.contains_key(&active_id));
         assert!(rm.event_senders.contains_key(&done_id));
@@ -1630,8 +1759,7 @@ mod tests {
         let orphan_id = RunId::new();
 
         // Register a sender for a run that doesn't exist in the runs map.
-        let (tx, _rx) = mpsc::unbounded_channel();
-        rm.register_sender(orphan_id, tx);
+        let _rx = rm.subscribe_run(orphan_id);
         assert!(rm.event_senders.contains_key(&orphan_id));
 
         rm.purge_terminal_senders();
@@ -2099,10 +2227,8 @@ mod tests {
         let session_id = SessionId::new();
         let run_id = RunId::new();
 
-        let (tx_a, mut rx_a) = mpsc::unbounded_channel();
-        let (tx_b, mut rx_b) = mpsc::unbounded_channel();
-        rm.register_agent_sender(agent_a, tx_a);
-        rm.register_agent_sender(agent_b, tx_b);
+        let mut rx_a = rm.subscribe_agent(agent_a);
+        let mut rx_b = rm.subscribe_agent(agent_b);
 
         // Send an event for agent A only.
         rm.send_agent_event(
@@ -2226,12 +2352,84 @@ mod tests {
 
         for _ in 0..100 {
             let subscription = rm.subscribe_activity();
-            assert_eq!(rm.activity_senders.lock().len(), 1);
+            assert_eq!(rm.activity_senders.get(&()).unwrap().len(), 1);
             drop(subscription);
             assert!(
-                rm.activity_senders.lock().is_empty(),
+                rm.activity_senders.is_empty(),
                 "dropping an idle subscription must unregister it immediately"
             );
         }
+    }
+
+    #[test]
+    fn all_subscription_kinds_unregister_on_idle_drop() {
+        let rm = RunManager::new();
+        for _ in 0..100 {
+            let run = rm.subscribe_run(RunId::new());
+            let session = rm.subscribe_session(SessionId::new());
+            let agent = rm.subscribe_agent(AgentId::new());
+            drop((run, session, agent));
+        }
+        assert!(rm.event_senders.is_empty());
+        assert!(rm.session_senders.is_empty());
+        assert!(rm.agent_senders.is_empty());
+    }
+
+    #[test]
+    fn replayable_slow_subscriber_is_dropped_at_bounded_buffer_limit() {
+        let rm = RunManager::new();
+        let agent_id = AgentId::new();
+        let _subscription = rm.subscribe_agent(agent_id);
+        for _ in 0..=SSE_SUBSCRIBER_BUFFER {
+            fan_out_to(
+                &rm.agent_senders,
+                agent_id,
+                &SseEventData::connected(RunId::new()),
+            );
+        }
+        assert!(
+            !rm.agent_senders.contains_key(&agent_id),
+            "a replayable subscriber that cannot drain its bounded buffer must be evicted"
+        );
+    }
+
+    #[test]
+    fn live_only_session_burst_is_not_evicted_or_truncated() {
+        let rm = RunManager::new();
+        let session_id = SessionId::new();
+        let mut subscription = rm.subscribe_session(session_id);
+        let count = SSE_SUBSCRIBER_BUFFER + 17;
+
+        for _ in 0..count {
+            rm.send_transient_session_event(session_id, SseEventData::connected(RunId::new()));
+        }
+
+        assert!(
+            rm.session_senders.contains_key(&session_id),
+            "session feeds carry non-replayable events and must remain lossless"
+        );
+        for _ in 0..count {
+            assert!(subscription.try_recv().is_ok());
+        }
+        assert!(subscription.try_recv().is_err());
+    }
+
+    #[test]
+    fn attach_time_snapshot_burst_is_not_limited_by_replayable_buffer_size() {
+        let rm = RunManager::new();
+        let session_id = SessionId::new();
+        let mut subscription = rm.subscribe_session(session_id);
+        let count = SSE_SUBSCRIBER_BUFFER + 17;
+
+        for _ in 0..count {
+            assert!(
+                subscription.try_send(SseEventData::connected(RunId::new())),
+                "synthetic attach-time snapshots must all be queued"
+            );
+        }
+        for _ in 0..count {
+            assert!(subscription.try_recv().is_ok());
+        }
+        assert!(subscription.try_recv().is_err());
     }
 }

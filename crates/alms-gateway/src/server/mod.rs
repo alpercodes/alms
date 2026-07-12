@@ -11,9 +11,7 @@ pub(crate) mod routes;
 mod run_manager;
 mod state;
 
-#[cfg(test)]
-pub(crate) use run_manager::ActivitySubscription;
-pub use run_manager::RunManager;
+pub use run_manager::{ManagedSubscription, RunManager};
 pub use state::{AppState, ServerLlmDefault};
 
 use crate::auth::{AuthToken, no_cache, require_auth};

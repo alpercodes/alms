@@ -323,10 +323,8 @@ mod tests {
             // A live per-run subscriber (`GET /runs/{run_id}/events`) and a
             // live session subscriber, both connected BEFORE the run ends —
             // the pair the Codex P2 stream-close finding is about.
-            let (run_tx, mut run_rx) = mpsc::unbounded_channel();
-            rm.register_sender(run_id, run_tx);
-            let (sess_tx, _sess_rx) = mpsc::unbounded_channel();
-            rm.register_session_sender(session_id, sess_tx);
+            let mut run_rx = rm.subscribe_run(run_id);
+            let _session_subscription = rm.subscribe_session(session_id);
 
             // An untagged visible token_delta populates run_text_buffers[run_id]
             // (the buffer that would otherwise leak — finding 2).

@@ -334,14 +334,15 @@ fn seed_alice_bob(state: &AppState) -> (AgentId, AgentId) {
 fn subscribe_session(
     state: &AppState,
     session_id: SessionId,
-) -> mpsc::UnboundedReceiver<SseEventData> {
-    let (tx, rx) = mpsc::unbounded_channel();
-    state.run_manager.register_session_sender(session_id, tx);
-    rx
+) -> crate::server::ManagedSubscription<SessionId> {
+    state.run_manager.subscribe_session(session_id)
 }
 
 /// Drain all currently buffered events from a receiver without blocking.
-fn drain_events(rx: &mut mpsc::UnboundedReceiver<SseEventData>) -> Vec<SseEventData> {
+fn drain_events<K>(rx: &mut crate::server::ManagedSubscription<K>) -> Vec<SseEventData>
+where
+    K: Eq + std::hash::Hash + Clone,
+{
     let mut events = Vec::new();
     while let Ok(event) = rx.try_recv() {
         events.push(event);
@@ -445,8 +446,7 @@ async fn cancellation_between_precheck_and_start_transition_cleans_up_without_st
     state
         .run_manager
         .register_cancel_token(run_id, cancel_token.clone());
-    let (run_tx, _run_rx) = mpsc::unbounded_channel();
-    state.run_manager.register_sender(run_id, run_tx);
+    let _run_subscription = state.run_manager.subscribe_run(run_id);
 
     let approval_id = uuid::Uuid::new_v4();
     let (decision_tx, _decision_rx) = tokio::sync::oneshot::channel();
@@ -529,8 +529,7 @@ async fn start_persistence_failure_is_reported_and_quarantined() {
     state
         .run_manager
         .register_cancel_token(run_id, cancel_token.clone());
-    let (run_tx, _run_rx) = mpsc::unbounded_channel();
-    state.run_manager.register_sender(run_id, run_tx);
+    let _run_subscription = state.run_manager.subscribe_run(run_id);
     state.run_manager.inject_next_persistence_failure();
 
     super::lifecycle::execute_run(
@@ -580,8 +579,7 @@ async fn terminal_persistence_failure_is_reported_and_quarantined() {
     state
         .run_manager
         .register_cancel_token(run_id, cancel_token.clone());
-    let (run_tx, _run_rx) = mpsc::unbounded_channel();
-    state.run_manager.register_sender(run_id, run_tx);
+    let _run_subscription = state.run_manager.subscribe_run(run_id);
     let barrier = super::lifecycle::install_terminal_transition_barrier(run_id);
     let execute_state = state.clone();
     let handle = tokio::spawn(async move {
@@ -4820,10 +4818,11 @@ async fn handle_dm_run_failure_fires_when_cancel_transition_already_lost() {
 // ---------------------------------------------------------------------------
 
 /// Subscribe to the agent-scoped session-activity feed and return the receiver.
-fn subscribe_agent(state: &AppState, agent_id: AgentId) -> mpsc::UnboundedReceiver<SseEventData> {
-    let (tx, rx) = mpsc::unbounded_channel();
-    state.run_manager.register_agent_sender(agent_id, tx);
-    rx
+fn subscribe_agent(
+    state: &AppState,
+    agent_id: AgentId,
+) -> crate::server::ManagedSubscription<AgentId> {
+    state.run_manager.subscribe_agent(agent_id)
 }
 
 /// End-to-end happy path for the agent-scoped session-activity feed.
@@ -4968,12 +4967,12 @@ async fn agent_session_activity_feed_filters_by_agent_id() {
 /// mirrors what `stream_session_activity` (`GET /events/session-activity`)
 /// registers, the feed the web UI sidebar subscribes to for the active-run
 /// dot across every agent's sessions.
-fn subscribe_activity(state: &AppState) -> crate::server::ActivitySubscription {
+fn subscribe_activity(state: &AppState) -> crate::server::ManagedSubscription<()> {
     state.run_manager.subscribe_activity()
 }
 
 fn drain_activity_events(
-    subscription: &mut crate::server::ActivitySubscription,
+    subscription: &mut crate::server::ManagedSubscription<()>,
 ) -> Vec<SseEventData> {
     let mut events = Vec::new();
     while let Ok(event) = subscription.try_recv() {
@@ -6213,6 +6212,7 @@ async fn stream_agent_events_returns_404_for_unknown_agent_and_does_not_leak_sen
         HeaderMap::new(),
         Query(super::SessionEventsQuery {
             last_event_id: None,
+            stream_epoch: None,
         }),
     )
     .await;
@@ -6246,6 +6246,7 @@ async fn stream_agent_events_returns_404_for_unknown_agent_and_does_not_leak_sen
         HeaderMap::new(),
         Query(super::SessionEventsQuery {
             last_event_id: None,
+            stream_epoch: None,
         }),
     )
     .await;

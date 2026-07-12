@@ -287,11 +287,21 @@ test('reconnect older than the retained floor reconciles from /sessions and buff
     // remaining tail now starts much later.
     openAgentEventsStream('agent-1', {
         lastEventId: 1,
-        reconcileOnOpen: true,
+        streamEpoch: 'epoch-before-gap',
     });
     const es = active.created[0];
     assert.ok(es.url.includes('last_event_id=1'));
+    assert.ok(es.url.includes('stream_epoch=epoch-before-gap'));
     es._emitOpen();
+    assert.equal(calls.length, 0, 'ordinary initial open does not duplicate the boot snapshot');
+    es._emit('stream_state', {
+        stream_epoch: 'epoch-before-gap',
+        retained_from: 1000,
+        newest: 1001,
+        replay_gap: true,
+        epoch_mismatch: false,
+        requires_reconciliation: true,
+    });
     assert.deepEqual(calls, [{
         agentId: null,
         opts: { includeDms: true },
@@ -300,6 +310,11 @@ test('reconnect older than the retained floor reconciles from /sessions and buff
     // A retained-tail event arrives while the authoritative request is in
     // flight. It must apply after the snapshot, not be overwritten by it.
     es._emit('session_activity_ended', {
+        session_id: 'replayed-before-snapshot',
+        run_id: 'r1001',
+        has_active_run: false,
+    }, 1001);
+    es._emit('session_activity_ended', {
         session_id: 'ended-in-tail',
         run_id: 'r1002',
         has_active_run: false,
@@ -307,6 +322,7 @@ test('reconnect older than the retained floor reconciles from /sessions and buff
     resolveSnapshot({
         sessions: [
             { id: 'missed-start-before-floor', has_active_run: true },
+            { id: 'replayed-before-snapshot', has_active_run: true },
             { id: 'ended-in-tail', has_active_run: true },
         ],
     });
@@ -316,11 +332,71 @@ test('reconnect older than the retained floor reconciles from /sessions and buff
         bgRuns.value['missed-start-before-floor'],
         'the snapshot restores activity whose start fell before the retained floor',
     );
+    assert.ok(
+        bgRuns.value['replayed-before-snapshot'],
+        'replayed events at or below stream_state.newest must not regress the newer snapshot',
+    );
     assert.equal(
         bgRuns.value['ended-in-tail'],
         undefined,
         'the buffered retained-tail event must win over the older snapshot',
     );
+});
+
+test('a second reconnect queues a separate snapshot instead of widening the first ceiling', async () => {
+    const resolvers = [];
+    let snapshotCalls = 0;
+    active = await loadHook({
+        listSessions: () => {
+            snapshotCalls++;
+            return new Promise(resolve => { resolvers.push(resolve); });
+        },
+    });
+    const { openAgentEventsStream } = active.mod;
+    const { bgRuns } = active.queue;
+
+    openAgentEventsStream('agent-1');
+    const es = active.created[0];
+    es._emit('stream_state', {
+        stream_epoch: 'epoch-a',
+        newest: 10,
+        replay_gap: true,
+        epoch_mismatch: false,
+        requires_reconciliation: true,
+    });
+    assert.equal(snapshotCalls, 1);
+
+    // A newer reconnect happens before snapshot 1 resolves. Event 15 is newer
+    // than snapshot 1's replay ceiling, so snapshot 1 must apply it. It is
+    // older than snapshot 2's ceiling, but that ceiling belongs exclusively
+    // to the second authoritative request.
+    es._emit('stream_state', {
+        stream_epoch: 'epoch-a',
+        newest: 20,
+        replay_gap: true,
+        epoch_mismatch: false,
+        requires_reconciliation: true,
+    });
+    es._emit('session_activity_ended', {
+        session_id: 'changed-between-reconnects',
+        run_id: 'r15',
+        has_active_run: false,
+    }, 15);
+
+    resolvers[0]({
+        sessions: [{ id: 'changed-between-reconnects', has_active_run: true }],
+    });
+    await new Promise(resolve => setImmediate(resolve));
+
+    assert.equal(snapshotCalls, 2, 'the newer stream state must queue its own snapshot');
+    assert.equal(
+        bgRuns.value['changed-between-reconnects'],
+        undefined,
+        'snapshot 1 must not discard events using snapshot 2\'s wider ceiling',
+    );
+
+    resolvers[1]({ sessions: [] });
+    await new Promise(resolve => setImmediate(resolve));
 });
 
 test('native reconnect after event-log restart clears stale state and accepts reset IDs', async () => {
@@ -340,6 +416,12 @@ test('native reconnect after event-log restart clears stale state and accepts re
     const es = active.created[0];
     es._emitOpen();
     assert.equal(snapshotCalls, 0, 'the boot snapshot already covers the initial open');
+    es._emit('stream_state', {
+        stream_epoch: 'epoch-a',
+        replay_gap: false,
+        epoch_mismatch: false,
+        requires_reconciliation: false,
+    });
 
     es._emit('session_activity_started', {
         session_id: 'stale-before-restart',
@@ -351,7 +433,12 @@ test('native reconnect after event-log restart clears stale state and accepts re
     // A second `open` on the same EventSource is the browser's native
     // reconnect. The gateway's event IDs have reset, but reconciliation is
     // independent of the old cursor/epoch.
-    es._emitOpen();
+    es._emit('stream_state', {
+        stream_epoch: 'epoch-b',
+        replay_gap: false,
+        epoch_mismatch: false,
+        requires_reconciliation: false,
+    });
     assert.equal(snapshotCalls, 1);
     es._emit('session_activity_started', {
         session_id: 'fresh-after-restart',

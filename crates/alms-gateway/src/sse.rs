@@ -99,6 +99,32 @@ impl SseEventData {
         }
     }
 
+    /// Control event emitted before replay on every persistent stream.
+    ///
+    /// It carries the gateway epoch and retained cursor window without
+    /// advancing Last-Event-ID. Clients that observe a gap or epoch change
+    /// must reconcile from an authoritative REST snapshot while buffering
+    /// subsequent replay/live events.
+    pub fn stream_state(
+        stream_epoch: Uuid,
+        retained_from: Option<u64>,
+        newest: Option<u64>,
+        replay_gap: bool,
+        epoch_mismatch: bool,
+    ) -> Self {
+        Self::new(
+            "stream_state",
+            StreamStateData {
+                stream_epoch: stream_epoch.to_string(),
+                retained_from,
+                newest,
+                replay_gap,
+                epoch_mismatch,
+                requires_reconciliation: replay_gap || epoch_mismatch,
+            },
+        )
+    }
+
     pub fn connected(run_id: RunId) -> Self {
         Self::new(
             "connected",
@@ -802,6 +828,19 @@ impl SseEventData {
     }
 }
 
+fn wire_event(data: SseEventData) -> Event {
+    let mut event = Event::default().event(&data.event_type);
+    if let Some(id) = data.event_id {
+        event = event.id(id.to_string());
+    } else if data.event_type.as_bytes() != *b"stream_state" {
+        event = event.id(next_ephemeral_id());
+    }
+    event.json_data(&data.data).unwrap_or_else(|e| {
+        error!("Failed to serialize SSE event '{}': {}", data.event_type, e);
+        Event::default().data("{}")
+    })
+}
+
 /// SSE event stream wrapper
 pub struct RunEventStream;
 
@@ -817,23 +856,11 @@ impl RunEventStream {
     pub fn stream_replay_only(
         replay: Vec<SseEventData>,
     ) -> Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>> {
-        let stream = tokio_stream::iter(replay.into_iter().map(|data| {
-            let event = Event::default()
-                .event(&data.event_type)
-                .id(data
-                    .event_id
-                    .map(|id| id.to_string())
-                    .unwrap_or_else(next_ephemeral_id))
-                .json_data(&data.data)
-                .unwrap_or_else(|e| {
-                    error!(
-                        "Failed to serialize SSE replay event '{}': {}",
-                        data.event_type, e
-                    );
-                    Event::default().data("{}")
-                });
-            Ok::<_, Infallible>(event)
-        }));
+        let stream = tokio_stream::iter(
+            replay
+                .into_iter()
+                .map(|data| Ok::<_, Infallible>(wire_event(data))),
+        );
 
         Sse::new(stream)
     }
@@ -857,46 +884,18 @@ impl RunEventStream {
         // (possible because we register-before-replay to close the race gap).
         let max_replay_id = replay.iter().filter_map(|e| e.event_id).max().unwrap_or(0);
 
-        let replay_stream = tokio_stream::iter(replay.into_iter().map(|data| {
-            let event = Event::default()
-                .event(&data.event_type)
-                .id(data
-                    .event_id
-                    .map(|id| id.to_string())
-                    .unwrap_or_else(next_ephemeral_id))
-                .json_data(&data.data)
-                .unwrap_or_else(|e| {
-                    error!(
-                        "Failed to serialize SSE replay event '{}': {}",
-                        data.event_type, e
-                    );
-                    Event::default().data("{}")
-                });
-            Ok::<_, Infallible>(event)
-        }));
+        let replay_stream = tokio_stream::iter(
+            replay
+                .into_iter()
+                .map(|data| Ok::<_, Infallible>(wire_event(data))),
+        );
 
         let live_stream = live_stream
             .filter(move |data| {
                 // Skip events already delivered during replay
                 !matches!(data.event_id, Some(id) if id <= max_replay_id)
             })
-            .map(|data| {
-                let event = Event::default()
-                    .event(&data.event_type)
-                    .id(data
-                        .event_id
-                        .map(|id| id.to_string())
-                        .unwrap_or_else(next_ephemeral_id))
-                    .json_data(&data.data)
-                    .unwrap_or_else(|e| {
-                        error!(
-                            "Failed to serialize SSE live event '{}': {}",
-                            data.event_type, e
-                        );
-                        Event::default().data("{}")
-                    });
-                Ok::<_, Infallible>(event)
-            });
+            .map(|data| Ok::<_, Infallible>(wire_event(data)));
 
         let stream = replay_stream.chain(live_stream);
 
@@ -920,6 +919,16 @@ pub fn event_channel() -> (
 #[derive(Debug, Serialize)]
 struct ConnectedData {
     run_id: String,
+}
+
+#[derive(Debug, Serialize)]
+struct StreamStateData {
+    stream_epoch: String,
+    retained_from: Option<u64>,
+    newest: Option<u64>,
+    replay_gap: bool,
+    epoch_mismatch: bool,
+    requires_reconciliation: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -1358,6 +1367,56 @@ mod tests {
         let json = serde_json::to_string(&event).unwrap();
         assert!(json.contains("run_started"));
         assert!(json.contains(&run_id.0.to_string()));
+    }
+
+    #[test]
+    fn stream_state_requires_reconciliation_for_gap_or_epoch_mismatch() {
+        let epoch = uuid::Uuid::new_v4();
+        let clean = SseEventData::stream_state(epoch, Some(10), Some(20), false, false);
+        assert_eq!(clean.event_type, "stream_state");
+        assert_eq!(clean.event_id, None);
+        assert_eq!(clean.data["requires_reconciliation"], false);
+
+        let gap = SseEventData::stream_state(epoch, Some(10), Some(20), true, false);
+        assert_eq!(gap.data["replay_gap"], true);
+        assert_eq!(gap.data["requires_reconciliation"], true);
+
+        let mismatch = SseEventData::stream_state(epoch, Some(10), Some(20), false, true);
+        assert_eq!(mismatch.data["epoch_mismatch"], true);
+        assert_eq!(mismatch.data["requires_reconciliation"], true);
+    }
+
+    #[tokio::test]
+    async fn stream_state_does_not_advance_the_wire_cursor() {
+        use axum::response::IntoResponse;
+
+        let epoch = uuid::Uuid::new_v4();
+        let state = SseEventData::stream_state(epoch, Some(10), Some(20), false, false);
+        let mut persisted = SseEventData::run_started(RunId::new(), alms_core::SessionId::new());
+        persisted.event_id = Some(21);
+
+        let response = RunEventStream::stream_replay_only(vec![state, persisted]).into_response();
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let wire = std::str::from_utf8(&body).unwrap();
+        let state_frame = wire
+            .split("\n\n")
+            .find(|frame| frame.contains("event: stream_state"))
+            .or_else(|| {
+                wire.split("\n\n")
+                    .find(|frame| frame.contains("event:stream_state"))
+            })
+            .expect("stream_state frame must be present");
+
+        assert!(
+            !state_frame.lines().any(|line| line.starts_with("id:")),
+            "stream_state must not replace Last-Event-ID: {state_frame}"
+        );
+        assert!(
+            wire.contains("id: 21") || wire.contains("id:21"),
+            "persisted events must still carry their numeric cursor: {wire}"
+        );
     }
 
     /// `run_started` without a layered config snapshot serializes

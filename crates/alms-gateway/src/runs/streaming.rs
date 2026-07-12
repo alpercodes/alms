@@ -1,8 +1,9 @@
 //! SSE event streaming — per-run, per-session, and per-agent event streams.
 
 use crate::api_error;
-use crate::server::AppState;
-use crate::sse::{RunEventStream, SseEventData, event_channel};
+use crate::event_log::ReplayWindow;
+use crate::server::{AppState, ManagedSubscription};
+use crate::sse::{RunEventStream, SseEventData};
 use alms_core::{AgentId, RunId, RunStatus, SessionId};
 use axum::{
     Json,
@@ -13,6 +14,47 @@ use axum::{
 use serde::Deserialize;
 use tracing::{info, instrument, warn};
 
+fn parse_last_event_id(headers: &HeaderMap, query: &SessionEventsQuery) -> Option<u64> {
+    query
+        .last_event_id
+        .as_deref()
+        .and_then(|v| v.parse::<u64>().ok())
+        .or_else(|| {
+            headers
+                .get("last-event-id")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.parse::<u64>().ok())
+        })
+}
+
+fn replay_with_stream_state(
+    state: &AppState,
+    supplied_epoch: Option<&str>,
+    window: ReplayWindow,
+) -> Vec<SseEventData> {
+    let epoch = state.run_manager.stream_epoch();
+    let epoch_mismatch = supplied_epoch.is_some_and(|raw| {
+        uuid::Uuid::parse_str(raw)
+            .map(|candidate| candidate != epoch)
+            .unwrap_or(true)
+    });
+    let mut replay = Vec::with_capacity(window.events.len() + 1);
+    replay.push(SseEventData::stream_state(
+        epoch,
+        window.retained_from,
+        window.newest,
+        window.replay_gap,
+        epoch_mismatch,
+    ));
+    replay.extend(window.events.into_iter().map(|e| SseEventData {
+        event_type: e.event_type,
+        data: e.data,
+        ts: e.ts,
+        event_id: Some(e.event_id),
+    }));
+    replay
+}
+
 /// GET /runs/{run_id}/events - Stream events via SSE
 ///
 /// Supports Last-Event-ID header for reconnect.
@@ -21,13 +63,9 @@ pub async fn stream_run_events(
     State(state): State<AppState>,
     Path(run_id): Path<RunId>,
     headers: HeaderMap,
+    Query(query): Query<SessionEventsQuery>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
-    let last_event_id = headers
-        .get("last-event-id")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.parse::<u64>().ok());
-
-    let from_id = last_event_id.map(|id| id + 1).unwrap_or(0);
+    let last_event_id = parse_last_event_id(&headers, &query);
 
     // Check run exists — return 404 for nonexistent runs instead of
     // leaking an orphaned sender entry.
@@ -44,16 +82,11 @@ pub async fn stream_run_events(
     if is_terminal {
         // Run is done — replay historical events then close. No sender
         // registration since no new events will arrive.
-        let logged_events = state.run_manager.events_from(run_id, from_id).await;
-        let replay_events: Vec<SseEventData> = logged_events
-            .into_iter()
-            .map(|e| SseEventData {
-                event_type: e.event_type,
-                data: e.data,
-                ts: e.ts,
-                event_id: Some(e.event_id),
-            })
-            .collect();
+        let window = state
+            .run_manager
+            .run_replay_window(run_id, last_event_id)
+            .await;
+        let replay_events = replay_with_stream_state(&state, query.stream_epoch.as_deref(), window);
         info!(
             "Run {} is {:?}, replaying {} events then closing",
             run_id.0,
@@ -66,8 +99,7 @@ pub async fn stream_run_events(
         // log to close the race where events produced between snapshot
         // and registration would be lost. Overlap is deduplicated by
         // stream_with_replay.
-        let (tx, rx) = event_channel();
-        state.run_manager.register_sender(run_id, tx);
+        let subscription = state.run_manager.subscribe_run(run_id);
 
         // TOCTOU guard: the run may have completed between the time the
         // client initiated the SSE request and `register_sender`. In that
@@ -86,21 +118,17 @@ pub async fn stream_run_events(
             .unwrap_or(true);
 
         if became_terminal {
-            state.run_manager.remove_senders(run_id);
+            drop(subscription);
             warn!(
                 "Run {} became terminal during SSE subscription — cleaned up orphaned sender",
                 run_id.0
             );
-            let logged_events = state.run_manager.events_from(run_id, from_id).await;
-            let replay_events: Vec<SseEventData> = logged_events
-                .into_iter()
-                .map(|e| SseEventData {
-                    event_type: e.event_type,
-                    data: e.data,
-                    ts: e.ts,
-                    event_id: Some(e.event_id),
-                })
-                .collect();
+            let window = state
+                .run_manager
+                .run_replay_window(run_id, last_event_id)
+                .await;
+            let replay_events =
+                replay_with_stream_state(&state, query.stream_epoch.as_deref(), window);
             if !replay_events.is_empty() {
                 info!(
                     "Replaying {} events for terminal run {}",
@@ -111,16 +139,11 @@ pub async fn stream_run_events(
             return Ok(RunEventStream::stream_replay_only(replay_events).into_response());
         }
 
-        let logged_events = state.run_manager.events_from(run_id, from_id).await;
-        let replay_events: Vec<SseEventData> = logged_events
-            .into_iter()
-            .map(|e| SseEventData {
-                event_type: e.event_type,
-                data: e.data,
-                ts: e.ts,
-                event_id: Some(e.event_id),
-            })
-            .collect();
+        let window = state
+            .run_manager
+            .run_replay_window(run_id, last_event_id)
+            .await;
+        let replay_events = replay_with_stream_state(&state, query.stream_epoch.as_deref(), window);
         if !replay_events.is_empty() {
             info!(
                 "Replaying {} events for active run {}",
@@ -128,7 +151,7 @@ pub async fn stream_run_events(
                 run_id.0
             );
         }
-        Ok(RunEventStream::stream_with_replay(rx, replay_events).into_response())
+        Ok(RunEventStream::stream_with_replay_source(subscription, replay_events).into_response())
     }
 }
 
@@ -146,6 +169,8 @@ pub struct SessionEventsQuery {
     /// the request with a 422 deserialization error, which would break SSE
     /// reconnection and leave the run appearing stuck (see #465 follow-up).
     pub last_event_id: Option<String>,
+    /// Gateway epoch last observed by the client.
+    pub stream_epoch: Option<String>,
 }
 
 /// Register a new live subscriber on a session's SSE stream and bring it up
@@ -173,27 +198,30 @@ pub struct SessionEventsQuery {
 pub(crate) fn attach_session_stream(
     state: &AppState,
     session_id: SessionId,
-) -> tokio::sync::mpsc::UnboundedReceiver<SseEventData> {
-    let (tx, rx) = event_channel();
-    state
-        .run_manager
-        .register_session_sender(session_id, tx.clone());
+) -> ManagedSubscription<SessionId> {
+    let subscription = state.run_manager.subscribe_session(session_id);
     for snap in state.coordinator.subagent_activity_snapshot(session_id) {
         // The frontend routes the signal purely by `source_agent`; `run_id`
         // is carried for wire-shape parity with live signals (which use the
         // parent's run id) and falls back to the nil UUID when the spawn
         // predates run registration.
         let run_id = snap.parent_run_id.unwrap_or(RunId(uuid::Uuid::nil()));
-        let _ = tx.send(SseEventData::subagent_activity(
+        if !subscription.try_send(SseEventData::subagent_activity(
             run_id,
             &snap.kind,
             snap.tool,
             snap.tool_invocation_id,
             snap.parent_tool_invocation_id,
             Some(snap.label),
-        ));
+        )) {
+            // Session subscriptions are lossless, so this can only happen if
+            // the receiver closed during attachment. Stop immediately rather
+            // than silently returning a stream with a partial snapshot.
+            warn!(%session_id, "session stream closed while queuing activity snapshot");
+            break;
+        }
     }
-    rx
+    subscription
 }
 
 /// GET /sessions/{session_id}/events — persistent session-level SSE stream.
@@ -224,34 +252,16 @@ pub async fn stream_session_events(
     // Both sources may contain non-numeric values (`ephemeral-N` from
     // ephemeral events), so we parse with `.ok()` to silently ignore
     // unparseable values and fall back to replaying all events (from_id=0).
-    let last_event_id = query
-        .last_event_id
-        .as_deref()
-        .and_then(|v| v.parse::<u64>().ok())
-        .or_else(|| {
-            headers
-                .get("last-event-id")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|v| v.parse::<u64>().ok())
-        });
-    let from_id = last_event_id.map(|id| id + 1).unwrap_or(0);
+    let last_event_id = parse_last_event_id(&headers, &query);
 
-    let rx = attach_session_stream(&state, session_id);
+    let subscription = attach_session_stream(&state, session_id);
 
     // Replay missed events on reconnect
-    let logged_events = state
+    let window = state
         .run_manager
-        .session_events_from(session_id, from_id)
+        .session_replay_window(session_id, last_event_id)
         .await;
-    let replay_events: Vec<SseEventData> = logged_events
-        .into_iter()
-        .map(|e| SseEventData {
-            event_type: e.event_type,
-            data: e.data,
-            ts: e.ts,
-            event_id: Some(e.event_id),
-        })
-        .collect();
+    let replay_events = replay_with_stream_state(&state, query.stream_epoch.as_deref(), window);
 
     if !replay_events.is_empty() {
         info!(
@@ -261,7 +271,7 @@ pub async fn stream_session_events(
         );
     }
 
-    Ok(RunEventStream::stream_with_replay(rx, replay_events).into_response())
+    Ok(RunEventStream::stream_with_replay_source(subscription, replay_events).into_response())
 }
 
 /// GET /agents/{agent_id}/events — agent-scoped SSE feed (#856).
@@ -325,31 +335,15 @@ pub async fn stream_agent_events(
 
     // Query parameter takes precedence over header (the header is only
     // sent by the browser on automatic reconnects).
-    let last_event_id = query
-        .last_event_id
-        .as_deref()
-        .and_then(|v| v.parse::<u64>().ok())
-        .or_else(|| {
-            headers
-                .get("last-event-id")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|v| v.parse::<u64>().ok())
-        });
-    let from_id = last_event_id.map(|id| id + 1).unwrap_or(0);
+    let last_event_id = parse_last_event_id(&headers, &query);
 
-    let (tx, rx) = event_channel();
-    state.run_manager.register_agent_sender(agent_id, tx);
+    let subscription = state.run_manager.subscribe_agent(agent_id);
 
-    let logged_events = state.run_manager.agent_events_from(agent_id, from_id).await;
-    let replay_events: Vec<SseEventData> = logged_events
-        .into_iter()
-        .map(|e| SseEventData {
-            event_type: e.event_type,
-            data: e.data,
-            ts: e.ts,
-            event_id: Some(e.event_id),
-        })
-        .collect();
+    let window = state
+        .run_manager
+        .agent_replay_window(agent_id, last_event_id)
+        .await;
+    let replay_events = replay_with_stream_state(&state, query.stream_epoch.as_deref(), window);
 
     if !replay_events.is_empty() {
         info!(
@@ -359,7 +353,7 @@ pub async fn stream_agent_events(
         );
     }
 
-    Ok(RunEventStream::stream_with_replay(rx, replay_events).into_response())
+    Ok(RunEventStream::stream_with_replay_source(subscription, replay_events).into_response())
 }
 
 /// GET /events/session-activity — GLOBAL cross-agent session-activity feed
@@ -392,30 +386,15 @@ pub async fn stream_session_activity(
 ) -> impl IntoResponse {
     // Query parameter takes precedence over header (the header is only
     // sent by the browser on automatic reconnects).
-    let last_event_id = query
-        .last_event_id
-        .as_deref()
-        .and_then(|v| v.parse::<u64>().ok())
-        .or_else(|| {
-            headers
-                .get("last-event-id")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|v| v.parse::<u64>().ok())
-        });
-    let from_id = last_event_id.map(|id| id + 1).unwrap_or(0);
+    let last_event_id = parse_last_event_id(&headers, &query);
 
     let subscription = state.run_manager.subscribe_activity();
 
-    let logged_events = state.run_manager.activity_events_from(from_id).await;
-    let replay_events: Vec<SseEventData> = logged_events
-        .into_iter()
-        .map(|e| SseEventData {
-            event_type: e.event_type,
-            data: e.data,
-            ts: e.ts,
-            event_id: Some(e.event_id),
-        })
-        .collect();
+    let window = state
+        .run_manager
+        .activity_replay_window(last_event_id)
+        .await;
+    let replay_events = replay_with_stream_state(&state, query.stream_epoch.as_deref(), window);
 
     if !replay_events.is_empty() {
         info!(

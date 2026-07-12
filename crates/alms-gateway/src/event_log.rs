@@ -21,6 +21,16 @@ pub struct LoggedEvent {
     pub ts: DateTime<Utc>,
 }
 
+/// Replay snapshot plus the retained cursor window it came from.
+#[derive(Debug, Clone)]
+pub struct ReplayWindow {
+    pub events: Vec<LoggedEvent>,
+    pub retained_from: Option<u64>,
+    pub newest: Option<u64>,
+    /// True when the supplied cursor cannot be satisfied from this log.
+    pub replay_gap: bool,
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct EventLog {
     events: Arc<RwLock<Vec<LoggedEvent>>>,
@@ -83,6 +93,31 @@ impl EventLog {
             .cloned()
             .collect()
     }
+
+    /// Snapshot the retained window and determine whether a client cursor is
+    /// still replayable. A cursor beyond the newest id also signals a gap
+    /// because it is the observable shape of a gateway restart when IDs reset.
+    pub async fn replay_window(&self, last_event_id: Option<u64>) -> ReplayWindow {
+        let events = self.events.read().await;
+        let retained_from = events.first().map(|e| e.event_id);
+        let newest = events.last().map(|e| e.event_id);
+        let replay_gap = last_event_id.is_some_and(|cursor| match (retained_from, newest) {
+            (Some(floor), Some(high)) => cursor.saturating_add(1) < floor || cursor > high,
+            _ => cursor > 0,
+        });
+        let from_id = last_event_id.map(|id| id.saturating_add(1)).unwrap_or(0);
+        let events = events
+            .iter()
+            .filter(|e| e.event_id >= from_id)
+            .cloned()
+            .collect();
+        ReplayWindow {
+            events,
+            retained_from,
+            newest,
+            replay_gap,
+        }
+    }
 }
 
 #[derive(Debug, Default, Clone)]
@@ -135,6 +170,19 @@ impl EventLogManager {
         match logs.get(&run_id) {
             Some(log) => log.events_from(from_id).await,
             None => Vec::new(),
+        }
+    }
+
+    pub async fn replay_window(&self, run_id: RunId, last_event_id: Option<u64>) -> ReplayWindow {
+        let logs = self.logs.read().await;
+        match logs.get(&run_id) {
+            Some(log) => log.replay_window(last_event_id).await,
+            None => ReplayWindow {
+                events: Vec::new(),
+                retained_from: None,
+                newest: None,
+                replay_gap: last_event_id.is_some_and(|id| id > 0),
+            },
         }
     }
 }
@@ -198,6 +246,23 @@ impl SessionEventLogManager {
         match logs.get(&session_id) {
             Some(log) => log.events_from(from_id).await,
             None => Vec::new(),
+        }
+    }
+
+    pub async fn replay_window(
+        &self,
+        session_id: SessionId,
+        last_event_id: Option<u64>,
+    ) -> ReplayWindow {
+        let logs = self.logs.read().await;
+        match logs.get(&session_id) {
+            Some(log) => log.replay_window(last_event_id).await,
+            None => ReplayWindow {
+                events: Vec::new(),
+                retained_from: None,
+                newest: None,
+                replay_gap: last_event_id.is_some_and(|id| id > 0),
+            },
         }
     }
 
@@ -279,6 +344,23 @@ impl AgentEventLogManager {
             None => Vec::new(),
         }
     }
+
+    pub async fn replay_window(
+        &self,
+        agent_id: AgentId,
+        last_event_id: Option<u64>,
+    ) -> ReplayWindow {
+        let logs = self.logs.read().await;
+        match logs.get(&agent_id) {
+            Some(log) => log.replay_window(last_event_id).await,
+            None => ReplayWindow {
+                events: Vec::new(),
+                retained_from: None,
+                newest: None,
+                replay_gap: last_event_id.is_some_and(|id| id > 0),
+            },
+        }
+    }
 }
 
 #[cfg(test)]
@@ -293,6 +375,64 @@ mod tests {
 
     fn test_run_id() -> RunId {
         RunId(Uuid::new_v4())
+    }
+
+    async fn append_bounded(log: &EventLog, max: usize) -> u64 {
+        let run_id = test_run_id();
+        let session_id = test_session_id();
+        log.mint_and_push(
+            |event_id| LoggedEvent {
+                event_id,
+                run_id,
+                session_id,
+                event_type: "test".into(),
+                data: serde_json::json!({}),
+                ts: Utc::now(),
+            },
+            Some(max),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn replay_window_flags_cursor_older_than_retained_floor() {
+        let log = EventLog::new();
+        for _ in 0..5 {
+            append_bounded(&log, 3).await;
+        }
+
+        let window = log.replay_window(Some(1)).await;
+        assert_eq!(window.retained_from, Some(3));
+        assert_eq!(window.newest, Some(5));
+        assert!(window.replay_gap);
+        assert_eq!(
+            window.events.iter().map(|e| e.event_id).collect::<Vec<_>>(),
+            vec![3, 4, 5]
+        );
+    }
+
+    #[tokio::test]
+    async fn replay_window_flags_cursor_from_prior_log_epoch() {
+        let restarted_log = EventLog::new();
+        append_bounded(&restarted_log, 3).await;
+
+        let window = restarted_log.replay_window(Some(900)).await;
+        assert_eq!(window.retained_from, Some(1));
+        assert_eq!(window.newest, Some(1));
+        assert!(window.replay_gap);
+        assert!(window.events.is_empty());
+    }
+
+    #[tokio::test]
+    async fn replay_window_accepts_cursor_immediately_before_floor() {
+        let log = EventLog::new();
+        for _ in 0..5 {
+            append_bounded(&log, 3).await;
+        }
+
+        let window = log.replay_window(Some(2)).await;
+        assert!(!window.replay_gap);
+        assert_eq!(window.events.len(), 3);
     }
 
     #[tokio::test]

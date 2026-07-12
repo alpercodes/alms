@@ -55,6 +55,7 @@ let activeAgentId = null;
 let retryCount = 0;
 const MAX_RETRIES = 10;
 let lastSeenEventId = null;
+let lastSeenStreamEpoch = null;
 /**
  * In-flight backoff timer scheduled by `es.onerror`. Stored at module
  * scope so the manual-reconnect path (banner click, `online` event,
@@ -109,6 +110,9 @@ function applyActivitySnapshot(data) {
  *   the internal retry path)
  */
 export function openAgentEventsStream(agentId, opts) {
+    const requestedEpoch = (opts && opts.streamEpoch != null)
+        ? String(opts.streamEpoch)
+        : null;
     closeAgentEventsStream();
     if (!agentId) return;
 
@@ -128,6 +132,7 @@ export function openAgentEventsStream(agentId, opts) {
     const params = new URLSearchParams();
     if (token) params.set('token', token);
     if (opts && opts.lastEventId != null) params.set('last_event_id', String(opts.lastEventId));
+    if (requestedEpoch) params.set('stream_epoch', requestedEpoch);
     const qs = params.toString();
     // Global cross-agent feed (#1211) — NOT `/agents/${agentId}/events`.
     // `agentId` is retained above only as the teardown/reopen scoping
@@ -141,20 +146,40 @@ export function openAgentEventsStream(agentId, opts) {
     activeAgentId = agentId;
     retryCount = 0;
     lastSeenEventId = (opts && opts.lastEventId != null) ? opts.lastEventId : null;
+    lastSeenStreamEpoch = requestedEpoch;
     let hasOpened = false;
     let reconciling = false;
     let bufferedActivity = [];
+    let queuedReconciliation = false;
+    let queuedReplayCeiling = null;
+    let reconciliationRetryCount = 0;
 
-    const dispatchActivity = (type, data) => {
+    const dispatchActivity = (type, data, eventId) => {
         if (reconciling) {
-            bufferedActivity.push({ type, data });
+            bufferedActivity.push({ type, data, eventId });
             return;
         }
         applyActivityEvent(type, data);
     };
 
-    const reconcileActivity = async () => {
-        if (reconciling || es !== activeAgentEs) return;
+    const reconcileActivity = async (replayCeiling) => {
+        const requestReplayCeiling = Number.isSafeInteger(replayCeiling)
+            ? replayCeiling
+            : null;
+        if (reconciling) {
+            // A stream can reconnect again while the previous authoritative
+            // snapshot is still in flight. Keep that later reconciliation
+            // separate: widening the first request's ceiling would let its
+            // older snapshot discard events belonging to the newer stream.
+            queuedReconciliation = true;
+            if (requestReplayCeiling != null) {
+                queuedReplayCeiling = queuedReplayCeiling == null
+                    ? requestReplayCeiling
+                    : Math.max(queuedReplayCeiling, requestReplayCeiling);
+            }
+            return;
+        }
+        if (es !== activeAgentEs) return;
         reconciling = true;
         bufferedActivity = [];
 
@@ -166,13 +191,45 @@ export function openAgentEventsStream(agentId, opts) {
         }
 
         if (es !== activeAgentEs) return;
-        if (snapshot) applyActivitySnapshot(snapshot);
+        if (snapshot) {
+            applyActivitySnapshot(snapshot);
+            reconciliationRetryCount = 0;
+        }
 
         const pending = bufferedActivity;
         bufferedActivity = [];
         reconciling = false;
         for (const event of pending) {
+            // `stream_state.newest` is the replay snapshot ceiling. Events
+            // at or below it predate the authoritative /sessions response
+            // and must not regress that snapshot when the retained tail is
+            // drained. IDs above it are genuinely live and apply afterward.
+            if (
+                requestReplayCeiling != null
+                && event.eventId != null
+                && event.eventId <= requestReplayCeiling
+            ) {
+                continue;
+            }
             applyActivityEvent(event.type, event.data);
+        }
+
+        const shouldRunQueuedReconciliation = queuedReconciliation;
+        const nextReplayCeiling = queuedReplayCeiling;
+        queuedReconciliation = false;
+        queuedReplayCeiling = null;
+        if (shouldRunQueuedReconciliation && es === activeAgentEs) {
+            void reconcileActivity(nextReplayCeiling);
+            return;
+        }
+
+        if (!snapshot && es === activeAgentEs) {
+            reconciliationRetryCount++;
+            const delay = Math.min(1000 * Math.pow(2, reconciliationRetryCount - 1), 30000);
+            es._reconciliationRetryTimer = setTimeout(() => {
+                es._reconciliationRetryTimer = null;
+                if (es === activeAgentEs) void reconcileActivity(null);
+            }, delay);
         }
     };
 
@@ -189,7 +246,7 @@ export function openAgentEventsStream(agentId, opts) {
         hasOpened = true;
         clearStreamDead('agent-events');
         if (shouldReconcile) {
-            void reconcileActivity();
+            void reconcileActivity(null);
         }
     });
 
@@ -214,12 +271,30 @@ export function openAgentEventsStream(agentId, opts) {
 
     on('session_activity_started', (e) => {
         const data = JSON.parse(e.data);
-        dispatchActivity('session_activity_started', data);
+        const eventId = /^\d+$/.test(e.lastEventId) ? Number(e.lastEventId) : null;
+        dispatchActivity('session_activity_started', data, eventId);
     });
 
     on('session_activity_ended', (e) => {
         const data = JSON.parse(e.data);
-        dispatchActivity('session_activity_ended', data);
+        const eventId = /^\d+$/.test(e.lastEventId) ? Number(e.lastEventId) : null;
+        dispatchActivity('session_activity_ended', data, eventId);
+    });
+
+    on('stream_state', (e) => {
+        const data = JSON.parse(e.data);
+        const epochChanged = Boolean(
+            lastSeenStreamEpoch
+            && data.stream_epoch
+            && lastSeenStreamEpoch !== data.stream_epoch
+        );
+        if (data.stream_epoch) {
+            lastSeenStreamEpoch = data.stream_epoch;
+        }
+        if (data.requires_reconciliation || epochChanged) {
+            const replayCeiling = Number.isSafeInteger(data.newest) ? data.newest : null;
+            void reconcileActivity(replayCeiling);
+        }
     });
 
     es.onerror = () => {
@@ -241,6 +316,7 @@ export function openAgentEventsStream(agentId, opts) {
             const delay = Math.min(2000 * Math.pow(2, retryCount - 1), 30000);
             const reopenAgentId = agentId;
             const reopenLastId = lastSeenEventId;
+            const reopenEpoch = lastSeenStreamEpoch;
             // Track the timer id so the manual-reconnect path can
             // cancel it (see the clearTimeout at the top of
             // openAgentEventsStream / closeAgentEventsStream).
@@ -250,6 +326,7 @@ export function openAgentEventsStream(agentId, opts) {
                 if (activeAgentId === reopenAgentId) {
                     openAgentEventsStream(reopenAgentId, {
                         lastEventId: reopenLastId,
+                        streamEpoch: reopenEpoch,
                         reconcileOnOpen: true,
                     });
                 }
@@ -268,9 +345,11 @@ function reconnectAgentEventsStream() {
     retryCount = 0;
     const aid = activeAgentId;
     const replayId = lastSeenEventId;
+    const replayEpoch = lastSeenStreamEpoch;
     if (aid) {
         openAgentEventsStream(aid, {
             lastEventId: replayId,
+            streamEpoch: replayEpoch,
             reconcileOnOpen: true,
         });
     } else {
@@ -290,11 +369,16 @@ registerAgentEventsReconnect(reconnectAgentEventsStream);
  */
 export function closeAgentEventsStream() {
     if (activeAgentEs) {
+        if (activeAgentEs._reconciliationRetryTimer != null) {
+            clearTimeout(activeAgentEs._reconciliationRetryTimer);
+            activeAgentEs._reconciliationRetryTimer = null;
+        }
         activeAgentEs.close();
         activeAgentEs = null;
     }
     activeAgentId = null;
     lastSeenEventId = null;
+    lastSeenStreamEpoch = null;
     retryCount = 0;
     // Cancel any pending backoff reopen — closing is an explicit
     // teardown signal. Without this, a teardown mid-backoff would

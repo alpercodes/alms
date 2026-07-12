@@ -516,6 +516,41 @@ data: {"run_id":"...","session_id":"...","ts":"..."}
 
 ```
 
+Every SSE endpoint emits `stream_state` first on each connection, before
+replayed or live domain events:
+
+```json
+{
+  "stream_epoch": "<gateway-startup-uuid>",
+  "retained_from": 42,
+  "newest": 1041,
+  "replay_gap": false,
+  "epoch_mismatch": false,
+  "requires_reconciliation": false
+}
+```
+
+Clients should retain `stream_epoch` alongside the numeric event cursor and
+send both `?last_event_id=<n>&stream_epoch=<uuid>` when reconnecting. A cursor
+older than the retained floor sets `replay_gap`; a cursor from a prior gateway
+process sets `epoch_mismatch`. Either condition sets
+`requires_reconciliation`, which tells the client to refresh the relevant
+authoritative REST snapshot while buffering live events. `newest` is the
+replay snapshot ceiling: buffered events with IDs at or below it predate the
+REST response and must not be re-applied after that response; higher IDs are
+live transitions and apply afterward.
+
+Agent-scoped and global session-activity subscriber channels are bounded to
+256 events. Their semantic events are replayable, so a client that cannot
+drain that buffer is disconnected and recovers through this protocol.
+
+Run and session subscriber channels are lossless rather than bounded because
+they also carry transient events such as token deltas that replay cannot
+reconstruct. A connected client that stops draining those feeds can therefore
+accumulate buffered events until it disconnects. Every feed unregisters its
+sender immediately when the connection closes, including during otherwise
+idle periods.
+
 #### Event types (MVP)
 
 `run_created`
@@ -1077,9 +1112,11 @@ to the agent's event log — separate from per-run and per-session event
 log counters.
 
 > **Note:** The agent event log is held in memory and lost on daemon
-> restart. After a restart, clients should open the SSE stream without a
-> `last_event_id` parameter and rely on `GET /sessions` to repopulate
-> any sidebar indicators.
+> restart. Clients should retain and submit both their `last_event_id` and
+> `stream_epoch`. The restarted gateway responds with a `stream_state`
+> whose `epoch_mismatch` and `requires_reconciliation` fields are true;
+> clients must then refresh the authoritative sessions snapshot while
+> buffering live activity events.
 
 > **Cross-agent activity:** this feed is scoped to a single agent, so it
 > cannot surface activity on sessions owned by *other* agents. The web UI
@@ -1122,10 +1159,13 @@ Supported via `Last-Event-ID` header or `?last_event_id=<n>` query parameter
 (the query parameter takes precedence). Event IDs are scoped to this feed's
 own event log — separate from the per-run, per-session, and per-agent
 counters. The bounded log can truncate an old cursor, and the log is
-in-memory so its IDs reset on daemon restart. Clients must reconcile from
-`GET /sessions` (`has_active_run`) whenever a connection reopens. The web
-UI does this while buffering replayed/live activity events, then applies
-those events after the snapshot so no transition during the request is lost.
+in-memory so its IDs reset on daemon restart. The leading `stream_state`
+event reports either condition through `requires_reconciliation`. The web UI
+then reconciles from `GET /sessions` (`has_active_run`) while buffering
+activity events, discards replayed events through the advertised `newest`
+ceiling, and applies only newer live transitions after the snapshot so no
+transition during the request is lost and no retained-tail event can regress
+the authoritative state.
 
 ---
 

@@ -1207,8 +1207,7 @@ async fn test_subagent_activity_sse_is_ephemeral_not_persisted() {
     let session_id = SessionId::new();
 
     // Live session subscriber.
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-    run_manager.register_session_sender(session_id, tx);
+    let mut rx = run_manager.subscribe_session(session_id);
 
     let hwm_before = run_manager.latest_session_event_id(session_id).await;
 
