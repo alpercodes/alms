@@ -3,6 +3,7 @@ pub mod channel;
 pub mod config;
 pub mod error;
 pub mod job;
+pub mod lifecycle;
 pub mod registry;
 pub mod run;
 pub mod secrets;
@@ -14,15 +15,18 @@ pub use channel::{Channel, ChannelConfig, IncomingMessage, OutgoingMessage};
 pub use audit::{AuditDecision, AuditEvent};
 pub use config::AlmsConfig;
 pub use error::{AlmsError, AlmsResult, audit_error_string, sanitize_error_for_session};
-pub use job::{CreateJobRequest, Job, JobId, JobSchedule, JobStatus};
+pub use job::{
+    CreateJobRequest, Job, JobId, JobSchedule, JobStatus, JobTerminalReason, JobTransition,
+};
+pub use lifecycle::{MAX_LIFECYCLE_REVISION, TransitionOutcome};
 pub use registry::{
     AgentRecord, CreateAgentRequest, UpdateAgentRequest, WORKSPACE_FILENAMES, WorktreeMode,
     init_workspace_files, migrate_workspace_dirs, validate_agent_name,
 };
 pub use run::{
     CreateRunRequest, CreateRunResponse, ResolvedRunConfig, Run, RunId, RunInput, RunRegistrar,
-    RunStatus, RunStatusResponse, TokenUsage, ToolCallRecord, ToolCallRole, deliverable_dm_reply,
-    ran_ignore_message_successfully,
+    RunStatus, RunStatusResponse, RunTransition, TokenUsage, ToolCallRecord, ToolCallRole,
+    deliverable_dm_reply, ran_ignore_message_successfully,
 };
 pub use source_label::{derive_source_label, truncate_to_char_boundary};
 

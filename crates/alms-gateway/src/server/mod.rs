@@ -351,7 +351,7 @@ async fn bootstrap_scheduler(state: &AppState) -> AlmsResult<()> {
     let mut registered = 0usize;
 
     for job in jobs {
-        if job.status == JobStatus::Cancelled {
+        if job.status() == JobStatus::Cancelled {
             continue;
         }
         let Some(fire_at) = cron_utils::compute_next_fire(&job, now) else {

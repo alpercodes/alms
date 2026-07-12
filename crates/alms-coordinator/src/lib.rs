@@ -1125,7 +1125,7 @@ async fn run_subagent(
 
     // Register the subagent run with the RunRegistrar (if available) so it
     // appears in GET /runs, the UI sidebar, and CLI `alms run list`.
-    let subagent_run = if let Some(ref registrar) = run_registrar {
+    let (subagent_run, registration_error) = if let Some(ref registrar) = run_registrar {
         let mut run = if let Some(parent_rid) = request.parent_run_id {
             Run::for_subagent(
                 sub_session_id,
@@ -1137,10 +1137,21 @@ async fn run_subagent(
             Run::new(sub_session_id, sub_agent_id, request.task.clone())
         };
         run.mark_running();
-        registrar.register_run(run.clone());
-        Some(run)
+        match registrar.register_run(run.clone()) {
+            Ok(()) => (Some(run), None),
+            Err(error) => {
+                let message = format!("Failed to persist subagent run registration: {error}");
+                tracing::error!(
+                    target: "subagent::error",
+                    task_id = %task_id.0,
+                    error = %error,
+                    "Subagent run registration failed"
+                );
+                (None, Some(AlmsError::Runtime(message)))
+            }
+        }
     } else {
-        None
+        (None, None)
     };
 
     // #1180: build a forwarder bound to the subagent's OWN session so its
@@ -1184,80 +1195,95 @@ async fn run_subagent(
     // the loop's own `Err(Cancelled)` / `Err(CancelledWithToolCalls)` from
     // a checkpoint, which `subagent_error_status` classifies as `Cancelled`
     // rather than `Failed` so the labelling is poll-order-independent).
-    let (new_status, result_value, tokens_used, run_output, typed_error) = tokio::select! {
-        // `biased`: poll the cancellation arm FIRST on every wake instead of
-        // in random order, so a cancel requested before (or at) the poll
-        // takes the cheap token arm without running the loop at all. This
-        // is a fast path, not the correctness mechanism: even when the run
-        // branch wins the both-ready race (or the loop observes the token
-        // at one of its own checkpoints mid-run), the `Err` handler below
-        // classifies the loop's `Cancelled` / `CancelledWithToolCalls`
-        // errors as `TaskStatus::Cancelled`, so a user cancel is never
-        // mislabelled as a failure in either order.
-        biased;
-        _ = child_cancel_token.cancelled() => {
-            info!(
-                target: "subagent::cancelled",
-                task_id = %task_id.0,
-                "Subagent cancelled"
-            );
-            (TaskStatus::Cancelled, serde_json::json!({"cancelled": true}), None, None, None)
-        }
-        output = run_agent_loop(task_id, &request, sub_agent_id, &sub_context_id, &session_manager, &llm, parent_event_tx, self_event_fwd, &base_agent_config, workspace_dir.as_deref(), data_dir.as_deref(), project_root.as_deref(), &subagent_prompts, child_cancel_token.clone(), secrets.as_ref(), &security_config, is_background, subagents.clone()) => {
-            match output {
-                Ok(run_output) => {
-                    info!(
-                        target: "subagent::completed",
-                        task_id = %task_id.0,
-                        elapsed_ms = %start.elapsed().as_millis(),
-                        "Subagent completed"
-                    );
-                    let tokens = (run_output.usage.prompt_tokens
-                        + run_output.usage.completion_tokens) as usize;
-                    (
-                        TaskStatus::Completed,
-                        serde_json::json!({"response": run_output.response}),
-                        Some(tokens),
-                        Some(run_output),
-                        None,
-                    )
-                }
-                Err(e) if subagent_error_status(&e) == TaskStatus::Cancelled => {
-                    // The loop observed the fired token at one of its own
-                    // checkpoints before the token arm above was polled.
-                    // Same outcome shape as the token arm: this is a user
-                    // cancel, not a failure — no typed error (matching the
-                    // token arm's contract; `dispatch()` maps Cancelled to
-                    // its dedicated "Subagent was cancelled" error without
-                    // consulting the typed channel).
-                    info!(
-                        target: "subagent::cancelled",
-                        task_id = %task_id.0,
-                        "Subagent cancelled (observed at a loop checkpoint)"
-                    );
-                    (
-                        TaskStatus::Cancelled,
-                        serde_json::json!({"cancelled": true}),
-                        None,
-                        None,
-                        None,
-                    )
-                }
-                Err(e) => {
-                    tracing::error!(
-                        target: "subagent::error",
-                        task_id = %task_id.0,
-                        error = %e,
-                        "Subagent run failed"
-                    );
-                    let err_text = e.to_string();
-                    (
-                        TaskStatus::Failed,
-                        serde_json::json!({"error": err_text}),
-                        None,
-                        None,
-                        Some(e),
-                    )
+    let (mut new_status, mut result_value, tokens_used, run_output, mut typed_error) = if let Some(
+        error,
+    ) =
+        registration_error
+    {
+        let message = error.to_string();
+        (
+            TaskStatus::Failed,
+            serde_json::json!({"error": message}),
+            None,
+            None,
+            Some(error),
+        )
+    } else {
+        tokio::select! {
+            // `biased`: poll the cancellation arm FIRST on every wake instead of
+            // in random order, so a cancel requested before (or at) the poll
+            // takes the cheap token arm without running the loop at all. This
+            // is a fast path, not the correctness mechanism: even when the run
+            // branch wins the both-ready race (or the loop observes the token
+            // at one of its own checkpoints mid-run), the `Err` handler below
+            // classifies the loop's `Cancelled` / `CancelledWithToolCalls`
+            // errors as `TaskStatus::Cancelled`, so a user cancel is never
+            // mislabelled as a failure in either order.
+            biased;
+            _ = child_cancel_token.cancelled() => {
+                info!(
+                    target: "subagent::cancelled",
+                    task_id = %task_id.0,
+                    "Subagent cancelled"
+                );
+                (TaskStatus::Cancelled, serde_json::json!({"cancelled": true}), None, None, None)
+            }
+            output = run_agent_loop(task_id, &request, sub_agent_id, &sub_context_id, &session_manager, &llm, parent_event_tx, self_event_fwd, &base_agent_config, workspace_dir.as_deref(), data_dir.as_deref(), project_root.as_deref(), &subagent_prompts, child_cancel_token.clone(), secrets.as_ref(), &security_config, is_background, subagents.clone()) => {
+                match output {
+                    Ok(run_output) => {
+                        info!(
+                            target: "subagent::completed",
+                            task_id = %task_id.0,
+                            elapsed_ms = %start.elapsed().as_millis(),
+                            "Subagent completed"
+                        );
+                        let tokens = (run_output.usage.prompt_tokens
+                            + run_output.usage.completion_tokens) as usize;
+                        (
+                            TaskStatus::Completed,
+                            serde_json::json!({"response": run_output.response}),
+                            Some(tokens),
+                            Some(run_output),
+                            None,
+                        )
+                    }
+                    Err(e) if subagent_error_status(&e) == TaskStatus::Cancelled => {
+                        // The loop observed the fired token at one of its own
+                        // checkpoints before the token arm above was polled.
+                        // Same outcome shape as the token arm: this is a user
+                        // cancel, not a failure — no typed error (matching the
+                        // token arm's contract; `dispatch()` maps Cancelled to
+                        // its dedicated "Subagent was cancelled" error without
+                        // consulting the typed channel).
+                        info!(
+                            target: "subagent::cancelled",
+                            task_id = %task_id.0,
+                            "Subagent cancelled (observed at a loop checkpoint)"
+                        );
+                        (
+                            TaskStatus::Cancelled,
+                            serde_json::json!({"cancelled": true}),
+                            None,
+                            None,
+                            None,
+                        )
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            target: "subagent::error",
+                            task_id = %task_id.0,
+                            error = %e,
+                            "Subagent run failed"
+                        );
+                        let err_text = e.to_string();
+                        (
+                            TaskStatus::Failed,
+                            serde_json::json!({"error": err_text}),
+                            None,
+                            None,
+                            Some(e),
+                        )
+                    }
                 }
             }
         }
@@ -1267,6 +1293,51 @@ async fn run_subagent(
     // on the oneshot). This is a no-op if the token was already cancelled.
     child_cancel_token.cancel();
     bridge_handle.abort();
+
+    // Commit the coordinator-owned run snapshot before publishing terminal
+    // events or completion notifications. A persistence failure is a task
+    // failure, not a successful lifecycle transition.
+    if let (Some(registrar), Some(mut run)) = (&run_registrar, subagent_run) {
+        match new_status {
+            TaskStatus::Completed => {
+                if let Some(ref output) = run_output {
+                    let _ = run.mark_completed(
+                        output.response.clone(),
+                        alms_core::TokenUsage {
+                            prompt_tokens: output.usage.prompt_tokens,
+                            completion_tokens: output.usage.completion_tokens,
+                            reasoning_tokens: output.usage.reasoning_tokens,
+                            cache_creation_input_tokens: output.usage.cache_creation_input_tokens,
+                            cache_read_input_tokens: output.usage.cache_read_input_tokens,
+                        },
+                    );
+                }
+            }
+            TaskStatus::Failed => {
+                let error = result_value["error"]
+                    .as_str()
+                    .unwrap_or("unknown error")
+                    .to_string();
+                let _ = run.mark_failed(error);
+            }
+            TaskStatus::Cancelled => {
+                let _ = run.mark_cancelled();
+            }
+            _ => {}
+        }
+        if let Err(error) = registrar.update_run(run) {
+            tracing::error!(
+                target: "subagent::error",
+                task_id = %task_id.0,
+                error = %error,
+                "Failed to persist subagent lifecycle transition"
+            );
+            let message = format!("Failed to persist subagent lifecycle transition: {error}");
+            new_status = TaskStatus::Failed;
+            result_value = serde_json::json!({ "error": message });
+            typed_error = Some(AlmsError::Runtime(message));
+        }
+    }
 
     // #1180: seal the subagent's OWN session — emit its terminal SSE
     // (run_finished / run_error / run_cancelled) and evict its text buffer via
@@ -1297,48 +1368,6 @@ async fn run_subagent(
             _ => alms_tools::SubagentRunOutcome::Cancelled,
         };
         self_fwd.forward_run_terminal(outcome);
-    }
-
-    // Update the run record with the outcome.  This executes regardless of
-    // which tokio::select! branch fired (normal completion or cancellation),
-    // preventing orphaned "Running" records.
-    if let (Some(registrar), Some(mut run)) = (&run_registrar, subagent_run) {
-        match new_status {
-            TaskStatus::Completed => {
-                if let Some(ref output) = run_output {
-                    // Intentional discard: the coordinator persists the
-                    // updated run via `registrar.update_run(run)` below
-                    // and does not broadcast an SSE event, so the #1046
-                    // duplicate-broadcast guard does not apply here.
-                    let _ = run.mark_completed(
-                        output.response.clone(),
-                        alms_core::TokenUsage {
-                            prompt_tokens: output.usage.prompt_tokens,
-                            completion_tokens: output.usage.completion_tokens,
-                            reasoning_tokens: output.usage.reasoning_tokens,
-                            cache_creation_input_tokens: output.usage.cache_creation_input_tokens,
-                            cache_read_input_tokens: output.usage.cache_read_input_tokens,
-                        },
-                    );
-                }
-            }
-            TaskStatus::Failed => {
-                let error = result_value["error"]
-                    .as_str()
-                    .unwrap_or("unknown error")
-                    .to_string();
-                // Intentional discard: same coordinator-persistence-only
-                // path as the `Completed` branch above.
-                let _ = run.mark_failed(error);
-            }
-            TaskStatus::Cancelled => {
-                // Intentional discard: same coordinator-persistence-only
-                // path as the `Completed` / `Failed` branches above.
-                let _ = run.mark_cancelled();
-            }
-            _ => {}
-        }
-        registrar.update_run(run);
     }
 
     let task_result = TaskResult {

@@ -34,6 +34,15 @@ Per-release notes for ALMS, with an emphasis on **operator-facing changes** — 
 
 ### Notable changes
 
+- **Revision-aware run and job lifecycles**: all production lifecycle changes
+  now pass through explicit state machines with legal-transition checks,
+  idempotent terminal outcomes, and a monotonically increasing revision.
+  Run and job SQLite upserts compare revisions so delayed coordinator,
+  scheduler, or recovery snapshots cannot resurrect cancelled work or replace
+  a newer terminal result. One-shot jobs retain the legacy cancelled status
+  for compatibility while the additive terminal reason distinguishes normal
+  completion, deadline completion, and operator cancellation. Restart recovery
+  also advances the run revision and records the gateway-restarted reason.
 - **Transactional, versioned SQLite migrations** (PR #1224): startup now
   records ordered schema changes in `schema_migrations`, applies each step
   together with its version row in one `BEGIN IMMEDIATE` transaction, and

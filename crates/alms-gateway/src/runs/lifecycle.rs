@@ -23,9 +23,56 @@ use futures::FutureExt;
 use serde::Deserialize;
 use serde::Serialize;
 use std::panic::AssertUnwindSafe;
+#[cfg(test)]
+use std::sync::{Arc, LazyLock};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, instrument, warn};
+
+#[cfg(test)]
+static START_TRANSITION_BARRIERS: LazyLock<dashmap::DashMap<RunId, Arc<tokio::sync::Barrier>>> =
+    LazyLock::new(dashmap::DashMap::new);
+#[cfg(test)]
+static TERMINAL_TRANSITION_BARRIERS: LazyLock<dashmap::DashMap<RunId, Arc<tokio::sync::Barrier>>> =
+    LazyLock::new(dashmap::DashMap::new);
+
+#[cfg(test)]
+pub(super) fn install_start_transition_barrier(run_id: RunId) -> Arc<tokio::sync::Barrier> {
+    let barrier = Arc::new(tokio::sync::Barrier::new(2));
+    START_TRANSITION_BARRIERS.insert(run_id, barrier.clone());
+    barrier
+}
+
+#[cfg(test)]
+async fn pause_before_start_transition(run_id: RunId) {
+    let barrier = START_TRANSITION_BARRIERS
+        .get(&run_id)
+        .map(|entry| entry.value().clone());
+    if let Some(barrier) = barrier {
+        barrier.wait().await;
+        barrier.wait().await;
+        START_TRANSITION_BARRIERS.remove(&run_id);
+    }
+}
+
+#[cfg(test)]
+pub(super) fn install_terminal_transition_barrier(run_id: RunId) -> Arc<tokio::sync::Barrier> {
+    let barrier = Arc::new(tokio::sync::Barrier::new(2));
+    TERMINAL_TRANSITION_BARRIERS.insert(run_id, barrier.clone());
+    barrier
+}
+
+#[cfg(test)]
+async fn pause_before_terminal_transition(run_id: RunId) {
+    let barrier = TERMINAL_TRANSITION_BARRIERS
+        .get(&run_id)
+        .map(|entry| entry.value().clone());
+    if let Some(barrier) = barrier {
+        barrier.wait().await;
+        barrier.wait().await;
+        TERMINAL_TRANSITION_BARRIERS.remove(&run_id);
+    }
+}
 
 /// GET /runs?session_id=<uuid>&limit=<n> — list runs for a session (existing)
 /// GET /runs?agent_id=<uuid>&limit=<n> — list runs across all sessions for an agent
@@ -152,6 +199,7 @@ fn enrich_run(state: &AppState, run: Run) -> AgentRunEntry {
     /// Full text is available via `GET /runs/{run_id}`.
     const RESPONSE_TRUNCATE_LEN: usize = 200;
 
+    let status = run.status();
     let response = run.output.map(|s| {
         if s.len() > RESPONSE_TRUNCATE_LEN {
             let mut truncated = s[..RESPONSE_TRUNCATE_LEN].to_string();
@@ -166,7 +214,7 @@ fn enrich_run(state: &AppState, run: Run) -> AgentRunEntry {
         run_id: run.run_id,
         session_id: run.session_id,
         agent_id: run.agent_id,
-        status: run.status,
+        status,
         response,
         error: run.error,
         started_at: run.started_at,
@@ -290,7 +338,7 @@ pub async fn get_run_tool_calls(
 /// recorded post-boundary reasoning yet — the client can safely call this
 /// on every reload regardless of run state.
 ///
-/// **Terminal runs (#1133):** when `run.status.is_terminal()`, the response
+/// **Terminal runs (#1133):** when `run.status().is_terminal()`, the response
 /// is forced to `{ text: "", last_event_id: null, terminal: true,
 /// seal_event_id: <id|null> }`. Reasoning is sealed onto the run's assistant
 /// message in history, so this endpoint must not re-seed it (double-render)
@@ -478,8 +526,8 @@ pub async fn get_run_reasoning(
     let terminal = state
         .run_manager
         .get_run(run_id)
-        .map(|fresh| fresh.status)
-        .unwrap_or(run.status)
+        .map(|fresh| fresh.status())
+        .unwrap_or(run.status())
         .is_terminal();
     if terminal {
         text.clear();
@@ -614,15 +662,14 @@ pub async fn cancel_run(
         .get_run(run_id)
         .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "NOT_FOUND", "Run not found"))?;
 
-    match run.status {
+    match run.status() {
         RunStatus::Queued | RunStatus::Running => {}
         _ => {
             return Err(already_finished());
         }
     }
 
-    let found = state.run_manager.cancel_run(run_id);
-    if !found {
+    if !state.run_manager.has_cancel_token(run_id) {
         return Err(already_finished());
     }
 
@@ -649,12 +696,50 @@ pub async fn cancel_run(
     // this point and `execute_run`'s terminal arm, any concurrent
     // `GET /sessions` snapshot or `GET /runs/{id}` query now sees
     // `Cancelled` instead of `Running`, matching the SSE feed.
-    let transitioned = state.run_manager.mark_run_as_cancelled(run_id);
-    if transitioned {
-        state
-            .run_manager
-            .send_event(run_id, run.session_id, SseEventData::run_cancelled(run_id))
-            .await;
+    match state.run_manager.try_mark_run_as_cancelled(run_id) {
+        Ok(true) => {
+            let _ = state.run_manager.cancel_run(run_id);
+            state
+                .run_manager
+                .send_event(run_id, run.session_id, SseEventData::run_cancelled(run_id))
+                .await;
+        }
+        Ok(false) => {
+            let authoritative = state.run_manager.get_run(run_id);
+            if !authoritative.is_some_and(|run| run.status() == RunStatus::Cancelled) {
+                return Err(already_finished());
+            }
+        }
+        Err(error) => {
+            let message = format!("Run cancellation could not be committed: {error}");
+            // The failed durable attempt quarantines the in-memory run as
+            // Failed/persistence_failed. Stop the real worker and publish the
+            // same terminal boundary immediately so execution cannot continue
+            // behind a terminal status surface.
+            let _ = state.run_manager.cancel_run(run_id);
+            state
+                .run_manager
+                .send_event(
+                    run_id,
+                    run.session_id,
+                    SseEventData::run_error(run_id, &message),
+                )
+                .await;
+            state
+                .run_manager
+                .send_agent_event(
+                    run.agent_id,
+                    run_id,
+                    run.session_id,
+                    SseEventData::session_activity_ended(run.session_id, run_id, run.agent_id),
+                )
+                .await;
+            return Err(api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "LIFECYCLE_PERSISTENCE_FAILED",
+                message,
+            ));
+        }
     }
 
     info!("Cancel requested for run {}", run_id.0);
@@ -1062,7 +1147,13 @@ pub async fn create_run(
         .try_reserve(agent_id)
         .map_err(queue_admission_error)?;
 
-    state.run_manager.insert_run(run.clone());
+    state.run_manager.insert_run(run.clone()).map_err(|error| {
+        run_creation_api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "LIFECYCLE_PERSISTENCE_FAILED",
+            &format!("Failed to persist the new run: {error}"),
+        )
+    })?;
 
     // Pre-persist the user's input message to the session BEFORE enqueueing
     // the run.  Previously the input was only persisted inside
@@ -1129,10 +1220,18 @@ pub async fn create_run(
     })) {
         Ok(receipt) => receipt,
         Err(error) => {
-            let _ = state
+            let persistence_error = state
                 .run_manager
-                .mark_run_as_failed(run_id, "Run queue closed before dispatch".to_string());
+                .try_mark_run_as_failed(run_id, "Run queue closed before dispatch".to_string())
+                .err();
             state.run_manager.remove_cancel_token(run_id);
+            if let Some(persistence_error) = persistence_error {
+                return Err(run_creation_api_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "LIFECYCLE_PERSISTENCE_FAILED",
+                    &format!("Run dispatch failure could not be persisted: {persistence_error}"),
+                ));
+            }
             return Err(queue_admission_error(error));
         }
     };
@@ -1322,6 +1421,28 @@ fn truncate_error_for_peer(err: &AlmsError) -> String {
     truncated
 }
 
+/// Resolve cancellation/completion persistence provenance from the
+/// authoritative run snapshot, then sanitize it for DM history.
+///
+/// A caller may observe `Ok(false)` after an earlier HTTP/approval path
+/// already quarantined the run. In that case the local transition carries no
+/// error, but `terminal_reason = persistence_failed` preserves the cause.
+pub(super) fn lifecycle_persistence_error_for_peer(
+    state: &AppState,
+    run_id: RunId,
+    observed_error: Option<String>,
+) -> Option<String> {
+    let authoritative_error = state.run_manager.get_run(run_id).and_then(|run| {
+        (run.terminal_reason() == Some("persistence_failed")).then(|| {
+            run.error
+                .unwrap_or_else(|| "lifecycle persistence failed".to_string())
+        })
+    });
+    authoritative_error
+        .or(observed_error)
+        .map(|message| truncate_error_for_peer(&AlmsError::Runtime(message)))
+}
+
 /// Broadcast a `run_queue_position` SSE event for every still-queued run on
 /// the given agent (#831).
 ///
@@ -1426,7 +1547,22 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
         // skip the duplicate broadcast. The synthetic
         // `session_activity_ended` below still fires because it serves a
         // separate sidebar-indicator-clearing purpose.
-        let transitioned = state.run_manager.mark_run_as_cancelled(run_id);
+        let (transitioned, persistence_error) =
+            match state.run_manager.try_mark_run_as_cancelled(run_id) {
+                Ok(transitioned) => (transitioned, None),
+                Err(error) => {
+                    let message = format!("Run cancellation could not be persisted: {error}");
+                    state
+                        .run_manager
+                        .send_event(
+                            run_id,
+                            session_id,
+                            SseEventData::run_error(run_id, &message),
+                        )
+                        .await;
+                    (false, Some(message))
+                }
+            };
         if transitioned {
             state
                 .run_manager
@@ -1468,16 +1604,32 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
         // resolved yet here (this exit precedes `resolve_agent_config`), so
         // the helper re-resolves it from the registry by `agent_id`. The
         // helper is a no-op for non-peer / non-`dm:` runs.
-        super::dm_lifecycle::notify_dm_peer_of_setup_cancellation(
-            &state,
-            &run_id,
-            &session_id,
-            agent_id,
-            None,
-            &context_id,
-            is_peer_message,
-        )
-        .await;
+        let persistence_peer_error =
+            lifecycle_persistence_error_for_peer(&state, run_id, persistence_error);
+        if let Some(message) = persistence_peer_error {
+            super::dm_lifecycle::notify_dm_peer_of_setup_failure(
+                &state,
+                &run_id,
+                &session_id,
+                agent_id,
+                None,
+                &context_id,
+                is_peer_message,
+                message,
+            )
+            .await;
+        } else {
+            super::dm_lifecycle::notify_dm_peer_of_setup_cancellation(
+                &state,
+                &run_id,
+                &session_id,
+                agent_id,
+                None,
+                &context_id,
+                is_peer_message,
+            )
+            .await;
+        }
 
         info!("Run {} was cancelled before starting", run_id.0);
         // #1198 exit 1/5: a queued-then-cancelled episode run never
@@ -1567,15 +1719,25 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
             // extra `ended` is harmless (consumers ignore ended events
             // for sessions whose indicator was never lit) and matches
             // the pre-#1046 behaviour.
-            let failed_transitioned = state.run_manager.mark_run_as_failed(run_id, e.to_string());
+            let mut failure_message = e.to_string();
+            let (_failed_transitioned, emit_failure) = match state
+                .run_manager
+                .try_mark_run_as_failed(run_id, failure_message.clone())
+            {
+                Ok(transitioned) => (transitioned, transitioned),
+                Err(error) => {
+                    failure_message = format!("Run failure could not be persisted: {error}");
+                    (false, true)
+                }
+            };
 
-            if failed_transitioned {
+            if emit_failure {
                 state
                     .run_manager
                     .send_event(
                         run_id,
                         session_id,
-                        SseEventData::run_error(run_id, &e.to_string()),
+                        SseEventData::run_error(run_id, &failure_message),
                     )
                     .await;
             }
@@ -1602,7 +1764,7 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
                 None,
                 &context_id,
                 is_peer_message,
-                truncate_error_for_peer(&alms_core::AlmsError::Runtime(e.to_string())),
+                truncate_error_for_peer(&alms_core::AlmsError::Runtime(failure_message)),
             )
             .await;
 
@@ -1660,18 +1822,6 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
             "Run {} rejected by token-budget validator before LLM call: {}",
             run_id.0, message
         );
-        state
-            .run_manager
-            .send_event(
-                run_id,
-                session_id,
-                SseEventData::run_error_with_code(
-                    run_id,
-                    "INVALID_TOKEN_BUDGET_FOR_PROVIDER",
-                    &message,
-                ),
-            )
-            .await;
         // Flip the run before publishing terminal session activity so
         // `send_agent_event` snapshots the authoritative post-transition
         // `has_active_run` value. Keep `run_error` first: clients rely on
@@ -1680,9 +1830,24 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
         // runs before worker dispatch. If cancellation won concurrently,
         // the terminal state is already absorbing and the activity snapshot
         // below is still false for this run.
-        let _ = state
+        let persistence_error = state
             .run_manager
-            .mark_run_as_failed(run_id, message.clone());
+            .try_mark_run_as_failed(run_id, message.clone())
+            .err()
+            .map(|error| format!("Run failure could not be persisted: {error}"));
+        let peer_message = persistence_error
+            .as_deref()
+            .unwrap_or(message.as_str())
+            .to_string();
+        let failure_event = if let Some(error) = persistence_error.as_deref() {
+            SseEventData::run_error(run_id, error)
+        } else {
+            SseEventData::run_error_with_code(run_id, "INVALID_TOKEN_BUDGET_FOR_PROVIDER", &message)
+        };
+        state
+            .run_manager
+            .send_event(run_id, session_id, failure_event)
+            .await;
         state
             .run_manager
             .send_agent_event(
@@ -1707,7 +1872,7 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
             agent_name.as_deref(),
             &context_id,
             is_peer_message,
-            truncate_error_for_peer(&alms_core::AlmsError::Runtime(message)),
+            truncate_error_for_peer(&alms_core::AlmsError::Runtime(peer_message)),
         )
         .await;
 
@@ -1774,6 +1939,9 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
     // the `run_started` SSE payload below (#837).
     let resolved_config = super::build_resolved_config(&agent_config, &llm);
 
+    #[cfg(test)]
+    pause_before_start_transition(run_id).await;
+
     // #895: flip the run state BEFORE broadcasting `run_started`. See the
     // pre-cancel branch above for the full rationale — broadcasting first
     // leaves a narrow window where a concurrent `GET /sessions` observes
@@ -1785,9 +1953,94 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
     //
     // Atomic-with-snapshot variant (#837): the layered config is stored
     // alongside the status flip in a single SQLite upsert.
-    state
+    let started = match state
         .run_manager
-        .mark_run_as_running_with_config(run_id, resolved_config.clone());
+        .try_mark_run_as_running_with_config(run_id, resolved_config.clone())
+    {
+        Ok(started) => started,
+        Err(error) => {
+            let message = format!("Run start could not be persisted: {error}");
+            error!(run_id = %run_id.0, "{message}");
+            state
+                .run_manager
+                .send_event(
+                    run_id,
+                    session_id,
+                    SseEventData::run_error(run_id, &message),
+                )
+                .await;
+            state
+                .run_manager
+                .send_agent_event(
+                    agent_id,
+                    run_id,
+                    session_id,
+                    SseEventData::session_activity_ended(session_id, run_id, agent_id),
+                )
+                .await;
+            state.run_manager.remove_cancel_token(run_id);
+            state.run_manager.remove_senders(run_id);
+            state.approval_store.clear_for_run(run_id);
+            super::dm_lifecycle::notify_dm_peer_of_setup_failure(
+                &state,
+                &run_id,
+                &session_id,
+                agent_id,
+                agent_name.as_deref(),
+                &context_id,
+                is_peer_message,
+                truncate_error_for_peer(&alms_core::AlmsError::Runtime(message)),
+            )
+            .await;
+            super::notifications::finish_episode_run(&state, episode_job_id, run_id, &[]).await;
+            broadcast_queue_advance(&state, agent_id).await;
+            return;
+        }
+    };
+    if !started {
+        // Cancellation may win after the early pre-cancel check while config
+        // and runtime setup are in progress. The state machine rejects the
+        // stale start, so do not emit run_started or execute the agent loop.
+        state
+            .run_manager
+            .send_agent_event(
+                agent_id,
+                run_id,
+                session_id,
+                SseEventData::session_activity_ended(session_id, run_id, agent_id),
+            )
+            .await;
+        state.run_manager.remove_cancel_token(run_id);
+        state.run_manager.remove_senders(run_id);
+        state.approval_store.clear_for_run(run_id);
+        if let Some(message) = lifecycle_persistence_error_for_peer(&state, run_id, None) {
+            super::dm_lifecycle::notify_dm_peer_of_setup_failure(
+                &state,
+                &run_id,
+                &session_id,
+                agent_id,
+                agent_name.as_deref(),
+                &context_id,
+                is_peer_message,
+                message,
+            )
+            .await;
+        } else {
+            super::dm_lifecycle::notify_dm_peer_of_setup_cancellation(
+                &state,
+                &run_id,
+                &session_id,
+                agent_id,
+                agent_name.as_deref(),
+                &context_id,
+                is_peer_message,
+            )
+            .await;
+        }
+        super::notifications::finish_episode_run(&state, episode_job_id, run_id, &[]).await;
+        broadcast_queue_advance(&state, agent_id).await;
+        return;
+    }
 
     state
         .run_manager
@@ -1900,15 +2153,25 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
             // it here would leave the agent feed with an unpaired
             // `started` and a sidebar indicator stuck on until the
             // next unrelated event clears it.
-            let failed_transitioned = state.run_manager.mark_run_as_failed(run_id, e.to_string());
+            let mut failure_message = e.to_string();
+            let (_failed_transitioned, emit_failure) = match state
+                .run_manager
+                .try_mark_run_as_failed(run_id, failure_message.clone())
+            {
+                Ok(transitioned) => (transitioned, transitioned),
+                Err(error) => {
+                    failure_message = format!("Run failure could not be persisted: {error}");
+                    (false, true)
+                }
+            };
 
-            if failed_transitioned {
+            if emit_failure {
                 state
                     .run_manager
                     .send_event(
                         run_id,
                         session_id,
-                        SseEventData::run_error(run_id, &e.to_string()),
+                        SseEventData::run_error(run_id, &failure_message),
                     )
                     .await;
             }
@@ -1960,7 +2223,7 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
                 agent_name.as_deref(),
                 &context_id,
                 is_peer_message,
-                truncate_error_for_peer(&e),
+                truncate_error_for_peer(&alms_core::AlmsError::Runtime(failure_message)),
             )
             .await;
 
@@ -2516,6 +2779,9 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
     // arm owns a different vec. Cloned only for job-stamped runs.
     let mut episode_tool_calls: Vec<alms_core::ToolCallRecord> = Vec::new();
 
+    #[cfg(test)]
+    pause_before_terminal_transition(run_id).await;
+
     match result {
         Ok(output) => {
             persist_tool_calls(&output.tool_calls);
@@ -2643,10 +2909,24 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
             // silent here. Note this differs from the `Cancelled` / `Failed`
             // Err arms below where `handle_dm_run_failure` is intentionally
             // unconditional — see those arms for the rationale.
-            let completed_transitioned =
-                state
-                    .run_manager
-                    .mark_run_as_completed(run_id, output.response, output.usage);
+            let (completed_transitioned, completion_persistence_error) = match state
+                .run_manager
+                .try_mark_run_as_completed(run_id, output.response, output.usage)
+            {
+                Ok(transitioned) => (transitioned, None),
+                Err(error) => {
+                    let message = format!("Run completion could not be persisted: {error}");
+                    state
+                        .run_manager
+                        .send_event(
+                            run_id,
+                            session_id,
+                            SseEventData::run_error(run_id, &message),
+                        )
+                        .await;
+                    (false, Some(message))
+                }
+            };
 
             if completed_transitioned {
                 // token_delta events already emitted during streaming in the agent loop
@@ -2780,6 +3060,15 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
                 // `depths.remove()` / tombstone guard makes a second call a
                 // no-op (no duplicate marker or trigger). Best-effort — a
                 // returned error is logged, not propagated.
+                let completion_peer_error = lifecycle_persistence_error_for_peer(
+                    &state,
+                    run_id,
+                    completion_persistence_error,
+                );
+                let conversation_reason = completion_peer_error
+                    .map_or(ConversationEndReason::UserCancelled, |message| {
+                        ConversationEndReason::Errored { message }
+                    });
                 if let Err(e) = super::dm_lifecycle::handle_dm_run_failure(
                     &state,
                     &run_id,
@@ -2788,7 +3077,7 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
                     agent_name.as_deref(),
                     &context_id,
                     is_peer_message,
-                    ConversationEndReason::UserCancelled,
+                    conversation_reason,
                 )
                 .await
                 {
@@ -2825,7 +3114,22 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
             // The downstream `handle_dm_run_failure` and
             // `session_activity_ended` emissions still fire — they are
             // NOT duplicated by the HTTP handler (#1052 Tim review).
-            let cancelled_transitioned = state.run_manager.mark_run_as_cancelled(run_id);
+            let (cancelled_transitioned, cancellation_persistence_error) =
+                match state.run_manager.try_mark_run_as_cancelled(run_id) {
+                    Ok(transitioned) => (transitioned, None),
+                    Err(error) => {
+                        let message = format!("Run cancellation could not be persisted: {error}");
+                        state
+                            .run_manager
+                            .send_event(
+                                run_id,
+                                session_id,
+                                SseEventData::run_error(run_id, &message),
+                            )
+                            .await;
+                        (false, Some(message))
+                    }
+                };
 
             if cancelled_transitioned {
                 state
@@ -2867,6 +3171,15 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
             // `handle_dm_run_failure_double_end_is_idempotent`), so a
             // duplicate call after some other path already ended the
             // conversation is safe.
+            let cancellation_peer_error = lifecycle_persistence_error_for_peer(
+                &state,
+                run_id,
+                cancellation_persistence_error,
+            );
+            let conversation_reason = cancellation_peer_error
+                .map_or(ConversationEndReason::UserCancelled, |message| {
+                    ConversationEndReason::Errored { message }
+                });
             if let Err(e) = super::dm_lifecycle::handle_dm_run_failure(
                 &state,
                 &run_id,
@@ -2875,7 +3188,7 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
                 agent_name.as_deref(),
                 &context_id,
                 is_peer_message,
-                ConversationEndReason::UserCancelled,
+                conversation_reason,
             )
             .await
             {
@@ -2909,7 +3222,22 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
             // the rationale on gating the SSE broadcast on the transition
             // bool (and on `handle_dm_run_failure` being intentionally
             // unconditional).
-            let cancelled_transitioned = state.run_manager.mark_run_as_cancelled(run_id);
+            let (cancelled_transitioned, cancellation_persistence_error) =
+                match state.run_manager.try_mark_run_as_cancelled(run_id) {
+                    Ok(transitioned) => (transitioned, None),
+                    Err(error) => {
+                        let message = format!("Run cancellation could not be persisted: {error}");
+                        state
+                            .run_manager
+                            .send_event(
+                                run_id,
+                                session_id,
+                                SseEventData::run_error(run_id, &message),
+                            )
+                            .await;
+                        (false, Some(message))
+                    }
+                };
 
             if cancelled_transitioned {
                 state
@@ -2928,6 +3256,15 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
             // would strand the DM peer when an external path (e.g. the
             // synchronous HTTP cancel handler from #1050) won the
             // state-flip race.
+            let cancellation_peer_error = lifecycle_persistence_error_for_peer(
+                &state,
+                run_id,
+                cancellation_persistence_error,
+            );
+            let conversation_reason = cancellation_peer_error
+                .map_or(ConversationEndReason::UserCancelled, |message| {
+                    ConversationEndReason::Errored { message }
+                });
             if let Err(e) = super::dm_lifecycle::handle_dm_run_failure(
                 &state,
                 &run_id,
@@ -2936,7 +3273,7 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
                 agent_name.as_deref(),
                 &context_id,
                 is_peer_message,
-                ConversationEndReason::UserCancelled,
+                conversation_reason,
             )
             .await
             {
@@ -2988,17 +3325,25 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
             // duplicate terminal SSE event. `handle_dm_run_failure` below
             // remains UNCONDITIONAL per #1050 design (see the `Cancelled`
             // arm above for the rationale).
-            let failed_transitioned = state
+            let mut failure_message = source.to_string();
+            let (failed_transitioned, emit_failure, persistence_failed) = match state
                 .run_manager
-                .mark_run_as_failed(run_id, source.to_string());
+                .try_mark_run_as_failed(run_id, failure_message.clone())
+            {
+                Ok(transitioned) => (transitioned, transitioned, false),
+                Err(error) => {
+                    failure_message = format!("Run failure could not be persisted: {error}");
+                    (false, true, true)
+                }
+            };
 
-            if failed_transitioned {
+            if emit_failure {
                 state
                     .run_manager
                     .send_event(
                         run_id,
                         session_id,
-                        SseEventData::run_error(run_id, &source.to_string()),
+                        SseEventData::run_error(run_id, &failure_message),
                     )
                     .await;
             }
@@ -3037,7 +3382,9 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
                 &context_id,
                 is_peer_message,
                 ConversationEndReason::Errored {
-                    message: truncate_error_for_peer(&source),
+                    message: truncate_error_for_peer(&alms_core::AlmsError::Runtime(
+                        failure_message.clone(),
+                    )),
                 },
             )
             .await
@@ -3054,6 +3401,13 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
                     run_id.0,
                     tool_calls.len(),
                     source
+                );
+            } else if persistence_failed {
+                error!(
+                    "Run {} failure was quarantined after persistence failed ({} tool calls persisted): {}",
+                    run_id.0,
+                    tool_calls.len(),
+                    failure_message
                 );
             } else {
                 error!(
@@ -3080,15 +3434,25 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
             // non-Cancelled error into `FailedWithToolCalls`), but is
             // kept defensively for synthetic test inputs and
             // direct-runtime-bypass paths.
-            let failed_transitioned = state.run_manager.mark_run_as_failed(run_id, e.to_string());
+            let mut failure_message = e.to_string();
+            let (failed_transitioned, emit_failure, persistence_failed) = match state
+                .run_manager
+                .try_mark_run_as_failed(run_id, failure_message.clone())
+            {
+                Ok(transitioned) => (transitioned, transitioned, false),
+                Err(error) => {
+                    failure_message = format!("Run failure could not be persisted: {error}");
+                    (false, true, true)
+                }
+            };
 
-            if failed_transitioned {
+            if emit_failure {
                 state
                     .run_manager
                     .send_event(
                         run_id,
                         session_id,
-                        SseEventData::run_error(run_id, &e.to_string()),
+                        SseEventData::run_error(run_id, &failure_message),
                     )
                     .await;
             }
@@ -3114,7 +3478,9 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
                 &context_id,
                 is_peer_message,
                 ConversationEndReason::Errored {
-                    message: truncate_error_for_peer(&e),
+                    message: truncate_error_for_peer(&alms_core::AlmsError::Runtime(
+                        failure_message.clone(),
+                    )),
                 },
             )
             .await
@@ -3127,6 +3493,11 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
 
             if failed_transitioned {
                 error!("Run {} failed: {}", run_id.0, e);
+            } else if persistence_failed {
+                error!(
+                    "Run {} failure was quarantined after persistence failed: {}",
+                    run_id.0, failure_message
+                );
             } else {
                 error!(
                     "Run {} loop returned Err but state was already terminal — \
@@ -3236,16 +3607,24 @@ where
     const PANIC_REASON: &str = "Run panicked during execution";
     error!(run_id = %run_id.0, %session_id, "{PANIC_REASON}");
 
-    let transitioned = state
+    let (transitioned, failure_message, persistence_failed) = match state
         .run_manager
-        .mark_run_as_failed(run_id, PANIC_REASON.to_string());
-    if transitioned {
+        .try_mark_run_as_failed(run_id, PANIC_REASON.to_string())
+    {
+        Ok(transitioned) => (transitioned, PANIC_REASON.to_string(), false),
+        Err(error) => (
+            false,
+            format!("Run panic could not be persisted: {error}"),
+            true,
+        ),
+    };
+    if transitioned || persistence_failed {
         state
             .run_manager
             .send_event(
                 run_id,
                 session_id,
-                SseEventData::run_error(run_id, PANIC_REASON),
+                SseEventData::run_error(run_id, &failure_message),
             )
             .await;
 
@@ -3258,7 +3637,7 @@ where
             &context_id,
             is_peer_message,
             ConversationEndReason::Errored {
-                message: PANIC_REASON.to_string(),
+                message: failure_message,
             },
         )
         .await
@@ -3300,7 +3679,7 @@ pub async fn get_run_status(
     match state.run_manager.get_run(run_id) {
         Some(run) => {
             let agent_id = run.agent_id;
-            let is_queued = matches!(run.status, alms_core::RunStatus::Queued);
+            let is_queued = matches!(run.status(), alms_core::RunStatus::Queued);
             let mut resp = RunStatusResponse::from(run);
             // Attach tool call count if SQLite is available.
             if let Some(store) = state.session_manager.store() {

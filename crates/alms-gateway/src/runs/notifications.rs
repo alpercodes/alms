@@ -31,16 +31,34 @@ pub(crate) async fn scheduler_fire_loop(mut rx: mpsc::UnboundedReceiver<JobId>, 
         let Some(job) = state.job_store.get(job_id) else {
             continue;
         };
-        if job.status == JobStatus::Cancelled {
+        if job.status() == JobStatus::Cancelled {
             continue;
         }
         let state_clone = state.clone();
+        let retry_state = state.clone();
         let Ok(reservation) = state.agent_queue.reserve(job.agent_id).await else {
             break;
         };
         if let Err(error) = reservation.submit(Box::pin(async move {
             if let Err(e) = fire_job_run(state_clone, job_id).await {
                 error!("Job {} run dispatch failed: {}", job_id, e);
+                if retry_state
+                    .job_store
+                    .get(job_id)
+                    .is_some_and(|job| job.status() != JobStatus::Cancelled)
+                {
+                    retry_state
+                        .scheduler
+                        .schedule_once(
+                            job_id,
+                            tokio::time::Instant::now() + std::time::Duration::from_secs(5),
+                        )
+                        .await;
+                    warn!(
+                        %job_id,
+                        "Re-armed scheduled job after durable run registration failed"
+                    );
+                }
             }
         })) {
             warn!(?error, %job_id, "Scheduled job queue closed before dispatch");
@@ -60,7 +78,7 @@ pub(super) async fn fire_job_run(state: AppState, job_id: JobId) -> alms_core::A
         info!("Skipping fired job — not found in store");
         return Ok(());
     };
-    if job.status == JobStatus::Cancelled {
+    if job.status() == JobStatus::Cancelled {
         info!("Skipping fired job — already cancelled");
         return Ok(());
     }
@@ -83,7 +101,7 @@ pub(super) async fn fire_job_run(state: AppState, job_id: JobId) -> alms_core::A
 
     let run = Run::for_job(session_id, job.agent_id, job.prompt.clone(), job_id);
     let run_id = run.run_id;
-    state.run_manager.insert_run(run.clone());
+    state.run_manager.insert_run(run.clone())?;
     // Job runs execute inline (not via agent_queue) so queued_behind is 0.
     state
         .run_manager
@@ -219,7 +237,7 @@ pub(super) async fn close_episode(
         info!(job_id = %job_id, "Job disappeared during episode — skipping close");
         return;
     };
-    if job.status == JobStatus::Cancelled {
+    if job.status() == JobStatus::Cancelled {
         info!(job_id = %job_id, "Job was cancelled during episode — skipping close");
         return;
     }
@@ -259,7 +277,7 @@ pub(super) async fn close_episode(
     // the job `Cancelled -> Active` and re-arm it (a cancelled recurring
     // job resurrected). The store's absorbing-`Cancelled` guard now refuses
     // the stale write, and every re-arm below is gated on `Recorded`.
-    record_and_rearm(state, &job, &episode).await;
+    record_and_rearm(state, &job, &episode, timed_out).await;
     drop(job_completion_cancellation_guard);
 }
 
@@ -278,6 +296,7 @@ pub(super) async fn record_and_rearm(
     state: &AppState,
     job: &alms_core::job::Job,
     episode: &job_episode::JobEpisode,
+    timed_out: bool,
 ) {
     let job_id = episode.job_id;
     let now = Utc::now();
@@ -286,10 +305,17 @@ pub(super) async fn record_and_rearm(
             // Target status is Cancelled (a spent one-shot). A refusal means
             // a DELETE won the race and the job is already Cancelled — the
             // same terminal state either way; nothing to re-arm.
-            match state
-                .job_store
-                .record_run(job_id, now, JobStatus::Cancelled, None)
-            {
+            match state.job_store.record_run_with_reason(
+                job_id,
+                now,
+                JobStatus::Cancelled,
+                None,
+                Some(if timed_out {
+                    alms_core::JobTerminalReason::DeadlineReached
+                } else {
+                    alms_core::JobTerminalReason::Completed
+                }),
+            ) {
                 Ok(RecordRunOutcome::Recorded) => {}
                 Ok(outcome) => {
                     info!(job_id = %job_id, ?outcome, "record_run not applied at episode close")
@@ -415,7 +441,7 @@ async fn notify_job_completion(
     // (#1196). Failed/cancelled text isn't fetchable, so those arms never
     // signal a fetch regardless of capping.
     let (status, raw_summary, fetchable) = match state.run_manager.get_run(run_id) {
-        Some(run) => match run.status {
+        Some(run) => match run.status() {
             RunStatus::Completed => ("success", run.output.unwrap_or_default(), true),
             RunStatus::Failed => (
                 "error",
@@ -1057,7 +1083,17 @@ pub(super) async fn enqueue_triggered_run(
     state
         .run_manager
         .register_cancel_token(run_id, cancel_token.clone());
-    state.run_manager.insert_run(run);
+    if let Err(error) = state.run_manager.insert_run(run) {
+        state.run_manager.remove_cancel_token(run_id);
+        drop(job_trigger_cancellation_gate);
+        error!(
+            run_id = %run_id.0,
+            error = %error,
+            "Triggered run registration failed durably"
+        );
+        finish_episode_run(state, job_id, run_id, &[]).await;
+        return None;
+    }
 
     // #1207 (Tim's S4 on PR #1202): record an episode continuation's run id
     // IMMEDIATELY after the run exists — before the enqueue below could
@@ -1105,9 +1141,25 @@ pub(super) async fn enqueue_triggered_run(
     })) {
         Ok(receipt) => receipt,
         Err(error) => {
-            let _ = state
+            let persistence_error = state
                 .run_manager
-                .mark_run_as_failed(run_id, "Run queue closed before dispatch".to_string());
+                .try_mark_run_as_failed(run_id, "Run queue closed before dispatch".to_string())
+                .err();
+            if let Some(persistence_error) = persistence_error {
+                state
+                    .run_manager
+                    .send_event(
+                        run_id,
+                        session_id,
+                        SseEventData::run_error(
+                            run_id,
+                            &format!(
+                                "Triggered run dispatch failure could not be persisted: {persistence_error}"
+                            ),
+                        ),
+                    )
+                    .await;
+            }
             state.run_manager.remove_cancel_token(run_id);
             finish_episode_run(state, job_id, run_id, &[]).await;
             warn!(
@@ -1970,10 +2022,10 @@ mod tests {
         output: String,
     ) -> RunId {
         let mut run = Run::for_job(session_id, agent_id, prompt.to_string(), job_id);
-        run.status = RunStatus::Completed;
-        run.output = Some(output);
+        assert!(run.mark_running());
+        assert!(run.mark_completed(output, Default::default()));
         let run_id = run.run_id;
-        state.run_manager.insert_run(run);
+        let _ = state.run_manager.insert_run(run);
         run_id
     }
 
@@ -2290,10 +2342,10 @@ mod tests {
         // A Failed run with an over-cap error body.
         let job_id = JobId::new();
         let mut run = Run::for_job(web_session_id, agent_id, "flaky job".to_string(), job_id);
-        run.status = RunStatus::Failed;
-        run.error = Some("boom ".repeat(crate::sse::JOB_SUMMARY_MAX_CHARS));
+        assert!(run.mark_running());
+        assert!(run.mark_failed("boom ".repeat(crate::sse::JOB_SUMMARY_MAX_CHARS)));
         let run_id = run.run_id;
-        state.run_manager.insert_run(run);
+        let _ = state.run_manager.insert_run(run);
 
         notify_job_completion(&state, agent_id, "flaky job", run_id, job_id, None).await;
 

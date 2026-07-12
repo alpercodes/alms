@@ -464,6 +464,7 @@ Why not `POST /agent/run`?
   "session_id": "<uuid>",
   "agent_id": "<uuid>",
   "status": "completed",
+  "lifecycle_revision": 2,
   "response": "The agent's text output",
   "error": null,
   "started_at": "2026-02-11T07:52:00Z",
@@ -485,6 +486,8 @@ Why not `POST /agent/run`?
 ```
 
 Notes:
+- lifecycle_revision starts at 0 and increases for every accepted status transition. Clients can reject a delayed snapshot whose revision is lower than one they have already observed.
+- terminal_reason is omitted outside failed/cancelled terminal states. Current machine-readable values include "failed", "cancelled", and "gateway_restarted".
 - `response` and `error` use `skip_serializing_if = "Option::is_none"` — they are absent (not `null`) for in-flight runs, present only once the run reaches a terminal state.
 - `response` maps to the agent's text output (`Run.output`); renamed at the API boundary for clarity.
 - `usage` is `null` for failed/cancelled runs.
@@ -1225,6 +1228,13 @@ open (absent otherwise):
   }
 }
 ```
+
+Every job object also carries lifecycle_revision (starting at 0 and increasing
+for each accepted lifecycle mutation). terminal_reason is omitted for
+pending/active jobs. A terminal one-shot job keeps the legacy
+status "cancelled" shape for compatibility and distinguishes its outcome with
+terminal_reason "completed" or "deadline_reached"; an operator cancellation
+uses "operator_cancelled".
 
 ### 7.2 Cancel a job
 `DELETE /jobs/{job_id}`

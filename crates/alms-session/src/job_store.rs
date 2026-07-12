@@ -1,12 +1,16 @@
 //! In-memory job store with optional SQLite write-through.
 
 use crate::sqlite::SqliteStore;
-use alms_core::AlmsResult;
-use alms_core::job::{CreateJobRequest, Job, JobId, JobSchedule, JobStatus};
-use chrono::Utc;
+use alms_core::TransitionOutcome;
+use alms_core::job::{
+    CreateJobRequest, Job, JobId, JobSchedule, JobStatus, JobTerminalReason, JobTransition,
+};
+use alms_core::{AlmsError, AlmsResult, MAX_LIFECYCLE_REVISION};
 use dashmap::DashMap;
 use std::sync::Arc;
-use tracing::{info, warn};
+#[cfg(test)]
+use std::sync::atomic::{AtomicBool, Ordering};
+use tracing::info;
 
 /// Outcome of [`JobStore::record_run`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -32,6 +36,8 @@ pub enum RecordRunOutcome {
 pub struct JobStore {
     jobs: Arc<DashMap<JobId, Job>>,
     store: Option<Arc<SqliteStore>>,
+    #[cfg(test)]
+    fail_next_persistence: Arc<AtomicBool>,
 }
 
 impl Default for JobStore {
@@ -46,6 +52,8 @@ impl JobStore {
         Self {
             jobs: Arc::new(DashMap::new()),
             store: None,
+            #[cfg(test)]
+            fail_next_persistence: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -83,21 +91,10 @@ impl JobStore {
             JobSchedule::Recurring { .. } => None,
         };
 
-        let job = Job {
-            id: JobId::new(),
-            agent_id: req.agent_id,
-            prompt: req.prompt,
-            schedule: req.schedule,
-            status: JobStatus::Pending,
-            created_at: Utc::now(),
-            next_run_at,
-            last_run_at: None,
-        };
+        let job = Job::new(req.agent_id, req.prompt, req.schedule, next_run_at);
 
-        if let Some(ref store) = self.store
-            && let Err(e) = store.save_job(&job)
-        {
-            warn!("Failed to persist job {}: {}", job.id.0, e);
+        if let Some(ref store) = self.store {
+            store.save_job(&job)?;
         }
 
         self.jobs.insert(job.id, job.clone());
@@ -124,16 +121,7 @@ impl JobStore {
         id: JobId,
         next: Option<chrono::DateTime<chrono::Utc>>,
     ) -> AlmsResult<()> {
-        if let Some(mut entry) = self.jobs.get_mut(&id) {
-            entry.next_run_at = next;
-            let job = entry.clone();
-            drop(entry);
-            if let Some(ref store) = self.store
-                && let Err(e) = store.save_job(&job)
-            {
-                warn!("Failed to persist next_run_at for job {}: {}", id.0, e);
-            }
-        }
+        let _ = self.transition_job(id, JobTransition::SetNextRunAt(next))?;
         Ok(())
     }
 
@@ -160,29 +148,46 @@ impl JobStore {
         new_status: JobStatus,
         next_run_at: Option<chrono::DateTime<chrono::Utc>>,
     ) -> AlmsResult<RecordRunOutcome> {
-        let Some(mut entry) = self.jobs.get_mut(&id) else {
-            return Ok(RecordRunOutcome::NotFound);
+        let terminal_reason =
+            (new_status == JobStatus::Cancelled).then_some(JobTerminalReason::Completed);
+        self.record_run_with_reason(id, ran_at, new_status, next_run_at, terminal_reason)
+    }
+
+    /// Record a firing with an explicit terminal reason for a one-shot job.
+    pub fn record_run_with_reason(
+        &self,
+        id: JobId,
+        ran_at: chrono::DateTime<chrono::Utc>,
+        new_status: JobStatus,
+        next_run_at: Option<chrono::DateTime<chrono::Utc>>,
+        terminal_reason: Option<JobTerminalReason>,
+    ) -> AlmsResult<RecordRunOutcome> {
+        let transition = match new_status {
+            JobStatus::Active => JobTransition::RecordRecurringRun {
+                ran_at,
+                next_run_at,
+            },
+            JobStatus::Cancelled => JobTransition::CompleteOneShot {
+                ran_at,
+                terminal_reason: terminal_reason.unwrap_or(JobTerminalReason::Completed),
+            },
+            JobStatus::Pending => {
+                return Err(AlmsError::InvalidConfig(
+                    "record_run cannot transition a job to pending".to_string(),
+                ));
+            }
         };
-        if entry.status == JobStatus::Cancelled {
-            drop(entry);
-            info!(
-                "Job {} is cancelled — record_run refused (Cancelled is absorbing, #1202 S1)",
-                id.0
-            );
-            return Ok(RecordRunOutcome::RefusedCancelled);
+        match self.transition_job(id, transition)? {
+            None => Ok(RecordRunOutcome::NotFound),
+            Some(TransitionOutcome::Applied { .. }) => {
+                info!("Job {} run recorded (status={:?})", id.0, new_status);
+                Ok(RecordRunOutcome::Recorded)
+            }
+            Some(TransitionOutcome::NoOp { .. } | TransitionOutcome::Rejected { .. }) => {
+                info!("Job {} is terminal — record_run refused", id.0);
+                Ok(RecordRunOutcome::RefusedCancelled)
+            }
         }
-        entry.last_run_at = Some(ran_at);
-        entry.status = new_status;
-        entry.next_run_at = next_run_at;
-        let job = entry.clone();
-        drop(entry);
-        if let Some(ref store) = self.store
-            && let Err(e) = store.save_job(&job)
-        {
-            warn!("Failed to persist record_run for job {}: {}", id.0, e);
-        }
-        info!("Job {} run recorded (status={:?})", id.0, new_status);
-        Ok(RecordRunOutcome::Recorded)
     }
 
     /// Cancel a job.
@@ -192,27 +197,55 @@ impl JobStore {
     /// - `Ok(Some(false))` — job exists but was already cancelled
     /// - `Ok(None)` — job not found
     pub fn cancel(&self, id: JobId) -> AlmsResult<Option<bool>> {
+        match self.transition_job(id, JobTransition::Cancel)? {
+            None => Ok(None),
+            Some(TransitionOutcome::Applied { .. }) => {
+                info!("Cancelled job {}", id.0);
+                Ok(Some(true))
+            }
+            Some(TransitionOutcome::NoOp { .. } | TransitionOutcome::Rejected { .. }) => {
+                Ok(Some(false))
+            }
+        }
+    }
+
+    fn transition_job(
+        &self,
+        id: JobId,
+        transition: JobTransition,
+    ) -> AlmsResult<Option<TransitionOutcome<JobStatus>>> {
         let Some(mut entry) = self.jobs.get_mut(&id) else {
             return Ok(None);
         };
-
-        if entry.status == JobStatus::Cancelled {
-            return Ok(Some(false));
-        }
-
-        entry.status = JobStatus::Cancelled;
-        entry.next_run_at = None;
-        let job = entry.clone();
-        drop(entry);
-
-        if let Some(ref store) = self.store
-            && let Err(e) = store.save_job(&job)
+        let mut candidate = entry.clone();
+        let outcome = candidate.transition(transition);
+        if matches!(outcome, TransitionOutcome::Rejected { .. })
+            && candidate.lifecycle_revision() >= MAX_LIFECYCLE_REVISION
         {
-            warn!("Failed to persist cancellation for job {}: {}", id.0, e);
+            return Err(AlmsError::Runtime(format!(
+                "job {} lifecycle revision is exhausted",
+                id.0
+            )));
         }
+        if outcome.is_applied() {
+            #[cfg(test)]
+            if self.fail_next_persistence.swap(false, Ordering::AcqRel) {
+                return Err(AlmsError::Runtime(
+                    "injected job persistence failure".to_string(),
+                ));
+            }
+            if let Some(store) = &self.store {
+                store.save_job(&candidate)?;
+            }
+            *entry = candidate;
+        }
+        drop(entry);
+        Ok(Some(outcome))
+    }
 
-        info!("Cancelled job {}", id.0);
-        Ok(Some(true))
+    #[cfg(test)]
+    fn inject_next_persistence_failure(&self) {
+        self.fail_next_persistence.store(true, Ordering::Release);
     }
 
     /// Flush the SQLite WAL to disk. No-op if no SQLite store is attached.
@@ -281,13 +314,109 @@ mod tests {
         assert_eq!(store.cancel(job.id).unwrap(), Some(false));
         // still in list with Cancelled status
         let listed = store.list();
-        assert_eq!(listed[0].status, JobStatus::Cancelled);
+        assert_eq!(listed[0].status(), JobStatus::Cancelled);
     }
 
     #[test]
     fn test_cancel_unknown_returns_none() {
         let store = JobStore::new();
         assert_eq!(store.cancel(JobId::new()).unwrap(), None);
+    }
+
+    #[test]
+    fn revision_exhaustion_is_reported_instead_of_already_cancelled() {
+        let store = JobStore::new();
+        let job = Job::from_persisted(
+            JobId::new(),
+            AgentId::new(),
+            "exhausted".to_string(),
+            JobSchedule::Recurring {
+                cron: "* * * * *".to_string(),
+            },
+            JobStatus::Pending,
+            Utc::now(),
+            None,
+            None,
+            MAX_LIFECYCLE_REVISION,
+            None,
+        );
+        let job_id = job.id;
+        store.jobs.insert(job_id, job);
+
+        let error = store.cancel(job_id).unwrap_err().to_string();
+        assert!(error.contains("revision is exhausted"));
+        assert_eq!(store.get(job_id).unwrap().status(), JobStatus::Pending);
+    }
+
+    #[test]
+    fn failed_cancel_persistence_does_not_commit_or_resurrect_on_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("jobs.db");
+        let path = path.to_string_lossy().into_owned();
+        let store = JobStore::with_sqlite(&path).unwrap();
+        let job = store.create(recurring_req()).unwrap();
+        let next = Utc::now() + chrono::Duration::minutes(1);
+        assert_eq!(
+            store
+                .record_run(job.id, Utc::now(), JobStatus::Active, Some(next))
+                .unwrap(),
+            RecordRunOutcome::Recorded
+        );
+
+        store.inject_next_persistence_failure();
+        assert!(store.cancel(job.id).is_err());
+        assert_eq!(store.get(job.id).unwrap().status(), JobStatus::Active);
+        drop(store);
+
+        let restarted = JobStore::with_sqlite(&path).unwrap();
+        let job = restarted
+            .get(job.id)
+            .expect("durable active job should load after restart");
+        assert_eq!(job.status(), JobStatus::Active);
+        assert_eq!(job.next_run_at, Some(next));
+        assert_eq!(job.terminal_reason(), None);
+    }
+
+    #[test]
+    fn job_completion_and_operator_cancellation_are_first_writer_wins() {
+        let store = JobStore::new();
+        let completed_first = store.create(once_req()).unwrap();
+        assert_eq!(
+            store
+                .record_run_with_reason(
+                    completed_first.id,
+                    Utc::now(),
+                    JobStatus::Cancelled,
+                    None,
+                    Some(JobTerminalReason::Completed),
+                )
+                .unwrap(),
+            RecordRunOutcome::Recorded
+        );
+        assert_eq!(store.cancel(completed_first.id).unwrap(), Some(false));
+        assert_eq!(
+            store.get(completed_first.id).unwrap().terminal_reason(),
+            Some(JobTerminalReason::Completed)
+        );
+
+        let cancelled_first = store.create(once_req()).unwrap();
+        assert_eq!(store.cancel(cancelled_first.id).unwrap(), Some(true));
+        assert_eq!(
+            store
+                .record_run_with_reason(
+                    cancelled_first.id,
+                    Utc::now(),
+                    JobStatus::Cancelled,
+                    None,
+                    Some(JobTerminalReason::Completed),
+                )
+                .unwrap(),
+            RecordRunOutcome::RefusedCancelled
+        );
+        assert_eq!(
+            store.get(cancelled_first.id).unwrap().terminal_reason(),
+            Some(JobTerminalReason::OperatorCancelled)
+        );
     }
 
     /// #1202 S1: `Cancelled` is absorbing. A `record_run` landing after a
@@ -319,7 +448,7 @@ mod tests {
 
         let job = store.get(job.id).unwrap();
         assert_eq!(
-            job.status,
+            job.status(),
             JobStatus::Cancelled,
             "a cancelled job must never transition back to Active"
         );
@@ -347,7 +476,7 @@ mod tests {
         assert_eq!(outcome, RecordRunOutcome::Recorded);
 
         let job = store.get(job.id).unwrap();
-        assert_eq!(job.status, JobStatus::Active);
+        assert_eq!(job.status(), JobStatus::Active);
         assert_eq!(job.next_run_at, Some(next));
         assert!(job.last_run_at.is_some());
     }
@@ -369,16 +498,12 @@ mod tests {
         let expected_agent_id = req.agent_id;
 
         let schedule_json = serde_json::to_string(&req.schedule).unwrap();
-        let job = Job {
-            id: JobId::new(),
-            agent_id: req.agent_id,
-            prompt: req.prompt,
-            schedule: req.schedule,
-            status: JobStatus::Pending,
-            created_at: Utc::now(),
-            next_run_at: Some(Utc::now() + chrono::Duration::hours(1)),
-            last_run_at: None,
-        };
+        let job = Job::new(
+            req.agent_id,
+            req.prompt,
+            req.schedule,
+            Some(Utc::now() + chrono::Duration::hours(1)),
+        );
         store.save_job(&job).unwrap();
 
         let jobs = store.load_all_jobs().unwrap();
@@ -393,26 +518,101 @@ mod tests {
     }
 
     #[test]
+    fn equal_revision_job_snapshot_is_an_idempotent_noop() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let mut authoritative = Job::new(
+            AgentId::new(),
+            "once".to_string(),
+            JobSchedule::Once { run_at: Utc::now() },
+            Some(Utc::now()),
+        );
+        assert!(
+            authoritative
+                .transition(JobTransition::CompleteOneShot {
+                    ran_at: Utc::now(),
+                    terminal_reason: JobTerminalReason::Completed,
+                })
+                .is_applied()
+        );
+        let conflicting = Job::from_persisted(
+            authoritative.id,
+            authoritative.agent_id,
+            "delayed conflicting payload".to_string(),
+            authoritative.schedule.clone(),
+            authoritative.status(),
+            authoritative.created_at,
+            authoritative.next_run_at,
+            authoritative.last_run_at,
+            authoritative.lifecycle_revision(),
+            Some(JobTerminalReason::OperatorCancelled),
+        );
+
+        store.save_job(&authoritative).unwrap();
+        store.save_job(&conflicting).unwrap();
+
+        let loaded = store
+            .load_job_by_id(authoritative.id)
+            .unwrap()
+            .expect("job should remain persisted");
+        assert_eq!(loaded.prompt, "once");
+        assert_eq!(loaded.terminal_reason(), Some(JobTerminalReason::Completed));
+    }
+
+    #[test]
+    fn sqlite_refuses_stale_job_snapshot_after_terminal_transition() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let mut job = Job::new(
+            AgentId::new(),
+            "x".to_string(),
+            JobSchedule::Recurring {
+                cron: "* * * * *".to_string(),
+            },
+            Some(Utc::now()),
+        );
+        assert!(
+            job.transition(JobTransition::RecordRecurringRun {
+                ran_at: Utc::now(),
+                next_run_at: None,
+            })
+            .is_applied()
+        );
+        let stale = job.clone();
+        assert!(job.transition(JobTransition::Cancel).is_applied());
+
+        store.save_job(&job).unwrap();
+        store.save_job(&stale).unwrap();
+
+        let loaded = store.load_job_by_id(job.id).unwrap().unwrap();
+        assert_eq!(loaded.status(), JobStatus::Cancelled);
+        assert_eq!(loaded.lifecycle_revision(), 2);
+        assert_eq!(
+            loaded.terminal_reason(),
+            Some(JobTerminalReason::OperatorCancelled)
+        );
+    }
+
+    #[test]
     fn test_sqlite_cancelled_not_loaded() {
         let store = SqliteStore::open_in_memory().unwrap();
-        let mut job = Job {
-            id: JobId::new(),
-            agent_id: AgentId::new(),
-            prompt: "x".to_string(),
-            schedule: JobSchedule::Once { run_at: Utc::now() },
-            status: JobStatus::Cancelled,
-            created_at: Utc::now(),
-            next_run_at: None,
-            last_run_at: None,
-        };
+        let mut job = Job::new(
+            AgentId::new(),
+            "x".to_string(),
+            JobSchedule::Once { run_at: Utc::now() },
+            None,
+        );
+        assert!(job.transition(JobTransition::Cancel).is_applied());
         store.save_job(&job).unwrap();
         // Cancelled jobs are not loaded on startup
         assert_eq!(store.load_all_jobs().unwrap().len(), 0);
 
-        // Pending jobs are loaded
-        job.id = JobId::new();
-        job.status = JobStatus::Pending;
-        store.save_job(&job).unwrap();
+        // Pending jobs are loaded.
+        let pending = Job::new(
+            job.agent_id,
+            "pending".to_string(),
+            JobSchedule::Once { run_at: Utc::now() },
+            Some(Utc::now()),
+        );
+        store.save_job(&pending).unwrap();
         assert_eq!(store.load_all_jobs().unwrap().len(), 1);
     }
 }

@@ -966,7 +966,7 @@ mod tests {
         let parent_session_id = parent_session.id;
         let parent_run = Run::new(parent_session_id, parent_agent_id, "user input".into());
         let parent_run_id = parent_run.run_id;
-        state.run_manager.insert_run(parent_run);
+        let _ = state.run_manager.insert_run(parent_run);
 
         // Subagent session (context_id must start with `subagent_` so
         // `classify_session_type` returns `"subagent"`), plus a run on
@@ -982,7 +982,7 @@ mod tests {
             "subagent input".into(),
             parent_run_id,
         );
-        state.run_manager.insert_run(sub_run);
+        let _ = state.run_manager.insert_run(sub_run);
 
         let (status, body) = invoke_get_session_metadata(state, sub_session_id).await;
 
@@ -1018,7 +1018,7 @@ mod tests {
             "subagent input".into(),
             phantom_parent_run_id,
         );
-        state.run_manager.insert_run(sub_run);
+        let _ = state.run_manager.insert_run(sub_run);
 
         let (status, body) = invoke_get_session_metadata(state, sub_session_id).await;
 
@@ -1055,7 +1055,7 @@ mod tests {
         let parent_session_id = parent_session.id;
         let parent_run = Run::new(parent_session_id, parent_agent_id, "user input".into());
         let parent_run_id = parent_run.run_id;
-        state.run_manager.insert_run(parent_run);
+        let _ = state.run_manager.insert_run(parent_run);
 
         // Subagent session — first run goes through `Run::for_subagent`
         // and carries the breadcrumb.
@@ -1070,7 +1070,7 @@ mod tests {
             "subagent input".into(),
             parent_run_id,
         );
-        state.run_manager.insert_run(original_sub_run);
+        let _ = state.run_manager.insert_run(original_sub_run);
 
         // ...then a LATER run lands on the same session without a
         // parent breadcrumb. Use a strictly-later `created_at` so the
@@ -1081,7 +1081,7 @@ mod tests {
         let mut parentless_later_run =
             Run::new(sub_session_id, sub_agent_id, "follow-up input".into());
         parentless_later_run.created_at = chrono::Utc::now() + chrono::Duration::seconds(60);
-        state.run_manager.insert_run(parentless_later_run);
+        let _ = state.run_manager.insert_run(parentless_later_run);
 
         // Sanity: the newest-first ordering really does put the
         // parent-less run ahead of the parent-linked one. If this

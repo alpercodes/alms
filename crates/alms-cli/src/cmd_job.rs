@@ -74,7 +74,7 @@ pub(crate) fn job_list(
             JobSchedule::Once { run_at } => format!("once:{}", fmt_time(run_at)),
             JobSchedule::Recurring { cron } => format!("cron:{cron}"),
         };
-        let status = fmt_job_status(j.status);
+        let status = fmt_job_status(j.status());
         let next = j
             .next_run_at
             .map(|t| fmt_time(&t))
@@ -112,7 +112,7 @@ pub(crate) fn job_show(store: &SqliteStore, job_id_str: &str, json: bool) -> any
     println!("Agent:       {}", job.agent_id);
     println!("Prompt:      {}", job.prompt);
     println!("Schedule:    {}", schedule);
-    println!("Status:      {}", fmt_job_status(job.status));
+    println!("Status:      {}", fmt_job_status(job.status()));
     println!("Created:     {}", fmt_time(&job.created_at));
     if let Some(t) = job.next_run_at {
         println!("Next Run:    {}", fmt_time(&t));
@@ -231,16 +231,7 @@ mod tests {
                 run_at: chrono::Utc::now() + chrono::Duration::hours(1),
             },
         };
-        let job = Job {
-            id: JobId::new(),
-            agent_id: req.agent_id,
-            prompt: req.prompt,
-            schedule: req.schedule,
-            status: JobStatus::Pending,
-            created_at: chrono::Utc::now(),
-            next_run_at: None,
-            last_run_at: None,
-        };
+        let job = Job::new(req.agent_id, req.prompt, req.schedule, None);
         store.save_job(&job).unwrap();
         job
     }

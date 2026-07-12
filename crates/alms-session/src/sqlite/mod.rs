@@ -35,7 +35,7 @@ pub use tool_calls::SessionToolCall;
 use crate::types::{
     Content, ContextSummary, Message, Role, Session, SessionStatus, SessionSummary,
 };
-use alms_core::job::{Job, JobId, JobSchedule, JobStatus};
+use alms_core::job::{Job, JobId, JobSchedule, JobStatus, JobTerminalReason};
 use alms_core::registry::AgentRecord;
 use alms_core::run::{Run, RunStatus, TokenUsage, ToolCallRecord, ToolCallRole};
 use alms_core::{
@@ -282,6 +282,23 @@ fn str_to_job_status(s: &str) -> JobStatus {
     }
 }
 
+fn job_terminal_reason_to_str(reason: JobTerminalReason) -> &'static str {
+    match reason {
+        JobTerminalReason::Completed => "completed",
+        JobTerminalReason::DeadlineReached => "deadline_reached",
+        JobTerminalReason::OperatorCancelled => "operator_cancelled",
+    }
+}
+
+fn str_to_job_terminal_reason(s: &str) -> Option<JobTerminalReason> {
+    match s {
+        "completed" => Some(JobTerminalReason::Completed),
+        "deadline_reached" => Some(JobTerminalReason::DeadlineReached),
+        "operator_cancelled" => Some(JobTerminalReason::OperatorCancelled),
+        _ => None,
+    }
+}
+
 fn run_status_to_str(status: RunStatus) -> &'static str {
     match status {
         RunStatus::Queued => "queued",
@@ -312,6 +329,8 @@ fn parse_job_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Job> {
     let created_at_str: String = row.get(5)?;
     let next_run_at_str: Option<String> = row.get(6)?;
     let last_run_at_str: Option<String> = row.get(7)?;
+    let lifecycle_revision: i64 = row.get(8)?;
+    let terminal_reason_str: Option<String> = row.get(9)?;
 
     let id_uuid = uuid::Uuid::parse_str(&id_str).map_err(|e| {
         rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
@@ -332,16 +351,23 @@ fn parse_job_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Job> {
         .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
         .map(|dt| dt.with_timezone(&chrono::Utc));
 
-    Ok(Job {
-        id: JobId(id_uuid),
-        agent_id: AgentId(agent_uuid),
+    let lifecycle_revision = u64::try_from(lifecycle_revision).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(8, rusqlite::types::Type::Integer, Box::new(e))
+    })?;
+    Ok(Job::from_persisted(
+        JobId(id_uuid),
+        AgentId(agent_uuid),
         prompt,
         schedule,
-        status: str_to_job_status(&status_str),
-        created_at: created_at.with_timezone(&chrono::Utc),
+        str_to_job_status(&status_str),
+        created_at.with_timezone(&chrono::Utc),
         next_run_at,
         last_run_at,
-    })
+        lifecycle_revision,
+        terminal_reason_str
+            .as_deref()
+            .and_then(str_to_job_terminal_reason),
+    ))
 }
 
 fn parse_session_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Session> {
@@ -487,7 +513,8 @@ fn parse_agent_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentRecord> {
 ///   0: run_id, 1: session_id, 2: agent_id, 3: input, 4: response,
 ///   5: error, 6: status, 7: started_at, 8: ended_at,
 ///   9: prompt_tokens, 10: completion_tokens, 11: job_id,
-///   12: parent_run_id, 13: created_at, 14: resolved_config (#837)
+///   12: parent_run_id, 13: created_at, 14: resolved_config (#837),
+///   15: lifecycle_revision, 16: terminal_reason
 fn parse_run_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Run> {
     let run_id_str: String = row.get(0)?;
     let session_id_str: String = row.get(1)?;
@@ -526,6 +553,8 @@ fn parse_run_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Run> {
     // tighten this to `row.get(14)?` without auditing those failure
     // paths.
     let resolved_config_str: Option<String> = row.get(14).ok().flatten();
+    let lifecycle_revision: i64 = row.get(15).unwrap_or_default();
+    let terminal_reason: Option<String> = row.get(16).ok().flatten();
 
     let run_id_uuid = uuid::Uuid::parse_str(&run_id_str).map_err(|e| {
         rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
@@ -600,13 +629,16 @@ fn parse_run_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Run> {
         }
     });
 
-    Ok(Run {
-        run_id: RunId(run_id_uuid),
-        session_id: SessionId(session_id_uuid),
-        agent_id: AgentId(agent_id_uuid),
-        status: str_to_run_status(&status_str),
+    let lifecycle_revision = u64::try_from(lifecycle_revision).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(15, rusqlite::types::Type::Integer, Box::new(e))
+    })?;
+    Ok(Run::from_persisted(
+        RunId(run_id_uuid),
+        SessionId(session_id_uuid),
+        AgentId(agent_id_uuid),
+        str_to_run_status(&status_str),
         input,
-        output: response,
+        response,
         error,
         usage,
         created_at,
@@ -615,5 +647,7 @@ fn parse_run_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Run> {
         job_id,
         parent_run_id,
         resolved_config,
-    })
+        lifecycle_revision,
+        terminal_reason,
+    ))
 }

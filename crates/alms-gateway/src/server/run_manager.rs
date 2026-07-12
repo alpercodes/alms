@@ -7,12 +7,14 @@
 
 use crate::event_log::{AgentEventLogManager, EventLogManager, LoggedEvent};
 use crate::sse::SseEventData;
-use alms_core::{AgentId, Run, RunId, SessionId};
-use dashmap::DashMap;
+use alms_core::{AgentId, Run, RunId, RunTransition, SessionId, TransitionOutcome};
+use dashmap::{DashMap, mapref::entry::Entry};
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
+#[cfg(test)]
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 use tokio::sync::mpsc;
@@ -93,7 +95,7 @@ impl Drop for ActivitySubscription {
 #[derive(Debug, Clone)]
 pub struct RunManager {
     pub event_senders: Arc<DashMap<RunId, Vec<mpsc::UnboundedSender<SseEventData>>>>,
-    pub runs: Arc<DashMap<RunId, Run>>,
+    pub(crate) runs: Arc<DashMap<RunId, Run>>,
     /// In-memory event log for SSE reconnect during current process lifetime.
     /// Events are lost on restart — this does **not** provide cross-restart durability.
     pub event_log: EventLogManager,
@@ -148,6 +150,8 @@ pub struct RunManager {
     cancel_tokens: Arc<DashMap<RunId, CancellationToken>>,
     /// Optional SQLite store for run persistence.
     sqlite_store: Option<Arc<alms_session::SqliteStore>>,
+    #[cfg(test)]
+    fail_next_persistence: Arc<AtomicBool>,
 }
 
 impl RunManager {
@@ -169,6 +173,8 @@ impl RunManager {
             drain_notify: Arc::new(tokio::sync::Notify::new()),
             cancel_tokens: Arc::new(DashMap::new()),
             sqlite_store: None,
+            #[cfg(test)]
+            fail_next_persistence: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -197,7 +203,11 @@ impl RunManager {
                 );
             }
             Err(e) => {
-                tracing::warn!("Failed to mark stale runs as failed: {}", e);
+                tracing::error!(
+                    "Failed to quarantine stale runs; refusing to hydrate run state: {}",
+                    e
+                );
+                return;
             }
             _ => {}
         }
@@ -274,7 +284,7 @@ impl RunManager {
                 .get(run_id)
                 .map(|r| {
                     matches!(
-                        r.status,
+                        r.status(),
                         alms_core::RunStatus::Completed
                             | alms_core::RunStatus::Failed
                             | alms_core::RunStatus::Cancelled
@@ -288,35 +298,84 @@ impl RunManager {
         });
     }
 
-    pub fn insert_run(&self, run: Run) {
-        if let Some(store) = &self.sqlite_store
-            && let Err(e) = store.save_run(&run)
-        {
-            tracing::warn!(run_id = %run.run_id.0, "Failed to persist new run to SQLite: {e}");
-        }
-        self.runs.insert(run.run_id, run);
+    pub fn insert_run(&self, run: Run) -> alms_core::AlmsResult<()> {
+        self.update_run(run).map(|_| ())
     }
 
     pub fn get_run(&self, run_id: RunId) -> Option<Run> {
         self.runs.get(&run_id).map(|r| r.value().clone())
     }
 
-    pub fn update_run(&self, run: Run) {
-        if let Some(store) = &self.sqlite_store
-            && let Err(e) = store.save_run(&run)
-        {
-            tracing::warn!(run_id = %run.run_id.0, "Failed to persist run update to SQLite: {e}");
+    pub fn update_run(&self, run: Run) -> alms_core::AlmsResult<bool> {
+        let run_id = run.run_id;
+        let revision = run.lifecycle_revision();
+        let accepted = match self.runs.entry(run_id) {
+            Entry::Vacant(entry) => {
+                self.persist_run_candidate(&run)?;
+                entry.insert(run);
+                true
+            }
+            Entry::Occupied(mut entry) => {
+                let current = entry.get();
+                let accept = run.lifecycle_revision() > current.lifecycle_revision();
+                if accept {
+                    if let Err(error) = self.persist_run_candidate(&run) {
+                        let current_is_active = matches!(
+                            current.status(),
+                            alms_core::RunStatus::Queued | alms_core::RunStatus::Running
+                        );
+                        let candidate_is_terminal = matches!(
+                            run.status(),
+                            alms_core::RunStatus::Completed
+                                | alms_core::RunStatus::Failed
+                                | alms_core::RunStatus::Cancelled
+                        );
+                        if current_is_active && candidate_is_terminal {
+                            let mut quarantine = current.clone();
+                            let _ = quarantine.transition(RunTransition::Fail {
+                                error: format!("lifecycle persistence failed: {error}"),
+                                terminal_reason: "persistence_failed".to_string(),
+                            });
+                            entry.insert(quarantine);
+                        }
+                        return Err(error);
+                    }
+                    entry.insert(run);
+                }
+                accept
+            }
+        };
+        if !accepted {
+            tracing::debug!(
+                run_id = %run_id.0,
+                revision,
+                "Ignored stale or conflicting run snapshot"
+            );
         }
-        self.runs.insert(run.run_id, run);
+        Ok(accepted)
     }
 
     /// Atomically transition a run to Running state and persist the snapshot.
     ///
     /// The run data is cloned while still holding the DashMap lock, so the
     /// persisted state cannot reflect a concurrent mutation.
-    pub fn mark_run_as_running(&self, run_id: RunId) {
-        let snapshot = self.modify_and_snapshot(run_id, |r| r.mark_running());
-        self.persist_snapshot(run_id, snapshot);
+    pub fn mark_run_as_running(&self, run_id: RunId) -> bool {
+        self.try_mark_run_as_running(run_id)
+            .unwrap_or_else(|error| {
+                tracing::error!(run_id = %run_id.0, "Run start persistence failed: {error}");
+                false
+            })
+    }
+
+    pub fn try_mark_run_as_running(&self, run_id: RunId) -> alms_core::AlmsResult<bool> {
+        Ok(self
+            .transition_run(
+                run_id,
+                RunTransition::Start {
+                    resolved_config: None,
+                },
+            )?
+            .is_some_and(|outcome| outcome.is_applied()))
     }
 
     /// Atomically transition a run to `Running` AND attach the layered
@@ -334,12 +393,27 @@ impl RunManager {
         &self,
         run_id: RunId,
         resolved_config: alms_core::ResolvedRunConfig,
-    ) {
-        let snapshot = self.modify_and_snapshot(run_id, |r| {
-            r.mark_running();
-            r.set_resolved_config(resolved_config);
-        });
-        self.persist_snapshot(run_id, snapshot);
+    ) -> bool {
+        self.try_mark_run_as_running_with_config(run_id, resolved_config)
+            .unwrap_or_else(|error| {
+                tracing::error!(run_id = %run_id.0, "Run start persistence failed: {error}");
+                false
+            })
+    }
+
+    pub fn try_mark_run_as_running_with_config(
+        &self,
+        run_id: RunId,
+        resolved_config: alms_core::ResolvedRunConfig,
+    ) -> alms_core::AlmsResult<bool> {
+        Ok(self
+            .transition_run(
+                run_id,
+                RunTransition::Start {
+                    resolved_config: Some(resolved_config),
+                },
+            )?
+            .is_some_and(|outcome| outcome.is_applied()))
     }
 
     /// Atomically transition a run to Completed state and persist the snapshot.
@@ -362,7 +436,22 @@ impl RunManager {
         output: String,
         usage: alms_core::TokenUsage,
     ) -> bool {
-        self.modify_and_persist_if(run_id, |r| r.mark_completed(output, usage))
+        self.try_mark_run_as_completed(run_id, output, usage)
+            .unwrap_or_else(|error| {
+                tracing::error!(run_id = %run_id.0, "Run completion persistence failed: {error}");
+                false
+            })
+    }
+
+    pub fn try_mark_run_as_completed(
+        &self,
+        run_id: RunId,
+        output: String,
+        usage: alms_core::TokenUsage,
+    ) -> alms_core::AlmsResult<bool> {
+        Ok(self
+            .transition_run(run_id, RunTransition::Complete { output, usage })?
+            .is_some_and(|outcome| outcome.is_applied()))
     }
 
     /// Atomically transition a run to Failed state and persist the snapshot.
@@ -376,7 +465,27 @@ impl RunManager {
     /// See issues #1046 / #1052.
     #[must_use]
     pub fn mark_run_as_failed(&self, run_id: RunId, error: String) -> bool {
-        self.modify_and_persist_if(run_id, |r| r.mark_failed(error))
+        self.try_mark_run_as_failed(run_id, error)
+            .unwrap_or_else(|persistence_error| {
+                tracing::error!(run_id = %run_id.0, "Run failure persistence failed: {persistence_error}");
+                false
+            })
+    }
+
+    pub fn try_mark_run_as_failed(
+        &self,
+        run_id: RunId,
+        error: String,
+    ) -> alms_core::AlmsResult<bool> {
+        Ok(self
+            .transition_run(
+                run_id,
+                RunTransition::Fail {
+                    error,
+                    terminal_reason: "failed".to_string(),
+                },
+            )?
+            .is_some_and(|outcome| outcome.is_applied()))
     }
 
     /// Atomically transition a run to Cancelled state and persist the snapshot.
@@ -391,69 +500,85 @@ impl RunManager {
     /// #1046 / #1052 for the race motivation.
     #[must_use]
     pub fn mark_run_as_cancelled(&self, run_id: RunId) -> bool {
-        self.modify_and_persist_if(run_id, |r| r.mark_cancelled())
+        self.try_mark_run_as_cancelled(run_id)
+            .unwrap_or_else(|error| {
+                tracing::error!(run_id = %run_id.0, "Run cancellation persistence failed: {error}");
+                false
+            })
     }
 
-    /// Modify a run under DashMap lock; persist the snapshot only when the
-    /// closure reports a real transition.
-    ///
-    /// Used by the three [`alms_core::Run::mark_completed`] /
-    /// [`alms_core::Run::mark_failed`] / [`alms_core::Run::mark_cancelled`]
-    /// terminal transitions, all of which return `bool` (#1052). If the
-    /// run was already terminal the closure returns `false`, we skip the
-    /// SQLite write to avoid clobbering the existing terminal row, and we
-    /// propagate `false` to the caller so it can skip its post-flip side
-    /// effects (DM lifecycle, SSE broadcast, episodic summary).
-    fn modify_and_persist_if(&self, run_id: RunId, f: impl FnOnce(&mut Run) -> bool) -> bool {
+    pub fn try_mark_run_as_cancelled(&self, run_id: RunId) -> alms_core::AlmsResult<bool> {
+        Ok(self
+            .transition_run(
+                run_id,
+                RunTransition::Cancel {
+                    terminal_reason: "cancelled".to_string(),
+                },
+            )?
+            .is_some_and(|outcome| outcome.is_applied()))
+    }
+
+    /// Apply one authoritative lifecycle transition and persist only an
+    /// accepted revision.
+    pub fn transition_run(
+        &self,
+        run_id: RunId,
+        transition: RunTransition,
+    ) -> alms_core::AlmsResult<Option<TransitionOutcome<alms_core::RunStatus>>> {
         let Some(mut entry) = self.runs.get_mut(&run_id) else {
-            return false;
+            return Ok(None);
         };
-        let transitioned = f(entry.value_mut());
-        let snapshot = if transitioned {
-            Some(entry.clone())
-        } else {
-            None
-        };
-        // Drop the DashMap lock before the SQLite write to keep the
-        // critical section short.
+        let mut candidate = entry.clone();
+        let outcome = candidate.transition(transition);
+        if matches!(outcome, TransitionOutcome::Rejected { .. })
+            && entry.lifecycle_revision() >= alms_core::MAX_LIFECYCLE_REVISION
+        {
+            return Err(alms_core::AlmsError::Runtime(format!(
+                "run {} lifecycle revision is exhausted",
+                run_id.0
+            )));
+        }
+        let reached_terminal = matches!(
+            outcome,
+            TransitionOutcome::Applied { to, .. } if to.is_terminal()
+        );
+        if outcome.is_applied() {
+            if let Err(error) = self.persist_run_candidate(&candidate) {
+                let mut quarantined = entry.clone();
+                let _ = quarantined.transition(RunTransition::Fail {
+                    error: format!("lifecycle persistence failed: {error}"),
+                    terminal_reason: "persistence_failed".to_string(),
+                });
+                *entry = quarantined;
+                drop(entry);
+                self.run_text_buffers.remove(&run_id);
+                return Err(error);
+            }
+            *entry = candidate;
+        }
         drop(entry);
-        if transitioned {
-            self.persist_snapshot(run_id, snapshot);
-            // #1107: drop the in-flight visible-reply text buffer when the
-            // run reaches a terminal state. On the Ok arm of the agent
-            // loop the final assistant message (including its full
-            // visible text) has been sealed and flushed to the message
-            // store, so the messages GET on the next load is the
-            // authoritative source and any leftover text in the buffer
-            // would race with that path on a same-tab reload. On the
-            // mid-stream `Err(AlmsError::Cancelled)` arm persistence is
-            // skipped and the partial visible text is dropped here by
-            // design — not a regression vs pre-#1107 (cancelled-partial
-            // text was never persisted) and out of scope for the
-            // in-flight rehydration use case this endpoint targets.
+        if reached_terminal {
             self.run_text_buffers.remove(&run_id);
         }
-        transitioned
+        Ok(Some(outcome))
     }
 
-    /// Modify a run in the DashMap and return a clone while still under lock.
-    ///
-    /// Returns `None` if the run does not exist (callers always `insert_run`
-    /// first, so this should not happen in practice).
-    fn modify_and_snapshot(&self, run_id: RunId, f: impl FnOnce(&mut Run)) -> Option<Run> {
-        let mut entry = self.runs.get_mut(&run_id)?;
-        f(entry.value_mut());
-        Some(entry.clone())
+    #[cfg(test)]
+    pub(crate) fn inject_next_persistence_failure(&self) {
+        self.fail_next_persistence.store(true, Ordering::Release);
     }
 
-    /// Persist a previously-snapshotted run to SQLite (if store is configured).
-    fn persist_snapshot(&self, run_id: RunId, snapshot: Option<Run>) {
-        if let Some(store) = &self.sqlite_store
-            && let Some(run) = snapshot
-            && let Err(e) = store.save_run(&run)
-        {
-            tracing::warn!(run_id = %run_id.0, "Failed to persist run to SQLite: {e}");
+    fn persist_run_candidate(&self, run: &Run) -> alms_core::AlmsResult<()> {
+        #[cfg(test)]
+        if self.fail_next_persistence.swap(false, Ordering::AcqRel) {
+            return Err(alms_core::AlmsError::Runtime(
+                "injected run persistence failure".to_string(),
+            ));
         }
+        if let Some(store) = &self.sqlite_store {
+            store.save_run(run)?;
+        }
+        Ok(())
     }
 
     /// Store a per-run cancellation token.
@@ -469,6 +594,10 @@ impl RunManager {
         } else {
             false
         }
+    }
+
+    pub fn has_cancel_token(&self, run_id: RunId) -> bool {
+        self.cancel_tokens.contains_key(&run_id)
     }
 
     /// Remove a per-run cancellation token (cleanup after run ends).
@@ -507,7 +636,7 @@ impl RunManager {
                 let run = entry.value();
                 run.job_id == Some(target)
                     && matches!(
-                        run.status,
+                        run.status(),
                         alms_core::RunStatus::Queued | alms_core::RunStatus::Running
                     )
             })
@@ -540,7 +669,7 @@ impl RunManager {
                 let run = entry.value();
                 run.session_id == target
                     && matches!(
-                        run.status,
+                        run.status(),
                         alms_core::RunStatus::Queued | alms_core::RunStatus::Running
                     )
             })
@@ -567,7 +696,7 @@ impl RunManager {
             let r = e.value();
             r.session_id == session_id
                 && matches!(
-                    r.status,
+                    r.status(),
                     alms_core::RunStatus::Queued | alms_core::RunStatus::Running
                 )
         })
@@ -585,7 +714,7 @@ impl RunManager {
             .iter()
             .filter(|e| {
                 let r = e.value();
-                r.agent_id == agent_id && matches!(r.status, alms_core::RunStatus::Queued)
+                r.agent_id == agent_id && matches!(r.status(), alms_core::RunStatus::Queued)
             })
             .map(|e| e.value().clone())
             .collect();
@@ -603,7 +732,7 @@ impl RunManager {
             .iter()
             .filter(|e| {
                 let r = e.value();
-                r.session_id == session_id && matches!(r.status, alms_core::RunStatus::Queued)
+                r.session_id == session_id && matches!(r.status(), alms_core::RunStatus::Queued)
             })
             .map(|e| e.value().clone())
             .collect();
@@ -623,7 +752,7 @@ impl RunManager {
     pub fn agent_has_running_run(&self, agent_id: alms_core::AgentId) -> bool {
         self.runs.iter().any(|e| {
             let r = e.value();
-            r.agent_id == agent_id && matches!(r.status, alms_core::RunStatus::Running)
+            r.agent_id == agent_id && matches!(r.status(), alms_core::RunStatus::Running)
         })
     }
 
@@ -1062,12 +1191,12 @@ impl Default for RunManager {
 }
 
 impl alms_core::RunRegistrar for RunManager {
-    fn register_run(&self, run: Run) {
-        self.insert_run(run);
+    fn register_run(&self, run: Run) -> alms_core::AlmsResult<()> {
+        self.insert_run(run)
     }
 
-    fn update_run(&self, run: Run) {
-        RunManager::update_run(self, run);
+    fn update_run(&self, run: Run) -> alms_core::AlmsResult<()> {
+        RunManager::update_run(self, run).map(|_| ())
     }
 }
 
@@ -1240,7 +1369,7 @@ mod tests {
         // Insert a Queued run — still false (only Running counts).
         let queued = Run::new(SessionId::new(), agent_id, "queued".into());
         let queued_id = queued.run_id;
-        rm.insert_run(queued);
+        let _ = rm.insert_run(queued);
         assert!(
             !rm.agent_has_running_run(agent_id),
             "Queued run should not count"
@@ -1263,7 +1392,7 @@ mod tests {
 
         let run_a = Run::new(SessionId::new(), agent_a, "a".into());
         let run_a_id = run_a.run_id;
-        rm.insert_run(run_a);
+        let _ = rm.insert_run(run_a);
         rm.mark_run_as_running(run_a_id);
 
         // Agent A is running, agent B is not.
@@ -1276,13 +1405,134 @@ mod tests {
         let rm = RunManager::new();
         let run = Run::new(SessionId::new(), AgentId::new(), "test".to_string());
         let run_id = run.run_id;
-        rm.insert_run(run);
+        let _ = rm.insert_run(run);
         rm.mark_run_as_running(run_id);
         assert!(rm.mark_run_as_cancelled(run_id));
 
         let r = rm.get_run(run_id).unwrap();
-        assert_eq!(r.status, alms_core::RunStatus::Cancelled);
+        assert_eq!(r.status(), alms_core::RunStatus::Cancelled);
         assert!(r.ended_at.is_some());
+    }
+
+    #[test]
+    fn failed_completion_persistence_does_not_commit_and_restart_recovers_running_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("runs.db");
+        let store = Arc::new(alms_session::SqliteStore::open(&path).unwrap());
+        let rm = RunManager::new().with_store(store.clone());
+        let run = Run::new(SessionId::new(), AgentId::new(), "test".to_string());
+        let run_id = run.run_id;
+        let _ = rm.insert_run(run);
+        assert!(rm.mark_run_as_running(run_id));
+
+        rm.inject_next_persistence_failure();
+        assert!(
+            rm.try_mark_run_as_completed(run_id, "must not commit".to_string(), Default::default())
+                .is_err()
+        );
+        let current = rm.get_run(run_id).unwrap();
+        assert_eq!(current.status(), alms_core::RunStatus::Failed);
+        assert_eq!(current.terminal_reason(), Some("persistence_failed"));
+        assert_eq!(current.output, None);
+        drop(rm);
+        drop(store);
+
+        let restarted_store = Arc::new(alms_session::SqliteStore::open(&path).unwrap());
+        let restarted = RunManager::new().with_store(restarted_store);
+        restarted.hydrate_from_store();
+        let recovered = restarted.get_run(run_id).unwrap();
+        assert_eq!(recovered.status(), alms_core::RunStatus::Failed);
+        assert_eq!(recovered.terminal_reason(), Some("gateway_restarted"));
+        assert_eq!(recovered.output, None);
+    }
+
+    #[test]
+    fn hydration_fails_closed_when_stale_revision_is_exhausted() {
+        let store = Arc::new(alms_session::SqliteStore::open_in_memory().unwrap());
+        let run = Run::from_persisted(
+            RunId::new(),
+            SessionId::new(),
+            AgentId::new(),
+            alms_core::RunStatus::Queued,
+            "exhausted".to_string(),
+            None,
+            None,
+            None,
+            chrono::Utc::now(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            alms_core::MAX_LIFECYCLE_REVISION,
+            None,
+        );
+        let run_id = run.run_id;
+        store.save_run(&run).unwrap();
+
+        let manager = RunManager::new().with_store(store);
+        manager.hydrate_from_store();
+        assert!(
+            manager.get_run(run_id).is_none(),
+            "failed recovery must not hydrate an active exhausted run"
+        );
+    }
+
+    #[test]
+    fn coordinator_update_persists_before_committing_memory() {
+        let store = Arc::new(alms_session::SqliteStore::open_in_memory().unwrap());
+        let manager = RunManager::new().with_store(store.clone());
+        let mut running = Run::new(SessionId::new(), AgentId::new(), "subagent".to_string());
+        assert!(running.mark_running());
+        let run_id = running.run_id;
+        let _ = manager.insert_run(running.clone());
+        let mut completed = running;
+        assert!(completed.mark_completed("done".to_string(), Default::default()));
+
+        manager.inject_next_persistence_failure();
+        assert!(manager.update_run(completed).is_err());
+        let quarantined = manager.get_run(run_id).unwrap();
+        assert_eq!(quarantined.status(), alms_core::RunStatus::Failed);
+        assert_eq!(quarantined.terminal_reason(), Some("persistence_failed"));
+        assert_eq!(
+            store.load_run(run_id).unwrap().unwrap().status(),
+            alms_core::RunStatus::Running
+        );
+    }
+
+    #[test]
+    fn stale_coordinator_snapshot_cannot_replace_terminal_run() {
+        let rm = RunManager::new();
+        let mut running = Run::new(SessionId::new(), AgentId::new(), "test".into());
+        assert!(running.mark_running());
+        let stale = running.clone();
+        let run_id = running.run_id;
+        let _ = rm.insert_run(running);
+
+        assert!(rm.mark_run_as_completed(run_id, "done".into(), Default::default()));
+        rm.update_run(stale).unwrap();
+
+        let current = rm.get_run(run_id).unwrap();
+        assert_eq!(current.status(), alms_core::RunStatus::Completed);
+        assert_eq!(current.lifecycle_revision(), 2);
+    }
+
+    #[test]
+    fn equal_revision_snapshot_cannot_replace_authoritative_payload() {
+        let rm = RunManager::new();
+        let mut run = Run::new(SessionId::new(), AgentId::new(), "test".into());
+        assert!(run.mark_running());
+        assert!(run.mark_completed("authoritative".into(), Default::default()));
+        let run_id = run.run_id;
+        let _ = rm.insert_run(run.clone());
+
+        let mut conflicting = run;
+        conflicting.output = Some("delayed conflicting payload".to_string());
+        rm.update_run(conflicting).unwrap();
+
+        let current = rm.get_run(run_id).unwrap();
+        assert_eq!(current.output.as_deref(), Some("authoritative"));
+        assert_eq!(current.terminal_reason(), None);
     }
 
     /// #1052 — terminal transitions are idempotent and return `false` on
@@ -1296,7 +1546,7 @@ mod tests {
         let rm = RunManager::new();
         let run = Run::new(SessionId::new(), AgentId::new(), "test".to_string());
         let run_id = run.run_id;
-        rm.insert_run(run);
+        let _ = rm.insert_run(run);
         rm.mark_run_as_running(run_id);
 
         // First cancel wins.
@@ -1321,7 +1571,7 @@ mod tests {
         );
         let r = rm.get_run(run_id).unwrap();
         assert_eq!(
-            r.status,
+            r.status(),
             alms_core::RunStatus::Cancelled,
             "Cancelled must not be clobbered by a racing Completed flip"
         );
@@ -1333,7 +1583,7 @@ mod tests {
         );
         let r = rm.get_run(run_id).unwrap();
         assert_eq!(
-            r.status,
+            r.status(),
             alms_core::RunStatus::Cancelled,
             "Cancelled must not be clobbered by a racing Failed flip"
         );
@@ -1352,8 +1602,8 @@ mod tests {
         active_run.run_id = active_id;
         done_run.run_id = done_id;
 
-        rm.insert_run(active_run);
-        rm.insert_run(done_run);
+        let _ = rm.insert_run(active_run);
+        let _ = rm.insert_run(done_run);
         rm.mark_run_as_running(active_id);
         rm.mark_run_as_running(done_id);
         assert!(rm.mark_run_as_completed(done_id, "output".into(), Default::default()));
@@ -1404,7 +1654,7 @@ mod tests {
         );
         let run_id = run.run_id;
         run.mark_running();
-        rm.insert_run(run);
+        let _ = rm.insert_run(run);
 
         let token = CancellationToken::new();
         rm.register_cancel_token(run_id, token.clone());
@@ -1428,7 +1678,7 @@ mod tests {
             job_id,
         );
         let run_id = run.run_id;
-        rm.insert_run(run);
+        let _ = rm.insert_run(run);
         rm.mark_run_as_running(run_id);
         assert!(rm.mark_run_as_completed(run_id, "output".into(), Default::default()));
 
@@ -1455,7 +1705,7 @@ mod tests {
         );
         let run_id = run.run_id;
         run.mark_running();
-        rm.insert_run(run);
+        let _ = rm.insert_run(run);
 
         let token = CancellationToken::new();
         rm.register_cancel_token(run_id, token.clone());
@@ -1531,10 +1781,10 @@ mod tests {
         let agent_b = AgentId::new();
 
         // Insert 3 runs for agent_a and 1 for agent_b.
-        rm.insert_run(Run::new(SessionId::new(), agent_a, "a1".into()));
-        rm.insert_run(Run::new(SessionId::new(), agent_a, "a2".into()));
-        rm.insert_run(Run::new(SessionId::new(), agent_a, "a3".into()));
-        rm.insert_run(Run::new(SessionId::new(), agent_b, "b1".into()));
+        let _ = rm.insert_run(Run::new(SessionId::new(), agent_a, "a1".into()));
+        let _ = rm.insert_run(Run::new(SessionId::new(), agent_a, "a2".into()));
+        let _ = rm.insert_run(Run::new(SessionId::new(), agent_a, "a3".into()));
+        let _ = rm.insert_run(Run::new(SessionId::new(), agent_b, "b1".into()));
 
         let runs_a = rm.list_by_agent(agent_a, 50);
         assert_eq!(runs_a.len(), 3);
@@ -1551,7 +1801,7 @@ mod tests {
         let agent_id = AgentId::new();
 
         for i in 0..5 {
-            rm.insert_run(Run::new(SessionId::new(), agent_id, format!("run {i}")));
+            let _ = rm.insert_run(Run::new(SessionId::new(), agent_id, format!("run {i}")));
         }
 
         let runs = rm.list_by_agent(agent_id, 3);
@@ -1565,8 +1815,8 @@ mod tests {
 
         let r1 = Run::new(SessionId::new(), agent_id, "first".into());
         let r2 = Run::new(SessionId::new(), agent_id, "second".into());
-        rm.insert_run(r1);
-        rm.insert_run(r2);
+        let _ = rm.insert_run(r1);
+        let _ = rm.insert_run(r2);
 
         let runs = rm.list_by_agent(agent_id, 50);
         assert_eq!(runs.len(), 2);
@@ -1581,8 +1831,8 @@ mod tests {
         let session_a = SessionId::new();
         let session_b = SessionId::new();
 
-        rm.insert_run(Run::new(session_a, agent_id, "sa".into()));
-        rm.insert_run(Run::new(session_b, agent_id, "sb".into()));
+        let _ = rm.insert_run(Run::new(session_a, agent_id, "sa".into()));
+        let _ = rm.insert_run(Run::new(session_b, agent_id, "sb".into()));
 
         let runs = rm.list_by_agent(agent_id, 50);
         assert_eq!(runs.len(), 2);
@@ -1626,7 +1876,16 @@ mod tests {
     ) -> Run {
         let mut run = Run::new(session_id, agent_id, "test".into());
         run.created_at = created_at;
-        run.status = status;
+        match status {
+            alms_core::RunStatus::Queued => {}
+            alms_core::RunStatus::Running => assert!(run.mark_running()),
+            alms_core::RunStatus::Completed => {
+                assert!(run.mark_running());
+                assert!(run.mark_completed("done".into(), Default::default()));
+            }
+            alms_core::RunStatus::Failed => assert!(run.mark_failed("failed".into())),
+            alms_core::RunStatus::Cancelled => assert!(run.mark_cancelled()),
+        }
         run
     }
 
@@ -1656,25 +1915,25 @@ mod tests {
         let older_id = older_running.run_id;
         let newer_id = newer_queued.run_id;
 
-        rm.insert_run(older_running);
-        rm.insert_run(newer_queued);
+        let _ = rm.insert_run(older_running);
+        let _ = rm.insert_run(newer_queued);
 
         // Both runs are returned (limit is generous) and ordered newest-first.
         let runs = rm.list_by_session(session_id, 200);
         assert_eq!(runs.len(), 2);
         assert_eq!(runs[0].run_id, newer_id, "newest first");
         assert_eq!(runs[1].run_id, older_id);
-        assert_eq!(runs[1].status, alms_core::RunStatus::Running);
+        assert_eq!(runs[1].status(), alms_core::RunStatus::Running);
 
         // The frontend prefers running over queued, so the running run
         // is what activeRunId.value should resolve to. We assert that
         // selection logic here as a data-layer cross-check.
         let active = runs
             .iter()
-            .find(|r| r.status == alms_core::RunStatus::Running)
+            .find(|r| r.status() == alms_core::RunStatus::Running)
             .or_else(|| {
                 runs.iter()
-                    .find(|r| r.status == alms_core::RunStatus::Queued)
+                    .find(|r| r.status() == alms_core::RunStatus::Queued)
             });
         assert_eq!(active.map(|r| r.run_id), Some(older_id));
     }
@@ -1698,7 +1957,7 @@ mod tests {
             alms_core::RunStatus::Running,
         );
         let old_running_id = old_running.run_id;
-        rm.insert_run(old_running);
+        let _ = rm.insert_run(old_running);
 
         // Insert 25 newer terminal runs in front of it.
         for i in 0..25 {
@@ -1708,7 +1967,7 @@ mod tests {
                 base - chrono::Duration::seconds(50 - i),
                 alms_core::RunStatus::Completed,
             );
-            rm.insert_run(run);
+            let _ = rm.insert_run(run);
         }
 
         // Old (broken) behaviour: limit=20 truncates the running run away.
@@ -1725,7 +1984,7 @@ mod tests {
         assert!(
             restored
                 .iter()
-                .any(|r| r.run_id == old_running_id && r.status == alms_core::RunStatus::Running),
+                .any(|r| r.run_id == old_running_id && r.status() == alms_core::RunStatus::Running),
             "new restore limit (200) surfaces the still-running run"
         );
     }
@@ -1751,7 +2010,7 @@ mod tests {
             alms_core::RunStatus::Running,
         );
         let dm_running_id = dm_running.run_id;
-        rm.insert_run(dm_running);
+        let _ = rm.insert_run(dm_running);
 
         // 15 newer non-DM runs across other sessions for the same agent.
         for i in 0..15 {
@@ -1761,7 +2020,7 @@ mod tests {
                 base - chrono::Duration::seconds(100 - i),
                 alms_core::RunStatus::Completed,
             );
-            rm.insert_run(run);
+            let _ = rm.insert_run(run);
         }
 
         // Old (broken) behaviour: limit=10 truncates the DM run away.
@@ -1778,7 +2037,7 @@ mod tests {
         assert!(
             restored
                 .iter()
-                .any(|r| r.run_id == dm_running_id && r.status == alms_core::RunStatus::Running),
+                .any(|r| r.run_id == dm_running_id && r.status() == alms_core::RunStatus::Running),
             "new restore limit (100) surfaces the active DM run"
         );
     }
@@ -1799,7 +2058,7 @@ mod tests {
         // Insert a queued run -> active.
         let run = Run::new(session_id, agent_id, "test".into());
         let run_id = run.run_id;
-        rm.insert_run(run);
+        let _ = rm.insert_run(run);
         assert!(rm.has_active_runs(session_id));
 
         // Mark running -> still active.
@@ -1822,7 +2081,7 @@ mod tests {
 
         let run_b = Run::new(session_b, agent_id, "on B".into());
         let run_b_id = run_b.run_id;
-        rm.insert_run(run_b);
+        let _ = rm.insert_run(run_b);
         rm.mark_run_as_running(run_b_id);
 
         assert!(!rm.has_active_runs(session_a), "session A has no runs");
@@ -1906,7 +2165,7 @@ mod tests {
 
         let run_a = Run::new(session_id, agent_a, "a".into());
         let run_a_id = run_a.run_id;
-        rm.insert_run(run_a);
+        let _ = rm.insert_run(run_a);
         rm.mark_run_as_running(run_a_id);
         rm.send_agent_event(
             agent_a,
@@ -1920,7 +2179,7 @@ mod tests {
 
         let run_b = Run::new(session_id, agent_b, "b".into());
         let run_b_id = run_b.run_id;
-        rm.insert_run(run_b);
+        let _ = rm.insert_run(run_b);
         rm.mark_run_as_running(run_b_id);
         rm.send_agent_event(
             agent_b,

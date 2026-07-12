@@ -5,25 +5,41 @@ use super::*;
 impl SqliteStore {
     // ── Jobs ──────────────────────────────────────────────────────────────────
 
-    /// Upsert a job row (handles both insert and update via OR REPLACE).
+    /// Upsert a job row, refusing snapshots older than the persisted revision.
     pub fn save_job(&self, job: &Job) -> AlmsResult<()> {
         let schedule_json = serde_json::to_string(&job.schedule)
             .map_err(|e| AlmsError::Runtime(format!("SQLite save_job serialize: {e}")))?;
+        let lifecycle_revision = i64::try_from(job.lifecycle_revision()).map_err(|_| {
+            AlmsError::Runtime(format!(
+                "job {} lifecycle revision {} exceeds SQLite INTEGER",
+                job.id.0,
+                job.lifecycle_revision()
+            ))
+        })?;
         self.conn
             .lock()
             .execute(
-                "INSERT OR REPLACE INTO jobs \
-                 (id, agent_id, prompt, schedule, status, created_at, next_run_at, last_run_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                "INSERT INTO jobs \
+                 (id, agent_id, prompt, schedule, status, created_at, next_run_at, last_run_at, \
+                  lifecycle_revision, terminal_reason) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10) \
+                 ON CONFLICT(id) DO UPDATE SET \
+                   agent_id=excluded.agent_id, prompt=excluded.prompt, schedule=excluded.schedule, \
+                   status=excluded.status, created_at=excluded.created_at, \
+                   next_run_at=excluded.next_run_at, last_run_at=excluded.last_run_at, \
+                   lifecycle_revision=excluded.lifecycle_revision, terminal_reason=excluded.terminal_reason \
+                 WHERE excluded.lifecycle_revision > jobs.lifecycle_revision",
                 params![
                     job.id.0.to_string(),
                     job.agent_id.0.to_string(),
                     &job.prompt,
                     schedule_json,
-                    job_status_to_str(job.status),
+                    job_status_to_str(job.status()),
                     job.created_at.to_rfc3339(),
                     job.next_run_at.map(|t| t.to_rfc3339()),
                     job.last_run_at.map(|t| t.to_rfc3339()),
+                    lifecycle_revision,
+                    job.terminal_reason().map(job_terminal_reason_to_str),
                 ],
             )
             .map_err(|e| AlmsError::Runtime(format!("SQLite save_job: {e}")))?;
@@ -33,7 +49,8 @@ impl SqliteStore {
     /// Load all non-cancelled jobs, oldest first.
     pub fn load_all_jobs(&self) -> AlmsResult<Vec<Job>> {
         self.query_jobs(
-            "SELECT id, agent_id, prompt, schedule, status, created_at, next_run_at, last_run_at \
+            "SELECT id, agent_id, prompt, schedule, status, created_at, next_run_at, last_run_at, \
+                    lifecycle_revision, terminal_reason \
              FROM jobs WHERE status != 'cancelled' ORDER BY rowid",
         )
     }
@@ -42,7 +59,8 @@ impl SqliteStore {
     pub fn load_job_by_id(&self, id: JobId) -> AlmsResult<Option<Job>> {
         let conn = self.conn.lock();
         let result = conn.query_row(
-            "SELECT id, agent_id, prompt, schedule, status, created_at, next_run_at, last_run_at \
+            "SELECT id, agent_id, prompt, schedule, status, created_at, next_run_at, last_run_at, \
+                    lifecycle_revision, terminal_reason \
              FROM jobs WHERE id = ?1",
             params![id.0.to_string()],
             parse_job_row,
@@ -57,7 +75,8 @@ impl SqliteStore {
     /// Load all jobs including cancelled, ordered by created_at DESC.
     pub fn load_all_jobs_unfiltered(&self) -> AlmsResult<Vec<Job>> {
         self.query_jobs(
-            "SELECT id, agent_id, prompt, schedule, status, created_at, next_run_at, last_run_at \
+            "SELECT id, agent_id, prompt, schedule, status, created_at, next_run_at, last_run_at, \
+                    lifecycle_revision, terminal_reason \
              FROM jobs ORDER BY created_at DESC",
         )
     }

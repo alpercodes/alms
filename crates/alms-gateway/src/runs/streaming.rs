@@ -37,7 +37,7 @@ pub async fn stream_run_events(
         .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "NOT_FOUND", "Run not found"))?;
 
     let is_terminal = matches!(
-        run.status,
+        run.status(),
         RunStatus::Completed | RunStatus::Failed | RunStatus::Cancelled
     );
 
@@ -57,7 +57,7 @@ pub async fn stream_run_events(
         info!(
             "Run {} is {:?}, replaying {} events then closing",
             run_id.0,
-            run.status,
+            run.status(),
             replay_events.len()
         );
         Ok(RunEventStream::stream_replay_only(replay_events).into_response())
@@ -79,7 +79,7 @@ pub async fn stream_run_events(
             .get_run(run_id)
             .map(|r| {
                 matches!(
-                    r.status,
+                    r.status(),
                     RunStatus::Completed | RunStatus::Failed | RunStatus::Cancelled
                 )
             })

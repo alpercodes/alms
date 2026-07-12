@@ -371,7 +371,7 @@ async fn cancelled_before_execution_emits_cancelled_event() {
     // Create a run and insert it.
     let run = Run::new(session_id, agent_id, "test input".into());
     let run_id = run.run_id;
-    state.run_manager.insert_run(run.clone());
+    let _ = state.run_manager.insert_run(run.clone());
 
     // Register a cancellation token and cancel it BEFORE execution.
     let cancel_token = CancellationToken::new();
@@ -404,7 +404,7 @@ async fn cancelled_before_execution_emits_cancelled_event() {
     // Verify the run status is Cancelled.
     let run = state.run_manager.get_run(run_id).expect("run should exist");
     assert_eq!(
-        run.status,
+        run.status(),
         RunStatus::Cancelled,
         "pre-cancelled run should transition to Cancelled status"
     );
@@ -417,6 +417,258 @@ async fn cancelled_before_execution_emits_cancelled_event() {
         events.iter().map(|e| &e.event_type).collect::<Vec<_>>()
     );
 
+    shutdown_token.cancel();
+}
+
+#[tokio::test]
+async fn cancellation_between_precheck_and_start_transition_cleans_up_without_starting() {
+    let (state, shutdown_token, _cr, _tr, _dr) = test_app_state_with_mock_llm();
+    let agent_id = AgentId::new();
+    let session = state
+        .session_manager
+        .get_or_create(agent_id, "test-cancel-during-start");
+    let session_id = session.id;
+    let job_id = alms_core::JobId::new();
+    let run = Run::for_job(
+        session_id,
+        agent_id,
+        "must never reach the agent loop".into(),
+        job_id,
+    );
+    let run_id = run.run_id;
+    let _ = state.run_manager.insert_run(run.clone());
+    state
+        .job_episodes
+        .open(job_id, session_id, agent_id, run_id);
+
+    let cancel_token = CancellationToken::new();
+    state
+        .run_manager
+        .register_cancel_token(run_id, cancel_token.clone());
+    let (run_tx, _run_rx) = mpsc::unbounded_channel();
+    state.run_manager.register_sender(run_id, run_tx);
+
+    let approval_id = uuid::Uuid::new_v4();
+    let (decision_tx, _decision_rx) = tokio::sync::oneshot::channel();
+    state
+        .approval_store
+        .insert(crate::approvals::PendingApproval {
+            approval_id,
+            run_id,
+            tool: "test".to_string(),
+            params: serde_json::json!({}),
+            requested_at: chrono::Utc::now(),
+            decision_tx,
+        });
+
+    let barrier = super::lifecycle::install_start_transition_barrier(run_id);
+    let execute_state = state.clone();
+    let execute_cancel_token = cancel_token.clone();
+    let handle = tokio::spawn(async move {
+        super::lifecycle::execute_run(
+            execute_state,
+            super::RunParams {
+                run_id,
+                session_id,
+                agent_id,
+                input: run.input,
+                context_id: "test-cancel-during-start".to_string(),
+                cancel_token: execute_cancel_token,
+                is_peer_message: false,
+                is_system_triggered: false,
+                input_pre_persisted: false,
+            },
+        )
+        .await;
+    });
+
+    barrier.wait().await;
+    cancel_token.cancel();
+    assert!(state.run_manager.mark_run_as_cancelled(run_id));
+    barrier.wait().await;
+    tokio::time::timeout(std::time::Duration::from_secs(5), handle)
+        .await
+        .expect("execute_run should leave the rejected-start branch")
+        .expect("execute_run task should not panic");
+
+    let run = state.run_manager.get_run(run_id).unwrap();
+    assert_eq!(run.status(), RunStatus::Cancelled);
+    let event_types: Vec<_> = state
+        .run_manager
+        .events_from(run_id, 0)
+        .await
+        .into_iter()
+        .map(|event| event.event_type)
+        .collect();
+    assert!(!event_types.iter().any(|kind| kind == "run_started"));
+    assert!(!event_types.iter().any(|kind| kind == "run_finished"));
+    assert!(!state.run_manager.cancel_run(run_id));
+    assert!(!state.run_manager.event_senders.contains_key(&run_id));
+    assert!(
+        state
+            .approval_store
+            .list_pending()
+            .iter()
+            .all(|approval| approval.run_id != run_id)
+    );
+    assert!(state.job_episodes.snapshot(job_id).is_none());
+    shutdown_token.cancel();
+}
+
+#[tokio::test]
+async fn start_persistence_failure_is_reported_and_quarantined() {
+    let (state, shutdown_token, _cr, _tr, _dr) = test_app_state_with_mock_llm();
+    let agent_id = AgentId::new();
+    let session = state
+        .session_manager
+        .get_or_create(agent_id, "test-start-persistence-failure");
+    let run = Run::new(session.id, agent_id, "must not start".into());
+    let run_id = run.run_id;
+    let _ = state.run_manager.insert_run(run.clone());
+    let cancel_token = CancellationToken::new();
+    state
+        .run_manager
+        .register_cancel_token(run_id, cancel_token.clone());
+    let (run_tx, _run_rx) = mpsc::unbounded_channel();
+    state.run_manager.register_sender(run_id, run_tx);
+    state.run_manager.inject_next_persistence_failure();
+
+    super::lifecycle::execute_run(
+        state.clone(),
+        super::RunParams {
+            run_id,
+            session_id: session.id,
+            agent_id,
+            input: run.input,
+            context_id: "test-start-persistence-failure".to_string(),
+            cancel_token,
+            is_peer_message: false,
+            is_system_triggered: false,
+            input_pre_persisted: false,
+        },
+    )
+    .await;
+
+    let run = state.run_manager.get_run(run_id).unwrap();
+    assert_eq!(run.status(), RunStatus::Failed);
+    assert_eq!(run.terminal_reason(), Some("persistence_failed"));
+    let event_types: Vec<_> = state
+        .run_manager
+        .events_from(run_id, 0)
+        .await
+        .into_iter()
+        .map(|event| event.event_type)
+        .collect();
+    assert!(event_types.iter().any(|kind| kind == "run_error"));
+    assert!(!event_types.iter().any(|kind| kind == "run_started"));
+    assert!(!state.run_manager.cancel_run(run_id));
+    assert!(!state.run_manager.event_senders.contains_key(&run_id));
+    shutdown_token.cancel();
+}
+
+#[tokio::test]
+async fn terminal_persistence_failure_is_reported_and_quarantined() {
+    let (state, shutdown_token, _cr, _tr, _dr) = test_app_state_with_mock_llm();
+    let agent_id = AgentId::new();
+    let session = state
+        .session_manager
+        .get_or_create(agent_id, "test-terminal-persistence-failure");
+    let run = Run::new(session.id, agent_id, "complete in mock mode".into());
+    let run_id = run.run_id;
+    let _ = state.run_manager.insert_run(run.clone());
+    let cancel_token = CancellationToken::new();
+    state
+        .run_manager
+        .register_cancel_token(run_id, cancel_token.clone());
+    let (run_tx, _run_rx) = mpsc::unbounded_channel();
+    state.run_manager.register_sender(run_id, run_tx);
+    let barrier = super::lifecycle::install_terminal_transition_barrier(run_id);
+    let execute_state = state.clone();
+    let handle = tokio::spawn(async move {
+        super::lifecycle::execute_run(
+            execute_state,
+            super::RunParams {
+                run_id,
+                session_id: session.id,
+                agent_id,
+                input: run.input,
+                context_id: "test-terminal-persistence-failure".to_string(),
+                cancel_token,
+                is_peer_message: false,
+                is_system_triggered: false,
+                input_pre_persisted: false,
+            },
+        )
+        .await;
+    });
+
+    barrier.wait().await;
+    assert_eq!(
+        state.run_manager.get_run(run_id).unwrap().status(),
+        RunStatus::Running
+    );
+    state.run_manager.inject_next_persistence_failure();
+    barrier.wait().await;
+    tokio::time::timeout(std::time::Duration::from_secs(5), handle)
+        .await
+        .expect("execute_run should leave the terminal transition")
+        .expect("execute_run task should not panic");
+
+    let run = state.run_manager.get_run(run_id).unwrap();
+    assert_eq!(run.status(), RunStatus::Failed);
+    assert_eq!(run.terminal_reason(), Some("persistence_failed"));
+    let event_types: Vec<_> = state
+        .run_manager
+        .events_from(run_id, 0)
+        .await
+        .into_iter()
+        .map(|event| event.event_type)
+        .collect();
+    assert!(event_types.iter().any(|kind| kind == "run_started"));
+    assert!(event_types.iter().any(|kind| kind == "run_error"));
+    assert!(!event_types.iter().any(|kind| kind == "run_finished"));
+    assert!(!state.run_manager.cancel_run(run_id));
+    assert!(!state.run_manager.event_senders.contains_key(&run_id));
+    shutdown_token.cancel();
+}
+
+#[tokio::test]
+async fn create_run_registration_failure_aborts_before_message_or_queue_side_effects() {
+    use alms_core::{CreateRunRequest, RunInput};
+    use axum::{Json, extract::State, http::StatusCode};
+
+    let (state, shutdown_token, _cr, _tr, _dr) = test_app_state_with_mock_llm();
+    let agent_id = AgentId::new();
+    let session = state
+        .session_manager
+        .get_or_create(agent_id, "test-registration-persistence-failure");
+    state.run_manager.inject_next_persistence_failure();
+
+    let request = CreateRunRequest {
+        session_id: session.id,
+        agent_id: Some(agent_id),
+        input: RunInput::Text {
+            text: "must not be admitted".to_string(),
+        },
+    };
+    let Err((status, body)) =
+        super::lifecycle::create_run(State(state.clone()), Json(request)).await
+    else {
+        panic!("registration persistence failure must reject POST /runs");
+    };
+
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(body.0["error"]["code"], "LIFECYCLE_PERSISTENCE_FAILED");
+    assert!(state.run_manager.runs.is_empty());
+    assert!(
+        state
+            .session_manager
+            .get_history(session.id)
+            .unwrap()
+            .is_empty(),
+        "the user message must not be persisted after registration fails"
+    );
+    assert_eq!(state.agent_queue.pending_count(&agent_id), 0);
     shutdown_token.cancel();
 }
 
@@ -434,7 +686,7 @@ async fn cancelled_during_shutdown_emits_cancelled_event() {
 
     let run = Run::new(session_id, agent_id, "shutdown test".into());
     let run_id = run.run_id;
-    state.run_manager.insert_run(run.clone());
+    let _ = state.run_manager.insert_run(run.clone());
 
     let cancel_token = CancellationToken::new();
     state
@@ -465,7 +717,7 @@ async fn cancelled_during_shutdown_emits_cancelled_event() {
 
     let run = state.run_manager.get_run(run_id).expect("run should exist");
     assert_eq!(
-        run.status,
+        run.status(),
         RunStatus::Cancelled,
         "run during shutdown should be cancelled"
     );
@@ -500,7 +752,7 @@ async fn deny_cancels_queued_runs_in_same_session() {
     let mut run_a = Run::new(session_id, agent_id, "guarded run".into());
     run_a.mark_running();
     let run_a_id = run_a.run_id;
-    state.run_manager.insert_run(run_a);
+    let _ = state.run_manager.insert_run(run_a);
     let token_a = CancellationToken::new();
     state
         .run_manager
@@ -509,7 +761,7 @@ async fn deny_cancels_queued_runs_in_same_session() {
     // Run B: Queued behind A on the SAME session.
     let run_b = Run::new(session_id, agent_id, "queued behind".into());
     let run_b_id = run_b.run_id;
-    state.run_manager.insert_run(run_b.clone());
+    let _ = state.run_manager.insert_run(run_b.clone());
     let token_b = CancellationToken::new();
     state
         .run_manager
@@ -521,7 +773,7 @@ async fn deny_cancels_queued_runs_in_same_session() {
         .get_or_create(agent_id, "test-deny-queue-other");
     let run_c = Run::new(other_session.id, agent_id, "other session".into());
     let run_c_id = run_c.run_id;
-    state.run_manager.insert_run(run_c);
+    let _ = state.run_manager.insert_run(run_c);
     let token_c = CancellationToken::new();
     state
         .run_manager
@@ -566,7 +818,7 @@ async fn deny_cancels_queued_runs_in_same_session() {
         "queued same-session run's token must be cancelled on deny"
     );
     assert_eq!(
-        state.run_manager.get_run(run_b_id).unwrap().status,
+        state.run_manager.get_run(run_b_id).unwrap().status(),
         RunStatus::Cancelled,
         "queued same-session run must flip to Cancelled on deny"
     );
@@ -584,7 +836,7 @@ async fn deny_cancels_queued_runs_in_same_session() {
         "queued run on another session must not be cancelled"
     );
     assert_eq!(
-        state.run_manager.get_run(run_c_id).unwrap().status,
+        state.run_manager.get_run(run_c_id).unwrap().status(),
         RunStatus::Queued,
         "queued run on another session must stay Queued"
     );
@@ -620,7 +872,7 @@ async fn deny_cancels_queued_runs_in_same_session() {
     )
     .await;
     assert_eq!(
-        state.run_manager.get_run(run_b_id).unwrap().status,
+        state.run_manager.get_run(run_b_id).unwrap().status(),
         RunStatus::Cancelled,
         "queued run must never auto-start after a deny"
     );
@@ -651,7 +903,7 @@ async fn deny_skips_queued_run_without_registered_cancel_token() {
     let mut run_a = Run::new(session_id, agent_id, "guarded run".into());
     run_a.mark_running();
     let run_a_id = run_a.run_id;
-    state.run_manager.insert_run(run_a);
+    let _ = state.run_manager.insert_run(run_a);
     let token_a = CancellationToken::new();
     state
         .run_manager
@@ -662,7 +914,7 @@ async fn deny_skips_queued_run_without_registered_cancel_token() {
     // inside `create_run`'s insert-to-register window.
     let run_b = Run::new(session_id, agent_id, "queued, token pending".into());
     let run_b_id = run_b.run_id;
-    state.run_manager.insert_run(run_b);
+    let _ = state.run_manager.insert_run(run_b);
 
     let approval_id = uuid::Uuid::new_v4();
     let (decision_tx, decision_rx) = tokio::sync::oneshot::channel();
@@ -695,7 +947,7 @@ async fn deny_skips_queued_run_without_registered_cancel_token() {
     // The token-less queued run escaped the sweep: still Queued, never
     // marked Cancelled (degraded pre-#1109 behavior, not corruption).
     assert_eq!(
-        state.run_manager.get_run(run_b_id).unwrap().status,
+        state.run_manager.get_run(run_b_id).unwrap().status(),
         RunStatus::Queued,
         "queued run without a registered cancel token must be left Queued \
          by the deny sweep — marking it Cancelled would race create_run's \
@@ -1502,7 +1754,7 @@ async fn partial_tool_call_failure_preserves_error_in_run_record() {
 
     let run = Run::new(session_id, agent_id, "test input".into());
     let run_id = run.run_id;
-    state.run_manager.insert_run(run);
+    let _ = state.run_manager.insert_run(run);
 
     // Simulate what execute_run does on FailedWithToolCalls: mark as failed
     // with the error message while tool calls are persisted separately.
@@ -1514,7 +1766,7 @@ async fn partial_tool_call_failure_preserves_error_in_run_record() {
     );
 
     let run = state.run_manager.get_run(run_id).expect("run should exist");
-    assert_eq!(run.status, RunStatus::Failed);
+    assert_eq!(run.status(), RunStatus::Failed);
     assert_eq!(
         run.error.as_deref(),
         Some("LLM API error after 2 tool calls"),
@@ -1542,7 +1794,7 @@ async fn completed_run_is_not_cancellable() {
 
     let run = Run::new(session_id, agent_id, "test".into());
     let run_id = run.run_id;
-    state.run_manager.insert_run(run);
+    let _ = state.run_manager.insert_run(run);
 
     // Register a cancel token (as execute_run does on start).
     let cancel_token = CancellationToken::new();
@@ -1581,7 +1833,7 @@ async fn completed_run_is_not_cancellable() {
     // Verify the run status is still Completed (not mutated).
     let run = state.run_manager.get_run(run_id).unwrap();
     assert_eq!(
-        run.status,
+        run.status(),
         RunStatus::Completed,
         "completed run status must not change after a cancel attempt"
     );
@@ -2834,7 +3086,7 @@ async fn create_run_pre_persists_user_input_to_session() {
 /// Codex P2 follow-up on the first cut: we wait for the run to transition
 /// to `Running` (which guarantees `mark_run_as_running_with_config` has
 /// fired and the layered snapshot is now on the run record) and assert
-/// against `run.resolved_config` from the persisted run, NOT against a
+/// against `run.resolved_config()` from the persisted run, NOT against a
 /// fresh `resolve_agent_config` call. A separate-helper assertion is
 /// independent of the request body and would still pass even if a
 /// regression reintroduced `body.merge_into(resolved)` somewhere inside
@@ -2956,8 +3208,7 @@ async fn create_run_ignores_stale_per_run_override_fields() {
         .get_run(run_id)
         .expect("run must exist after create_run enqueued it");
     let snapshot = run
-        .resolved_config
-        .as_ref()
+        .resolved_config()
         .expect("resolved_config must be populated once the run reaches Running");
 
     // Provider + model: agent's anthropic/claude-sonnet-4-6, NOT the
@@ -3474,7 +3725,7 @@ async fn execute_run_failure_arm_marks_run_failed_with_structured_error_on_provi
     // / subagent paths use.
     let run = Run::new(session_id, agent_id, "trigger #863 in execute_run".into());
     let run_id = run.run_id;
-    state.run_manager.insert_run(run.clone());
+    let _ = state.run_manager.insert_run(run.clone());
 
     let cancel_token = CancellationToken::new();
     state
@@ -3514,10 +3765,10 @@ async fn execute_run_failure_arm_marks_run_failed_with_structured_error_on_provi
         .get_run(run_id)
         .expect("run must still exist after execute_run returns");
     assert_eq!(
-        final_run.status,
+        final_run.status(),
         RunStatus::Failed,
         "run must reach Failed via the resolve_outcome failure arm; got {:?}",
-        final_run.status,
+        final_run.status(),
     );
 
     // 2. The persisted error carries the `Display`-formatted structured
@@ -3581,7 +3832,7 @@ async fn create_run_reports_queued_behind_when_agent_is_running() {
     // Simulate an already-running run on this agent.
     let running_run = Run::new(session_id, agent_id, "prior task".into());
     let running_run_id = running_run.run_id;
-    state.run_manager.insert_run(running_run);
+    let _ = state.run_manager.insert_run(running_run);
     state.run_manager.mark_run_as_running(running_run_id);
 
     // Subscribe to session events so we can inspect the run_created payload.
@@ -3634,7 +3885,7 @@ async fn run_panic_is_reconciled_to_failed_and_cleans_activity_state() {
     let run = Run::new(session_id, agent_id, "panic".to_string());
     let run_id = run.run_id;
     let cancel_token = CancellationToken::new();
-    state.run_manager.insert_run(run);
+    let _ = state.run_manager.insert_run(run);
     state
         .run_manager
         .register_cancel_token(run_id, cancel_token.clone());
@@ -3658,7 +3909,7 @@ async fn run_panic_is_reconciled_to_failed_and_cleans_activity_state() {
     .await;
 
     let failed = state.run_manager.get_run(run_id).expect("run retained");
-    assert_eq!(failed.status, RunStatus::Failed);
+    assert_eq!(failed.status(), RunStatus::Failed);
     assert_eq!(
         failed.error.as_deref(),
         Some("Run panicked during execution")
@@ -3684,7 +3935,7 @@ async fn late_cleanup_panic_does_not_reclassify_a_completed_run_as_failed() {
     let session_id = SessionId::new();
     let run = Run::new(session_id, agent_id, "complete".to_string());
     let run_id = run.run_id;
-    state.run_manager.insert_run(run);
+    let _ = state.run_manager.insert_run(run);
     state.run_manager.mark_run_as_running(run_id);
     assert!(state.run_manager.mark_run_as_completed(
         run_id,
@@ -3710,7 +3961,7 @@ async fn late_cleanup_panic_does_not_reclassify_a_completed_run_as_failed() {
     .await;
 
     let completed = state.run_manager.get_run(run_id).expect("run retained");
-    assert_eq!(completed.status, RunStatus::Completed);
+    assert_eq!(completed.status(), RunStatus::Completed);
     assert_eq!(completed.output.as_deref(), Some("done"));
     assert!(completed.error.is_none());
 }
@@ -4221,7 +4472,7 @@ async fn handle_dm_run_completion_gated_when_cancel_wins_race() {
     // Insert bob's peer-triggered run (the run that races the cancel).
     let run = Run::new(dm_session_id, bob_id, "received a DM".into());
     let run_id = run.run_id;
-    state.run_manager.insert_run(run);
+    let _ = state.run_manager.insert_run(run);
     state.run_manager.mark_run_as_running(run_id);
 
     // Simulate the race: a concurrent path (cancel handler, shutdown
@@ -4251,7 +4502,7 @@ async fn handle_dm_run_completion_gated_when_cancel_wins_race() {
         "mark_run_as_completed must return false when state is already terminal"
     );
     assert_eq!(
-        state.run_manager.get_run(run_id).unwrap().status,
+        state.run_manager.get_run(run_id).unwrap().status(),
         RunStatus::Cancelled,
         "Cancelled status must NOT be clobbered to Completed"
     );
@@ -4343,7 +4594,7 @@ async fn handle_dm_run_completion_fires_when_completed_transition_wins() {
 
     let run = Run::new(dm_session_id, bob_id, "received a DM".into());
     let run_id = run.run_id;
-    state.run_manager.insert_run(run);
+    let _ = state.run_manager.insert_run(run);
     state.run_manager.mark_run_as_running(run_id);
 
     let mut dm_rx = subscribe_session(&state, dm_session_id);
@@ -4473,7 +4724,7 @@ async fn handle_dm_run_failure_fires_when_cancel_transition_already_lost() {
     // Insert bob's peer-triggered run.
     let run = Run::new(dm_session_id, bob_id, "received a DM".into());
     let run_id = run.run_id;
-    state.run_manager.insert_run(run);
+    let _ = state.run_manager.insert_run(run);
     state.run_manager.mark_run_as_running(run_id);
 
     // Simulate the race: an external path (the synchronous HTTP cancel
@@ -4601,7 +4852,7 @@ async fn agent_session_activity_started_and_ended_arrive_on_feed() {
     // Insert and mark a run as running on session A.
     let run = Run::new(session_a_id, agent_id, "test".into());
     let run_id = run.run_id;
-    state.run_manager.insert_run(run);
+    let _ = state.run_manager.insert_run(run);
     state.run_manager.mark_run_as_running(run_id);
 
     // Mid-run: GET /sessions should report has_active_run=true for A only.
@@ -4681,7 +4932,7 @@ async fn agent_session_activity_feed_filters_by_agent_id() {
     // Emit activity on agent Y's feed.
     let run = Run::new(session_y_id, agent_y, "Y run".into());
     let run_id = run.run_id;
-    state.run_manager.insert_run(run);
+    let _ = state.run_manager.insert_run(run);
     state
         .run_manager
         .send_agent_event(
@@ -4744,7 +4995,7 @@ async fn drive_activity_run(
 ) {
     let run = Run::new(session_id, agent_id, input.to_string());
     let run_id = run.run_id;
-    state.run_manager.insert_run(run.clone());
+    let _ = state.run_manager.insert_run(run.clone());
     let cancel_token = CancellationToken::new();
     state
         .run_manager
@@ -4957,7 +5208,7 @@ async fn pre_cancelled_run_emits_session_activity_ended() {
 
     let run = Run::new(session_id, agent_id, "noop".into());
     let run_id = run.run_id;
-    state.run_manager.insert_run(run.clone());
+    let _ = state.run_manager.insert_run(run.clone());
 
     let cancel_token = CancellationToken::new();
     state
@@ -5065,7 +5316,7 @@ async fn pre_cancelled_run_flips_state_before_broadcasting() {
 
     let run = Run::new(session_id, agent_id, "noop".into());
     let run_id = run.run_id;
-    state.run_manager.insert_run(run.clone());
+    let _ = state.run_manager.insert_run(run.clone());
 
     let cancel_token = CancellationToken::new();
     state
@@ -5147,7 +5398,7 @@ async fn pre_cancelled_run_flips_state_before_broadcasting() {
         .get_run(run_id)
         .expect("run must exist after pre-cancellation");
     assert_eq!(
-        run_snapshot.status,
+        run_snapshot.status(),
         RunStatus::Cancelled,
         "run status must be Cancelled after the run completes"
     );
@@ -5165,11 +5416,11 @@ async fn pre_cancelled_run_flips_state_before_broadcasting() {
 /// We can't pin the invariant via `has_active_runs` alone because both
 /// `Queued` and `Running` count as active, so the field is `true` in
 /// both pre-fix and post-fix orderings at this point. Instead we pin
-/// `run.status`, which differs: pre-fix the run is still `Queued` at
+/// `run.status()`, which differs: pre-fix the run is still `Queued` at
 /// broadcast time; post-fix it is already `Running`.
 ///
 /// **Interposer pattern:** spawn `execute_run`, subscribe a session
-/// sender, and probe `run.status` synchronously the moment
+/// sender, and probe `run.status()` synchronously the moment
 /// `run_started` arrives. Between `send_event(run_started)` and
 /// `mark_run_as_running` in pre-fix code there is a real suspension
 /// point — `send_agent_event(session_activity_started).await` — so the
@@ -5192,7 +5443,7 @@ async fn happy_path_start_flips_state_before_broadcasting() {
 
     let run = Run::new(session_id, agent_id, "test".into());
     let run_id = run.run_id;
-    state.run_manager.insert_run(run.clone());
+    let _ = state.run_manager.insert_run(run.clone());
 
     let cancel_token = CancellationToken::new();
     state
@@ -5239,11 +5490,11 @@ async fn happy_path_start_flips_state_before_broadcasting() {
         if event.event_type == "run_started" {
             saw_started = true;
             // SYNCHRONOUS probe — see comment in the pre-cancel test.
-            // We probe `run.status` rather than `has_active_runs` because
+            // We probe `run.status()` rather than `has_active_runs` because
             // both `Queued` and `Running` count as active, so the latter
             // does not distinguish pre-fix (`Queued` at broadcast) from
             // post-fix (`Running` at broadcast).
-            probed_status = state.run_manager.get_run(run_id).map(|r| r.status);
+            probed_status = state.run_manager.get_run(run_id).map(|r| r.status());
             break;
         }
     }
@@ -5255,7 +5506,7 @@ async fn happy_path_start_flips_state_before_broadcasting() {
     assert_eq!(
         probed_status,
         Some(RunStatus::Running),
-        "run.status must be Running at the moment run_started is observed \
+        "run.status() must be Running at the moment run_started is observed \
          by a session subscriber (pre-#895 race: probe sees status=Queued \
          even though the started event has fired). Reverting the \
          lifecycle.rs reorder causes this assertion to fail."
@@ -5305,7 +5556,7 @@ async fn smoke_post_execute_cancel_flips_state_at_run_manager_boundary() {
 
     let run = Run::new(session_id, agent_id, "test".into());
     let run_id = run.run_id;
-    state.run_manager.insert_run(run);
+    let _ = state.run_manager.insert_run(run);
     state.run_manager.mark_run_as_running(run_id);
     assert!(state.run_manager.has_active_runs(session_id));
 
@@ -5335,7 +5586,7 @@ async fn smoke_post_execute_cancel_flips_state_at_run_manager_boundary() {
         .get_run(run_id)
         .expect("run must exist after mark_run_as_cancelled");
     assert_eq!(
-        run_snapshot.status,
+        run_snapshot.status(),
         RunStatus::Cancelled,
         "run status must be Cancelled after mark_run_as_cancelled"
     );
@@ -5471,7 +5722,7 @@ async fn failed_with_tool_calls_arm_flips_state_before_broadcasting() {
 
     let run = Run::new(session_id, agent_id, "trigger LLM failure".into());
     let run_id = run.run_id;
-    state.run_manager.insert_run(run.clone());
+    let _ = state.run_manager.insert_run(run.clone());
 
     let cancel_token = CancellationToken::new();
     state
@@ -5653,7 +5904,7 @@ async fn smoke_ok_arm_flips_state_at_run_manager_boundary() {
 
     let run = Run::new(session_id, agent_id, "test".into());
     let run_id = run.run_id;
-    state.run_manager.insert_run(run);
+    let _ = state.run_manager.insert_run(run);
     state.run_manager.mark_run_as_running(run_id);
     assert!(state.run_manager.has_active_runs(session_id));
 
@@ -5693,7 +5944,7 @@ async fn smoke_ok_arm_flips_state_at_run_manager_boundary() {
         .get_run(run_id)
         .expect("run must exist after mark_run_as_completed");
     assert_eq!(
-        run_snapshot.status,
+        run_snapshot.status(),
         RunStatus::Completed,
         "run status must be Completed after mark_run_as_completed"
     );
@@ -5739,7 +5990,7 @@ async fn smoke_err_arm_flips_state_at_run_manager_boundary() {
 
     let run = Run::new(session_id, agent_id, "test".into());
     let run_id = run.run_id;
-    state.run_manager.insert_run(run);
+    let _ = state.run_manager.insert_run(run);
     state.run_manager.mark_run_as_running(run_id);
     assert!(state.run_manager.has_active_runs(session_id));
 
@@ -5779,7 +6030,7 @@ async fn smoke_err_arm_flips_state_at_run_manager_boundary() {
         .get_run(run_id)
         .expect("run must exist after mark_run_as_failed");
     assert_eq!(
-        run_snapshot.status,
+        run_snapshot.status(),
         RunStatus::Failed,
         "run status must be Failed after mark_run_as_failed"
     );
@@ -5827,7 +6078,7 @@ async fn execute_run_failed_arm_persists_no_lifecycle_error_marker() {
 
     let run = Run::new(session_id, agent_id, "trigger LLM failure".into());
     let run_id = run.run_id;
-    state.run_manager.insert_run(run.clone());
+    let _ = state.run_manager.insert_run(run.clone());
 
     let cancel_token = CancellationToken::new();
     state
@@ -5862,10 +6113,10 @@ async fn execute_run_failed_arm_persists_no_lifecycle_error_marker() {
         .get_run(run_id)
         .expect("run must still exist after execute_run returns");
     assert_eq!(
-        final_run.status,
+        final_run.status(),
         RunStatus::Failed,
         "run must reach Failed status when the LLM is unreachable; got {:?} (error={:?})",
-        final_run.status,
+        final_run.status(),
         final_run.error,
     );
 
@@ -6067,7 +6318,7 @@ async fn three_back_to_back_queued_runs_get_distinct_initial_positions() {
     // create_run calls all see queued_behind > 0.
     let running_run = Run::new(session_id, agent_id, "prior task".into());
     let running_run_id = running_run.run_id;
-    state.run_manager.insert_run(running_run);
+    let _ = state.run_manager.insert_run(running_run);
     state.run_manager.mark_run_as_running(running_run_id);
 
     // Park a never-completing work item on the per-agent SessionQueue so
@@ -6169,16 +6420,16 @@ async fn execute_run_terminal_broadcasts_decremented_positions_to_remaining_queu
     // Create three queued runs, A, B, C, in FIFO order.
     let a = Run::new(session_id, agent_id, "A".into());
     let a_id = a.run_id;
-    state.run_manager.insert_run(a);
+    let _ = state.run_manager.insert_run(a);
     // Sleep enough for `created_at` to differ deterministically.
     tokio::time::sleep(std::time::Duration::from_millis(2)).await;
     let b = Run::new(session_id, agent_id, "B".into());
     let b_id = b.run_id;
-    state.run_manager.insert_run(b);
+    let _ = state.run_manager.insert_run(b);
     tokio::time::sleep(std::time::Duration::from_millis(2)).await;
     let c = Run::new(session_id, agent_id, "C".into());
     let c_id = c.run_id;
-    state.run_manager.insert_run(c);
+    let _ = state.run_manager.insert_run(c);
 
     let mut rx = subscribe_session(&state, session_id);
 
@@ -6260,17 +6511,17 @@ async fn get_run_status_returns_queue_position_for_queued_run() {
     // One running run + two queued runs.
     let running = Run::new(session_id, agent_id, "running".into());
     let running_id = running.run_id;
-    state.run_manager.insert_run(running);
+    let _ = state.run_manager.insert_run(running);
     state.run_manager.mark_run_as_running(running_id);
 
     tokio::time::sleep(std::time::Duration::from_millis(2)).await;
     let q1 = Run::new(session_id, agent_id, "q1".into());
     let q1_id = q1.run_id;
-    state.run_manager.insert_run(q1);
+    let _ = state.run_manager.insert_run(q1);
     tokio::time::sleep(std::time::Duration::from_millis(2)).await;
     let q2 = Run::new(session_id, agent_id, "q2".into());
     let q2_id = q2.run_id;
-    state.run_manager.insert_run(q2);
+    let _ = state.run_manager.insert_run(q2);
 
     // Queued #1 should be position 1 (next up — one Running ahead).
     let resp_q1 = super::lifecycle::get_run_status(State(state.clone()), Path(q1_id))
@@ -6309,7 +6560,7 @@ async fn broadcast_queue_advance_is_noop_when_no_queued_runs_remain() {
 
     let run = Run::new(session_id, agent_id, "single".into());
     let run_id = run.run_id;
-    state.run_manager.insert_run(run);
+    let _ = state.run_manager.insert_run(run);
 
     let mut rx = subscribe_session(&state, session_id);
 
@@ -6893,7 +7144,7 @@ async fn execute_run_rejects_overbudget_resolved_config_on_non_http_path() {
     // scheduler / peer-DM / subagent paths use.
     let run = Run::new(session_id, agent_id, "over-budget non-http trigger".into());
     let run_id = run.run_id;
-    state.run_manager.insert_run(run.clone());
+    let _ = state.run_manager.insert_run(run.clone());
 
     let cancel_token = CancellationToken::new();
     state
@@ -6953,10 +7204,10 @@ async fn execute_run_rejects_overbudget_resolved_config_on_non_http_path() {
         .get_run(run_id)
         .expect("run must still exist after execute_run returns");
     assert_eq!(
-        final_run.status,
+        final_run.status(),
         RunStatus::Failed,
         "run must reach Failed via the budget arm; got {:?}",
-        final_run.status,
+        final_run.status(),
     );
 
     // 2. The persisted error carries the structured message — same shape
@@ -6994,9 +7245,9 @@ async fn execute_run_rejects_overbudget_resolved_config_on_non_http_path() {
     //    snapshot is never persisted and the run isn't visible in the
     //    running set.
     assert!(
-        final_run.resolved_config.is_none(),
+        final_run.resolved_config().is_none(),
         "Failed-before-running runs must not have a resolved_config snapshot; got {:?}",
-        final_run.resolved_config,
+        final_run.resolved_config(),
     );
 
     shutdown_token.cancel();
@@ -7090,7 +7341,7 @@ async fn execute_run_mock_mode_skips_budget_validation_on_non_http_path() {
         "mock-mode overbudget non-http trigger".into(),
     );
     let run_id = run.run_id;
-    state.run_manager.insert_run(run.clone());
+    let _ = state.run_manager.insert_run(run.clone());
 
     let cancel_token = CancellationToken::new();
     state
@@ -7230,7 +7481,7 @@ async fn drive_notification_run_with_debug_mode(
 
     let run = Run::new(session_id, agent_id, "Subagent 'worker' completed.".into());
     let run_id = run.run_id;
-    state.run_manager.insert_run(run.clone());
+    let _ = state.run_manager.insert_run(run.clone());
     let cancel_token = CancellationToken::new();
     state
         .run_manager
@@ -7277,10 +7528,10 @@ async fn notification_run_with_debug_mode_off_does_not_emit_context_debug() {
     // subscription observed its lifecycle — guards against a vacuous pass
     // where the run failed before the runtime ever built a context.
     assert_eq!(
-        final_run.status,
+        final_run.status(),
         RunStatus::Completed,
         "mock-mode notification run must complete; got {:?} (error: {:?})",
-        final_run.status,
+        final_run.status(),
         final_run.error,
     );
     assert!(
@@ -7291,8 +7542,7 @@ async fn notification_run_with_debug_mode_off_does_not_emit_context_debug() {
 
     // The resolved snapshot honors the agent record — no force-flip.
     let snapshot = final_run
-        .resolved_config
-        .as_ref()
+        .resolved_config()
         .expect("running run must have persisted a resolved-config snapshot");
     assert!(
         !snapshot.debug_mode,
@@ -7316,16 +7566,15 @@ async fn notification_run_with_debug_mode_on_emits_context_debug() {
     let (final_run, events) = drive_notification_run_with_debug_mode(true).await;
 
     assert_eq!(
-        final_run.status,
+        final_run.status(),
         RunStatus::Completed,
         "mock-mode notification run must complete; got {:?} (error: {:?})",
-        final_run.status,
+        final_run.status(),
         final_run.error,
     );
 
     let snapshot = final_run
-        .resolved_config
-        .as_ref()
+        .resolved_config()
         .expect("running run must have persisted a resolved-config snapshot");
     assert!(
         snapshot.debug_mode,
@@ -7375,7 +7624,7 @@ async fn http_cancel_flips_state_synchronously() {
     // Set up a run in the Running state (the common case for cancel).
     let run = Run::new(session_id, agent_id, "test".into());
     let run_id = run.run_id;
-    state.run_manager.insert_run(run);
+    let _ = state.run_manager.insert_run(run);
     state.run_manager.mark_run_as_running(run_id);
 
     // Register a cancel token so `cancel_run` finds it.
@@ -7404,9 +7653,9 @@ async fn http_cancel_flips_state_synchronously() {
         .get_run(run_id)
         .expect("run must still exist after cancel");
     assert_eq!(
-        run_after.status,
+        run_after.status(),
         RunStatus::Cancelled,
-        "run.status MUST be Cancelled immediately after `cancel_run` \
+        "run.status() MUST be Cancelled immediately after `cancel_run` \
          returns (#1046). Pre-fix: status stayed `Running` until \
          `execute_run`'s terminal arm completed."
     );
@@ -7436,6 +7685,63 @@ async fn http_cancel_flips_state_synchronously() {
             .collect::<Vec<_>>()
     );
 
+    shutdown_token.cancel();
+}
+
+#[tokio::test]
+async fn http_cancel_persists_before_firing_the_cancellation_token() {
+    use axum::extract::{Path, State};
+
+    let (state, shutdown_token, _cr, _tr, _dr) = test_app_state();
+    let agent_id = AgentId::new();
+    let session = state
+        .session_manager
+        .get_or_create(agent_id, "test-cancel-persistence-order");
+    let run = Run::new(session.id, agent_id, "test".into());
+    let run_id = run.run_id;
+    let _ = state.run_manager.insert_run(run);
+    assert!(state.run_manager.mark_run_as_running(run_id));
+    let cancel_token = CancellationToken::new();
+    state
+        .run_manager
+        .register_cancel_token(run_id, cancel_token.clone());
+    let mut session_rx = subscribe_session(&state, session.id);
+    state.run_manager.inject_next_persistence_failure();
+
+    let Err((status, body)) =
+        super::lifecycle::cancel_run(State(state.clone()), Path(run_id)).await
+    else {
+        panic!("durable cancellation failure must fail the HTTP request");
+    };
+
+    assert_eq!(status, axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(body.0["error"]["code"], "LIFECYCLE_PERSISTENCE_FAILED");
+    assert!(
+        cancel_token.is_cancelled(),
+        "the quarantined worker must be stopped after the durable attempt fails"
+    );
+    let quarantined = state.run_manager.get_run(run_id).unwrap();
+    assert_eq!(quarantined.status(), RunStatus::Failed);
+    assert_eq!(quarantined.terminal_reason(), Some("persistence_failed"));
+    let peer_error = super::lifecycle::lifecycle_persistence_error_for_peer(&state, run_id, None)
+        .expect("the quarantined terminal reason must retain persistence provenance");
+    assert_eq!(peer_error, "Runtime error");
+    assert!(!peer_error.contains("injected run persistence failure"));
+    assert!(
+        drain_events(&mut session_rx)
+            .iter()
+            .any(|event| event.event_type == "run_error"),
+        "the persistence failure must be published immediately"
+    );
+    assert!(
+        state
+            .run_manager
+            .activity_events_from(0)
+            .await
+            .iter()
+            .any(|event| event.event_type == "session_activity_ended"),
+        "the activity boundary must close immediately"
+    );
     shutdown_token.cancel();
 }
 
@@ -7470,7 +7776,7 @@ async fn http_cancel_and_execute_run_emit_single_event() {
 
     let run = Run::new(session_id, agent_id, "trigger LLM hang".into());
     let run_id = run.run_id;
-    state.run_manager.insert_run(run.clone());
+    let _ = state.run_manager.insert_run(run.clone());
 
     let cancel_token = CancellationToken::new();
     state
@@ -7571,7 +7877,7 @@ async fn http_cancel_and_execute_run_emit_single_event() {
         .get_run(run_id)
         .expect("run must exist after execute_run");
     assert_eq!(
-        final_run.status,
+        final_run.status(),
         RunStatus::Cancelled,
         "run must remain `Cancelled` after `execute_run` completes its cleanup"
     );
@@ -7595,12 +7901,12 @@ fn run_mark_cancelled_is_idempotent_and_returns_transition_bool() {
     let mut run = Run::new(session_id, agent_id, "test".into());
 
     // Queued → Cancelled transitions and reports true.
-    assert!(matches!(run.status, RunStatus::Queued));
+    assert!(matches!(run.status(), RunStatus::Queued));
     assert!(
         run.mark_cancelled(),
         "Queued → Cancelled must report transition=true"
     );
-    assert!(matches!(run.status, RunStatus::Cancelled));
+    assert!(matches!(run.status(), RunStatus::Cancelled));
     let first_ended_at = run.ended_at.expect("ended_at must be stamped");
 
     // Second call on an already-Cancelled run reports false and does
@@ -7625,13 +7931,13 @@ fn run_mark_cancelled_is_idempotent_and_returns_transition_bool() {
     let mut failed_run = Run::new(session_id, agent_id, "test".into());
     failed_run.mark_running();
     let _ = failed_run.mark_failed("boom".into());
-    assert!(matches!(failed_run.status, RunStatus::Failed));
+    assert!(matches!(failed_run.status(), RunStatus::Failed));
     assert!(
         !failed_run.mark_cancelled(),
         "mark_cancelled on a Failed run must report false (no transition)"
     );
     assert!(
-        matches!(failed_run.status, RunStatus::Failed),
+        matches!(failed_run.status(), RunStatus::Failed),
         "mark_cancelled on a Failed run must NOT overwrite the terminal status"
     );
 }
@@ -7710,7 +8016,7 @@ async fn http_cancel_wins_against_natural_completion() {
     // production state at the moment the LLM call is in flight.
     let run = Run::new(session_id, agent_id, "race fixture".into());
     let run_id = run.run_id;
-    state.run_manager.insert_run(run);
+    let _ = state.run_manager.insert_run(run);
     state.run_manager.mark_run_as_running(run_id);
 
     let mut session_rx = subscribe_session(&state, session_id);
@@ -7798,7 +8104,7 @@ async fn http_cancel_wins_against_natural_completion() {
         .get_run(run_id)
         .expect("run must exist after the race");
     assert_eq!(
-        final_run.status,
+        final_run.status(),
         RunStatus::Cancelled,
         "run state must remain Cancelled — `mark_completed` / \
          `mark_failed` must NOT regress an already-Cancelled run. \
@@ -7867,7 +8173,7 @@ async fn get_run_reasoning_returns_concatenated_text_and_max_event_id() {
 
     let run = Run::new(session_id, agent_id, "go think".into());
     let run_id = run.run_id;
-    state.run_manager.insert_run(run);
+    let _ = state.run_manager.insert_run(run);
 
     // Fire three reasoning_delta events on a first-turn run (no
     // parent-agent tool events yet, so the #1077 turn boundary is unset
@@ -7984,7 +8290,7 @@ async fn get_run_reasoning_returns_empty_when_no_reasoning_events_logged() {
 
     let run = Run::new(session_id, agent_id, "no reasoning yet".into());
     let run_id = run.run_id;
-    state.run_manager.insert_run(run);
+    let _ = state.run_manager.insert_run(run);
 
     let response = super::lifecycle::get_run_reasoning(State(state.clone()), Path(run_id))
         .await
@@ -8017,10 +8323,10 @@ async fn get_run_reasoning_isolates_text_by_run_id() {
 
     let run_a = Run::new(session_id, agent_id, "a".into());
     let run_a_id = run_a.run_id;
-    state.run_manager.insert_run(run_a);
+    let _ = state.run_manager.insert_run(run_a);
     let run_b = Run::new(session_id, agent_id, "b".into());
     let run_b_id = run_b.run_id;
-    state.run_manager.insert_run(run_b);
+    let _ = state.run_manager.insert_run(run_b);
 
     state
         .run_manager
@@ -8089,7 +8395,7 @@ async fn get_run_reasoning_drops_pre_turn_boundary_deltas() {
 
     let run = Run::new(session_id, agent_id, "multi-turn".into());
     let run_id = run.run_id;
-    state.run_manager.insert_run(run);
+    let _ = state.run_manager.insert_run(run);
 
     // Turn 1: reasoning -> tool_start -> tool_end
     state
@@ -8196,7 +8502,7 @@ async fn get_run_reasoning_returns_full_text_when_no_tool_events() {
 
     let run = Run::new(session_id, agent_id, "first turn".into());
     let run_id = run.run_id;
-    state.run_manager.insert_run(run);
+    let _ = state.run_manager.insert_run(run);
 
     state
         .run_manager
@@ -8255,7 +8561,7 @@ async fn get_run_reasoning_boundary_ignores_subagent_tool_events() {
 
     let run = Run::new(session_id, agent_id, "subagent boundary".into());
     let run_id = run.run_id;
-    state.run_manager.insert_run(run);
+    let _ = state.run_manager.insert_run(run);
 
     state
         .run_manager
@@ -8336,10 +8642,10 @@ async fn get_run_reasoning_boundary_is_run_scoped() {
 
     let run_a = Run::new(session_id, agent_id, "a".into());
     let run_a_id = run_a.run_id;
-    state.run_manager.insert_run(run_a);
+    let _ = state.run_manager.insert_run(run_a);
     let run_b = Run::new(session_id, agent_id, "b".into());
     let run_b_id = run_b.run_id;
-    state.run_manager.insert_run(run_b);
+    let _ = state.run_manager.insert_run(run_b);
 
     // Run B emits some reasoning first.
     state
@@ -8414,7 +8720,7 @@ async fn get_run_reasoning_boundary_uses_unmatched_tool_start() {
 
     let run = Run::new(session_id, agent_id, "approval-paused".into());
     let run_id = run.run_id;
-    state.run_manager.insert_run(run);
+    let _ = state.run_manager.insert_run(run);
 
     // Turn 1: reasoning -> tool_start (NO matching tool_end — approval-paused).
     state
@@ -8486,7 +8792,7 @@ async fn get_run_reasoning_live_run_returns_text_cursor_and_terminal_false() {
 
     let run = Run::new(session_id, agent_id, "go think".into());
     let run_id = run.run_id;
-    state.run_manager.insert_run(run);
+    let _ = state.run_manager.insert_run(run);
     // Run is in flight — the production state while the LLM call streams.
     state.run_manager.mark_run_as_running(run_id);
 
@@ -8556,7 +8862,7 @@ async fn get_run_reasoning_terminal_completed_run_seals_to_null_cursor() {
 
     let run = Run::new(session_id, agent_id, "think then finish".into());
     let run_id = run.run_id;
-    state.run_manager.insert_run(run);
+    let _ = state.run_manager.insert_run(run);
     state.run_manager.mark_run_as_running(run_id);
 
     // Final-turn reasoning lands in the durable session event log...
@@ -8646,7 +8952,7 @@ async fn get_run_reasoning_terminal_seal_event_id_is_above_delta_hwm() {
 
     let run = Run::new(session_id, agent_id, "think then finish".into());
     let run_id = run.run_id;
-    state.run_manager.insert_run(run);
+    let _ = state.run_manager.insert_run(run);
     state.run_manager.mark_run_as_running(run_id);
 
     // Final-turn reasoning streams into the durable session event log during
@@ -8755,7 +9061,7 @@ async fn get_run_reasoning_cancel_path_trailing_delta_still_seals() {
 
     let run = Run::new(session_id, agent_id, "cancel mid-think".into());
     let run_id = run.run_id;
-    state.run_manager.insert_run(run);
+    let _ = state.run_manager.insert_run(run);
     state.run_manager.mark_run_as_running(run_id);
 
     // HTTP cancel_run wins the race: flip to Cancelled + broadcast
@@ -8844,7 +9150,7 @@ async fn get_run_text_returns_concatenated_visible_reply_text() {
 
     let run = Run::new(session_id, agent_id, "go talk".into());
     let run_id = run.run_id;
-    state.run_manager.insert_run(run);
+    let _ = state.run_manager.insert_run(run);
 
     // Interleave a non-ephemeral event (`run_started`) so the buffer's
     // `last_session_event_id` watermark has something to snap to —
@@ -8949,7 +9255,7 @@ async fn get_run_text_returns_empty_when_no_text_events_logged() {
 
     let run = Run::new(session_id, agent_id, "silent".into());
     let run_id = run.run_id;
-    state.run_manager.insert_run(run);
+    let _ = state.run_manager.insert_run(run);
 
     let response = super::lifecycle::get_run_text(State(state.clone()), Path(run_id))
         .await
@@ -8982,10 +9288,10 @@ async fn get_run_text_isolates_text_by_run_id() {
 
     let run_a = Run::new(session_id, agent_id, "a".into());
     let run_a_id = run_a.run_id;
-    state.run_manager.insert_run(run_a);
+    let _ = state.run_manager.insert_run(run_a);
     let run_b = Run::new(session_id, agent_id, "b".into());
     let run_b_id = run_b.run_id;
-    state.run_manager.insert_run(run_b);
+    let _ = state.run_manager.insert_run(run_b);
 
     state
         .run_manager
@@ -9057,7 +9363,7 @@ async fn get_run_text_drops_pre_turn_boundary_deltas() {
 
     let run = Run::new(session_id, agent_id, "multi-turn".into());
     let run_id = run.run_id;
-    state.run_manager.insert_run(run);
+    let _ = state.run_manager.insert_run(run);
 
     // Turn 1: token_delta -> tool_start -> tool_end
     state
@@ -9163,7 +9469,7 @@ async fn get_run_text_boundary_ignores_subagent_tool_events() {
 
     let run = Run::new(session_id, agent_id, "subagent boundary".into());
     let run_id = run.run_id;
-    state.run_manager.insert_run(run);
+    let _ = state.run_manager.insert_run(run);
 
     state
         .run_manager
@@ -9245,7 +9551,7 @@ async fn get_run_text_boundary_uses_unmatched_tool_start() {
 
     let run = Run::new(session_id, agent_id, "approval-paused".into());
     let run_id = run.run_id;
-    state.run_manager.insert_run(run);
+    let _ = state.run_manager.insert_run(run);
 
     // Turn 1: token_delta -> tool_start (NO matching tool_end — approval-paused).
     state
@@ -9314,7 +9620,7 @@ async fn get_run_text_last_event_id_bounded_by_session_hwm() {
 
     let run = Run::new(session_id, agent_id, "hwm".into());
     let run_id = run.run_id;
-    state.run_manager.insert_run(run);
+    let _ = state.run_manager.insert_run(run);
 
     // Mix some non-ephemeral events around the token_delta so the HWM
     // walks across multiple ids and we can verify the watermark sits
@@ -9405,7 +9711,7 @@ async fn get_run_text_returns_empty_after_run_completes() {
 
     let run = Run::new(session_id, agent_id, "soon-done".into());
     let run_id = run.run_id;
-    state.run_manager.insert_run(run);
+    let _ = state.run_manager.insert_run(run);
 
     state
         .run_manager
@@ -10358,7 +10664,7 @@ async fn queued_then_cancelled_dm_run_notifies_peer() {
     // queue dispatches the work item).
     let run = Run::new(dm_session_id, bob_id, "ping".to_string());
     let run_id = run.run_id;
-    state.run_manager.insert_run(run.clone());
+    let _ = state.run_manager.insert_run(run.clone());
     let cancel_token = CancellationToken::new();
     state
         .run_manager
@@ -10385,7 +10691,7 @@ async fn queued_then_cancelled_dm_run_notifies_peer() {
 
     // The run must be Cancelled (never auto-started).
     assert_eq!(
-        state.run_manager.get_run(run_id).unwrap().status,
+        state.run_manager.get_run(run_id).unwrap().status(),
         RunStatus::Cancelled,
         "queued-then-cancelled run must stay Cancelled"
     );
@@ -10450,7 +10756,7 @@ async fn queued_then_cancelled_non_peer_run_does_not_notify() {
 
     let run = Run::new(session_id, bob_id, "hello".to_string());
     let run_id = run.run_id;
-    state.run_manager.insert_run(run.clone());
+    let _ = state.run_manager.insert_run(run.clone());
     let cancel_token = CancellationToken::new();
     state
         .run_manager
@@ -10475,7 +10781,7 @@ async fn queued_then_cancelled_non_peer_run_does_not_notify() {
     .await;
 
     assert_eq!(
-        state.run_manager.get_run(run_id).unwrap().status,
+        state.run_manager.get_run(run_id).unwrap().status(),
         RunStatus::Cancelled
     );
     assert!(
@@ -10821,7 +11127,7 @@ fn spend_one_shot(state: &AppState, job_id: alms_core::JobId) {
         )
         .expect("record_run must succeed");
     assert_eq!(
-        state.job_store.get(job_id).unwrap().status,
+        state.job_store.get(job_id).unwrap().status(),
         alms_core::JobStatus::Cancelled,
         "sanity: a spent one-shot carries JobStatus::Cancelled (#763)"
     );
@@ -10868,13 +11174,48 @@ async fn episode_job_with_no_async_work_completes_at_turn_end() {
 
     // The job record was updated and the recurring schedule re-armed.
     let job = state.job_store.get(job_id).expect("job still exists");
-    assert_eq!(job.status, alms_core::JobStatus::Active);
+    assert_eq!(job.status(), alms_core::JobStatus::Active);
     assert!(job.last_run_at.is_some(), "record_run must have fired");
     assert!(
         job.next_run_at.expect("re-armed") > chrono::Utc::now(),
         "no cron tick elapsed during the turn — normal future re-arm"
     );
 
+    shutdown_token.cancel();
+}
+
+#[tokio::test]
+async fn scheduler_rearms_job_after_run_registration_persistence_failure() {
+    let (state, shutdown_token, _cr, _tr, _dr) = test_app_state_with_mock_llm();
+    let agent_id = AgentId::new();
+    let job_id = create_recurring_job(&state, agent_id, "retry durable registration");
+    let (fire_tx, fire_rx) = mpsc::unbounded_channel();
+    let loop_state = state.clone();
+    let loop_handle = tokio::spawn(async move {
+        super::notifications::scheduler_fire_loop(fire_rx, loop_state).await;
+    });
+
+    state.run_manager.inject_next_persistence_failure();
+    fire_tx.send(job_id).unwrap();
+
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if state.scheduler.pending_count().await == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("registration failure should promptly re-arm the job");
+
+    assert!(state.run_manager.runs.is_empty());
+    assert!(state.job_episodes.snapshot(job_id).is_none());
+    assert_eq!(
+        state.job_store.get(job_id).unwrap().status(),
+        alms_core::JobStatus::Pending
+    );
+    loop_handle.abort();
     shutdown_token.cancel();
 }
 
@@ -10903,7 +11244,7 @@ async fn episode_precancelled_turn_releases_reservation_and_closes() {
         job_id,
     );
     let run_id = run.run_id;
-    state.run_manager.insert_run(run.clone());
+    let _ = state.run_manager.insert_run(run.clone());
     state
         .job_episodes
         .open(job_id, session_id, agent_id, run_id);
@@ -10940,7 +11281,7 @@ async fn episode_precancelled_turn_releases_reservation_and_closes() {
     assert_eq!(meta["job_status"], "cancelled");
     let job = state.job_store.get(job_id).unwrap();
     assert!(job.last_run_at.is_some());
-    assert_eq!(job.status, alms_core::JobStatus::Active);
+    assert_eq!(job.status(), alms_core::JobStatus::Active);
 
     shutdown_token.cancel();
 }
@@ -11357,10 +11698,10 @@ async fn deadline_close_detaches_and_completes_with_note() {
 
     // A completed turn-1 run so the card has a real run to read.
     let mut run = Run::for_job(job_session_id, agent_id, "slow conversation".into(), job_id);
-    run.status = RunStatus::Completed;
-    run.output = Some("asked bob, waiting".into());
+    assert!(run.mark_running());
+    assert!(run.mark_completed("asked bob, waiting".into(), Default::default()));
     let run_id = run.run_id;
-    state.run_manager.insert_run(run);
+    let _ = state.run_manager.insert_run(run);
 
     // An expired episode with one pending DM (as the sweep would drain it).
     let pending_dm = SessionId::new();
@@ -11400,7 +11741,7 @@ async fn deadline_close_detaches_and_completes_with_note() {
     // The job completed + re-armed normally.
     let job = state.job_store.get(job_id).unwrap();
     assert!(job.last_run_at.is_some());
-    assert_eq!(job.status, alms_core::JobStatus::Active);
+    assert_eq!(job.status(), alms_core::JobStatus::Active);
 
     shutdown_token.cancel();
 }
@@ -11734,7 +12075,7 @@ async fn cancel_job_cancels_unstamped_run_on_its_job_session() {
     state
         .run_manager
         .register_cancel_token(run_id, token.clone());
-    state.run_manager.insert_run(run);
+    let _ = state.run_manager.insert_run(run);
 
     let response = crate::jobs::cancel_job(State(state.clone()), Path(job_id))
         .await
@@ -11905,7 +12246,7 @@ async fn delete_jobs_interleaved_with_close_cannot_resurrect_job() {
 
     // The stale snapshot close_episode holds across its fanout await.
     let job_snapshot = state.job_store.get(job_id).expect("job is live");
-    assert_ne!(job_snapshot.status, alms_core::JobStatus::Cancelled);
+    assert_ne!(job_snapshot.status(), alms_core::JobStatus::Cancelled);
 
     let job_session_id = state
         .session_manager
@@ -11932,12 +12273,12 @@ async fn delete_jobs_interleaved_with_close_cannot_resurrect_job() {
     assert_eq!(state.job_store.cancel(job_id).unwrap(), Some(true));
 
     // close_episode's post-fanout tail runs with the stale snapshot.
-    super::notifications::record_and_rearm(&state, &job_snapshot, &episode).await;
+    super::notifications::record_and_rearm(&state, &job_snapshot, &episode, false).await;
 
     // The job must stay Cancelled — not resurrected, not re-armed.
     let job = state.job_store.get(job_id).expect("job still in store");
     assert_eq!(
-        job.status,
+        job.status(),
         alms_core::JobStatus::Cancelled,
         "a DELETE interleaved with episode close must leave the job Cancelled (S1)"
     );
@@ -11966,7 +12307,7 @@ fn completed_episode(
     let run_id = run.run_id;
     run.mark_running();
     assert!(run.mark_completed("done".into(), TokenUsage::default()));
-    state.run_manager.insert_run(run);
+    let _ = state.run_manager.insert_run(run);
 
     super::job_episode::JobEpisode {
         job_id,
@@ -12037,7 +12378,7 @@ async fn cancel_wins_before_episode_close_without_completion_card() {
     close.await;
 
     assert_eq!(
-        state.job_store.get(job_id).unwrap().status,
+        state.job_store.get(job_id).unwrap().status(),
         alms_core::JobStatus::Cancelled
     );
     assert!(
@@ -12077,7 +12418,7 @@ async fn episode_close_wins_before_cancel_and_keeps_completion_card() {
     let (_text, metadata) = job_marker_from(&state, web_session_id);
     assert_eq!(metadata["job_id"], job_id.0.to_string());
     assert_eq!(
-        state.job_store.get(job_id).unwrap().status,
+        state.job_store.get(job_id).unwrap().status(),
         alms_core::JobStatus::Cancelled,
         "DELETE may cancel the recurring job after its completed episode is visible"
     );
@@ -12106,7 +12447,7 @@ async fn blocked_job_gate_does_not_delay_unrelated_job_cancellation() {
         .into_response();
     assert_eq!(response.status(), axum::http::StatusCode::NO_CONTENT);
     assert_eq!(
-        state.job_store.get(independent_job_id).unwrap().status,
+        state.job_store.get(independent_job_id).unwrap().status(),
         alms_core::JobStatus::Cancelled
     );
 

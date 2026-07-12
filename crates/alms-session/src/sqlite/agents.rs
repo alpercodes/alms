@@ -591,7 +591,7 @@ mod tests {
     use super::super::test_helpers::new_message;
     use super::super::*;
     use crate::types::Session;
-    use alms_core::job::{Job, JobId, JobSchedule, JobStatus};
+    use alms_core::job::{Job, JobSchedule};
     use alms_core::registry::AgentRecord;
     use alms_core::run::{Run, ToolCallRecord, ToolCallRole};
 
@@ -723,30 +723,22 @@ mod tests {
         store.save_summary(ss.id, &summary).unwrap();
 
         // Add jobs for both agents
-        let doomed_job = Job {
-            id: JobId::new(),
-            agent_id: doomed.id,
-            prompt: "doomed job".to_string(),
-            schedule: JobSchedule::Once {
+        let doomed_job = Job::new(
+            doomed.id,
+            "doomed job".to_string(),
+            JobSchedule::Once {
                 run_at: chrono::Utc::now(),
             },
-            status: JobStatus::Pending,
-            created_at: chrono::Utc::now(),
-            next_run_at: None,
-            last_run_at: None,
-        };
-        let survivor_job = Job {
-            id: JobId::new(),
-            agent_id: survivor.id,
-            prompt: "survivor job".to_string(),
-            schedule: JobSchedule::Once {
+            None,
+        );
+        let survivor_job = Job::new(
+            survivor.id,
+            "survivor job".to_string(),
+            JobSchedule::Once {
                 run_at: chrono::Utc::now(),
             },
-            status: JobStatus::Pending,
-            created_at: chrono::Utc::now(),
-            next_run_at: None,
-            last_run_at: None,
-        };
+            None,
+        );
         store.save_job(&doomed_job).unwrap();
         store.save_job(&survivor_job).unwrap();
 

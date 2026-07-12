@@ -315,3 +315,9 @@ This program does not:
   HTTP saturation, priority-aware positions, and reentrant trigger protection.
 - Phase 1 queue, gateway, coordinator, formatting, and workspace lint gates
   pass locally.
+- Phase 2 is implemented on PR #1224 with transactional, versioned migrations
+  and the additive lifecycle columns required by Phase 3.
+- Phase 3 is implemented on codex/phase3-lifecycle-state-machines with
+  authoritative run/job transition APIs, monotonic revisions, revision-aware
+  SQLite upserts, stale coordinator snapshot rejection, and deterministic
+  lifecycle race regressions.

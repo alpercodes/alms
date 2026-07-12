@@ -186,7 +186,7 @@ pub async fn resolve_approval(
                 if queued.run_id == info.run_id {
                     continue;
                 }
-                if !state.run_manager.cancel_run(queued.run_id) {
+                if !state.run_manager.has_cancel_token(queued.run_id) {
                     // Token not registered yet (create_run's insert-to-register
                     // window, lifecycle.rs ~:879-961) or already cleaned up.
                     // Mirror the HTTP cancel handler (lifecycle.rs ~:592): never
@@ -199,8 +199,34 @@ pub async fn resolve_approval(
                     // tracked in #1142.
                     continue;
                 }
-                let transitioned = state.run_manager.mark_run_as_cancelled(queued.run_id);
-                if transitioned {
+                let transition = state.run_manager.try_mark_run_as_cancelled(queued.run_id);
+                if let Err(error) = &transition {
+                    let message = format!(
+                        "Queued run cancellation after tool denial could not be persisted: {error}"
+                    );
+                    state
+                        .run_manager
+                        .send_event(
+                            queued.run_id,
+                            queued.session_id,
+                            crate::sse::SseEventData::run_error(queued.run_id, &message),
+                        )
+                        .await;
+                    state
+                        .run_manager
+                        .send_agent_event(
+                            queued.agent_id,
+                            queued.run_id,
+                            queued.session_id,
+                            crate::sse::SseEventData::session_activity_ended(
+                                queued.session_id,
+                                queued.run_id,
+                                queued.agent_id,
+                            ),
+                        )
+                        .await;
+                } else if matches!(transition, Ok(true)) {
+                    let _ = state.run_manager.cancel_run(queued.run_id);
                     state
                         .run_manager
                         .send_event(

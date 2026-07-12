@@ -1,6 +1,9 @@
 //! Run types and status for ALMS
 
-use crate::{AgentId, SessionId, config::ReasoningEffort, job::JobId};
+use crate::lifecycle::MAX_LIFECYCLE_REVISION;
+use crate::{
+    AgentId, SessionId, config::ReasoningEffort, job::JobId, lifecycle::TransitionOutcome,
+};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -277,13 +280,43 @@ impl RunStatus {
     }
 }
 
+/// The only supported mutations of a run's lifecycle state.
+#[derive(Debug, Clone)]
+pub enum RunTransition {
+    Start {
+        resolved_config: Option<ResolvedRunConfig>,
+    },
+    Complete {
+        output: String,
+        usage: TokenUsage,
+    },
+    Fail {
+        error: String,
+        terminal_reason: String,
+    },
+    Cancel {
+        terminal_reason: String,
+    },
+}
+
+impl RunTransition {
+    fn target_status(&self) -> RunStatus {
+        match self {
+            Self::Start { .. } => RunStatus::Running,
+            Self::Complete { .. } => RunStatus::Completed,
+            Self::Fail { .. } => RunStatus::Failed,
+            Self::Cancel { .. } => RunStatus::Cancelled,
+        }
+    }
+}
+
 /// A run represents a single agent execution
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Run {
     pub run_id: RunId,
     pub session_id: SessionId,
     pub agent_id: AgentId,
-    pub status: RunStatus,
+    status: RunStatus,
     pub input: String,
     pub output: Option<String>,
     pub error: Option<String>,
@@ -302,7 +335,13 @@ pub struct Run {
     /// advanced past the queued state. Populated once at the transition
     /// from `Queued` to `Running` and never mutated afterwards.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub resolved_config: Option<ResolvedRunConfig>,
+    resolved_config: Option<ResolvedRunConfig>,
+    /// Monotonically increases for every accepted lifecycle transition.
+    #[serde(default)]
+    lifecycle_revision: u64,
+    /// Machine-readable reason for a terminal failure or cancellation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    terminal_reason: Option<String>,
 }
 
 impl Run {
@@ -322,7 +361,65 @@ impl Run {
             job_id: None,
             parent_run_id: None,
             resolved_config: None,
+            lifecycle_revision: 0,
+            terminal_reason: None,
         }
+    }
+
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_persisted(
+        run_id: RunId,
+        session_id: SessionId,
+        agent_id: AgentId,
+        status: RunStatus,
+        input: String,
+        output: Option<String>,
+        error: Option<String>,
+        usage: Option<TokenUsage>,
+        created_at: DateTime<Utc>,
+        started_at: Option<DateTime<Utc>>,
+        ended_at: Option<DateTime<Utc>>,
+        job_id: Option<JobId>,
+        parent_run_id: Option<RunId>,
+        resolved_config: Option<ResolvedRunConfig>,
+        lifecycle_revision: u64,
+        terminal_reason: Option<String>,
+    ) -> Self {
+        Self {
+            run_id,
+            session_id,
+            agent_id,
+            status,
+            input,
+            output,
+            error,
+            usage,
+            created_at,
+            started_at,
+            ended_at,
+            job_id,
+            parent_run_id,
+            resolved_config,
+            lifecycle_revision,
+            terminal_reason,
+        }
+    }
+
+    pub fn status(&self) -> RunStatus {
+        self.status
+    }
+
+    pub fn resolved_config(&self) -> Option<&ResolvedRunConfig> {
+        self.resolved_config.as_ref()
+    }
+
+    pub fn lifecycle_revision(&self) -> u64 {
+        self.lifecycle_revision
+    }
+
+    pub fn terminal_reason(&self) -> Option<&str> {
+        self.terminal_reason.as_deref()
     }
 
     /// Create a run triggered by a scheduled job.
@@ -346,21 +443,83 @@ impl Run {
         }
     }
 
-    pub fn mark_running(&mut self) {
-        self.status = RunStatus::Running;
-        self.started_at = Some(Utc::now());
+    /// Apply a lifecycle transition under the caller's synchronization
+    /// boundary. This is the single authority for legal state changes.
+    pub fn transition(&mut self, transition: RunTransition) -> TransitionOutcome<RunStatus> {
+        let from = self.status;
+        let to = transition.target_status();
+
+        if from == to {
+            return TransitionOutcome::NoOp {
+                state: from,
+                revision: self.lifecycle_revision,
+            };
+        }
+
+        let legal = matches!(
+            (&transition, from),
+            (RunTransition::Start { .. }, RunStatus::Queued)
+                | (RunTransition::Complete { .. }, RunStatus::Running)
+                | (
+                    RunTransition::Fail { .. } | RunTransition::Cancel { .. },
+                    RunStatus::Queued | RunStatus::Running
+                )
+        );
+        if !legal {
+            return TransitionOutcome::Rejected {
+                from,
+                to,
+                revision: self.lifecycle_revision,
+            };
+        }
+        if self.lifecycle_revision >= MAX_LIFECYCLE_REVISION {
+            return TransitionOutcome::Rejected {
+                from,
+                to,
+                revision: self.lifecycle_revision,
+            };
+        }
+
+        let now = Utc::now();
+        match transition {
+            RunTransition::Start { resolved_config } => {
+                self.started_at = Some(now);
+                self.resolved_config = resolved_config;
+                self.terminal_reason = None;
+            }
+            RunTransition::Complete { output, usage } => {
+                self.output = Some(output);
+                self.usage = Some(usage);
+                self.ended_at = Some(now);
+                self.terminal_reason = None;
+            }
+            RunTransition::Fail {
+                error,
+                terminal_reason,
+            } => {
+                self.error = Some(error);
+                self.ended_at = Some(now);
+                self.terminal_reason = Some(terminal_reason);
+            }
+            RunTransition::Cancel { terminal_reason } => {
+                self.ended_at = Some(now);
+                self.terminal_reason = Some(terminal_reason);
+            }
+        }
+        self.status = to;
+        self.lifecycle_revision += 1;
+        TransitionOutcome::Applied {
+            from,
+            to,
+            revision: self.lifecycle_revision,
+        }
     }
 
-    /// Attach the layered config snapshot (#837).
-    ///
-    /// Called at the `Queued` → `Running` transition by the gateway after
-    /// per-agent and server-default config has been merged. (The #546-era
-    /// notification-run debug-flip that used to settle here too was
-    /// removed — the per-agent `debug_mode` toggle is now the sole gate
-    /// for notification runs as well.) Idempotent over-writes are allowed
-    /// but only the first call should occur in practice.
-    pub fn set_resolved_config(&mut self, config: ResolvedRunConfig) {
-        self.resolved_config = Some(config);
+    pub fn mark_running(&mut self) -> bool {
+        self.transition(RunTransition::Start {
+            resolved_config: None,
+        })
+        .is_applied()
     }
 
     /// Transition the run to `Completed` and stamp `ended_at`.
@@ -386,15 +545,8 @@ impl Run {
     /// happened, not when a later cleanup pass re-marked the run.
     #[must_use = "callers that broadcast a terminal SSE event must gate the broadcast on this bool — discarding it regresses the #1046 duplicate-broadcast guard. If the discard is intentional (e.g. coordinator persistence, test setup), bind to `let _ =` to make it explicit."]
     pub fn mark_completed(&mut self, output: String, usage: TokenUsage) -> bool {
-        if matches!(self.status, RunStatus::Running) {
-            self.status = RunStatus::Completed;
-            self.output = Some(output);
-            self.usage = Some(usage);
-            self.ended_at = Some(Utc::now());
-            true
-        } else {
-            false
-        }
+        self.transition(RunTransition::Complete { output, usage })
+            .is_applied()
     }
 
     /// Transition the run to `Failed` and stamp `ended_at`.
@@ -420,14 +572,11 @@ impl Run {
     /// first transition.
     #[must_use = "callers that broadcast a terminal SSE event must gate the broadcast on this bool — discarding it regresses the #1046 duplicate-broadcast guard. If the discard is intentional (e.g. coordinator persistence, test setup), bind to `let _ =` to make it explicit."]
     pub fn mark_failed(&mut self, error: String) -> bool {
-        if matches!(self.status, RunStatus::Queued | RunStatus::Running) {
-            self.status = RunStatus::Failed;
-            self.error = Some(error);
-            self.ended_at = Some(Utc::now());
-            true
-        } else {
-            false
-        }
+        self.transition(RunTransition::Fail {
+            error,
+            terminal_reason: "failed".to_string(),
+        })
+        .is_applied()
     }
 
     /// Transition the run to `Cancelled` and stamp `ended_at`.
@@ -445,13 +594,10 @@ impl Run {
     /// happened, not when a later cleanup pass re-marked the run.
     #[must_use = "callers that broadcast a terminal SSE event must gate the broadcast on this bool — discarding it regresses the #1046 duplicate-broadcast guard. If the discard is intentional (e.g. coordinator persistence, test setup), bind to `let _ =` to make it explicit."]
     pub fn mark_cancelled(&mut self) -> bool {
-        if matches!(self.status, RunStatus::Queued | RunStatus::Running) {
-            self.status = RunStatus::Cancelled;
-            self.ended_at = Some(Utc::now());
-            true
-        } else {
-            false
-        }
+        self.transition(RunTransition::Cancel {
+            terminal_reason: "cancelled".to_string(),
+        })
+        .is_applied()
     }
 }
 
@@ -499,6 +645,9 @@ pub struct RunStatusResponse {
     pub session_id: SessionId,
     pub agent_id: AgentId,
     pub status: RunStatus,
+    pub lifecycle_revision: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub terminal_reason: Option<String>,
     /// The agent's text response (populated when run completes).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub response: Option<String>,
@@ -545,6 +694,8 @@ impl From<Run> for RunStatusResponse {
             session_id: run.session_id,
             agent_id: run.agent_id,
             status: run.status,
+            lifecycle_revision: run.lifecycle_revision,
+            terminal_reason: run.terminal_reason.clone(),
             response: run.output.clone(),
             error: run.error.clone(),
             started_at: run.started_at,
@@ -569,9 +720,9 @@ impl From<Run> for RunStatusResponse {
 /// on its `RunManager`.
 pub trait RunRegistrar: Send + Sync + std::fmt::Debug {
     /// Register a new run (insert into the run store and persist to SQLite).
-    fn register_run(&self, run: Run);
+    fn register_run(&self, run: Run) -> crate::AlmsResult<()>;
     /// Update an existing run (e.g. mark as completed/failed).
-    fn update_run(&self, run: Run);
+    fn update_run(&self, run: Run) -> crate::AlmsResult<()>;
 }
 
 /// Check whether `ignore_message` was **successfully** called during a run.
@@ -640,6 +791,50 @@ pub fn deliverable_dm_reply<'a>(response: &'a str, reasoning: Option<&str>) -> O
 mod tests {
     use super::*;
     use chrono::Utc;
+
+    #[test]
+    fn cancellation_before_start_cannot_be_resurrected() {
+        let mut run = Run::new(SessionId::new(), AgentId::new(), "test".into());
+
+        assert!(run.mark_cancelled());
+        assert_eq!(run.status, RunStatus::Cancelled);
+        assert_eq!(run.lifecycle_revision, 1);
+
+        assert!(!run.mark_running());
+        assert_eq!(run.status, RunStatus::Cancelled);
+        assert_eq!(run.lifecycle_revision, 1);
+    }
+
+    #[test]
+    fn duplicate_terminal_transition_is_a_revision_preserving_noop() {
+        let mut run = Run::new(SessionId::new(), AgentId::new(), "test".into());
+        assert!(run.mark_running());
+        assert!(run.mark_failed("boom".into()));
+        let ended_at = run.ended_at;
+        let revision = run.lifecycle_revision;
+
+        assert!(!run.mark_failed("later".into()));
+        assert_eq!(run.status, RunStatus::Failed);
+        assert_eq!(run.error.as_deref(), Some("boom"));
+        assert_eq!(run.ended_at, ended_at);
+        assert_eq!(run.lifecycle_revision, revision);
+    }
+
+    #[test]
+    fn run_revision_exhaustion_is_rejected_without_mutation() {
+        let mut run = Run::new(SessionId::new(), AgentId::new(), "test".into());
+        run.lifecycle_revision = MAX_LIFECYCLE_REVISION;
+
+        assert!(matches!(
+            run.transition(RunTransition::Start {
+                resolved_config: None,
+            }),
+            TransitionOutcome::Rejected { .. }
+        ));
+        assert_eq!(run.status, RunStatus::Queued);
+        assert!(run.started_at.is_none());
+        assert_eq!(run.lifecycle_revision, MAX_LIFECYCLE_REVISION);
+    }
 
     /// `TokenUsage` with no reasoning or cache fields set must serialize
     /// byte-identically to the pre-#766/#768 shape. Relied on by the
@@ -969,7 +1164,12 @@ mod tests {
             reasoning_effort: None,
             gemini_thinking_budget: None,
         };
-        run.set_resolved_config(snapshot.clone());
+        assert!(
+            run.transition(RunTransition::Start {
+                resolved_config: Some(snapshot.clone()),
+            })
+            .is_applied()
+        );
 
         let resp: RunStatusResponse = run.into();
         assert_eq!(

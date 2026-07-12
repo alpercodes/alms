@@ -1,6 +1,7 @@
 //! Run persistence -- save, load, mark_stale.
 
 use super::*;
+use alms_core::{RunTransition, TransitionOutcome};
 
 impl SqliteStore {
     // ── Runs ─────────────────────────────────────────────────────────────────
@@ -22,7 +23,7 @@ impl SqliteStore {
         // (queued runs, old rows) maps to a SQL NULL via Option.
         // A serialization failure is non-fatal — we log and store NULL
         // so a malformed snapshot can never block a run from persisting.
-        let resolved_config_json = run.resolved_config.as_ref().and_then(|cfg| {
+        let resolved_config_json = run.resolved_config().and_then(|cfg| {
             serde_json::to_string(cfg)
                 .map_err(|e| {
                     tracing::warn!(
@@ -33,14 +34,30 @@ impl SqliteStore {
                 .ok()
         });
 
+        let lifecycle_revision = i64::try_from(run.lifecycle_revision()).map_err(|_| {
+            AlmsError::Runtime(format!(
+                "run {} lifecycle revision {} exceeds SQLite INTEGER",
+                run.run_id.0,
+                run.lifecycle_revision()
+            ))
+        })?;
         self.conn
             .lock()
             .execute(
-                "INSERT OR REPLACE INTO runs \
+                "INSERT INTO runs \
                  (run_id, session_id, agent_id, input, response, error, status, \
                   started_at, ended_at, prompt_tokens, completion_tokens, job_id, \
-                  parent_run_id, created_at, resolved_config) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                  parent_run_id, created_at, resolved_config, lifecycle_revision, terminal_reason) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17) \
+                 ON CONFLICT(run_id) DO UPDATE SET \
+                   session_id=excluded.session_id, agent_id=excluded.agent_id, input=excluded.input, \
+                   response=excluded.response, error=excluded.error, status=excluded.status, \
+                   started_at=excluded.started_at, ended_at=excluded.ended_at, \
+                   prompt_tokens=excluded.prompt_tokens, completion_tokens=excluded.completion_tokens, \
+                   job_id=excluded.job_id, parent_run_id=excluded.parent_run_id, \
+                   created_at=excluded.created_at, resolved_config=excluded.resolved_config, \
+                   lifecycle_revision=excluded.lifecycle_revision, terminal_reason=excluded.terminal_reason \
+                 WHERE excluded.lifecycle_revision > runs.lifecycle_revision",
                 params![
                     run.run_id.0.to_string(),
                     run.session_id.0.to_string(),
@@ -48,7 +65,7 @@ impl SqliteStore {
                     &run.input,
                     run.output.as_deref(),
                     run.error.as_deref(),
-                    run_status_to_str(run.status),
+                    run_status_to_str(run.status()),
                     run.started_at.map(|dt| dt.to_rfc3339()),
                     run.ended_at.map(|dt| dt.to_rfc3339()),
                     prompt_tokens,
@@ -57,6 +74,8 @@ impl SqliteStore {
                     run.parent_run_id.map(|r| r.0.to_string()),
                     run.created_at.to_rfc3339(),
                     resolved_config_json,
+                    lifecycle_revision,
+                    run.terminal_reason(),
                 ],
             )
             .map_err(|e| AlmsError::Runtime(format!("SQLite save_run: {e}")))?;
@@ -69,7 +88,7 @@ impl SqliteStore {
         let result = conn.query_row(
             "SELECT run_id, session_id, agent_id, input, response, error, status, \
                     started_at, ended_at, prompt_tokens, completion_tokens, job_id, \
-                    parent_run_id, created_at, resolved_config \
+                    parent_run_id, created_at, resolved_config, lifecycle_revision, terminal_reason \
              FROM runs WHERE run_id = ?1",
             params![run_id.0.to_string()],
             parse_run_row,
@@ -92,7 +111,7 @@ impl SqliteStore {
             .prepare(
                 "SELECT run_id, session_id, agent_id, input, response, error, status, \
                         started_at, ended_at, prompt_tokens, completion_tokens, job_id, \
-                        parent_run_id, created_at, resolved_config \
+                        parent_run_id, created_at, resolved_config, lifecycle_revision, terminal_reason \
                  FROM runs WHERE session_id = ?1 ORDER BY created_at DESC LIMIT ?2",
             )
             .map_err(|e| AlmsError::Runtime(format!("SQLite prepare load_runs_by_session: {e}")))?;
@@ -131,7 +150,7 @@ impl SqliteStore {
             .prepare(
                 "SELECT run_id, session_id, agent_id, input, response, error, status, \
                         started_at, ended_at, prompt_tokens, completion_tokens, job_id, \
-                        parent_run_id, created_at, resolved_config \
+                        parent_run_id, created_at, resolved_config, lifecycle_revision, terminal_reason \
                  FROM runs WHERE created_at >= ?1 ORDER BY created_at ASC",
             )
             .map_err(|e| AlmsError::Runtime(format!("SQLite prepare load_all_runs: {e}")))?;
@@ -156,15 +175,48 @@ impl SqliteStore {
     /// These are stale leftovers from a previous process that crashed or was
     /// killed. Returns the number of rows updated.
     pub fn mark_stale_runs_failed(&self) -> AlmsResult<usize> {
-        let conn = self.conn.lock();
-        let now = chrono::Utc::now().to_rfc3339();
-        let count = conn
-            .execute(
-                "UPDATE runs SET status = 'failed', error = 'stale: gateway restarted', ended_at = ?1 \
-                 WHERE status IN ('queued', 'running')",
-                params![now],
-            )
-            .map_err(|e| AlmsError::Runtime(format!("SQLite mark_stale_runs_failed: {e}")))?;
+        let stale_runs = {
+            let conn = self.conn.lock();
+            let mut stmt = conn
+                .prepare(
+                    "SELECT run_id, session_id, agent_id, input, response, error, status, \
+                            started_at, ended_at, prompt_tokens, completion_tokens, job_id, \
+                            parent_run_id, created_at, resolved_config, lifecycle_revision, terminal_reason \
+                     FROM runs WHERE status IN ('queued', 'running')",
+                )
+                .map_err(|e| {
+                    AlmsError::Runtime(format!("SQLite prepare mark_stale_runs_failed: {e}"))
+                })?;
+            stmt.query_map([], parse_run_row)
+                .map_err(|e| {
+                    AlmsError::Runtime(format!("SQLite query mark_stale_runs_failed: {e}"))
+                })?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| {
+                    AlmsError::Runtime(format!("SQLite parse mark_stale_runs_failed: {e}"))
+                })?
+        };
+
+        let mut count = 0;
+        for mut run in stale_runs {
+            match run.transition(RunTransition::Fail {
+                error: "stale: gateway restarted".to_string(),
+                terminal_reason: "gateway_restarted".to_string(),
+            }) {
+                TransitionOutcome::Applied { .. } => {
+                    self.save_run(&run)?;
+                    count += 1;
+                }
+                TransitionOutcome::Rejected { .. } => {
+                    return Err(AlmsError::Runtime(format!(
+                        "stale run {} could not be quarantined at lifecycle revision {}",
+                        run.run_id.0,
+                        run.lifecycle_revision()
+                    )));
+                }
+                TransitionOutcome::NoOp { .. } => {}
+            }
+        }
         Ok(count)
     }
 }
@@ -173,7 +225,7 @@ impl SqliteStore {
 mod tests {
     use super::super::test_helpers::new_session;
     use super::super::*;
-    use alms_core::run::{Run, RunStatus, TokenUsage};
+    use alms_core::run::{Run, RunStatus, RunTransition, TokenUsage};
 
     fn new_run(session_id: SessionId, agent_id: AgentId) -> Run {
         Run::new(session_id, agent_id, "hello".to_string())
@@ -193,7 +245,7 @@ mod tests {
         assert_eq!(loaded.session_id, session.id);
         assert_eq!(loaded.agent_id, session.agent_id);
         assert_eq!(loaded.input, "hello");
-        assert!(matches!(loaded.status, RunStatus::Queued));
+        assert!(matches!(loaded.status(), RunStatus::Queued));
         assert!(loaded.output.is_none());
         assert!(loaded.error.is_none());
         assert!(loaded.usage.is_none());
@@ -219,7 +271,7 @@ mod tests {
         store.save_run(&run).unwrap();
 
         let loaded = store.load_run(run.run_id).unwrap().unwrap();
-        assert!(matches!(loaded.status, RunStatus::Completed));
+        assert!(matches!(loaded.status(), RunStatus::Completed));
         assert_eq!(loaded.output.as_deref(), Some("I am a response"));
         assert!(loaded.error.is_none());
         let usage = loaded.usage.unwrap();
@@ -227,6 +279,77 @@ mod tests {
         assert_eq!(usage.completion_tokens, 50);
         assert!(loaded.started_at.is_some());
         assert!(loaded.ended_at.is_some());
+    }
+
+    #[test]
+    fn stale_running_snapshot_cannot_overwrite_any_terminal_state() {
+        for terminal in [
+            RunStatus::Completed,
+            RunStatus::Failed,
+            RunStatus::Cancelled,
+        ] {
+            let store = SqliteStore::open_in_memory().unwrap();
+            let session = new_session();
+            let mut running = new_run(session.id, session.agent_id);
+            assert!(running.mark_running());
+            let stale = running.clone();
+
+            match terminal {
+                RunStatus::Completed => {
+                    assert!(running.mark_completed("done".into(), TokenUsage::default()));
+                }
+                RunStatus::Failed => assert!(running.mark_failed("boom".into())),
+                RunStatus::Cancelled => assert!(running.mark_cancelled()),
+                _ => unreachable!(),
+            }
+
+            store.save_run(&running).unwrap();
+            store.save_run(&stale).unwrap();
+            let loaded = store.load_run(running.run_id).unwrap().unwrap();
+            assert_eq!(loaded.status(), terminal);
+            assert_eq!(loaded.lifecycle_revision(), 2);
+        }
+    }
+
+    #[test]
+    fn equal_revision_run_snapshot_is_an_idempotent_noop() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let session = new_session();
+        let mut authoritative = new_run(session.id, session.agent_id);
+        assert!(authoritative.mark_running());
+        assert!(authoritative.mark_completed("authoritative".into(), TokenUsage::default()));
+        let conflicting = Run::from_persisted(
+            authoritative.run_id,
+            authoritative.session_id,
+            authoritative.agent_id,
+            authoritative.status(),
+            authoritative.input.clone(),
+            Some("delayed conflicting payload".to_string()),
+            authoritative.error.clone(),
+            authoritative.usage,
+            authoritative.created_at,
+            authoritative.started_at,
+            authoritative.ended_at,
+            authoritative.job_id,
+            authoritative.parent_run_id,
+            authoritative.resolved_config().cloned(),
+            authoritative.lifecycle_revision(),
+            Some("conflicting_reason".to_string()),
+        );
+
+        store.save_run(&authoritative).unwrap();
+        store.save_run(&conflicting).unwrap();
+
+        let loaded = store
+            .load_run(authoritative.run_id)
+            .unwrap()
+            .expect("run should remain persisted");
+        assert_eq!(loaded.output.as_deref(), Some("authoritative"));
+        assert_eq!(loaded.terminal_reason(), None);
+        assert_eq!(
+            loaded.lifecycle_revision(),
+            authoritative.lifecycle_revision()
+        );
     }
 
     #[test]
@@ -240,7 +363,7 @@ mod tests {
         store.save_run(&run).unwrap();
 
         let loaded = store.load_run(run.run_id).unwrap().unwrap();
-        assert!(matches!(loaded.status, RunStatus::Failed));
+        assert!(matches!(loaded.status(), RunStatus::Failed));
         assert_eq!(loaded.error.as_deref(), Some("LLM error"));
         assert!(loaded.output.is_none());
     }
@@ -256,7 +379,7 @@ mod tests {
         store.save_run(&run).unwrap();
 
         let loaded = store.load_run(run.run_id).unwrap().unwrap();
-        assert!(matches!(loaded.status, RunStatus::Cancelled));
+        assert!(matches!(loaded.status(), RunStatus::Cancelled));
         assert!(loaded.output.is_none());
         assert!(loaded.error.is_none());
         assert!(loaded.started_at.is_some());
@@ -298,17 +421,21 @@ mod tests {
 
         // Queued and running should now be failed.
         let q = store.load_run(queued_id).unwrap().unwrap();
-        assert!(matches!(q.status, RunStatus::Failed));
+        assert!(matches!(q.status(), RunStatus::Failed));
         assert_eq!(q.error.as_deref(), Some("stale: gateway restarted"));
         assert!(q.ended_at.is_some());
+        assert_eq!(q.lifecycle_revision(), 1);
+        assert_eq!(q.terminal_reason(), Some("gateway_restarted"));
 
         let r = store.load_run(running_id).unwrap().unwrap();
-        assert!(matches!(r.status, RunStatus::Failed));
+        assert!(matches!(r.status(), RunStatus::Failed));
         assert_eq!(r.error.as_deref(), Some("stale: gateway restarted"));
+        assert_eq!(r.lifecycle_revision(), 2);
+        assert_eq!(r.terminal_reason(), Some("gateway_restarted"));
 
         // Completed run should be unchanged.
         let c = store.load_run(completed_id).unwrap().unwrap();
-        assert!(matches!(c.status, RunStatus::Completed));
+        assert!(matches!(c.status(), RunStatus::Completed));
         assert_eq!(c.output.as_deref(), Some("done"));
     }
 
@@ -367,7 +494,7 @@ mod tests {
         store.save_run(&run).unwrap();
 
         let loaded = store.load_run(run.run_id).unwrap().unwrap();
-        assert!(matches!(loaded.status, RunStatus::Completed));
+        assert!(matches!(loaded.status(), RunStatus::Completed));
         assert_eq!(loaded.output.as_deref(), Some("done"));
     }
 
@@ -454,10 +581,10 @@ mod tests {
         let store = SqliteStore::open_in_memory().unwrap();
         let session = new_session();
         let run = new_run(session.id, session.agent_id);
-        assert!(run.resolved_config.is_none());
+        assert!(run.resolved_config().is_none());
         store.save_run(&run).unwrap();
         let loaded = store.load_run(run.run_id).unwrap().unwrap();
-        assert!(loaded.resolved_config.is_none());
+        assert!(loaded.resolved_config().is_none());
     }
 
     /// #837: a populated `ResolvedRunConfig` round-trips through the
@@ -481,13 +608,18 @@ mod tests {
             reasoning_effort: Some(alms_core::config::ReasoningEffort::Medium),
             gemini_thinking_budget: Some(2048),
         };
-        run.set_resolved_config(cfg.clone());
+        assert!(
+            run.transition(RunTransition::Start {
+                resolved_config: Some(cfg.clone()),
+            })
+            .is_applied()
+        );
         store.save_run(&run).unwrap();
 
         let loaded = store.load_run(run.run_id).unwrap().unwrap();
         let loaded_cfg = loaded
-            .resolved_config
+            .resolved_config()
             .expect("resolved_config should round-trip");
-        assert_eq!(loaded_cfg, cfg);
+        assert_eq!(loaded_cfg, &cfg);
     }
 }

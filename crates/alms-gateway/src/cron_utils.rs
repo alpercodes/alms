@@ -76,19 +76,11 @@ mod tests {
     }
 
     fn make_once_job(run_at: DateTime<Utc>) -> Job {
-        use alms_core::{
-            AgentId,
-            job::{JobId, JobStatus},
-        };
-        Job {
-            id: JobId::new(),
-            agent_id: AgentId::new(),
-            prompt: "test".to_string(),
-            schedule: JobSchedule::Once { run_at },
-            status: JobStatus::Pending,
-            created_at: Utc::now(),
-            next_run_at: None,
-            last_run_at: None,
-        }
+        Job::new(
+            alms_core::AgentId::new(),
+            "test".to_string(),
+            JobSchedule::Once { run_at },
+            None,
+        )
     }
 }
