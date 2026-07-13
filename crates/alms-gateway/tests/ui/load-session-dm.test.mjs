@@ -147,7 +147,7 @@ function normalizeApproval(a) {
 // Test hooks — exported so the harness can reach the live signals + recordings.
 export const __test = {
     chatMessages, activeRunId, runs, sessions, crossAgentSessions,
-    activeAgent, parentSessionId, __calls,
+    activeSessionId, activeAgent, parentSessionId, __calls,
 };
 `;
 
@@ -281,6 +281,7 @@ function reset() {
     T.runs.value = [];
     T.sessions.value = [];
     T.crossAgentSessions.value = [];
+    T.activeSessionId.value = null;
     T.activeAgent.value = null;
     T.parentSessionId.value = null;
     T.__calls.getRunReasoning.length = 0;
@@ -612,4 +613,35 @@ test('strict DM reconciliation keeps stream closed when tool-call history fails'
         /tool snapshot unavailable/,
     );
     assert.equal(T.__calls.streamOpens.length, 0);
+});
+
+test('contract reconciliation clears stale activity when every run is terminal', async () => {
+    reset();
+    T.activeSessionId.value = DM_SESSION_ID;
+    T.activeRunId.value = 'run-terminal';
+    T.chatMessages.value = [{
+        id: 'stale-thinking', type: 'thinking', runId: 'run-terminal',
+    }];
+    globalThis.__lsApi = makeApi({
+        getSession: async () => DM_ENVELOPE,
+        getSessionMessages: async () => ({ messages: [], last_event_id: 52 }),
+        listRuns: async () => ({
+            runs: [{ run_id: 'run-terminal', status: 'completed' }],
+        }),
+    });
+
+    await globalThis.__lsReconciler(DM_SESSION_ID, 47);
+
+    assert.equal(T.activeRunId.value, null);
+    assert.equal(
+        T.chatMessages.value.some(message => message.type === 'thinking'),
+        false,
+    );
+    assert.equal(
+        T.__calls.phase.some(
+            call => call[0] === 'setAgentPhase' || call[0] === 'setDmContext',
+        ),
+        false,
+    );
+    assert.deepEqual(T.__calls.phase.at(-1), ['clearAgentPhase']);
 });

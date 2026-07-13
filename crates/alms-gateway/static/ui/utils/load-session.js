@@ -264,9 +264,7 @@ export async function loadSession(sessionId, opts) {
         // already executing. (#735)
         const active = loaded.find(r => r.status === 'running')
             || loaded.find(r => r.status === 'queued');
-        if (active) {
-            activeRunId.value = active.run_id;
-        }
+        activeRunId.value = active?.run_id ?? null;
     } catch (err) {
         if (isStale()) return;
         if (opts.requireAuthoritativeSnapshot) throw err;
