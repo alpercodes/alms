@@ -23,7 +23,15 @@ export async function apiFetch(path, opts = {}) {
     }
     // 204 No Content
     if (res.status === 204) return null;
-    return res.json();
+    const contracts = globalThis.__almsContracts;
+    if (!contracts) {
+        throw new Error('Frontend contract bridge is not installed');
+    }
+    return contracts.parseApiJsonResponse(
+        path,
+        opts.method || 'GET',
+        await res.text(),
+    );
 }
 
 export const get = (path) => apiFetch(path);

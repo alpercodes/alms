@@ -9,6 +9,8 @@ ALMS (Agent Loop Management System) is a Rust-based multi-agent coordination pla
 ```bash
 # Requires Rust nightly (auto-installed from rust-toolchain.toml)
 # On Windows, cargo is at ~/.cargo/bin/cargo — use `export PATH="$HOME/.cargo/bin:$PATH"` if needed
+# Frontend requires the exact Node/npm versions in .node-version and package.json
+npm ci
 cargo build --release
 cargo run --bin alms -- gateway --bind 127.0.0.1:8080
 
@@ -17,6 +19,9 @@ make ci          # fmt-check + clippy + test + build-release
 make test        # cargo test --all
 make test-golden # SSE golden tests only
 make clippy      # cargo clippy -- -D warnings
+npm run ui:check # TypeScript + ESLint + Prettier + Vitest
+npm run ui:build # Rebuild committed rust-embed assets
+npm run ui:test:e2e
 ```
 
 ## Project Structure
@@ -53,6 +58,9 @@ crates/
   alms-sandbox/      # Builtin native tools (echo, math, http_get, shell, fs_*, etc.) + tool registry
   alms-channel/      # Channel adapters (Telegram polling implemented)
   alms-cli/          # CLI entrypoint (clap) — gateway, health, agent/session/run/job management
+frontend/            # Strict TypeScript contracts, bridge, Vitest, Playwright
+crates/alms-gateway/static/ui/       # Editable browser UI source
+crates/alms-gateway/static/ui-dist/  # Committed deterministic Vite output embedded by Rust
 docs/                # Design docs — api.md, architecture.md, security-model.md, etc.
                      #   agent-runtime-design.md — detailed design for config/context/workspace
                      #   agent-ux-requirements.md — Alper's UX requirements
@@ -89,6 +97,8 @@ alms-cli → alms-gateway → alms-runtime      → alms-core
 - **Concurrency**: `tokio` async runtime, `DashMap` for concurrent maps, `parking_lot` for locks
 - **IDs**: Newtype wrappers (`AgentId`, `SessionId`, `RunId`, etc.) — never raw strings
 - **Tests**: `#[cfg(test)] mod tests` in each file. Golden tests for SSE in `alms-gateway/tests/`
+- **Frontend**: new code is strict TypeScript; all API/SSE JSON crosses the mandatory validated bridge
+- **Frontend assets**: run `npm run ui:build` and commit `static/ui-dist/`; CI rejects generated drift
 
 ## Git Workflow
 

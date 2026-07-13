@@ -1,6 +1,6 @@
 // Central dependency re-exports.
-// Actual CDN URLs are pinned in index.html's importmap — this file
-// just re-exports so components import from one place.
+// Package versions are pinned in package-lock.json and bundled by Vite.
+// This file keeps component imports centralized during the TS migration.
 import { h, render } from 'preact';
 import { useState, useRef, useEffect, useCallback, useMemo } from 'preact/hooks';
 import { signal, computed, effect, batch, useSignal } from '@preact/signals';

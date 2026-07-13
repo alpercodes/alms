@@ -105,7 +105,7 @@ pub trait EventForwarder: Send + Sync + std::fmt::Debug {
         _tool: Option<String>,
         _tool_invocation_id: Option<Uuid>,
         _parent_tool_invocation_id: Option<Uuid>,
-        _source_agent: Option<String>,
+        _source_agent: String,
     ) {
     }
 

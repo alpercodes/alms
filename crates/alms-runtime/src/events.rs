@@ -222,7 +222,7 @@ pub enum RuntimeEvent {
         /// The subagent label this status belongs to. Always `Some` in
         /// practice — the UI routes the signal to the matching status-bar
         /// chip by this label.
-        source_agent: Option<String>,
+        source_agent: String,
     },
     /// Debug snapshot of the full context window sent to the LLM.
     ///

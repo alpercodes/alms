@@ -1,0 +1,20 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "allowJs": true,
+    "checkJs": true,
+    "strict": false,
+    "noImplicitAny": false,
+    "noEmit": true,
+    "noResolve": true,
+    "target": "ES2023",
+    "lib": ["ES2023", "DOM", "DOM.Iterable"]
+  },
+  "include": [
+    "frontend/global.d.ts",
+    "crates/alms-gateway/static/ui/**/*.d.ts",
+    "crates/alms-gateway/static/ui/api/client.js",
+    "crates/alms-gateway/static/ui/hooks/use-agent-events.js",
+    "crates/alms-gateway/static/ui/hooks/use-session-stream.js"
+  ]
+}

@@ -38,6 +38,13 @@ fn validate_posture(posture: &str) -> Result<(), String> {
     }
 }
 
+fn normalize_optional_override(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+}
+
 /// Validate the per-agent summary provider/model pair (#872).
 ///
 /// Both fields must be set together or both must be unset. When a provider
@@ -231,8 +238,12 @@ pub async fn create_agent(
 
     let wants_default = req.is_default.unwrap_or(false);
 
+    let model = normalize_optional_override(req.model.as_deref());
+    let posture = normalize_optional_override(req.posture.as_deref());
+    let provider = normalize_optional_override(req.provider.as_deref());
+
     // Validate posture if provided
-    if let Some(ref p) = req.posture {
+    if let Some(ref p) = posture {
         validate_posture(p)
             .map_err(|msg| api_error(StatusCode::BAD_REQUEST, "INVALID_POSTURE", msg))?;
     }
@@ -289,9 +300,9 @@ pub async fn create_agent(
         id: AgentId::new(),
         name: req.name,
         description: req.description.unwrap_or_default(),
-        model: req.model,
-        posture: req.posture,
-        provider: req.provider,
+        model,
+        posture,
+        provider,
         telegram_token: req.telegram_token,
         thinking_budget_tokens: req.thinking_budget_tokens,
         reasoning_effort: req.reasoning_effort,
@@ -1273,6 +1284,17 @@ pub async fn set_default(
 mod tests {
     use super::*;
     use alms_session::SqliteStore;
+
+    #[test]
+    fn optional_overrides_trim_values_and_reject_empty_sentinels() {
+        assert_eq!(normalize_optional_override(None), None);
+        assert_eq!(normalize_optional_override(Some("")), None);
+        assert_eq!(normalize_optional_override(Some("   ")), None);
+        assert_eq!(
+            normalize_optional_override(Some("  openai  ")),
+            Some("openai".to_string())
+        );
+    }
 
     fn new_agent(name: &str) -> AgentRecord {
         let now = Utc::now();

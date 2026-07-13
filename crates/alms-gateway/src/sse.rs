@@ -238,7 +238,7 @@ impl SseEventData {
         tool: Option<String>,
         tool_invocation_id: Option<uuid::Uuid>,
         parent_tool_invocation_id: Option<uuid::Uuid>,
-        source_agent: Option<String>,
+        source_agent: String,
     ) -> Self {
         Self::new(
             "subagent_activity",
@@ -1003,10 +1003,8 @@ struct SubagentActivityData {
     /// (which cross-attaches status between concurrent unnamed subagents).
     #[serde(skip_serializing_if = "Option::is_none")]
     parent_tool_invocation_id: Option<String>,
-    /// The subagent label the frontend routes the signal by. Always set in
-    /// practice; optional to mirror the other tagged payloads.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    source_agent: Option<String>,
+    /// The subagent label the frontend routes the signal by.
+    source_agent: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -1356,6 +1354,69 @@ fn classify_error(msg: &str) -> String {
 mod tests {
     use super::*;
     use alms_core::RunId;
+
+    #[test]
+    fn frontend_wire_fixtures_match_real_rust_serialization() {
+        use alms_core::{AgentId, RunStatus, RunStatusResponse, SessionId};
+        use chrono::TimeZone;
+
+        let fixtures: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../frontend/wire-fixtures.json"
+            ))
+            .expect("read frontend wire fixtures"),
+        )
+        .expect("parse frontend wire fixtures");
+
+        let parse_uuid = |value: &str| uuid::Uuid::parse_str(value).unwrap();
+        let run_id = RunId(parse_uuid("11111111-1111-4111-8111-111111111111"));
+        let session_id = SessionId(parse_uuid("22222222-2222-4222-8222-222222222222"));
+        let agent_id = AgentId(parse_uuid("33333333-3333-4333-8333-333333333333"));
+        let timestamp = Utc.with_ymd_and_hms(2026, 7, 12, 10, 0, 0).unwrap();
+        let run = RunStatusResponse {
+            run_id,
+            session_id,
+            agent_id,
+            status: RunStatus::Running,
+            lifecycle_revision: 7,
+            terminal_reason: None,
+            response: None,
+            error: None,
+            started_at: Some(timestamp),
+            ended_at: None,
+            usage: None,
+            ts: timestamp,
+            job_id: None,
+            parent_run_id: None,
+            tool_call_count: None,
+            queue_position: None,
+            resolved_config: None,
+        };
+        assert_eq!(serde_json::to_value(run).unwrap(), fixtures["run_status"]);
+
+        let activity = SseEventData::subagent_activity(
+            run_id,
+            "tool_start",
+            Some("shell".to_string()),
+            Some(parse_uuid("55555555-5555-4555-8555-555555555555")),
+            Some(parse_uuid("66666666-6666-4666-8666-666666666666")),
+            "reviewer".to_string(),
+        );
+        assert_eq!(activity.data, fixtures["sse"]["subagent_activity"]);
+
+        let run_error = SseEventData::run_error_with_code(run_id, "INTERNAL", "boom");
+        assert_eq!(run_error.data, fixtures["sse"]["run_error"]);
+
+        let approval = SseEventData::approval_required(
+            run_id,
+            "44444444-4444-4444-8444-444444444444",
+            "shell",
+            serde_json::json!({ "command": "echo ok" }),
+            None,
+        );
+        assert_eq!(approval.data, fixtures["sse"]["approval_required"]);
+    }
 
     #[test]
     fn test_event_data_serialization() {

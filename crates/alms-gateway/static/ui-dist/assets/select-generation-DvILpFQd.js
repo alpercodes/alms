@@ -1,0 +1,1 @@
+import{t as e}from"./rolldown-runtime-DK3Fl9T5.js";var t=e({bumpSelectGeneration:()=>r,selectGeneration:()=>n}),n=0;function r(){return++n}export{n,t as r,r as t};

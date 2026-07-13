@@ -9,7 +9,7 @@
 //     without waiting for a terminal SSE event.
 //
 // The module under test imports `signal` from `../deps.js` (Preact
-// signals via the index.html import-map) and `activeSessionId` from
+// signals through the Vite bundle) and `activeSessionId` from
 // `./sessions.js`. Neither is reachable from Node, so we rewrite the
 // two top-level imports to a local signal stub and an unused stub
 // before loading the module via dynamic `import()`. The signal stub

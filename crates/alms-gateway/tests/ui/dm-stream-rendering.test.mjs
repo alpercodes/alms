@@ -187,6 +187,11 @@ FakeEventSource.OPEN = 1;
 
 globalThis.EventSource = FakeEventSource;
 globalThis.localStorage = { getItem() { return null; }, setItem() {}, removeItem() {} };
+globalThis.__almsContracts = {
+    parseSseJsonPayload(_type, raw) {
+        return JSON.parse(raw);
+    },
+};
 globalThis.requestAnimationFrame = (fn) => { fn(); return 1; };
 globalThis.cancelAnimationFrame = () => {};
 
@@ -219,6 +224,11 @@ function reconnectStream(sessionId) {
 
 /** Reset all stub signals between tests. */
 function reset() {
+    globalThis.__almsContracts = {
+        parseSseJsonPayload(_type, raw) {
+            return JSON.parse(raw);
+        },
+    };
     T.chatMessages.value = [];
     T.activeRunId.value = null;
     T.activeSession.value = null;
@@ -266,18 +276,6 @@ test('#1154 B8: reasoning_delta buckets by event run_id', () => {
     const buffers = mod.dmThinkingBuffers.value;
     assert.equal(buffers.get('run-1'), 'reasoning A');
     assert.equal(buffers.get('run-2'), 'reasoning B');
-});
-
-test('#1154 B8: reasoning_delta falls back to activeRunId when run_id omitted (legacy)', () => {
-    reset();
-    T.activeSession.value = { session_type: 'dm' };
-    const es = openStream('sess-1');
-
-    T.activeRunId.value = 'run-legacy';
-    es.emit('reasoning_delta', { text: 'no run id here' });
-
-    assert.equal(mod.dmThinkingBuffers.value.get('run-legacy'), 'no run id here',
-        'legacy backends without run_id still bucket reasoning under activeRunId');
 });
 
 // ---------------------------------------------------------------------------
@@ -1114,4 +1112,34 @@ test('#1157 reconnect: a session SWITCH does NOT carry pending text into the new
     assert.ok(block, 'a reasoning block exists in session B');
     assert.equal(block.thinkingText, '',
         'session A pending text must NOT carry across a session switch and promote into session B');
+});
+
+test('malformed numeric session SSE reconciles before resuming past the frame', async () => {
+    reset();
+    let bridgeCalls = 0;
+    const reconciliations = [];
+    globalThis.__almsContracts = {
+        parseSseJsonPayload(type, raw) {
+            bridgeCalls++;
+            assert.equal(type, 'token_delta');
+            assert.equal(raw, '{bad json');
+            throw new Error('visible contract violation');
+        },
+    };
+    mod.registerSessionContractReconciler(async (sessionId, eventId) => {
+        reconciliations.push({ sessionId, eventId });
+    });
+    const es = openStream('session-contract-test');
+
+    es.emit('token_delta', '{bad json', 47);
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(bridgeCalls, 1, 'the raw frame must pass through the guarded bridge');
+    assert.deepEqual(reconciliations, [{ sessionId: 'session-contract-test', eventId: 47 }]);
+    assert.deepEqual(
+        T.chatMessages.value,
+        [],
+        'the token handler must not run after malformed JSON is rejected',
+    );
+
+    reset();
 });

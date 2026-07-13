@@ -811,7 +811,7 @@ async fn test_bg_subagent_does_not_block_parent_run_drain() {
             tool: None,
             tool_invocation_id: Some(uuid::Uuid::new_v4()),
             parent_tool_invocation_id: Some(uuid::Uuid::new_v4()),
-            source_agent: Some("worker".to_string()),
+            source_agent: "worker".to_string(),
         })
         .unwrap();
 
@@ -1096,7 +1096,7 @@ async fn test_bg_subagent_activity_signal_forwarded_transient_and_content_droppe
         tool: Some("shell".to_string()),
         tool_invocation_id: Some(activity_inv),
         parent_tool_invocation_id: Some(parent_inv),
-        source_agent: Some("reviewer".to_string()),
+        source_agent: "reviewer".to_string(),
     };
 
     let assert_activity = |routed: Option<RoutedBgEvent>| {
@@ -1221,7 +1221,7 @@ async fn test_subagent_activity_sse_is_ephemeral_not_persisted() {
                 None,
                 None,
                 None,
-                Some("reviewer".to_string()),
+                "reviewer".to_string(),
             ),
         )
         .await;
@@ -1258,7 +1258,7 @@ async fn test_subagent_activity_sse_is_ephemeral_not_persisted() {
             None,
             None,
             None,
-            Some("reviewer".to_string()),
+            "reviewer".to_string(),
         ),
     );
     let received = rx.recv().await.expect("transient fan-out must deliver");

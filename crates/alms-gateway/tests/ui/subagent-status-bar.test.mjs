@@ -260,6 +260,11 @@ FakeEventSource.OPEN = 1;
 
 globalThis.EventSource = FakeEventSource;
 globalThis.localStorage = { getItem() { return null; }, setItem() {}, removeItem() {} };
+globalThis.__almsContracts = {
+    parseSseJsonPayload(_type, raw) {
+        return JSON.parse(raw);
+    },
+};
 globalThis.requestAnimationFrame = (fn) => { fn(); return 1; };
 globalThis.cancelAnimationFrame = () => {};
 
@@ -946,16 +951,6 @@ test('#1183: pending signals are capped — the least-recently-written label is 
     assert.deepEqual(T.activeSubagents.value['agent-8'].activity,
         { kind: 'reasoning', tool: null },
         'a recently-written label is retained and applies normally');
-});
-
-test('a subagent_activity without source_agent is ignored (defensive)', () => {
-    reset();
-    T.trackSubagentStart('reviewer', 'task', 'inv-1');
-    const es = openStream('sess-1');
-
-    es.emit('subagent_activity', { kind: 'reasoning' });
-    assert.equal(T.activeSubagents.value.reviewer.activity, null,
-        'an unlabelled signal cannot be routed and must be dropped');
 });
 
 // ===========================================================================

@@ -165,6 +165,16 @@ pub struct AgentRunEntry {
     pub duration_ms: Option<i64>,
 }
 
+fn run_duration_ms(
+    started_at: Option<chrono::DateTime<Utc>>,
+    ended_at: Option<chrono::DateTime<Utc>>,
+) -> Option<i64> {
+    match (started_at, ended_at) {
+        (Some(start), Some(end)) => Some((end - start).num_milliseconds().max(0)),
+        _ => None,
+    }
+}
+
 /// Enrich a `Run` with session type, trigger, context_id, and duration.
 fn enrich_run(state: &AppState, run: Run) -> AgentRunEntry {
     // Look up the session to get context_id for classification.
@@ -180,10 +190,7 @@ fn enrich_run(state: &AppState, run: Run) -> AgentRunEntry {
     let trigger = derive_trigger(&run, &context_id);
 
     // Compute duration if both started_at and ended_at are present.
-    let duration_ms = match (run.started_at, run.ended_at) {
-        (Some(start), Some(end)) => Some((end - start).num_milliseconds()),
-        _ => None,
-    };
+    let duration_ms = run_duration_ms(run.started_at, run.ended_at);
 
     let ts = run
         .ended_at
@@ -3723,6 +3730,16 @@ mod tests {
     /// Helper to create a basic run for testing.
     fn test_run() -> Run {
         Run::new(SessionId::new(), AgentId::new(), "test".into())
+    }
+
+    #[test]
+    fn duration_is_never_negative_when_wall_clock_moves_backwards() {
+        let start = Utc::now();
+        let earlier_end = start - chrono::Duration::milliseconds(25);
+
+        assert_eq!(run_duration_ms(Some(start), Some(earlier_end)), Some(0));
+        assert_eq!(run_duration_ms(Some(start), Some(start)), Some(0));
+        assert_eq!(run_duration_ms(Some(start), None), None);
     }
 
     #[test]

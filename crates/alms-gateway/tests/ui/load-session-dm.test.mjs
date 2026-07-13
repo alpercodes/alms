@@ -117,6 +117,7 @@ const __calls = {
     phase: [],
 };
 function openSessionStream(sessionId, opts) { __calls.streamOpens.push({ sessionId, opts }); }
+function registerSessionContractReconciler(reconciler) { globalThis.__lsReconciler = reconciler; }
 function setAgentPhase(phase, detail) { __calls.phase.push(['setAgentPhase', phase, detail ?? null]); }
 function clearAgentPhase() { __calls.phase.push(['clearAgentPhase']); }
 function setDmContext(peer) { __calls.phase.push(['setDmContext', peer]); }
@@ -124,6 +125,7 @@ function setDmContext(peer) { __calls.phase.push(['setDmContext', peer]); }
 // ---- sessions / agents state ----
 const sessions = signal([]);
 const crossAgentSessions = signal([]);
+const activeSessionId = signal(null);
 const activeAgent = signal(null);
 
 // ---- inert helpers ----
@@ -145,7 +147,7 @@ function normalizeApproval(a) {
 // Test hooks — exported so the harness can reach the live signals + recordings.
 export const __test = {
     chatMessages, activeRunId, runs, sessions, crossAgentSessions,
-    activeAgent, parentSessionId, __calls,
+    activeSessionId, activeAgent, parentSessionId, __calls,
 };
 `;
 
@@ -279,6 +281,7 @@ function reset() {
     T.runs.value = [];
     T.sessions.value = [];
     T.crossAgentSessions.value = [];
+    T.activeSessionId.value = null;
     T.activeAgent.value = null;
     T.parentSessionId.value = null;
     T.__calls.getRunReasoning.length = 0;
@@ -570,4 +573,75 @@ test('phase restore: running DM run restores setDmContext(peer) instead of gener
         'a running DM must restore the DM phase via setDmContext');
     assert.equal(dmContextCalls[0][1], 'bob',
         'the peer is the participant that is not the active agent');
+});
+
+// ---------------------------------------------------------------------------
+// Strict malformed-frame reconciliation must never reopen from partial state.
+// ---------------------------------------------------------------------------
+
+test('strict reconciliation keeps stream closed when the runs snapshot fails', async () => {
+    reset();
+    globalThis.__lsApi = makeApi({
+        getSession: async () => DM_ENVELOPE,
+        listRuns: async () => { throw new Error('runs unavailable'); },
+    });
+
+    await assert.rejects(
+        () => mod.loadSession(DM_SESSION_ID, {
+            isStale: () => false,
+            logPrefix: 'strict-test',
+            requireAuthoritativeSnapshot: true,
+        }),
+        /runs unavailable/,
+    );
+    assert.equal(T.__calls.streamOpens.length, 0);
+});
+
+test('strict DM reconciliation keeps stream closed when tool-call history fails', async () => {
+    reset();
+    globalThis.__lsApi = makeApi({
+        getSession: async () => DM_ENVELOPE,
+        getSessionToolCalls: async () => { throw new Error('tool snapshot unavailable'); },
+    });
+
+    await assert.rejects(
+        () => mod.loadSession(DM_SESSION_ID, {
+            isStale: () => false,
+            logPrefix: 'strict-test',
+            requireAuthoritativeSnapshot: true,
+        }),
+        /tool snapshot unavailable/,
+    );
+    assert.equal(T.__calls.streamOpens.length, 0);
+});
+
+test('contract reconciliation clears stale activity when every run is terminal', async () => {
+    reset();
+    T.activeSessionId.value = DM_SESSION_ID;
+    T.activeRunId.value = 'run-terminal';
+    T.chatMessages.value = [{
+        id: 'stale-thinking', type: 'thinking', runId: 'run-terminal',
+    }];
+    globalThis.__lsApi = makeApi({
+        getSession: async () => DM_ENVELOPE,
+        getSessionMessages: async () => ({ messages: [], last_event_id: 52 }),
+        listRuns: async () => ({
+            runs: [{ run_id: 'run-terminal', status: 'completed' }],
+        }),
+    });
+
+    await globalThis.__lsReconciler(DM_SESSION_ID, 47);
+
+    assert.equal(T.activeRunId.value, null);
+    assert.equal(
+        T.chatMessages.value.some(message => message.type === 'thinking'),
+        false,
+    );
+    assert.equal(
+        T.__calls.phase.some(
+            call => call[0] === 'setAgentPhase' || call[0] === 'setDmContext',
+        ),
+        false,
+    );
+    assert.deepEqual(T.__calls.phase.at(-1), ['clearAgentPhase']);
 });

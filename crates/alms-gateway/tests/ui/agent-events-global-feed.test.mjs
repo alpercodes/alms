@@ -123,6 +123,10 @@ function installEventSourceStub() {
             const evt = { data: JSON.stringify(dataObj), lastEventId: id != null ? String(id) : '' };
             for (const fn of this._listeners[type] || []) fn(evt);
         }
+        _emitRaw(type, data, id) {
+            const evt = { data, lastEventId: id != null ? String(id) : '' };
+            for (const fn of this._listeners[type] || []) fn(evt);
+        }
     }
     StubEventSource.CLOSED = 2;
     StubEventSource.CONNECTING = 0;
@@ -154,12 +158,25 @@ afterEach(async () => {
     delete globalThis.__agentEventsGlobalApi__;
     delete globalThis.EventSource;
     delete globalThis.localStorage;
+    delete globalThis.__almsContracts;
 });
 
 async function loadHook(api = { listSessions: async () => ({ sessions: [] }) }) {
     const stub = makeSignalStub();
     const created = installEventSourceStub();
     installLocalStorageStub();
+    globalThis.__almsContracts = {
+        parseSseJsonPayload(type, raw) {
+            const payload = JSON.parse(raw);
+            if (
+                (type === 'session_activity_started' || type === 'session_activity_ended')
+                && typeof payload.has_active_run !== 'boolean'
+            ) {
+                throw new Error('has_active_run must be boolean');
+            }
+            return payload;
+        },
+    };
     globalThis.__agentEventsGlobalApi__ = api;
     const { dir, hookPath, queuePath } = await installHarness(stub);
     // Import the hook (cache-busted so each test gets fresh module state)
@@ -457,4 +474,35 @@ test('native reconnect after event-log restart clears stale state and accepts re
         bgRuns.value['fresh-after-restart'],
         'the reset event ID is buffered and applied after reconciliation',
     );
+});
+
+test('invalid numeric activity frame reconciles and resumes after that frame', async () => {
+    let snapshotCalls = 0;
+    active = await loadHook({
+        async listSessions() {
+            snapshotCalls++;
+            return { sessions: [] };
+        },
+    });
+    const { openAgentEventsStream } = active.mod;
+    const { bgRuns } = active.queue;
+    const originalConsoleError = console.error;
+    console.error = () => {};
+
+    try {
+        openAgentEventsStream('agent-1');
+        active.created[0]._emit('session_activity_started', {
+            session_id: 'invalid-session',
+            run_id: 'invalid-run',
+            has_active_run: 'yes',
+        }, 41);
+        await new Promise(resolve => setImmediate(resolve));
+    } finally {
+        console.error = originalConsoleError;
+    }
+
+    assert.equal(snapshotCalls, 1, 'a rejected frame must trigger an authoritative snapshot');
+    assert.deepEqual(bgRuns.value, {}, 'the rejected activity must never mutate state');
+    assert.equal(active.created.length, 2, 'the stream reopens after snapshot reconciliation');
+    assert.match(active.created[1].url, /last_event_id=41/);
 });
