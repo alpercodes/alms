@@ -31,7 +31,12 @@
 import { batch, signal } from '../deps.js';
 import { chatMessages, nextMsgId } from '../state/chat.js';
 import { appendMessage, updateMessage, filterMessages, transformMessages } from '../state/chat-actions.js';
-import { activeRunId, bumpRunListGeneration } from '../state/runs.js';
+import {
+    activeRunId,
+    bumpRunListGeneration,
+    upsertRun,
+    setRunStatus,
+} from '../state/runs.js';
 import { trackSubagentStart, trackSubagentEnd, trackSubagentActivity, findSubagentByToolInvocationId, findSubagentBySessionId, setSubagentSessionId, activeSubagents } from '../state/subagents.js';
 import { agentPhase, setAgentPhase, clearAgentPhase, setDmContext, revertPhase, dmPeer } from '../state/agent-status.js';
 import { messageQueue } from '../state/queue.js';
@@ -286,6 +291,7 @@ let sawTokenDelta = false;
  */
 let lastSeenEventId = null;
 
+let lastSeenStreamEpoch = null;
 let sessionContractReconciler = null;
 
 /**
@@ -430,10 +436,13 @@ function sealLastAgent() {
  * Stays open across runs -- all events for this session arrive here.
  *
  * @param {string} sessionId
- * @param {{ lastEventId?: number, sealedReasoningRunIds?: Set<string> }} [opts]
- *   Replay cursor and load-time reasoning dedupe state.
+ * @param {{ lastEventId?: number, streamEpoch?: string, sealedReasoningRunIds?: Set<string> }} [opts]
+ *   Replay cursor, stream epoch, and load-time reasoning dedupe state.
  */
 export function openSessionStream(sessionId, opts) {
+    const requestedStreamEpoch = opts && opts.streamEpoch != null
+        ? String(opts.streamEpoch)
+        : null;
     // Recover the reasoning-dedupe suppress-set (#1135) BEFORE the internal
     // `closeSessionStream()` below clears the per-session store, so a
     // same-session EventSource reconnect (which reopens via this function
@@ -521,6 +530,7 @@ export function openSessionStream(sessionId, opts) {
     const params = new URLSearchParams();
     if (token) params.set('token', token);
     if (opts && opts.lastEventId != null) params.set('last_event_id', String(opts.lastEventId));
+    if (requestedStreamEpoch) params.set('stream_epoch', requestedStreamEpoch);
     const qs = params.toString();
     const url = `/sessions/${sessionId}/events${qs ? '?' + qs : ''}`;
     const es = new EventSource(url);
@@ -529,6 +539,7 @@ export function openSessionStream(sessionId, opts) {
     sessionRetryCount = 0;
     lastSeenEventId = (opts && opts.lastEventId != null) ? opts.lastEventId : null;
 
+    lastSeenStreamEpoch = requestedStreamEpoch;
     // Reasoning-dedupe suppress-set (#1135). A fresh `loadSession` passes the
     // freshly-built set in `opts.sealedReasoningRunIds`; record it under this
     // session id so the reconnect paths (auto-backoff `onerror`, manual
@@ -609,11 +620,15 @@ export function openSessionStream(sessionId, opts) {
     const seenEventIds = new Set();
     let contractRecovering = false;
 
-    const recoverFromContractViolation = async (eventId, error) => {
+    const reconcileFromSnapshot = async (eventId, streamEpoch, reason, error = null) => {
         if (contractRecovering || streamGeneration !== selectGeneration) return;
         contractRecovering = true;
         es.close();
-        console.error('[session-events] rejected live event; reconciling:', error);
+        if (error) {
+            console.error('[session-events] rejected live event; reconciling:', error);
+        } else {
+            console.warn('[session-events] authoritative reconciliation:', reason);
+        }
 
         if (!sessionContractReconciler) {
             markStreamDead('session');
@@ -624,12 +639,15 @@ export function openSessionStream(sessionId, opts) {
             // Reload REST snapshots before reopening. The malformed frame is
             // used as the minimum cursor so it is not replayed forever; all
             // later persisted frames replay onto the authoritative snapshot.
-            await sessionContractReconciler(sessionId, eventId);
+            await sessionContractReconciler(sessionId, eventId, streamEpoch);
         } catch (reconcileError) {
             console.error('[session-events] contract reconciliation failed:', reconcileError);
             markStreamDead('session');
         }
     };
+
+    const recoverFromContractViolation = (eventId, error) =>
+        reconcileFromSnapshot(eventId, lastSeenStreamEpoch, 'contract violation', error);
 
     /**
      * Wrap an event handler to track the highest seen SSE event ID and
@@ -682,10 +700,47 @@ export function openSessionStream(sessionId, opts) {
         }
     });
 
+    const eventCursor = (event) => /^\d+$/.test(event.lastEventId)
+        ? Number(event.lastEventId)
+        : null;
+    on('stream_state', (e) => {
+        const data = e.data;
+        const previousEpoch = lastSeenStreamEpoch;
+        const epochChanged = Boolean(
+            previousEpoch
+            && data.stream_epoch
+            && previousEpoch !== data.stream_epoch
+        );
+        if (data.stream_epoch) {
+            lastSeenStreamEpoch = data.stream_epoch;
+        }
+        if (data.requires_reconciliation || epochChanged) {
+            const hasNewest = Number.isSafeInteger(data.newest);
+            const boundary = hasNewest
+                ? data.newest
+                : (epochChanged ? null : eventCursor(e));
+            void reconcileFromSnapshot(
+                boundary,
+                data.stream_epoch || lastSeenStreamEpoch,
+                epochChanged ? 'stream epoch changed' : 'replay gap',
+            );
+        }
+    });
+
     // -- run_created: a new run was created on this session --
     on('run_created', (e) => {
         const data = e.data;
         const queuedBehind = data.queued_behind;
+        upsertRun(
+            {
+                run_id: data.run_id,
+                session_id: data.session_id,
+                status: 'queued',
+                ...(queuedBehind > 0 ? { queue_position: queuedBehind } : {}),
+            },
+            eventCursor(e),
+            lastSeenStreamEpoch,
+        );
         sawTokenDelta = false;
         bumpRunListGeneration();
 
@@ -727,7 +782,6 @@ export function openSessionStream(sessionId, opts) {
             // block will be created when run_started fires. (#691)
             if (queuedBehind > 0) {
                 batch(() => {
-                    activeRunId.value = data.run_id;
                     // Header bar is NOT updated here -- it should keep
                     // showing the agent's current activity (e.g. a DM with
                     // another peer).  The inline thinking indicator handles
@@ -754,7 +808,6 @@ export function openSessionStream(sessionId, opts) {
                 // UI-selected agent, not necessarily the one reasoning.
                 const agentName = dmReasoningAgentName(data.source);
                 batch(() => {
-                    activeRunId.value = data.run_id;
                     appendMessage({
                         id: nextMsgId(),
                         type: 'dm_reasoning',
@@ -777,7 +830,6 @@ export function openSessionStream(sessionId, opts) {
             // `run_queue_position` SSE handler (#831) can locate the right
             // indicator to decrement when an upstream run completes.
             batch(() => {
-                activeRunId.value = data.run_id;
                 appendMessage({
                     id: nextMsgId(), type: 'thinking', source: data.source,
                     queuedBehind, runId: data.run_id,
@@ -795,7 +847,6 @@ export function openSessionStream(sessionId, opts) {
             // `run_queue_position` SSE handler (#831) can locate the right
             // indicator to decrement when an upstream run completes.
             batch(() => {
-                activeRunId.value = data.run_id;
                 updateMessage(
                     m => m.type === 'thinking' && m.pending,
                     m => ({ ...m, queuedBehind, pending: false, runId: data.run_id }),
@@ -806,7 +857,6 @@ export function openSessionStream(sessionId, opts) {
             // indicator transitions from "Sending..." to "Thinking...".
             // (#704)
             batch(() => {
-                activeRunId.value = data.run_id;
                 updateMessage(
                     m => m.type === 'thinking' && m.pending,
                     m => ({ ...m, pending: false }),
@@ -818,6 +868,16 @@ export function openSessionStream(sessionId, opts) {
     // -- run_started: the run has been dequeued and is now executing --
     on('run_started', (e) => {
         const data = e.data;
+        upsertRun(
+            {
+                run_id: data.run_id,
+                session_id: data.session_id,
+                status: 'running',
+                queue_position: undefined,
+            },
+            eventCursor(e),
+            lastSeenStreamEpoch,
+        );
         // Gate via `isDmEvent` (run_id-aware) rather than a bare `activeSession`
         // read, mirroring the delta / run_finished handlers (#1162 attach race).
         // `run_started` carries no `source`, so it cannot re-detect `peer:` on
@@ -892,6 +952,16 @@ export function openSessionStream(sessionId, opts) {
     on('run_queue_position', (e) => {
         const data = e.data;
         const position = data.position;
+        upsertRun(
+            {
+                run_id: data.run_id,
+                session_id: data.session_id,
+                status: 'queued',
+                queue_position: position,
+            },
+            eventCursor(e),
+            lastSeenStreamEpoch,
+        );
         updateMessage(
             m => m.type === 'thinking' && m.queuedBehind > 0
                 && m.runId === data.run_id,
@@ -959,10 +1029,10 @@ export function openSessionStream(sessionId, opts) {
             // reasoning), and run end discards it (it was the implicit reply).
             //
             // B8 (#1154): bucket strictly by the event's own `run_id` rather
-            // than `activeRunId.value`. Two DM runs can overlap (a queued
-            // run's `run_created` overwrites `activeRunId` mid-stream, and
-            // `handleRunEnd` nulls `activeRunId` for the FIRST run to end),
-            // so keying on the mutable `activeRunId` lands one agent's
+            // than `activeRunId.value`. Two DM runs can overlap, while the
+            // derived active run can change whenever a queued run is created
+            // or either run reaches a terminal state. Keying on that mutable
+            // selection would land one agent's
             // text in the other agent's collapsible. The wire-level `run_id`
             // is the authoritative owner of the delta.
             const runId = data.run_id;
@@ -1799,6 +1869,17 @@ export function openSessionStream(sessionId, opts) {
             // (approval resolution + appended status/error/token messages)
             // is collapsed into one write to avoid intermediate states.
             const endingRunId = data.run_id || null;
+            if (endingRunId) {
+                const terminalStatus = status === 'finished'
+                    ? 'completed'
+                    : status === 'error' ? 'failed' : 'cancelled';
+                setRunStatus(endingRunId, terminalStatus, {
+                    sessionId,
+                    cursor: eventCursor(e),
+                    streamEpoch: lastSeenStreamEpoch,
+                });
+            }
+
 
             // S3 (#1154): gate via `isDmEvent` (run_id-aware), not a bare
             // `activeSession` read. On a reconnect that replays the terminal
@@ -1939,7 +2020,6 @@ export function openSessionStream(sessionId, opts) {
 
                 return msgs;
             });
-            activeRunId.value = null;
 
             // Preserve DM context across runs (#688): when the agent is
             // in a DM conversation, individual run endings should NOT
@@ -1948,6 +2028,8 @@ export function openSessionStream(sessionId, opts) {
             // For non-DM runs, clear the phase as before.
             if (dmPeer.value) {
                 setAgentPhase('dm', dmPeer.value);
+            } else if (activeRunId.value) {
+                setAgentPhase('calling_llm', null);
             } else {
                 clearAgentPhase();
             }
@@ -1965,7 +2047,7 @@ export function openSessionStream(sessionId, opts) {
 
         // Process queued user messages via dynamic import
         // (avoids circular dependency with input-area.js)
-        if (messageQueue.value.length > 0) {
+        if (!activeRunId.value && messageQueue.value.length > 0) {
             const next = messageQueue.value[0];
             const remaining = messageQueue.value.slice(1);
             messageQueue.value = remaining;
@@ -2013,7 +2095,7 @@ export function openSessionStream(sessionId, opts) {
             backoffTimer = setTimeout(() => {
                 backoffTimer = null;
                 if (activeSessionId.value === sessionId) {
-                    openSessionStream(sessionId, { lastEventId: lastSeenEventId });
+                    openSessionStream(sessionId, { lastEventId: lastSeenEventId, streamEpoch: lastSeenStreamEpoch });
                 }
             }, delay);
         }
@@ -2035,7 +2117,7 @@ function reconnectSessionStream() {
     sessionRetryCount = 0;
     const sid = activeSessionId.value;
     if (sid) {
-        openSessionStream(sid, { lastEventId: lastSeenEventId });
+        openSessionStream(sid, { lastEventId: lastSeenEventId, streamEpoch: lastSeenStreamEpoch });
     } else {
         // Even with no active session there's nothing to reconnect to,
         // but the dead flag should be cleared so the banner reflects

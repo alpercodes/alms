@@ -1,0 +1,1 @@
+var e=globalThis.__almsState;if(!e||e.version!==1)throw Error(`Normalized frontend state bridge is not installed`);var t=e;export{t};

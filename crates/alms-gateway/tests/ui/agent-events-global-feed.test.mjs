@@ -39,6 +39,73 @@ function makeSignalStub() {
     }
     return { signal };
 }
+function installStateBridgeStub(stub) {
+    const backgroundRuns = stub.signal({});
+    let reconciliation = null;
+    let nextToken = 0;
+
+    const apply = (type, data) => {
+        const next = { ...backgroundRuns.value };
+        if (data.has_active_run) {
+            next[data.session_id] = {
+                runId: type === 'session_activity_started' ? data.run_id : null,
+                finished: false,
+            };
+        } else {
+            delete next[data.session_id];
+        }
+        backgroundRuns.value = next;
+    };
+
+    const replaceSnapshot = (sessions) => {
+        const next = {};
+        for (const session of sessions || []) {
+            if (session.has_active_run) {
+                next[session.id] = { runId: null, finished: false };
+            }
+        }
+        backgroundRuns.value = next;
+    };
+
+    globalThis.__almsState = {
+        version: 1,
+        backgroundRuns,
+        replaceActivitySnapshot: replaceSnapshot,
+        applyActivityEvent(type, data, cursor = null, streamEpoch = null) {
+            const event = { type, data, cursor, streamEpoch };
+            if (reconciliation) {
+                reconciliation.events.push(event);
+                return;
+            }
+            apply(type, data);
+        },
+        beginActivityReconciliation(replayCeiling = null, streamEpoch = null) {
+            reconciliation = {
+                token: ++nextToken,
+                replayCeiling,
+                streamEpoch,
+                events: [],
+            };
+            return reconciliation.token;
+        },
+        commitActivityReconciliation(token, sessions) {
+            if (!reconciliation || reconciliation.token !== token) return false;
+            const current = reconciliation;
+            reconciliation = null;
+            replaceSnapshot(sessions);
+            for (const event of current.events) {
+                if (current.replayCeiling != null
+                    && event.cursor != null
+                    && event.cursor <= current.replayCeiling) continue;
+                apply(event.type, event.data);
+            }
+            return true;
+        },
+        abortActivityReconciliation(token) {
+            if (reconciliation?.token === token) reconciliation = null;
+        },
+    };
+}
 
 /**
  * Materialise a temp dir mirroring the `static/ui/` layout the hook
@@ -77,6 +144,10 @@ export const useSignal = (v) => ({ value: v });
     );
     await fs.copyFile(path.join(UI_ROOT, 'state', 'queue.js'), path.join(stateDir, 'queue.js'));
     await fs.copyFile(
+        path.join(UI_ROOT, 'state', 'entity-state.js'),
+        path.join(stateDir, 'entity-state.js'),
+    );
+    await fs.copyFile(
         path.join(UI_ROOT, 'state', 'stream-health.js'),
         path.join(stateDir, 'stream-health.js'),
     );
@@ -86,6 +157,7 @@ export const useSignal = (v) => ({ value: v });
     );
 
     globalThis.__agentEventsGlobalSignalStub__ = stub;
+    installStateBridgeStub(stub);
     return {
         dir,
         hookPath: path.join(hooksDir, 'use-agent-events.js'),
@@ -159,6 +231,7 @@ afterEach(async () => {
     delete globalThis.EventSource;
     delete globalThis.localStorage;
     delete globalThis.__almsContracts;
+    delete globalThis.__almsState;
 });
 
 async function loadHook(api = { listSessions: async () => ({ sessions: [] }) }) {
@@ -243,13 +316,11 @@ test('session_activity_started for ANY agent writes bgRuns; _ended clears it (#1
 test('overlapping runs keep the dot active until the final run ends', async () => {
     active = await loadHook();
     const { openAgentEventsStream } = active.mod;
-    const { bgRuns } = active.queue;
+    const { bgRuns, replaceActivitySnapshot } = active.queue;
     const sessionId = 'shared-dm-session';
 
     // Boot-time snapshots intentionally have no per-run cardinality.
-    bgRuns.value = {
-        [sessionId]: { runId: null, finished: false },
-    };
+    replaceActivitySnapshot([{ id: sessionId, has_active_run: true }]);
 
     openAgentEventsStream('agent-1');
     const es = active.created[0];
@@ -416,6 +487,42 @@ test('a second reconnect queues a separate snapshot instead of widening the firs
     await new Promise(resolve => setImmediate(resolve));
 });
 
+test('queued reconciliation resets its ceiling across stream epochs', async () => {
+    const resolvers = [];
+    let snapshotCalls = 0;
+    active = await loadHook({
+        listSessions: () => {
+            snapshotCalls++;
+            return new Promise(resolve => { resolvers.push(resolve); });
+        },
+    });
+    const { openAgentEventsStream } = active.mod;
+    const { bgRuns } = active.queue;
+
+    openAgentEventsStream('agent-1');
+    const es = active.created[0];
+    es._emit('stream_state', {
+        stream_epoch: 'epoch-a', newest: 100, requires_reconciliation: true,
+    });
+    es._emit('stream_state', {
+        stream_epoch: 'epoch-b', newest: 1, requires_reconciliation: false,
+    });
+
+    resolvers[0]({ sessions: [] });
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(snapshotCalls, 2, 'the new epoch queues an independent snapshot');
+
+    es._emit('session_activity_ended', {
+        session_id: 'new-epoch-session', run_id: 'new-run', has_active_run: false,
+    }, 2);
+    resolvers[1]({
+        sessions: [{ id: 'new-epoch-session', has_active_run: true }],
+    });
+    await new Promise(resolve => setImmediate(resolve));
+
+    assert.equal(bgRuns.value['new-epoch-session'], undefined,
+        'cursor 2 must be compared with epoch-b ceiling 1, not epoch-a ceiling 100');
+});
 test('native reconnect after event-log restart clears stale state and accepts reset IDs', async () => {
     let resolveSnapshot;
     const snapshot = new Promise(resolve => { resolveSnapshot = resolve; });

@@ -30,8 +30,8 @@
  *
  * The synthetic-`ended` semantics from the backend (pre-cancelled runs
  * emit only `session_activity_ended` without a paired `started`) are
- * naturally handled — `removeBgRun` is a no-op when nothing was ever
- * written for that sessionId.
+ * naturally handled — the normalized reducer ignores an unknown run id
+ * while preserving any other active runs for that session.
  *
  * Notes:
  *   - Auth uses the `?token=` query parameter (mirrors `openSessionStream`)
@@ -43,7 +43,13 @@
  */
 
 import { listSessions } from '../api/sessions.js';
-import { bgRuns, setBgRun, removeBgRun } from '../state/queue.js';
+import {
+    replaceActivitySnapshot,
+    applyActivityEvent,
+    beginActivityReconciliation,
+    commitActivityReconciliation,
+    abortActivityReconciliation,
+} from '../state/queue.js';
 import {
     markStreamDead,
     clearStreamDead,
@@ -65,33 +71,6 @@ let lastSeenStreamEpoch = null;
  */
 let backoffTimer = null;
 
-/**
- * Apply one activity transition using the backend's authoritative
- * session-level predicate.
- */
-function applyActivityEvent(type, data) {
-    if (data.has_active_run) {
-        setBgRun(data.session_id, {
-            // An ended event can still report session activity when another
-            // overlapping run remains. Its own run_id is terminal, not the
-            // identity of the remaining run, so do not expose it as active.
-            runId: type === 'session_activity_ended' ? null : data.run_id,
-            finished: false,
-        });
-    } else {
-        removeBgRun(data.session_id);
-    }
-}
-
-function applyActivitySnapshot(data) {
-    const seed = {};
-    for (const session of data.sessions || []) {
-        if (session.has_active_run) {
-            seed[session.id] = { runId: null, finished: false };
-        }
-    }
-    bgRuns.value = seed;
-}
 
 /**
  * Open the agent-scoped SSE stream.  Closes any previously open stream
@@ -142,31 +121,30 @@ export function openAgentEventsStream(agentId, opts) {
     lastSeenStreamEpoch = requestedEpoch;
     let hasOpened = false;
     let reconciling = false;
-    let bufferedActivity = [];
     let queuedReconciliation = false;
     let queuedReplayCeiling = null;
+    let queuedReplayEpoch = null;
     let reconciliationRetryCount = 0;
     let contractRecovering = false;
 
-    const dispatchActivity = (type, data, eventId) => {
-        if (reconciling) {
-            bufferedActivity.push({ type, data, eventId });
-            return;
-        }
-        applyActivityEvent(type, data);
-    };
+    const dispatchActivity = (type, data, eventId) =>
+        applyActivityEvent(type, data, eventId, lastSeenStreamEpoch);
 
-    const reconcileActivity = async (replayCeiling) => {
+    const reconcileActivity = async (replayCeiling, streamEpoch = lastSeenStreamEpoch) => {
         const requestReplayCeiling = Number.isSafeInteger(replayCeiling)
             ? replayCeiling
             : null;
+        const requestStreamEpoch = streamEpoch;
         if (reconciling) {
             // A stream can reconnect again while the previous authoritative
             // snapshot is still in flight. Keep that later reconciliation
             // separate: widening the first request's ceiling would let its
             // older snapshot discard events belonging to the newer stream.
             queuedReconciliation = true;
-            if (requestReplayCeiling != null) {
+            if (queuedReplayEpoch !== requestStreamEpoch) {
+                queuedReplayEpoch = requestStreamEpoch;
+                queuedReplayCeiling = requestReplayCeiling;
+            } else if (requestReplayCeiling != null) {
                 queuedReplayCeiling = queuedReplayCeiling == null
                     ? requestReplayCeiling
                     : Math.max(queuedReplayCeiling, requestReplayCeiling);
@@ -175,7 +153,7 @@ export function openAgentEventsStream(agentId, opts) {
         }
         if (es !== activeAgentEs) return;
         reconciling = true;
-        bufferedActivity = [];
+        const reconciliationToken = beginActivityReconciliation(requestReplayCeiling, requestStreamEpoch);
 
         let snapshot = null;
         try {
@@ -184,36 +162,35 @@ export function openAgentEventsStream(agentId, opts) {
             console.error('[agent-events] activity reconciliation failed:', err);
         }
 
-        if (es !== activeAgentEs) return;
+        if (es !== activeAgentEs) {
+            abortActivityReconciliation(reconciliationToken);
+            return;
+        }
         if (snapshot) {
-            applyActivitySnapshot(snapshot);
-            reconciliationRetryCount = 0;
+            const committed = commitActivityReconciliation(reconciliationToken, snapshot.sessions || []);
+            if (committed) {
+                reconciliationRetryCount = 0;
+            } else {
+                queuedReconciliation = true;
+                queuedReplayCeiling = requestReplayCeiling;
+                queuedReplayEpoch = requestStreamEpoch;
+            }
+        } else {
+            // Fail closed: discard buffered deltas and retry an authoritative
+            // snapshot instead of deriving state from an incomplete recovery window.
+            abortActivityReconciliation(reconciliationToken);
         }
 
-        const pending = bufferedActivity;
-        bufferedActivity = [];
         reconciling = false;
-        for (const event of pending) {
-            // `stream_state.newest` is the replay snapshot ceiling. Events
-            // at or below it predate the authoritative /sessions response
-            // and must not regress that snapshot when the retained tail is
-            // drained. IDs above it are genuinely live and apply afterward.
-            if (
-                requestReplayCeiling != null
-                && event.eventId != null
-                && event.eventId <= requestReplayCeiling
-            ) {
-                continue;
-            }
-            applyActivityEvent(event.type, event.data);
-        }
 
         const shouldRunQueuedReconciliation = queuedReconciliation;
         const nextReplayCeiling = queuedReplayCeiling;
+        const nextReplayEpoch = queuedReplayEpoch;
         queuedReconciliation = false;
         queuedReplayCeiling = null;
+        queuedReplayEpoch = null;
         if (shouldRunQueuedReconciliation && es === activeAgentEs) {
-            void reconcileActivity(nextReplayCeiling);
+            void reconcileActivity(nextReplayCeiling, nextReplayEpoch);
             return;
         }
 
@@ -253,7 +230,7 @@ export function openAgentEventsStream(agentId, opts) {
         try {
             const snapshot = await listSessions(null, { includeDms: true });
             if (es !== activeAgentEs) return;
-            applyActivitySnapshot(snapshot);
+            replaceActivitySnapshot(snapshot.sessions || [], eventId, lastSeenStreamEpoch);
 
             // A malformed frame cannot become valid on replay. Skip only
             // that frame after replacing local state with the authoritative

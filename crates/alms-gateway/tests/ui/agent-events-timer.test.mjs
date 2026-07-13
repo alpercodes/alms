@@ -105,6 +105,10 @@ export const useSignal = (v) => ({ value: v });
         path.join(stateDir, 'queue.js'),
     );
     await fs.copyFile(
+        path.join(UI_ROOT, 'state', 'entity-state.js'),
+        path.join(stateDir, 'entity-state.js'),
+    );
+    await fs.copyFile(
         path.join(UI_ROOT, 'state', 'stream-health.js'),
         path.join(stateDir, 'stream-health.js'),
     );
@@ -114,6 +118,15 @@ export const useSignal = (v) => ({ value: v });
     );
 
     globalThis.__agentEventsTimerSignalStub__ = stub;
+    globalThis.__almsState = {
+        version: 1,
+        backgroundRuns: stub.signal({}),
+        replaceActivitySnapshot() {},
+        applyActivityEvent() {},
+        beginActivityReconciliation() { return 1; },
+        commitActivityReconciliation() { return true; },
+        abortActivityReconciliation() {},
+    };
     return { dir, hookPath: path.join(hooksDir, 'use-agent-events.js') };
 }
 
@@ -184,6 +197,7 @@ afterEach(async () => {
         await fs.rm(active.tempDir, { recursive: true, force: true });
     }
     delete globalThis.__agentEventsTimerSignalStub__;
+    delete globalThis.__almsState;
     delete globalThis.EventSource;
     delete globalThis.localStorage;
     if (mock.timers && mock.timers.reset) {

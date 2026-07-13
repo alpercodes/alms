@@ -25,10 +25,10 @@ import { historyCoversSeal } from './reasoning-coverage.js';
 import { normalizeApproval } from './approvals.js';
 import { chatMessages, nextMsgId } from '../state/chat.js';
 import { replaceMessages, appendMessage, updateMessage, filterMessages } from '../state/chat-actions.js';
-import { activeRunId, runs } from '../state/runs.js';
+import { activeRunId, runs, replaceRuns, setRunStatus, upsertRun } from '../state/runs.js';
 import { openSessionStream, registerSessionContractReconciler } from '../hooks/use-session-stream.js';
 import { setAgentPhase, clearAgentPhase, setDmContext } from '../state/agent-status.js';
-import { sessions, crossAgentSessions, activeSessionId } from '../state/sessions.js';
+import { sessions, crossAgentSessions, activeSessionId, upsertSession } from '../state/sessions.js';
 import { activeAgent } from '../state/agents.js';
 import { getPendingMessage, clearPendingMessage } from '../state/pending-messages.js';
 import { rehydrateSubagentsFromHistory, parentSessionId } from '../state/subagents.js';
@@ -188,7 +188,7 @@ export async function loadSession(sessionId, opts) {
         if (session
             && INTERNAL_SESSION_TYPES.has(session.session_type)
             && !sessions.value.some(s => s.id === session.id)) {
-            sessions.value = [...sessions.value, session];
+            upsertSession(session, 'pinned');
         }
 
         // Inject an envelope-resolved DM into `crossAgentSessions.value`
@@ -217,13 +217,13 @@ export async function loadSession(sessionId, opts) {
         //
         // Sidebar blast radius: none beyond one legitimate row appearing
         // early. The id-guard prevents duplicates, and the boot path's
-        // wholesale `crossAgentSessions.value = crossAgent` assignment
-        // supersedes the injected entry when the full list lands (the DM
+        // authoritative cross-agent scope replacement supersedes the
+        // injected entry when the full list lands (the DM
         // is in that list anyway).
         if (session
             && session.session_type === 'dm'
             && !crossAgentSessions.value.some(s => s.id === session.id)) {
-            crossAgentSessions.value = [...crossAgentSessions.value, session];
+            upsertSession(session, 'cross');
         }
 
         // Populate the breadcrumb pointer from the backend. `parent_session_id`
@@ -255,20 +255,11 @@ export async function loadSession(sessionId, opts) {
         const data = await listRuns(sessionId, SESSION_RUNS_RESTORE_LIMIT);
         if (isStale()) return;
         const loaded = data.runs || [];
-        runs.value = loaded;
-
-        // Prefer a `running` run over a `queued` one when both exist for
-        // this session. The backend returns runs newest-first, so without
-        // this preference a newer queued run would mask an older still-
-        // running run, leaving the UI showing queued/idle while work is
-        // already executing. (#735)
-        const active = loaded.find(r => r.status === 'running')
-            || loaded.find(r => r.status === 'queued');
-        activeRunId.value = active?.run_id ?? null;
+        replaceRuns(sessionId, loaded);
     } catch (err) {
         if (isStale()) return;
         if (opts.requireAuthoritativeSnapshot) throw err;
-        runs.value = [];
+        replaceRuns(sessionId, []);
     }
 
     // Step 2: Fetch message history and session-level tool calls in
@@ -412,7 +403,10 @@ export async function loadSession(sessionId, opts) {
         // entries; the chronological-order invariant the function depends
         // on is preserved by `mapHistoryMessages` itself.
         rehydrateSubagentsFromHistory(mapped);
-        lastEventId = historyData.last_event_id ?? null;
+        const historyEventId = historyData.last_event_id ?? null;
+        if (historyEventId != null && (lastEventId == null || historyEventId > lastEventId)) {
+            lastEventId = historyEventId;
+        }
     } catch (err) {
         if (isStale()) return;
         replaceMessages([{ id: nextMsgId(), type: 'error', text: `Failed to load message history: ${err.error?.message || err.message || 'unknown error'}` }]);
@@ -634,7 +628,19 @@ export async function loadSession(sessionId, opts) {
                     // authoritatively here. A genuinely-live run reports
                     // `terminal: false`, keeps `activeRunId`, and gets
                     // `run_finished` from the live stream as normal.
-                    activeRunId.value = null;
+                    try {
+                        const terminalRun = await getRun(reasoningRunId);
+                        if (isStale()) return;
+                        upsertRun(terminalRun);
+                    } catch (runStatusError) {
+                        console.warn(
+                            '[loadSession] terminal run status refresh failed:',
+                            runStatusError,
+                        );
+                        setRunStatus(reasoningRunId, 'completed', {
+                            sessionId,
+                        });
+                    }
                     // Layer 4 (C2): clearing `activeRunId` stops the input-area
                     // spinner but does NOT remove the inline `type:'thinking'`
                     // chat row seeded above for this run. In the swallowed-
@@ -753,7 +759,11 @@ export async function loadSession(sessionId, opts) {
     // Thread the load-time sealed-reasoning dedupe set (#1133, Layer 3)
     // into the stream so its `reasoning_delta` handler can drop replayed
     // deltas for runs whose reasoning is already sealed into history.
-    openSessionStream(sessionId, { lastEventId, sealedReasoningRunIds });
+    openSessionStream(sessionId, {
+        lastEventId,
+        streamEpoch: opts.streamEpoch ?? null,
+        sealedReasoningRunIds,
+    });
 
     // Step 5: Restore agent phase for in-progress runs.
     //
@@ -885,11 +895,12 @@ async function restoreGlobalAgentPhase(agentId, sessionId, isStale, logPrefix) {
     }
 }
 
-registerSessionContractReconciler(async (sessionId, rejectedEventId) => {
+registerSessionContractReconciler(async (sessionId, boundaryEventId, streamEpoch) => {
     await loadSession(sessionId, {
         isStale: () => activeSessionId.value !== sessionId,
         logPrefix: 'contract-reconcile',
-        minimumLastEventId: rejectedEventId,
+        minimumLastEventId: boundaryEventId,
+        streamEpoch,
         requireAuthoritativeSnapshot: true,
     });
 });

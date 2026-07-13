@@ -757,7 +757,7 @@ async function loadNavDeps() {
         loadSession: loadMod.loadSession,
         closeSessionStream: sseMod.closeSessionStream,
         replaceMessages: chatMod.replaceMessages,
-        activeRunId: runsMod.activeRunId,
+        clearRuns: runsMod.clearRuns,
         selectedRunId: runsMod.selectedRunId,
         bumpSelectGeneration: genMod.bumpSelectGeneration,
         selectGeneration: genMod,
@@ -778,7 +778,7 @@ async function doSessionSwitch(targetSessionId, logPrefix) {
     const gen = deps.bumpSelectGeneration();
     deps.closeSessionStream();
     activeSessionId.value = targetSessionId;
-    deps.activeRunId.value = null;
+    deps.clearRuns();
     deps.selectedRunId.value = null;
     deps.replaceMessages([]);
     clearAllSubagents();

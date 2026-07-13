@@ -1,8 +1,15 @@
 import { html, batch, useSignal } from '../../deps.js';
-import { sessions, activeSessionId, crossAgentSessions, expandedAgentId, jobsGroupExpanded } from '../../state/sessions.js';
+import {
+    sessions,
+    activeSessionId,
+    crossAgentSessions,
+    expandedAgentId,
+    jobsGroupExpanded,
+    replaceSessionScopes,
+} from '../../state/sessions.js';
 import { agents, activeAgentId, activeAgent } from '../../state/agents.js';
 import { replaceMessages } from '../../state/chat-actions.js';
-import { activeRunId, selectedRunId, runs } from '../../state/runs.js';
+import { activeRunId, selectedRunId, clearRuns, replaceRuns } from '../../state/runs.js';
 import { bgRuns, messageQueue } from '../../state/queue.js';
 import { auditEvents } from '../../state/audit.js';
 import { listSessions, createSession, deleteSession } from '../../api/sessions.js';
@@ -105,15 +112,13 @@ async function newSession() {
             fetchCrossAgentSurfaces(),
         ]);
         batch(() => {
-            sessions.value = data.sessions || [];
-            crossAgentSessions.value = cross;
+            replaceSessionScopes(data.sessions || [], cross);
             activeSessionId.value = resp.session_id;
             saveActiveSession(activeAgentId.value, resp.session_id);
-            activeRunId.value = null;
             selectedRunId.value = null;
             replaceMessages([]);
             messageQueue.value = [];
-            runs.value = [];
+            replaceRuns(resp.session_id, []);
             auditEvents.value = null;
             clearAllSubagents();
         });
@@ -251,10 +256,9 @@ function SessionItem({ session, activeAgentName }) {
                 closeSessionStream();
                 batch(() => {
                     activeSessionId.value = null;
-                    activeRunId.value = null;
                     selectedRunId.value = null;
                     replaceMessages([]);
-                    runs.value = [];
+                    clearRuns();
                     auditEvents.value = null;
                     clearAllSubagents();
                     // Drop any in-memory queue items belonging to the
@@ -272,8 +276,7 @@ function SessionItem({ session, activeAgentName }) {
                 }),
                 fetchCrossAgentSurfaces(),
             ]);
-            sessions.value = data.sessions || [];
-            crossAgentSessions.value = cross;
+            replaceSessionScopes(data.sessions || [], cross);
         } catch (err) {
             console.error('[deleteSession] failed:', err);
         }

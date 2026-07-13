@@ -21,7 +21,7 @@
 
 import { batch } from '../deps.js';
 import { activeSessionId, sessions, crossAgentSessions } from '../state/sessions.js';
-import { activeRunId, selectedRunId } from '../state/runs.js';
+import { selectedRunId, clearRuns } from '../state/runs.js';
 import { replaceMessages } from '../state/chat-actions.js';
 import { messageQueue } from '../state/queue.js';
 import { auditEvents } from '../state/audit.js';
@@ -98,7 +98,7 @@ export async function navigateToSession(sessionId, opts) {
     closeSessionStream();
     batch(() => {
         activeSessionId.value = sessionId;
-        activeRunId.value = null;
+        clearRuns();
         selectedRunId.value = null;
         replaceMessages([]);
         messageQueue.value = [];

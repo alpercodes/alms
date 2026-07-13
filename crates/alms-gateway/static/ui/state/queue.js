@@ -1,20 +1,28 @@
 import { signal } from '../deps.js';
+import { entityState } from './entity-state.js';
 
 // Foreground message queue (messages waiting to be sent after current run finishes)
 export const messageQueue = signal([]);
 
-// Background session activity: { [sessionId]: { runId, finished } }.
-// `runId` is the most recent started run when known, or null when seeded from
-// a snapshot / retained by an ended event because another run remains active.
-// Drives the sidebar's cross-session activity dot via hasActiveRun() in
-// session-list.js. See #856 / #909.
-export const bgRuns = signal({});
+// Read-only compatibility selector over normalized session activity.
+export const bgRuns = entityState.backgroundRuns;
 
-export function setBgRun(sessionId, data) {
-    bgRuns.value = { ...bgRuns.value, [sessionId]: data };
+export function replaceActivitySnapshot(sessions, cursor = null, streamEpoch = null) {
+    entityState.replaceActivitySnapshot(sessions, cursor, streamEpoch);
 }
 
-export function removeBgRun(sessionId) {
-    const { [sessionId]: _, ...rest } = bgRuns.value;
-    bgRuns.value = rest;
+export function applyActivityEvent(type, data, cursor = null, streamEpoch = null) {
+    entityState.applyActivityEvent(type, data, cursor, streamEpoch);
+}
+
+export function beginActivityReconciliation(replayCeiling = null, streamEpoch = null) {
+    return entityState.beginActivityReconciliation(replayCeiling, streamEpoch);
+}
+
+export function commitActivityReconciliation(token, sessions) {
+    return entityState.commitActivityReconciliation(token, sessions);
+}
+
+export function abortActivityReconciliation(token) {
+    entityState.abortActivityReconciliation(token);
 }

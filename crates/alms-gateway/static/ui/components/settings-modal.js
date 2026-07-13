@@ -2,7 +2,7 @@ import { html, useSignal, useEffect } from '../deps.js';
 import { serverDefaults, refreshServerDefaults } from '../state/settings.js';
 import { patchSettings } from '../api/settings.js';
 import { listKeys, setKey, removeKey } from '../api/auth.js';
-import { agents, activeAgentId } from '../state/agents.js';
+import { agents, activeAgentId, replaceAgents } from '../state/agents.js';
 import { updateAgent, listAgents } from '../api/agents.js';
 import {
     MODEL_SUGGESTIONS,
@@ -544,7 +544,7 @@ export function SettingsModal({ open, onClose }) {
                     // page reload.
                     const data = await listAgents();
                     if (data && Array.isArray(data.agents)) {
-                        agents.value = data.agents;
+                        replaceAgents(data.agents);
                     }
                 } catch (err) {
                     serverError.value = err.error?.message

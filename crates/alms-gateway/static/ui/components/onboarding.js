@@ -1,6 +1,6 @@
 import { h, html, useSignal } from '../deps.js';
 import { createAgent, listAgents } from '../api/agents.js';
-import { agents } from '../state/agents.js';
+import { agents, replaceAgents } from '../state/agents.js';
 import { switchAgent } from '../hooks/use-boot.js';
 
 export function OnboardingView() {
@@ -24,7 +24,7 @@ export function OnboardingView() {
         try {
             const resp = await createAgent({ name: val, is_default: true });
             const data = await listAgents();
-            agents.value = data.agents || [];
+            replaceAgents(data.agents || []);
             const newId = resp.id || (agents.value.find(a => a.name === val) || {}).id;
             if (newId) {
                 await switchAgent(newId);

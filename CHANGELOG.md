@@ -34,6 +34,12 @@ Per-release notes for ALMS, with an emphasis on **operator-facing changes** — 
 
 ### Notable changes
 
+- **Normalized frontend entity state and authoritative reconnect recovery**
+  (PR #1228): agents, sessions, runs, and activity now share one typed reducer
+  with revision/cursor guards. SSE replay gaps and epoch resets reconcile from
+  authoritative snapshots, overlapping runs remain cardinality-safe, and the
+  wire protocol is unchanged.
+
 - **Revision-aware run and job lifecycles**: all production lifecycle changes
   now pass through explicit state machines with legal-transition checks,
   idempotent terminal outcomes, and a monotonically increasing revision.

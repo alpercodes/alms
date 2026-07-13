@@ -1,16 +1,19 @@
 import { signal, computed } from '../deps.js';
 import { agents } from './agents.js';
 import { sessionOwnerName } from '../utils/session-owner.js';
+import { entityState } from './entity-state.js';
 
-export const sessions = signal([]);
+export const sessions = entityState.agentSessions;
 export const activeSessionId = signal(null);
 
 /**
  * Cross-agent session list — every user-facing session for every
  * agent in the tenant.
  *
- * The per-agent `sessions` list above only carries the active agent's
- * sessions. This signal carries everything (chat / DM / notification)
+ * The `sessions` selector above carries the active agent's scoped chats plus
+ * any explicitly pinned active internal envelope. Pinned envelopes survive
+ * authoritative list refreshes until `resetScopedEntities()` runs. This
+ * cross-agent signal carries everything (chat / DM / notification)
  * for every agent so the sidebar can:
  *   - Render cross-agent DM / notification sections without forcing
  *     an agent switch (DMs are stored under `AgentId::nil()` and
@@ -27,7 +30,19 @@ export const activeSessionId = signal(null);
  * scheduled-job sessions (#1197) are always included; DMs are gated
  * on the `include_dms` query flag.
  */
-export const crossAgentSessions = signal([]);
+export const crossAgentSessions = entityState.crossAgentSessions;
+export function replaceSessionScopes(agentSessions, crossSessions) {
+    entityState.replaceSessionScopes(agentSessions, crossSessions);
+}
+
+
+export function upsertSession(session, scope = 'pinned') {
+    entityState.upsertSession(session, scope);
+}
+
+export function resetScopedEntities() {
+    entityState.resetScopedState();
+}
 
 /**
  * Whether the sidebar's "Jobs" section body is expanded (#1197).

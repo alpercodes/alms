@@ -1,11 +1,17 @@
 import { fetchSettings } from '../api/settings.js';
 import { listSessions, createSession, getSessionMessages } from '../api/sessions.js';
-import { agents, activeAgentId } from '../state/agents.js';
-import { sessions, activeSessionId, crossAgentSessions, expandedAgentId } from '../state/sessions.js';
-import { activeRunId, selectedRunId, runs } from '../state/runs.js';
+import { agents, activeAgentId, replaceAgents } from '../state/agents.js';
+import {
+    sessions,
+    activeSessionId,
+    expandedAgentId,
+    replaceSessionScopes,
+    resetScopedEntities,
+} from '../state/sessions.js';
+import { selectedRunId, replaceRuns } from '../state/runs.js';
 import { serverDefaults } from '../state/settings.js';
 import { replaceMessages } from '../state/chat-actions.js';
-import { messageQueue, bgRuns } from '../state/queue.js';
+import { messageQueue, replaceActivitySnapshot } from '../state/queue.js';
 import { wsFiles } from '../state/workspace.js';
 import { auditEvents } from '../state/audit.js';
 import { agentSwitchLoading } from '../state/loading.js';
@@ -121,7 +127,7 @@ export async function boot() {
     try {
         const data = await fetchSettings();
         serverDefaults.value = data;
-        agents.value = data.agents || [];
+        replaceAgents(data.agents || []);
 
         // Determine active agent: localStorage > default > first
         const saved = localStorage.getItem(AGENT_KEY);
@@ -205,7 +211,7 @@ async function loadAgentSessions(agentId, preferredSessionId) {
         // per-agent call because `/sessions` now unconditionally
         // returns them (PR #1100 removed the opt-in toggle), so we
         // filter them out here via `filterChatSessions` before
-        // assigning to `sessions.value` — Codex P2 on PR #1100 caught
+        // committing the normalized agent scope — Codex P2 on PR #1100 caught
         // that without this filter, an agent whose only session
         // activity is a notification would skip the chat-creation
         // fallback below and land in a read-only notification view at
@@ -221,8 +227,7 @@ async function loadAgentSessions(agentId, preferredSessionId) {
         ]);
         if (gen !== switchGeneration) return; // stale — discard
         const agentSessions = filterChatSessions(data.sessions || []);
-        sessions.value = agentSessions;
-        crossAgentSessions.value = crossAgent;
+        replaceSessionScopes(agentSessions, crossAgent);
 
         // Seed cross-session activity indicators (#856) from the
         // `has_active_run` snapshot so the sidebar's yellow dot shows
@@ -239,13 +244,7 @@ async function loadAgentSessions(agentId, preferredSessionId) {
         // surfaced session (notifications are always `false` — they
         // never run — so including them is harmless), and duplicate ids
         // across the two lists collapse to the same `bgRuns` entry.
-        const seedBg = {};
-        for (const s of [...agentSessions, ...crossAgent]) {
-            if (s.has_active_run) {
-                seedBg[s.id] = { runId: null, finished: false };
-            }
-        }
-        bgRuns.value = seedBg;
+        replaceActivitySnapshot([...agentSessions, ...crossAgent]);
 
         // Open the global cross-agent activity SSE feed so subsequent
         // transitions (`session_activity_started` / `session_activity_ended`)
@@ -307,12 +306,11 @@ async function loadAgentSessions(agentId, preferredSessionId) {
             if (gen !== switchGeneration) return; // stale — discard
             // Same notification-filter contract as the initial fetch
             // above — `/sessions` always returns notifications post
-            // PR #1100, but `sessions.value` is per-agent chats only.
-            sessions.value = filterChatSessions(reloaded.sessions || []);
-            crossAgentSessions.value = reloadedCross;
+            // PR #1100, but the normalized agent scope is chats only.
+            replaceSessionScopes(filterChatSessions(reloaded.sessions || []), reloadedCross);
             activeSessionId.value = resp.session_id;
             replaceMessages([]);
-            runs.value = [];
+            replaceRuns(resp.session_id, []);
             // Open persistent session stream
             openSessionStream(resp.session_id);
         }
@@ -353,16 +351,12 @@ export async function switchAgent(agentId, opts) {
 
     // Reset all state
     activeSessionId.value = null;
-    activeRunId.value = null;
     selectedRunId.value = null;
-    sessions.value = [];
-    crossAgentSessions.value = [];
-    runs.value = [];
+    resetScopedEntities();
     replaceMessages([]);
     messageQueue.value = [];
     wsFiles.value = null;
     auditEvents.value = null;
-    bgRuns.value = {}; // clear stale cross-session activity (#856)
     clearAllSubagents();
 
     // loadAgentSessions() bumps switchGeneration synchronously (before its

@@ -1,18 +1,8 @@
-import { html, useEffect, useSignal, batch } from '../../deps.js';
+import { html, useEffect, useSignal } from '../../deps.js';
 import { activeAgentId } from '../../state/agents.js';
-import { activeSessionId } from '../../state/sessions.js';
-import { activeRunId, selectedRunId } from '../../state/runs.js';
-import { replaceMessages } from '../../state/chat-actions.js';
-import { auditEvents } from '../../state/audit.js';
-import { messageQueue } from '../../state/queue.js';
-import { sessionSwitchLoading } from '../../state/loading.js';
 import { activePanelTab } from '../../state/panel.js';
-import { clearAllSubagents, parentSessionId } from '../../state/subagents.js';
-import { closeSessionStream } from '../../hooks/use-session-stream.js';
-import { saveActiveSession } from '../../hooks/use-boot.js';
-import { selectGeneration, bumpSelectGeneration } from '../../state/select-generation.js';
-import { loadSession } from '../../utils/load-session.js';
 import { getAgentTimeline } from '../../api/timeline.js';
+import { navigateToSession } from '../../utils/navigate-session.js';
 
 const PAGE_SIZE = 50;
 
@@ -86,38 +76,6 @@ function dateGroup(iso) {
     return d.toLocaleDateString([], { weekday: 'short', month: 'short', day: 'numeric' });
 }
 
-/** Navigate to a session (same pattern as runs-tab.js). */
-async function navigateToSession(sessionId) {
-    if (!sessionId || sessionId === activeSessionId.value) return;
-
-    const gen = bumpSelectGeneration();
-
-    closeSessionStream();
-    batch(() => {
-        activeSessionId.value = sessionId;
-        activeRunId.value = null;
-        selectedRunId.value = null;
-        replaceMessages([]);
-        messageQueue.value = [];
-        auditEvents.value = null;
-        clearAllSubagents();
-        parentSessionId.value = null;
-        sessionSwitchLoading.value = true;
-    });
-
-    saveActiveSession(activeAgentId.value, sessionId);
-
-    try {
-        await loadSession(sessionId, {
-            isStale: () => gen !== selectGeneration,
-            logPrefix: 'timelineTab',
-        });
-    } finally {
-        if (gen === selectGeneration) {
-            sessionSwitchLoading.value = false;
-        }
-    }
-}
 
 export function TimelineTab() {
     const events = useSignal([]);

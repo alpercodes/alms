@@ -108,6 +108,37 @@ function filterMessages(predicate) {
 // ---- runs state ----
 const activeRunId = signal(null);
 const runs = signal([]);
+function syncActiveRun() {
+    activeRunId.value = runs.value.find(run => run.status === 'running')?.run_id
+        || runs.value.find(run => run.status === 'queued')?.run_id
+        || null;
+}
+function replaceRuns(_sessionId, nextRuns) {
+    runs.value = nextRuns;
+    syncActiveRun();
+}
+function clearRuns() {
+    runs.value = [];
+    activeRunId.value = null;
+}
+function upsertRun(run) {
+    if (!run?.run_id) return;
+    const current = runs.value.find(existing => existing.run_id === run.run_id) || {};
+    runs.value = [
+        { ...current, ...run },
+        ...runs.value.filter(existing => existing.run_id !== run.run_id),
+    ];
+    syncActiveRun();
+}
+function setRunStatus(runId, status, options) {
+    upsertRun({ run_id: runId, session_id: options?.sessionId, status });
+}function upsertSession(session, scope) {
+    const target = scope === 'cross' ? crossAgentSessions : sessions;
+    target.value = [
+        ...target.value.filter(existing => existing.id !== session.id),
+        session,
+    ];
+}
 
 // ---- recorded side-effect surfaces ----
 const __calls = {
@@ -487,6 +518,7 @@ test('terminal race: DM run that finished during the load window is reconciled (
         getSession: async () => ({ ...DM_ENVELOPE, has_active_run: true }),
         // Stale step-1 snapshot: still says running.
         listRuns: async () => ({ runs: [{ run_id: DEAD, status: 'running' }] }),
+        getRun: async () => ({ run_id: DEAD, status: 'completed' }),
         // The authoritative probe says terminal; seal_event_id 40 <= the
         // messages HWM 42 → history covers the seal (sub-race A) → the run
         // also belongs in the Layer-3 suppress set.
@@ -525,6 +557,32 @@ test('terminal race: DM run that finished during the load window is reconciled (
     assertGroupedDmRender();
 });
 
+test('terminal probe failure preserves a queued sibling run', async () => {
+    reset();
+    T.crossAgentSessions.value = [DM_ENVELOPE];
+    const DEAD = 'run-dead-probe';
+    const SIBLING = 'run-queued-sibling';
+    globalThis.__lsApi = makeApi({
+        getSession: async () => ({ ...DM_ENVELOPE, has_active_run: true }),
+        listRuns: async () => ({
+            runs: [
+                { run_id: DEAD, status: 'running' },
+                { run_id: SIBLING, status: 'queued', queue_position: 1 },
+            ],
+        }),
+        getRun: async () => { throw new Error('run probe unavailable'); },
+        getRunReasoning: async () => ({
+            text: '', last_event_id: null, terminal: true, seal_event_id: 40,
+        }),
+    });
+
+    await runLoadSession();
+
+    assert.equal(T.runs.value.find(run => run.run_id === DEAD)?.status, 'completed');
+    assert.equal(T.runs.value.find(run => run.run_id === SIBLING)?.status, 'queued');
+    assert.equal(T.activeRunId.value, SIBLING,
+        'terminal-probe fallback must preserve queued sibling activity');
+});
 test('control: mid-run NON-DM load still seeds the in-flight text (skip is DM-scoped)', async () => {
     reset();
     const CHAT_ENVELOPE = {

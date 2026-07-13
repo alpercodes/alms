@@ -75,6 +75,24 @@ function transformMessages(fn) { chatMessages.value = fn(chatMessages.value); }
 // runs state
 const activeRunId = signal(null);
 function bumpRunListGeneration() {}
+const runEntities = new Map();
+function syncActiveRun() {
+    const newestFirst = [...runEntities.values()].reverse();
+    activeRunId.value = newestFirst.find(run => run.status === 'running')?.run_id
+        || newestFirst.find(run => run.status === 'queued')?.run_id
+        || null;
+}
+function upsertRun(run) {
+    runEntities.set(run.run_id, { ...(runEntities.get(run.run_id) || {}), ...run });
+    syncActiveRun();
+}
+function setRunStatus(runId, status) {
+    upsertRun({ run_id: runId, status });
+}
+function resetRunState() {
+    runEntities.clear();
+    activeRunId.value = null;
+}
 
 // subagents (inert)
 function trackSubagentStart() {}
@@ -122,7 +140,7 @@ function getSealedReasoningRunIds(id) { return __sealedSets.get(id) || null; }
 function clearSealedReasoningRunIds(id) { __sealedSets.delete(id); }
 
 // Test hooks — exported so the harness can reach the live signals.
-export const __test = { signal, chatMessages, activeRunId, activeSession, dmParticipants, activeAgent, dmPeer, clearAgentPhaseCalls };
+export const __test = { signal, chatMessages, activeRunId, activeSession, dmParticipants, activeAgent, dmPeer, clearAgentPhaseCalls, resetRunState, runEntities };
 `;
 
 /**
@@ -230,7 +248,7 @@ function reset() {
         },
     };
     T.chatMessages.value = [];
-    T.activeRunId.value = null;
+    T.resetRunState();
     T.activeSession.value = null;
     T.dmParticipants.value = [];
     T.activeAgent.value = null;
@@ -939,6 +957,8 @@ test('#1162 attach race: a QUEUED peer DM run gets its block at run_started even
     // carries no source, so it relies on `peerRunIds` (recorded by run_created)
     // via the run_id-aware `isDmEvent` gate.
     es.emit('run_started', { run_id: 'R' });
+    assert.equal(T.runEntities.get('R')?.queue_position, undefined,
+        'run_started clears the obsolete queue position from the run entity');
     const block = reasoningBlock('R');
     assert.ok(block && block.isLive,
         'run_started creates the dm_reasoning block via peerRunIds even when activeSession is unresolved');
@@ -1112,6 +1132,98 @@ test('#1157 reconnect: a session SWITCH does NOT carry pending text into the new
     assert.ok(block, 'a reasoning block exists in session B');
     assert.equal(block.thinkingText, '',
         'session A pending text must NOT carry across a session switch and promote into session B');
+});
+test('session replay gap forces an authoritative snapshot at the retained-tail ceiling', async () => {
+    reset();
+    const reconciliations = [];
+    mod.registerSessionContractReconciler(async (sessionId, boundaryEventId, streamEpoch) => {
+        reconciliations.push({ sessionId, boundaryEventId, streamEpoch });
+    });
+
+    mod.openSessionStream('session-gap-test', {
+        lastEventId: 1,
+        streamEpoch: 'epoch-a',
+    });
+    const es = FakeEventSource.last;
+    assert.match(es.url, /last_event_id=1/);
+    assert.match(es.url, /stream_epoch=epoch-a/);
+
+    es.emit('stream_state', {
+        stream_epoch: 'epoch-a',
+        retained_from: 1000,
+        newest: 1001,
+        replay_gap: true,
+        epoch_mismatch: false,
+        requires_reconciliation: true,
+    });
+    await new Promise(resolve => setImmediate(resolve));
+
+    assert.equal(es.readyState, EventSource.CLOSED);
+    assert.deepEqual(reconciliations, [{
+        sessionId: 'session-gap-test',
+        boundaryEventId: 1001,
+        streamEpoch: 'epoch-a',
+    }]);
+});
+
+test('session event-log restart reconciles when the stream epoch changes', async () => {
+    reset();
+    const reconciliations = [];
+    mod.registerSessionContractReconciler(async (sessionId, boundaryEventId, streamEpoch) => {
+        reconciliations.push({ sessionId, boundaryEventId, streamEpoch });
+    });
+
+    mod.openSessionStream('session-restart-test', {
+        lastEventId: 900,
+        streamEpoch: 'epoch-a',
+    });
+    const es = FakeEventSource.last;
+    es.emit('stream_state', {
+        stream_epoch: 'epoch-b',
+        retained_from: null,
+        newest: 1,
+        replay_gap: false,
+        epoch_mismatch: false,
+        requires_reconciliation: false,
+    });
+    await new Promise(resolve => setImmediate(resolve));
+
+    assert.equal(es.readyState, EventSource.CLOSED);
+    assert.deepEqual(reconciliations, [{
+        sessionId: 'session-restart-test',
+        boundaryEventId: 1,
+        streamEpoch: 'epoch-b',
+    }]);
+});
+
+test('session event-log restart with an empty log drops the inherited old cursor', async () => {
+    reset();
+    const reconciliations = [];
+    mod.registerSessionContractReconciler(async (sessionId, boundaryEventId, streamEpoch) => {
+        reconciliations.push({ sessionId, boundaryEventId, streamEpoch });
+    });
+
+    mod.openSessionStream('session-empty-restart-test', {
+        lastEventId: 900,
+        streamEpoch: 'epoch-a',
+    });
+    const es = FakeEventSource.last;
+    es.emit('stream_state', {
+        stream_epoch: 'epoch-b',
+        retained_from: null,
+        newest: null,
+        replay_gap: false,
+        epoch_mismatch: false,
+        requires_reconciliation: false,
+    }, 900);
+    await new Promise(resolve => setImmediate(resolve));
+
+    assert.equal(es.readyState, EventSource.CLOSED);
+    assert.deepEqual(reconciliations, [{
+        sessionId: 'session-empty-restart-test',
+        boundaryEventId: null,
+        streamEpoch: 'epoch-b',
+    }]);
 });
 
 test('malformed numeric session SSE reconciles before resuming past the frame', async () => {

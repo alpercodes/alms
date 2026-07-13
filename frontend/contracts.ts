@@ -23,7 +23,7 @@ const usageSchema = z
   })
   .passthrough();
 
-const agentSchema = z
+export const agentSchema = z
   .object({
     id: uuidSchema,
     name: stringSchema,
@@ -42,7 +42,7 @@ const agentSchema = z
   })
   .passthrough();
 
-const sessionSchema = z
+export const sessionSchema = z
   .object({
     id: uuidSchema,
     agent_id: uuidSchema,
@@ -111,7 +111,7 @@ const messageSchema = z.discriminatedUnion("type", [
   imageMessageSchema,
 ]);
 
-const sessionRunSchema = z
+export const sessionRunSchema = z
   .object({
     run_id: uuidSchema,
     session_id: uuidSchema,
@@ -133,7 +133,7 @@ const sessionRunSchema = z
   })
   .passthrough();
 
-const agentRunSchema = z
+export const agentRunSchema = z
   .object({
     run_id: uuidSchema,
     session_id: uuidSchema,
@@ -152,7 +152,7 @@ const jobScheduleSchema = z.discriminatedUnion("type", [
   z.object({ type: z.literal("once"), run_at: timestampSchema }).passthrough(),
   z.object({ type: z.literal("recurring"), cron: stringSchema }).passthrough(),
 ]);
-const jobSchema = z
+export const jobSchema = z
   .object({
     id: uuidSchema,
     prompt: z.string(),
@@ -183,6 +183,13 @@ export const sessionActivitySchema = z
     ts: timestampSchema,
   })
   .passthrough();
+
+export type Agent = z.infer<typeof agentSchema>;
+export type Session = z.infer<typeof sessionSchema>;
+export type SessionRun = z.infer<typeof sessionRunSchema>;
+export type AgentRun = z.infer<typeof agentRunSchema>;
+export type Job = z.infer<typeof jobSchema>;
+export type SessionActivity = z.infer<typeof sessionActivitySchema>;
 
 export const sessionsSnapshotSchema = z
   .object({

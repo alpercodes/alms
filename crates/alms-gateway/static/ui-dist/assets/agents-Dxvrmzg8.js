@@ -1,1 +1,0 @@
-import{t as e}from"./rolldown-runtime-DK3Fl9T5.js";import{i as t,s as n}from"./deps-DqdW5C85.js";var r=e({activeAgent:()=>o,activeAgentId:()=>a,agents:()=>i}),i=n([]),a=n(null),o=t(()=>i.value.find(e=>e.id===a.value)||null);export{r as i,a as n,i as r,o as t};

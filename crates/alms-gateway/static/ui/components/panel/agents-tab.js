@@ -1,5 +1,5 @@
 import { html, useEffect, useSignal } from '../../deps.js';
-import { agents, activeAgentId } from '../../state/agents.js';
+import { agents, activeAgentId, replaceAgents } from '../../state/agents.js';
 import { expandedAgentId } from '../../state/sessions.js';
 import { serverDefaults } from '../../state/settings.js';
 import { activePanelTab } from '../../state/panel.js';
@@ -124,7 +124,7 @@ function EffortTriState({ label, hint, mode, value }) {
 async function refreshAgents() {
     try {
         const data = await listAgents();
-        agents.value = data.agents || data || [];
+        replaceAgents(data.agents || data || []);
     } catch (err) {
         console.error('[agents] fetch failed:', err);
     }
