@@ -1181,7 +1181,10 @@ pub async fn create_run(
         role: alms_session::Role::User,
         content: alms_session::Content::Text(run.input.clone()),
         timestamp: alms_core::Timestamp::now(),
-        metadata: Some(serde_json::json!({ "pending_input": true })),
+        metadata: Some(serde_json::json!({
+            "pending_input": true,
+            "run_id": run_id.0.to_string(),
+        })),
     };
     let input_pre_persisted = match state.session_manager.append_message(session_id, user_msg) {
         Ok(()) => true,

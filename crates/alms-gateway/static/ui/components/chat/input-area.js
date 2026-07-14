@@ -3,14 +3,20 @@ import { activeSessionId } from '../../state/sessions.js';
 import { activeAgentId, agents } from '../../state/agents.js';
 import { activeRunId, runs } from '../../state/runs.js';
 import { nextMsgId } from '../../state/chat.js';
-import { appendMessage, transformMessages } from '../../state/chat-actions.js';
+import { transformMessages } from '../../state/chat-actions.js';
 import { messageQueue } from '../../state/queue.js';
 import { createRun, cancelRun as apiCancelRun } from '../../api/runs.js';
-import { savePendingMessage, setPendingRunId, clearPendingMessage } from '../../state/pending-messages.js';
+import {
+    beginOptimisticMessage,
+    getPendingMessages,
+    setPendingRunId,
+    rollbackOptimisticMessage,
+} from '../../state/pending-messages.js';
 import {
     loadDraft, saveDraft, clearDraft,
     loadQueue, saveQueue,
     planMountDrain,
+    consumeAcceptedQueueHead,
 } from '../../state/composer-storage.js';
 import { IconSend, IconStop } from '../../utils/icons.js';
 
@@ -23,30 +29,55 @@ import { IconSend, IconStop } from '../../utils/icons.js';
  *   Used by handleRunEnd's queued-message path to avoid a microtask gap
  *   where activeSessionId could change between dequeue and execution
  *   (see issue #526).
+ * @param {boolean} [opts.queued] -- true when startQueuedRun owns the
+ *   dequeue and any follow-up drain.
+ * @returns {Promise<boolean>} whether the submission was accepted by the
+ *   composer. A rejected queued head must remain queued.
  */
 export async function startRun(text, opts) {
     const sessionId = opts?.sessionId || activeSessionId.value;
     const agentId = activeAgentId.value;
     if (!agentId) {
-        transformMessages(msgs =>
-            [...msgs,
-             { id: nextMsgId(), type: 'error', text: 'Select an agent before sending a message.' }]
-        );
-        return;
+        if (sessionId) {
+            transformMessages(
+                msgs => [...msgs, {
+                    id: nextMsgId(),
+                    type: 'error',
+                    text: 'Select an agent before sending a message.',
+                }],
+                sessionId,
+            );
+        } else {
+            console.warn('[startRun] rejected: no agent or session selected');
+        }
+        return false;
     }
 
-    appendMessage(
-        { id: nextMsgId(), type: 'user', role: 'user', text, ts: new Date().toISOString() },
-        { id: nextMsgId(), type: 'thinking', pending: true },
+    if (!sessionId) {
+        console.warn('[startRun] rejected: no session selected');
+        return false;
+    }
+
+    // A run ID is the first unambiguous correlation key emitted by the
+    // backend. Until createRun returns one, accept only one submission for
+    // this session; otherwise run_created could not identify which pending
+    // thinking row belongs to which request.
+    if (getPendingMessages(sessionId).length > 0) return false;
+
+    const sentAt = new Date().toISOString();
+    const optimisticMessage = {
+        id: nextMsgId(),
+        type: 'user',
+        role: 'user',
+        text,
+        ts: sentAt,
+    };
+    beginOptimisticMessage(
+        sessionId,
+        text,
+        optimisticMessage,
+        [{ id: nextMsgId(), type: 'thinking', pending: true }],
     );
-
-    // Track the optimistically-appended user message so it can be
-    // re-injected if the user switches sessions before the backend
-    // persists it to the session history.  (Fixes message-loss on
-    // rapid session switch while agent is thinking.)
-    if (sessionId) {
-        savePendingMessage(sessionId, text);
-    }
 
     try {
         // Per-run config overrides were removed in the #941 pivot — the
@@ -64,26 +95,68 @@ export async function startRun(text, opts) {
         // match by run ID instead of text content (avoids false-positive
         // deduplication when the user sends identical text twice).
         if (sessionId && runResp?.run_id) {
-            setPendingRunId(sessionId, runResp.run_id);
+            setPendingRunId(sessionId, optimisticMessage.id, runResp.run_id);
+            // A terminal SSE event may have arrived before createRun returned.
+            // Linking settles that pending row; resume the queue now because
+            // the earlier terminal-event drain was correctly rejected.
+            if (!opts?.queued && !activeRunId.value && messageQueue.value.length > 0) {
+                await startQueuedRun(messageQueue.value[0], sessionId);
+            }
         }
         // No need to open a per-run SSE stream — the session stream
         // (opened by use-boot.js) receives all events automatically.
         // run_created → token_delta → run_finished all arrive there.
     } catch (err) {
         // Run creation failed -- no run will persist the message.
-        if (sessionId) clearPendingMessage(sessionId);
+        rollbackOptimisticMessage(sessionId, { messageId: optimisticMessage.id });
         transformMessages(msgs =>
             [...msgs.filter(m => m.type !== 'thinking'),
-             { id: nextMsgId(), type: 'error', text: `Failed to start run: ${err.error?.message || err.message || err.status || 'unknown error'}` }]
+             { id: nextMsgId(), type: 'error', text: `Failed to start run: ${err.error?.message || err.message || err.status || 'unknown error'}` }],
+            sessionId,
         );
         console.error('[startRun] failed:', err);
     }
+    return true;
+}
+
+/**
+ * Submit a queued entry and remove only that exact head after acceptance.
+ *
+ * @param {{text: string}} entry
+ * @param {string} sessionId
+ * @returns {Promise<boolean>}
+ */
+export async function startQueuedRun(entry, sessionId) {
+    const queueAtStart = messageQueue.value;
+    if (queueAtStart[0] !== entry) return false;
+
+    const accepted = await startRun(entry.text, { sessionId, queued: true });
+    const currentQueue = messageQueue.value;
+    const next = consumeAcceptedQueueHead(currentQueue, entry, accepted);
+    if (next === currentQueue) {
+        // A session switch may replace the visible queue while createRun is
+        // pending. Commit the accepted dequeue to its owning session's storage
+        // without touching the newly visible session.
+        const storedNext = consumeAcceptedQueueHead(queueAtStart, entry, accepted);
+        if (storedNext === queueAtStart) return false;
+        saveQueue(sessionId, storedNext);
+        return true;
+    }
+    messageQueue.value = next;
+    saveQueue(sessionId, next);
+    if (!activeRunId.value && next.length > 0) {
+        await startQueuedRun(next[0], sessionId);
+    }
+    return true;
 }
 
 function sendMessage(promptRef) {
     const text = promptRef.current.value.trim();
     if (!text || !activeSessionId.value || !activeAgentId.value) return;
     const sessionId = activeSessionId.value;
+    // Keep the draft in place while the previous create request is still
+    // acquiring its run ID. The user can send again once correlation is safe.
+    if (!activeRunId.value && getPendingMessages(sessionId).length > 0) return;
     promptRef.current.value = '';
     promptRef.current.style.height = 'auto';
     // Clear any persisted draft for this session — the operator pressed
@@ -170,9 +243,11 @@ export function InputArea() {
         //      left.
         //
         // The fix in both cases: when the mount effect sees a non-empty
-        // restored queue with no active run, peel off the head and start
-        // a run with it. Idempotent with the SSE drain because both gate
-        // on `messageQueue.value.length > 0` and there is exactly one
+        // restored queue with no active run, submit the head and remove it
+        // only after the composer accepts it. Idempotent with the SSE drain
+        // because both gate on `messageQueue.value.length > 0`, and exact
+        // head identity prevents a stale async drain from removing a replacement.
+        // There is exactly one
         // mount and one run-end event per restoration. (#975)
         //
         // The decision is delegated to `planMountDrain` so the contract
@@ -192,9 +267,9 @@ export function InputArea() {
             messageQueue.value = restoredQueue;
         }
         if (plan.drain) {
-            messageQueue.value = plan.remaining;
-            saveQueue(sessionId, plan.remaining);
-            startRun(plan.head.text, { sessionId });
+            startQueuedRun(plan.head, sessionId).catch(err => {
+                console.error('[queue] mount drain failed:', err);
+            });
         }
     }, [sessionId]);
 

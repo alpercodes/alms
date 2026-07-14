@@ -1,9 +1,15 @@
 import { html, useEffect, useSignal } from '../../deps.js';
-import { jobs } from '../../state/jobs.js';
+import {
+    jobs, captureJobMutationGeneration, replaceJobs,
+    createOptimisticJob, confirmOptimisticJobCreate, rollbackOptimisticJobCreate,
+    cancelOptimisticJob, confirmOptimisticJobCancel, rollbackOptimisticJobCancel,
+} from '../../state/jobs.js';
 import { agents, activeAgentId } from '../../state/agents.js';
 import { activePanelTab } from '../../state/panel.js';
 import { listJobs, createJob, cancelJob } from '../../api/jobs.js';
 import { fmtDate } from '../../utils/format.js';
+
+let optimisticJobSequence = 0;
 
 const PRESETS = [
     { label: '1m',   cron: '* * * * *',       desc: 'Every minute' },
@@ -47,9 +53,10 @@ function nowLocal() {
 }
 
 async function refreshJobs() {
+    const mutationGeneration = captureJobMutationGeneration();
     try {
         const data = await listJobs();
-        jobs.value = data.jobs || data || [];
+        replaceJobs(data.jobs || data || [], mutationGeneration);
     } catch (err) {
         console.error('[jobs] fetch failed:', err);
     }
@@ -85,25 +92,38 @@ export function JobsTab() {
         error.value = '';
         success.value = '';
         loading.value = true;
+        let optimisticId = null;
         try {
             let schedule;
             if (scheduleMode.value === 'once') {
-                // Convert local datetime to UTC ISO string for the backend.
                 const localDate = new Date(runAt.value);
                 if (isNaN(localDate.getTime())) {
                     error.value = 'Invalid date/time. Please select a valid date.';
                     loading.value = false;
                     return;
                 }
-                schedule = { type: "once", run_at: localDate.toISOString() };
+                schedule = { type: 'once', run_at: localDate.toISOString() };
             } else {
-                schedule = { type: "recurring", cron: cron.value.trim() };
+                schedule = { type: 'recurring', cron: cron.value.trim() };
             }
-            await createJob({
+
+            const request = {
                 agent_id: agentId.value,
                 schedule,
                 prompt: prompt.value.trim(),
+            };
+            optimisticId = 'optimistic-job-' + (++optimisticJobSequence);
+            createOptimisticJob({
+                id: optimisticId,
+                ...request,
+                status: 'pending',
+                next_run_at: null,
+                last_run_at: null,
             });
+
+            const created = await createJob(request);
+            confirmOptimisticJobCreate(optimisticId, created);
+            optimisticId = null;
             cron.value = '';
             prompt.value = '';
             customMode.value = false;
@@ -111,10 +131,9 @@ export function JobsTab() {
             success.value = scheduleMode.value === 'once'
                 ? 'Job scheduled (one-time).'
                 : 'Recurring job created.';
-            // Clear success message after a few seconds.
             setTimeout(() => { success.value = ''; }, 4000);
-            await refreshJobs();
         } catch (err) {
+            if (optimisticId) rollbackOptimisticJobCreate(optimisticId);
             const msg = err.error?.message || err.message || '';
             error.value = msg || 'Failed to create job. Check that all fields are filled and the schedule is valid.';
         } finally {
@@ -123,10 +142,16 @@ export function JobsTab() {
     };
 
     const onCancel = async (id) => {
+        error.value = '';
+        cancelOptimisticJob(id);
         try {
-            await cancelJob(id);
-            await refreshJobs();
+            const cancelled = await cancelJob(id);
+            confirmOptimisticJobCancel(id, cancelled);
         } catch (err) {
+            rollbackOptimisticJobCancel(id);
+            if (err.status === 409) {
+                await refreshJobs();
+            }
             error.value = err.error?.message || err.message || 'Failed to cancel job';
         }
     };
@@ -216,7 +241,7 @@ export function JobsTab() {
                             ${j.last_run_at && html`<span> | last run: ${fmtDate(j.last_run_at)}</span>`}
                         </div>
                         <span class="job-status-${j.status || 'active'}">${j.status || 'active'}</span>
-                        ${j.status !== 'cancelled' && html`
+                        ${j.status !== 'cancelled' && !j.optimistic && html`
                             <button class="job-cancel" onClick=${() => onCancel(j.id)}>Cancel</button>
                         `}
                     </div>

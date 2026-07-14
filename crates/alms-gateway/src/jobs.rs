@@ -74,7 +74,8 @@ pub async fn create_job(
         );
     }
 
-    (StatusCode::CREATED, Json(serde_json::json!(job))).into_response()
+    let persisted_job = state.job_store.get(job.id).unwrap_or(job);
+    (StatusCode::CREATED, Json(job_json(&state, &persisted_job))).into_response()
 }
 
 /// Serialize a job, attaching the open-episode snapshot (#1198 step 8)
@@ -198,7 +199,15 @@ pub async fn cancel_job(
                 teardown_episode(&state, episode).await;
             }
 
-            StatusCode::NO_CONTENT.into_response()
+            match state.job_store.get(job_id) {
+                Some(job) => (StatusCode::OK, Json(job_json(&state, &job))).into_response(),
+                None => api_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "INTERNAL_ERROR",
+                    "cancelled job disappeared from the store",
+                )
+                .into_response(),
+            }
         }
         Ok(Some(false)) => api_error(
             StatusCode::CONFLICT,

@@ -164,6 +164,6 @@ describe("guarded raw JSON wrappers", () => {
       vi.fn(() => Promise.resolve({ ok: true, status: 204 } as Response)),
     );
 
-    await expect(apiFetch(`/jobs/${runId}`, { method: "DELETE" })).resolves.toBeNull();
+    await expect(apiFetch("/synthetic-no-content", { method: "DELETE" })).resolves.toBeNull();
   });
 });

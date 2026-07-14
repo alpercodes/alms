@@ -1,98 +1,78 @@
 /**
- * Centralized write API for chatMessages.
+ * Session-scoped write API for normalized chat messages.
  *
- * Every mutation to chatMessages.value SHOULD go through one of these
- * five functions.  Each performs a single atomic signal write so that
- * Preact sees exactly one new array reference per logical operation.
- *
- * The only deliberate exception is the initial `chatMessages.value = []`
- * reset performed during session/agent switches -- those are simple
- * enough to remain inline where they improve readability.
- *
- * Functions:
- *   replaceMessages(msgs)             -- set the entire array
- *   appendMessage(...msgs)            -- push one or more messages
- *   updateMessage(predicate, updater) -- find last match, apply updater
- *   filterMessages(predicate)         -- keep only matching messages
- *   transformMessages(fn)             -- arbitrary (msgs) => newMsgs
- *
- * Relates to #521, #527.
+ * chatMessages is a read-only selector. Every mutation below resolves a
+ * concrete session and dispatches a typed reducer action through the state
+ * bridge. Authoritative history loads pass the session explicitly; live
+ * handlers use the currently-bound session selected by loadSession().
  */
 
-import { chatMessages } from './chat.js';
+import { entityState } from './entity-state.js';
 
-/**
- * Replace the entire chatMessages array.
- *
- * Used for history loads (REST API -> mapped messages) and error states.
- *
- * @param {Array} msgs - The new message array
- */
-export function replaceMessages(msgs) {
-    chatMessages.value = msgs;
+function resolveSessionId(sessionId) {
+    return sessionId || entityState.messageSessionId.value;
+}
+
+function requireSessionId(sessionId) {
+    const resolved = resolveSessionId(sessionId);
+    if (!resolved) {
+        throw new Error('Cannot mutate messages without a bound session');
+    }
+    return resolved;
 }
 
 /**
- * Append one or more messages to the end of chatMessages.
- *
- * Accepts a variable number of message objects.  All are appended in a
- * single signal write so Preact re-renders only once.
- *
- * @param {...object} msgs - Message objects to append
+ * Install an authoritative message snapshot and bind it to the visible chat.
+ * Passing an empty array without a session only unbinds the current selector.
  */
-export function appendMessage(...msgs) {
-    chatMessages.value = [...chatMessages.value, ...msgs];
-}
-
-/**
- * Find the last message matching `predicate` and apply `updater` to it.
- *
- * If no message matches, the signal is not written (avoids unnecessary
- * re-renders).  Returns true if a match was found and updated.
- *
- * @param {function} predicate - (msg) => boolean
- * @param {function} updater   - (msg) => newMsg (must return a new object)
- * @returns {boolean} Whether a matching message was found and updated
- */
-export function updateMessage(predicate, updater) {
-    const msgs = chatMessages.value;
-    const idx = msgs.findLastIndex(predicate);
-    if (idx < 0) return false;
-    const copy = [...msgs];
-    copy[idx] = updater(copy[idx]);
-    chatMessages.value = copy;
-    return true;
-}
-
-/**
- * Keep only messages that match `predicate` (remove the rest).
- *
- * Only writes the signal if at least one message was removed.
- *
- * @param {function} predicate - (msg) => boolean (true = keep)
- */
-export function filterMessages(predicate) {
-    const msgs = chatMessages.value;
-    const filtered = msgs.filter(predicate);
-    if (filtered.length !== msgs.length) {
-        chatMessages.value = filtered;
+export function replaceMessages(msgs, sessionId = null) {
+    if (sessionId) {
+        entityState.replaceMessages(sessionId, msgs);
+    } else if (msgs.length === 0) {
+        entityState.unbindMessages();
+    } else {
+        entityState.replaceMessages(requireSessionId(null), msgs);
     }
 }
 
-/**
- * Apply an arbitrary transformation to the message array.
- *
- * This is the escape hatch for compound operations that combine
- * filtering, mapping, and appending in a single atomic write --
- * e.g. flushDeltaBuffer (filter thinking + update-or-append agent)
- * or handleRunEnd (map approvals + multi-push).
- *
- * The transformer receives the current messages array and must return
- * a new array.  The result is written unconditionally (the caller is
- * responsible for short-circuiting if no change is needed).
- *
- * @param {function} fn - (msgs) => newMsgs
- */
-export function transformMessages(fn) {
-    chatMessages.value = fn(chatMessages.value);
+/** Remove all cached and optimistic messages for one session. */
+export function clearMessages(sessionId) {
+    entityState.clearMessages(sessionId);
+}
+
+/** Append one or more messages to the currently visible session. */
+export function appendMessage(...msgs) {
+    appendMessagesToSession(requireSessionId(null), ...msgs);
+}
+
+/** Append messages to a specific session without changing visible selection. */
+export function appendMessagesToSession(sessionId, ...msgs) {
+    entityState.transformMessages(requireSessionId(sessionId), current => [...current, ...msgs]);
+}
+
+/** Find the last message matching predicate and replace it atomically. */
+export function updateMessage(predicate, updater, sessionId = null) {
+    let found = false;
+    entityState.transformMessages(requireSessionId(sessionId), current => {
+        const idx = current.findLastIndex(predicate);
+        if (idx < 0) return current;
+        const copy = [...current];
+        copy[idx] = updater(copy[idx]);
+        found = true;
+        return copy;
+    });
+    return found;
+}
+
+/** Keep only messages accepted by predicate. */
+export function filterMessages(predicate, sessionId = null) {
+    entityState.transformMessages(requireSessionId(sessionId), current => {
+        const filtered = current.filter(predicate);
+        return filtered.length === current.length ? current : filtered;
+    });
+}
+
+/** Apply one atomic transformation to a session's ordered message list. */
+export function transformMessages(transformer, sessionId = null) {
+    entityState.transformMessages(requireSessionId(sessionId), transformer);
 }

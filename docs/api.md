@@ -1237,6 +1237,10 @@ Cronjobs are “autonomy with persistence”. Even if implementation is minimal,
 }
 ```
 
+**Response 201** — the final persisted job entity after scheduler
+registration. For recurring jobs this includes the computed `next_run_at`
+and the lifecycle revision that stored it.
+
 ### 7.1.1 Job episodes (#1198)
 
 A firing opens a **job episode**: the job stays active until the agent's full
@@ -1281,7 +1285,9 @@ uses "operator_cancelled".
 
 Cancels a scheduled job, removes it from the scheduler, and cancels any in-progress runs that were spawned by the job — including episode continuation runs. An open episode is torn down: pending DM conversations are ended with the `user_cancelled` reason (the peer gets the standard ended-notification) and pending background subagents are cancelled (#1198).
 
-**Response 204** — job cancelled successfully (no body).
+**Response 200** — the final persisted cancelled job entity. The response
+includes the authoritative `lifecycle_revision`, `status: "cancelled"`, and
+`terminal_reason: "operator_cancelled"`.
 
 **Response 404** — job not found.
 

@@ -8,7 +8,7 @@ import {
     replaceSessionScopes,
 } from '../../state/sessions.js';
 import { agents, activeAgentId, activeAgent } from '../../state/agents.js';
-import { replaceMessages } from '../../state/chat-actions.js';
+import { clearMessages, replaceMessages } from '../../state/chat-actions.js';
 import { activeRunId, selectedRunId, clearRuns, replaceRuns } from '../../state/runs.js';
 import { bgRuns, messageQueue } from '../../state/queue.js';
 import { auditEvents } from '../../state/audit.js';
@@ -116,7 +116,7 @@ async function newSession() {
             activeSessionId.value = resp.session_id;
             saveActiveSession(activeAgentId.value, resp.session_id);
             selectedRunId.value = null;
-            replaceMessages([]);
+            replaceMessages([], resp.session_id);
             messageQueue.value = [];
             replaceRuns(resp.session_id, []);
             auditEvents.value = null;
@@ -251,14 +251,16 @@ function SessionItem({ session, activeAgentName }) {
             // acceptance criterion: "if the session is deleted, both
             // draft and queue for that session are discarded".)
             clearComposerState(session.id);
+            // Messages and pending operations are session-owned even when
+            // the deleted row is not currently selected.
+            clearMessages(session.id);
+            clearRuns(session.id);
             // If we deleted the active session, clear it
             if (session.id === activeSessionId.value) {
                 closeSessionStream();
                 batch(() => {
                     activeSessionId.value = null;
                     selectedRunId.value = null;
-                    replaceMessages([]);
-                    clearRuns();
                     auditEvents.value = null;
                     clearAllSubagents();
                     // Drop any in-memory queue items belonging to the

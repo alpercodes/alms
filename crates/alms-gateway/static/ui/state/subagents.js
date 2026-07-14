@@ -780,7 +780,7 @@ async function doSessionSwitch(targetSessionId, logPrefix) {
     activeSessionId.value = targetSessionId;
     deps.clearRuns();
     deps.selectedRunId.value = null;
-    deps.replaceMessages([]);
+    deps.replaceMessages([], targetSessionId);
     clearAllSubagents();
     // Persist the new active session so a subsequent reload lands the
     // operator back on this subagent / parent session rather than on

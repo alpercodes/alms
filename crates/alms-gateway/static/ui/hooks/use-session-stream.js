@@ -44,8 +44,7 @@ import { activeSessionId, activeSession, dmParticipants } from '../state/session
 import { activeAgent } from '../state/agents.js';
 import { normalizeApproval } from '../utils/approvals.js';
 import { selectGeneration } from '../state/select-generation.js';
-import { clearPendingMessage } from '../state/pending-messages.js';
-import { saveQueue } from '../state/composer-storage.js';
+import { confirmOptimisticMessage } from '../state/pending-messages.js';
 import { DM_END_REASON_LABELS } from '../utils/constants.js';
 import {
     markStreamDead,
@@ -2034,37 +2033,32 @@ export function openSessionStream(sessionId, opts) {
                 clearAgentPhase();
             }
 
-            // The run has ended -- the user message is either persisted
-            // (finished/error after execution started) or was never
-            // persisted (cancelled before execution).  Either way, the
-            // session history is now the source of truth.
+            // Run creation pre-persists the user input before execution, so
+            // every terminal state (including cancellation) confirms it.
+            // The session history is now the source of truth.
             //
             // Use the stream's closure-captured sessionId (not
             // activeSessionId.value) because the user may have switched
             // to a different session before this run ended.
-            clearPendingMessage(sessionId);
+            if (!endingRunId) {
+                console.warn('[handleRunEnd] terminal event missing run_id; optimistic message left for reconciliation');
+            } else {
+                confirmOptimisticMessage(sessionId, { runId: endingRunId });
+            }
         });
 
         // Process queued user messages via dynamic import
         // (avoids circular dependency with input-area.js)
         if (!activeRunId.value && messageQueue.value.length > 0) {
             const next = messageQueue.value[0];
-            const remaining = messageQueue.value.slice(1);
-            messageQueue.value = remaining;
-            // Capture activeSessionId synchronously before the async
-            // import().then() microtask gap -- the value could change
-            // if the user switches sessions between now and when the
-            // .then() callback fires.  (Fixes #526)
-            const capturedSessionId = activeSessionId.value;
-            // Mirror the dequeue into per-session storage so a refresh
-            // (or switch-away-then-back) doesn't restore the message we
-            // just drained. Keyed on the stream's closure-captured
+            // Keep the head queued until acceptance. Use the stream's
             // sessionId — same reasoning as the queue drain itself: the
             // queue belongs to the run's session, not whatever session
             // the operator is currently looking at. (#975)
-            saveQueue(sessionId, remaining);
-            import('../components/chat/input-area.js').then(mod => {
-                if (mod.startRun) mod.startRun(next.text, { sessionId: capturedSessionId });
+            import('../components/chat/input-area.js').then(async mod => {
+                if (mod.startQueuedRun) {
+                    await mod.startQueuedRun(next, sessionId);
+                }
             }).catch(err => {
                 console.error('[session-stream] Failed to process queued message:', err);
             });

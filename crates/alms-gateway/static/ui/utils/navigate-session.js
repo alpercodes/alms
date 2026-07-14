@@ -100,7 +100,7 @@ export async function navigateToSession(sessionId, opts) {
         activeSessionId.value = sessionId;
         clearRuns();
         selectedRunId.value = null;
-        replaceMessages([]);
+        replaceMessages([], sessionId);
         messageQueue.value = [];
         auditEvents.value = null;
         clearAllSubagents();

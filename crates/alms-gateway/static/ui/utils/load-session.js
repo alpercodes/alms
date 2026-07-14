@@ -30,7 +30,7 @@ import { openSessionStream, registerSessionContractReconciler } from '../hooks/u
 import { setAgentPhase, clearAgentPhase, setDmContext } from '../state/agent-status.js';
 import { sessions, crossAgentSessions, activeSessionId, upsertSession } from '../state/sessions.js';
 import { activeAgent } from '../state/agents.js';
-import { getPendingMessage, clearPendingMessage } from '../state/pending-messages.js';
+import { getPendingMessages, confirmOptimisticMessage } from '../state/pending-messages.js';
 import { rehydrateSubagentsFromHistory, parentSessionId } from '../state/subagents.js';
 
 /** Internal session types that `/sessions` (list) deliberately filters out
@@ -328,63 +328,30 @@ export async function loadSession(sessionId, opts) {
         // fetch will not contain it.  Re-inject it so the user sees their
         // own message when switching back.  (Fixes message-loss on rapid
         // session switch.)
-        const pending = getPendingMessage(sessionId);
-        if (pending) {
-            // Determine whether the backend has persisted the pending
-            // message by checking the run's status.  The runs list was
-            // fetched in step 1 and is available in runs.value.
-            //
-            // If the pending entry has a runId, look up that run.  The
-            // backend pre-persists the user's message to the session
-            // synchronously in `create_run`, BEFORE the run is enqueued,
-            // so the loaded history is already the source of truth for
-            // any run that exists in `runs.value` (queued, running, or
-            // terminal).  If the runId is present and the run is found,
-            // the message is guaranteed to be in the history.
-            //
-            // This avoids false-positive deduplication via text matching:
-            // if the user sends identical text twice and switches away
-            // before the second is persisted, text comparison would
-            // incorrectly match the first occurrence and drop the second.
-            let alreadyPersisted = false;
-            if (pending.runId) {
-                const run = runs.value.find(r => r.run_id === pending.runId);
-                // Any known run means the backend received the request and
-                // pre-persisted the input -- the history reflects it.
-                alreadyPersisted = !!run;
-            } else {
-                // runId not yet available (createRun response has not
-                // returned).  Fall back to text matching as a best-effort
-                // check -- this window is very short (HTTP round-trip).
-                const lastUserMsg = mapped.findLast(m => m.type === 'user');
-                alreadyPersisted = lastUserMsg && lastUserMsg.text === pending.text;
-            }
+        const pendingMessages = getPendingMessages(sessionId);
+        for (const pending of pendingMessages) {
+            // The backend pre-persists the input before enqueueing the run.
+            // A known correlated run therefore makes the loaded history
+            // authoritative for this exact optimistic message. Without a run
+            // ID we preserve the local entity rather than text-matching: two
+            // identical concurrent sends must never settle one another.
+            const alreadyPersisted = pending.runId
+                ? runs.value.some(run => run.run_id === pending.runId)
+                : false;
 
             if (alreadyPersisted) {
-                // Backend has persisted it -- no longer pending.
-                clearPendingMessage(sessionId);
+                confirmOptimisticMessage(sessionId, { messageId: pending.messageId });
             } else {
-                // Re-inject the user message at the end of the mapped
-                // history (before any thinking indicator added in step 3).
-                mapped.push({
-                    id: nextMsgId(),
-                    type: 'user',
-                    role: 'user',
-                    text: pending.text,
-                    sealed: true,
-                    // Per-message timestamp (#855) — best-effort: the
-                    // pending message has no server timestamp yet, so use
-                    // the moment the message was queued (Date.now() saved
-                    // on `pending`) when available, falling back to "now".
-                    ts: pending.ts || new Date().toISOString(),
-                });
-                console.debug(`[${logPrefix}] re-injected pending user message for session`, sessionId);
+                console.debug(
+                    '[loadSession] preserving pending user message for session',
+                    sessionId,
+                    pending.messageId,
+                );
             }
         }
-
         // For DM sessions, group reasoning entries into collapsible blocks.
         const grouped = isDmSession ? groupDmReasoningBlocks(mapped) : mapped;
-        replaceMessages(grouped);
+        replaceMessages(grouped, sessionId);
         // Rehydrate the SubagentBar from any still-in-flight invoke_agent
         // tool rows in the freshly-loaded history (#1041). Pass the
         // PRE-grouping `mapped` array, not the post-grouping `grouped`
@@ -409,7 +376,7 @@ export async function loadSession(sessionId, opts) {
         }
     } catch (err) {
         if (isStale()) return;
-        replaceMessages([{ id: nextMsgId(), type: 'error', text: `Failed to load message history: ${err.error?.message || err.message || 'unknown error'}` }]);
+        replaceMessages([{ id: nextMsgId(), type: 'error', text: `Failed to load message history: ${err.error?.message || err.message || 'unknown error'}` }], sessionId);
         if (opts.requireAuthoritativeSnapshot) throw err;
     }
 

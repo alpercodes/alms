@@ -876,6 +876,12 @@ const apiContracts: ReadonlyArray<{
     schema: jobSchema,
   },
   {
+    method: "DELETE",
+    matches: (url) => /^\/jobs\/[^/]+$/.test(url.pathname),
+    boundary: "DELETE /jobs/{id}",
+    schema: jobSchema,
+  },
+  {
     method: "GET",
     matches: (url) => url.pathname === "/audit",
     boundary: "GET /audit",

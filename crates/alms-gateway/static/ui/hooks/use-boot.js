@@ -309,7 +309,7 @@ async function loadAgentSessions(agentId, preferredSessionId) {
             // PR #1100, but the normalized agent scope is chats only.
             replaceSessionScopes(filterChatSessions(reloaded.sessions || []), reloadedCross);
             activeSessionId.value = resp.session_id;
-            replaceMessages([]);
+            replaceMessages([], resp.session_id);
             replaceRuns(resp.session_id, []);
             // Open persistent session stream
             openSessionStream(resp.session_id);

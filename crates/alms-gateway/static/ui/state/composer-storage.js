@@ -243,13 +243,33 @@ export function clearComposerState(sessionId) {
 }
 
 /**
+ * Remove the exact queued head only after startRun accepted it.
+ *
+ * Object identity is intentional: identical queued text is valid, so a
+ * delayed completion must never consume a newer entry just because its text
+ * matches. Returning the original array signals that no mutation occurred.
+ *
+ * @param {Array<{ text: string }>} queue
+ * @param {{ text: string }|null|undefined} expectedHead
+ * @param {boolean} accepted
+ * @returns {Array<{ text: string }>}
+ */
+export function consumeAcceptedQueueHead(queue, expectedHead, accepted) {
+    if (!accepted || !Array.isArray(queue) || queue[0] !== expectedHead) {
+        return queue;
+    }
+    return queue.slice(1);
+}
+
+/**
  * Decide what to do with a queue restored on InputArea mount.
  *
  * Pure function so the integration contract — "queue restored on mount
  * after run completed must auto-drain" (#975 Tim review on PR #990) —
  * can be unit-tested without spinning up a Preact tree. The caller
- * (InputArea's mount effect) does the side effects: write the remaining
- * queue back to storage, write the messageQueue signal, call startRun.
+ * (InputArea's mount effect) starts the candidate without removing it.
+ * consumeAcceptedQueueHead() commits the dequeue only after startRun accepts
+ * the exact head.
  *
  * Decision matrix:
  *

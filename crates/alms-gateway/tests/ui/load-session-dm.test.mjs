@@ -160,8 +160,8 @@ const activeSessionId = signal(null);
 const activeAgent = signal(null);
 
 // ---- inert helpers ----
-function getPendingMessage() { return null; }
-function clearPendingMessage() {}
+function getPendingMessages() { return []; }
+function confirmOptimisticMessage() {}
 function rehydrateSubagentsFromHistory() {}
 const parentSessionId = signal(null);
 function historyCoversSeal(historyHWM, sealEventId) {

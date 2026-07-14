@@ -411,6 +411,42 @@ test('queue load returns [] when sessionId is missing or null', async () => {
 });
 
 // ---------------------------------------------------------------------
+// Accepted queue-head consumption - run creation correlation race
+// ---------------------------------------------------------------------
+
+test('consumeAcceptedQueueHead retains a rejected queued submission', async () => {
+    const m = await loadComposerStorage();
+    const head = { text: 'M1' };
+    const queue = [head, { text: 'M2' }];
+
+    const retained = m.consumeAcceptedQueueHead(queue, head, false);
+
+    assert.equal(retained, queue, 'rejected submission keeps the original queue');
+    assert.deepEqual(retained, [head, { text: 'M2' }]);
+});
+
+test('consumeAcceptedQueueHead removes only the accepted exact head', async () => {
+    const m = await loadComposerStorage();
+    const head = { text: 'same' };
+    const duplicate = { text: 'same' };
+    const queue = [head, duplicate];
+
+    const remaining = m.consumeAcceptedQueueHead(queue, head, true);
+
+    assert.deepEqual(remaining, [duplicate]);
+    assert.equal(remaining[0], duplicate, 'identical text must not consume the next object');
+});
+
+test('consumeAcceptedQueueHead ignores a stale drain candidate', async () => {
+    const m = await loadComposerStorage();
+    const queue = [{ text: 'replacement' }];
+
+    const retained = m.consumeAcceptedQueueHead(queue, { text: 'replacement' }, true);
+
+    assert.equal(retained, queue, 'a different head object must remain queued');
+});
+
+// ---------------------------------------------------------------------
 // Session deletion sweep — both #975 and #981 acceptance criterion
 // ---------------------------------------------------------------------
 

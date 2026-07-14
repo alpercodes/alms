@@ -40,6 +40,16 @@ Per-release notes for ALMS, with an emphasis on **operator-facing changes** — 
   authoritative snapshots, overlapping runs remain cardinality-safe, and the
   wire protocol is unchanged.
 
+- **Normalized messages, jobs, and optimistic UI actions** (Phase 6B): chat
+  history is now stored once per session by message ID, scheduled jobs share
+  the typed entity store, and send/create/cancel operations have explicit
+  confirm/rollback transitions. Browser tests now pin reconnect convergence,
+  cross-agent message isolation, and delayed-request routing. Job creation and
+  cancellation now return the final persisted entity; notably,
+  `DELETE /jobs/{id}` returns `200` with the cancelled job instead of an
+  empty `204`, so the UI receives the authoritative revision and terminal
+  reason without a racy follow-up snapshot.
+
 - **Revision-aware run and job lifecycles**: all production lifecycle changes
   now pass through explicit state machines with legal-transition checks,
   idempotent terminal outcomes, and a monotonically increasing revision.

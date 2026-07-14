@@ -3014,8 +3014,7 @@ async fn create_run_pre_persists_user_input_to_session() {
     // Call the handler directly. We do NOT await the spawned execute_run -- we
     // just want to verify that the synchronous create_run call persists the
     // input BEFORE enqueueing.
-    let (status, _resp) = match super::lifecycle::create_run(State(state.clone()), Json(req)).await
-    {
+    let (status, resp) = match super::lifecycle::create_run(State(state.clone()), Json(req)).await {
         Ok(ok) => ok,
         Err((code, body)) => panic!("create_run failed: status={code:?} body={:?}", body.0),
     };
@@ -3058,6 +3057,17 @@ async fn create_run_pre_persists_user_input_to_session() {
     assert!(
         marker,
         "pre-persisted user message should carry pending_input: true metadata",
+    );
+    let correlated_run_id = user_msgs[0]
+        .metadata
+        .as_ref()
+        .and_then(|md| md.get("run_id"))
+        .and_then(|value| value.as_str());
+    let expected_run_id = resp.0.run_id.0.to_string();
+    assert_eq!(
+        correlated_run_id,
+        Some(expected_run_id.as_str()),
+        "pre-persisted input must carry its authoritative run id",
     );
 }
 
@@ -11098,6 +11108,62 @@ fn create_recurring_job(state: &AppState, agent_id: AgentId, prompt: &str) -> al
         .expect("job creation must succeed")
         .id
 }
+#[tokio::test]
+async fn job_mutation_responses_return_authoritative_persisted_entities() {
+    use axum::response::IntoResponse as _;
+
+    let (state, shutdown_token, _cr, _tr, _dr) = test_app_state_with_sqlite();
+    let (agent_id, _) = seed_alice_bob(&state);
+
+    let response = crate::jobs::create_job(
+        axum::extract::State(state.clone()),
+        axum::Json(alms_core::job::CreateJobRequest {
+            agent_id,
+            prompt: "authoritative response".to_string(),
+            schedule: alms_core::job::JobSchedule::Recurring {
+                cron: "0 0 * * *".to_string(),
+            },
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(response.status(), axum::http::StatusCode::CREATED);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("create response body");
+    let created: serde_json::Value =
+        serde_json::from_slice(&body).expect("create response must be JSON");
+    assert!(
+        created["next_run_at"].is_string(),
+        "create response must include the scheduler's persisted next run"
+    );
+    assert_eq!(created["lifecycle_revision"], 1);
+
+    let job_id = state
+        .job_store
+        .list()
+        .into_iter()
+        .find(|job| job.prompt == "authoritative response")
+        .expect("created job")
+        .id;
+    let response = crate::jobs::cancel_job(
+        axum::extract::State(state.clone()),
+        axum::extract::Path(job_id),
+    )
+    .await
+    .into_response();
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("cancel response body");
+    let cancelled: serde_json::Value =
+        serde_json::from_slice(&body).expect("cancel response must be JSON");
+    assert_eq!(cancelled["status"], "cancelled");
+    assert_eq!(cancelled["lifecycle_revision"], 2);
+    assert_eq!(cancelled["terminal_reason"], "operator_cancelled");
+
+    shutdown_token.cancel();
+}
 
 fn create_once_job(state: &AppState, agent_id: AgentId, prompt: &str) -> alms_core::JobId {
     state
@@ -11870,7 +11936,7 @@ async fn cancel_job_teardown_ends_pending_dms() {
     use axum::response::IntoResponse as _;
     assert_eq!(
         response.into_response().status(),
-        axum::http::StatusCode::NO_CONTENT
+        axum::http::StatusCode::OK
     );
 
     // Episode gone.
@@ -11985,7 +12051,7 @@ async fn cancel_job_teardown_leaves_no_runs_for_the_job() {
     use axum::response::IntoResponse as _;
     assert_eq!(
         response.into_response().status(),
-        axum::http::StatusCode::NO_CONTENT
+        axum::http::StatusCode::OK
     );
     assert!(state.job_episodes.snapshot(job_id).is_none());
 
@@ -12081,7 +12147,7 @@ async fn cancel_job_cancels_unstamped_run_on_its_job_session() {
     let response = crate::jobs::cancel_job(State(state.clone()), Path(job_id))
         .await
         .into_response();
-    assert_eq!(response.status(), axum::http::StatusCode::NO_CONTENT);
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
     assert!(
         token.is_cancelled(),
         "operator cancellation must cancel an un-stamped run on its job session"
@@ -12375,7 +12441,7 @@ async fn cancel_wins_before_episode_close_without_completion_card() {
 
     drop(guard);
     let response = cancel.await.into_response();
-    assert_eq!(response.status(), axum::http::StatusCode::NO_CONTENT);
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
     close.await;
 
     assert_eq!(
@@ -12414,7 +12480,7 @@ async fn episode_close_wins_before_cancel_and_keeps_completion_card() {
     drop(guard);
     close.await;
     let response = cancel.await.into_response();
-    assert_eq!(response.status(), axum::http::StatusCode::NO_CONTENT);
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
 
     let (_text, metadata) = job_marker_from(&state, web_session_id);
     assert_eq!(metadata["job_id"], job_id.0.to_string());
@@ -12446,7 +12512,7 @@ async fn blocked_job_gate_does_not_delay_unrelated_job_cancellation() {
         .await
         .expect("an unrelated job must not wait for another job's gate")
         .into_response();
-    assert_eq!(response.status(), axum::http::StatusCode::NO_CONTENT);
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
     assert_eq!(
         state.job_store.get(independent_job_id).unwrap().status(),
         alms_core::JobStatus::Cancelled
@@ -12467,7 +12533,7 @@ async fn blocked_job_gate_does_not_delay_unrelated_job_cancellation() {
     let response = crate::jobs::cancel_job(State(state.clone()), Path(blocked_job_id))
         .await
         .into_response();
-    assert_eq!(response.status(), axum::http::StatusCode::NO_CONTENT);
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
 
     shutdown_token.cancel();
 }

@@ -1,6 +1,6 @@
 # Phase 6 — Normalized frontend state and reconnect behavior
 
-Status: implementation in progress
+Status: implementation complete; Phase 6B pending review and merge
 
 Parent plan: `docs/engineering-stabilization-plan.md`
 
@@ -67,6 +67,12 @@ through named store actions.
    message selection before the new snapshot is installed.
 9. Store actions are pure and deterministic; signal publication occurs once
    per logical action.
+10. Optimistic messages are correlated by message ID until a run ID exists,
+    then settled only by that exact run ID.
+11. A job snapshot may commit only if no job mutation began or settled since
+    the request captured its mutation generation.
+12. Entity selectors subscribe to their own state slice, so high-frequency
+    message updates cannot notify unrelated agent/session/run/job consumers.
 
 ## Reconnect transition
 
@@ -115,6 +121,26 @@ reopens only after that strict reload succeeds.
 - Agent reset removes prior-agent scoped entities and activity.
 - Epoch/replay-gap session recovery performs a strict authoritative reload.
 - Existing UI behavior, contract, build, and embedding tests remain green.
+
+## Phase 6B tests
+
+- Message normalization preserves per-session ordering and deduplicates IDs.
+- Authoritative history snapshots retain an unconfirmed optimistic message.
+- Optimistic messages and jobs confirm or roll back explicitly.
+- Job snapshots preserve in-flight optimistic create/cancel transitions,
+  reject pre-mutation responses, and update rollback baselines safely.
+- Job mutation responses contain the final persisted entity, including
+  lifecycle revision, next run, and terminal reason.
+- Overlapping optimistic messages settle by exact run identity, and the UI
+  blocks a second uncorrelated submission until the first has a run ID.
+- Message-only updates do not notify unrelated entity selectors.
+- Deleting any session clears its cached messages and pending operations.
+- Agent switching removes prior-agent message entities before rendering the
+  next session.
+- A replay-gap reconnect replaces stale messages with the authoritative
+  session snapshot.
+- Existing UI behavior, typed contracts, browser flows, and embedded assets
+  remain green.
 
 ## Phase gate
 

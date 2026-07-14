@@ -128,7 +128,8 @@ const activeAgent = signal(null);
 // misc inert helpers
 function normalizeApproval(d) { return { approvalId: d.approval_id, tool: d.tool, params: d.params, runId: d.run_id }; }
 let selectGeneration = 0;
-function clearPendingMessage() {}
+function confirmOptimisticMessage() {}
+function rollbackOptimisticMessage() {}
 function saveQueue() {}
 const DM_END_REASON_LABELS = { ignored: 'no further replies', depth_exceeded: 'message limit reached', user_cancelled: 'cancelled by user', errored: 'run failed' };
 function markStreamDead() {}

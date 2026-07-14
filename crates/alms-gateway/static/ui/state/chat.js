@@ -1,8 +1,8 @@
-import { signal } from '../deps.js';
+import { entityState } from './entity-state.js';
 
 // Chat messages for the active session.
 // Entries: { id: string, type: 'user'|'agent'|'tool'|'approval'|'error'|'warning'|'system'|'dm_ended'|'run_boundary'|'subagent_completed'|'job_completed'|'thinking'|'tokens'|'notification', ... }
-export const chatMessages = signal([]);
+export const chatMessages = entityState.messages;
 
 // Monotonically increasing counter for stable message IDs.
 // Using a counter (rather than crypto.randomUUID()) is intentional: it is
