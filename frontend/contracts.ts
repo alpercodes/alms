@@ -157,9 +157,14 @@ export const jobSchema = z
     id: uuidSchema,
     prompt: z.string(),
     schedule: jobScheduleSchema,
-    status: z.enum(["pending", "active", "cancelled"]),
+    status: z.enum(["pending", "active", "completed", "failed", "cancelled"]),
     next_run_at: timestampSchema.nullable(),
     last_run_at: timestampSchema.nullable(),
+    terminal_reason: z
+      .enum(["completed", "deadline_reached", "retry_exhausted", "operator_cancelled"])
+      .optional(),
+    retry_count: uintSchema.optional(),
+    last_error: z.string().optional(),
   })
   .passthrough();
 

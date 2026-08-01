@@ -10,9 +10,16 @@ impl SqliteStore {
         self.conn
             .lock()
             .execute(
-                "INSERT OR REPLACE INTO sessions \
-             (id, agent_id, context_id, created_at, last_activity, status) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                "INSERT INTO sessions \
+                 (id, agent_id, context_id, created_at, last_activity, status) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+                 ON CONFLICT(id) DO UPDATE SET \
+                   agent_id=excluded.agent_id, \
+                   context_id=excluded.context_id, \
+                   created_at=excluded.created_at, \
+                   last_activity=CASE WHEN sessions.last_activity > excluded.last_activity \
+                     THEN sessions.last_activity ELSE excluded.last_activity END, \
+                   status=excluded.status",
                 params![
                     session.id.0.to_string(),
                     session.agent_id.0.to_string(),
@@ -24,6 +31,20 @@ impl SqliteStore {
             )
             .map_err(|e| AlmsError::Runtime(format!("SQLite save_session: {e}")))?;
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_session_insert_failure_for_test(&self) {
+        self.conn
+            .lock()
+            .execute_batch(
+                "CREATE TEMP TRIGGER reject_session_insert
+                 BEFORE INSERT ON sessions
+                 BEGIN
+                     SELECT RAISE(ABORT, 'injected session persistence failure');
+                 END;",
+            )
+            .unwrap();
     }
 
     /// Delete a session and all its related data (messages, audit, summaries,

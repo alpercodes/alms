@@ -7,10 +7,33 @@ pub use job_store::JobStore;
 pub use sqlite::{SessionToolCall, SqliteStore, TimelineEvent, TimelinePage};
 pub use types::{Content, ContextSummary, Message, Role, Session, SessionConfig, SessionSummary};
 
-use alms_core::{AgentId, AlmsResult, RunId, SessionId};
+use alms_core::{AgentId, AlmsResult, RunId, SessionId, Timestamp};
 use dashmap::DashMap;
 use std::sync::Arc;
 use tracing::{debug, info, warn};
+
+fn is_pending_input(message: &Message) -> bool {
+    message
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get("pending_input"))
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+}
+
+fn claimed_input_timestamp(message: &Message) -> Option<chrono::DateTime<chrono::Utc>> {
+    message
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get("input_claimed_at"))
+        .and_then(serde_json::Value::as_str)
+        .and_then(|timestamp| chrono::DateTime::parse_from_rfc3339(timestamp).ok())
+        .map(|timestamp| timestamp.with_timezone(&chrono::Utc))
+}
+
+fn logical_message_timestamp(message: &Message) -> chrono::DateTime<chrono::Utc> {
+    claimed_input_timestamp(message).unwrap_or(message.timestamp.0)
+}
 
 /// Session manager - owns all session state
 #[derive(Debug)]
@@ -159,14 +182,31 @@ impl SessionManager {
         session_id: SessionId,
         agent_id: AgentId,
         context_id: impl Into<String>,
-    ) -> Session {
+    ) -> AlmsResult<Session> {
         let context_id = context_id.into();
         let key = (agent_id, context_id.clone());
 
-        let session = self
-            .sessions
-            .entry(key.clone())
-            .or_insert_with(|| {
+        let session = match self.sessions.entry(key.clone()) {
+            dashmap::mapref::entry::Entry::Occupied(entry) => {
+                let session = entry.get().clone();
+                if session.id != session_id {
+                    return Err(alms_core::AlmsError::Runtime(format!(
+                        "Context {context_id} already resolves to session {}, not {}",
+                        session.id.0, session_id.0
+                    )));
+                }
+                session
+            }
+            dashmap::mapref::entry::Entry::Vacant(entry) => {
+                if let Some(existing_key) = self.session_by_id.get(&session_id)
+                    && existing_key.value() != &key
+                {
+                    return Err(alms_core::AlmsError::Runtime(format!(
+                        "Session {} is already registered for another context",
+                        session_id.0
+                    )));
+                }
+
                 let now = alms_core::Timestamp::now();
                 let session = Session {
                     id: session_id,
@@ -176,27 +216,32 @@ impl SessionManager {
                     last_activity: now,
                     status: types::SessionStatus::Active,
                 };
+
+                // Persist before publishing any in-memory projection. A
+                // deterministic first-use notification session must either be
+                // authoritative on disk or not exist at all; logging and
+                // continuing would let a run outlive its missing parent after
+                // restart.
+                if let Some(store) = &self.store {
+                    store.save_session(&session)?;
+                }
+
                 self.session_by_id.insert(session_id, key);
                 self.history.insert(session_id, Vec::new());
                 self.audit.insert(session_id, Vec::new());
                 self.summaries.entry(session_id).or_default();
 
-                if let Some(store) = &self.store
-                    && let Err(e) = store.save_session(&session)
-                {
-                    warn!("Failed to persist session {}: {}", session_id.0, e);
-                }
-
                 info!(
                     "Created new session with predetermined ID: {:?}",
                     session_id
                 );
+                entry.insert(session.clone());
                 session
-            })
-            .clone();
+            }
+        };
 
         debug!("get_or_create_with_id session: {:?}", session.id);
-        session
+        Ok(session)
     }
 
     /// Get or create a shared session by a known `SessionId`.
@@ -333,12 +378,130 @@ impl SessionManager {
         Ok(())
     }
 
+    /// Update the in-memory projection after the run and initial message were
+    /// already committed by `SqliteStore::save_run_with_initial_message`.
+    pub fn append_persisted_message(
+        &self,
+        session_id: SessionId,
+        message: Message,
+        touched_at: Timestamp,
+    ) -> AlmsResult<()> {
+        let key = self
+            .session_by_id
+            .get(&session_id)
+            .map(|entry| entry.value().clone())
+            .ok_or_else(|| alms_core::AlmsError::SessionNotFound(session_id.0.to_string()))?;
+
+        {
+            let mut history = self
+                .history
+                .get_mut(&session_id)
+                .ok_or_else(|| alms_core::AlmsError::SessionNotFound(session_id.0.to_string()))?;
+            history.push(message);
+        }
+
+        let mut session = self
+            .sessions
+            .get_mut(&key)
+            .ok_or_else(|| alms_core::AlmsError::SessionNotFound(session_id.0.to_string()))?;
+        if touched_at.0 > session.last_activity.0 {
+            session.last_activity = touched_at;
+        }
+        Ok(())
+    }
     /// Get session history
     pub fn get_history(&self, session_id: SessionId) -> AlmsResult<Vec<Message>> {
         self.history
             .get(&session_id)
             .map(|h| h.clone())
             .ok_or_else(|| alms_core::AlmsError::SessionNotFound(session_id.0.to_string()))
+    }
+
+    /// Mark this run's pre-persisted user input as active context.
+    ///
+    /// Admissions persist user messages before queueing so the UI never loses
+    /// them. A queued prompt must not, however, enter an earlier run's LLM
+    /// snapshot. The claim is written through before memory is updated and its
+    /// timestamp records actual execution order without changing SQLite `seq`.
+    pub fn claim_pending_input(&self, session_id: SessionId, run_id: RunId) -> AlmsResult<()> {
+        let mut history = self
+            .history
+            .get_mut(&session_id)
+            .ok_or_else(|| alms_core::AlmsError::SessionNotFound(session_id.0.to_string()))?;
+        let run_id = run_id.0.to_string();
+        let position = history
+            .iter()
+            .position(|message| {
+                message
+                    .metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.get("run_id"))
+                    .and_then(serde_json::Value::as_str)
+                    == Some(run_id.as_str())
+            })
+            .ok_or_else(|| {
+                alms_core::AlmsError::Runtime(format!(
+                    "Pre-persisted input for run {run_id} was not found"
+                ))
+            })?;
+
+        if !is_pending_input(&history[position]) {
+            return Err(alms_core::AlmsError::Runtime(format!(
+                "Pre-persisted input for run {run_id} was already claimed"
+            )));
+        }
+
+        let latest_visible = history
+            .iter()
+            .filter(|message| !is_pending_input(message))
+            .map(logical_message_timestamp)
+            .max();
+        let mut claimed_at = chrono::Utc::now();
+        if let Some(latest_visible) = latest_visible
+            && claimed_at <= latest_visible
+        {
+            claimed_at = latest_visible + chrono::Duration::nanoseconds(1);
+        }
+
+        let mut claimed = history[position].clone();
+        let metadata = claimed
+            .metadata
+            .as_mut()
+            .and_then(serde_json::Value::as_object_mut)
+            .ok_or_else(|| {
+                alms_core::AlmsError::Runtime(format!(
+                    "Pre-persisted input for run {run_id} has invalid metadata"
+                ))
+            })?;
+        metadata.insert("pending_input".to_string(), serde_json::Value::Bool(false));
+        metadata.insert(
+            "input_claimed_at".to_string(),
+            serde_json::Value::String(claimed_at.to_rfc3339()),
+        );
+
+        if let Some(store) = &self.store {
+            store.save_message(session_id, &claimed)?;
+        }
+        history[position] = claimed;
+        Ok(())
+    }
+
+    /// Return only messages eligible for an LLM context snapshot.
+    ///
+    /// Pending admissions remain in normal history for UI/API visibility but
+    /// are hidden here until their run starts. Once claimed inputs exist, the
+    /// durable claim timestamps restore execution order around assistant
+    /// responses even when several user prompts were pre-persisted first.
+    pub fn get_context_history(&self, session_id: SessionId) -> AlmsResult<Vec<Message>> {
+        let mut history = self.get_history(session_id)?;
+        history.retain(|message| !is_pending_input(message));
+        if history
+            .iter()
+            .any(|message| claimed_input_timestamp(message).is_some())
+        {
+            history.sort_by_key(logical_message_timestamp);
+        }
+        Ok(history)
     }
 
     /// Find the last message in a session that satisfies `predicate`.
@@ -681,6 +844,99 @@ mod tests {
     }
 
     #[test]
+    fn persisted_message_projection_never_regresses_last_activity() {
+        let mgr = make_manager();
+        let session = mgr.get_or_create(AgentId::new(), "monotonic-activity");
+        let newer = alms_core::Timestamp(session.last_activity.0 + chrono::Duration::minutes(2));
+        let older = alms_core::Timestamp(session.last_activity.0 + chrono::Duration::minutes(1));
+
+        mgr.append_persisted_message(session.id, make_msg("newer"), newer)
+            .unwrap();
+        mgr.append_persisted_message(session.id, make_msg("older"), older)
+            .unwrap();
+
+        assert_eq!(mgr.get(session.id).unwrap().last_activity, newer);
+    }
+
+    #[test]
+    fn context_history_claims_pending_inputs_in_execution_order_across_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let db_path = directory.path().join("claimed-inputs.db");
+        let db_path = db_path.to_str().unwrap();
+        let mgr = SessionManager::with_sqlite(SessionConfig::default(), db_path).unwrap();
+        let session = mgr.get_or_create(AgentId::new(), "claimed-inputs");
+        let first_run = RunId::new();
+        let second_run = RunId::new();
+
+        let pending = |text: &str, run_id: RunId| Message {
+            id: uuid::Uuid::new_v4().to_string(),
+            role: Role::User,
+            content: Content::Text(text.to_string()),
+            timestamp: Timestamp::now(),
+            metadata: Some(serde_json::json!({
+                "pending_input": true,
+                "run_id": run_id.0.to_string(),
+            })),
+        };
+        mgr.append_message(session.id, pending("first prompt", first_run))
+            .unwrap();
+        mgr.append_message(session.id, pending("second prompt", second_run))
+            .unwrap();
+
+        mgr.claim_pending_input(session.id, first_run).unwrap();
+        let first_context = mgr.get_context_history(session.id).unwrap();
+        assert_eq!(first_context.len(), 1);
+        assert!(matches!(
+            &first_context[0].content,
+            Content::Text(text) if text == "first prompt"
+        ));
+        let visible_history = mgr.get_history(session.id).unwrap();
+        assert_eq!(visible_history.len(), 2, "queued input remains UI-visible");
+        assert_eq!(
+            visible_history[0].metadata.as_ref().unwrap()["pending_input"],
+            false
+        );
+        assert!(
+            visible_history[0].metadata.as_ref().unwrap()["input_claimed_at"]
+                .as_str()
+                .is_some()
+        );
+        assert_eq!(
+            visible_history[1].metadata.as_ref().unwrap()["pending_input"],
+            true
+        );
+
+        let mut reply = make_msg("first reply");
+        reply.role = Role::Assistant;
+        mgr.append_message(session.id, reply).unwrap();
+        mgr.claim_pending_input(session.id, second_run).unwrap();
+
+        let context_text = |manager: &SessionManager| {
+            manager
+                .get_context_history(session.id)
+                .unwrap()
+                .into_iter()
+                .filter_map(|message| match message.content {
+                    Content::Text(text) => Some(text),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            context_text(&mgr),
+            vec!["first prompt", "first reply", "second prompt"]
+        );
+
+        drop(mgr);
+        let reloaded = SessionManager::with_sqlite(SessionConfig::default(), db_path).unwrap();
+        assert_eq!(
+            context_text(&reloaded),
+            vec!["first prompt", "first reply", "second prompt"],
+            "claim metadata must reconstruct logical turn order after restart"
+        );
+    }
+
+    #[test]
     fn test_archive_idle_persists_status() {
         let config = SessionConfig {
             idle_timeout_secs: 0, // immediate idle
@@ -864,8 +1120,9 @@ mod tests {
         let agent_id = AgentId::new();
         let predetermined_id = SessionId::deterministic("notifications:test-agent");
 
-        let session =
-            mgr.get_or_create_with_id(predetermined_id, agent_id, "notifications:test-agent");
+        let session = mgr
+            .get_or_create_with_id(predetermined_id, agent_id, "notifications:test-agent")
+            .unwrap();
 
         assert_eq!(
             session.id, predetermined_id,
@@ -883,6 +1140,37 @@ mod tests {
     }
 
     #[test]
+    fn failed_predetermined_session_persistence_is_never_published_or_reloaded() {
+        let directory = tempfile::tempdir().unwrap();
+        let db_path = directory.path().join("failed-predetermined-session.db");
+        let db_path = db_path.to_str().unwrap();
+        let agent_id = AgentId::new();
+        let session_id = SessionId::deterministic("notifications:durable-test");
+
+        {
+            let mgr = SessionManager::with_sqlite(SessionConfig::default(), db_path).unwrap();
+            mgr.store()
+                .unwrap()
+                .inject_session_insert_failure_for_test();
+            let error = mgr
+                .get_or_create_with_id(session_id, agent_id, "notifications:durable-test")
+                .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("injected session persistence failure")
+            );
+            assert!(
+                mgr.get(session_id).is_err(),
+                "a failed durable insert must not publish an in-memory session"
+            );
+        }
+
+        let reloaded = SessionManager::with_sqlite(SessionConfig::default(), db_path).unwrap();
+        assert!(reloaded.get(session_id).is_err());
+    }
+
+    #[test]
     fn test_get_or_create_with_id_idempotent_with_get_or_create() {
         // Idempotency: pre-creating a session with get_or_create_with_id, then
         // calling the regular get_or_create with the same (agent_id, context_id)
@@ -893,8 +1181,9 @@ mod tests {
         let predetermined_id = SessionId::deterministic("notifications:test-agent");
 
         // Pre-create with a specific ID.
-        let first =
-            mgr.get_or_create_with_id(predetermined_id, agent_id, "notifications:test-agent");
+        let first = mgr
+            .get_or_create_with_id(predetermined_id, agent_id, "notifications:test-agent")
+            .unwrap();
         assert_eq!(first.id, predetermined_id);
 
         // Regular get_or_create with the same key should find the existing session.

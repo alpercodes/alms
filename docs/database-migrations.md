@@ -51,26 +51,25 @@ SQLite's `memory` journal mode.
 
 ## Current versions
 
-| Schema | Contents | Phase 2 binary | Checkpoint binary |
+| Schema | Contents | Current binary | Checkpoint binary |
 | --- | --- | --- | --- |
-| 0 | Unversioned legacy database accepted by the old best-effort upgrader | Upgrades to 2 | Reads only the historical shapes it already supported |
-| 1 | Migration history plus normalized `v0.2.4` tables, columns, indexes, and message sequence backfill | Upgrades to 2 | Read/write compatible |
-| 2 | Adds lifecycle metadata columns on `runs` and `jobs` | Current | Read/write compatible because all changes are additive |
-| >2 | Future schema | Refuses to open | Not guaranteed |
+| 0 | Unversioned legacy database | Upgrades to 3 | Historical shapes only |
+| 1 | Normalized `v0.2.4` schema and migration history | Upgrades to 3 | Read/write compatible |
+| 2 | Lifecycle revision/reason columns on `runs` and `jobs` | Upgrades to 3 | Structurally compatible |
+| 3 | Durable job retry state and distinct terminal outcomes | Current | Not semantically compatible |
+| >3 | Future schema | Refuses to open | Not guaranteed |
 
-Schema 2 adds these fields without changing current runtime behavior:
+Schema 3 adds durable retry state:
 
-| Table | Column | Type/default | Intended owner |
+| Table | Column | Type/default | Meaning |
 | --- | --- | --- | --- |
-| `runs` | `lifecycle_revision` | `INTEGER NOT NULL DEFAULT 0` | Phase 3 transition API |
-| `runs` | `terminal_reason` | nullable `TEXT` | Phase 3 terminal metadata |
-| `jobs` | `lifecycle_revision` | `INTEGER NOT NULL DEFAULT 0` | Phase 3 transition API |
-| `jobs` | `terminal_reason` | nullable `TEXT` | Phase 3 terminal metadata |
+| `jobs` | `retry_count` | `INTEGER NOT NULL DEFAULT 0` | Persisted bounded dispatch attempts |
+| `jobs` | `last_error` | nullable `TEXT` | Most recent dispatch failure |
 
-The checkpoint binary uses explicit column lists and can continue reading and
-writing schema 2. Its inserts omit the new columns, so SQLite supplies `0` and
-`NULL`. Phase 2 deliberately does not persist new job status strings or change
-existing enum meanings.
+The migration also normalizes legacy one-shot rows that encoded completion as
+`status = 'cancelled'` with terminal reason `completed` or `deadline_reached`
+to the distinct `completed` status. New writes may persist `completed` and
+`failed`, so an older binary must not open a schema-3 database.
 
 Inspect the installed version with:
 
@@ -100,26 +99,17 @@ main file while the daemon is running.
 
 ## Roll back to the checkpoint binary
 
-Schema 2 is intentionally readable by `v0.2.4-pre-stabilization`, so a binary
-rollback from Phase 2 does not require a database restore:
-
-1. Stop the current daemon.
-2. Switch to or deploy `v0.2.4-pre-stabilization`.
-3. Start the daemon against the existing schema-2 database.
-4. Verify session, run, job, and agent reads before accepting traffic.
-
-The checkpoint binary ignores `schema_migrations` and the four additive
-lifecycle columns.
-
-For a future schema not listed as checkpoint-compatible, restore the backup:
+Schema 3 is not semantically compatible with the pre-stabilization checkpoint:
+the checkpoint does not understand the `completed` and `failed` job states.
+Rolling back code therefore also requires restoring the database backup taken
+before the migration.
 
 1. Stop every process that can access the database.
-2. Preserve the failed/newer database separately for diagnosis.
-3. Restore the verified backup as `.alms/alms.db`.
-4. Ensure no WAL/SHM files from the newer database remain beside the restored
-   file.
-5. Run `PRAGMA integrity_check;` against the restored file.
-6. Start the compatible binary and verify the migration history and core data.
+2. Preserve the schema-3 database separately for diagnosis.
+3. Restore the verified pre-migration backup as `.alms/alms.db`.
+4. Ensure no WAL/SHM files from schema 3 remain beside the restored file.
+5. Run `PRAGMA integrity_check;`.
+6. Start `v0.2.4-pre-stabilization` and verify core reads.
 
 Never edit or delete `schema_migrations` to force an older binary to open a
 newer database. Restore a compatible snapshot instead.
@@ -128,12 +118,12 @@ newer database. Restore a compatible snapshot instead.
 
 1. Append exactly one entry to the ordered migration list.
 2. Increment `CURRENT_SCHEMA_VERSION` to the same number.
-3. Keep the change additive throughout the documented rollback window.
-4. Use nullable columns or defaults that preserve old-writer behavior.
-5. Add a frozen upgrade fixture and a rollback-on-failure regression.
-6. Update the compatibility matrix and backup/rollback notes.
-7. Test fresh install, baseline upgrade, repeated startup, concurrent startup,
+3. State the supported rollback window explicitly; compatibility is not
+   assumed for this private, undeployed project.
+4. Add a frozen upgrade fixture and a rollback-on-failure regression.
+5. Update the version matrix and backup/rollback notes.
+6. Test fresh install, baseline upgrade, repeated startup, concurrent startup,
    failed-step retry, and the full workspace.
 
-Do not modify a migration that may already have shipped. Add a new ordered
+Do not modify a migration that may already have been used. Add a new ordered
 step.

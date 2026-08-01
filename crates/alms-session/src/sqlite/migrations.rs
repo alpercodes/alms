@@ -1,15 +1,15 @@
 //! Ordered, transactional SQLite schema migrations.
 //!
 //! Version 1 adopts and normalizes every schema shape accepted by the former
-//! best-effort startup path. Version 2 adds storage reserved for the explicit
-//! lifecycle state machines introduced in the next stabilization phase.
+//! best-effort startup path. Later versions add lifecycle metadata and
+//! normalize durable job terminal/retry state.
 
 use super::{V1_BASELINE_INDEXES, V1_BASELINE_SCHEMA};
 use alms_core::{AlmsError, AlmsResult};
 use rusqlite::{Connection, ErrorCode, Transaction, TransactionBehavior, params};
 use std::time::{Duration, Instant};
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 2;
+pub const CURRENT_SCHEMA_VERSION: u32 = 3;
 
 const CONNECTION_PRAGMAS: &str = "
 PRAGMA foreign_keys=ON;
@@ -42,6 +42,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 2,
         name: "add_lifecycle_metadata",
         apply: add_lifecycle_metadata,
+    },
+    Migration {
+        version: 3,
+        name: "normalize_job_terminal_states",
+        apply: normalize_job_terminal_states,
     },
 ];
 
@@ -244,6 +249,22 @@ fn add_lifecycle_metadata(transaction: &Transaction<'_>) -> rusqlite::Result<()>
     Ok(())
 }
 
+fn normalize_job_terminal_states(transaction: &Transaction<'_>) -> rusqlite::Result<()> {
+    add_column_if_missing(
+        transaction,
+        "jobs",
+        "retry_count",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    add_column_if_missing(transaction, "jobs", "last_error", "TEXT")?;
+    transaction.execute(
+        "UPDATE jobs SET status = 'completed' \
+         WHERE status = 'cancelled' AND terminal_reason IN ('completed', 'deadline_reached')",
+        [],
+    )?;
+    Ok(())
+}
+
 fn add_column_if_missing(
     conn: &Connection,
     table: &str,
@@ -299,6 +320,10 @@ mod tests {
         transaction.execute_batch("ALTER TABLE marker ADD COLUMN phase_two TEXT;")
     }
 
+    fn successful_migration_three(transaction: &Transaction<'_>) -> rusqlite::Result<()> {
+        transaction.execute_batch("CREATE TABLE phase_three (value TEXT);")
+    }
+
     #[test]
     fn failed_step_rolls_back_and_can_be_retried() {
         let mut conn = Connection::open_in_memory().unwrap();
@@ -312,6 +337,11 @@ mod tests {
                 version: 2,
                 name: "fail_after_alter",
                 apply: failing_migration_two,
+            },
+            Migration {
+                version: 3,
+                name: "add_phase_three",
+                apply: successful_migration_three,
             },
         ];
 
@@ -327,9 +357,14 @@ mod tests {
                 name: "add_phase_two",
                 apply: successful_migration_two,
             },
+            Migration {
+                version: 3,
+                name: "add_phase_three",
+                apply: successful_migration_three,
+            },
         ];
         apply_migrations(&mut conn, &repaired).unwrap();
-        assert_eq!(read_schema_version(&conn).unwrap(), 2);
+        assert_eq!(read_schema_version(&conn).unwrap(), 3);
         assert!(column_exists(&conn, "marker", "phase_two").unwrap());
     }
 

@@ -23,8 +23,9 @@ use futures::FutureExt;
 use serde::Deserialize;
 use serde::Serialize;
 use std::panic::AssertUnwindSafe;
+use std::sync::Arc;
 #[cfg(test)]
-use std::sync::{Arc, LazyLock};
+use std::sync::LazyLock;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, instrument, warn};
@@ -35,6 +36,116 @@ static START_TRANSITION_BARRIERS: LazyLock<dashmap::DashMap<RunId, Arc<tokio::sy
 #[cfg(test)]
 static TERMINAL_TRANSITION_BARRIERS: LazyLock<dashmap::DashMap<RunId, Arc<tokio::sync::Barrier>>> =
     LazyLock::new(dashmap::DashMap::new);
+#[cfg(test)]
+static ADMISSION_PERSISTENCE_BARRIERS: LazyLock<
+    dashmap::DashMap<SessionId, Arc<tokio::sync::Barrier>>,
+> = LazyLock::new(dashmap::DashMap::new);
+
+#[cfg(test)]
+static ADMISSION_EVENT_BARRIERS: LazyLock<dashmap::DashMap<SessionId, Arc<tokio::sync::Barrier>>> =
+    LazyLock::new(dashmap::DashMap::new);
+#[cfg(test)]
+static ADMISSION_EXECUTION_BARRIERS: LazyLock<
+    dashmap::DashMap<SessionId, Arc<tokio::sync::Barrier>>,
+> = LazyLock::new(dashmap::DashMap::new);
+
+#[cfg(test)]
+static ADMISSION_ACQUIRE_BARRIERS: LazyLock<
+    dashmap::DashMap<SessionId, Arc<tokio::sync::Barrier>>,
+> = LazyLock::new(dashmap::DashMap::new);
+
+#[derive(Debug)]
+pub(crate) struct RunAdmissionGate {
+    mutex: Arc<tokio::sync::Mutex<()>>,
+    leases: std::sync::atomic::AtomicUsize,
+}
+
+pub(crate) type RunAdmissionGates = Arc<dashmap::DashMap<SessionId, Arc<RunAdmissionGate>>>;
+
+/// Pre-await ownership of an admission mutex.
+///
+/// This lease exists before `lock_owned().await`, so cancelling a waiter still
+/// runs the same last-reference cleanup as dropping an acquired guard.
+struct RunAdmissionLease {
+    gates: RunAdmissionGates,
+    session_id: SessionId,
+    gate: Arc<RunAdmissionGate>,
+}
+
+impl Drop for RunAdmissionLease {
+    fn drop(&mut self) {
+        let previous = self
+            .gate
+            .leases
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        debug_assert!(previous > 0, "admission lease count underflow");
+        if previous != 1 {
+            return;
+        }
+
+        if let dashmap::mapref::entry::Entry::Occupied(entry) = self.gates.entry(self.session_id) {
+            // Acquisition increments `leases` while holding this same map
+            // entry. If a new user arrived after our 1 -> 0 transition, the
+            // recheck observes it and preserves the entry; otherwise removal
+            // linearizes before a later acquirer creates a replacement gate.
+            if Arc::ptr_eq(entry.get(), &self.gate)
+                && self.gate.leases.load(std::sync::atomic::Ordering::Acquire) == 0
+            {
+                entry.remove();
+            }
+        }
+    }
+}
+
+/// Owns one acquired session admission mutex.
+pub(crate) struct RunAdmissionGuard {
+    guard: Option<tokio::sync::OwnedMutexGuard<()>>,
+    lease: Option<RunAdmissionLease>,
+}
+
+impl Drop for RunAdmissionGuard {
+    fn drop(&mut self) {
+        drop(self.guard.take());
+        drop(self.lease.take());
+    }
+}
+
+/// Acquire the per-session admission boundary with cancellation-safe ownership.
+pub(crate) async fn acquire_run_admission_guard(
+    gates: &RunAdmissionGates,
+    session_id: SessionId,
+) -> RunAdmissionGuard {
+    let gate = match gates.entry(session_id) {
+        dashmap::mapref::entry::Entry::Occupied(entry) => {
+            let gate = entry.get().clone();
+            gate.leases
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            gate
+        }
+        dashmap::mapref::entry::Entry::Vacant(entry) => {
+            let gate = Arc::new(RunAdmissionGate {
+                mutex: Arc::new(tokio::sync::Mutex::new(())),
+                leases: std::sync::atomic::AtomicUsize::new(1),
+            });
+            entry.insert(gate.clone());
+            gate
+        }
+    };
+    let lease = RunAdmissionLease {
+        gates: gates.clone(),
+        session_id,
+        gate,
+    };
+
+    #[cfg(test)]
+    pause_during_admission_acquire(session_id).await;
+
+    let guard = lease.gate.mutex.clone().lock_owned().await;
+    RunAdmissionGuard {
+        guard: Some(guard),
+        lease: Some(lease),
+    }
+}
 
 #[cfg(test)]
 pub(super) fn install_start_transition_barrier(run_id: RunId) -> Arc<tokio::sync::Barrier> {
@@ -71,6 +182,84 @@ async fn pause_before_terminal_transition(run_id: RunId) {
         barrier.wait().await;
         barrier.wait().await;
         TERMINAL_TRANSITION_BARRIERS.remove(&run_id);
+    }
+}
+
+#[cfg(test)]
+pub(super) fn install_admission_persistence_barrier(
+    session_id: SessionId,
+) -> Arc<tokio::sync::Barrier> {
+    let barrier = Arc::new(tokio::sync::Barrier::new(2));
+    ADMISSION_PERSISTENCE_BARRIERS.insert(session_id, barrier.clone());
+    barrier
+}
+
+#[cfg(test)]
+async fn pause_after_admission_persistence(session_id: SessionId) {
+    let barrier = ADMISSION_PERSISTENCE_BARRIERS
+        .remove(&session_id)
+        .map(|(_, barrier)| barrier);
+    if let Some(barrier) = barrier {
+        barrier.wait().await;
+        barrier.wait().await;
+    }
+}
+
+#[cfg(test)]
+pub(super) fn install_admission_event_barrier(session_id: SessionId) -> Arc<tokio::sync::Barrier> {
+    let barrier = Arc::new(tokio::sync::Barrier::new(2));
+    ADMISSION_EVENT_BARRIERS.insert(session_id, barrier.clone());
+    barrier
+}
+
+#[cfg(test)]
+async fn pause_before_admission_event(session_id: SessionId) {
+    let barrier = ADMISSION_EVENT_BARRIERS
+        .remove(&session_id)
+        .map(|(_, barrier)| barrier);
+    if let Some(barrier) = barrier {
+        barrier.wait().await;
+        barrier.wait().await;
+    }
+}
+
+#[cfg(test)]
+pub(super) fn install_admission_execution_barrier(
+    session_id: SessionId,
+) -> Arc<tokio::sync::Barrier> {
+    let barrier = Arc::new(tokio::sync::Barrier::new(2));
+    ADMISSION_EXECUTION_BARRIERS.insert(session_id, barrier.clone());
+    barrier
+}
+
+#[cfg(test)]
+async fn pause_before_admission_execution(session_id: SessionId) {
+    let barrier = ADMISSION_EXECUTION_BARRIERS
+        .remove(&session_id)
+        .map(|(_, barrier)| barrier);
+    if let Some(barrier) = barrier {
+        barrier.wait().await;
+        barrier.wait().await;
+    }
+}
+
+#[cfg(test)]
+pub(super) fn install_admission_acquire_barrier(
+    session_id: SessionId,
+) -> Arc<tokio::sync::Barrier> {
+    let barrier = Arc::new(tokio::sync::Barrier::new(2));
+    ADMISSION_ACQUIRE_BARRIERS.insert(session_id, barrier.clone());
+    barrier
+}
+
+#[cfg(test)]
+async fn pause_during_admission_acquire(session_id: SessionId) {
+    let barrier = ADMISSION_ACQUIRE_BARRIERS
+        .remove(&session_id)
+        .map(|(_, barrier)| barrier);
+    if let Some(barrier) = barrier {
+        barrier.wait().await;
+        barrier.wait().await;
     }
 }
 
@@ -1147,35 +1336,31 @@ pub async fn create_run(
         }
     }
 
-    // Admission is the linearization point for queue position and happens
-    // before any run, message, cancellation-token, or SSE side effect.
+    // One same-session admission owns the complete durable-to-live boundary.
+    // Holding the gate through `run_created` keeps database message order,
+    // in-memory history, queue order, and the session feed consistent.
+    let admission_guard = acquire_run_admission_guard(&state.run_admission_gates, session_id).await;
+
+    // The session may have been deleted after the request's initial lookup but
+    // before this handler acquired the deletion fence.
+    state.session_manager.get(session_id).map_err(|_| {
+        run_creation_api_error(
+            StatusCode::NOT_FOUND,
+            "SESSION_NOT_FOUND",
+            "Session not found",
+        )
+    })?;
+
+    // Queue reservation happens before any run, message, cancellation-token,
+    // or SSE side effect inside the serialized admission boundary.
     let reservation = state
         .agent_queue
         .try_reserve(agent_id)
         .map_err(queue_admission_error)?;
 
-    state.run_manager.insert_run(run.clone()).map_err(|error| {
-        run_creation_api_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "LIFECYCLE_PERSISTENCE_FAILED",
-            &format!("Failed to persist the new run: {error}"),
-        )
-    })?;
-
-    // Pre-persist the user's input message to the session BEFORE enqueueing
-    // the run.  Previously the input was only persisted inside
-    // `runtime.run()` (when the agent loop actually starts), which meant a
-    // page reload during the queued-wait window would find no trace of the
-    // user's message -- the UI had optimistically rendered it but the
-    // backend had never stored it.
-    //
-    // The stored message carries `pending_input: true` metadata so
-    // `execute_run` knows to skip re-persistence (via the new
-    // `input_pre_persisted` RunParams flag, which routes the run through
-    // `run_on_session` instead of `run`).  The metadata is informational
-    // only -- the frontend does NOT filter these out, because the user's
-    // message should be visible in the chat immediately after sending
-    // regardless of run status (queued, running, or completed).
+    // The queued run and its visible user input are one durable admission
+    // fact. The message carries `pending_input: true` so execution skips the
+    // runtime's legacy input write and cannot duplicate it.
     let user_msg = alms_session::Message {
         id: uuid::Uuid::new_v4().to_string(),
         role: alms_session::Role::User,
@@ -1186,20 +1371,54 @@ pub async fn create_run(
             "run_id": run_id.0.to_string(),
         })),
     };
-    let input_pre_persisted = match state.session_manager.append_message(session_id, user_msg) {
-        Ok(()) => true,
-        Err(e) => {
-            // Non-fatal: fall back to the runtime's legacy persistence path
-            // so the input is not lost entirely.  The page-reload window is
-            // the only scenario where this matters, so the fallback is
-            // acceptable.
-            warn!(
-                "Failed to pre-persist user input for run {}: {}",
-                run_id.0, e
-            );
-            false
-        }
-    };
+    let persisted_touch = state
+        .run_manager
+        .persist_run_admission(&run, &user_msg)
+        .map_err(|error| {
+            run_creation_api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "LIFECYCLE_PERSISTENCE_FAILED",
+                &format!("Failed to persist run admission: {error}"),
+            )
+        })?;
+
+    #[cfg(test)]
+    pause_after_admission_persistence(session_id).await;
+
+    if let Some(touched_at) = persisted_touch {
+        state
+            .session_manager
+            .append_persisted_message(session_id, user_msg, touched_at)
+            .map_err(|error| {
+                run_creation_api_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "ADMISSION_PROJECTION_FAILED",
+                    &format!("Failed to publish persisted run input: {error}"),
+                )
+            })?;
+    } else {
+        state
+            .session_manager
+            .append_message(session_id, user_msg)
+            .map_err(|error| {
+                run_creation_api_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "ADMISSION_PROJECTION_FAILED",
+                    &format!("Failed to publish run input: {error}"),
+                )
+            })?;
+    }
+    state
+        .run_manager
+        .insert_persisted_run(run.clone())
+        .map_err(|error| {
+            run_creation_api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "ADMISSION_PROJECTION_FAILED",
+                &format!("Failed to publish persisted run: {error}"),
+            )
+        })?;
+    let input_pre_persisted = true;
 
     // Dispatch before the first await after durable side effects. If the
     // request is dropped while publishing run_created, dropping start_tx
@@ -1274,6 +1493,10 @@ pub async fn create_run(
     // the queued work to advance to run_started.
     let event_state = state.clone();
     let event_task = tokio::spawn(async move {
+        let _admission_guard = admission_guard;
+        #[cfg(test)]
+        pause_before_admission_event(session_id).await;
+
         event_state
             .run_manager
             .send_session_event(
@@ -1525,6 +1748,60 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
     // rejection exit, the runtime-construction failure exit, and the common
     // terminal tail. `finish_episode_run` is a no-op for `None`.
     let episode_job_id = state.run_manager.get_run(run_id).and_then(|r| r.job_id);
+
+    if input_pre_persisted {
+        #[cfg(test)]
+        pause_before_admission_execution(session_id).await;
+
+        // Settle the accepted prompt as soon as its queue slot begins. This
+        // deliberately precedes the queued-cancellation/shutdown exit as well
+        // as config resolution, budget checks, start persistence, and runtime
+        // construction: every terminal accepted run must leave its prompt
+        // available to later context, while later queue slots stay hidden.
+        if let Err(error) = state
+            .session_manager
+            .claim_pending_input(session_id, run_id)
+        {
+            let mut failure_message = format!("Failed to claim accepted run input: {error}");
+            let emit_failure = match state
+                .run_manager
+                .try_mark_run_as_failed(run_id, failure_message.clone())
+            {
+                Ok(transitioned) => transitioned,
+                Err(persistence_error) => {
+                    failure_message = format!(
+                        "Run input claim failure could not be persisted: {persistence_error}"
+                    );
+                    true
+                }
+            };
+            if emit_failure {
+                state
+                    .run_manager
+                    .send_event(
+                        run_id,
+                        session_id,
+                        SseEventData::run_error(run_id, &failure_message),
+                    )
+                    .await;
+            }
+            state
+                .run_manager
+                .send_agent_event(
+                    agent_id,
+                    run_id,
+                    session_id,
+                    SseEventData::session_activity_ended(session_id, run_id, agent_id),
+                )
+                .await;
+            state.run_manager.remove_senders(run_id);
+            state.run_manager.remove_cancel_token(run_id);
+            state.approval_store.clear_for_run(run_id);
+            super::notifications::finish_episode_run(&state, episode_job_id, run_id, &[]).await;
+            broadcast_queue_advance(&state, agent_id).await;
+            return;
+        }
+    }
 
     // Early exit if already cancelled (queued-then-cancelled before execution
     // started) or if the server is shutting down.  The shutdown_token check
@@ -2698,11 +2975,8 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
             .run_on_session(&state.session_manager, session_id, &context_id, &input)
             .await
     } else if input_pre_persisted {
-        // User-initiated run where `create_run` already pre-persisted the
-        // input to the session (so it survives a page reload during the
-        // queued-wait window). Use `run_on_session` to skip the default
-        // Role::User persistence in `runtime.run()` and avoid duplicating
-        // the message.
+        // The prompt was durably claimed when this queue slot began. Reuse
+        // that session history without persisting the user message twice.
         runtime
             .run_on_session(&state.session_manager, session_id, &context_id, &input)
             .await
@@ -2738,14 +3012,21 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
         // `get_or_create` inside `runtime.run()` creates a session with a
         // random UUID because no session with that `(agent_id, context_id)`
         // key exists yet.  Fixes #585.
-        if is_system_triggered {
+        match if is_system_triggered {
             state
                 .session_manager
-                .get_or_create_with_id(session_id, agent_id, &context_id);
+                .get_or_create_with_id(session_id, agent_id, &context_id)
+                .map(|_| ())
+        } else {
+            Ok(())
+        } {
+            Ok(()) => {
+                runtime
+                    .run(&state.session_manager, &context_id, input)
+                    .await
+            }
+            Err(error) => Err(error),
         }
-        runtime
-            .run(&state.session_manager, &context_id, input)
-            .await
     };
 
     // Drop `runtime` to close the last STRONG sender on `runtime_tx`.

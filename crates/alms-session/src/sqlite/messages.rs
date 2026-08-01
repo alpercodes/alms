@@ -14,13 +14,21 @@ impl SqliteStore {
     /// `metadata` are updated -- `role`, `timestamp`, and `seq` are preserved
     /// from the original insert.
     pub fn save_message(&self, session_id: SessionId, msg: &Message) -> AlmsResult<()> {
+        let conn = self.conn.lock();
+        Self::save_message_on(&conn, session_id, msg)
+    }
+
+    pub(super) fn save_message_on(
+        conn: &Connection,
+        session_id: SessionId,
+        msg: &Message,
+    ) -> AlmsResult<()> {
         let content_json = serde_json::to_string(&msg.content)?;
         let metadata_json = msg
             .metadata
             .as_ref()
             .map(serde_json::to_string)
             .transpose()?;
-        let conn = self.conn.lock();
         let sid = session_id.0.to_string();
         conn.execute(
             "INSERT INTO messages (id, session_id, role, content, timestamp, metadata, seq) \

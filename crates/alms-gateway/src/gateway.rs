@@ -371,6 +371,13 @@ impl Gateway {
             Some(path) => {
                 info!("Opening SQLite session store at {}", path);
                 let store = SqliteStore::open(path)?;
+                let recovered = store.mark_stale_runs_failed()?;
+                if recovered > 0 {
+                    info!(
+                        recovered,
+                        "Recovered stale runs and released their pending inputs before session hydration"
+                    );
+                }
                 // Auto-migrate sidecar agent into the agents registry — only
                 // if a sidecar file existed (actual migration, not first run).
                 if SIDECAR_EXISTED.load(std::sync::atomic::Ordering::Relaxed) {
@@ -1177,6 +1184,131 @@ mod tests {
         };
         let gateway = Gateway::new(config).unwrap();
         assert_eq!(gateway.agent_id(), expected);
+    }
+
+    #[test]
+    fn gateway_restart_releases_queued_input_before_hydrating_history() {
+        let directory = tempfile::tempdir().unwrap();
+        let db_path = directory.path().join("restart-recovery.db");
+        let db_path = db_path.to_str().unwrap();
+        let agent_id = AgentId::new();
+        let session = alms_session::Session::new(agent_id, "restart-recovery");
+        let run = alms_core::Run::new(session.id, agent_id, "recover me".to_string());
+        let run_id = run.run_id;
+        let message = alms_session::Message {
+            id: "restart-recovery-input".to_string(),
+            role: alms_session::Role::User,
+            content: alms_session::Content::Text(run.input.clone()),
+            timestamp: alms_core::Timestamp::now(),
+            metadata: Some(serde_json::json!({
+                "pending_input": true,
+                "run_id": run_id.0.to_string(),
+            })),
+        };
+
+        {
+            let store = SqliteStore::open(db_path).unwrap();
+            store.save_session(&session).unwrap();
+            store.save_run_with_initial_message(&run, &message).unwrap();
+        }
+
+        let config = GatewayConfig {
+            db_path: Some(db_path.to_string()),
+            ..GatewayConfig::default()
+        };
+        let gateway = Gateway::new(config).unwrap();
+
+        let history = gateway.session_manager.get_history(session.id).unwrap();
+        let input = history
+            .iter()
+            .find(|candidate| candidate.id == message.id)
+            .expect("admitted input must survive restart");
+        let metadata = input.metadata.as_ref().unwrap();
+        assert_eq!(metadata["pending_input"], false);
+        assert!(metadata["input_claimed_at"].is_string());
+
+        let context = gateway
+            .session_manager
+            .get_context_history(session.id)
+            .unwrap();
+        let context_text = context
+            .iter()
+            .find_map(|message| match &message.content {
+                alms_session::Content::Text(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .expect("recovered prompt must be context-visible");
+        assert_eq!(context_text, "recover me");
+
+        let persisted = gateway
+            .session_manager
+            .store()
+            .unwrap()
+            .load_run(run_id)
+            .unwrap()
+            .unwrap();
+        assert!(matches!(persisted.status(), alms_core::RunStatus::Failed));
+        assert_eq!(persisted.terminal_reason(), Some("gateway_restarted"));
+    }
+
+    #[test]
+    fn gateway_restart_releases_cancelled_queued_input_without_changing_terminal_state() {
+        let directory = tempfile::tempdir().unwrap();
+        let db_path = directory.path().join("cancelled-restart-recovery.db");
+        let db_path = db_path.to_str().unwrap();
+        let agent_id = AgentId::new();
+        let session = alms_session::Session::new(agent_id, "cancelled-restart-recovery");
+        let mut run = alms_core::Run::new(session.id, agent_id, "keep me visible".to_string());
+        let run_id = run.run_id;
+        let message = alms_session::Message {
+            id: "cancelled-restart-recovery-input".to_string(),
+            role: alms_session::Role::User,
+            content: alms_session::Content::Text(run.input.clone()),
+            timestamp: alms_core::Timestamp::now(),
+            metadata: Some(serde_json::json!({
+                "pending_input": true,
+                "run_id": run_id.0.to_string(),
+            })),
+        };
+
+        {
+            let store = SqliteStore::open(db_path).unwrap();
+            store.save_session(&session).unwrap();
+            store.save_run_with_initial_message(&run, &message).unwrap();
+            assert!(run.mark_cancelled(), "queued cancellation must be accepted");
+            store.save_run(&run).unwrap();
+        }
+
+        let config = GatewayConfig {
+            db_path: Some(db_path.to_string()),
+            ..GatewayConfig::default()
+        };
+        let gateway = Gateway::new(config).unwrap();
+
+        let context = gateway
+            .session_manager
+            .get_context_history(session.id)
+            .unwrap();
+        let recovered_input = context
+            .iter()
+            .find(|candidate| candidate.id == message.id)
+            .expect("cancelled run input must become context-visible after restart");
+        let metadata = recovered_input.metadata.as_ref().unwrap();
+        assert_eq!(metadata["pending_input"], false);
+        assert!(metadata["input_claimed_at"].is_string());
+
+        let persisted = gateway
+            .session_manager
+            .store()
+            .unwrap()
+            .load_run(run_id)
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            persisted.status(),
+            alms_core::RunStatus::Cancelled
+        ));
+        assert_eq!(persisted.lifecycle_revision(), run.lifecycle_revision());
     }
 
     #[test]

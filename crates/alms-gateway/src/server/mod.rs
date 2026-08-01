@@ -21,7 +21,7 @@ use crate::runs::{
     completion_notification_loop, dm_event_loop, job_episode_sweep_loop, run_trigger_loop,
     scheduler_fire_loop,
 };
-use alms_core::{AlmsResult, JobStatus};
+use alms_core::AlmsResult;
 use alms_runtime::Scheduler;
 use axum::{Extension, middleware};
 use std::sync::Arc;
@@ -342,26 +342,26 @@ async fn shutdown_signal(token: CancellationToken, run_manager: RunManager) {
     }
 }
 
-/// Re-register all non-cancelled persisted jobs with the scheduler on startup.
+/// Re-register all non-terminal persisted jobs with the scheduler on startup.
 async fn bootstrap_scheduler(state: &AppState) -> AlmsResult<()> {
     let now = chrono::Utc::now();
     let jobs = state.job_store.list();
     let mut registered = 0usize;
 
     for job in jobs {
-        if job.status() == JobStatus::Cancelled {
-            continue;
-        }
-        let Some(fire_at) = cron_utils::compute_next_fire(&job, now) else {
-            tracing::warn!("Job {} has no future fire time, skipping bootstrap", job.id);
+        let Some(fire_at) = bootstrap_fire_at(&job, now) else {
+            if !job.status().is_terminal() {
+                tracing::warn!("Job {} has no future fire time, skipping bootstrap", job.id);
+            }
             continue;
         };
+        // Persist the recovery point before projecting it into the scheduler.
+        state.job_store.update_next_run_at(job.id, Some(fire_at))?;
         let delay = (fire_at - now)
             .to_std()
             .unwrap_or(std::time::Duration::ZERO);
         let instant = tokio::time::Instant::now() + delay;
         state.scheduler.schedule_once(job.id, instant).await;
-        state.job_store.update_next_run_at(job.id, Some(fire_at))?;
         registered += 1;
     }
 
@@ -369,4 +369,79 @@ async fn bootstrap_scheduler(state: &AppState) -> AlmsResult<()> {
         info!("Bootstrapped {} job(s) into scheduler", registered);
     }
     Ok(())
+}
+
+/// Resolve the authoritative startup fire time for one persisted job.
+///
+/// `next_run_at` is the durable scheduler intent written before the in-memory
+/// projection. It therefore wins for every schedule type, not only retries.
+/// A past-due intent is caught up once immediately; the cron expression is
+/// consulted only for legacy/new rows that have no persisted intent yet.
+fn bootstrap_fire_at(
+    job: &alms_core::job::Job,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    if job.status().is_terminal() {
+        return None;
+    }
+    job.next_run_at
+        .map(|persisted| {
+            if persisted <= now {
+                now + chrono::Duration::seconds(1)
+            } else {
+                persisted
+            }
+        })
+        .or_else(|| cron_utils::compute_next_fire(job, now))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::bootstrap_fire_at;
+    use alms_core::{
+        AgentId,
+        job::{Job, JobSchedule, JobTransition},
+    };
+    use chrono::{TimeZone as _, Utc};
+
+    fn recurring_job(next_run_at: Option<chrono::DateTime<Utc>>) -> Job {
+        Job::new(
+            AgentId::new(),
+            "scheduled work".to_string(),
+            JobSchedule::Recurring {
+                cron: "0 * * * *".to_string(),
+            },
+            next_run_at,
+        )
+    }
+
+    #[test]
+    fn bootstrap_catches_up_past_due_persisted_recurring_intent() {
+        let now = Utc.with_ymd_and_hms(2026, 7, 14, 10, 1, 0).unwrap();
+        let persisted = Utc.with_ymd_and_hms(2026, 7, 14, 10, 0, 0).unwrap();
+        let job = recurring_job(Some(persisted));
+
+        assert_eq!(
+            bootstrap_fire_at(&job, now),
+            Some(now + chrono::Duration::seconds(1))
+        );
+    }
+
+    #[test]
+    fn bootstrap_preserves_future_persisted_recurring_intent() {
+        let now = Utc.with_ymd_and_hms(2026, 7, 14, 10, 1, 0).unwrap();
+        let persisted = Utc.with_ymd_and_hms(2026, 7, 14, 11, 0, 0).unwrap();
+        let job = recurring_job(Some(persisted));
+
+        assert_eq!(bootstrap_fire_at(&job, now), Some(persisted));
+    }
+
+    #[test]
+    fn bootstrap_never_schedules_terminal_jobs() {
+        let now = Utc.with_ymd_and_hms(2026, 7, 14, 10, 1, 0).unwrap();
+        let mut job = recurring_job(Some(now + chrono::Duration::minutes(1)));
+        assert!(job.transition(JobTransition::Cancel).is_applied());
+
+        assert_eq!(bootstrap_fire_at(&job, now), None);
+    }
 }

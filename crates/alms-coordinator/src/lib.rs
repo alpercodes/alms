@@ -1137,7 +1137,7 @@ async fn run_subagent(
             Run::new(sub_session_id, sub_agent_id, request.task.clone())
         };
         run.mark_running();
-        match registrar.register_run(run.clone()) {
+        match registrar.register_run(run.clone()).await {
             Ok(()) => (Some(run), None),
             Err(error) => {
                 let message = format!("Failed to persist subagent run registration: {error}");

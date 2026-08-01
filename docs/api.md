@@ -1273,12 +1273,12 @@ open (absent otherwise):
 }
 ```
 
-Every job object also carries lifecycle_revision (starting at 0 and increasing
-for each accepted lifecycle mutation). terminal_reason is omitted for
-pending/active jobs. A terminal one-shot job keeps the legacy
-status "cancelled" shape for compatibility and distinguishes its outcome with
-terminal_reason "completed" or "deadline_reached"; an operator cancellation
-uses "operator_cancelled".
+Every job object carries `lifecycle_revision`, `retry_count`, and optional
+`last_error`. Status is one of `pending`, `active`, `completed`, `failed`, or
+`cancelled`. Terminal reasons are `completed`, `deadline_reached`,
+`retry_exhausted`, and `operator_cancelled`. Dispatch failures are retried from
+persisted scheduler intent with a bounded budget; a successful dispatch resets
+the retry fields.
 
 ### 7.2 Cancel a job
 `DELETE /jobs/{job_id}`
@@ -1300,6 +1300,8 @@ includes the authoritative `lifecycle_revision`, `status: "cancelled"`, and
   }
 }
 ```
+Completed or failed jobs also return `409`, with code `JOB_TERMINAL`; their
+persisted status, terminal reason, retry count, and last error are unchanged.
 
 ### 7.3 Run job now
 `POST /jobs/{job_id}:run`
@@ -1309,14 +1311,29 @@ includes the authoritative `lifecycle_revision`, `status: "cancelled"`, and
 
 ---
 
-## 8) Audit (MVP placeholder)
+## 8) Audit and operations
 
-MVP may store audit records in-memory or alongside snapshots, but the shape should be defined.
+Audit records align with `docs/security-model.md`:
 
-Planned:
 - `GET /audit?session_id=<uuid>&limit=100`
 
-Audit records should align with `docs/security-model.md`.
+### 8.1 Operational metrics
+
+`GET /operations/metrics` is authenticated and returns process-lifetime counters
+plus current subscriber gauges:
+
+```json
+{
+  "queue_saturation_rejections_total": 0,
+  "lifecycle_transition_rejections_total": 0,
+  "replay_gaps_total": 0,
+  "replay_epoch_mismatches_total": 0,
+  "subscribers": { "runs": 0, "sessions": 0, "agents": 0, "activity": 0 },
+  "persistence_snapshot_rejections_total": 0,
+  "job_dispatch_retry_attempts_total": 0,
+  "job_dispatch_retry_exhaustions_total": 0
+}
+```
 
 ---
 

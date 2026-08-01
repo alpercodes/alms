@@ -1,5 +1,5 @@
 use alms_core::CreateJobRequest;
-use alms_core::job::{Job, JobId, JobSchedule, JobStatus};
+use alms_core::job::{Job, JobId, JobSchedule, JobStatus, JobTerminalReason};
 use alms_session::SqliteStore;
 use clap::Subcommand;
 
@@ -113,6 +113,15 @@ pub(crate) fn job_show(store: &SqliteStore, job_id_str: &str, json: bool) -> any
     println!("Prompt:      {}", job.prompt);
     println!("Schedule:    {}", schedule);
     println!("Status:      {}", fmt_job_status(job.status()));
+    if let Some(reason) = job.terminal_reason() {
+        println!("Reason:      {}", fmt_job_terminal_reason(reason));
+    }
+    if job.retry_count() > 0 {
+        println!("Retries:     {}", job.retry_count());
+    }
+    if let Some(error) = job.last_error() {
+        println!("Last Error:  {error}");
+    }
     println!("Created:     {}", fmt_time(&job.created_at));
     if let Some(t) = job.next_run_at {
         println!("Next Run:    {}", fmt_time(&t));
@@ -213,7 +222,18 @@ fn fmt_job_status(s: JobStatus) -> &'static str {
     match s {
         JobStatus::Pending => "pending",
         JobStatus::Active => "active",
+        JobStatus::Completed => "completed",
+        JobStatus::Failed => "failed",
         JobStatus::Cancelled => "cancelled",
+    }
+}
+
+fn fmt_job_terminal_reason(reason: JobTerminalReason) -> &'static str {
+    match reason {
+        JobTerminalReason::Completed => "completed",
+        JobTerminalReason::DeadlineReached => "deadline reached",
+        JobTerminalReason::RetryExhausted => "retry exhausted",
+        JobTerminalReason::OperatorCancelled => "operator cancelled",
     }
 }
 

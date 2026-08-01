@@ -22,6 +22,21 @@ const PRESETS = [
     { label: '1d',   cron: '0 0 * * *',       desc: 'Daily at midnight' },
 ];
 
+function isCancellableStatus(status) {
+    return status === 'pending' || status === 'active';
+}
+
+function jobStatusLabel(job) {
+    const status = job.status || 'active';
+    if (!job.terminal_reason) return status;
+    return `${status} (${job.terminal_reason.replaceAll('_', ' ')})`;
+}
+
+function retryLabel(job) {
+    if (!job.retry_count) return '';
+    return `${job.retry_count} dispatch ${job.retry_count === 1 ? 'retry' : 'retries'}`;
+}
+
 /** Human-readable description of a cron expression. */
 function describeCron(expr) {
     if (!expr) return '';
@@ -239,9 +254,11 @@ export function JobsTab() {
                             <span>${describeCron(j.schedule?.cron) || (j.schedule?.type === 'once' ? 'Once at ' + fmtDate(j.schedule.run_at) : JSON.stringify(j.schedule))}</span>
                             ${j.next_run_at && html`<span> | next: ${fmtDate(j.next_run_at)}</span>`}
                             ${j.last_run_at && html`<span> | last run: ${fmtDate(j.last_run_at)}</span>`}
+                            ${retryLabel(j) && html`<span> | ${retryLabel(j)}</span>`}
+                            ${j.last_error && html`<span class="job-last-error"> | last error: ${j.last_error}</span>`}
                         </div>
-                        <span class="job-status-${j.status || 'active'}">${j.status || 'active'}</span>
-                        ${j.status !== 'cancelled' && !j.optimistic && html`
+                        <span class="job-status-${j.status || 'active'}">${jobStatusLabel(j)}</span>
+                        ${isCancellableStatus(j.status || 'active') && !j.optimistic && html`
                             <button class="job-cancel" onClick=${() => onCancel(j.id)}>Cancel</button>
                         `}
                     </div>

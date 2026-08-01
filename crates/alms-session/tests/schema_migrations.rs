@@ -41,13 +41,16 @@ fn fresh_install_reaches_current_schema() {
         vec![
             (1, "normalize_legacy_schema".to_string()),
             (2, "add_lifecycle_metadata".to_string()),
-        ]
+            (3, "normalize_job_terminal_states".to_string()),
+        ],
     );
     for (table, column) in [
         ("runs", "lifecycle_revision"),
         ("runs", "terminal_reason"),
         ("jobs", "lifecycle_revision"),
         ("jobs", "terminal_reason"),
+        ("jobs", "retry_count"),
+        ("jobs", "last_error"),
     ] {
         assert!(column_exists(&conn, table, column), "{table}.{column}");
     }
@@ -195,15 +198,15 @@ fn checkpoint_database_upgrades_without_data_loss() {
         )
         .unwrap();
     assert_eq!(run_metadata, (0, None));
-    let job_metadata: (i64, Option<String>) = conn
+    let job_metadata: (i64, Option<String>, i64, Option<String>) = conn
         .query_row(
-            "SELECT lifecycle_revision, terminal_reason FROM jobs
+            "SELECT lifecycle_revision, terminal_reason, retry_count, last_error FROM jobs
              WHERE id = '55555555-5555-4555-8555-555555555555'",
             [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
         .unwrap();
-    assert_eq!(job_metadata, (0, None));
+    assert_eq!(job_metadata, (0, None, 0, None));
 }
 
 #[test]
@@ -217,7 +220,51 @@ fn repeated_startup_is_idempotent() {
     }
 
     let conn = Connection::open(path).unwrap();
-    assert_eq!(migration_history(&conn).len(), 2);
+    assert_eq!(migration_history(&conn).len(), 3);
+}
+
+#[test]
+fn legacy_spent_one_shot_is_normalized_to_completed() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("legacy-job-terminal.db");
+    let store = SqliteStore::open(&path).unwrap();
+    drop(store);
+
+    let conn = Connection::open(&path).unwrap();
+    conn.execute("DELETE FROM schema_migrations WHERE version = 3", [])
+        .unwrap();
+    conn.execute(
+        "INSERT INTO jobs (
+            id, agent_id, prompt, schedule, status, created_at,
+            lifecycle_revision, terminal_reason
+         ) VALUES (
+            '55555555-5555-4555-8555-555555555555',
+            '11111111-1111-4111-8111-111111111111',
+            'legacy completed job',
+            '{\"type\":\"once\",\"run_at\":\"2026-07-11T00:00:00Z\"}',
+            'cancelled',
+            '2026-07-10T00:00:00Z',
+            1,
+            'completed'
+         )",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+
+    let store = SqliteStore::open(&path).unwrap();
+    assert_eq!(store.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
+    drop(store);
+
+    let conn = Connection::open(path).unwrap();
+    let status: String = conn
+        .query_row(
+            "SELECT status FROM jobs WHERE id = '55555555-5555-4555-8555-555555555555'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(status, "completed");
 }
 
 #[test]
@@ -242,7 +289,7 @@ fn concurrent_startup_applies_each_version_once() {
         }
 
         let conn = Connection::open(path).unwrap();
-        assert_eq!(migration_history(&conn).len(), 2);
+        assert_eq!(migration_history(&conn).len(), 3);
     }
 }
 
@@ -386,4 +433,6 @@ fn migration_history_records_are_queryable_for_operators() {
     assert_eq!(rows[1].0, 2);
     assert_eq!(rows[1].1, "add_lifecycle_metadata");
     assert!(rows.iter().all(|(_, _, applied_at)| !applied_at.is_empty()));
+    assert_eq!(rows[2].0, 3);
+    assert_eq!(rows[2].1, "normalize_job_terminal_states");
 }

@@ -12,6 +12,7 @@ use crate::approvals::{list_approvals, resolve_approval};
 use crate::auth::SSE_ENDPOINT_SEGMENTS;
 use crate::auth_keys;
 use crate::jobs::{cancel_job, create_job, get_job, list_jobs};
+use crate::operations::get_operational_metrics;
 use crate::runs::{
     cancel_dm, cancel_run, cancel_subagent, classify_session_type, create_run, get_run_reasoning,
     get_run_status, get_run_text, get_run_tool_calls, is_internal_context_id, list_runs,
@@ -208,6 +209,8 @@ pub(crate) fn protected_router() -> Router<AppState> {
         .route("/approvals", get(list_approvals))
         .route("/approvals/{approval_id}", post(resolve_approval))
         // Audit
+        // Operational counters and live SSE subscriber gauges.
+        .route("/operations/metrics", get(get_operational_metrics))
         .route("/audit", get(get_audit))
         // Agent registry CRUD
         .route(
@@ -576,6 +579,10 @@ async fn delete_session_by_id(
     State(state): State<AppState>,
     Path(session_id): Path<SessionId>,
 ) -> impl IntoResponse {
+    let _admission_guard =
+        crate::runs::lifecycle::acquire_run_admission_guard(&state.run_admission_gates, session_id)
+            .await;
+
     // Look up the session to get agent_id + context_id, then delete.
     match state.session_manager.get(session_id) {
         Ok(session) => {

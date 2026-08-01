@@ -8,6 +8,15 @@ impl SqliteStore {
 
     /// Insert or update a run row (upsert).
     pub fn save_run(&self, run: &Run) -> AlmsResult<()> {
+        let conn = self.conn.lock();
+        let affected = Self::save_run_on(&conn, run)?;
+        if affected == 0 {
+            self.record_persistence_snapshot_rejection();
+        }
+        Ok(())
+    }
+
+    pub(super) fn save_run_on(conn: &Connection, run: &Run) -> AlmsResult<usize> {
         let (prompt_tokens, completion_tokens) = run
             .usage
             .map(|u| {
@@ -41,9 +50,7 @@ impl SqliteStore {
                 run.lifecycle_revision()
             ))
         })?;
-        self.conn
-            .lock()
-            .execute(
+        let affected = conn.execute(
                 "INSERT INTO runs \
                  (run_id, session_id, agent_id, input, response, error, status, \
                   started_at, ended_at, prompt_tokens, completion_tokens, job_id, \
@@ -79,9 +86,52 @@ impl SqliteStore {
                 ],
             )
             .map_err(|e| AlmsError::Runtime(format!("SQLite save_run: {e}")))?;
-        Ok(())
+        Ok(affected)
     }
 
+    /// Persist a queued run, its initial user message, and the session
+    /// activity timestamp as one authoritative admission transaction.
+    pub fn save_run_with_initial_message(
+        &self,
+        run: &Run,
+        message: &Message,
+    ) -> AlmsResult<Timestamp> {
+        let mut conn = self.conn.lock();
+        let touched_at = Timestamp::now();
+        let transaction = conn
+            .transaction()
+            .map_err(|error| AlmsError::Runtime(format!("SQLite begin run admission: {error}")))?;
+
+        let affected = Self::save_run_on(&transaction, run)?;
+        if affected != 1 {
+            self.record_persistence_snapshot_rejection();
+            return Err(AlmsError::Runtime(format!(
+                "SQLite run admission rejected duplicate or stale run {}",
+                run.run_id.0
+            )));
+        }
+        Self::save_message_on(&transaction, run.session_id, message)?;
+        let updated = transaction
+            .execute(
+                "UPDATE sessions
+                 SET last_activity = CASE
+                     WHEN last_activity > ?1 THEN last_activity ELSE ?1
+                 END
+                 WHERE id = ?2",
+                params![touched_at.0.to_rfc3339(), run.session_id.0.to_string(),],
+            )
+            .map_err(|error| {
+                AlmsError::Runtime(format!("SQLite touch admitted run session: {error}"))
+            })?;
+        if updated != 1 {
+            return Err(AlmsError::SessionNotFound(run.session_id.0.to_string()));
+        }
+
+        transaction
+            .commit()
+            .map_err(|error| AlmsError::Runtime(format!("SQLite commit run admission: {error}")))?;
+        Ok(touched_at)
+    }
     /// Load a single run by its ID.
     pub fn load_run(&self, run_id: RunId) -> AlmsResult<Option<Run>> {
         let conn = self.conn.lock();
@@ -170,19 +220,28 @@ impl SqliteStore {
         Ok(rows)
     }
 
-    /// Mark any `queued` or `running` runs as `failed` in SQLite.
+    /// Reconcile durable run/input state after a gateway restart.
     ///
     /// These are stale leftovers from a previous process that crashed or was
-    /// killed. Returns the number of rows updated.
+    /// killed. Queued runs may still own an initial user message hidden by
+    /// `pending_input`; release that message in the same transaction as the
+    /// terminal run transition so restart recovery cannot expose a split state.
+    /// Inputs belonging to runs that were already terminal before the restart
+    /// are also released without changing the run's terminal state. This covers
+    /// cancellation winning before the queued worker claims its input.
+    /// Returns the number of runs updated.
     pub fn mark_stale_runs_failed(&self) -> AlmsResult<usize> {
+        let mut conn = self.conn.lock();
+        let transaction = conn.transaction().map_err(|error| {
+            AlmsError::Runtime(format!("SQLite begin stale-run recovery: {error}"))
+        })?;
         let stale_runs = {
-            let conn = self.conn.lock();
-            let mut stmt = conn
+            let mut stmt = transaction
                 .prepare(
                     "SELECT run_id, session_id, agent_id, input, response, error, status, \
                             started_at, ended_at, prompt_tokens, completion_tokens, job_id, \
                             parent_run_id, created_at, resolved_config, lifecycle_revision, terminal_reason \
-                     FROM runs WHERE status IN ('queued', 'running')",
+                     FROM runs WHERE status IN ('queued', 'running') ORDER BY created_at ASC",
                 )
                 .map_err(|e| {
                     AlmsError::Runtime(format!("SQLite prepare mark_stale_runs_failed: {e}"))
@@ -196,15 +255,71 @@ impl SqliteStore {
                     AlmsError::Runtime(format!("SQLite parse mark_stale_runs_failed: {e}"))
                 })?
         };
+        let terminal_runs_with_pending_input = {
+            let mut stmt = transaction
+                .prepare(
+                    // Keep messages as SQLite's outer loop so startup performs one
+                    // history scan plus primary-key run lookups, not one history
+                    // scan for every terminal run in a long-lived session.
+                    r#"SELECT DISTINCT
+                            runs.run_id, runs.session_id, runs.agent_id, runs.input, runs.response,
+                            runs.error, runs.status, runs.started_at, runs.ended_at,
+                            runs.prompt_tokens, runs.completion_tokens, runs.job_id,
+                            runs.parent_run_id, runs.created_at, runs.resolved_config,
+                            runs.lifecycle_revision, runs.terminal_reason
+                       FROM messages CROSS JOIN runs
+                       WHERE messages.metadata IS NOT NULL
+                         AND json_extract(
+                             CASE WHEN json_valid(messages.metadata)
+                                  THEN messages.metadata ELSE '{}' END,
+                             '$.pending_input'
+                         ) = 1
+                         AND runs.run_id = json_extract(
+                             CASE WHEN json_valid(messages.metadata)
+                                  THEN messages.metadata ELSE '{}' END,
+                             '$.run_id'
+                         )
+                         AND runs.session_id = messages.session_id
+                         AND runs.status IN ('completed', 'failed', 'cancelled')
+                       ORDER BY runs.created_at ASC"#,
+                )
+                .map_err(|e| {
+                    AlmsError::Runtime(format!(
+                        "SQLite prepare terminal pending-input recovery: {e}"
+                    ))
+                })?;
+            stmt.query_map([], parse_run_row)
+                .map_err(|e| {
+                    AlmsError::Runtime(format!("SQLite query terminal pending-input recovery: {e}"))
+                })?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| {
+                    AlmsError::Runtime(format!("SQLite parse terminal pending-input recovery: {e}"))
+                })?
+        };
 
         let mut count = 0;
+        let claimed_at = Timestamp::now().0.to_rfc3339();
         for mut run in stale_runs {
             match run.transition(RunTransition::Fail {
                 error: "stale: gateway restarted".to_string(),
                 terminal_reason: "gateway_restarted".to_string(),
             }) {
                 TransitionOutcome::Applied { .. } => {
-                    self.save_run(&run)?;
+                    let affected = Self::save_run_on(&transaction, &run)?;
+                    if affected != 1 {
+                        self.record_persistence_snapshot_rejection();
+                        return Err(AlmsError::Runtime(format!(
+                            "stale run {} lost its authoritative recovery transition",
+                            run.run_id.0
+                        )));
+                    }
+                    Self::settle_pending_input_on(
+                        &transaction,
+                        run.session_id,
+                        run.run_id,
+                        &claimed_at,
+                    )?;
                     count += 1;
                 }
                 TransitionOutcome::Rejected { .. } => {
@@ -214,10 +329,89 @@ impl SqliteStore {
                         run.lifecycle_revision()
                     )));
                 }
-                TransitionOutcome::NoOp { .. } => {}
+                TransitionOutcome::NoOp { .. } => {
+                    return Err(AlmsError::Runtime(format!(
+                        "stale run {} produced a no-op recovery transition",
+                        run.run_id.0
+                    )));
+                }
             }
         }
+        for run in terminal_runs_with_pending_input {
+            Self::settle_pending_input_on(&transaction, run.session_id, run.run_id, &claimed_at)?;
+        }
+        transaction.commit().map_err(|error| {
+            AlmsError::Runtime(format!("SQLite commit stale-run recovery: {error}"))
+        })?;
         Ok(count)
+    }
+
+    fn settle_pending_input_on(
+        conn: &Connection,
+        session_id: SessionId,
+        run_id: RunId,
+        claimed_at: &str,
+    ) -> AlmsResult<usize> {
+        let sid = session_id.0.to_string();
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, metadata FROM messages \
+                 WHERE session_id = ?1 AND metadata IS NOT NULL ORDER BY seq",
+            )
+            .map_err(|error| {
+                AlmsError::Runtime(format!("SQLite prepare pending-input recovery: {error}"))
+            })?;
+        let rows = stmt
+            .query_map(params![&sid], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|error| {
+                AlmsError::Runtime(format!("SQLite query pending-input recovery: {error}"))
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| {
+                AlmsError::Runtime(format!("SQLite parse pending-input recovery: {error}"))
+            })?;
+        drop(stmt);
+
+        let run_id = run_id.0.to_string();
+        let mut settled = 0;
+        for (message_id, metadata_json) in rows {
+            let Ok(mut metadata) = serde_json::from_str::<serde_json::Value>(&metadata_json) else {
+                continue;
+            };
+            if metadata.get("run_id").and_then(serde_json::Value::as_str) != Some(&run_id)
+                || metadata
+                    .get("pending_input")
+                    .and_then(serde_json::Value::as_bool)
+                    != Some(true)
+            {
+                continue;
+            }
+            let Some(object) = metadata.as_object_mut() else {
+                continue;
+            };
+            object.insert("pending_input".to_string(), serde_json::Value::Bool(false));
+            object.insert(
+                "input_claimed_at".to_string(),
+                serde_json::Value::String(claimed_at.to_string()),
+            );
+            let updated = conn
+                .execute(
+                    "UPDATE messages SET metadata = ?1 WHERE id = ?2 AND session_id = ?3",
+                    params![serde_json::to_string(&metadata)?, message_id, &sid],
+                )
+                .map_err(|error| {
+                    AlmsError::Runtime(format!("SQLite settle pending input: {error}"))
+                })?;
+            if updated != 1 {
+                return Err(AlmsError::Runtime(format!(
+                    "pending input message was not updated for stale run {run_id}"
+                )));
+            }
+            settled += 1;
+        }
+        Ok(settled)
     }
 }
 
@@ -350,6 +544,7 @@ mod tests {
             loaded.lifecycle_revision(),
             authoritative.lifecycle_revision()
         );
+        assert_eq!(store.persistence_snapshot_rejections_total(), 1);
     }
 
     #[test]
@@ -391,11 +586,24 @@ mod tests {
     fn test_mark_stale_runs_failed() {
         let store = SqliteStore::open_in_memory().unwrap();
         let session = new_session();
+        store.save_session(&session).unwrap();
 
         // Insert a queued run and a running run.
         let queued_run = new_run(session.id, session.agent_id);
         let queued_id = queued_run.run_id;
-        store.save_run(&queued_run).unwrap();
+        let queued_message = Message {
+            id: "stale-queued-input".to_string(),
+            role: Role::User,
+            content: Content::Text(queued_run.input.clone()),
+            timestamp: Timestamp::now(),
+            metadata: Some(serde_json::json!({
+                "pending_input": true,
+                "run_id": queued_id.0.to_string(),
+            })),
+        };
+        store
+            .save_run_with_initial_message(&queued_run, &queued_message)
+            .unwrap();
 
         let mut running_run = new_run(session.id, session.agent_id);
         running_run.mark_running();
@@ -426,6 +634,14 @@ mod tests {
         assert!(q.ended_at.is_some());
         assert_eq!(q.lifecycle_revision(), 1);
         assert_eq!(q.terminal_reason(), Some("gateway_restarted"));
+        let recovered_messages = store.load_messages(session.id).unwrap();
+        let recovered_input = recovered_messages
+            .iter()
+            .find(|message| message.id == queued_message.id)
+            .expect("queued input must remain durable");
+        let metadata = recovered_input.metadata.as_ref().unwrap();
+        assert_eq!(metadata["pending_input"], false);
+        assert!(metadata["input_claimed_at"].is_string());
 
         let r = store.load_run(running_id).unwrap().unwrap();
         assert!(matches!(r.status(), RunStatus::Failed));
@@ -437,6 +653,57 @@ mod tests {
         let c = store.load_run(completed_id).unwrap().unwrap();
         assert!(matches!(c.status(), RunStatus::Completed));
         assert_eq!(c.output.as_deref(), Some("done"));
+    }
+
+    #[test]
+    fn stale_run_recovery_rolls_back_status_when_pending_input_update_fails() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let session = new_session();
+        store.save_session(&session).unwrap();
+        let run = new_run(session.id, session.agent_id);
+        let message = Message {
+            id: "recovery-rollback-input".to_string(),
+            role: Role::User,
+            content: Content::Text(run.input.clone()),
+            timestamp: Timestamp::now(),
+            metadata: Some(serde_json::json!({
+                "pending_input": true,
+                "run_id": run.run_id.0.to_string(),
+            })),
+        };
+        store.save_run_with_initial_message(&run, &message).unwrap();
+        store
+            .conn
+            .lock()
+            .execute_batch(
+                "CREATE TEMP TRIGGER reject_pending_input_recovery
+                 BEFORE UPDATE OF metadata ON messages
+                 WHEN OLD.id = 'recovery-rollback-input'
+                 BEGIN
+                     SELECT RAISE(ABORT, 'injected pending-input recovery failure');
+                 END;",
+            )
+            .unwrap();
+
+        let error = store.mark_stale_runs_failed().unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("injected pending-input recovery failure")
+        );
+        assert!(matches!(
+            store.load_run(run.run_id).unwrap().unwrap().status(),
+            RunStatus::Queued
+        ));
+        let messages = store.load_messages(session.id).unwrap();
+        assert_eq!(
+            messages[0].metadata.as_ref().unwrap()["pending_input"],
+            true
+        );
+        assert!(
+            messages[0].metadata.as_ref().unwrap()["input_claimed_at"].is_null(),
+            "the failed transaction must not partially release the prompt"
+        );
     }
 
     #[test]
@@ -621,5 +888,133 @@ mod tests {
             .resolved_config()
             .expect("resolved_config should round-trip");
         assert_eq!(loaded_cfg, &cfg);
+    }
+
+    #[test]
+    fn run_admission_commits_run_message_and_activity_together() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let session = new_session();
+        store.save_session(&session).unwrap();
+        let run = new_run(session.id, session.agent_id);
+        let message = Message {
+            id: "admission-message".to_string(),
+            role: Role::User,
+            content: Content::Text(run.input.clone()),
+            timestamp: Timestamp::now(),
+            metadata: Some(serde_json::json!({
+                "pending_input": true,
+                "run_id": run.run_id.0.to_string(),
+            })),
+        };
+
+        let touched_at = store.save_run_with_initial_message(&run, &message).unwrap();
+
+        assert!(store.load_run(run.run_id).unwrap().is_some());
+        let messages = store.load_messages(session.id).unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].id, message.id);
+        assert_eq!(
+            store
+                .load_session_by_id(session.id)
+                .unwrap()
+                .unwrap()
+                .last_activity,
+            touched_at
+        );
+
+        let mut stale_session = session.clone();
+        stale_session.last_activity = Timestamp(touched_at.0 - chrono::Duration::hours(1));
+        store.save_session(&stale_session).unwrap();
+        assert_eq!(
+            store
+                .load_session_by_id(session.id)
+                .unwrap()
+                .unwrap()
+                .last_activity,
+            touched_at,
+            "a delayed stale session snapshot must not regress activity"
+        );
+    }
+
+    #[test]
+    fn run_admission_rolls_back_run_when_message_write_fails() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let session = new_session();
+        store.save_session(&session).unwrap();
+        let run = new_run(session.id, session.agent_id);
+        let message = Message {
+            id: "rejected-admission-message".to_string(),
+            role: Role::User,
+            content: Content::Text(run.input.clone()),
+            timestamp: Timestamp::now(),
+            metadata: None,
+        };
+        store
+            .conn
+            .lock()
+            .execute_batch(
+                "CREATE TRIGGER reject_admission_message
+                 BEFORE INSERT ON messages
+                 BEGIN
+                     SELECT RAISE(ABORT, 'injected admission message failure');
+                 END;",
+            )
+            .unwrap();
+
+        let error = store
+            .save_run_with_initial_message(&run, &message)
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("injected admission message failure")
+        );
+        assert!(
+            store.load_run(run.run_id).unwrap().is_none(),
+            "the run insert must roll back with the rejected message"
+        );
+        assert!(
+            store.load_messages(session.id).unwrap().is_empty(),
+            "the transaction must not expose a partial initial message"
+        );
+        assert_eq!(
+            store
+                .load_session_by_id(session.id)
+                .unwrap()
+                .unwrap()
+                .last_activity,
+            session.last_activity
+        );
+    }
+
+    #[test]
+    fn run_admission_rejects_duplicate_run_without_committing_message() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let session = new_session();
+        store.save_session(&session).unwrap();
+        let run = new_run(session.id, session.agent_id);
+        store.save_run(&run).unwrap();
+        let message = Message {
+            id: "duplicate-run-message".to_string(),
+            role: Role::User,
+            content: Content::Text(run.input.clone()),
+            timestamp: Timestamp::now(),
+            metadata: None,
+        };
+
+        let error = store
+            .save_run_with_initial_message(&run, &message)
+            .unwrap_err();
+        assert!(error.to_string().contains("duplicate or stale run"));
+        assert!(store.load_messages(session.id).unwrap().is_empty());
+        assert_eq!(
+            store
+                .load_session_by_id(session.id)
+                .unwrap()
+                .unwrap()
+                .last_activity,
+            session.last_activity
+        );
+        assert_eq!(store.persistence_snapshot_rejections_total(), 1);
     }
 }

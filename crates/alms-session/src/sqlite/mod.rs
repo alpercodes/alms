@@ -185,6 +185,7 @@ CREATE INDEX IF NOT EXISTS idx_session_summaries_agent
 /// SQLite-backed store for sessions, messages, and audit events.
 pub struct SqliteStore {
     conn: Arc<Mutex<Connection>>,
+    persistence_snapshot_rejections: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl std::fmt::Debug for SqliteStore {
@@ -197,6 +198,7 @@ impl Clone for SqliteStore {
     fn clone(&self) -> Self {
         Self {
             conn: Arc::clone(&self.conn),
+            persistence_snapshot_rejections: Arc::clone(&self.persistence_snapshot_rejections),
         }
     }
 }
@@ -209,6 +211,7 @@ impl SqliteStore {
         migrations::configure_and_apply(&mut conn)?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
+            persistence_snapshot_rejections: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         })
     }
 
@@ -219,7 +222,18 @@ impl SqliteStore {
         migrations::configure_and_apply(&mut conn)?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
+            persistence_snapshot_rejections: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         })
+    }
+
+    pub fn persistence_snapshot_rejections_total(&self) -> u64 {
+        self.persistence_snapshot_rejections
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub(super) fn record_persistence_snapshot_rejection(&self) {
+        self.persistence_snapshot_rejections
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Return the latest successfully committed schema migration.
@@ -270,6 +284,8 @@ fn job_status_to_str(status: JobStatus) -> &'static str {
     match status {
         JobStatus::Pending => "pending",
         JobStatus::Active => "active",
+        JobStatus::Completed => "completed",
+        JobStatus::Failed => "failed",
         JobStatus::Cancelled => "cancelled",
     }
 }
@@ -277,6 +293,8 @@ fn job_status_to_str(status: JobStatus) -> &'static str {
 fn str_to_job_status(s: &str) -> JobStatus {
     match s {
         "active" => JobStatus::Active,
+        "completed" => JobStatus::Completed,
+        "failed" => JobStatus::Failed,
         "cancelled" => JobStatus::Cancelled,
         _ => JobStatus::Pending,
     }
@@ -287,6 +305,7 @@ fn job_terminal_reason_to_str(reason: JobTerminalReason) -> &'static str {
         JobTerminalReason::Completed => "completed",
         JobTerminalReason::DeadlineReached => "deadline_reached",
         JobTerminalReason::OperatorCancelled => "operator_cancelled",
+        JobTerminalReason::RetryExhausted => "retry_exhausted",
     }
 }
 
@@ -295,6 +314,7 @@ fn str_to_job_terminal_reason(s: &str) -> Option<JobTerminalReason> {
         "completed" => Some(JobTerminalReason::Completed),
         "deadline_reached" => Some(JobTerminalReason::DeadlineReached),
         "operator_cancelled" => Some(JobTerminalReason::OperatorCancelled),
+        "retry_exhausted" => Some(JobTerminalReason::RetryExhausted),
         _ => None,
     }
 }
@@ -332,6 +352,8 @@ fn parse_job_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Job> {
     let lifecycle_revision: i64 = row.get(8)?;
     let terminal_reason_str: Option<String> = row.get(9)?;
 
+    let retry_count: i64 = row.get(10)?;
+    let last_error: Option<String> = row.get(11)?;
     let id_uuid = uuid::Uuid::parse_str(&id_str).map_err(|e| {
         rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
     })?;
@@ -367,6 +389,8 @@ fn parse_job_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Job> {
         terminal_reason_str
             .as_deref()
             .and_then(str_to_job_terminal_reason),
+        u32::try_from(retry_count).unwrap_or(u32::MAX),
+        last_error,
     ))
 }
 

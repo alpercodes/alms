@@ -48,24 +48,32 @@ pub enum JobStatus {
     Pending,
     /// Recurring job that has fired at least once
     Active,
+    /// Job finished normally and will not fire again
+    Completed,
+    /// Job exhausted its bounded recovery budget and will not fire again
+    Failed,
     /// Cancelled — will not fire again
     Cancelled,
 }
 
-/// Why a job entered its legacy terminal cancelled status.
-///
-/// The status string remains backward compatible while this field separates
-/// normal one-shot completion from operator cancellation.
+impl JobStatus {
+    pub fn is_terminal(self) -> bool {
+        matches!(self, Self::Completed | Self::Failed | Self::Cancelled)
+    }
+}
+
+/// Why a job entered a terminal status.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum JobTerminalReason {
     Completed,
     DeadlineReached,
+    RetryExhausted,
     OperatorCancelled,
 }
 
 /// The only supported mutations of a job's lifecycle state.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub enum JobTransition {
     SetNextRunAt(Option<DateTime<Utc>>),
     RecordRecurringRun {
@@ -75,6 +83,11 @@ pub enum JobTransition {
     CompleteOneShot {
         ran_at: DateTime<Utc>,
         terminal_reason: JobTerminalReason,
+    },
+    RecordDispatchFailure {
+        error: String,
+        retry_at: DateTime<Utc>,
+        max_attempts: u32,
     },
     Cancel,
 }
@@ -96,9 +109,16 @@ pub struct Job {
     /// Monotonically increases for every accepted lifecycle mutation.
     #[serde(default)]
     lifecycle_revision: u64,
-    /// Distinguishes completion from cancellation for legacy terminal rows.
+    /// Refines a terminal status with a machine-readable cause.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     terminal_reason: Option<JobTerminalReason>,
+    /// Consecutive recoverable dispatch failures since the last successful run.
+    #[serde(default)]
+    retry_count: u32,
+    /// Most recent recoverable dispatch error, retained while retrying or when
+    /// the retry budget is exhausted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_error: Option<String>,
 }
 
 impl Job {
@@ -119,6 +139,8 @@ impl Job {
             last_run_at: None,
             lifecycle_revision: 0,
             terminal_reason: None,
+            retry_count: 0,
+            last_error: None,
         }
     }
 
@@ -135,6 +157,8 @@ impl Job {
         last_run_at: Option<DateTime<Utc>>,
         lifecycle_revision: u64,
         terminal_reason: Option<JobTerminalReason>,
+        retry_count: u32,
+        last_error: Option<String>,
     ) -> Self {
         Self {
             id,
@@ -147,6 +171,8 @@ impl Job {
             last_run_at,
             lifecycle_revision,
             terminal_reason,
+            retry_count,
+            last_error,
         }
     }
 
@@ -162,24 +188,33 @@ impl Job {
         self.terminal_reason
     }
 
+    pub fn retry_count(&self) -> u32 {
+        self.retry_count
+    }
+
+    pub fn last_error(&self) -> Option<&str> {
+        self.last_error.as_deref()
+    }
+
     /// Apply a lifecycle transition under the caller's synchronization
-    /// boundary. Cancelled is absorbing and duplicate cancellation is a
-    /// no-op, so competing scheduler/operator writers have one winner.
+    /// boundary. Terminal states are absorbing and duplicate cancellation is
+    /// a no-op, so competing scheduler/operator writers have one winner.
     pub fn transition(&mut self, transition: JobTransition) -> TransitionOutcome<JobStatus> {
         let from = self.status;
-        if from == JobStatus::Cancelled {
+        if from.is_terminal() {
             return match transition {
-                JobTransition::Cancel => TransitionOutcome::NoOp {
+                JobTransition::Cancel if from == JobStatus::Cancelled => TransitionOutcome::NoOp {
                     state: from,
                     revision: self.lifecycle_revision,
                 },
                 _ => TransitionOutcome::Rejected {
                     from,
-                    to: match transition {
+                    to: match &transition {
                         JobTransition::RecordRecurringRun { .. } => JobStatus::Active,
-                        JobTransition::CompleteOneShot { .. } => JobStatus::Cancelled,
+                        JobTransition::CompleteOneShot { .. } => JobStatus::Completed,
+                        JobTransition::RecordDispatchFailure { .. } => JobStatus::Failed,
                         JobTransition::SetNextRunAt(_) => from,
-                        JobTransition::Cancel => unreachable!(),
+                        JobTransition::Cancel => JobStatus::Cancelled,
                     },
                     revision: self.lifecycle_revision,
                 },
@@ -197,11 +232,20 @@ impl Job {
         let to = match &transition {
             JobTransition::SetNextRunAt(_) => from,
             JobTransition::RecordRecurringRun { .. } => JobStatus::Active,
-            JobTransition::CompleteOneShot { .. } | JobTransition::Cancel => JobStatus::Cancelled,
+            JobTransition::CompleteOneShot { .. } => JobStatus::Completed,
+            JobTransition::RecordDispatchFailure { max_attempts, .. } => {
+                if self.retry_count.saturating_add(1) >= *max_attempts {
+                    JobStatus::Failed
+                } else {
+                    from
+                }
+            }
+            JobTransition::Cancel => JobStatus::Cancelled,
         };
         let legal = match (&transition, &self.schedule) {
             (JobTransition::SetNextRunAt(_), _) | (JobTransition::Cancel, _) => true,
             (JobTransition::RecordRecurringRun { .. }, JobSchedule::Recurring { .. }) => true,
+            (JobTransition::RecordDispatchFailure { max_attempts, .. }, _) => *max_attempts > 0,
             (
                 JobTransition::CompleteOneShot {
                     terminal_reason, ..
@@ -236,6 +280,8 @@ impl Job {
                 self.status = JobStatus::Active;
                 self.next_run_at = next_run_at;
                 self.terminal_reason = None;
+                self.retry_count = 0;
+                self.last_error = None;
                 JobStatus::Active
             }
             JobTransition::CompleteOneShot {
@@ -243,15 +289,37 @@ impl Job {
                 terminal_reason,
             } => {
                 self.last_run_at = Some(ran_at);
-                self.status = JobStatus::Cancelled;
+                self.status = JobStatus::Completed;
                 self.next_run_at = None;
                 self.terminal_reason = Some(terminal_reason);
-                JobStatus::Cancelled
+                self.retry_count = 0;
+                self.last_error = None;
+                JobStatus::Completed
+            }
+            JobTransition::RecordDispatchFailure {
+                error,
+                retry_at,
+                max_attempts,
+            } => {
+                self.retry_count = self.retry_count.saturating_add(1);
+                self.last_error = Some(error);
+                if self.retry_count >= max_attempts {
+                    self.status = JobStatus::Failed;
+                    self.next_run_at = None;
+                    self.terminal_reason = Some(JobTerminalReason::RetryExhausted);
+                    JobStatus::Failed
+                } else {
+                    self.next_run_at = Some(retry_at);
+                    self.terminal_reason = None;
+                    from
+                }
             }
             JobTransition::Cancel => {
                 self.status = JobStatus::Cancelled;
                 self.next_run_at = None;
                 self.terminal_reason = Some(JobTerminalReason::OperatorCancelled);
+                self.retry_count = 0;
+                self.last_error = None;
                 JobStatus::Cancelled
             }
         };
@@ -289,6 +357,8 @@ mod tests {
             last_run_at: None,
             lifecycle_revision: 0,
             terminal_reason: None,
+            retry_count: 0,
+            last_error: None,
         }
     }
 
@@ -367,5 +437,85 @@ mod tests {
         assert_eq!(job.status, JobStatus::Pending);
         assert!(job.last_run_at.is_none());
         assert_eq!(job.lifecycle_revision, MAX_LIFECYCLE_REVISION);
+    }
+
+    #[test]
+    fn dispatch_failures_are_bounded_and_terminal() {
+        let mut job = job(JobSchedule::Once { run_at: Utc::now() });
+        let first_retry = Utc::now() + chrono::Duration::seconds(5);
+        assert!(matches!(
+            job.transition(JobTransition::RecordDispatchFailure {
+                error: "first".to_string(),
+                retry_at: first_retry,
+                max_attempts: 3,
+            }),
+            TransitionOutcome::Applied {
+                to: JobStatus::Pending,
+                ..
+            }
+        ));
+        assert_eq!(job.retry_count(), 1);
+        assert_eq!(job.next_run_at, Some(first_retry));
+        assert_eq!(job.last_error(), Some("first"));
+
+        assert!(matches!(
+            job.transition(JobTransition::RecordDispatchFailure {
+                error: "second".to_string(),
+                retry_at: Utc::now(),
+                max_attempts: 3,
+            }),
+            TransitionOutcome::Applied {
+                to: JobStatus::Pending,
+                ..
+            }
+        ));
+        assert_eq!(job.retry_count(), 2);
+
+        assert!(matches!(
+            job.transition(JobTransition::RecordDispatchFailure {
+                error: "third".to_string(),
+                retry_at: Utc::now(),
+                max_attempts: 3,
+            }),
+            TransitionOutcome::Applied {
+                to: JobStatus::Failed,
+                ..
+            }
+        ));
+        assert_eq!(job.status(), JobStatus::Failed);
+        assert_eq!(job.retry_count(), 3);
+        assert_eq!(
+            job.terminal_reason(),
+            Some(JobTerminalReason::RetryExhausted)
+        );
+        assert_eq!(job.last_error(), Some("third"));
+        assert!(matches!(
+            job.transition(JobTransition::SetNextRunAt(Some(Utc::now()))),
+            TransitionOutcome::Rejected { .. }
+        ));
+    }
+
+    #[test]
+    fn successful_recurring_run_clears_retry_metadata() {
+        let mut job = job(JobSchedule::Recurring {
+            cron: "* * * * *".to_string(),
+        });
+        assert!(
+            job.transition(JobTransition::RecordDispatchFailure {
+                error: "temporary".to_string(),
+                retry_at: Utc::now(),
+                max_attempts: 3,
+            })
+            .is_applied()
+        );
+        assert!(
+            job.transition(JobTransition::RecordRecurringRun {
+                ran_at: Utc::now(),
+                next_run_at: Some(Utc::now()),
+            })
+            .is_applied()
+        );
+        assert_eq!(job.retry_count(), 0);
+        assert_eq!(job.last_error(), None);
     }
 }

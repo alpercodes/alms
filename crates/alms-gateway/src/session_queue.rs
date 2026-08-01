@@ -12,7 +12,10 @@ use std::future::Future;
 use std::hash::Hash;
 use std::panic::AssertUnwindSafe;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio::time::{Duration, timeout};
 use tokio_util::sync::CancellationToken;
@@ -86,6 +89,7 @@ struct QueueInner<K> {
     slots: DashMap<K, Arc<QueueSlot>>,
     global_capacity: Arc<Semaphore>,
     limits: QueueLimits,
+    saturation_rejections: AtomicU64,
     shutdown: CancellationToken,
 }
 
@@ -214,8 +218,13 @@ where
                 global_capacity: Arc::new(Semaphore::new(limits.total)),
                 limits,
                 shutdown,
+                saturation_rejections: AtomicU64::new(0),
             }),
         }
+    }
+
+    pub fn saturation_rejections(&self) -> u64 {
+        self.inner.saturation_rejections.load(Ordering::Relaxed)
     }
 
     /// Attempt admission without waiting.
@@ -227,18 +236,24 @@ where
         let slot = SlotUse {
             slot: self.slot_for(key),
         };
-        let key_permit = slot
-            .slot
-            .capacity
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| AdmissionError::PerKeyFull)?;
-        let global_permit = self
-            .inner
-            .global_capacity
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| AdmissionError::GlobalFull)?;
+        let key_permit = match slot.slot.capacity.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                self.inner
+                    .saturation_rejections
+                    .fetch_add(1, Ordering::Relaxed);
+                return Err(AdmissionError::PerKeyFull);
+            }
+        };
+        let global_permit = match self.inner.global_capacity.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                self.inner
+                    .saturation_rejections
+                    .fetch_add(1, Ordering::Relaxed);
+                return Err(AdmissionError::GlobalFull);
+            }
+        };
 
         if self.inner.shutdown.is_cancelled() {
             return Err(AdmissionError::ShuttingDown);
@@ -591,6 +606,7 @@ mod tests {
             queue.try_reserve(3).expect_err("global full"),
             AdmissionError::GlobalFull
         );
+        assert_eq!(queue.saturation_rejections(), 2);
         assert_eq!(queue.pending_total(), 3);
 
         drop(second);

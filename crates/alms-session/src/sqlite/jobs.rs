@@ -16,18 +16,20 @@ impl SqliteStore {
                 job.lifecycle_revision()
             ))
         })?;
-        self.conn
+        let affected = self
+            .conn
             .lock()
             .execute(
                 "INSERT INTO jobs \
                  (id, agent_id, prompt, schedule, status, created_at, next_run_at, last_run_at, \
-                  lifecycle_revision, terminal_reason) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10) \
+                  lifecycle_revision, terminal_reason, retry_count, last_error) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12) \
                  ON CONFLICT(id) DO UPDATE SET \
                    agent_id=excluded.agent_id, prompt=excluded.prompt, schedule=excluded.schedule, \
                    status=excluded.status, created_at=excluded.created_at, \
                    next_run_at=excluded.next_run_at, last_run_at=excluded.last_run_at, \
-                   lifecycle_revision=excluded.lifecycle_revision, terminal_reason=excluded.terminal_reason \
+                   lifecycle_revision=excluded.lifecycle_revision, terminal_reason=excluded.terminal_reason, \
+                   retry_count=excluded.retry_count, last_error=excluded.last_error \
                  WHERE excluded.lifecycle_revision > jobs.lifecycle_revision",
                 params![
                     job.id.0.to_string(),
@@ -40,18 +42,23 @@ impl SqliteStore {
                     job.last_run_at.map(|t| t.to_rfc3339()),
                     lifecycle_revision,
                     job.terminal_reason().map(job_terminal_reason_to_str),
+                    job.retry_count(),
+                    job.last_error(),
                 ],
             )
             .map_err(|e| AlmsError::Runtime(format!("SQLite save_job: {e}")))?;
+        if affected == 0 {
+            self.record_persistence_snapshot_rejection();
+        }
         Ok(())
     }
 
-    /// Load all non-cancelled jobs, oldest first.
+    /// Load all non-terminal jobs, oldest first.
     pub fn load_all_jobs(&self) -> AlmsResult<Vec<Job>> {
         self.query_jobs(
             "SELECT id, agent_id, prompt, schedule, status, created_at, next_run_at, last_run_at, \
-                    lifecycle_revision, terminal_reason \
-             FROM jobs WHERE status != 'cancelled' ORDER BY rowid",
+                    lifecycle_revision, terminal_reason, retry_count, last_error \
+             FROM jobs WHERE status NOT IN ('completed', 'failed', 'cancelled') ORDER BY rowid",
         )
     }
 
@@ -60,7 +67,7 @@ impl SqliteStore {
         let conn = self.conn.lock();
         let result = conn.query_row(
             "SELECT id, agent_id, prompt, schedule, status, created_at, next_run_at, last_run_at, \
-                    lifecycle_revision, terminal_reason \
+                    lifecycle_revision, terminal_reason, retry_count, last_error \
              FROM jobs WHERE id = ?1",
             params![id.0.to_string()],
             parse_job_row,
@@ -76,7 +83,7 @@ impl SqliteStore {
     pub fn load_all_jobs_unfiltered(&self) -> AlmsResult<Vec<Job>> {
         self.query_jobs(
             "SELECT id, agent_id, prompt, schedule, status, created_at, next_run_at, last_run_at, \
-                    lifecycle_revision, terminal_reason \
+                    lifecycle_revision, terminal_reason, retry_count, last_error \
              FROM jobs ORDER BY created_at DESC",
         )
     }

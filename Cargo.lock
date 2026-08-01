@@ -167,6 +167,7 @@ dependencies = [
  "alms-runtime",
  "alms-session",
  "alms-tools",
+ "async-trait",
  "axum",
  "chrono",
  "cron",

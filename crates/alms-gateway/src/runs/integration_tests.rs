@@ -373,6 +373,22 @@ async fn cancelled_before_execution_emits_cancelled_event() {
     let run = Run::new(session_id, agent_id, "test input".into());
     let run_id = run.run_id;
     let _ = state.run_manager.insert_run(run.clone());
+    state
+        .session_manager
+        .append_message(
+            session_id,
+            alms_session::Message {
+                id: uuid::Uuid::new_v4().to_string(),
+                role: alms_session::Role::User,
+                content: alms_session::Content::Text(run.input.clone()),
+                timestamp: alms_core::Timestamp::now(),
+                metadata: Some(serde_json::json!({
+                    "pending_input": true,
+                    "run_id": run_id.0.to_string(),
+                })),
+            },
+        )
+        .unwrap();
 
     // Register a cancellation token and cancel it BEFORE execution.
     let cancel_token = CancellationToken::new();
@@ -397,7 +413,7 @@ async fn cancelled_before_execution_emits_cancelled_event() {
             cancel_token,
             is_peer_message: false,
             is_system_triggered: false,
-            input_pre_persisted: false,
+            input_pre_persisted: true,
         },
     )
     .await;
@@ -416,6 +432,35 @@ async fn cancelled_before_execution_emits_cancelled_event() {
         events.iter().any(|e| e.event_type == "run_cancelled"),
         "expected a run_cancelled SSE event; got: {:?}",
         events.iter().map(|e| &e.event_type).collect::<Vec<_>>()
+    );
+
+    let history = state.session_manager.get_history(session_id).unwrap();
+    let run_id_string = run_id.0.to_string();
+    let claimed_input = history
+        .iter()
+        .find(|message| {
+            message
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("run_id"))
+                .and_then(serde_json::Value::as_str)
+                == Some(run_id_string.as_str())
+        })
+        .expect("pre-cancelled accepted prompt must remain durable");
+    let metadata = claimed_input.metadata.as_ref().unwrap();
+    assert_eq!(metadata["pending_input"], false);
+    assert!(metadata["input_claimed_at"].is_string());
+    assert!(
+        state
+            .session_manager
+            .get_context_history(session_id)
+            .unwrap()
+            .iter()
+            .any(|message| matches!(
+                &message.content,
+                alms_session::Content::Text(text) if text == "test input"
+            )),
+        "a pre-cancelled accepted prompt must remain context-visible"
     );
 
     shutdown_token.cancel();
@@ -516,7 +561,7 @@ async fn cancellation_between_precheck_and_start_transition_cleans_up_without_st
 }
 
 #[tokio::test]
-async fn start_persistence_failure_is_reported_and_quarantined() {
+async fn pre_persisted_input_survives_start_persistence_failure() {
     let (state, shutdown_token, _cr, _tr, _dr) = test_app_state_with_mock_llm();
     let agent_id = AgentId::new();
     let session = state
@@ -525,6 +570,22 @@ async fn start_persistence_failure_is_reported_and_quarantined() {
     let run = Run::new(session.id, agent_id, "must not start".into());
     let run_id = run.run_id;
     let _ = state.run_manager.insert_run(run.clone());
+    state
+        .session_manager
+        .append_message(
+            session.id,
+            alms_session::Message {
+                id: uuid::Uuid::new_v4().to_string(),
+                role: alms_session::Role::User,
+                content: alms_session::Content::Text(run.input.clone()),
+                timestamp: alms_core::Timestamp::now(),
+                metadata: Some(serde_json::json!({
+                    "pending_input": true,
+                    "run_id": run_id.0.to_string(),
+                })),
+            },
+        )
+        .unwrap();
     let cancel_token = CancellationToken::new();
     state
         .run_manager
@@ -543,7 +604,7 @@ async fn start_persistence_failure_is_reported_and_quarantined() {
             cancel_token,
             is_peer_message: false,
             is_system_triggered: false,
-            input_pre_persisted: false,
+            input_pre_persisted: true,
         },
     )
     .await;
@@ -562,6 +623,34 @@ async fn start_persistence_failure_is_reported_and_quarantined() {
     assert!(!event_types.iter().any(|kind| kind == "run_started"));
     assert!(!state.run_manager.cancel_run(run_id));
     assert!(!state.run_manager.event_senders.contains_key(&run_id));
+
+    let history = state.session_manager.get_history(session.id).unwrap();
+    let run_id_string = run_id.0.to_string();
+    let claimed_input = history
+        .iter()
+        .find(|message| {
+            message
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("run_id"))
+                .and_then(serde_json::Value::as_str)
+                == Some(run_id_string.as_str())
+        })
+        .expect("accepted prompt must remain in session history");
+    let metadata = claimed_input.metadata.as_ref().unwrap();
+    assert_eq!(metadata["pending_input"], false);
+    assert!(metadata["input_claimed_at"].as_str().is_some());
+    assert!(
+        state
+            .session_manager
+            .get_context_history(session.id)
+            .unwrap()
+            .iter()
+            .any(|message| matches!(
+                &message.content,
+                alms_session::Content::Text(text) if text == "must not start"
+            ))
+    );
     shutdown_token.cancel();
 }
 
@@ -667,6 +756,500 @@ async fn create_run_registration_failure_aborts_before_message_or_queue_side_eff
         "the user message must not be persisted after registration fails"
     );
     assert_eq!(state.agent_queue.pending_count(&agent_id), 0);
+    shutdown_token.cancel();
+}
+#[tokio::test]
+async fn concurrent_same_session_admissions_preserve_durable_and_live_order() {
+    use alms_core::{CreateRunRequest, RunInput};
+    use alms_session::{Content, Role};
+    use axum::{Json, extract::State, http::StatusCode};
+
+    let (state, shutdown_token, _cr, _tr, _dr) = test_app_state_with_mock_llm();
+    let agent_id = AgentId::new();
+    let session = state
+        .session_manager
+        .get_or_create(agent_id, "test-concurrent-admission-order");
+    let barrier = super::lifecycle::install_admission_persistence_barrier(session.id);
+
+    let first_state = state.clone();
+    let first_session_id = session.id;
+    let first = tokio::spawn(async move {
+        super::lifecycle::create_run(
+            State(first_state),
+            Json(CreateRunRequest {
+                session_id: first_session_id,
+                agent_id: Some(agent_id),
+                input: RunInput::Text {
+                    text: "first admission".to_string(),
+                },
+            }),
+        )
+        .await
+    });
+
+    barrier.wait().await;
+    let sqlite = state
+        .session_manager
+        .store()
+        .expect("SQLite-backed test state");
+    assert_eq!(sqlite.load_messages(session.id).unwrap().len(), 1);
+
+    let second_state = state.clone();
+    let second_session_id = session.id;
+    let mut second = tokio::spawn(async move {
+        super::lifecycle::create_run(
+            State(second_state),
+            Json(CreateRunRequest {
+                session_id: second_session_id,
+                agent_id: Some(agent_id),
+                input: RunInput::Text {
+                    text: "second admission".to_string(),
+                },
+            }),
+        )
+        .await
+    });
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(50), &mut second)
+            .await
+            .is_err(),
+        "the second same-session admission must wait for the first projection"
+    );
+    assert_eq!(
+        sqlite.load_messages(session.id).unwrap().len(),
+        1,
+        "the second durable commit must wait behind the session gate"
+    );
+
+    barrier.wait().await;
+    let (first_status, _) = tokio::time::timeout(std::time::Duration::from_secs(5), first)
+        .await
+        .expect("first admission timed out")
+        .expect("first admission task panicked")
+        .expect("first admission failed");
+    let (second_status, _) = tokio::time::timeout(std::time::Duration::from_secs(5), second)
+        .await
+        .expect("second admission timed out")
+        .expect("second admission task panicked")
+        .expect("second admission failed");
+    assert_eq!(first_status, StatusCode::CREATED);
+    assert_eq!(second_status, StatusCode::CREATED);
+
+    let user_texts = |messages: Vec<alms_session::Message>| {
+        messages
+            .into_iter()
+            .filter_map(|message| match (message.role, message.content) {
+                (Role::User, Content::Text(text))
+                    if message
+                        .metadata
+                        .as_ref()
+                        .and_then(|metadata| metadata.get("run_id"))
+                        .and_then(serde_json::Value::as_str)
+                        .is_some() =>
+                {
+                    Some(text)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    let expected = vec![
+        "first admission".to_string(),
+        "second admission".to_string(),
+    ];
+    assert_eq!(
+        user_texts(sqlite.load_messages(session.id).unwrap()),
+        expected
+    );
+    assert_eq!(
+        user_texts(state.session_manager.get_history(session.id).unwrap()),
+        expected
+    );
+    assert!(
+        state.run_admission_gates.is_empty(),
+        "idle admission gates must remove their weak registry entry"
+    );
+    shutdown_token.cancel();
+}
+
+#[tokio::test]
+async fn queued_later_prompt_is_not_visible_to_the_first_run() {
+    use alms_core::{CreateRunRequest, RunInput};
+    use axum::{Json, extract::State};
+
+    let (state, shutdown_token, _cr, _tr, _dr) = test_app_state_with_mock_llm();
+    let agent_id = AgentId::new();
+    let session = state
+        .session_manager
+        .get_or_create(agent_id, "test-run-context-boundary");
+    state.agent_config.write().debug_mode = true;
+    let mut session_events = subscribe_session(&state, session.id);
+    let execution_barrier = super::lifecycle::install_admission_execution_barrier(session.id);
+
+    let create = |text: &str| CreateRunRequest {
+        session_id: session.id,
+        agent_id: Some(agent_id),
+        input: RunInput::Text {
+            text: text.to_string(),
+        },
+    };
+    let (_, first) =
+        super::lifecycle::create_run(State(state.clone()), Json(create("first prompt")))
+            .await
+            .expect("first admission failed");
+    let (_, second) =
+        super::lifecycle::create_run(State(state.clone()), Json(create("second prompt")))
+            .await
+            .expect("second admission failed");
+
+    let before_claim = state
+        .session_manager
+        .get_context_history(session.id)
+        .unwrap();
+    assert!(
+        before_claim.is_empty(),
+        "neither queued prompt is eligible before the first run claims its input"
+    );
+    execution_barrier.wait().await;
+    execution_barrier.wait().await;
+
+    for _ in 0..500 {
+        let both_terminal = [first.0.run_id, second.0.run_id].into_iter().all(|run_id| {
+            state.run_manager.get_run(run_id).is_some_and(|run| {
+                matches!(
+                    run.status(),
+                    RunStatus::Completed | RunStatus::Failed | RunStatus::Cancelled
+                )
+            })
+        });
+        if both_terminal {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    let first_run = state
+        .run_manager
+        .get_run(first.0.run_id)
+        .expect("first run disappeared");
+    let second_run = state
+        .run_manager
+        .get_run(second.0.run_id)
+        .expect("second run disappeared");
+    assert_eq!(first_run.status(), RunStatus::Completed);
+    assert_eq!(second_run.status(), RunStatus::Completed);
+    assert_eq!(first_run.output.as_deref(), Some("[mock] first prompt"));
+    assert_eq!(second_run.output.as_deref(), Some("[mock] second prompt"));
+
+    let events = drain_events(&mut session_events);
+    let context_messages = |run_id: RunId| {
+        events
+            .iter()
+            .find(|event| {
+                event.event_type == "context_debug" && event.data["run_id"] == run_id.0.to_string()
+            })
+            .and_then(|event| event.data["messages"].as_array())
+            .cloned()
+            .unwrap_or_else(|| panic!("missing context_debug for run {run_id:?}"))
+    };
+    let text_turns = |messages: Vec<serde_json::Value>| {
+        messages
+            .into_iter()
+            .filter_map(|message| {
+                let role = message["role"].as_str()?;
+                if role == "system" {
+                    return None;
+                }
+                Some((role.to_string(), message["content"].as_str()?.to_string()))
+            })
+            .collect::<Vec<_>>()
+    };
+    let first_turns = text_turns(context_messages(first.0.run_id));
+    assert_eq!(
+        first_turns,
+        vec![("user".to_string(), "first prompt".to_string())]
+    );
+    assert!(
+        first_turns
+            .iter()
+            .all(|(_, content)| !content.contains("second prompt")),
+        "the actual first LLM context must not contain the later prompt"
+    );
+    assert_eq!(
+        text_turns(context_messages(second.0.run_id)),
+        vec![
+            ("user".to_string(), "first prompt".to_string()),
+            ("assistant".to_string(), "[mock] first prompt".to_string()),
+            ("user".to_string(), "second prompt".to_string()),
+        ]
+    );
+    shutdown_token.cancel();
+}
+
+#[tokio::test]
+async fn cancelled_create_request_keeps_event_order_and_gate_ownership() {
+    use alms_core::{CreateRunRequest, RunInput};
+    use axum::{Json, extract::State};
+
+    let (state, shutdown_token, _cr, _tr, _dr) = test_app_state_with_mock_llm();
+    let agent_id = AgentId::new();
+    let session = state
+        .session_manager
+        .get_or_create(agent_id, "test-cancelled-admission-publication");
+    let event_barrier = super::lifecycle::install_admission_event_barrier(session.id);
+
+    let first_state = state.clone();
+    let first_session_id = session.id;
+    let first = tokio::spawn(async move {
+        super::lifecycle::create_run(
+            State(first_state),
+            Json(CreateRunRequest {
+                session_id: first_session_id,
+                agent_id: Some(agent_id),
+                input: RunInput::Text {
+                    text: "first publication".to_string(),
+                },
+            }),
+        )
+        .await
+    });
+    event_barrier.wait().await;
+    let first_run_id = state.run_manager.list_by_session(session.id, 10)[0].run_id;
+    first.abort();
+    let _ = first.await;
+
+    let second_state = state.clone();
+    let second_session_id = session.id;
+    let mut second = tokio::spawn(async move {
+        super::lifecycle::create_run(
+            State(second_state),
+            Json(CreateRunRequest {
+                session_id: second_session_id,
+                agent_id: Some(agent_id),
+                input: RunInput::Text {
+                    text: "second publication".to_string(),
+                },
+            }),
+        )
+        .await
+    });
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(50), &mut second)
+            .await
+            .is_err(),
+        "the second admission must remain behind the detached first publisher"
+    );
+    assert!(
+        state
+            .run_manager
+            .session_events_from(session.id, 0)
+            .await
+            .iter()
+            .all(|event| event.event_type != "run_created")
+    );
+
+    event_barrier.wait().await;
+    let (_, second_response) = tokio::time::timeout(std::time::Duration::from_secs(5), second)
+        .await
+        .expect("second admission timed out")
+        .expect("second admission task panicked")
+        .expect("second admission failed");
+    let created_run_ids = state
+        .run_manager
+        .session_events_from(session.id, 0)
+        .await
+        .into_iter()
+        .filter(|event| event.event_type == "run_created")
+        .filter_map(|event| {
+            event
+                .data
+                .get("run_id")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|value| uuid::Uuid::parse_str(value).ok())
+                .map(RunId)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        created_run_ids,
+        vec![first_run_id, second_response.0.run_id]
+    );
+    assert!(state.run_admission_gates.is_empty());
+    shutdown_token.cancel();
+}
+
+#[tokio::test]
+async fn admission_gate_registry_does_not_retain_idle_sessions() {
+    let (state, shutdown_token, _cr, _tr, _dr) = test_app_state();
+    for _ in 0..100 {
+        let guard = super::lifecycle::acquire_run_admission_guard(
+            &state.run_admission_gates,
+            SessionId::new(),
+        )
+        .await;
+        drop(guard);
+    }
+    assert!(state.run_admission_gates.is_empty());
+    shutdown_token.cancel();
+}
+
+#[tokio::test]
+async fn simultaneous_final_admission_lease_drops_remove_registry_entry() {
+    let (state, shutdown_token, _cr, _tr, _dr) = test_app_state();
+    for _ in 0..100 {
+        let session_id = SessionId::new();
+        let owner =
+            super::lifecycle::acquire_run_admission_guard(&state.run_admission_gates, session_id)
+                .await;
+        let acquire_barrier = super::lifecycle::install_admission_acquire_barrier(session_id);
+        let gates = state.run_admission_gates.clone();
+        let waiter = tokio::spawn(async move {
+            super::lifecycle::acquire_run_admission_guard(&gates, session_id).await
+        });
+
+        acquire_barrier.wait().await;
+        let release = Arc::new(tokio::sync::Barrier::new(3));
+        let drop_release = release.clone();
+        let drop_task = tokio::spawn(async move {
+            drop_release.wait().await;
+            drop(owner);
+        });
+        let abort_release = release.clone();
+        let abort_waiter = waiter.abort_handle();
+        let abort_task = tokio::spawn(async move {
+            abort_release.wait().await;
+            abort_waiter.abort();
+        });
+
+        release.wait().await;
+        let _ = tokio::join!(drop_task, abort_task);
+        let _ = waiter.await;
+        assert!(
+            state.run_admission_gates.is_empty(),
+            "simultaneous final lease drops must remove the registry entry"
+        );
+    }
+    shutdown_token.cancel();
+}
+
+#[tokio::test]
+async fn deleted_job_session_cannot_gain_an_orphan_scheduled_run() {
+    let (state, shutdown_token, _cr, _tr, _dr) = test_app_state();
+    let agent_id = AgentId::new();
+    let job = state
+        .job_store
+        .create(alms_core::CreateJobRequest {
+            agent_id,
+            prompt: "scheduled work".to_string(),
+            schedule: alms_core::JobSchedule::Once {
+                run_at: chrono::Utc::now() + chrono::Duration::hours(1),
+            },
+        })
+        .unwrap();
+    let context_id = format!("job_{}", job.id.0);
+    let session = state.session_manager.get_or_create(agent_id, &context_id);
+    let owner =
+        super::lifecycle::acquire_run_admission_guard(&state.run_admission_gates, session.id).await;
+    let acquire_barrier = super::lifecycle::install_admission_acquire_barrier(session.id);
+    let fire_state = state.clone();
+    let fire =
+        tokio::spawn(async move { super::notifications::fire_job_run(fire_state, job.id).await });
+
+    acquire_barrier.wait().await;
+    state.session_manager.delete(agent_id, &context_id).unwrap();
+    acquire_barrier.wait().await;
+    drop(owner);
+
+    let result = fire.await.expect("scheduled producer panicked");
+    assert!(result.is_err(), "deleted target must reject registration");
+    assert!(state.run_manager.list_by_session(session.id, 10).is_empty());
+    assert!(!state.session_manager.has_session(&(agent_id, context_id)));
+    shutdown_token.cancel();
+}
+
+#[tokio::test]
+async fn deleted_session_cannot_gain_an_orphan_triggered_run() {
+    let (state, shutdown_token, _cr, _tr, _dr) = test_app_state();
+    let agent_id = AgentId::new();
+    let context_id = "deleted-trigger-target".to_string();
+    let session = state.session_manager.get_or_create(agent_id, &context_id);
+    let session_id = session.id;
+    let owner =
+        super::lifecycle::acquire_run_admission_guard(&state.run_admission_gates, session_id).await;
+    let acquire_barrier = super::lifecycle::install_admission_acquire_barrier(session_id);
+    let trigger_state = state.clone();
+    let trigger_context = context_id.clone();
+    let trigger = tokio::spawn(async move {
+        super::notifications::enqueue_triggered_run(
+            &trigger_state,
+            agent_id,
+            session_id,
+            "late notification".to_string(),
+            trigger_context,
+            "test".to_string(),
+            false,
+            None,
+        )
+        .await
+    });
+
+    acquire_barrier.wait().await;
+    state.session_manager.delete(agent_id, &context_id).unwrap();
+    acquire_barrier.wait().await;
+    drop(owner);
+
+    assert_eq!(
+        trigger.await.expect("triggered producer panicked"),
+        None,
+        "deleted target must suppress registration"
+    );
+    assert!(state.run_manager.list_by_session(session_id, 10).is_empty());
+    assert!(!state.session_manager.has_session(&(agent_id, context_id)));
+    shutdown_token.cancel();
+}
+
+#[tokio::test]
+async fn deleted_episode_target_releases_reserved_continuation() {
+    let (state, shutdown_token, _cr, _tr, _dr) = test_app_state();
+    let agent_id = AgentId::new();
+    let job_id = create_recurring_job(&state, agent_id, "episode cleanup");
+    let context_id = format!("job_{}", job_id.0);
+    let session = state.session_manager.get_or_create(agent_id, &context_id);
+    let turn1 = RunId::new();
+    let task_id = uuid::Uuid::new_v4();
+    state.job_episodes.open(job_id, session.id, agent_id, turn1);
+    assert!(matches!(
+        state.job_episodes.on_run_complete(
+            job_id,
+            turn1,
+            vec![],
+            vec![(task_id, SessionId::new())]
+        ),
+        super::job_episode::RunCompletion::Open
+    ));
+    let route = state
+        .job_episodes
+        .resolve_subagent(task_id)
+        .expect("terminal signal must reserve its continuation");
+    state.session_manager.delete(agent_id, &context_id).unwrap();
+
+    let result = super::notifications::enqueue_triggered_run(
+        &state,
+        agent_id,
+        route.job_session_id,
+        "late continuation".to_string(),
+        route.context_id,
+        "subagent".to_string(),
+        false,
+        Some(route.job_id),
+    )
+    .await;
+
+    assert_eq!(result, None);
+    assert!(
+        state.job_episodes.snapshot(job_id).is_none(),
+        "failed admission must release the final continuation reservation"
+    );
+    assert!(state.run_manager.list_by_session(session.id, 10).is_empty());
     shutdown_token.cancel();
 }
 
@@ -1472,10 +2055,10 @@ async fn dm_depth_exceeded_graceful_without_agent_registry() {
 
     // Create the DM session between alice and bob so we can subscribe.
     let dm_session_id = SessionId::deterministic_dm("alice", "bob");
-    let _dm_session =
-        state
-            .session_manager
-            .get_or_create_with_id(dm_session_id, agent_id, "dm:alice:bob");
+    let _dm_session = state
+        .session_manager
+        .get_or_create_with_id(dm_session_id, agent_id, "dm:alice:bob")
+        .unwrap();
     let mut dm_rx = subscribe_session(&state, dm_session_id);
 
     let (test_tx, test_rx) = mpsc::channel(8);
@@ -2880,10 +3463,10 @@ async fn dm_event_loop_forwards_messages_to_session_subscribers() {
 
     let agent_id = AgentId::new();
     let dm_session_id = SessionId::deterministic_dm("alice", "bob");
-    let _dm_session =
-        state
-            .session_manager
-            .get_or_create_with_id(dm_session_id, agent_id, "dm:alice:bob");
+    let _dm_session = state
+        .session_manager
+        .get_or_create_with_id(dm_session_id, agent_id, "dm:alice:bob")
+        .unwrap();
 
     // Subscribe to the DM session.
     let mut rx = subscribe_session(&state, dm_session_id);
@@ -3003,6 +3586,8 @@ async fn create_run_pre_persists_user_input_to_session() {
     let session = state.session_manager.get_or_create(agent_id, "web");
     let session_id = session.id;
 
+    let execution_barrier = super::lifecycle::install_admission_execution_barrier(session_id);
+
     let req = CreateRunRequest {
         session_id,
         agent_id: None,
@@ -3020,10 +3605,9 @@ async fn create_run_pre_persists_user_input_to_session() {
     };
     assert_eq!(status, axum::http::StatusCode::CREATED);
 
-    // Cancel shutdown so the enqueued execute_run task (spawned by create_run)
-    // early-exits without trying to call a real LLM.  This keeps the test
-    // deterministic and fast.
-    shutdown_token.cancel();
+    // Rendezvous before the executor claims the input, then keep it paused
+    // while the admission snapshot is inspected below.
+    execution_barrier.wait().await;
 
     // The user message must be in the session history immediately.
     let history = state
@@ -3069,6 +3653,9 @@ async fn create_run_pre_persists_user_input_to_session() {
         Some(expected_run_id.as_str()),
         "pre-persisted input must carry its authoritative run id",
     );
+
+    shutdown_token.cancel();
+    execution_barrier.wait().await;
 }
 
 /// Wire-compat regression for the #941 pivot.
@@ -4069,7 +4656,8 @@ async fn handle_dm_run_failure_skips_when_not_peer_message() {
     let session_id = SessionId::deterministic_dm("alice", "bob");
     state
         .session_manager
-        .get_or_create_with_id(session_id, bob_id, "dm:alice:bob");
+        .get_or_create_with_id(session_id, bob_id, "dm:alice:bob")
+        .unwrap();
     let mut dm_rx = subscribe_session(&state, session_id);
 
     let run_id = alms_core::RunId::new();
@@ -11137,7 +11725,7 @@ async fn job_mutation_responses_return_authoritative_persisted_entities() {
         created["next_run_at"].is_string(),
         "create response must include the scheduler's persisted next run"
     );
-    assert_eq!(created["lifecycle_revision"], 1);
+    assert_eq!(created["lifecycle_revision"], 0);
 
     let job_id = state
         .job_store
@@ -11159,7 +11747,7 @@ async fn job_mutation_responses_return_authoritative_persisted_entities() {
     let cancelled: serde_json::Value =
         serde_json::from_slice(&body).expect("cancel response must be JSON");
     assert_eq!(cancelled["status"], "cancelled");
-    assert_eq!(cancelled["lifecycle_revision"], 2);
+    assert_eq!(cancelled["lifecycle_revision"], 1);
     assert_eq!(cancelled["terminal_reason"], "operator_cancelled");
 
     shutdown_token.cancel();
@@ -11179,24 +11767,22 @@ fn create_once_job(state: &AppState, agent_id: AgentId, prompt: &str) -> alms_co
         .id
 }
 
-/// Drive a job into the normally-SPENT one-shot state: `record_and_rearm`'s
-/// `Once` arm records it as `JobStatus::Cancelled` because `JobStatus` has
-/// no `Completed` variant (the #763 quirk). Mirrors the exact store write
-/// that arm performs (`record_run(.., Cancelled, None)`).
+/// Drive a job into the normally spent one-shot state. Completion is distinct
+/// from operator cancellation so late detached results remain deliverable.
 fn spend_one_shot(state: &AppState, job_id: alms_core::JobId) {
     state
         .job_store
         .record_run(
             job_id,
             chrono::Utc::now(),
-            alms_core::JobStatus::Cancelled,
+            alms_core::JobStatus::Completed,
             None,
         )
         .expect("record_run must succeed");
     assert_eq!(
         state.job_store.get(job_id).unwrap().status(),
-        alms_core::JobStatus::Cancelled,
-        "sanity: a spent one-shot carries JobStatus::Cancelled (#763)"
+        alms_core::JobStatus::Completed,
+        "sanity: a spent one-shot carries JobStatus::Completed"
     );
     assert!(
         !state.operator_cancelled_jobs.contains(&job_id),
@@ -11278,9 +11864,15 @@ async fn scheduler_rearms_job_after_run_registration_persistence_failure() {
 
     assert!(state.run_manager.runs.is_empty());
     assert!(state.job_episodes.snapshot(job_id).is_none());
-    assert_eq!(
-        state.job_store.get(job_id).unwrap().status(),
-        alms_core::JobStatus::Pending
+    let retrying = state.job_store.get(job_id).unwrap();
+    assert_eq!(retrying.status(), alms_core::JobStatus::Pending);
+    assert_eq!(retrying.retry_count(), 1);
+    assert!(retrying.next_run_at.is_some());
+    assert!(
+        retrying
+            .last_error()
+            .is_some_and(|error| error.contains("persistence")),
+        "the durable job record must retain dispatch failure provenance"
     );
     loop_handle.abort();
     shutdown_token.cancel();
@@ -12156,16 +12748,11 @@ async fn cancel_job_cancels_unstamped_run_on_its_job_session() {
     shutdown_token.cancel();
 }
 
-/// Codex P2 on PR #1210 (confirmed by Tim): the #1206 suppression must key
-/// on OPERATOR-CANCEL INTENT, not on `JobStatus::Cancelled` — a normally-
-/// spent one-shot is ALSO recorded as `Cancelled` (#763: no `Completed`
-/// variant). Scenario: a one-shot dispatches a bg subagent, hits the 4h
-/// deadline, D5 detach-and-complete closes the episode (job recorded
-/// `Cancelled` = spent), the subagent keeps running and later completes for
-/// real. Its late `SubagentCompletion` lands on the job session and MUST
-/// still produce a notification run (the documented D5 "detach, deliver
-/// late via an orphan run" contract) — pre-fix it was silently suppressed
-/// and the agent never processed the detached result.
+/// The #1206 suppression must key on explicit operator-cancel intent. Scenario:
+/// a one-shot dispatches a background subagent, hits the four-hour deadline,
+/// and closes as `Completed`; the subagent keeps running and later completes.
+/// Its late completion lands on the job session and must still produce the
+/// documented orphan notification run.
 #[tokio::test]
 async fn spent_one_shot_detached_subagent_completion_not_suppressed() {
     let (state, shutdown_token, _cr, _tr, _dr) = test_app_state();
@@ -12535,5 +13122,37 @@ async fn blocked_job_gate_does_not_delay_unrelated_job_cancellation() {
         .into_response();
     assert_eq!(response.status(), axum::http::StatusCode::OK);
 
+    shutdown_token.cancel();
+}
+
+#[tokio::test]
+async fn operational_metrics_route_exposes_live_snapshot() {
+    use axum::body::Body;
+    use axum::http::Request as HttpRequest;
+    use tower::ServiceExt;
+
+    let (state, shutdown_token, _cr, _tr, _dr) = test_app_state();
+    let subscription = state.run_manager.subscribe_activity();
+    let router = crate::server::routes::protected_router().with_state(state.clone());
+    let response = router
+        .oneshot(
+            HttpRequest::get("/operations/metrics")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("metrics route should respond");
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["subscribers"]["activity"], 1);
+    assert!(json["queue_saturation_rejections_total"].is_number());
+    assert!(json["replay_epoch_mismatches_total"].is_number());
+    assert!(json["persistence_snapshot_rejections_total"].is_number());
+    assert!(json["job_dispatch_retry_exhaustions_total"].is_number());
+
+    drop(subscription);
     shutdown_token.cancel();
 }

@@ -321,6 +321,33 @@ impl JobEpisodeTracker {
         })
     }
 
+    /// Release the in-flight reservation created by `resolve_dm` or
+    /// `resolve_subagent` when admission fails before a continuation run is
+    /// durably registered. No run id is recorded because no run existed.
+    pub(crate) fn abandon_reserved_continuation(&self, job_id: JobId) -> RunCompletion {
+        let mut eps = self.episodes.lock();
+        let Some(ep) = eps.get_mut(&job_id) else {
+            return RunCompletion::Untracked;
+        };
+
+        if ep.in_flight_runs == 0 {
+            warn!(
+                job_id = %job_id,
+                "Episode continuation reservation underflow while abandoning admission"
+            );
+        }
+        ep.in_flight_runs = ep.in_flight_runs.saturating_sub(1);
+
+        if ep.is_quiescent() {
+            let ep = eps
+                .remove(&job_id)
+                .expect("entry exists after mutable lookup");
+            RunCompletion::Closed(Box::new(ep))
+        } else {
+            RunCompletion::Open
+        }
+    }
+
     /// Record a continuation run's id (the reservation was already taken by
     /// the resolve call). Called by `enqueue_triggered_run` immediately
     /// after the run is inserted — BEFORE the run is enqueued for execution
@@ -754,6 +781,27 @@ mod tests {
         t.remove(job_id).expect("episode removed (cancel path)");
         assert!(t.resolve_dm(dm, agent_id).is_empty());
         assert!(t.resolve_subagent(Uuid::new_v4()).is_none());
+    }
+
+    #[test]
+    fn abandoned_continuation_reservation_allows_episode_to_close() {
+        let t = tracker();
+        let (job_id, _, _, run1) = open_episode(&t);
+        let task_id = Uuid::new_v4();
+        assert!(matches!(
+            t.on_run_complete(job_id, run1, vec![], vec![(task_id, SessionId::new())]),
+            RunCompletion::Open
+        ));
+        assert!(t.resolve_subagent(task_id).is_some());
+
+        match t.abandon_reserved_continuation(job_id) {
+            RunCompletion::Closed(episode) => {
+                assert_eq!(episode.job_id, job_id);
+                assert_eq!(episode.runs, vec![run1]);
+            }
+            other => panic!("abandoned final reservation must close episode, got {other:?}"),
+        }
+        assert!(t.snapshot(job_id).is_none());
     }
 
     /// A run exit for an untracked job (episode already closed by the sweep)

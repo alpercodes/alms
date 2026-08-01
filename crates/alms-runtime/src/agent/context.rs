@@ -104,7 +104,7 @@ impl AgentRuntime {
             );
         }
 
-        let history = match session_manager.get_history(*session_id) {
+        let history = match session_manager.get_context_history(*session_id) {
             Ok(h) => h,
             Err(e) => {
                 error!(session_id = ?session_id, error = %e, "Failed to load session history — running without context");

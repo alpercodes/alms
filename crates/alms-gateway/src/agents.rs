@@ -61,58 +61,14 @@ fn validate_summary_pair(
     provider: Option<&str>,
     model: Option<&str>,
 ) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
-    match (provider, model) {
-        (None, None) | (Some(_), Some(_)) => {}
-        (Some(_), None) => {
-            return Err(api_error(
-                StatusCode::BAD_REQUEST,
-                "SUMMARY_PROVIDER_REQUIRES_MODEL",
-                "summary_provider is set but summary_model is empty. Set both \
-                 fields together — the summary provider's wire model namespace \
-                 is independent of the agent's primary provider, so partial \
-                 settings cannot be safely resolved.",
-            ));
-        }
-        (None, Some(_)) => {
-            return Err(api_error(
-                StatusCode::BAD_REQUEST,
-                "SUMMARY_MODEL_REQUIRES_PROVIDER",
-                "summary_model is set but summary_provider is empty. Set both \
-                 fields together — leaving summary_provider unset would fall \
-                 through to the server-level [context].summary_provider, which \
-                 may not match this model's namespace.",
-            ));
-        }
-    }
-
-    if let Some(p) = provider {
-        let entry = state.llm_config.providers.get(p);
-        if entry.is_none() {
-            return Err(api_error(
-                StatusCode::BAD_REQUEST,
-                "SUMMARY_PROVIDER_UNKNOWN",
-                format!(
-                    "summary_provider '{p}' is not configured under \
-                     [llm.providers.<name>] in alms.toml"
-                ),
-            ));
-        }
-        let entry_has_key = entry.is_some_and(|e| e.resolve_api_key().is_some());
-        let secrets_has_key = state.secrets.read().resolve_key(p).is_some();
-        if !entry_has_key && !secrets_has_key {
-            return Err(api_error(
-                StatusCode::BAD_REQUEST,
-                "SUMMARY_PROVIDER_MISSING_API_KEY",
-                format!(
-                    "summary_provider '{p}' has no resolvable API key — set one \
-                     with `alms auth set {p}` or configure \
-                     `[llm.providers.{p}].api_key_env` / `api_key`"
-                ),
-            ));
-        }
-    }
-
-    Ok(())
+    crate::configuration::validate_summary_pair(
+        provider,
+        model,
+        &state.llm_config.providers,
+        &state.secrets.read(),
+    )
+    .map(|_| ())
+    .map_err(|error| api_error(StatusCode::BAD_REQUEST, error.code, error.message))
 }
 
 /// Helper: get the SqliteStore from app state, or return 503.

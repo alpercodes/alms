@@ -8,7 +8,7 @@ use crate::approvals::ApprovalStore;
 use crate::gateway::Gateway;
 use crate::session_queue::SessionQueue;
 use alms_coordinator::Coordinator;
-use alms_core::{AgentId, AlmsResult};
+use alms_core::{AgentId, AlmsResult, Run};
 use alms_runtime::Scheduler;
 use alms_session::{JobStore, SessionManager};
 use std::sync::Arc;
@@ -24,6 +24,32 @@ pub struct ServerLlmDefault {
     pub model: String,
     /// Server-default provider name (must be a key in `llm_config.providers`).
     pub provider: String,
+}
+
+/// Coordinator-facing registrar that shares the same session deletion fence
+/// as HTTP, scheduled, and notification run producers.
+#[derive(Debug, Clone)]
+struct GatewayRunRegistrar {
+    session_manager: Arc<SessionManager>,
+    run_manager: RunManager,
+    run_admission_gates: crate::runs::lifecycle::RunAdmissionGates,
+}
+
+#[async_trait::async_trait]
+impl alms_core::RunRegistrar for GatewayRunRegistrar {
+    async fn register_run(&self, run: Run) -> AlmsResult<()> {
+        let _admission_guard = crate::runs::lifecycle::acquire_run_admission_guard(
+            &self.run_admission_gates,
+            run.session_id,
+        )
+        .await;
+        self.session_manager.get(run.session_id)?;
+        self.run_manager.insert_run(run)
+    }
+
+    fn update_run(&self, run: Run) -> AlmsResult<()> {
+        self.run_manager.update_run(run).map(|_| ())
+    }
 }
 
 /// Shared application state for HTTP server
@@ -51,14 +77,12 @@ pub struct AppState {
     /// the 4-hour deadline). In-memory by design for phase 1; see
     /// `docs/jobs-await-completion-design.md`.
     pub(crate) job_episodes: Arc<crate::runs::job_episode::JobEpisodeTracker>,
-    /// Jobs cancelled by the operator via `DELETE /jobs/{id}` (#1206
-    /// follow-up, Codex P2 on PR #1210). The #1206 orphan-run suppression
-    /// keys on membership here — the operator's *intent* — NOT on
-    /// `JobStatus::Cancelled`, because `JobStatus` has no `Completed`
-    /// variant (#763) and a normally-spent one-shot is also recorded as
-    /// `Cancelled`. Keying on status would silently drop the late results
-    /// of a one-shot's deadline-detached work (D5's "leave running"
-    /// contract delivers those via an orphan run on the job session).
+    /// Jobs cancelled by the operator via `DELETE /jobs/{id}`. This explicit
+    /// intent set is the synchronous race fence for teardown-spawned producers:
+    /// they must observe cancellation even when they hold an older job snapshot
+    /// or have not yet created their continuation run. Completed and failed jobs
+    /// are never inserted, so their detached late results remain deliverable.
+    ///
     ///
     /// In-memory lifetime is correct, not a compromise: the suppressed
     /// phenomena are in-flight triggers/completions, which don't survive a
@@ -84,6 +108,16 @@ pub struct AppState {
     /// `JobStore` records, so registry growth is bounded by job cardinality.
     pub(crate) job_completion_cancellation_gates:
         Arc<dashmap::DashMap<alms_core::JobId, Arc<tokio::sync::Mutex<()>>>>,
+    /// Serializes the durable commit, in-memory projection, queue submission,
+    /// and `run_created` publication of user admissions on one session.
+    ///
+    /// SQLite assigns message sequence numbers while committing. Without the
+    /// same-session gate, concurrent handlers can commit A then B but publish
+    /// and enqueue B then A, leaving history, `last_activity`, and execution
+    /// order inconsistent. Weak entries are removed when the last owned guard
+    /// or waiter drops, so deleted sessions and rejected requests do not leave
+    /// a permanent registry entry.
+    pub(crate) run_admission_gates: crate::runs::lifecycle::RunAdmissionGates,
     /// Scheduler for firing jobs at the right time
     pub scheduler: Arc<Scheduler>,
     /// Coordinator for subagent lifecycle management
@@ -365,12 +399,8 @@ impl AppState {
         // Create the shared agent config Arc *once* — both the Coordinator and
         // AppState reference the same lock so PATCH /settings updates propagate.
         let agent_config = Arc::new(parking_lot::RwLock::new(agent_config_val));
-        let db_path_str = gateway.db_path().map(String::from);
-        let job_store = match db_path_str.as_deref() {
-            Some(path) => {
-                tracing::info!("Opening SQLite job store at {}", path);
-                Arc::new(JobStore::with_sqlite(path)?)
-            }
+        let job_store = match session_manager.store() {
+            Some(store) => Arc::new(JobStore::with_store(Arc::clone(store))?),
             None => Arc::new(JobStore::new()),
         };
         // Build RunManager with optional SQLite persistence, then hydrate
@@ -383,6 +413,7 @@ impl AppState {
         } else {
             RunManager::new()
         };
+        let run_admission_gates = Arc::new(dashmap::DashMap::new());
 
         let mut coord = Coordinator::with_agent_config(
             agent_id,
@@ -391,7 +422,11 @@ impl AppState {
             Arc::clone(&agent_config),
         )
         .with_completion_channel(completion_tx)
-        .with_run_registrar(Arc::new(run_manager.clone()))
+        .with_run_registrar(Arc::new(GatewayRunRegistrar {
+            session_manager: session_manager.clone(),
+            run_manager: run_manager.clone(),
+            run_admission_gates: run_admission_gates.clone(),
+        }))
         // #1180: stream each subagent's OWN run events to its own session's SSE
         // log so the fullscreen subagent-session view streams live and is
         // replayable. Foreground and background alike.
@@ -477,6 +512,7 @@ impl AppState {
             operator_cancelled_jobs: Arc::new(dashmap::DashSet::new()),
             job_trigger_cancellation_gate: Arc::new(parking_lot::Mutex::new(())),
             job_completion_cancellation_gates: Arc::new(dashmap::DashMap::new()),
+            run_admission_gates,
             scheduler,
             coordinator,
             shutdown_token: shutdown_token.clone(),

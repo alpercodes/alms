@@ -48,7 +48,26 @@ pub async fn create_job(
         }
     }
 
-    let job = match state.job_store.create(req) {
+    // Persist a complete scheduler intent before publishing the in-memory
+    // scheduler projection. Restart recovery can always trust next_run_at.
+    let now = Utc::now();
+    let fire_at = match &req.schedule {
+        JobSchedule::Once { run_at } if *run_at <= now => now + chrono::Duration::seconds(1),
+        JobSchedule::Once { run_at } => *run_at,
+        JobSchedule::Recurring { cron } => {
+            let Some(next) = cron_utils::next_after(cron, now) else {
+                return api_error(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "INVALID_CRON",
+                    "cron expression is invalid or has no future occurrences",
+                )
+                .into_response();
+            };
+            next
+        }
+    };
+
+    let job = match state.job_store.create_with_next_run_at(req, Some(fire_at)) {
         Ok(job) => job,
         Err(e) => {
             return api_error(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR", e)
@@ -56,26 +75,15 @@ pub async fn create_job(
         }
     };
 
-    // Register the job with the scheduler so it fires at the right time.
-    let now = Utc::now();
-    if let Some(fire_at) = cron_utils::compute_next_fire(&job, now) {
-        let delay = (fire_at - now)
-            .to_std()
-            .unwrap_or(std::time::Duration::ZERO);
-        let instant = tokio::time::Instant::now() + delay;
-        state.scheduler.schedule_once(job.id, instant).await;
-        if let Err(e) = state.job_store.update_next_run_at(job.id, Some(fire_at)) {
-            warn!("Failed to persist next_run_at for job {}: {}", job.id.0, e);
-        }
-    } else {
-        warn!(
-            "Job {} has no computable fire time — created but will not fire",
-            job.id.0
-        );
-    }
+    let delay = (fire_at - now)
+        .to_std()
+        .unwrap_or(std::time::Duration::ZERO);
+    state
+        .scheduler
+        .schedule_once(job.id, tokio::time::Instant::now() + delay)
+        .await;
 
-    let persisted_job = state.job_store.get(job.id).unwrap_or(job);
-    (StatusCode::CREATED, Json(job_json(&state, &persisted_job))).into_response()
+    (StatusCode::CREATED, Json(job_json(&state, &job))).into_response()
 }
 
 /// Serialize a job, attaching the open-episode snapshot (#1198 step 8)
@@ -148,11 +156,9 @@ pub async fn cancel_job(
             let episode = {
                 let _gate = state.job_trigger_cancellation_gate.lock();
 
-                // #1206 follow-up (Codex P2 on PR #1210): record the
-                // *operator's* cancel intent. The orphan-run suppression in
-                // `enqueue_triggered_run` keys on this set — NOT on
-                // `JobStatus::Cancelled`, which a normally-spent one-shot also
-                // carries (#763: `JobStatus` has no `Completed` variant).
+                // Record explicit operator intent before tearing down async work.
+                // Late producers may hold an older job snapshot, so suppression
+                // uses this race fence rather than re-reading lifecycle status.
                 state.operator_cancelled_jobs.insert(job_id);
 
                 // #1198 D7: remove the episode FIRST so in-flight run exits and
@@ -209,12 +215,21 @@ pub async fn cancel_job(
                 .into_response(),
             }
         }
-        Ok(Some(false)) => api_error(
-            StatusCode::CONFLICT,
-            "ALREADY_CANCELLED",
-            "job is already cancelled",
-        )
-        .into_response(),
+        Ok(Some(false)) => match state.job_store.get(job_id) {
+            Some(job) if job.status() == alms_core::JobStatus::Cancelled => api_error(
+                StatusCode::CONFLICT,
+                "ALREADY_CANCELLED",
+                "job is already cancelled",
+            )
+            .into_response(),
+            Some(job) => api_error(
+                StatusCode::CONFLICT,
+                "JOB_TERMINAL",
+                format!("job is already terminal ({:?})", job.status()).to_lowercase(),
+            )
+            .into_response(),
+            None => api_error(StatusCode::NOT_FOUND, "NOT_FOUND", "job not found").into_response(),
+        },
         Ok(None) => api_error(StatusCode::NOT_FOUND, "NOT_FOUND", "job not found").into_response(),
         Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR", e).into_response(),
     }

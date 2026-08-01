@@ -6,7 +6,7 @@ use crate::cron_utils;
 use crate::server::AppState;
 use crate::sse::SseEventData;
 use alms_core::{JobId, JobSchedule, JobStatus, Run, RunId, RunStatus, SessionId};
-use alms_session::job_store::RecordRunOutcome;
+use alms_session::job_store::{DispatchFailureOutcome, RecordRunOutcome};
 use alms_tools::message_sender::ConversationEndReason;
 use chrono::Utc;
 use tokio::sync::mpsc;
@@ -14,6 +14,8 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, instrument, warn};
 
 use super::lifecycle::execute_run_guarded;
+const JOB_DISPATCH_MAX_ATTEMPTS: u32 = 3;
+const JOB_DISPATCH_RETRY_BASE_SECS: u64 = 5;
 
 // ---------------------------------------------------------------------------
 // Scheduler integration
@@ -26,12 +28,10 @@ use super::lifecycle::execute_run_guarded;
 /// work is submitted without spawning an unbounded task per firing.
 pub(crate) async fn scheduler_fire_loop(mut rx: mpsc::UnboundedReceiver<JobId>, state: AppState) {
     while let Some(job_id) = rx.recv().await {
-        // Resolve session for queue keying so jobs on the same session
-        // don't race with each other or with interactive runs.
         let Some(job) = state.job_store.get(job_id) else {
             continue;
         };
-        if job.status() == JobStatus::Cancelled {
+        if job.status().is_terminal() {
             continue;
         }
         let state_clone = state.clone();
@@ -40,24 +40,54 @@ pub(crate) async fn scheduler_fire_loop(mut rx: mpsc::UnboundedReceiver<JobId>, 
             break;
         };
         if let Err(error) = reservation.submit(Box::pin(async move {
-            if let Err(e) = fire_job_run(state_clone, job_id).await {
-                error!("Job {} run dispatch failed: {}", job_id, e);
-                if retry_state
-                    .job_store
-                    .get(job_id)
-                    .is_some_and(|job| job.status() != JobStatus::Cancelled)
-                {
-                    retry_state
-                        .scheduler
-                        .schedule_once(
-                            job_id,
-                            tokio::time::Instant::now() + std::time::Duration::from_secs(5),
-                        )
-                        .await;
-                    warn!(
-                        %job_id,
-                        "Re-armed scheduled job after durable run registration failed"
-                    );
+            if let Err(dispatch_error) = fire_job_run(state_clone, job_id).await {
+                error!("Job {} run dispatch failed: {}", job_id, dispatch_error);
+                let Some(job) = retry_state.job_store.get(job_id) else {
+                    return;
+                };
+                if job.status().is_terminal() {
+                    return;
+                }
+                let multiplier = 1u64 << job.retry_count().min(6);
+                let delay_secs = JOB_DISPATCH_RETRY_BASE_SECS.saturating_mul(multiplier);
+                let retry_at = Utc::now()
+                    + chrono::Duration::seconds(delay_secs.try_into().unwrap_or(i64::MAX));
+                match retry_state.job_store.record_dispatch_failure(
+                    job_id,
+                    dispatch_error.to_string(),
+                    retry_at,
+                    JOB_DISPATCH_MAX_ATTEMPTS,
+                ) {
+                    Ok(DispatchFailureOutcome::RetryScheduled { attempt, retry_at }) => {
+                        retry_state
+                            .scheduler
+                            .schedule_once(
+                                job_id,
+                                tokio::time::Instant::now()
+                                    + std::time::Duration::from_secs(delay_secs),
+                            )
+                            .await;
+                        warn!(
+                            %job_id,
+                            attempt,
+                            max_attempts = JOB_DISPATCH_MAX_ATTEMPTS,
+                            %retry_at,
+                            "Scheduled bounded retry after job dispatch failure"
+                        );
+                    }
+                    Ok(DispatchFailureOutcome::Exhausted { attempts }) => {
+                        error!(
+                            %job_id,
+                            attempts,
+                            "Job dispatch retry budget exhausted"
+                        );
+                    }
+                    Ok(
+                        DispatchFailureOutcome::RefusedTerminal | DispatchFailureOutcome::NotFound,
+                    ) => {}
+                    Err(error) => {
+                        error!(%job_id, %error, "Failed to persist job dispatch failure");
+                    }
                 }
             }
         })) {
@@ -78,7 +108,7 @@ pub(super) async fn fire_job_run(state: AppState, job_id: JobId) -> alms_core::A
         info!("Skipping fired job — not found in store");
         return Ok(());
     };
-    if job.status() == JobStatus::Cancelled {
+    if job.status().is_terminal() {
         info!("Skipping fired job — already cancelled");
         return Ok(());
     }
@@ -99,9 +129,13 @@ pub(super) async fn fire_job_run(state: AppState, job_id: JobId) -> alms_core::A
         .get_or_create(job.agent_id, &context_id);
     let session_id = session.id;
 
+    let admission_guard =
+        super::lifecycle::acquire_run_admission_guard(&state.run_admission_gates, session_id).await;
+    state.session_manager.get(session_id)?;
     let run = Run::for_job(session_id, job.agent_id, job.prompt.clone(), job_id);
     let run_id = run.run_id;
     state.run_manager.insert_run(run.clone())?;
+    drop(admission_guard);
     // Job runs execute inline (not via agent_queue) so queued_behind is 0.
     state
         .run_manager
@@ -211,6 +245,29 @@ pub(super) async fn finish_episode_run(
     }
 }
 
+/// Release a continuation reservation when admission ends before a durable
+/// run exists. If it was the episode's final outstanding work item, perform
+/// the normal close side effects immediately.
+async fn abandon_episode_continuation(state: &AppState, job_id: Option<JobId>) {
+    let Some(job_id) = job_id else { return };
+    match state.job_episodes.abandon_reserved_continuation(job_id) {
+        RunCompletion::Closed(episode) => {
+            info!(
+                job_id = %job_id,
+                "Abandoned continuation admission was the episode's final reservation"
+            );
+            close_episode(state, *episode, false).await;
+        }
+        RunCompletion::Open => {
+            debug!(
+                job_id = %job_id,
+                "Released abandoned continuation reservation; episode remains open"
+            );
+        }
+        RunCompletion::Untracked => {}
+    }
+}
+
 /// Close a job episode: completion card, `record_run`, and the recurring
 /// re-arm / coalesced catch-up (D6). `timed_out` marks a deadline-forced
 /// close (D5 detach-and-complete) — the card carries a deadline note and
@@ -237,7 +294,7 @@ pub(super) async fn close_episode(
         info!(job_id = %job_id, "Job disappeared during episode — skipping close");
         return;
     };
-    if job.status() == JobStatus::Cancelled {
+    if job.status().is_terminal() {
         info!(job_id = %job_id, "Job was cancelled during episode — skipping close");
         return;
     }
@@ -302,13 +359,12 @@ pub(super) async fn record_and_rearm(
     let now = Utc::now();
     match &job.schedule {
         JobSchedule::Once { .. } => {
-            // Target status is Cancelled (a spent one-shot). A refusal means
-            // a DELETE won the race and the job is already Cancelled — the
-            // same terminal state either way; nothing to re-arm.
+            // A one-shot closes as Completed. Refusal means another terminal
+            // transition (normally operator cancellation) won the race.
             match state.job_store.record_run_with_reason(
                 job_id,
                 now,
-                JobStatus::Cancelled,
+                JobStatus::Completed,
                 None,
                 Some(if timed_out {
                     alms_core::JobTerminalReason::DeadlineReached
@@ -974,14 +1030,10 @@ pub(crate) async fn completion_notification_loop(
 /// (`job_{uuid}`) whose job the operator cancelled via `DELETE /jobs/{id}`
 /// — the target shape of the teardown-spawned orphan runs from #1206.
 ///
-/// Keys on the `operator_cancelled_jobs` intent set, **NOT** on
-/// `JobStatus::Cancelled` (Codex P2 on PR #1210, confirmed by Tim):
-/// `JobStatus` has no `Completed` variant (#763), so a normally-spent
-/// one-shot is ALSO recorded as `Cancelled` by `record_and_rearm`'s `Once`
-/// arm. Status-keyed suppression would silently drop the late results of a
-/// one-shot's deadline-detached work (subagent completions and DM-ended
-/// fallbacks landing on the job session) — breaking D5's documented
-/// "detach, deliver late via an orphan run" contract.
+/// The explicit intent set is populated only by `DELETE /jobs/{id}` and is
+/// checked synchronously by late producers that may hold a pre-cancellation
+/// job snapshot. Completed and failed jobs are never inserted, so deadline-
+/// detached results remain deliverable after the episode closes.
 fn operator_cancelled_job_for_context(state: &AppState, context_id: &str) -> Option<JobId> {
     let raw = context_id.strip_prefix("job_")?;
     let job_id = JobId(uuid::Uuid::parse_str(raw).ok()?);
@@ -1035,9 +1087,69 @@ pub(super) async fn enqueue_triggered_run(
                 agent_id = %agent_id.0,
                 "Triggered run queue unavailable"
             );
+            abandon_episode_continuation(state, job_id).await;
             return None;
         }
     };
+
+    let admission_guard =
+        super::lifecycle::acquire_run_admission_guard(&state.run_admission_gates, session_id).await;
+    let target_session = match state.session_manager.get(session_id) {
+        Ok(session) => session,
+        Err(_)
+            if context_id.starts_with("notifications:")
+                && session_id == SessionId::deterministic(&context_id) =>
+        {
+            // Notification fallback sessions intentionally begin life at the
+            // first trigger. Create the deterministic session inside the same
+            // admission boundary as run registration so it cannot produce an
+            // orphan. A DELETE that linearizes first may be followed by this
+            // new notification, but the resulting run again has an
+            // authoritative parent session.
+            match state.session_manager.get_or_create_with_id(
+                session_id,
+                agent_id,
+                context_id.clone(),
+            ) {
+                Ok(session) => session,
+                Err(error) => {
+                    warn!(
+                        session_id = %session_id.0,
+                        source = %source_label,
+                        error = %error,
+                        "Suppressing triggered run because its deterministic session could not be persisted"
+                    );
+                    drop(admission_guard);
+                    drop(reservation);
+                    abandon_episode_continuation(state, job_id).await;
+                    return None;
+                }
+            }
+        }
+        Err(_) => {
+            warn!(
+                session_id = %session_id.0,
+                source = %source_label,
+                "Suppressing triggered run because its target session was deleted"
+            );
+            drop(admission_guard);
+            drop(reservation);
+            abandon_episode_continuation(state, job_id).await;
+            return None;
+        }
+    };
+    if target_session.id != session_id {
+        warn!(
+            session_id = %session_id.0,
+            actual_session_id = %target_session.id.0,
+            source = %source_label,
+            "Suppressing triggered run because its context resolves to another session"
+        );
+        drop(admission_guard);
+        drop(reservation);
+        abandon_episode_continuation(state, job_id).await;
+        return None;
+    }
 
     // #1206 (Tim's S3 on PR #1202): suppress post-teardown orphan runs.
     // `DELETE /jobs` tears down an open episode by ending its pending DMs
@@ -1074,6 +1186,10 @@ pub(super) async fn enqueue_triggered_run(
             source = %source_label,
             "Suppressing triggered run targeting an operator-cancelled job's session (#1206)"
         );
+        drop(job_trigger_cancellation_gate);
+        drop(admission_guard);
+        drop(reservation);
+        abandon_episode_continuation(state, job_id).await;
         return None;
     }
 
@@ -1086,12 +1202,14 @@ pub(super) async fn enqueue_triggered_run(
     if let Err(error) = state.run_manager.insert_run(run) {
         state.run_manager.remove_cancel_token(run_id);
         drop(job_trigger_cancellation_gate);
+        drop(admission_guard);
+        drop(reservation);
         error!(
             run_id = %run_id.0,
             error = %error,
             "Triggered run registration failed durably"
         );
-        finish_episode_run(state, job_id, run_id, &[]).await;
+        abandon_episode_continuation(state, job_id).await;
         return None;
     }
 
@@ -1118,6 +1236,7 @@ pub(super) async fn enqueue_triggered_run(
     // acceptable; closing it would require a separate in-flight counter
     // inside `SessionQueue`.
     drop(job_trigger_cancellation_gate);
+    drop(admission_guard);
 
     let (start_tx, start_rx) = tokio::sync::oneshot::channel();
     let state_clone = state.clone();

@@ -2,7 +2,7 @@ import { screen } from "@testing-library/preact";
 import { describe, expect, it, vi } from "vitest";
 
 import { installContractBridge } from "./bridge";
-import { ContractViolation, parseSsePayload } from "./contracts";
+import { ContractViolation, jobSchema, parseSsePayload } from "./contracts";
 
 const sessionId = "11111111-1111-4111-8111-111111111111";
 const runId = "22222222-2222-4222-8222-222222222222";
@@ -23,6 +23,33 @@ describe("typed compatibility boundary", () => {
     ).toMatchObject({ newest: 20 });
   });
 
+  it("accepts authoritative completed and failed job states", () => {
+    const base = {
+      id: runId,
+      prompt: "check durable state",
+      schedule: { type: "once" as const, run_at: "2026-07-12T10:00:00Z" },
+      next_run_at: null,
+      last_run_at: "2026-07-12T10:00:05Z",
+    };
+
+    expect(
+      jobSchema.parse({
+        ...base,
+        status: "completed",
+        terminal_reason: "deadline_reached",
+        retry_count: 0,
+      }).status,
+    ).toBe("completed");
+    expect(
+      jobSchema.parse({
+        ...base,
+        status: "failed",
+        terminal_reason: "retry_exhausted",
+        retry_count: 3,
+        last_error: "database unavailable",
+      }).status,
+    ).toBe("failed");
+  });
   it("rejects malformed activity without mutating legacy state", () => {
     expect(() =>
       parseSsePayload("session_activity_started", {

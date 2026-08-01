@@ -718,9 +718,10 @@ impl From<Run> for RunStatusResponse {
 /// The Coordinator uses this to make subagent runs visible in the RunManager
 /// without depending on `alms-gateway`. The gateway implements this trait
 /// on its `RunManager`.
+#[async_trait::async_trait]
 pub trait RunRegistrar: Send + Sync + std::fmt::Debug {
     /// Register a new run (insert into the run store and persist to SQLite).
-    fn register_run(&self, run: Run) -> crate::AlmsResult<()>;
+    async fn register_run(&self, run: Run) -> crate::AlmsResult<()>;
     /// Update an existing run (e.g. mark as completed/failed).
     fn update_run(&self, run: Run) -> crate::AlmsResult<()>;
 }

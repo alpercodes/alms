@@ -13,6 +13,7 @@ alms-tools = { path = "../alms-tools" }
 alms-coordinator = { path = "../alms-coordinator" }
 alms-channel = { path = "../alms-channel" }
 
+async-trait.workspace = true
 axum.workspace = true
 chrono.workspace = true
 cron.workspace = true

@@ -38,6 +38,9 @@ fn replay_with_stream_state(
             .map(|candidate| candidate != epoch)
             .unwrap_or(true)
     });
+    state
+        .run_manager
+        .observe_replay_epoch_mismatch(epoch_mismatch);
     let mut replay = Vec::with_capacity(window.events.len() + 1);
     replay.push(SseEventData::stream_state(
         epoch,

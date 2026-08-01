@@ -7,9 +7,12 @@ use alms_core::job::{
 };
 use alms_core::{AlmsError, AlmsResult, MAX_LIFECYCLE_REVISION};
 use dashmap::DashMap;
-use std::sync::Arc;
 #[cfg(test)]
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
 use tracing::info;
 
 /// Outcome of [`JobStore::record_run`].
@@ -23,19 +26,33 @@ pub enum RecordRunOutcome {
     /// transition a job back out of it (#1202 S1 — a `DELETE /jobs` racing
     /// the episode-close fanout would otherwise resurrect and re-arm a
     /// cancelled recurring job).
-    RefusedCancelled,
+    RefusedTerminal,
     /// No job with this id exists (e.g. deleted mid-flight).
     NotFound,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DispatchFailureOutcome {
+    RetryScheduled {
+        attempt: u32,
+        retry_at: chrono::DateTime<chrono::Utc>,
+    },
+    Exhausted {
+        attempts: u32,
+    },
+    RefusedTerminal,
+    NotFound,
+}
 /// Manages scheduled jobs in memory, with optional SQLite write-through.
 ///
-/// On startup, all non-cancelled jobs are loaded from SQLite so the scheduler
-/// (task #20) can re-register them without losing state across restarts.
+/// On startup, all non-terminal jobs are loaded from SQLite so the scheduler
+/// can re-register pending/active/retrying work without resurrecting outcomes.
 #[derive(Debug, Clone)]
 pub struct JobStore {
     jobs: Arc<DashMap<JobId, Job>>,
     store: Option<Arc<SqliteStore>>,
+    retry_attempts: Arc<AtomicU64>,
+    retry_exhaustions: Arc<AtomicU64>,
     #[cfg(test)]
     fail_next_persistence: Arc<AtomicBool>,
 }
@@ -52,18 +69,31 @@ impl JobStore {
         Self {
             jobs: Arc::new(DashMap::new()),
             store: None,
+            retry_attempts: Arc::new(AtomicU64::new(0)),
+            retry_exhaustions: Arc::new(AtomicU64::new(0)),
             #[cfg(test)]
             fail_next_persistence: Arc::new(AtomicBool::new(false)),
         }
     }
 
-    /// Create a store backed by SQLite at `db_path`.
-    ///
-    /// Opens (or creates) the database and loads all non-cancelled jobs into memory.
+    pub fn retry_attempts_total(&self) -> u64 {
+        self.retry_attempts.load(Ordering::Relaxed)
+    }
+
+    pub fn retry_exhaustions_total(&self) -> u64 {
+        self.retry_exhaustions.load(Ordering::Relaxed)
+    }
+
+    /// Create a SQLite-backed store and reload the complete job history.
     pub fn with_sqlite(db_path: &str) -> AlmsResult<Self> {
         let store = SqliteStore::open(db_path)?;
+        Self::with_store(Arc::new(store))
+    }
+
+    /// Create a store backed by the gateway's shared SQLite connection.
+    pub fn with_store(store: Arc<SqliteStore>) -> AlmsResult<Self> {
         let mut s = Self::new();
-        s.store = Some(Arc::new(store));
+        s.store = Some(store);
         s.load_from_store()?;
         Ok(s)
     }
@@ -72,7 +102,7 @@ impl JobStore {
         let Some(ref store) = self.store else {
             return Ok(());
         };
-        let jobs = store.load_all_jobs()?;
+        let jobs = store.load_all_jobs_unfiltered()?;
         let count = jobs.len();
         for job in jobs {
             self.jobs.insert(job.id, job);
@@ -87,10 +117,17 @@ impl JobStore {
     pub fn create(&self, req: CreateJobRequest) -> AlmsResult<Job> {
         let next_run_at = match &req.schedule {
             JobSchedule::Once { run_at } => Some(*run_at),
-            // Computed by the scheduler in task #20
             JobSchedule::Recurring { .. } => None,
         };
+        self.create_with_next_run_at(req, next_run_at)
+    }
 
+    /// Create and persist a job with its authoritative first fire time in one write.
+    pub fn create_with_next_run_at(
+        &self,
+        req: CreateJobRequest,
+        next_run_at: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> AlmsResult<Job> {
         let job = Job::new(req.agent_id, req.prompt, req.schedule, next_run_at);
 
         if let Some(ref store) = self.store {
@@ -129,7 +166,7 @@ impl JobStore {
     ///
     /// **`Cancelled` is absorbing (#1202 S1):** if the job is already
     /// `Cancelled`, the write is refused — nothing is mutated and
-    /// [`RecordRunOutcome::RefusedCancelled`] is returned. This closes the
+    /// [`RecordRunOutcome::RefusedTerminal`] is returned. This closes the
     /// cancel-vs-close TOCTOU at the persistence layer: the gateway's
     /// `close_episode` reads the job's status, `await`s the completion
     /// fanout, and only then records the run — a `DELETE /jobs` landing in
@@ -149,7 +186,7 @@ impl JobStore {
         next_run_at: Option<chrono::DateTime<chrono::Utc>>,
     ) -> AlmsResult<RecordRunOutcome> {
         let terminal_reason =
-            (new_status == JobStatus::Cancelled).then_some(JobTerminalReason::Completed);
+            (new_status == JobStatus::Completed).then_some(JobTerminalReason::Completed);
         self.record_run_with_reason(id, ran_at, new_status, next_run_at, terminal_reason)
     }
 
@@ -167,14 +204,14 @@ impl JobStore {
                 ran_at,
                 next_run_at,
             },
-            JobStatus::Cancelled => JobTransition::CompleteOneShot {
+            JobStatus::Completed => JobTransition::CompleteOneShot {
                 ran_at,
                 terminal_reason: terminal_reason.unwrap_or(JobTerminalReason::Completed),
             },
-            JobStatus::Pending => {
-                return Err(AlmsError::InvalidConfig(
-                    "record_run cannot transition a job to pending".to_string(),
-                ));
+            JobStatus::Pending | JobStatus::Failed | JobStatus::Cancelled => {
+                return Err(AlmsError::InvalidConfig(format!(
+                    "record_run cannot transition a job to {new_status:?}"
+                )));
             }
         };
         match self.transition_job(id, transition)? {
@@ -185,13 +222,49 @@ impl JobStore {
             }
             Some(TransitionOutcome::NoOp { .. } | TransitionOutcome::Rejected { .. }) => {
                 info!("Job {} is terminal — record_run refused", id.0);
-                Ok(RecordRunOutcome::RefusedCancelled)
+                Ok(RecordRunOutcome::RefusedTerminal)
             }
         }
     }
 
+    /// Persist a recoverable dispatch failure and either schedule the next
+    /// bounded retry or move the job to the authoritative failed state.
+    pub fn record_dispatch_failure(
+        &self,
+        id: JobId,
+        error: impl Into<String>,
+        retry_at: chrono::DateTime<chrono::Utc>,
+        max_attempts: u32,
+    ) -> AlmsResult<DispatchFailureOutcome> {
+        match self.transition_job(
+            id,
+            JobTransition::RecordDispatchFailure {
+                error: error.into(),
+                retry_at,
+                max_attempts,
+            },
+        )? {
+            None => Ok(DispatchFailureOutcome::NotFound),
+            Some(TransitionOutcome::Applied {
+                to: JobStatus::Failed,
+                ..
+            }) => {
+                self.retry_attempts.fetch_add(1, Ordering::Relaxed);
+                self.retry_exhaustions.fetch_add(1, Ordering::Relaxed);
+                let attempts = self.get(id).map_or(max_attempts, |job| job.retry_count());
+                Ok(DispatchFailureOutcome::Exhausted { attempts })
+            }
+            Some(TransitionOutcome::Applied { .. }) => {
+                self.retry_attempts.fetch_add(1, Ordering::Relaxed);
+                let attempt = self.get(id).map_or(1, |job| job.retry_count());
+                Ok(DispatchFailureOutcome::RetryScheduled { attempt, retry_at })
+            }
+            Some(TransitionOutcome::NoOp { .. } | TransitionOutcome::Rejected { .. }) => {
+                Ok(DispatchFailureOutcome::RefusedTerminal)
+            }
+        }
+    }
     /// Cancel a job.
-    ///
     /// Returns:
     /// - `Ok(Some(true))` — job was found and cancelled
     /// - `Ok(Some(false))` — job exists but was already cancelled
@@ -339,6 +412,8 @@ mod tests {
             None,
             MAX_LIFECYCLE_REVISION,
             None,
+            0,
+            None,
         );
         let job_id = job.id;
         store.jobs.insert(job_id, job);
@@ -386,7 +461,7 @@ mod tests {
                 .record_run_with_reason(
                     completed_first.id,
                     Utc::now(),
-                    JobStatus::Cancelled,
+                    JobStatus::Completed,
                     None,
                     Some(JobTerminalReason::Completed),
                 )
@@ -406,12 +481,12 @@ mod tests {
                 .record_run_with_reason(
                     cancelled_first.id,
                     Utc::now(),
-                    JobStatus::Cancelled,
+                    JobStatus::Completed,
                     None,
                     Some(JobTerminalReason::Completed),
                 )
                 .unwrap(),
-            RecordRunOutcome::RefusedCancelled
+            RecordRunOutcome::RefusedTerminal
         );
         assert_eq!(
             store.get(cancelled_first.id).unwrap().terminal_reason(),
@@ -442,7 +517,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             outcome,
-            RecordRunOutcome::RefusedCancelled,
+            RecordRunOutcome::RefusedTerminal,
             "record_run on a cancelled job must be refused"
         );
 
@@ -545,6 +620,8 @@ mod tests {
             authoritative.last_run_at,
             authoritative.lifecycle_revision(),
             Some(JobTerminalReason::OperatorCancelled),
+            0,
+            None,
         );
 
         store.save_job(&authoritative).unwrap();
@@ -614,5 +691,92 @@ mod tests {
         );
         store.save_job(&pending).unwrap();
         assert_eq!(store.load_all_jobs().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn dispatch_failure_budget_survives_restart_and_exhausts() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("job-retry.db");
+        let path = path.to_string_lossy().into_owned();
+        let store = JobStore::with_sqlite(&path).unwrap();
+        let job = store.create(once_req()).unwrap();
+        let first_retry = Utc::now() + chrono::Duration::seconds(5);
+        assert_eq!(
+            store
+                .record_dispatch_failure(job.id, "first", first_retry, 3)
+                .unwrap(),
+            DispatchFailureOutcome::RetryScheduled {
+                attempt: 1,
+                retry_at: first_retry,
+            }
+        );
+        drop(store);
+
+        let restarted = JobStore::with_sqlite(&path).unwrap();
+        let recovered = restarted.get(job.id).expect("retrying job must reload");
+        assert_eq!(recovered.retry_count(), 1);
+        assert_eq!(recovered.next_run_at, Some(first_retry));
+        assert_eq!(recovered.last_error(), Some("first"));
+
+        assert!(matches!(
+            restarted
+                .record_dispatch_failure(job.id, "second", Utc::now(), 3)
+                .unwrap(),
+            DispatchFailureOutcome::RetryScheduled { attempt: 2, .. }
+        ));
+        assert_eq!(
+            restarted
+                .record_dispatch_failure(job.id, "third", Utc::now(), 3)
+                .unwrap(),
+            DispatchFailureOutcome::Exhausted { attempts: 3 }
+        );
+        let failed = restarted.get(job.id).unwrap();
+        assert_eq!(failed.status(), JobStatus::Failed);
+        assert_eq!(
+            failed.terminal_reason(),
+            Some(JobTerminalReason::RetryExhausted)
+        );
+        assert_eq!(failed.next_run_at, None);
+        assert_eq!(restarted.retry_attempts_total(), 2);
+        assert_eq!(restarted.retry_exhaustions_total(), 1);
+        drop(restarted);
+
+        let final_restart = JobStore::with_sqlite(&path).unwrap();
+        let failed = final_restart
+            .get(job.id)
+            .expect("failed job must remain observable after restart");
+        assert_eq!(failed.status(), JobStatus::Failed);
+        assert_eq!(
+            failed.terminal_reason(),
+            Some(JobTerminalReason::RetryExhausted)
+        );
+    }
+
+    #[test]
+    fn completed_and_cancelled_jobs_remain_observable_after_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("job-history.db");
+        let path = path.to_string_lossy().into_owned();
+        let store = JobStore::with_sqlite(&path).unwrap();
+        let completed = store.create(once_req()).unwrap();
+        let cancelled = store.create(recurring_req()).unwrap();
+        assert_eq!(
+            store
+                .record_run(completed.id, Utc::now(), JobStatus::Completed, None)
+                .unwrap(),
+            RecordRunOutcome::Recorded
+        );
+        assert_eq!(store.cancel(cancelled.id).unwrap(), Some(true));
+        drop(store);
+
+        let restarted = JobStore::with_sqlite(&path).unwrap();
+        assert_eq!(
+            restarted.get(completed.id).unwrap().status(),
+            JobStatus::Completed
+        );
+        assert_eq!(
+            restarted.get(cancelled.id).unwrap().status(),
+            JobStatus::Cancelled
+        );
     }
 }

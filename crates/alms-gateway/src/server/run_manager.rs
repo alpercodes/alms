@@ -228,6 +228,17 @@ where
     }
 }
 
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+pub struct RunManagerMetrics {
+    pub transition_rejections_total: u64,
+    pub replay_gaps_total: u64,
+    pub replay_epoch_mismatches_total: u64,
+    pub run_subscribers: usize,
+    pub session_subscribers: usize,
+    pub agent_subscribers: usize,
+    pub activity_subscribers: usize,
+}
+
 /// Run manager for tracking runs and their event streams
 #[derive(Debug, Clone)]
 pub struct RunManager {
@@ -257,6 +268,9 @@ pub struct RunManager {
     /// [`ManagedSubscription`] drop guard as soon as the HTTP stream closes.
     activity_senders: SubscriberMap<()>,
     next_subscription_id: Arc<AtomicU64>,
+    transition_rejections: Arc<AtomicU64>,
+    replay_gap_detections: Arc<AtomicU64>,
+    replay_epoch_mismatches: Arc<AtomicU64>,
     /// Serializes authoritative session-activity snapshots with global event
     /// logging, so concurrent run transitions cannot publish an older
     /// `has_active_run` value after a newer one.
@@ -305,6 +319,9 @@ impl RunManager {
             agent_event_log: AgentEventLogManager::new(),
             activity_senders: Arc::new(DashMap::new()),
             next_subscription_id: Arc::new(AtomicU64::new(1)),
+            transition_rejections: Arc::new(AtomicU64::new(0)),
+            replay_gap_detections: Arc::new(AtomicU64::new(0)),
+            replay_epoch_mismatches: Arc::new(AtomicU64::new(0)),
             activity_event_gate: Arc::new(tokio::sync::Mutex::new(())),
             activity_event_log: AgentEventLogManager::new(),
             run_text_buffers: Arc::new(DashMap::new()),
@@ -319,6 +336,18 @@ impl RunManager {
 
     pub fn stream_epoch(&self) -> uuid::Uuid {
         self.stream_epoch
+    }
+
+    pub fn operational_metrics(&self) -> RunManagerMetrics {
+        RunManagerMetrics {
+            transition_rejections_total: self.transition_rejections.load(Ordering::Relaxed),
+            replay_gaps_total: self.replay_gap_detections.load(Ordering::Relaxed),
+            replay_epoch_mismatches_total: self.replay_epoch_mismatches.load(Ordering::Relaxed),
+            run_subscribers: self.event_senders.iter().map(|entry| entry.len()).sum(),
+            session_subscribers: self.session_senders.iter().map(|entry| entry.len()).sum(),
+            agent_subscribers: self.agent_senders.iter().map(|entry| entry.len()).sum(),
+            activity_subscribers: self.activity_senders.iter().map(|entry| entry.len()).sum(),
+        }
     }
 
     /// Set the SQLite store for run persistence.
@@ -448,6 +477,37 @@ impl RunManager {
 
     pub fn insert_run(&self, run: Run) -> alms_core::AlmsResult<()> {
         self.update_run(run).map(|_| ())
+    }
+
+    /// Persist the two durable facts that define HTTP run admission as one
+    /// transaction. Returns the transaction's session activity timestamp when
+    /// SQLite is enabled.
+    pub(crate) fn persist_run_admission(
+        &self,
+        run: &Run,
+        message: &alms_session::Message,
+    ) -> alms_core::AlmsResult<Option<alms_core::Timestamp>> {
+        self.fail_if_persistence_injected()?;
+        self.sqlite_store
+            .as_ref()
+            .map(|store| store.save_run_with_initial_message(run, message))
+            .transpose()
+    }
+
+    /// Publish a run that was already committed by `persist_run_admission`
+    /// into the in-memory projection without issuing a second SQLite write.
+    pub(crate) fn insert_persisted_run(&self, run: Run) -> alms_core::AlmsResult<()> {
+        let run_id = run.run_id;
+        match self.runs.entry(run_id) {
+            Entry::Vacant(entry) => {
+                entry.insert(run);
+                Ok(())
+            }
+            Entry::Occupied(_) => Err(alms_core::AlmsError::Runtime(format!(
+                "run {} was already registered during admission",
+                run_id.0
+            ))),
+        }
     }
 
     pub fn get_run(&self, run_id: RunId) -> Option<Run> {
@@ -678,6 +738,9 @@ impl RunManager {
         };
         let mut candidate = entry.clone();
         let outcome = candidate.transition(transition);
+        if matches!(outcome, TransitionOutcome::Rejected { .. }) {
+            self.transition_rejections.fetch_add(1, Ordering::Relaxed);
+        }
         if matches!(outcome, TransitionOutcome::Rejected { .. })
             && entry.lifecycle_revision() >= alms_core::MAX_LIFECYCLE_REVISION
         {
@@ -717,14 +780,19 @@ impl RunManager {
     }
 
     fn persist_run_candidate(&self, run: &Run) -> alms_core::AlmsResult<()> {
+        self.fail_if_persistence_injected()?;
+        if let Some(store) = &self.sqlite_store {
+            store.save_run(run)?;
+        }
+        Ok(())
+    }
+
+    fn fail_if_persistence_injected(&self) -> alms_core::AlmsResult<()> {
         #[cfg(test)]
         if self.fail_next_persistence.swap(false, Ordering::AcqRel) {
             return Err(alms_core::AlmsError::Runtime(
                 "injected run persistence failure".to_string(),
             ));
-        }
-        if let Some(store) = &self.sqlite_store {
-            store.save_run(run)?;
         }
         Ok(())
     }
@@ -1217,12 +1285,26 @@ impl RunManager {
             .await
     }
 
+    fn observe_replay_window(&self, window: ReplayWindow) -> ReplayWindow {
+        if window.replay_gap {
+            self.replay_gap_detections.fetch_add(1, Ordering::Relaxed);
+        }
+        window
+    }
+
+    pub(crate) fn observe_replay_epoch_mismatch(&self, epoch_mismatch: bool) {
+        if epoch_mismatch {
+            self.replay_epoch_mismatches.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     pub async fn run_replay_window(
         &self,
         run_id: RunId,
         last_event_id: Option<u64>,
     ) -> ReplayWindow {
-        self.event_log.replay_window(run_id, last_event_id).await
+        let window = self.event_log.replay_window(run_id, last_event_id).await;
+        self.observe_replay_window(window)
     }
 
     pub async fn session_replay_window(
@@ -1230,9 +1312,11 @@ impl RunManager {
         session_id: SessionId,
         last_event_id: Option<u64>,
     ) -> ReplayWindow {
-        self.session_event_log
+        let window = self
+            .session_event_log
             .replay_window(session_id, last_event_id)
-            .await
+            .await;
+        self.observe_replay_window(window)
     }
 
     pub async fn agent_replay_window(
@@ -1240,15 +1324,19 @@ impl RunManager {
         agent_id: AgentId,
         last_event_id: Option<u64>,
     ) -> ReplayWindow {
-        self.agent_event_log
+        let window = self
+            .agent_event_log
             .replay_window(agent_id, last_event_id)
-            .await
+            .await;
+        self.observe_replay_window(window)
     }
 
     pub async fn activity_replay_window(&self, last_event_id: Option<u64>) -> ReplayWindow {
-        self.activity_event_log
+        let window = self
+            .activity_event_log
             .replay_window(ACTIVITY_LOG_KEY, last_event_id)
-            .await
+            .await;
+        self.observe_replay_window(window)
     }
 
     /// Close all active SSE sender channels (per-run, per-session, per-agent).
@@ -1329,8 +1417,9 @@ impl Default for RunManager {
     }
 }
 
+#[async_trait::async_trait]
 impl alms_core::RunRegistrar for RunManager {
-    fn register_run(&self, run: Run) -> alms_core::AlmsResult<()> {
+    async fn register_run(&self, run: Run) -> alms_core::AlmsResult<()> {
         self.insert_run(run)
     }
 
@@ -1372,6 +1461,40 @@ mod tests {
         assert!(!rm.wait_drain(std::time::Duration::from_millis(50)).await);
     }
 
+    #[tokio::test]
+    async fn operational_metrics_track_rejections_gaps_and_live_subscribers() {
+        let rm = RunManager::new();
+        let run = Run::new(SessionId::new(), AgentId::new(), "metrics".into());
+        let run_id = run.run_id;
+        rm.insert_run(run).unwrap();
+        rm.transition_run(
+            run_id,
+            RunTransition::Cancel {
+                terminal_reason: "test".into(),
+            },
+        )
+        .unwrap();
+        let rejected = rm
+            .transition_run(
+                run_id,
+                RunTransition::Start {
+                    resolved_config: None,
+                },
+            )
+            .unwrap()
+            .unwrap();
+        assert!(matches!(rejected, TransitionOutcome::Rejected { .. }));
+        assert!(rm.run_replay_window(RunId::new(), Some(9)).await.replay_gap);
+        rm.observe_replay_epoch_mismatch(true);
+        let subscription = rm.subscribe_activity();
+        assert_eq!(rm.operational_metrics().activity_subscribers, 1);
+        drop(subscription);
+        let metrics = rm.operational_metrics();
+        assert_eq!(metrics.transition_rejections_total, 1);
+        assert_eq!(metrics.replay_gaps_total, 1);
+        assert_eq!(metrics.replay_epoch_mismatches_total, 1);
+        assert_eq!(metrics.activity_subscribers, 0);
+    }
     /// Verify that intermediate notifications (in_flight going 1->0->1) do
     /// not reset the absolute deadline in `wait_drain`.
     #[tokio::test(start_paused = true)]
@@ -1380,6 +1503,7 @@ mod tests {
         rm.track_in_flight(); // run A
 
         let rm2 = rm.clone();
+
         tokio::spawn(async move {
             // After 20ms: run A finishes (1->0, notifies), run B starts (0->1)
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;

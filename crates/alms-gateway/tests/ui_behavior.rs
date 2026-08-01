@@ -476,3 +476,12 @@ fn subagent_cancel_js_behaviour() {
 fn job_summary_js_behaviour() {
     run_node_test("job-summary.test.mjs");
 }
+
+/// Regression for PR #1230: terminal job helpers must remain in module scope.
+/// The Node harness evaluates the real `JobsTab` render with a failed job and
+/// verifies the status/retry/error metadata renders without a ReferenceError
+/// or an inappropriate cancellation control.
+#[test]
+fn jobs_tab_js_behaviour() {
+    run_node_test("jobs-tab.test.mjs");
+}

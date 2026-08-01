@@ -1,4 +1,4 @@
-import{a as e,c as t,d as n,i as r,l as i,n as a,o,r as s,s as c,u as l}from"./index-5vwJZZrk.js";import{n as u,t as d}from"./deps-uxKNyjCw.js";import{A as f,C as p,D as m,E as h,M as g,N as _,S as v,T as y,_ as b,a as x,b as S,c as C,d as w,f as T,g as E,h as D,i as ee,j as te,k as ne,l as re,m as ie,o as O,p as k,r as A,s as j,t as M,u as ae,v as N,w as oe,x as P,y as se}from"./pending-messages-DFFoAOTc.js";import{A as ce,C as F,D as le,E as I,I as L,M as ue,O as R,P as de,S as fe,T as pe,a as me,b as he,c as ge,d as _e,g as ve,h as ye,j as be,k as xe,l as Se,n as Ce,o as we,p as Te,r as Ee,s as De,t as Oe,u as ke,x as Ae,y as je}from"./use-session-stream-BCjHkhaY.js";import{t as z}from"./entity-state-Dvifu_4n.js";import{activeAgent as B,activeAgentId as V,agents as H,replaceAgents as Me}from"./agents-BjNLyqKW.js";import{activeRunId as U,clearRuns as Ne,replaceRuns as Pe,runListGeneration as Fe,selectedRunId as Ie}from"./runs-C4N2YFvi.js";import{a as Le,i as Re,o as ze,r as Be}from"./chat-actions-uXEv39RD.js";import{agentSwitchLoading as Ve,bootRetryAvailable as He,runBoot as Ue,sessionSwitchLoading as We,setRunBoot as Ge}from"./loading-BCtl854z.js";import{n as Ke,t as qe}from"./select-generation-DvILpFQd.js";import{n as Je,o as Ye,r as Xe,t as Ze}from"./runs-J5kT8dOv.js";import{t as Qe}from"./load-session-BhK4nUTX.js";var $e=()=>f(`/settings`),et=e=>te(`/settings`,e),W=o({});async function tt(){try{W.value=await $e()}catch(e){console.error(`[settings] refresh failed:`,e)}}var G=o(null),K=o(null),q=null,nt=null,rt=0,it=10,at=null,J=null,ot=null;function st(e,t){let n=t&&t.streamEpoch!=null?String(t.streamEpoch):null;if(lt(),!e)return;ot!==null&&(clearTimeout(ot),ot=null);let r=localStorage.getItem(`alms_auth_token`),i=new URLSearchParams;r&&i.set(`token`,r),t&&t.lastEventId!=null&&i.set(`last_event_id`,String(t.lastEventId)),n&&i.set(`stream_epoch`,n);let a=i.toString(),o=`/events/session-activity${a?`?`+a:``}`,s=new EventSource(o);q=s,nt=e,rt=0,at=t&&t.lastEventId!=null?t.lastEventId:null,J=n;let c=!1,l=!1,u=!1,d=null,f=null,p=0,m=!1,h=(e,t,n)=>re(e,t,n,J),g=async(e,t=J)=>{let n=Number.isSafeInteger(e)?e:null,r=t;if(l){u=!0,f===r?n!=null&&(d=d==null?n:Math.max(d,n)):(f=r,d=n);return}if(s!==q)return;l=!0;let i=ae(n,r),a=null;try{a=await L(null,{includeDms:!0})}catch(e){console.error(`[agent-events] activity reconciliation failed:`,e)}if(s!==q){C(i);return}a?T(i,a.sessions||[])?p=0:(u=!0,d=n,f=r):C(i),l=!1;let o=u,c=d,m=f;if(u=!1,d=null,f=null,o&&s===q){g(c,m);return}if(!a&&s===q){p++;let e=Math.min(1e3*2**(p-1),3e4);s._reconciliationRetryTimer=setTimeout(()=>{s._reconciliationRetryTimer=null,s===q&&g(null)},e)}};s.addEventListener(`open`,()=>{if(s!==q)return;let e=c||!!(t&&t.reconcileOnOpen);c=!0,me(`agent-events`),e&&g(null)});let _=async(t,n)=>{if(!(m||s!==q)){m=!0,s.close(),console.error(`[agent-events] rejected live event; reconciling:`,n);try{let n=await L(null,{includeDms:!0});if(s!==q)return;ie(n.sessions||[],t,J),q=null,st(e,{lastEventId:t,streamEpoch:J,reconcileOnOpen:!0})}catch(e){console.error(`[agent-events] contract reconciliation failed:`,e),De(`agent-events`)}}},v=(e,t)=>s.addEventListener(e,n=>{if(s!==q)return;let r=n.lastEventId,i=r&&/^\d+$/.test(r)?Number(r):null;try{let a=globalThis.__almsContracts;if(!a)throw Error(`Frontend contract bridge is not installed`);t({data:a.parseSseJsonPayload(e,n.data),lastEventId:n.lastEventId}),i!=null&&(at=r)}catch(t){i==null?(console.error(`[agent-events]`,e,`handler failed:`,t),s.close(),De(`agent-events`)):_(i,t)}});v(`session_activity_started`,e=>{let t=e.data,n=/^\d+$/.test(e.lastEventId)?Number(e.lastEventId):null;h(`session_activity_started`,t,n)}),v(`session_activity_ended`,e=>{let t=e.data,n=/^\d+$/.test(e.lastEventId)?Number(e.lastEventId):null;h(`session_activity_ended`,t,n)}),v(`stream_state`,e=>{let t=e.data,n=!!(J&&t.stream_epoch&&J!==t.stream_epoch);if(t.stream_epoch&&(J=t.stream_epoch),t.requires_reconciliation||n){let e=Number.isSafeInteger(t.newest)?t.newest:null;g(e)}}),s.onerror=()=>{if(s.readyState===EventSource.CLOSED){if(rt++,rt>=it){console.error(`[agent-events] Max retries reached for agent`,e),De(`agent-events`);return}let t=Math.min(2e3*2**(rt-1),3e4),n=e,r=at,i=J;ot=setTimeout(()=>{ot=null,nt===n&&st(n,{lastEventId:r,streamEpoch:i,reconcileOnOpen:!0})},t)}}}function ct(){rt=0;let e=nt;e?st(e,{lastEventId:at,streamEpoch:J,reconcileOnOpen:!0}):me(`agent-events`)}Se(ct);function lt(){q&&=(q._reconciliationRetryTimer!=null&&(clearTimeout(q._reconciliationRetryTimer),q._reconciliationRetryTimer=null),q.close(),null),nt=null,at=null,J=null,rt=0,ot!==null&&(clearTimeout(ot),ot=null),me(`agent-events`)}function ut(e,t){return!t||typeof t!=`string`?e??null:t===e?null:t}function dt(e){return!e||typeof e!=`string`?null:e}function ft(e,t){return!t||typeof t!=`string`||!e||typeof e!=`string`?!1:e===t}function pt(e){let t=new Map;if(!Array.isArray(e))return t;for(let n of e){if(!n||typeof n.agent_id!=`string`||!n.agent_id)continue;let e=t.get(n.agent_id);e?e.push(n):t.set(n.agent_id,[n])}return t}function mt(e,t){if(!e||!t||typeof t!=`string`)return!1;if(e.session_type===`notification`)return e.agent_name===t;if(e.session_type===`dm`){let n=e.participants;return Array.isArray(n)&&n.includes(t)}return!1}function ht(e,t){if(!Array.isArray(e))return[];let n=e.map((e,n)=>({s:e,idx:n,owned:+!mt(e,t)}));return n.sort((e,t)=>e.owned-t.owned||e.idx-t.idx),n.map(e=>e.s)}function gt(e){return Array.isArray(e)?e.filter(e=>e&&e.session_type!==`notification`&&e.session_type!==`job`):[]}function _t(e){return Array.isArray(e)?e.filter(e=>e&&e.session_type===`job`):[]}var vt=`alms_active_agent`,Y=0;function yt(e){return`alms_active_session_${e}`}function bt(e,t){e&&t&&localStorage.setItem(yt(e),t)}function xt(e,t,n){if(n){let e=t.find(e=>e.id===n);if(e)return e}let r=localStorage.getItem(yt(e));if(r){let e=t.find(e=>e.id===r);if(e)return e}return t[0]||null}async function St(e,t){let n=localStorage.getItem(yt(e));if(!n||t.some(e=>e.id===n))return null;try{return await de(n),n}catch(t){return t&&t.status===404&&localStorage.removeItem(yt(e)),null}}async function Ct(){try{let e=await $e();W.value=e,Me(e.agents||[]);let t=localStorage.getItem(vt),n=H.value.find(e=>e.is_default),r=H.value[0],i=H.value.find(e=>e.id===t)||n||r;i&&(V.value=i.id,S.value=dt(i.id),localStorage.setItem(vt,i.id),await Tt(i.id))}catch(e){throw console.error(`[boot] failed:`,e),e}}async function wt(){try{return(await L(null,{includeDms:!0})).sessions||[]}catch(e){return console.error(`[fetchCrossAgentSurfaces] failed:`,e),[]}}async function Tt(e,t){let n=++Y;try{let[r,i]=await Promise.all([L(e,{includeDms:!1}),wt()]);if(n!==Y)return;let a=gt(r.sessions||[]);y(a,i),ie([...a,...i]),st(e);let o=t?null:await St(e,a);if(n!==Y)return;if(o)E.value=o,bt(e,o),await Qe(o,{isStale:()=>n!==Y,logPrefix:`loadAgentSessions:hidden`});else if(a.length>0){let r=xt(e,a,t);E.value=r.id,bt(e,r.id),await Qe(r.id,{isStale:()=>n!==Y,logPrefix:`loadAgentSessions`})}else{let t=await be(e,`web-chat-`+Date.now());if(n!==Y)return;let[r,i]=await Promise.all([L(e,{includeDms:!1}),wt()]);if(n!==Y)return;y(gt(r.sessions||[]),i),E.value=t.session_id,Le([],t.session_id),Pe(t.session_id,[]),Ee(t.session_id)}}catch(e){if(n!==Y)return;console.error(`[loadAgentSessions] failed:`,e)}}async function Et(e,t){if(!H.value.find(t=>t.id===e))return;Oe(),lt(),qe(),V.value=e,S.value=dt(e),localStorage.setItem(vt,e),Ve.value=!0,E.value=null,Ie.value=null,h(),Le([]),k.value=[],G.value=null,K.value=null,he();let n=Tt(e,t&&t.targetSessionId),r=Y;try{await n}finally{r===Y&&(Ve.value=!1)}}var X=o(null),Z=o(`agents`);function Dt(e){X.value===e?X.value=null:(X.value=e,Z.value=e)}var Ot=`alms_theme`;function kt(){return localStorage.getItem(Ot)||`dark`}var At=o(kt());function jt(){let e=At.value===`dark`?`light`:`dark`;At.value=e,localStorage.setItem(Ot,e),document.documentElement.setAttribute(`data-theme`,e)}document.documentElement.setAttribute(`data-theme`,kt());var Mt=()=>d`<svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><circle cx="10" cy="10" r="8"/><path d="M10 6v4l3 3"/></svg>`,Nt=()=>d`<svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M3 5a2 2 0 012-2h3l2 2h5a2 2 0 012 2v7a2 2 0 01-2 2H5a2 2 0 01-2-2V5z"/></svg>`,Pt=()=>d`<svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M5 5l10 10M15 5L5 15"/></svg>`,Ft=()=>d`<svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 15V5M10 5L5 10M10 5l5 5"/></svg>`,It=()=>d`<svg width="20" height="20" viewBox="0 0 20 20" fill="currentColor"><rect x="5" y="5" width="10" height="10" rx="1.5"/></svg>`,Lt=()=>d`<svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M6 4l10 6-10 6V4z"/></svg>`,Rt=()=>d`<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12.22 2h-.44a2 2 0 00-2 2v.18a2 2 0 01-1 1.73l-.43.25a2 2 0 01-2 0l-.15-.08a2 2 0 00-2.73.73l-.22.38a2 2 0 00.73 2.73l.15.1a2 2 0 011 1.72v.51a2 2 0 01-1 1.74l-.15.09a2 2 0 00-.73 2.73l.22.38a2 2 0 002.73.73l.15-.08a2 2 0 012 0l.43.25a2 2 0 011 1.73V20a2 2 0 002 2h.44a2 2 0 002-2v-.18a2 2 0 011-1.73l.43-.25a2 2 0 012 0l.15.08a2 2 0 002.73-.73l.22-.39a2 2 0 00-.73-2.73l-.15-.08a2 2 0 01-1-1.74v-.5a2 2 0 011-1.74l.15-.09a2 2 0 00.73-2.73l-.22-.38a2 2 0 00-2.73-.73l-.15.08a2 2 0 01-2 0l-.43-.25a2 2 0 01-1-1.73V4a2 2 0 00-2-2z"/><circle cx="12" cy="12" r="3"/></svg>`,zt=()=>d`<svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M3 5h14M3 10h14M3 15h14"/></svg>`,Bt=()=>d`<svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><circle cx="10" cy="10" r="4"/><path d="M10 2v2M10 16v2M3.5 10H2M18 10h-1.5M5.05 5.05L3.63 3.63M16.37 16.37l-1.42-1.42M5.05 14.95l-1.42 1.42M16.37 3.63l-1.42 1.42"/></svg>`,Vt=()=>d`<svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M17 12.5A7.5 7.5 0 017.5 3 7.5 7.5 0 1017 12.5z"/></svg>`,Ht=o(!1);function Ut(){Ht.value=!Ht.value}function Wt(){Ht.value=!1}var Gt=[`agents`,`jobs`,`audit`],Kt=s(()=>W.value.posture||`guarded`);function qt({onOpenSettings:e,status:t}){let n=Kt.value,r=t.value===`connected`?`ok`:t.value===`running`?`running`:t.value===`error`||t.value===`offline`?`error`:``;return d`
+import{a as e,c as t,d as n,i as r,l as i,n as a,o,r as s,s as c,u as l}from"./index-X8xQ9_Xv.js";import{n as u,t as d}from"./deps-Bq0ztvnT.js";import{A as f,C as p,D as m,E as h,M as g,N as _,S as v,T as y,_ as b,a as x,b as S,c as C,d as w,f as T,g as E,h as D,i as ee,j as te,k as ne,l as re,m as ie,o as ae,p as O,r as k,s as A,t as j,u as M,v as N,w as oe,x as P,y as se}from"./pending-messages-CBPpKWhw.js";import{A as ce,C as F,D as le,E as I,I as L,M as ue,O as R,P as de,S as fe,T as pe,a as me,b as he,c as ge,d as _e,g as ve,h as ye,j as be,k as xe,l as Se,n as Ce,o as we,p as Te,r as Ee,s as De,t as Oe,u as ke,x as Ae,y as je}from"./use-session-stream-DwXms9Ag.js";import{t as z}from"./entity-state-Dvifu_4n.js";import{activeAgent as B,activeAgentId as V,agents as H,replaceAgents as Me}from"./agents-D1dxgqYi.js";import{activeRunId as U,clearRuns as Ne,replaceRuns as Pe,runListGeneration as Fe,selectedRunId as Ie}from"./runs-IkKmj7a9.js";import{a as Le,i as Re,o as ze,r as Be}from"./chat-actions-uXEv39RD.js";import{agentSwitchLoading as Ve,bootRetryAvailable as He,runBoot as Ue,sessionSwitchLoading as We,setRunBoot as Ge}from"./loading-CrD4oazO.js";import{n as Ke,t as qe}from"./select-generation-DvILpFQd.js";import{n as Je,o as Ye,r as Xe,t as Ze}from"./runs-BO3tWJCe.js";import{t as Qe}from"./load-session-C3I_4vVq.js";var $e=()=>f(`/settings`),et=e=>te(`/settings`,e),W=o({});async function tt(){try{W.value=await $e()}catch(e){console.error(`[settings] refresh failed:`,e)}}var G=o(null),K=o(null),q=null,nt=null,rt=0,it=10,at=null,J=null,ot=null;function st(e,t){let n=t&&t.streamEpoch!=null?String(t.streamEpoch):null;if(lt(),!e)return;ot!==null&&(clearTimeout(ot),ot=null);let r=localStorage.getItem(`alms_auth_token`),i=new URLSearchParams;r&&i.set(`token`,r),t&&t.lastEventId!=null&&i.set(`last_event_id`,String(t.lastEventId)),n&&i.set(`stream_epoch`,n);let a=i.toString(),o=`/events/session-activity${a?`?`+a:``}`,s=new EventSource(o);q=s,nt=e,rt=0,at=t&&t.lastEventId!=null?t.lastEventId:null,J=n;let c=!1,l=!1,u=!1,d=null,f=null,p=0,m=!1,h=(e,t,n)=>re(e,t,n,J),g=async(e,t=J)=>{let n=Number.isSafeInteger(e)?e:null,r=t;if(l){u=!0,f===r?n!=null&&(d=d==null?n:Math.max(d,n)):(f=r,d=n);return}if(s!==q)return;l=!0;let i=M(n,r),a=null;try{a=await L(null,{includeDms:!0})}catch(e){console.error(`[agent-events] activity reconciliation failed:`,e)}if(s!==q){C(i);return}a?T(i,a.sessions||[])?p=0:(u=!0,d=n,f=r):C(i),l=!1;let o=u,c=d,m=f;if(u=!1,d=null,f=null,o&&s===q){g(c,m);return}if(!a&&s===q){p++;let e=Math.min(1e3*2**(p-1),3e4);s._reconciliationRetryTimer=setTimeout(()=>{s._reconciliationRetryTimer=null,s===q&&g(null)},e)}};s.addEventListener(`open`,()=>{if(s!==q)return;let e=c||!!(t&&t.reconcileOnOpen);c=!0,me(`agent-events`),e&&g(null)});let _=async(t,n)=>{if(!(m||s!==q)){m=!0,s.close(),console.error(`[agent-events] rejected live event; reconciling:`,n);try{let n=await L(null,{includeDms:!0});if(s!==q)return;ie(n.sessions||[],t,J),q=null,st(e,{lastEventId:t,streamEpoch:J,reconcileOnOpen:!0})}catch(e){console.error(`[agent-events] contract reconciliation failed:`,e),De(`agent-events`)}}},v=(e,t)=>s.addEventListener(e,n=>{if(s!==q)return;let r=n.lastEventId,i=r&&/^\d+$/.test(r)?Number(r):null;try{let a=globalThis.__almsContracts;if(!a)throw Error(`Frontend contract bridge is not installed`);t({data:a.parseSseJsonPayload(e,n.data),lastEventId:n.lastEventId}),i!=null&&(at=r)}catch(t){i==null?(console.error(`[agent-events]`,e,`handler failed:`,t),s.close(),De(`agent-events`)):_(i,t)}});v(`session_activity_started`,e=>{let t=e.data,n=/^\d+$/.test(e.lastEventId)?Number(e.lastEventId):null;h(`session_activity_started`,t,n)}),v(`session_activity_ended`,e=>{let t=e.data,n=/^\d+$/.test(e.lastEventId)?Number(e.lastEventId):null;h(`session_activity_ended`,t,n)}),v(`stream_state`,e=>{let t=e.data,n=!!(J&&t.stream_epoch&&J!==t.stream_epoch);if(t.stream_epoch&&(J=t.stream_epoch),t.requires_reconciliation||n){let e=Number.isSafeInteger(t.newest)?t.newest:null;g(e)}}),s.onerror=()=>{if(s.readyState===EventSource.CLOSED){if(rt++,rt>=it){console.error(`[agent-events] Max retries reached for agent`,e),De(`agent-events`);return}let t=Math.min(2e3*2**(rt-1),3e4),n=e,r=at,i=J;ot=setTimeout(()=>{ot=null,nt===n&&st(n,{lastEventId:r,streamEpoch:i,reconcileOnOpen:!0})},t)}}}function ct(){rt=0;let e=nt;e?st(e,{lastEventId:at,streamEpoch:J,reconcileOnOpen:!0}):me(`agent-events`)}Se(ct);function lt(){q&&=(q._reconciliationRetryTimer!=null&&(clearTimeout(q._reconciliationRetryTimer),q._reconciliationRetryTimer=null),q.close(),null),nt=null,at=null,J=null,rt=0,ot!==null&&(clearTimeout(ot),ot=null),me(`agent-events`)}function ut(e,t){return!t||typeof t!=`string`?e??null:t===e?null:t}function dt(e){return!e||typeof e!=`string`?null:e}function ft(e,t){return!t||typeof t!=`string`||!e||typeof e!=`string`?!1:e===t}function pt(e){let t=new Map;if(!Array.isArray(e))return t;for(let n of e){if(!n||typeof n.agent_id!=`string`||!n.agent_id)continue;let e=t.get(n.agent_id);e?e.push(n):t.set(n.agent_id,[n])}return t}function mt(e,t){if(!e||!t||typeof t!=`string`)return!1;if(e.session_type===`notification`)return e.agent_name===t;if(e.session_type===`dm`){let n=e.participants;return Array.isArray(n)&&n.includes(t)}return!1}function ht(e,t){if(!Array.isArray(e))return[];let n=e.map((e,n)=>({s:e,idx:n,owned:+!mt(e,t)}));return n.sort((e,t)=>e.owned-t.owned||e.idx-t.idx),n.map(e=>e.s)}function gt(e){return Array.isArray(e)?e.filter(e=>e&&e.session_type!==`notification`&&e.session_type!==`job`):[]}function _t(e){return Array.isArray(e)?e.filter(e=>e&&e.session_type===`job`):[]}var vt=`alms_active_agent`,Y=0;function yt(e){return`alms_active_session_${e}`}function bt(e,t){e&&t&&localStorage.setItem(yt(e),t)}function xt(e,t,n){if(n){let e=t.find(e=>e.id===n);if(e)return e}let r=localStorage.getItem(yt(e));if(r){let e=t.find(e=>e.id===r);if(e)return e}return t[0]||null}async function St(e,t){let n=localStorage.getItem(yt(e));if(!n||t.some(e=>e.id===n))return null;try{return await de(n),n}catch(t){return t&&t.status===404&&localStorage.removeItem(yt(e)),null}}async function Ct(){try{let e=await $e();W.value=e,Me(e.agents||[]);let t=localStorage.getItem(vt),n=H.value.find(e=>e.is_default),r=H.value[0],i=H.value.find(e=>e.id===t)||n||r;i&&(V.value=i.id,S.value=dt(i.id),localStorage.setItem(vt,i.id),await Tt(i.id))}catch(e){throw console.error(`[boot] failed:`,e),e}}async function wt(){try{return(await L(null,{includeDms:!0})).sessions||[]}catch(e){return console.error(`[fetchCrossAgentSurfaces] failed:`,e),[]}}async function Tt(e,t){let n=++Y;try{let[r,i]=await Promise.all([L(e,{includeDms:!1}),wt()]);if(n!==Y)return;let a=gt(r.sessions||[]);y(a,i),ie([...a,...i]),st(e);let o=t?null:await St(e,a);if(n!==Y)return;if(o)E.value=o,bt(e,o),await Qe(o,{isStale:()=>n!==Y,logPrefix:`loadAgentSessions:hidden`});else if(a.length>0){let r=xt(e,a,t);E.value=r.id,bt(e,r.id),await Qe(r.id,{isStale:()=>n!==Y,logPrefix:`loadAgentSessions`})}else{let t=await be(e,`web-chat-`+Date.now());if(n!==Y)return;let[r,i]=await Promise.all([L(e,{includeDms:!1}),wt()]);if(n!==Y)return;y(gt(r.sessions||[]),i),E.value=t.session_id,Le([],t.session_id),Pe(t.session_id,[]),Ee(t.session_id)}}catch(e){if(n!==Y)return;console.error(`[loadAgentSessions] failed:`,e)}}async function Et(e,t){if(!H.value.find(t=>t.id===e))return;Oe(),lt(),qe(),V.value=e,S.value=dt(e),localStorage.setItem(vt,e),Ve.value=!0,E.value=null,Ie.value=null,h(),Le([]),O.value=[],G.value=null,K.value=null,he();let n=Tt(e,t&&t.targetSessionId),r=Y;try{await n}finally{r===Y&&(Ve.value=!1)}}var X=o(null),Z=o(`agents`);function Dt(e){X.value===e?X.value=null:(X.value=e,Z.value=e)}var Ot=`alms_theme`;function kt(){return localStorage.getItem(Ot)||`dark`}var At=o(kt());function jt(){let e=At.value===`dark`?`light`:`dark`;At.value=e,localStorage.setItem(Ot,e),document.documentElement.setAttribute(`data-theme`,e)}document.documentElement.setAttribute(`data-theme`,kt());var Mt=()=>d`<svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><circle cx="10" cy="10" r="8"/><path d="M10 6v4l3 3"/></svg>`,Nt=()=>d`<svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M3 5a2 2 0 012-2h3l2 2h5a2 2 0 012 2v7a2 2 0 01-2 2H5a2 2 0 01-2-2V5z"/></svg>`,Pt=()=>d`<svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M5 5l10 10M15 5L5 15"/></svg>`,Ft=()=>d`<svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 15V5M10 5L5 10M10 5l5 5"/></svg>`,It=()=>d`<svg width="20" height="20" viewBox="0 0 20 20" fill="currentColor"><rect x="5" y="5" width="10" height="10" rx="1.5"/></svg>`,Lt=()=>d`<svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M6 4l10 6-10 6V4z"/></svg>`,Rt=()=>d`<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12.22 2h-.44a2 2 0 00-2 2v.18a2 2 0 01-1 1.73l-.43.25a2 2 0 01-2 0l-.15-.08a2 2 0 00-2.73.73l-.22.38a2 2 0 00.73 2.73l.15.1a2 2 0 011 1.72v.51a2 2 0 01-1 1.74l-.15.09a2 2 0 00-.73 2.73l.22.38a2 2 0 002.73.73l.15-.08a2 2 0 012 0l.43.25a2 2 0 011 1.73V20a2 2 0 002 2h.44a2 2 0 002-2v-.18a2 2 0 011-1.73l.43-.25a2 2 0 012 0l.15.08a2 2 0 002.73-.73l.22-.39a2 2 0 00-.73-2.73l-.15-.08a2 2 0 01-1-1.74v-.5a2 2 0 011-1.74l.15-.09a2 2 0 00.73-2.73l-.22-.38a2 2 0 00-2.73-.73l-.15.08a2 2 0 01-2 0l-.43-.25a2 2 0 01-1-1.73V4a2 2 0 00-2-2z"/><circle cx="12" cy="12" r="3"/></svg>`,zt=()=>d`<svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M3 5h14M3 10h14M3 15h14"/></svg>`,Bt=()=>d`<svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><circle cx="10" cy="10" r="4"/><path d="M10 2v2M10 16v2M3.5 10H2M18 10h-1.5M5.05 5.05L3.63 3.63M16.37 16.37l-1.42-1.42M5.05 14.95l-1.42 1.42M16.37 3.63l-1.42 1.42"/></svg>`,Vt=()=>d`<svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M17 12.5A7.5 7.5 0 017.5 3 7.5 7.5 0 1017 12.5z"/></svg>`,Ht=o(!1);function Ut(){Ht.value=!Ht.value}function Wt(){Ht.value=!1}var Gt=[`agents`,`jobs`,`audit`],Kt=s(()=>W.value.posture||`guarded`);function qt({onOpenSettings:e,status:t}){let n=Kt.value,r=t.value===`connected`?`ok`:t.value===`running`?`running`:t.value===`error`||t.value===`offline`?`error`:``;return d`
         <header>
             <button class="sidebar-toggle-btn" title="Toggle sessions" aria-label="Toggle sessions"
                     onClick=${Ut}>
@@ -40,7 +40,7 @@ import{a as e,c as t,d as n,i as r,l as i,n as a,o,r as s,s as c,u as l}from"./i
                 <${Rt} />
             </button>
         </header>
-    `}async function Jt(t,n){if(!t||t===E.value)return;Wt();let r=m.value.find(e=>e.id===t)||N.value.find(e=>e.id===t);if(r&&r.session_type!==`dm`&&r.session_type!==`notification`&&r.session_type!==`job`&&r.agent_id&&V.value&&r.agent_id!==V.value&&H.value.some(e=>e.id===r.agent_id)){await Et(r.agent_id,{targetSessionId:t});return}let i=qe();Oe(),e(()=>{E.value=t,Ne(),Ie.value=null,Le([],t),k.value=[],K.value=null,he(),F.value=null,We.value=!0}),bt(V.value,t);try{await Qe(t,{isStale:()=>i!==Ke,logPrefix:n&&n.logPrefix||`navigateToSession`})}finally{i===Ke&&(We.value=!1)}}var Yt=`alms.composer.draft.`,Xt=`alms.composer.queue.`,Zt=64*1024,Qt=50,$t=256*1024;function en(){try{return typeof window<`u`&&!!window.localStorage}catch{return!1}}function tn(e){return Yt+e}function nn(e){return Xt+e}function rn(e){if(!e||!en())return``;try{let t=localStorage.getItem(tn(e));return typeof t==`string`?t:``}catch{return``}}function an(e,t){if(!(!e||!en())){if(!t){try{localStorage.removeItem(tn(e))}catch{}return}try{localStorage.setItem(tn(e),t)}catch{try{let n=t.length>Zt?t.slice(0,Zt):t;localStorage.setItem(tn(e),n),n.length<t.length&&console.warn(`[composer-storage] draft truncated from %d to %d chars on save (storage quota)`,t.length,n.length)}catch{console.warn(`[composer-storage] draft not persisted (storage rejected both full and truncated writes); in-memory textarea is still authoritative`)}}}}function on(e){if(!(!e||!en()))try{localStorage.removeItem(tn(e))}catch{}}function sn(e){if(!e||!en())return[];try{let t=localStorage.getItem(nn(e));if(!t)return[];let n=JSON.parse(t);return Array.isArray(n)?n.slice(0,Qt).filter(e=>e&&typeof e.text==`string`).map(e=>({text:e.text})):[]}catch{return[]}}function cn(e,t){if(!(!e||!en()))try{if(!Array.isArray(t)||t.length===0){localStorage.removeItem(nn(e));return}let n=t.slice(0,Qt).map(e=>({text:e.text})),r=JSON.stringify(n);for(;r.length>$t&&n.length>0;)n=n.slice(0,-1),r=JSON.stringify(n);if(n.length===0){localStorage.removeItem(nn(e));return}localStorage.setItem(nn(e),r)}catch{}}function ln(e){if(!(!e||!en()))try{localStorage.removeItem(nn(e))}catch{}}function un(e){on(e),ln(e)}function dn(e,t,n){return!n||!Array.isArray(e)||e[0]!==t?e:e.slice(1)}function fn({restoredQueue:e,activeRunId:t,activeAgentId:n}){return!Array.isArray(e)||e.length===0?{drain:!1,head:null,remaining:[]}:t||!n?{drain:!1,head:null,remaining:e}:{drain:!0,head:e[0],remaining:e.slice(1)}}var pn={chat:{icon:`▸`,cls:``,label:`Chat session`},dm:{icon:`↔`,cls:`dm`,label:`DM conversation`},notification:{icon:`⚡`,cls:`notification`,label:`Notification session`},job:{icon:`⏰`,cls:`job`,label:`Job session`},subagent:{icon:`⚙`,cls:`subagent`,label:`Subagent session`},telegram:{icon:`✉`,cls:`telegram`,label:`Telegram session`}};function mn(e){return pn[e.session_type]||pn.chat}function hn(e,t,n,r){if(e===t&&n)return!0;let i=r[e];return!!(i&&!i.finished)}function gn(e){return Jt(e,{logPrefix:`selectSession`})}async function _n(){if(V.value){Oe(),qe();try{let t=`web-chat-`+Date.now(),n=await be(V.value,t),[r,i]=await Promise.all([L(V.value,{includeDms:!0}),wt()]);e(()=>{y(r.sessions||[],i),E.value=n.session_id,bt(V.value,n.session_id),Ie.value=null,Le([],n.session_id),k.value=[],Pe(n.session_id,[]),K.value=null,he()}),Ee(n.session_id)}catch(e){console.error(`[newSession] failed:`,e)}}}function vn(e){let t=e.participants;return Array.isArray(t)&&t.length>=2?t.join(` <-> `):e.context_id||e.id.slice(0,8)}function yn(e){return e.agent_name?`notifications`:e.context_id||e.id.slice(0,8)}function bn(e){let t=e.context_id||``;return t.startsWith(`job_`)&&t.length>4?`job `+t.slice(4,12):t||e.id.slice(0,8)}function xn(e){return e.session_type===`dm`?vn(e):e.session_type===`notification`?yn(e):e.session_type===`job`?bn(e):e.context_id||e.id.slice(0,8)}function Sn(e){if(e.session_type===`notification`&&e.agent_name)return e.agent_name;if(e.session_type===`job`&&e.agent_id){let t=H.value.find(t=>t.id===e.agent_id);return t?t.name:null}return null}function Cn({session:t,activeAgentName:n}){let r=a(!1),i=a(null),o=E.value,s=t.id===o,c=hn(t.id,o,U.value,w.value),l=mn(t),u=l.cls?` session-item-`+l.cls:``,f=e=>{e.stopPropagation(),r.value=!0,i.value=setTimeout(()=>{r.value=!1},3e3)},p=async n=>{n.stopPropagation(),i.value&&=(clearTimeout(i.value),null),r.value=!1;try{await ue(t.id),un(t.id),Be(t.id),Ne(t.id),t.id===E.value&&(Oe(),e(()=>{E.value=null,Ie.value=null,K.value=null,he(),k.value=[]}));let[n,r]=await Promise.all([L(V.value,{includeDms:!0}),wt()]);y(n.sessions||[],r)}catch(e){console.error(`[deleteSession] failed:`,e)}},m=e=>{e.stopPropagation(),i.value&&=(clearTimeout(i.value),null),r.value=!1},h=xn(t),g=t.session_type===`chat`?``:`
+    `}async function Jt(t,n){if(!t||t===E.value)return;Wt();let r=m.value.find(e=>e.id===t)||N.value.find(e=>e.id===t);if(r&&r.session_type!==`dm`&&r.session_type!==`notification`&&r.session_type!==`job`&&r.agent_id&&V.value&&r.agent_id!==V.value&&H.value.some(e=>e.id===r.agent_id)){await Et(r.agent_id,{targetSessionId:t});return}let i=qe();Oe(),e(()=>{E.value=t,Ne(),Ie.value=null,Le([],t),O.value=[],K.value=null,he(),F.value=null,We.value=!0}),bt(V.value,t);try{await Qe(t,{isStale:()=>i!==Ke,logPrefix:n&&n.logPrefix||`navigateToSession`})}finally{i===Ke&&(We.value=!1)}}var Yt=`alms.composer.draft.`,Xt=`alms.composer.queue.`,Zt=64*1024,Qt=50,$t=256*1024;function en(){try{return typeof window<`u`&&!!window.localStorage}catch{return!1}}function tn(e){return Yt+e}function nn(e){return Xt+e}function rn(e){if(!e||!en())return``;try{let t=localStorage.getItem(tn(e));return typeof t==`string`?t:``}catch{return``}}function an(e,t){if(!(!e||!en())){if(!t){try{localStorage.removeItem(tn(e))}catch{}return}try{localStorage.setItem(tn(e),t)}catch{try{let n=t.length>Zt?t.slice(0,Zt):t;localStorage.setItem(tn(e),n),n.length<t.length&&console.warn(`[composer-storage] draft truncated from %d to %d chars on save (storage quota)`,t.length,n.length)}catch{console.warn(`[composer-storage] draft not persisted (storage rejected both full and truncated writes); in-memory textarea is still authoritative`)}}}}function on(e){if(!(!e||!en()))try{localStorage.removeItem(tn(e))}catch{}}function sn(e){if(!e||!en())return[];try{let t=localStorage.getItem(nn(e));if(!t)return[];let n=JSON.parse(t);return Array.isArray(n)?n.slice(0,Qt).filter(e=>e&&typeof e.text==`string`).map(e=>({text:e.text})):[]}catch{return[]}}function cn(e,t){if(!(!e||!en()))try{if(!Array.isArray(t)||t.length===0){localStorage.removeItem(nn(e));return}let n=t.slice(0,Qt).map(e=>({text:e.text})),r=JSON.stringify(n);for(;r.length>$t&&n.length>0;)n=n.slice(0,-1),r=JSON.stringify(n);if(n.length===0){localStorage.removeItem(nn(e));return}localStorage.setItem(nn(e),r)}catch{}}function ln(e){if(!(!e||!en()))try{localStorage.removeItem(nn(e))}catch{}}function un(e){on(e),ln(e)}function dn(e,t,n){return!n||!Array.isArray(e)||e[0]!==t?e:e.slice(1)}function fn({restoredQueue:e,activeRunId:t,activeAgentId:n}){return!Array.isArray(e)||e.length===0?{drain:!1,head:null,remaining:[]}:t||!n?{drain:!1,head:null,remaining:e}:{drain:!0,head:e[0],remaining:e.slice(1)}}var pn={chat:{icon:`▸`,cls:``,label:`Chat session`},dm:{icon:`↔`,cls:`dm`,label:`DM conversation`},notification:{icon:`⚡`,cls:`notification`,label:`Notification session`},job:{icon:`⏰`,cls:`job`,label:`Job session`},subagent:{icon:`⚙`,cls:`subagent`,label:`Subagent session`},telegram:{icon:`✉`,cls:`telegram`,label:`Telegram session`}};function mn(e){return pn[e.session_type]||pn.chat}function hn(e,t,n,r){if(e===t&&n)return!0;let i=r[e];return!!(i&&!i.finished)}function gn(e){return Jt(e,{logPrefix:`selectSession`})}async function _n(){if(V.value){Oe(),qe();try{let t=`web-chat-`+Date.now(),n=await be(V.value,t),[r,i]=await Promise.all([L(V.value,{includeDms:!0}),wt()]);e(()=>{y(r.sessions||[],i),E.value=n.session_id,bt(V.value,n.session_id),Ie.value=null,Le([],n.session_id),O.value=[],Pe(n.session_id,[]),K.value=null,he()}),Ee(n.session_id)}catch(e){console.error(`[newSession] failed:`,e)}}}function vn(e){let t=e.participants;return Array.isArray(t)&&t.length>=2?t.join(` <-> `):e.context_id||e.id.slice(0,8)}function yn(e){return e.agent_name?`notifications`:e.context_id||e.id.slice(0,8)}function bn(e){let t=e.context_id||``;return t.startsWith(`job_`)&&t.length>4?`job `+t.slice(4,12):t||e.id.slice(0,8)}function xn(e){return e.session_type===`dm`?vn(e):e.session_type===`notification`?yn(e):e.session_type===`job`?bn(e):e.context_id||e.id.slice(0,8)}function Sn(e){if(e.session_type===`notification`&&e.agent_name)return e.agent_name;if(e.session_type===`job`&&e.agent_id){let t=H.value.find(t=>t.id===e.agent_id);return t?t.name:null}return null}function Cn({session:t,activeAgentName:n}){let r=a(!1),i=a(null),o=E.value,s=t.id===o,c=hn(t.id,o,U.value,w.value),l=mn(t),u=l.cls?` session-item-`+l.cls:``,f=e=>{e.stopPropagation(),r.value=!0,i.value=setTimeout(()=>{r.value=!1},3e3)},p=async n=>{n.stopPropagation(),i.value&&=(clearTimeout(i.value),null),r.value=!1;try{await ue(t.id),un(t.id),Be(t.id),Ne(t.id),t.id===E.value&&(Oe(),e(()=>{E.value=null,Ie.value=null,K.value=null,he(),O.value=[]}));let[n,r]=await Promise.all([L(V.value,{includeDms:!0}),wt()]);y(n.sessions||[],r)}catch(e){console.error(`[deleteSession] failed:`,e)}},m=e=>{e.stopPropagation(),i.value&&=(clearTimeout(i.value),null),r.value=!1},h=xn(t),g=t.session_type===`chat`?``:`
 Type: `+t.session_type,_=Sn(t);return d`
         <div class="session-item${u}${mt(t,n)?` session-item-active-agent`:``} ${s?`active`:``} ${c?`has-run`:``}"
              role="option"
@@ -1066,7 +1066,7 @@ Context: `+t.context_id+g}
                 </div>
             `}
         </div>
-    `}function di(e){let t=k.value.filter((t,n)=>n!==e);k.value=t,cn(E.value,t)}function fi(){let e=k.value;return e.length===0?null:d`
+    `}function di(e){let t=O.value.filter((t,n)=>n!==e);O.value=t,cn(E.value,t)}function fi(){let e=O.value;return e.length===0?null:d`
         <div id="message-queue">
             ${e.map((e,t)=>d`
                 <div class="queued-msg">
@@ -1077,7 +1077,7 @@ Context: `+t.context_id+g}
                 </div>
             `)}
         </div>
-    `}async function pi(e,t){let n=t?.sessionId||E.value,r=V.value;if(!r)return n?ze(e=>[...e,{id:j(),type:`error`,text:`Select an agent before sending a message.`}],n):console.warn(`[startRun] rejected: no agent or session selected`),!1;if(!n)return console.warn(`[startRun] rejected: no session selected`),!1;if(A(n).length>0)return!1;let i=new Date().toISOString(),a={id:j(),type:`user`,role:`user`,text:e,ts:i};M(n,e,a,[{id:j(),type:`thinking`,pending:!0}]);try{let i=await Je({session_id:n,agent_id:r,input:{type:`text`,text:e}});n&&i?.run_id&&(x(n,a.id,i.run_id),!t?.queued&&!U.value&&k.value.length>0&&await mi(k.value[0],n))}catch(e){ee(n,{messageId:a.id}),ze(t=>[...t.filter(e=>e.type!==`thinking`),{id:j(),type:`error`,text:`Failed to start run: ${e.error?.message||e.message||e.status||`unknown error`}`}],n),console.error(`[startRun] failed:`,e)}return!0}async function mi(e,t){let n=k.value;if(n[0]!==e)return!1;let r=await pi(e.text,{sessionId:t,queued:!0}),i=k.value,a=dn(i,e,r);if(a===i){let i=dn(n,e,r);return i===n?!1:(cn(t,i),!0)}return k.value=a,cn(t,a),!U.value&&a.length>0&&await mi(a[0],t),!0}function hi(e){let t=e.current.value.trim();if(!t||!E.value||!V.value)return;let n=E.value;if(!(!U.value&&A(n).length>0)){if(e.current.value=``,e.current.style.height=`auto`,on(n),U.value){let r=[...k.value,{text:t}];k.value=r,cn(n,r),e.current.focus();return}pi(t)}}async function gi(){if(U.value)try{await Ze(U.value)}catch{}}function _i(e){e.style.height=`auto`,e.style.height=Math.min(e.scrollHeight,150)+`px`}function vi(){let e=c(null),t=H.value.length>0,n=!!E.value,r=!!V.value,a=t&&r&&n,o=!!U.value,s=r?`Send a message...`:`Select an agent to send a message`,l=E.value;return i(()=>{let t=e.current;t&&(t.value=rn(l),_i(t));let n=sn(l),r=fn({restoredQueue:n,activeRunId:U.value,activeAgentId:V.value});n.length>0&&(k.value=n),r.drain&&mi(r.head,l).catch(e=>{console.error(`[queue] mount drain failed:`,e)})},[l]),d`
+    `}async function pi(e,t){let n=t?.sessionId||E.value,r=V.value;if(!r)return n?ze(e=>[...e,{id:A(),type:`error`,text:`Select an agent before sending a message.`}],n):console.warn(`[startRun] rejected: no agent or session selected`),!1;if(!n)return console.warn(`[startRun] rejected: no session selected`),!1;if(k(n).length>0)return!1;let i=new Date().toISOString(),a={id:A(),type:`user`,role:`user`,text:e,ts:i};j(n,e,a,[{id:A(),type:`thinking`,pending:!0}]);try{let i=await Je({session_id:n,agent_id:r,input:{type:`text`,text:e}});n&&i?.run_id&&(x(n,a.id,i.run_id),!t?.queued&&!U.value&&O.value.length>0&&await mi(O.value[0],n))}catch(e){ee(n,{messageId:a.id}),ze(t=>[...t.filter(e=>e.type!==`thinking`),{id:A(),type:`error`,text:`Failed to start run: ${e.error?.message||e.message||e.status||`unknown error`}`}],n),console.error(`[startRun] failed:`,e)}return!0}async function mi(e,t){let n=O.value;if(n[0]!==e)return!1;let r=await pi(e.text,{sessionId:t,queued:!0}),i=O.value,a=dn(i,e,r);if(a===i){let i=dn(n,e,r);return i===n?!1:(cn(t,i),!0)}return O.value=a,cn(t,a),!U.value&&a.length>0&&await mi(a[0],t),!0}function hi(e){let t=e.current.value.trim();if(!t||!E.value||!V.value)return;let n=E.value;if(!(!U.value&&k(n).length>0)){if(e.current.value=``,e.current.style.height=`auto`,on(n),U.value){let r=[...O.value,{text:t}];O.value=r,cn(n,r),e.current.focus();return}pi(t)}}async function gi(){if(U.value)try{await Ze(U.value)}catch{}}function _i(e){e.style.height=`auto`,e.style.height=Math.min(e.scrollHeight,150)+`px`}function vi(){let e=c(null),t=H.value.length>0,n=!!E.value,r=!!V.value,a=t&&r&&n,o=!!U.value,s=r?`Send a message...`:`Select an agent to send a message`,l=E.value;return i(()=>{let t=e.current;t&&(t.value=rn(l),_i(t));let n=sn(l),r=fn({restoredQueue:n,activeRunId:U.value,activeAgentId:V.value});n.length>0&&(O.value=n),r.drain&&mi(r.head,l).catch(e=>{console.error(`[queue] mount drain failed:`,e)})},[l]),d`
         <div id="input-area">
             <div class="input-container">
                 <textarea id="prompt" ref=${e} rows="1"
@@ -1463,7 +1463,7 @@ Context: `+t.context_id+g}
                     content=${G.value[e+`.md`]||G.value[e]||``} />
             `)}
         </div>
-    `:d`<div class="ws-notice">No agent selected</div>`}var aa=z.jobs;function oa(){return z.getJobMutationGeneration()}function sa(e,t){z.replaceJobs(e,t)}function ca(e){z.createOptimisticJob(e)}function la(e,t){z.confirmOptimisticJobCreate(e,t)}function ua(e){z.rollbackOptimisticJobCreate(e)}function da(e){z.cancelOptimisticJob(e)}function fa(e,t){z.confirmOptimisticJobCancel(e,t)}function pa(e){z.rollbackOptimisticJobCancel(e)}var ma=()=>f(`/jobs`),ha=e=>g(`/jobs`,e),ga=e=>ne(`/jobs/${e}`),_a=0,va=[{label:`1m`,cron:`* * * * *`,desc:`Every minute`},{label:`5m`,cron:`*/5 * * * *`,desc:`Every 5 minutes`},{label:`15m`,cron:`*/15 * * * *`,desc:`Every 15 minutes`},{label:`30m`,cron:`*/30 * * * *`,desc:`Every 30 minutes`},{label:`1h`,cron:`0 * * * *`,desc:`Every hour`},{label:`6h`,cron:`0 */6 * * *`,desc:`Every 6 hours`},{label:`12h`,cron:`0 */12 * * *`,desc:`Every 12 hours`},{label:`1d`,cron:`0 0 * * *`,desc:`Daily at midnight`}];function ya(e){if(!e)return``;let t=va.find(t=>t.cron===e.trim());return t?t.desc:e.trim().split(/\s+/).length===5?e:`Invalid cron (need 5 fields)`}function ba(e){let t=e=>String(e).padStart(2,`0`);return`${e.getFullYear()}-${t(e.getMonth()+1)}-${t(e.getDate())}T${t(e.getHours())}:${t(e.getMinutes())}`}function xa(){let e=new Date(Date.now()+5*6e4);return e.setSeconds(0,0),ba(e)}function Sa(){let e=new Date;return e.setSeconds(0,0),ba(e)}async function Ca(){let e=oa();try{let t=await ma();sa(t.jobs||t||[],e)}catch(e){console.error(`[jobs] fetch failed:`,e)}}function wa(){let e=a(`recurring`),t=a(``),n=a(xa()),r=a(``),o=a(V.value||``),s=a(``),c=a(``),l=a(!1),u=a(!1);i(()=>{Z.value===`jobs`&&Ca()},[Z.value]),i(()=>{o.value=V.value||``},[V.value]);let f=ya(t.value),p=e.value===`once`?!!n.value:!!t.value.trim(),m=!!o.value&&p&&!!r.value.trim(),h=async()=>{if(!m)return;s.value=``,c.value=``,l.value=!0;let i=null;try{let a;if(e.value===`once`){let e=new Date(n.value);if(isNaN(e.getTime())){s.value=`Invalid date/time. Please select a valid date.`,l.value=!1;return}a={type:`once`,run_at:e.toISOString()}}else a={type:`recurring`,cron:t.value.trim()};let d={agent_id:o.value,schedule:a,prompt:r.value.trim()};i=`optimistic-job-`+ ++_a,ca({id:i,...d,status:`pending`,next_run_at:null,last_run_at:null});let f=await ha(d);la(i,f),i=null,t.value=``,r.value=``,u.value=!1,n.value=xa(),c.value=e.value===`once`?`Job scheduled (one-time).`:`Recurring job created.`,setTimeout(()=>{c.value=``},4e3)}catch(e){i&&ua(i);let t=e.error?.message||e.message||``;s.value=t||`Failed to create job. Check that all fields are filled and the schedule is valid.`}finally{l.value=!1}},g=async e=>{s.value=``,da(e);try{fa(e,await ga(e))}catch(t){pa(e),t.status===409&&await Ca(),s.value=t.error?.message||t.message||`Failed to cancel job`}};return d`
+    `:d`<div class="ws-notice">No agent selected</div>`}var aa=z.jobs;function oa(){return z.getJobMutationGeneration()}function sa(e,t){z.replaceJobs(e,t)}function ca(e){z.createOptimisticJob(e)}function la(e,t){z.confirmOptimisticJobCreate(e,t)}function ua(e){z.rollbackOptimisticJobCreate(e)}function da(e){z.cancelOptimisticJob(e)}function fa(e,t){z.confirmOptimisticJobCancel(e,t)}function pa(e){z.rollbackOptimisticJobCancel(e)}var ma=()=>f(`/jobs`),ha=e=>g(`/jobs`,e),ga=e=>ne(`/jobs/${e}`),_a=0,va=[{label:`1m`,cron:`* * * * *`,desc:`Every minute`},{label:`5m`,cron:`*/5 * * * *`,desc:`Every 5 minutes`},{label:`15m`,cron:`*/15 * * * *`,desc:`Every 15 minutes`},{label:`30m`,cron:`*/30 * * * *`,desc:`Every 30 minutes`},{label:`1h`,cron:`0 * * * *`,desc:`Every hour`},{label:`6h`,cron:`0 */6 * * *`,desc:`Every 6 hours`},{label:`12h`,cron:`0 */12 * * *`,desc:`Every 12 hours`},{label:`1d`,cron:`0 0 * * *`,desc:`Daily at midnight`}];function ya(e){return e===`pending`||e===`active`}function ba(e){let t=e.status||`active`;return e.terminal_reason?`${t} (${e.terminal_reason.replaceAll(`_`,` `)})`:t}function xa(e){return e.retry_count?`${e.retry_count} dispatch ${e.retry_count===1?`retry`:`retries`}`:``}function Sa(e){if(!e)return``;let t=va.find(t=>t.cron===e.trim());return t?t.desc:e.trim().split(/\s+/).length===5?e:`Invalid cron (need 5 fields)`}function Ca(e){let t=e=>String(e).padStart(2,`0`);return`${e.getFullYear()}-${t(e.getMonth()+1)}-${t(e.getDate())}T${t(e.getHours())}:${t(e.getMinutes())}`}function wa(){let e=new Date(Date.now()+5*6e4);return e.setSeconds(0,0),Ca(e)}function Ta(){let e=new Date;return e.setSeconds(0,0),Ca(e)}async function Ea(){let e=oa();try{let t=await ma();sa(t.jobs||t||[],e)}catch(e){console.error(`[jobs] fetch failed:`,e)}}function Da(){let e=a(`recurring`),t=a(``),n=a(wa()),r=a(``),o=a(V.value||``),s=a(``),c=a(``),l=a(!1),u=a(!1);i(()=>{Z.value===`jobs`&&Ea()},[Z.value]),i(()=>{o.value=V.value||``},[V.value]);let f=Sa(t.value),p=e.value===`once`?!!n.value:!!t.value.trim(),m=!!o.value&&p&&!!r.value.trim(),h=async()=>{if(!m)return;s.value=``,c.value=``,l.value=!0;let i=null;try{let a;if(e.value===`once`){let e=new Date(n.value);if(isNaN(e.getTime())){s.value=`Invalid date/time. Please select a valid date.`,l.value=!1;return}a={type:`once`,run_at:e.toISOString()}}else a={type:`recurring`,cron:t.value.trim()};let d={agent_id:o.value,schedule:a,prompt:r.value.trim()};i=`optimistic-job-`+ ++_a,ca({id:i,...d,status:`pending`,next_run_at:null,last_run_at:null});let f=await ha(d);la(i,f),i=null,t.value=``,r.value=``,u.value=!1,n.value=wa(),c.value=e.value===`once`?`Job scheduled (one-time).`:`Recurring job created.`,setTimeout(()=>{c.value=``},4e3)}catch(e){i&&ua(i);let t=e.error?.message||e.message||``;s.value=t||`Failed to create job. Check that all fields are filled and the schedule is valid.`}finally{l.value=!1}},g=async e=>{s.value=``,da(e);try{fa(e,await ga(e))}catch(t){pa(e),t.status===409&&await Ea(),s.value=t.error?.message||t.message||`Failed to cancel job`}};return d`
         <div>
             <div class="jobs-form">
                 <select class="jobs-select" value=${o.value}
@@ -1512,7 +1512,7 @@ Context: `+t.context_id+g}
                 `:d`
                     <input class="jobs-input" type="datetime-local"
                            value=${n.value}
-                           min=${Sa()}
+                           min=${Ta()}
                            onInput=${e=>{n.value=e.target.value}} />
                 `}
 
@@ -1541,18 +1541,20 @@ Context: `+t.context_id+g}
                     <div class="job-item">
                         <div class="job-prompt">${e.prompt||e.task||`(no prompt)`}</div>
                         <div class="job-meta">
-                            <span>${ya(e.schedule?.cron)||(e.schedule?.type===`once`?`Once at `+Mn(e.schedule.run_at):JSON.stringify(e.schedule))}</span>
+                            <span>${Sa(e.schedule?.cron)||(e.schedule?.type===`once`?`Once at `+Mn(e.schedule.run_at):JSON.stringify(e.schedule))}</span>
                             ${e.next_run_at&&d`<span> | next: ${Mn(e.next_run_at)}</span>`}
                             ${e.last_run_at&&d`<span> | last run: ${Mn(e.last_run_at)}</span>`}
+                            ${xa(e)&&d`<span> | ${xa(e)}</span>`}
+                            ${e.last_error&&d`<span class="job-last-error"> | last error: ${e.last_error}</span>`}
                         </div>
-                        <span class="job-status-${e.status||`active`}">${e.status||`active`}</span>
-                        ${e.status!==`cancelled`&&!e.optimistic&&d`
+                        <span class="job-status-${e.status||`active`}">${ba(e)}</span>
+                        ${ya(e.status||`active`)&&!e.optimistic&&d`
                             <button class="job-cancel" onClick=${()=>g(e.id)}>Cancel</button>
                         `}
                     </div>
                 `)}
         </div>
-    `}var Ta=(e,t=50)=>f(`/audit?session_id=${e}&limit=${t}`),Ea=50;async function Da(e){if(!E.value){K.value=null;return}try{let t=await Ta(E.value,e);K.value=t.events||t||[]}catch{K.value=[]}}function Oa(){let e=a(Ea),t=a(!1);i(()=>{Z.value===`audit`&&(e.value=Ea,Da(Ea))},[Z.value,E.value]);let n=async()=>{t.value=!0;try{let t=e.value+Ea;e.value=t,await Da(t)}catch(e){console.error(`[AuditTab] loadMore failed:`,e)}finally{t.value=!1}};if(!E.value)return d`<div class="empty-state">No session selected</div>`;if(K.value===null)return d`<div class="loading-state">Loading...</div>`;if(K.value.length===0)return d`<div class="empty-state">No audit events</div>`;let r=K.value.length>=e.value;return d`
+    `}var Oa=(e,t=50)=>f(`/audit?session_id=${e}&limit=${t}`),ka=50;async function Aa(e){if(!E.value){K.value=null;return}try{let t=await Oa(E.value,e);K.value=t.events||t||[]}catch{K.value=[]}}function ja(){let e=a(ka),t=a(!1);i(()=>{Z.value===`audit`&&(e.value=ka,Aa(ka))},[Z.value,E.value]);let n=async()=>{t.value=!0;try{let t=e.value+ka;e.value=t,await Aa(t)}catch(e){console.error(`[AuditTab] loadMore failed:`,e)}finally{t.value=!1}};if(!E.value)return d`<div class="empty-state">No session selected</div>`;if(K.value===null)return d`<div class="loading-state">Loading...</div>`;if(K.value.length===0)return d`<div class="empty-state">No audit events</div>`;let r=K.value.length>=e.value;return d`
         <div>
             ${K.value.map((e,t)=>d`
                 <div class="audit-event" key=${e.id||`audit-${e.timestamp||``}-${t}`}>
@@ -1574,7 +1576,7 @@ Context: `+t.context_id+g}
                 </button>
             `}
         </div>
-    `}var ka=50,Aa={completed:`✓`,failed:`✗`,cancelled:`⊘`,running:`⋯`},ja={user:`user`,scheduled:`scheduled`,subagent:`subagent`,dm:`dm`,notification:`notif`,telegram:`telegram`},Ma={chat:`chat`,dm:`dm`,subagent:`sub`,job:`job`,notification:`notif`,telegram:`tg`};function Na(e){if(e==null)return`--`;if(e<1e3)return e+`ms`;if(e<6e4)return(e/1e3).toFixed(1)+`s`;let t=Math.floor(e/6e4),n=Math.round(e%6e4/1e3);return t+`m`+(n>0?n+`s`:``)}function Pa(e){return e==null?`--`:e>=1e4?(e/1e3).toFixed(0)+`k`:e>=1e3?(e/1e3).toFixed(1)+`k`:String(e)}function Fa(e){if(!e)return``;let t=Date.now()-new Date(e).getTime();if(t<0)return`just now`;let n=Math.floor(t/1e3);if(n<60)return n+`s ago`;let r=Math.floor(n/60);if(r<60)return r+`m ago`;let i=Math.floor(r/60);return i<24?i+`h ago`:Math.floor(i/24)+`d ago`}function Ia(){let e=a([]),t=a(!1),n=a(``),r=async()=>{if(!V.value){e.value=[];return}t.value=!0,n.value=``;try{let t=await Ye(V.value,ka);e.value=t.runs||[]}catch(t){console.error(`[RunsTab] fetch failed:`,t),n.value=t.error?.message||t.message||`Failed to load runs`,e.value=[]}finally{t.value=!1}};return i(()=>{Z.value===`runs`&&r()},[Z.value,V.value,Fe.value]),V.value?t.value&&e.value.length===0?d`<div class="loading-state">Loading runs...</div>`:n.value?d`
+    `}var Ma=50,Na={completed:`✓`,failed:`✗`,cancelled:`⊘`,running:`⋯`},Pa={user:`user`,scheduled:`scheduled`,subagent:`subagent`,dm:`dm`,notification:`notif`,telegram:`telegram`},Fa={chat:`chat`,dm:`dm`,subagent:`sub`,job:`job`,notification:`notif`,telegram:`tg`};function Ia(e){if(e==null)return`--`;if(e<1e3)return e+`ms`;if(e<6e4)return(e/1e3).toFixed(1)+`s`;let t=Math.floor(e/6e4),n=Math.round(e%6e4/1e3);return t+`m`+(n>0?n+`s`:``)}function La(e){return e==null?`--`:e>=1e4?(e/1e3).toFixed(0)+`k`:e>=1e3?(e/1e3).toFixed(1)+`k`:String(e)}function Ra(e){if(!e)return``;let t=Date.now()-new Date(e).getTime();if(t<0)return`just now`;let n=Math.floor(t/1e3);if(n<60)return n+`s ago`;let r=Math.floor(n/60);if(r<60)return r+`m ago`;let i=Math.floor(r/60);return i<24?i+`h ago`:Math.floor(i/24)+`d ago`}function za(){let e=a([]),t=a(!1),n=a(``),r=async()=>{if(!V.value){e.value=[];return}t.value=!0,n.value=``;try{let t=await Ye(V.value,Ma);e.value=t.runs||[]}catch(t){console.error(`[RunsTab] fetch failed:`,t),n.value=t.error?.message||t.message||`Failed to load runs`,e.value=[]}finally{t.value=!1}};return i(()=>{Z.value===`runs`&&r()},[Z.value,V.value,Fe.value]),V.value?t.value&&e.value.length===0?d`<div class="loading-state">Loading runs...</div>`:n.value?d`
             <div>
                 <div class="runs-tab-error">${n.value}</div>
                 <button class="runs-tab-retry" onClick=${r}>Retry</button>
@@ -1595,32 +1597,32 @@ Context: `+t.context_id+g}
                          onClick=${()=>e.session_id&&Jt(e.session_id)}
                          title=${`Run `+e.run_id.slice(0,8)+` | Session `+(e.session_id||``).slice(0,8)}>
                         <div class="runs-tab-row-top">
-                            <span class="runs-tab-status">${Aa[e.status]||`·`}</span>
+                            <span class="runs-tab-status">${Na[e.status]||`·`}</span>
                             <span class="runs-tab-trigger runs-tab-trigger--${e.trigger||`user`}">
-                                ${ja[e.trigger]||e.trigger||`user`}
+                                ${Pa[e.trigger]||e.trigger||`user`}
                             </span>
                             <span class="runs-tab-session-type">
-                                ${Ma[e.session_type]||e.session_type||``}
+                                ${Fa[e.session_type]||e.session_type||``}
                             </span>
-                            <span class="runs-tab-time">${Fa(e.ts)}</span>
+                            <span class="runs-tab-time">${Ra(e.ts)}</span>
                         </div>
                         <div class="runs-tab-row-bottom">
-                            <span class="runs-tab-duration">${Na(e.duration_ms)}</span>
+                            <span class="runs-tab-duration">${Ia(e.duration_ms)}</span>
                             <span class="runs-tab-tools">${e.tool_call_count==null?``:e.tool_call_count+` tools`}</span>
                             <span class="runs-tab-tokens">
-                                ${e.usage?Pa(e.usage.prompt_tokens)+` in / `+Pa(e.usage.completion_tokens)+` out`+(typeof e.usage.reasoning_tokens==`number`&&e.usage.reasoning_tokens>0?` (+`+Pa(e.usage.reasoning_tokens)+` reasoning)`:``)+(typeof e.usage.cache_read_input_tokens==`number`&&e.usage.cache_read_input_tokens>0?` (`+Pa(e.usage.cache_read_input_tokens)+` cached)`:``):``}
+                                ${e.usage?La(e.usage.prompt_tokens)+` in / `+La(e.usage.completion_tokens)+` out`+(typeof e.usage.reasoning_tokens==`number`&&e.usage.reasoning_tokens>0?` (+`+La(e.usage.reasoning_tokens)+` reasoning)`:``)+(typeof e.usage.cache_read_input_tokens==`number`&&e.usage.cache_read_input_tokens>0?` (`+La(e.usage.cache_read_input_tokens)+` cached)`:``):``}
                             </span>
                         </div>
                     </div>
                 `)}
             </div>
         </div>
-    `:d`<div class="runs-tab-empty">No agent selected</div>`}function La(e,t=50,n=null){let r=`/agents/${e}/timeline?limit=${t}`;return n&&(r+=`&before=${encodeURIComponent(n)}`),f(r)}var Ra=50,za={run_started:`▶`,run_completed:`✓`,run_failed:`✗`,run_cancelled:`⊘`,run_ended:`■`,tool_call:`⚙`,message_received:`●`,message_sent:`○`,marker:`⚑`},Ba={run_started:`started`,run_completed:`completed`,run_failed:`failed`,run_cancelled:`cancelled`,run_ended:`ended`,tool_call:`tool`,message_received:`message`,message_sent:`sent`,marker:`marker`},Va={chat:`chat`,dm:`dm`,subagent:`sub`,job:`job`,notification:`notif`,telegram:`tg`,episodic:`epis`};function Ha(e){if(!e)return``;let t=Date.now()-new Date(e).getTime();if(t<0)return`just now`;let n=Math.floor(t/1e3);if(n<60)return n+`s ago`;let r=Math.floor(n/60);if(r<60)return r+`m ago`;let i=Math.floor(r/60);return i<24?i+`h ago`:Math.floor(i/24)+`d ago`}function Ua(e){return e?new Date(e).toLocaleTimeString([],{hour:`2-digit`,minute:`2-digit`}):``}function Wa(e){if(!e)return``;let t=new Date(e),n=new Date,r=new Date;return r.setDate(r.getDate()-1),t.toDateString()===n.toDateString()?`Today`:t.toDateString()===r.toDateString()?`Yesterday`:t.toLocaleDateString([],{weekday:`short`,month:`short`,day:`numeric`})}function Ga(){let e=a([]),t=a(!1),n=a(!1),r=a(``),o=a(!1),s=a(null),c=async(i=!1)=>{if(!V.value){e.value=[];return}i?n.value=!0:t.value=!0,r.value=``;try{let t=i?s.value:null,n=await La(V.value,Ra,t),r=n.events||[];i?e.value=[...e.value,...r]:e.value=r,o.value=n.pagination?.has_more||!1,s.value=n.pagination?.next_before||null}catch(t){console.error(`[TimelineTab] fetch failed:`,t),r.value=t.error?.message||t.message||`Failed to load timeline`,i||(e.value=[])}finally{t.value=!1,n.value=!1}};if(i(()=>{Z.value===`timeline`&&c(!1)},[Z.value,V.value]),!V.value)return d`<div class="tl-empty">No agent selected</div>`;if(t.value&&e.value.length===0)return d`<div class="loading-state">Loading timeline...</div>`;if(r.value)return d`
+    `:d`<div class="runs-tab-empty">No agent selected</div>`}function Ba(e,t=50,n=null){let r=`/agents/${e}/timeline?limit=${t}`;return n&&(r+=`&before=${encodeURIComponent(n)}`),f(r)}var Va=50,Ha={run_started:`▶`,run_completed:`✓`,run_failed:`✗`,run_cancelled:`⊘`,run_ended:`■`,tool_call:`⚙`,message_received:`●`,message_sent:`○`,marker:`⚑`},Ua={run_started:`started`,run_completed:`completed`,run_failed:`failed`,run_cancelled:`cancelled`,run_ended:`ended`,tool_call:`tool`,message_received:`message`,message_sent:`sent`,marker:`marker`},Wa={chat:`chat`,dm:`dm`,subagent:`sub`,job:`job`,notification:`notif`,telegram:`tg`,episodic:`epis`};function Ga(e){if(!e)return``;let t=Date.now()-new Date(e).getTime();if(t<0)return`just now`;let n=Math.floor(t/1e3);if(n<60)return n+`s ago`;let r=Math.floor(n/60);if(r<60)return r+`m ago`;let i=Math.floor(r/60);return i<24?i+`h ago`:Math.floor(i/24)+`d ago`}function Ka(e){return e?new Date(e).toLocaleTimeString([],{hour:`2-digit`,minute:`2-digit`}):``}function qa(e){if(!e)return``;let t=new Date(e),n=new Date,r=new Date;return r.setDate(r.getDate()-1),t.toDateString()===n.toDateString()?`Today`:t.toDateString()===r.toDateString()?`Yesterday`:t.toLocaleDateString([],{weekday:`short`,month:`short`,day:`numeric`})}function Ja(){let e=a([]),t=a(!1),n=a(!1),r=a(``),o=a(!1),s=a(null),c=async(i=!1)=>{if(!V.value){e.value=[];return}i?n.value=!0:t.value=!0,r.value=``;try{let t=i?s.value:null,n=await Ba(V.value,Va,t),r=n.events||[];i?e.value=[...e.value,...r]:e.value=r,o.value=n.pagination?.has_more||!1,s.value=n.pagination?.next_before||null}catch(t){console.error(`[TimelineTab] fetch failed:`,t),r.value=t.error?.message||t.message||`Failed to load timeline`,i||(e.value=[])}finally{t.value=!1,n.value=!1}};if(i(()=>{Z.value===`timeline`&&c(!1)},[Z.value,V.value]),!V.value)return d`<div class="tl-empty">No agent selected</div>`;if(t.value&&e.value.length===0)return d`<div class="loading-state">Loading timeline...</div>`;if(r.value)return d`
             <div>
                 <div class="tl-error">${r.value}</div>
                 <button class="tl-retry" onClick=${()=>c(!1)}>Retry</button>
             </div>
-        `;if(e.value.length===0)return d`<div class="tl-empty">No activity yet</div>`;let l=new Set;{let t=``;for(let n of e.value){let e=Wa(n.timestamp);e!==t&&(l.add(n),t=e)}}return d`
+        `;if(e.value.length===0)return d`<div class="tl-empty">No activity yet</div>`;let l=new Set;{let t=``;for(let n of e.value){let e=qa(n.timestamp);e!==t&&(l.add(n),t=e)}}return d`
         <div class="tl-tab">
             <div class="tl-header">
                 <span class="tl-count">${e.value.length} event${e.value.length===1?``:`s`}</span>
@@ -1630,7 +1632,7 @@ Context: `+t.context_id+g}
                 </button>
             </div>
             <div class="tl-list">
-                ${e.value.map((e,t)=>{let n=Wa(e.timestamp),r=l.has(e),i=e.event_type===`tool_call`,a=e.event_type===`run_started`||e.event_type===`run_completed`||e.event_type===`run_failed`||e.event_type===`run_cancelled`||e.event_type===`run_ended`,o=e.metadata?.tool_name,s=e.event_type+`-`+e.timestamp+`-`+(e.run_id||``)+`-`+t+(o?`-`+o:``);return d`
+                ${e.value.map((e,t)=>{let n=qa(e.timestamp),r=l.has(e),i=e.event_type===`tool_call`,a=e.event_type===`run_started`||e.event_type===`run_completed`||e.event_type===`run_failed`||e.event_type===`run_cancelled`||e.event_type===`run_ended`,o=e.metadata?.tool_name,s=e.event_type+`-`+e.timestamp+`-`+(e.run_id||``)+`-`+t+(o?`-`+o:``);return d`
                         ${r&&d`
                             <div class="tl-date-group" key=${`g-`+n}>${n}</div>
                         `}
@@ -1638,13 +1640,13 @@ Context: `+t.context_id+g}
                              key=${s}
                              onClick=${()=>Jt(e.session_id)}
                              title=${`Session `+(e.session_id||``).slice(0,8)+(e.run_id?` | Run `+e.run_id.slice(0,8):``)}>
-                            <span class="tl-time">${Ua(e.timestamp)}</span>
-                            <span class="tl-icon tl-icon--${e.event_type}">${za[e.event_type]||`·`}</span>
+                            <span class="tl-time">${Ka(e.timestamp)}</span>
+                            <span class="tl-icon tl-icon--${e.event_type}">${Ha[e.event_type]||`·`}</span>
                             <span class="tl-session-badge tl-session-badge--${e.session_type||`chat`}">
-                                ${Va[e.session_type]||e.session_type||`chat`}
+                                ${Wa[e.session_type]||e.session_type||`chat`}
                             </span>
-                            <span class="tl-event-label">${Ba[e.event_type]||e.event_type}</span>
-                            <span class="tl-ago">${Ha(e.timestamp)}</span>
+                            <span class="tl-event-label">${Ua[e.event_type]||e.event_type}</span>
+                            <span class="tl-ago">${Ga(e.timestamp)}</span>
                         </div>
                         ${e.summary&&d`
                             <div class="tl-summary${i?` tl-summary--indent`:``}"
@@ -1662,18 +1664,18 @@ Context: `+t.context_id+g}
                 </button>
             `}
         </div>
-    `}function Ka({tab:e}){return e===`agents`?d`<${Xi} />`:e===`workspace`?d`<${ia} />`:e===`runs`?d`<${Ia} />`:e===`jobs`?d`<${wa} />`:e===`audit`?d`<${Oa} />`:e===`timeline`?d`<${Ga} />`:null}function qa(){X.value=null}function Ja(){return X.value?d`
+    `}function Ya({tab:e}){return e===`agents`?d`<${Xi} />`:e===`workspace`?d`<${ia} />`:e===`runs`?d`<${za} />`:e===`jobs`?d`<${Da} />`:e===`audit`?d`<${ja} />`:e===`timeline`?d`<${Ja} />`:null}function Xa(){X.value=null}function Za(){return X.value?d`
         <div id="panel" class="open">
             <div class="panel-header">
                 <span class="panel-header-title">${Z.value.charAt(0).toUpperCase()+Z.value.slice(1)}</span>
                 <button class="panel-close-btn" title="Close panel" aria-label="Close panel"
-                        onClick=${qa}>\u00D7</button>
+                        onClick=${Xa}>\u00D7</button>
             </div>
             <div class="panel-body">
-                <${Ka} tab=${Z.value} />
+                <${Ya} tab=${Z.value} />
             </div>
         </div>
-    `:null}var Ya=()=>f(`/auth/keys`),Xa=(e,t)=>_(`/auth/keys`,{provider:e,key:t}),Za=e=>ne(`/auth/keys/${e}`),Qa=[`openai`,`anthropic`,`openrouter`,`gemini`];function $a({title:e,defaultOpen:t=!1,children:n}){let r=a(t);return d`
+    `:null}var Qa=()=>f(`/auth/keys`),$a=(e,t)=>_(`/auth/keys`,{provider:e,key:t}),eo=e=>ne(`/auth/keys/${e}`),to=[`openai`,`anthropic`,`openrouter`,`gemini`];function no({title:e,defaultOpen:t=!1,children:n}){let r=a(t);return d`
         <div class="settings-section">
             <button type="button" class="settings-section-toggle"
                     aria-expanded=${r.value}
@@ -1686,7 +1688,7 @@ Context: `+t.context_id+g}
                 ${n}
             </div>
         </div>
-    `}function eo({label:e,value:t,desc:n}){return d`
+    `}function ro({label:e,value:t,desc:n}){return d`
         <div class="settings-info-row">
             <div class="settings-info-row-header">
                 <span class="settings-info-row-label">${e}</span>
@@ -1702,10 +1704,10 @@ Context: `+t.context_id+g}
             </div>
             ${t&&d`<span class="settings-hint">${t}</span>`}
         </div>
-    `}function to(){let e=a([]),t=a(null),n=a(``),r=a(!1),o=a(``),s=async()=>{try{let t=await Ya();e.value=t.keys||[]}catch(e){console.error(`[auth] list keys failed:`,e)}};i(()=>{s()},[]);let c=async e=>{if(n.value.trim()){r.value=!0,o.value=``;try{await Xa(e,n.value.trim()),n.value=``,t.value=null,await s()}catch(e){o.value=e.error?.message||e.message||`Failed to save key`}finally{r.value=!1}}},l=async e=>{try{await Za(e),await s()}catch(e){o.value=e.error?.message||e.message||`Failed to remove key`}};return d`
+    `}function io(){let e=a([]),t=a(null),n=a(``),r=a(!1),o=a(``),s=async()=>{try{let t=await Qa();e.value=t.keys||[]}catch(e){console.error(`[auth] list keys failed:`,e)}};i(()=>{s()},[]);let c=async e=>{if(n.value.trim()){r.value=!0,o.value=``;try{await $a(e,n.value.trim()),n.value=``,t.value=null,await s()}catch(e){o.value=e.error?.message||e.message||`Failed to save key`}finally{r.value=!1}}},l=async e=>{try{await eo(e),await s()}catch(e){o.value=e.error?.message||e.message||`Failed to remove key`}};return d`
         <div class="settings-row">
             <label class="settings-label">API Keys</label>
-            ${Qa.map(i=>{let a=e.value.find(e=>e.provider===i),o=a?.configured,s=a?.source||`none`,u=a?.key||``;return t.value===i?d`
+            ${to.map(i=>{let a=e.value.find(e=>e.provider===i),o=a?.configured,s=a?.source||`none`,u=a?.key||``;return t.value===i?d`
                         <div class="api-key-row" key=${i}>
                             <span class="api-key-provider">${i}</span>
                             <input class="settings-input" type="password"
@@ -1745,13 +1747,13 @@ Context: `+t.context_id+g}
                 `})}
             ${o.value&&d`<div class="inline-error">${o.value}</div>`}
         </div>
-    `}function no({open:e,onClose:t}){let n=a(!1),r=a(!1),o=a(``),s=a(``),c=a(``),l=a(``),u=a(``),f=a(``),p=a(``),m=a(``),h=a(``),g=a(!0),_=a(``),v=a(``),y=a(``),b=a(``),x=a(``),S=a(``),C=a(``),w=a(``),T=a(!0),E=a(!1),D=a(``),ee=a(``),te=a(!0),ne=a(!1),re=a(``),ie=a(!1),O=a(!1),k=a(!1),A=a(``);if(i(()=>{if(e){let e=W.value,t=e.context||{},i=e.session||{},a=e.tools||{},d=e.llm||{},k=d.anthropic||{},j=d.openai||{},M=d.gemini||{};o.value=t.strategy||`truncate`,s.value=t.max_input_tokens==null?``:String(t.max_input_tokens),c.value=t.compact_trigger_pct==null?``:String(t.compact_trigger_pct),l.value=t.compact_retain_pct==null?``:String(t.compact_retain_pct),u.value=t.summary_model||``,f.value=t.summary_provider||``,p.value=i.max_messages==null?``:String(i.max_messages),m.value=i.max_context_tokens==null?``:String(i.max_context_tokens),h.value=i.idle_timeout_secs==null?``:String(i.idle_timeout_secs),g.value=i.auto_archive==null||i.auto_archive,_.value=i.archive_ttl_secs==null?``:String(i.archive_ttl_secs),v.value=a.shell_policy||`sandboxed`,y.value=a.sandbox_root||`.`,b.value=a.timeout_secs==null?``:String(a.timeout_secs),x.value=a.max_output_bytes==null?``:String(a.max_output_bytes),S.value=e.model||``,C.value=e.provider||``,w.value=k.thinking_budget_tokens==null?``:String(k.thinking_budget_tokens),T.value=k.prompt_cache_enabled==null||!!k.prompt_cache_enabled,E.value=!1,D.value=j.reasoning_effort||``,ee.value=M.thinking_budget==null?``:String(M.thinking_budget),te.value=M.cache_enabled==null||!!M.cache_enabled,ne.value=!1,re.value=M.cache_ttl_seconds==null?``:String(M.cache_ttl_seconds);let ae=H.value.find(e=>e.id===V.value);ie.value=!!(ae&&ae.debug_mode),O.value=!1,n.value=!1,r.value=!1,A.value=``}},[e]),!e)return null;let j=W.value,M=j.context||{},ae=j.session||{},N=j.logging||{},oe=j.tools||{},P=j.llm||{},se=P.anthropic||{},ce=P.openai||{},F=P.gemini||{},le=async()=>{k.value=!0,A.value=``,n.value=!1;let e={},i={};o.value&&o.value!==(M.strategy||``)&&(i.strategy=o.value);let a=parseInt(s.value,10);!isNaN(a)&&a!==M.max_input_tokens&&(i.max_input_tokens=a);let d=parseFloat(c.value);!isNaN(d)&&d!==M.compact_trigger_pct&&(i.compact_trigger_pct=d);let N=parseFloat(l.value);!isNaN(N)&&N!==M.compact_retain_pct&&(i.compact_retain_pct=N),u.value!==(M.summary_model||``)&&(i.summary_model=u.value),f.value!==(M.summary_provider||``)&&(i.summary_provider=f.value),Object.keys(i).length>0&&(e.context=i);let P={},le=parseInt(p.value,10);!isNaN(le)&&le!==ae.max_messages&&(P.max_messages=le);let I=parseInt(m.value,10);!isNaN(I)&&I!==ae.max_context_tokens&&(P.max_context_tokens=I);let L=parseInt(h.value,10);!isNaN(L)&&L!==ae.idle_timeout_secs&&(P.idle_timeout_secs=L),g.value!==ae.auto_archive&&(P.auto_archive=g.value);let ue=parseInt(_.value,10);!isNaN(ue)&&ue!==ae.archive_ttl_secs&&(P.archive_ttl_secs=ue),Object.keys(P).length>0&&(e.session=P);let R={};v.value&&v.value!==(oe.shell_policy||``)&&(R.shell_policy=v.value),y.value!==(oe.sandbox_root||``)&&(R.sandbox_root=y.value);let de=parseInt(b.value,10);!isNaN(de)&&de!==oe.timeout_secs&&(R.timeout_secs=de);let fe=parseInt(x.value,10);!isNaN(fe)&&fe!==oe.max_output_bytes&&(R.max_output_bytes=fe),Object.keys(R).length>0&&(e.tools=R);let pe={},me={},he=parseInt(w.value,10);w.value!==``&&!isNaN(he)&&he!==se.thinking_budget_tokens&&(me.thinking_budget_tokens=he),E.value&&T.value!==!!se.prompt_cache_enabled&&(me.prompt_cache_enabled=T.value),Object.keys(me).length>0&&(pe.anthropic=me);let ge={},_e=ce.reasoning_effort||``;D.value!==_e&&(ge.reasoning_effort=D.value),Object.keys(ge).length>0&&(pe.openai=ge);let ve={},ye=parseInt(ee.value,10);ee.value!==``&&!isNaN(ye)&&ye!==F.thinking_budget&&(ve.thinking_budget=ye),ne.value&&te.value!==!!F.cache_enabled&&(ve.cache_enabled=te.value);let be=parseInt(re.value,10);re.value!==``&&!isNaN(be)&&be!==F.cache_ttl_seconds&&(ve.cache_ttl_seconds=be),Object.keys(ve).length>0&&(pe.gemini=ve),Object.keys(pe).length>0&&(e.llm=pe),S.value&&S.value!==(j.model||``)&&(e.model=S.value),C.value&&C.value!==(j.provider||``)&&(e.provider=C.value);let xe=!1;if(Object.keys(e).length>0)try{let t=await et(e);t&&t.restart_required&&(xe=!0),await tt()}catch(e){let t=Array.isArray(e.errors)?e.errors.join(`; `):null;A.value=t||e.message||`Failed to save server settings`}if(O.value&&V.value){let e=H.value.find(e=>e.id===V.value),t=Vi(e&&e.debug_mode,ie.value);if(Object.keys(t).length>0)try{await xi(V.value,t);let e=await yi();e&&Array.isArray(e.agents)&&Me(e.agents)}catch(e){A.value=e.error?.message||e.message||`Failed to save debug mode`}}A.value||(n.value=!0,r.value=xe),k.value=!1,!A.value&&!xe&&setTimeout(()=>t(),600)},I=e=>{e.target===e.currentTarget&&t()},L=oe.enabled||j.enabled_tools||[];return d`
+    `}function ao({open:e,onClose:t}){let n=a(!1),r=a(!1),o=a(``),s=a(``),c=a(``),l=a(``),u=a(``),f=a(``),p=a(``),m=a(``),h=a(``),g=a(!0),_=a(``),v=a(``),y=a(``),b=a(``),x=a(``),S=a(``),C=a(``),w=a(``),T=a(!0),E=a(!1),D=a(``),ee=a(``),te=a(!0),ne=a(!1),re=a(``),ie=a(!1),ae=a(!1),O=a(!1),k=a(``);if(i(()=>{if(e){let e=W.value,t=e.context||{},i=e.session||{},a=e.tools||{},d=e.llm||{},O=d.anthropic||{},A=d.openai||{},j=d.gemini||{};o.value=t.strategy||`truncate`,s.value=t.max_input_tokens==null?``:String(t.max_input_tokens),c.value=t.compact_trigger_pct==null?``:String(t.compact_trigger_pct),l.value=t.compact_retain_pct==null?``:String(t.compact_retain_pct),u.value=t.summary_model||``,f.value=t.summary_provider||``,p.value=i.max_messages==null?``:String(i.max_messages),m.value=i.max_context_tokens==null?``:String(i.max_context_tokens),h.value=i.idle_timeout_secs==null?``:String(i.idle_timeout_secs),g.value=i.auto_archive==null||i.auto_archive,_.value=i.archive_ttl_secs==null?``:String(i.archive_ttl_secs),v.value=a.shell_policy||`sandboxed`,y.value=a.sandbox_root||`.`,b.value=a.timeout_secs==null?``:String(a.timeout_secs),x.value=a.max_output_bytes==null?``:String(a.max_output_bytes),S.value=e.model||``,C.value=e.provider||``,w.value=O.thinking_budget_tokens==null?``:String(O.thinking_budget_tokens),T.value=O.prompt_cache_enabled==null||!!O.prompt_cache_enabled,E.value=!1,D.value=A.reasoning_effort||``,ee.value=j.thinking_budget==null?``:String(j.thinking_budget),te.value=j.cache_enabled==null||!!j.cache_enabled,ne.value=!1,re.value=j.cache_ttl_seconds==null?``:String(j.cache_ttl_seconds);let M=H.value.find(e=>e.id===V.value);ie.value=!!(M&&M.debug_mode),ae.value=!1,n.value=!1,r.value=!1,k.value=``}},[e]),!e)return null;let A=W.value,j=A.context||{},M=A.session||{},N=A.logging||{},oe=A.tools||{},P=A.llm||{},se=P.anthropic||{},ce=P.openai||{},F=P.gemini||{},le=async()=>{O.value=!0,k.value=``,n.value=!1;let e={},i={};o.value&&o.value!==(j.strategy||``)&&(i.strategy=o.value);let a=parseInt(s.value,10);!isNaN(a)&&a!==j.max_input_tokens&&(i.max_input_tokens=a);let d=parseFloat(c.value);!isNaN(d)&&d!==j.compact_trigger_pct&&(i.compact_trigger_pct=d);let N=parseFloat(l.value);!isNaN(N)&&N!==j.compact_retain_pct&&(i.compact_retain_pct=N),u.value!==(j.summary_model||``)&&(i.summary_model=u.value),f.value!==(j.summary_provider||``)&&(i.summary_provider=f.value),Object.keys(i).length>0&&(e.context=i);let P={},le=parseInt(p.value,10);!isNaN(le)&&le!==M.max_messages&&(P.max_messages=le);let I=parseInt(m.value,10);!isNaN(I)&&I!==M.max_context_tokens&&(P.max_context_tokens=I);let L=parseInt(h.value,10);!isNaN(L)&&L!==M.idle_timeout_secs&&(P.idle_timeout_secs=L),g.value!==M.auto_archive&&(P.auto_archive=g.value);let ue=parseInt(_.value,10);!isNaN(ue)&&ue!==M.archive_ttl_secs&&(P.archive_ttl_secs=ue),Object.keys(P).length>0&&(e.session=P);let R={};v.value&&v.value!==(oe.shell_policy||``)&&(R.shell_policy=v.value),y.value!==(oe.sandbox_root||``)&&(R.sandbox_root=y.value);let de=parseInt(b.value,10);!isNaN(de)&&de!==oe.timeout_secs&&(R.timeout_secs=de);let fe=parseInt(x.value,10);!isNaN(fe)&&fe!==oe.max_output_bytes&&(R.max_output_bytes=fe),Object.keys(R).length>0&&(e.tools=R);let pe={},me={},he=parseInt(w.value,10);w.value!==``&&!isNaN(he)&&he!==se.thinking_budget_tokens&&(me.thinking_budget_tokens=he),E.value&&T.value!==!!se.prompt_cache_enabled&&(me.prompt_cache_enabled=T.value),Object.keys(me).length>0&&(pe.anthropic=me);let ge={},_e=ce.reasoning_effort||``;D.value!==_e&&(ge.reasoning_effort=D.value),Object.keys(ge).length>0&&(pe.openai=ge);let ve={},ye=parseInt(ee.value,10);ee.value!==``&&!isNaN(ye)&&ye!==F.thinking_budget&&(ve.thinking_budget=ye),ne.value&&te.value!==!!F.cache_enabled&&(ve.cache_enabled=te.value);let be=parseInt(re.value,10);re.value!==``&&!isNaN(be)&&be!==F.cache_ttl_seconds&&(ve.cache_ttl_seconds=be),Object.keys(ve).length>0&&(pe.gemini=ve),Object.keys(pe).length>0&&(e.llm=pe),S.value&&S.value!==(A.model||``)&&(e.model=S.value),C.value&&C.value!==(A.provider||``)&&(e.provider=C.value);let xe=!1;if(Object.keys(e).length>0)try{let t=await et(e);t&&t.restart_required&&(xe=!0),await tt()}catch(e){let t=Array.isArray(e.errors)?e.errors.join(`; `):null;k.value=t||e.message||`Failed to save server settings`}if(ae.value&&V.value){let e=H.value.find(e=>e.id===V.value),t=Vi(e&&e.debug_mode,ie.value);if(Object.keys(t).length>0)try{await xi(V.value,t);let e=await yi();e&&Array.isArray(e.agents)&&Me(e.agents)}catch(e){k.value=e.error?.message||e.message||`Failed to save debug mode`}}k.value||(n.value=!0,r.value=xe),O.value=!1,!k.value&&!xe&&setTimeout(()=>t(),600)},I=e=>{e.target===e.currentTarget&&t()},L=oe.enabled||A.enabled_tools||[];return d`
         <div class="settings-overlay open" onClick=${I}>
             <div class="settings-modal">
                 <h2>Settings</h2>
 
                 <!-- Security: API Keys -->
-                <${to} />
+                <${io} />
 
                 <div class="settings-divider"></div>
 
@@ -1768,7 +1770,7 @@ Context: `+t.context_id+g}
                      config surface lives in the Agents panel; this row
                      is mirrored here as a discoverable shortcut for
                      the most common Debug-mode flow. -->
-                <${$a} key="debug" title="Debug" defaultOpen=${!1}>
+                <${no} key="debug" title="Debug" defaultOpen=${!1}>
                     <span class="settings-hint settings-section-desc">
                         Per-agent context-window inspection. When enabled, every turn from the active agent
                         emits a snapshot of the full assembled LLM context (system prompts, workspace,
@@ -1783,7 +1785,7 @@ Context: `+t.context_id+g}
                             <input type="checkbox"
                                    checked=${ie.value}
                                    disabled=${!V.value}
-                                   onChange=${e=>{ie.value=e.target.checked,O.value=!0}} />
+                                   onChange=${e=>{ie.value=e.target.checked,ae.value=!0}} />
                             <span>${ie.value?`enabled`:`disabled`}</span>
                         </label>
                     <//>
@@ -1801,7 +1803,7 @@ Context: `+t.context_id+g}
                      re-applies on the next daemon start; on PATCH the
                      response carries restart_required:true so the operator
                      gets a yellow banner instead of a 600ms Saved! flash. -->
-                <${$a} key="defaults" title="Default LLM (model / provider)" defaultOpen=${!0}>
+                <${no} key="defaults" title="Default LLM (model / provider)" defaultOpen=${!0}>
                     <span class="settings-hint settings-section-desc">
                         Server-default LLM identity — new agents inherit these values when they don't
                         carry a per-agent override (per-agent values live on the agent record and are
@@ -1813,11 +1815,11 @@ Context: `+t.context_id+g}
                         desc="Model id sent to the resolved provider's wire (e.g. z-ai/glm-5.2, claude-sonnet-4-6, gpt-5.4). Pick from the suggestions list or type any model the provider accepts.">
                         <input class="settings-input settings-input-sm" type="text"
                                list="model-suggestions"
-                               placeholder=${j.model||`model id`}
+                               placeholder=${A.model||`model id`}
                                value=${S.value}
                                onInput=${e=>{S.value=e.target.value}} />
                         <span class="settings-effective">
-                            <${ji} value=${S.value.trim()} defaultValue=${j.model} />
+                            <${ji} value=${S.value.trim()} defaultValue=${A.model} />
                         </span>
                     <//>
                     <${$} label="Default LLM provider"
@@ -1825,7 +1827,7 @@ Context: `+t.context_id+g}
                         <select class="settings-select settings-input-sm"
                                 value=${C.value}
                                 onChange=${e=>{C.value=e.target.value}}>
-                            ${(j.llm_providers&&j.llm_providers.length>0?j.llm_providers:Qa).map(e=>{let t=ki(e);return d`<option value=${e} key=${e}>${t===`Custom`?e:t}</option>`})}
+                            ${(A.llm_providers&&A.llm_providers.length>0?A.llm_providers:to).map(e=>{let t=ki(e);return d`<option value=${e} key=${e}>${t===`Custom`?e:t}</option>`})}
                         </select>
                     <//>
                     <datalist id="model-suggestions">
@@ -1834,7 +1836,7 @@ Context: `+t.context_id+g}
                 <//>
 
                 <!-- Context (server-level, editable) -->
-                <${$a} key="ctx" title="Context" defaultOpen=${!1}>
+                <${no} key="ctx" title="Context" defaultOpen=${!1}>
                     <span class="settings-hint settings-section-desc">
                         truncate fits the most recent history into the token budget.
                         compact summarises older messages once the session crosses the trigger threshold.
@@ -1877,7 +1879,7 @@ Context: `+t.context_id+g}
                      in-loop compact-strategy compaction AND the post-run
                      episodic memory generation. Lifted out of the Context
                      section to make the dual-path scope obvious. -->
-                <${$a} key="summary" title="Summary (compact strategy + episodic memory)" defaultOpen=${!1}>
+                <${no} key="summary" title="Summary (compact strategy + episodic memory)" defaultOpen=${!1}>
                     <span class="settings-hint settings-section-desc">
                         Optional dedicated provider/model for the summary task. Drives both the in-loop compact-strategy compaction
                         (rolling context window) and the per-run episodic memory generation. Both fields must be set together — partial
@@ -1892,7 +1894,7 @@ Context: `+t.context_id+g}
                                value=${u.value}
                                onInput=${e=>{u.value=e.target.value}} />
                         <span class="settings-effective">
-                            <${ji} value=${u.value.trim()} defaultValue=${j.model} />
+                            <${ji} value=${u.value.trim()} defaultValue=${A.model} />
                         </span>
                     <//>
                     <${$} label="Summary provider"
@@ -1901,13 +1903,13 @@ Context: `+t.context_id+g}
                                 value=${f.value}
                                 onChange=${e=>{f.value=e.target.value}}>
                             <option value="">Unset (no dedicated summary task)</option>
-                            ${(j.llm_providers&&j.llm_providers.length>0?j.llm_providers:Qa).map(e=>{let t=ki(e);return d`<option value=${e} key=${e}>${t===`Custom`?e:t}</option>`})}
+                            ${(A.llm_providers&&A.llm_providers.length>0?A.llm_providers:to).map(e=>{let t=ki(e);return d`<option value=${e} key=${e}>${t===`Custom`?e:t}</option>`})}
                         </select>
                     <//>
                 <//>
 
                 <!-- Session (server-level, editable) -->
-                <${$a} key="sess" title="Session" defaultOpen=${!1}>
+                <${no} key="sess" title="Session" defaultOpen=${!1}>
                     <span class="settings-hint settings-section-desc">
                         Controls session storage and retention. Changes apply to the next run.
                     </span>
@@ -1947,7 +1949,7 @@ Context: `+t.context_id+g}
                 <//>
 
                 <!-- Tools (server-level, editable) -->
-                <${$a} key="tools" title="Tools" defaultOpen=${!1}>
+                <${no} key="tools" title="Tools" defaultOpen=${!1}>
                     <span class="settings-hint settings-section-desc">
                         Tool execution settings. Changes apply to the next run.
                     </span>
@@ -1978,12 +1980,12 @@ Context: `+t.context_id+g}
                                value=${x.value}
                                onInput=${e=>{x.value=e.target.value}} />
                     <//>
-                    <${eo} label="Enabled tools" value=${`${L.length} tools`}
+                    <${ro} label="Enabled tools" value=${`${L.length} tools`}
                         desc=${L.join(`, `)} />
                 <//>
 
                 <!-- LLM Providers (server-level, editable) — #809 / #804 Slice A -->
-                <${$a} key="llm" title="LLM Providers" defaultOpen=${!1}>
+                <${no} key="llm" title="LLM Providers" defaultOpen=${!1}>
                     <span class="settings-hint settings-section-desc">
                         Server-level reasoning &amp; caching defaults. Mutations propagate to the next HTTP-triggered run without restart; Telegram-triggered runs use a boot-time snapshot until the daemon is restarted.
                     </span>
@@ -2047,17 +2049,17 @@ Context: `+t.context_id+g}
                 <//>
 
                 <!-- Logging (server-level, read-only) -->
-                <${$a} key="log" title="Logging" defaultOpen=${!1}>
+                <${no} key="log" title="Logging" defaultOpen=${!1}>
                     <span class="settings-hint settings-section-desc">
                         File-based logging settings. Requires restart to change.
                     </span>
-                    <${eo} label="File logging" value=${N.file_enabled==null?`--`:N.file_enabled?`enabled`:`disabled`}
+                    <${ro} label="File logging" value=${N.file_enabled==null?`--`:N.file_enabled?`enabled`:`disabled`}
                         desc="Whether persistent file logging is active." />
-                    <${eo} label="File level" value=${N.file_level||`--`}
+                    <${ro} label="File level" value=${N.file_level||`--`}
                         desc="Log level for file output (trace, debug, info, warn, error)." />
-                    <${eo} label="Rotation" value=${N.rotation||`--`}
+                    <${ro} label="Rotation" value=${N.rotation||`--`}
                         desc="Log rotation policy: daily, hourly, or never." />
-                    <${eo} label="Log directory" value=${N.log_dir||`default (data/logs/)`}
+                    <${ro} label="Log directory" value=${N.log_dir||`default (data/logs/)`}
                         desc="Directory where log files are written." />
                 <//>
 
@@ -2067,15 +2069,15 @@ Context: `+t.context_id+g}
                 <div class="settings-row">
                     <label class="settings-label">Server info</label>
                     <div class="settings-info">
-                        <div>Version: <span class="settings-info-value">${j.version||`unknown`}</span></div>
-                        <div>Base URL: <span class="settings-info-value">${j.base_url||`unknown`}</span></div>
-                        <div>Stream timeout: <span class="settings-info-value">${j.stream_chunk_timeout_secs||180}s</span></div>
+                        <div>Version: <span class="settings-info-value">${A.version||`unknown`}</span></div>
+                        <div>Base URL: <span class="settings-info-value">${A.base_url||`unknown`}</span></div>
+                        <div>Stream timeout: <span class="settings-info-value">${A.stream_chunk_timeout_secs||180}s</span></div>
                     </div>
                 </div>
 
-                ${A.value&&d`
+                ${k.value&&d`
                     <div class="settings-error">
-                        Failed to save server settings: ${A.value}
+                        Failed to save server settings: ${k.value}
                     </div>
                 `}
 
@@ -2092,13 +2094,13 @@ Context: `+t.context_id+g}
                 <div class="settings-footer">
                     <button class="settings-cancel" onClick=${t}>Cancel</button>
                     <button class="settings-save" onClick=${le}
-                            disabled=${k.value}>
-                        ${k.value?`Saving...`:n.value?`Saved!`:`Apply`}
+                            disabled=${O.value}>
+                        ${O.value?`Saving...`:n.value?`Saved!`:`Apply`}
                     </button>
                 </div>
             </div>
         </div>
-    `}function ro(){let e=a(``),t=a(``),n=a(!1);return d`
+    `}function oo(){let e=a(``),t=a(``),n=a(!1);return d`
         <div id="onboarding">
             <form class="onboard-card" onSubmit=${async r=>{r.preventDefault();let i=e.value.trim();if(i){if(!/^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$/.test(i)){t.value=`Invalid name: lowercase letters, digits, hyphens only (1-64 chars, no trailing hyphen)`;return}n.value=!0,t.value=``;try{let e=await bi({name:i,is_default:!0});Me((await yi()).agents||[]);let t=e.id||(H.value.find(e=>e.name===i)||{}).id;t?await Et(t):console.warn(`[onboarding] POST /agents returned no id for agent:`,i,e)}catch(e){t.value=e.error?.message||e.message||`Failed to create agent`}finally{n.value=!1}}}}>
                 <h2>Welcome to ALMS</h2>
@@ -2117,9 +2119,9 @@ Context: `+t.context_id+g}
                 <div class="onboard-error">${t.value}</div>
             </form>
         </div>
-    `}function io(e){if(!e)return``;if(e.status===`done`)return`Done`;if(e.status===`fail`)return`Failed`;if(e.status===`cancelled`)return`Cancelled`;let t=e.activity;if(!t||!t.kind)return`Starting…`;switch(t.kind){case`reasoning`:return`Reasoning…`;case`writing`:return`Writing…`;case`tool_start`:return t.tool?`Using ${t.tool}`:`Using tool`;case`tool_end`:return`Running…`;default:return`Running…`}}function ao(){let e=Object.entries(je.value);return e.length===0?null:d`
+    `}function so(e){if(!e)return``;if(e.status===`done`)return`Done`;if(e.status===`fail`)return`Failed`;if(e.status===`cancelled`)return`Cancelled`;let t=e.activity;if(!t||!t.kind)return`Starting…`;switch(t.kind){case`reasoning`:return`Reasoning…`;case`writing`:return`Writing…`;case`tool_start`:return t.tool?`Using ${t.tool}`:`Using tool`;case`tool_end`:return`Running…`;default:return`Running…`}}function co(){let e=Object.entries(je.value);return e.length===0?null:d`
         <div class="sa-bar" aria-label="Subagent status bar">
-            ${e.map(([e,t])=>{let n=t.status===`running`,r=t.status===`done`?`✓`:`✗`,i=t.displayName||e,a=io(t),o=()=>{t.sessionId&&fe(t.sessionId)},s=e=>{Bi(e)&&o()},c=e=>{zi(e)&&(e.preventDefault(),o())},l=t.task?`${i}: ${t.task} — open subagent session`:`${i} — open subagent session`,u=le(t.sessionId),f=e=>t=>{if(t.stopPropagation(),t.key===`Escape`){t.preventDefault(),I();return}(t.key===`Enter`||t.key===` `)&&(t.preventDefault(),e(t))},p=e=>{e.stopPropagation(),R(t.sessionId)},m=e=>{e.stopPropagation(),pe(t.sessionId)},h=e=>{e.stopPropagation(),I()};return d`
+            ${e.map(([e,t])=>{let n=t.status===`running`,r=t.status===`done`?`✓`:`✗`,i=t.displayName||e,a=so(t),o=()=>{t.sessionId&&fe(t.sessionId)},s=e=>{Bi(e)&&o()},c=e=>{zi(e)&&(e.preventDefault(),o())},l=t.task?`${i}: ${t.task} — open subagent session`:`${i} — open subagent session`,u=le(t.sessionId),f=e=>t=>{if(t.stopPropagation(),t.key===`Escape`){t.preventDefault(),I();return}(t.key===`Enter`||t.key===` `)&&(t.preventDefault(),e(t))},p=e=>{e.stopPropagation(),R(t.sessionId)},m=e=>{e.stopPropagation(),pe(t.sessionId)},h=e=>{e.stopPropagation(),I()};return d`
                     <div class="sa-chip ${n?`running`:t.status}"
                          role="button"
                          tabindex="0"
@@ -2154,7 +2156,7 @@ Context: `+t.context_id+g}
                     </div>
                 `})}
         </div>
-    `}function oo(){let e=B.value,{phase:t,detail:n}=Te.value,r=ve(t,n),o=a(!1),s=a(!1),u=c(null),f=l(()=>{o.value=!o.value},[]),p=l(()=>{o.value=!1,s.value=!0},[]);return i(()=>{if(!o.value)return;let e=e=>{u.current&&!u.current.contains(e.target)&&(o.value=!1)};return document.addEventListener(`click`,e,!0),()=>document.removeEventListener(`click`,e,!0)},[o.value]),e?d`
+    `}function lo(){let e=B.value,{phase:t,detail:n}=Te.value,r=ve(t,n),o=a(!1),s=a(!1),u=c(null),f=l(()=>{o.value=!o.value},[]),p=l(()=>{o.value=!1,s.value=!0},[]);return i(()=>{if(!o.value)return;let e=e=>{u.current&&!u.current.contains(e.target)&&(o.value=!1)};return document.addEventListener(`click`,e,!0),()=>document.removeEventListener(`click`,e,!0)},[o.value]),e?d`
         <div class="agent-header-bar">
             <div class="agent-header-bar-left">
                 <span class="agent-header-bar-name">${e.name}</span>
@@ -2208,7 +2210,7 @@ Context: `+t.context_id+g}
                     onClose=${()=>{s.value=!1}} />
             `}
         </div>
-    `:null}var so=o(!1),co=new Set;function lo(e,t,n){return e.fromAgent?e.fromAgent===t[0]?`left`:`right`:e.type===`agent`||e.role===`assistant`?n?n===t[0]?`left`:`right`:`left`:e.type===`user`||e.role===`user`?n?n===t[0]?`right`:`left`:`right`:`center`}function uo({msg:e,participants:t,perspectiveAgent:n}){let r=lo(e,t,n),a=e.fromAgent||(r===`left`?t[0]:t[1])||`?`,o=u(e.text||``),s=e.type===`agent`||e.role===`assistant`,l=c(null);return i(()=>{s&&Yn(l.current)},[o,s]),d`
+    `:null}var uo=o(!1),fo=new Set;function po(e,t,n){return e.fromAgent?e.fromAgent===t[0]?`left`:`right`:e.type===`agent`||e.role===`assistant`?n?n===t[0]?`left`:`right`:`left`:e.type===`user`||e.role===`user`?n?n===t[0]?`right`:`left`:`right`:`center`}function mo({msg:e,participants:t,perspectiveAgent:n}){let r=po(e,t,n),a=e.fromAgent||(r===`left`?t[0]:t[1])||`?`,o=u(e.text||``),s=e.type===`agent`||e.role===`assistant`,l=c(null);return i(()=>{s&&Yn(l.current)},[o,s]),d`
         <div class="dm-msg dm-msg-${r}">
             <div class="dm-msg-name-row dm-msg-name-row-${r}">
                 <div class="dm-msg-name">${a}</div>
@@ -2217,11 +2219,11 @@ Context: `+t.context_id+g}
             <div class="dm-msg-bubble markdown-body" ref=${l}
                  dangerouslySetInnerHTML=${{__html:o}} />
         </div>
-    `}function fo({text:e}){return d`
+    `}function ho({text:e}){return d`
         <div class="dm-ended-banner">
             <span class="dm-ended-label">${e}</span>
         </div>
-    `}function po(e,t){if(!e)return!1;let n=e.trim();if(!n)return!1;for(let e of t||[]){if(e.tool!==`send_message`)continue;let t=e.params&&typeof e.params.message==`string`?e.params.message.trim():``;if(t&&t===n)return!0}return!1}function mo({runId:e,agentName:n,thinkingText:r,tools:i,status:a,isLive:o}){let[s,c]=t(!1),l=o&&Ce.value.get(e)||``,u=r||l,f=po(u,i)?``:u,p=(i||[]).filter(e=>!(e.tool===`send_message`&&e.status===`done`)),m=p.length,h=(i||[]).length>0;return!o&&!h&&(!f||!f.trim())?null:d`
+    `}function go(e,t){if(!e)return!1;let n=e.trim();if(!n)return!1;for(let e of t||[]){if(e.tool!==`send_message`)continue;let t=e.params&&typeof e.params.message==`string`?e.params.message.trim():``;if(t&&t===n)return!0}return!1}function _o({runId:e,agentName:n,thinkingText:r,tools:i,status:a,isLive:o}){let[s,c]=t(!1),l=o&&Ce.value.get(e)||``,u=r||l,f=go(u,i)?``:u,p=(i||[]).filter(e=>!(e.tool===`send_message`&&e.status===`done`)),m=p.length,h=(i||[]).length>0;return!o&&!h&&(!f||!f.trim())?null:d`
         <div class=${`dm-reasoning-block`+(a===`failed`?` dm-reasoning-block--failed`:``)+(o?` dm-reasoning-block--live`:``)}>
             <div class="dm-reasoning-header" onClick=${()=>c(!s)}>
                 <span class="dm-reasoning-toggle">${s?`▼`:`▶`}</span>
@@ -2239,7 +2241,7 @@ Context: `+t.context_id+g}
                 </div>
             `}
         </div>
-    `}async function ho(){let e=E.value;if(!(!e||so.value)){so.value=!0;try{await ce(e)}catch(e){console.error(`[cancel-dm] failed:`,e)}finally{so.value=!1}}}function go(){let e=c(null),t=se.value;i(()=>{let t=0,n=r(()=>{O.value,cancelAnimationFrame(t),t=requestAnimationFrame(()=>{Pn(e.current)})});return()=>{cancelAnimationFrame(t),n()}},[]);let n=O.value,a=B.value?B.value.name:null,o=t.length>=2?`${t[0]} <-> ${t[1]}`:`DM conversation`,s=!!U.value,l=!!ye.value,u=s||l,f=so.value;return d`
+    `}async function vo(){let e=E.value;if(!(!e||uo.value)){uo.value=!0;try{await ce(e)}catch(e){console.error(`[cancel-dm] failed:`,e)}finally{uo.value=!1}}}function yo(){let e=c(null),t=se.value;i(()=>{let t=0,n=r(()=>{ae.value,cancelAnimationFrame(t),t=requestAnimationFrame(()=>{Pn(e.current)})});return()=>{cancelAnimationFrame(t),n()}},[]);let n=ae.value,a=B.value?B.value.name:null,o=t.length>=2?`${t[0]} <-> ${t[1]}`:`DM conversation`,s=!!U.value,l=!!ye.value,u=s||l,f=uo.value;return d`
         <div class="dm-view-header">
             <span class="dm-view-header-icon" aria-hidden="true">\u2194</span>
             <span class="dm-view-header-label">${o}</span>
@@ -2249,12 +2251,12 @@ Context: `+t.context_id+g}
             ${n.length===0&&d`
                 <div class="empty-state">No messages in this conversation yet.</div>
             `}
-            ${n.map(e=>{if(e.type===`dm_ended`){let t=`Conversation ended -- ${e.reason||`ended`}`;return d`<${fo} key=${e.id} text=${t} />`}if(e.type===`system`)return d`<${fo} key=${e.id} text=${e.text} />`;if(e.type===`notification`){let t=e.metadata||{};if(t.type===`dm_ended_notification`){let n=`DM with ${t.peer||`unknown`} ended -- ${_e[t.reason]||t.reason||`ended`}`;return d`<${fo} key=${e.id} text=${n} />`}return d`<${fo} key=${e.id} text=${e.text} />`}if(e.type===`error`)return d`<div key=${e.id} class="dm-msg dm-msg-center"><div class="dm-msg-error">${e.text}</div></div>`;if(e.type===`tokens`)return null;if(e.type===`thinking`){let t=`Thinking…`;if(e.pending)t=`Sending…`;else if(e.queuedBehind>0)t=`Queued \u2014 position ${e.queuedBehind}\u2026`;else if(e.source){let n=e.source.startsWith(`peer:`)?e.source.slice(5):e.source;n&&(t=`${n} is thinking\u2026`)}return d`<div key=${e.id} class="dm-msg dm-msg-center"><div class="dm-msg-thinking">${t}</div></div>`}if(e.type===`warning`)return d`<${fo} key=${e.id} text=${e.text||`Warning`} />`;if(e.type===`run_boundary`){if(!e.status||e.status===`completed`)return null;let t=e.status===`failed`?`run failed`:e.status===`cancelled`?`run cancelled`:`run ${e.status}`;return d`<${fo} key=${e.id} text=${t} />`}if(e.type===`subagent_completed`){let t=`Subagent '${e.name||`subagent`}' ${e.status===`fail`?`failed`:`completed`}`;return d`<${fo} key=${e.id} text=${t} />`}if(e.type===`job_completed`)return d`<${fo} key=${e.id} text=${`Job '${e.jobName||`job`}' ${e.status||`completed`}`} />`;if(e.type===`context_debug`)return d`<${Jr} key=${e.id} ...${e} />`;if(e.type===`dm_reasoning`)return d`<${mo} key=${e.id} ...${e} />`;if(e.type===`tool`){if(e.tool===`send_message`&&e.status===`done`&&!e.error)return null;co.has(e.id)||(co.add(e.id),console.warn(`[DmConversationView] ungrouped DM tool rendered as a standalone sibling row — this fallback is meant to be dead post-#1076/#1154. Tool:`,e.tool,`id:`,e.id,`runId:`,e.runId));let n=lo({type:`agent`,role:`assistant`},t,a),r=n===`left`?t[0]:t[1];return d`
+            ${n.map(e=>{if(e.type===`dm_ended`){let t=`Conversation ended -- ${e.reason||`ended`}`;return d`<${ho} key=${e.id} text=${t} />`}if(e.type===`system`)return d`<${ho} key=${e.id} text=${e.text} />`;if(e.type===`notification`){let t=e.metadata||{};if(t.type===`dm_ended_notification`){let n=`DM with ${t.peer||`unknown`} ended -- ${_e[t.reason]||t.reason||`ended`}`;return d`<${ho} key=${e.id} text=${n} />`}return d`<${ho} key=${e.id} text=${e.text} />`}if(e.type===`error`)return d`<div key=${e.id} class="dm-msg dm-msg-center"><div class="dm-msg-error">${e.text}</div></div>`;if(e.type===`tokens`)return null;if(e.type===`thinking`){let t=`Thinking…`;if(e.pending)t=`Sending…`;else if(e.queuedBehind>0)t=`Queued \u2014 position ${e.queuedBehind}\u2026`;else if(e.source){let n=e.source.startsWith(`peer:`)?e.source.slice(5):e.source;n&&(t=`${n} is thinking\u2026`)}return d`<div key=${e.id} class="dm-msg dm-msg-center"><div class="dm-msg-thinking">${t}</div></div>`}if(e.type===`warning`)return d`<${ho} key=${e.id} text=${e.text||`Warning`} />`;if(e.type===`run_boundary`){if(!e.status||e.status===`completed`)return null;let t=e.status===`failed`?`run failed`:e.status===`cancelled`?`run cancelled`:`run ${e.status}`;return d`<${ho} key=${e.id} text=${t} />`}if(e.type===`subagent_completed`){let t=`Subagent '${e.name||`subagent`}' ${e.status===`fail`?`failed`:`completed`}`;return d`<${ho} key=${e.id} text=${t} />`}if(e.type===`job_completed`)return d`<${ho} key=${e.id} text=${`Job '${e.jobName||`job`}' ${e.status||`completed`}`} />`;if(e.type===`context_debug`)return d`<${Jr} key=${e.id} ...${e} />`;if(e.type===`dm_reasoning`)return d`<${_o} key=${e.id} ...${e} />`;if(e.type===`tool`){if(e.tool===`send_message`&&e.status===`done`&&!e.error)return null;fo.has(e.id)||(fo.add(e.id),console.warn(`[DmConversationView] ungrouped DM tool rendered as a standalone sibling row — this fallback is meant to be dead post-#1076/#1154. Tool:`,e.tool,`id:`,e.id,`runId:`,e.runId));let n=po({type:`agent`,role:`assistant`},t,a),r=n===`left`?t[0]:t[1];return d`
                         <div key=${e.id} class="dm-msg dm-msg-${n} dm-msg-tool-row">
                             <div class="dm-msg-name">${r||`?`}</div>
                             <${Hr} ...${e} />
                         </div>
-                    `}if(e.type===`image`){let n=lo(e,t,a),r=e.fromAgent||(n===`left`?t[0]:t[1])||`?`;return d`
+                    `}if(e.type===`image`){let n=po(e,t,a),r=e.fromAgent||(n===`left`?t[0]:t[1])||`?`;return d`
                         <div key=${e.id} class="dm-msg dm-msg-${n}">
                             <div class="dm-msg-name-row dm-msg-name-row-${n}">
                                 <div class="dm-msg-name">${r}</div>
@@ -2264,7 +2266,7 @@ Context: `+t.context_id+g}
                                 ${e.url?d`<img src=${e.url} alt=${e.alt||``} class="dm-msg-image" />`:`[Image${e.alt?`: `+e.alt:``}]`}
                             </div>
                         </div>
-                    `}return e.type===`user`||e.type===`agent`?d`<${uo} key=${e.id} msg=${e} participants=${t} perspectiveAgent=${a} />`:null})}
+                    `}return e.type===`user`||e.type===`agent`?d`<${mo} key=${e.id} msg=${e} participants=${t} perspectiveAgent=${a} />`:null})}
         </div>
         <div class="dm-view-footer">
             ${u?d`
@@ -2272,7 +2274,7 @@ Context: `+t.context_id+g}
                             disabled=${f}
                             title="Stop this DM conversation"
                             aria-label="Stop conversation"
-                            onClick=${ho}>
+                            onClick=${vo}>
                         <span class="dm-cancel-btn-icon" aria-hidden="true">\u25A0</span>
                         ${f?`Stopping…`:`Stop conversation`}
                     </button>
@@ -2280,7 +2282,7 @@ Context: `+t.context_id+g}
                     <span class="dm-view-footer-text">This is a read-only view of an agent-to-agent conversation.</span>
                 `}
         </div>
-    `}function _o(){return ke.value?d`
+    `}function bo(){return ke.value?d`
         <button
             type="button"
             class="stream-dead-banner"
@@ -2294,16 +2296,16 @@ Context: `+t.context_id+g}
                 Live updates disconnected — click to reconnect or reload.
             </span>
         </button>
-    `:null}r(()=>{let e=B.value;document.title=e?`ALMS - ${e.name}`:`ALMS`});var vo=o(`connecting...`);function yo(e){let t=[],n=0;for(;n<e.length;)if(e[n].type===`tool`){let r=[];for(;n<e.length&&e[n].type===`tool`;)r.push(e[n]),n++;r.length>1?t.push({_isToolGroup:!0,key:`tg-`+r[0].id,tools:r}):t.push(r[0])}else t.push(e[n]),n++;return t}function bo(){let e=c(null);i(()=>{let t=0,n=r(()=>{O.value,cancelAnimationFrame(t),t=requestAnimationFrame(()=>{Pn(e.current)})});return()=>{cancelAnimationFrame(t),n()}},[]);let t=yo(O.value),n=P.value,a=v.value,o=p.value,s=D.value,l=b.value,u=o?s?.agent_name?s.agent_name+` notifications`:`Notification session`:s?.session_type===`job`?l?l+` job session`:`Job session`:s?.session_type===`subagent`?`Subagent session`:`Internal session`,f=o?`⚡`:s?.session_type===`job`?`⏰`:`⚙`,m=s?.session_type?`internal-session-`+s.session_type:``;return d`
+    `:null}r(()=>{let e=B.value;document.title=e?`ALMS - ${e.name}`:`ALMS`});var xo=o(`connecting...`);function So(e){let t=[],n=0;for(;n<e.length;)if(e[n].type===`tool`){let r=[];for(;n<e.length&&e[n].type===`tool`;)r.push(e[n]),n++;r.length>1?t.push({_isToolGroup:!0,key:`tg-`+r[0].id,tools:r}):t.push(r[0])}else t.push(e[n]),n++;return t}function Co(){let e=c(null);i(()=>{let t=0,n=r(()=>{ae.value,cancelAnimationFrame(t),t=requestAnimationFrame(()=>{Pn(e.current)})});return()=>{cancelAnimationFrame(t),n()}},[]);let t=So(ae.value),n=P.value,a=v.value,o=p.value,s=D.value,l=b.value,u=o?s?.agent_name?s.agent_name+` notifications`:`Notification session`:s?.session_type===`job`?l?l+` job session`:`Job session`:s?.session_type===`subagent`?`Subagent session`:`Internal session`,f=o?`⚡`:s?.session_type===`job`?`⏰`:`⚙`,m=s?.session_type?`internal-session-`+s.session_type:``;return d`
         <div id="chat">
-            <${oo} />
+            <${lo} />
             ${(Ve.value||We.value)&&d`
                 <div id="messages" role="log" aria-live="polite">
                     ${Ve.value?d`<div class="loading-state">Loading agent...</div>`:d`<div class="loading-state">Loading session...</div>`}
                 </div>
             `}
             ${!Ve.value&&!We.value&&n&&d`
-                <${go} />
+                <${yo} />
             `}
             ${!Ve.value&&!We.value&&!n&&d`
             ${a&&d`
@@ -2340,7 +2342,7 @@ Context: `+t.context_id+g}
                 </div>
             `}
             <div id="messages" role="log" aria-live="polite" ref=${e}>
-                ${O.value.length===0&&d`
+                ${ae.value.length===0&&d`
                     <div class="empty-state">
                         ${a?`No activity recorded in this session yet.`:`No messages yet. Send a message to start.`}
                     </div>
@@ -2371,7 +2373,7 @@ Context: `+t.context_id+g}
                         `}return null})}
             </div>
             <${fi} />
-            <${ao} />
+            <${co} />
             ${a?d`
                     <div class="internal-session-footer">
                         <span class="internal-session-footer-text">This is a read-only view of internal agent activity.</span>
@@ -2379,14 +2381,14 @@ Context: `+t.context_id+g}
                 `:d`<${vi} />`}
             `}
         </div>
-    `}function xo(){let e=a(!1);return d`
-        <${qt} status=${vo} onOpenSettings=${()=>{e.value=!0}} />
-        <${_o} />
+    `}function wo(){let e=a(!1);return d`
+        <${qt} status=${xo} onOpenSettings=${()=>{e.value=!0}} />
+        <${bo} />
         ${H.value.length>0?d`
                 <div id="main">
                     <${An} />
-                    <${bo} />
-                    <${Ja} />
-                </div>`:d`<${ro} />`}
-        <${no} open=${e.value} onClose=${()=>{e.value=!1}} />
-    `}n(d`<${xo} />`,document.getElementById(`app`));function So(){He.value=!1,vo.value=`connecting...`,Ct().then(()=>{vo.value=`connected`}).catch(()=>{vo.value=`offline`,He.value=!0})}Ge(So),we(),So();export{wt as a,Ct as i,mi as n,bt as o,pi as r,Et as s,vo as status,vi as t};
+                    <${Co} />
+                    <${Za} />
+                </div>`:d`<${oo} />`}
+        <${ao} open=${e.value} onClose=${()=>{e.value=!1}} />
+    `}n(d`<${wo} />`,document.getElementById(`app`));function To(){He.value=!1,xo.value=`connecting...`,Ct().then(()=>{xo.value=`connected`}).catch(()=>{xo.value=`offline`,He.value=!0})}Ge(To),we(),To();export{wt as a,Ct as i,mi as n,bt as o,pi as r,Et as s,xo as status,vi as t};

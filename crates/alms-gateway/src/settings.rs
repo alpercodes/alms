@@ -624,102 +624,34 @@ pub async fn patch_settings(
             }
         }
 
-        // #866 / #871: `summary_model` and `summary_provider` are validated
-        // together because their post-PATCH combined state matters: when a
-        // dedicated summary provider is configured, the agent's resolved
-        // model name belongs to a different provider and must NOT be used
-        // as a fallback for the summary task's wire model. The runtime has
-        // a defense-in-depth leak guard in `runs/lifecycle.rs` that clears
-        // the inherited model in this shape, but we reject the combination
-        // up front so misconfigurations surface at PATCH time exactly like
-        // `SUMMARY_PROVIDER_UNKNOWN` / `SUMMARY_PROVIDER_MISSING_API_KEY`
-        // do (Option 1 philosophy from #866).
-        //
-        // Compute the would-be post-PATCH values without committing them,
-        // validate the combined invariant, then commit.
-        //
-        // The clear sentinel is trim-aware (PR #1194, Tim's nit on #1191):
-        // a whitespace-only value clears exactly like `""`, matching the
-        // TOML path (`ContextConfig`'s deserializer filters on
-        // `trim().is_empty()`). Pre-fix, `"  "` slipped past the empty
-        // check and was treated as a provider name / model slug.
-        let next_summary_model: Option<String> = match ctx_patch.summary_model.as_ref() {
-            Some(v) if v.trim().is_empty() => None,
-            Some(v) => Some(v.clone()),
-            None => ctx.summary_model.clone(),
-        };
-        // Validate `summary_provider` if the patch touches it. `Ok(Some(p))`
-        // = set to provider name `p`; `Ok(None)` = clear; per-field error
-        // pushed onto `errors` and the live value preserved for the cross-
-        // field check.
-        let next_summary_provider_resolved: Option<String> =
-            match ctx_patch.summary_provider.as_ref() {
-                None => ctx.summary_provider.clone(),
-                Some(v) if v.trim().is_empty() => None,
-                Some(v) => {
-                    let entry = state.llm_config.providers.get(v);
-                    let entry_has_key = entry.is_some_and(|e| e.resolve_api_key().is_some());
-                    let secrets_has_key = state.secrets.read().resolve_key(v).is_some();
-                    if entry.is_none() {
-                        errors.push(format!(
-                            "SUMMARY_PROVIDER_UNKNOWN: context.summary_provider '{v}' \
-                         is not configured under [llm.providers.<name>] in alms.toml"
-                        ));
-                        ctx.summary_provider.clone()
-                    } else if !entry_has_key && !secrets_has_key {
-                        errors.push(format!(
-                            "SUMMARY_PROVIDER_MISSING_API_KEY: context.summary_provider '{v}' \
-                         has no resolvable API key — set one with `alms auth set {v}` or \
-                         configure `[llm.providers.{v}].api_key_env` / `api_key`"
-                        ));
-                        ctx.summary_provider.clone()
-                    } else {
-                        Some(v.clone())
-                    }
-                }
+        if ctx_patch.summary_model.is_some() || ctx_patch.summary_provider.is_some() {
+            // Summary provider/model is one policy-owned pair. Compute the
+            // complete post-PATCH pair, validate once, and only then commit.
+            // commit either field so partial configuration cannot leak through.
+            let next_summary_model = match ctx_patch.summary_model.as_ref() {
+                Some(value) => Some(value.as_str()),
+                None => ctx.summary_model.as_deref(),
+            };
+            let next_summary_provider = match ctx_patch.summary_provider.as_ref() {
+                Some(value) => Some(value.as_str()),
+                None => ctx.summary_provider.as_deref(),
             };
 
-        // #871 / #872 cross-field invariant: the summary provider/model
-        // pair must be symmetric — both set or both unset. The pre-#872
-        // shape only validated provider-set + model-missing, but the
-        // model-set + provider-missing direction is just as broken: the
-        // resolver used to silently pair the user's `summary_model` with
-        // the agent's primary provider (the exact misconfiguration that
-        // produced the `model: not found` 404 in #866), and the v0.2.2
-        // default config shipped in that asymmetric shape. Reject both
-        // directions at PATCH time, regardless of which field the patch
-        // touched.
-        let provider_set = next_summary_provider_resolved.is_some();
-        let model_set = next_summary_model.is_some();
-        if provider_set && !model_set {
-            errors.push(
-                "SUMMARY_PROVIDER_REQUIRES_MODEL: context.summary_provider is set but \
-                 context.summary_model is empty. The agent's resolved model belongs to \
-                 the AGENT's provider namespace and is not a safe fallback for the \
-                 summary provider's wire — set summary_model to a slug valid for the \
-                 summary provider, or clear summary_provider (use empty string) to \
-                 inherit the agent's provider/model."
-                    .to_string(),
-            );
-        } else if !provider_set && model_set {
-            errors.push(
-                "SUMMARY_MODEL_REQUIRES_PROVIDER: context.summary_model is set but \
-                 context.summary_provider is empty. The user-supplied summary_model \
-                 belongs to a specific provider's namespace; pairing it with the \
-                 agent's primary provider would 404 on the wire. Set \
-                 summary_provider to the matching provider name, or clear summary_model \
-                 (use empty string) to inherit the agent's provider/model."
-                    .to_string(),
-            );
-        } else {
-            // Cross-field invariant holds — commit the would-be values for
-            // any field the patch touched. Per-field validation errors above
-            // already preserved the live value, so this is a no-op for those.
-            if ctx_patch.summary_model.is_some() {
-                ctx.summary_model = next_summary_model;
-            }
-            if ctx_patch.summary_provider.is_some() {
-                ctx.summary_provider = next_summary_provider_resolved;
+            match crate::configuration::validate_summary_pair(
+                next_summary_provider,
+                next_summary_model,
+                &state.llm_config.providers,
+                &state.secrets.read(),
+            ) {
+                Ok(pair) => {
+                    if ctx_patch.summary_model.is_some() {
+                        ctx.summary_model = pair.model;
+                    }
+                    if ctx_patch.summary_provider.is_some() {
+                        ctx.summary_provider = pair.provider;
+                    }
+                }
+                Err(error) => errors.push(error.to_string()),
             }
         }
 

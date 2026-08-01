@@ -96,6 +96,9 @@
 .job-meta { font-size: var(--text-2xs); color: var(--text-muted); }
 .job-status-active    { color: var(--success); }
 .job-status-cancelled { color: var(--text-disabled); text-decoration: line-through; }
+.job-status-completed { color: var(--success); }
+.job-status-failed    { color: var(--error); }
+.job-last-error       { color: var(--error); }
 .job-status-pending   { color: var(--warning); }
 .jobs-empty { padding: var(--space-4); font-size: var(--text-sm); color: var(--text-disabled); font-style: italic; text-align: center; }
 .jobs-error { font-size: var(--text-xs); color: var(--error); }
