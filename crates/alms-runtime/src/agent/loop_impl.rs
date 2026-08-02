@@ -1700,13 +1700,12 @@ impl AgentRuntime {
     /// `truncated_in_loop: true` flag in the message metadata tells
     /// `session_msg_to_llm` to skip its own (smaller) re-truncation pass.
     ///
-    /// Visible to test code (in this crate and `alms-coordinator`) so
-    /// integration tests can drive the truncation path without spinning
-    /// up a full LLM round trip. Not part of the public API surface —
-    /// `#[doc(hidden)]` keeps it out of generated docs.
+    /// Crate-visible so runtime unit tests can drive the truncation path
+    /// without spinning up a full LLM round trip. It is not part of the
+    /// public API surface.
     #[doc(hidden)]
     #[allow(clippy::too_many_arguments)] // Private helper; the parameters are clear and grouping them into a struct would add indirection without real benefit.
-    pub fn process_tool_results(
+    pub(crate) fn process_tool_results(
         &self,
         tool_calls: &[ToolCall],
         results: Vec<AlmsResult<serde_json::Value>>,
@@ -1967,10 +1966,10 @@ impl AgentRuntime {
     ///   for oversized results becomes a JSON string instead of a structured
     ///   object — consumers that want the full bytes use the spill file.
     ///
-    /// Visible across crates (`alms-coordinator` integration tests) but
-    /// `#[doc(hidden)]` so it stays off the public API surface.
+    /// Crate-visible so runtime unit tests can exercise the emission path
+    /// without exposing this helper as public API.
     #[doc(hidden)]
-    pub fn truncate_for_emit(
+    pub(crate) fn truncate_for_emit(
         &self,
         tool_call_id: &str,
         value: &serde_json::Value,

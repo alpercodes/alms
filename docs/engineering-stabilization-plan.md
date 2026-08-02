@@ -1,6 +1,6 @@
 # ALMS Engineering Stabilization Plan
 
-Status: approved for implementation
+Status: Phases 1–7 merged; Phase 8 implementation complete in PR #1231.
 
 Baseline checkpoint: v0.2.4-pre-stabilization
 
@@ -329,3 +329,16 @@ This program does not:
 - Phase 5 is implemented on codex/phase5-typed-frontend with a reproducible
   Vite build, strict TypeScript/Zod compatibility boundary, committed
   Rust-embedded assets, and Vitest/Playwright gates.
+- Phase 5 merged as PR #1227.
+- Phase 6A merged as PR #1228 with normalized agent, session, run, and
+  activity ownership plus authoritative reconnect reconciliation.
+- Phase 6B merged as PR #1229 with normalized message/job ownership,
+  deterministic optimistic settlement, and browser convergence coverage.
+- Phase 7 merged as PR #1230 with authoritative job terminal semantics,
+  transactional run admission, restart-safe scheduler/retry projections,
+  shared configuration policy, and operational metrics.
+- Phase 8 implementation is complete in PR #1231. Its bounded scope is
+  gateway run configuration/read-API extraction, `AgentRuntime` environment
+  extraction, coordinator/API visibility cleanup, documentation archival, and
+  one separately tested notification-input persistence fix. See
+  [`phase8-decomposition-plan.md`](phase8-decomposition-plan.md).

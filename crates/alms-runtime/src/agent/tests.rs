@@ -4707,6 +4707,112 @@ mod tool_output_truncate_integration {
         }
     }
 
+    /// Regression for the subagent-shaped builder path (#921): constructing
+    /// the runtime through `AgentRuntime::new(...).with_tool_output_truncate(...)`
+    /// must activate the policy, place spill files under the supplied
+    /// `tool-output/sub-{task_id}/` directory, bound both the in-loop and
+    /// audit/SSE previews, and persist the truncation metadata used when the
+    /// session is reconstructed on a later run.
+    #[tokio::test]
+    async fn builder_shaped_subagent_runtime_truncates_oversized_tool_output() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let task_id = uuid::Uuid::new_v4();
+        let sub_run_dir = data_dir
+            .path()
+            .join(crate::tool_output_truncate::TOOL_OUTPUT_DIR_NAME)
+            .join(format!("sub-{task_id}"));
+
+        let config = AgentConfig {
+            tool_output_truncate: alms_core::config::ToolOutputTruncateConfig {
+                enabled: true,
+                max_bytes: 4 * 1024,
+                max_lines: 100,
+                retention_days: 7,
+            },
+            ..AgentConfig::default()
+        };
+        let llm_config = LlmConfig {
+            mock: true,
+            ..LlmConfig::default()
+        };
+        let runtime =
+            AgentRuntime::new(AgentId::new(), config, LlmClient::new(llm_config).unwrap())
+                .unwrap()
+                .with_tool_output_truncate(sub_run_dir.clone(), true, 4 * 1024, 100);
+
+        let session_manager = SessionManager::new(SessionConfig::default());
+        let session = session_manager.get_or_create(AgentId::new(), "subagent-test");
+        let tool_call = ToolCall::new("call_subagent_huge", "fake_tool", "{}");
+        let result_value = serde_json::Value::String("x".repeat(100 * 1024));
+        let mut messages = Vec::new();
+        let mut records = Vec::new();
+        let mut seq = 0;
+        let invocation_ids = vec![uuid::Uuid::new_v4()];
+
+        runtime.process_tool_results(
+            std::slice::from_ref(&tool_call),
+            vec![Ok(result_value.clone())],
+            &invocation_ids,
+            &mut messages,
+            &mut records,
+            &mut seq,
+            &session_manager,
+            session.id,
+            false,
+        );
+
+        let spill_path = sub_run_dir.join("tool_call_subagent_huge.txt");
+        assert!(
+            spill_path.exists(),
+            "subagent spill must land under tool-output/sub-{}/: {}",
+            task_id,
+            spill_path.display()
+        );
+        assert_eq!(
+            std::fs::read_to_string(&spill_path).unwrap(),
+            result_value.to_string(),
+            "spill bytes must match the original JSON-stringified result"
+        );
+
+        assert_eq!(messages.len(), 1);
+        let preview = messages[0].content_str();
+        assert!(
+            preview.len() < 8 * 1024,
+            "subagent in-loop preview must be capped: {} bytes",
+            preview.len()
+        );
+
+        let emit_value = runtime.truncate_for_emit(&tool_call.id, &result_value);
+        let emit_preview = emit_value
+            .as_str()
+            .expect("truncated emit value must be a JSON string");
+        assert!(
+            emit_preview.len() < 8 * 1024,
+            "subagent audit/SSE preview must be capped: {} bytes",
+            emit_preview.len()
+        );
+
+        let history = session_manager.get_history(session.id).unwrap();
+        let tool_msg = history
+            .iter()
+            .find(|message| matches!(message.role, alms_session::Role::Tool))
+            .expect("subagent tool result must be persisted");
+        let metadata = tool_msg.metadata.as_ref().expect("metadata must be set");
+        assert_eq!(
+            metadata
+                .get("truncated_in_loop")
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        assert!(
+            metadata
+                .get("spill_path")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|path| path.contains("sub-")),
+            "persisted spill_path must reference the subagent dir: {metadata:?}"
+        );
+    }
+
     /// Drive `process_tool_results` with a single oversized tool result
     /// and assert: the in-loop messages carry the truncated preview, the
     /// session DB row has `truncated_in_loop: true` metadata, and the

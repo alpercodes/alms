@@ -749,7 +749,7 @@ pub async fn patch_settings(
     //
     // All six knobs live on the server-level `AgentConfig` which is the
     // single source of truth for new runs (see
-    // `runs/mod.rs::resolve_agent_config` and
+    // `configuration::resolve_agent_config` and
     // `runs/lifecycle.rs::execute_run`). Mutating it under the same
     // write lock as the other PATCH branches ensures the next `POST /runs`
     // picks up the new value without a daemon restart.
@@ -906,9 +906,10 @@ pub async fn patch_settings(
         let candidate_model: Option<&str> = body_model
             .or(entry_model.as_deref())
             .or(Some(current_default_model.as_str()));
-        let new_kind = crate::runs::provider_kind_for_name(&provider, &state.llm_config.providers);
+        let new_kind =
+            crate::configuration::provider_kind_for_name(&provider, &state.llm_config.providers);
         let model_ok = match candidate_model {
-            Some(m) => crate::runs::model_belongs_to_kind(m, new_kind),
+            Some(m) => crate::configuration::model_belongs_to_kind(m, new_kind),
             // No candidate model at all (entry has no model, live default
             // is empty). Reject — the post-patch state is unrunnable.
             None => false,
@@ -1234,9 +1235,9 @@ fn validate_patch_budget(
     //
     // Iterate over every registered agent and re-run the validator
     // against the same effective `(provider, model)` that the runtime's
-    // `runs::resolve_agent_config` would resolve to. The shared helper
-    // `runs::resolve_effective_provider_and_model` is the single source
-    // of truth for the resolution rules:
+    // `configuration::resolve_agent_config` would resolve to. The shared
+    // `configuration::resolve_effective_provider_and_model` helper is the
+    // single source of truth for the resolution rules:
     //
     // 1. `record.provider` ?? server-default provider.
     // 2. Cross-namespace drop (#942): when the per-agent provider override
@@ -1305,7 +1306,7 @@ fn validate_patch_budget(
     let mut last_message: Option<String> = None;
     for record in agents {
         let (effective_provider, effective_model) =
-            match crate::runs::resolve_effective_provider_and_model(
+            match crate::configuration::resolve_effective_provider_and_model(
                 record.provider.as_deref(),
                 record.model.as_deref(),
                 server_provider,
@@ -1313,7 +1314,7 @@ fn validate_patch_budget(
                 &state.llm_config.providers,
             ) {
                 Ok(pair) => pair,
-                Err(crate::runs::ResolveEffectiveModelError::MissingModelAfterProviderSwitch {
+                Err(crate::configuration::ResolveEffectiveModelError::MissingModelAfterProviderSwitch {
                     new_provider,
                     prev_provider,
                 }) => {

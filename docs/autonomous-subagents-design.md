@@ -1,5 +1,15 @@
 # Autonomous Subagents — Design Document
 
+> **Current status (2026-08-01): historical roadmap, not an implementation
+> specification.** Named-agent workspaces, multi-turn subagent loops,
+> persistent sessions, foreground/background dispatch, per-session SSE, coarse
+> activity snapshots, and automatic background-completion notification runs are
+> implemented. The `get_task_result` polling tool described below no longer
+> exists. The remaining product work is recursive subagent spawning, a richer
+> first-class progress protocol, and bounded/truncated `invoke_agent` results.
+> Historical designs and task numbers below are preserved to explain earlier
+> decisions; use `CLAUDE.md` and `architecture.md` for current behavior.
+
 ## Problem Statement
 
 Today, subagents in ALMS are **request-response workers**. A parent agent calls `invoke_agent(task)`, the subagent runs its `agent_loop` (multi-iteration tool use), and returns a single text response. This works for simple delegation but falls short of the model we actually want:
@@ -14,8 +24,8 @@ This is exactly how Claude Code's subagents work: launch a reviewer agent, it re
 |---|---|---|
 | Multi-iteration tool use | **Done** | `agent_loop` loops until the LLM stops requesting tools (bounded by token budget, provider `max_tokens`, posture approvals, and run cancellation) — subagent already uses tools autonomously |
 | Persistent session across invocations | **Done** | `name` param on `invoke_agent` → UUID v5 deterministic identity → same session reused |
-| Background execution | **Done** | `background=true` → `dispatch_background()` → poll via `get_task_result` |
-| SSE event forwarding | **Done** | Subagent tool events forwarded into parent run's event stream |
+| Background execution | **Done** | `background=true` → `dispatch_background()` → automatic completion notification run |
+| SSE event routing | **Done** | Parent receives lifecycle + coarse `subagent_activity`; full tool/token events stay on the child session stream |
 | Foreground blocking | **Done** | Parent's `dispatch()` awaits the oneshot channel until subagent completes |
 
 The `agent_loop` is already multi-turn. A subagent getting the task "Review this code for security issues" will:
@@ -269,7 +279,12 @@ let session = session_manager.get_or_create(stable_id, &stable_ctx);
 let messages = session_manager.get_history(session.id)?;
 ```
 
-> **Note:** `parent_session_id` here is the **spawning chat session**, not the parent agent's identity. The named subagent's persistent session is therefore keyed per-conversation, not per-agent — opening a new chat with the same parent agent yields a different `session_id` and will not resolve a subagent session spawned in a previous chat. This is the current intended model; whether to add an agent-scoped fallback is tracked as a v0.2.4 design question.
+> **Current identity scope:** `parent_agent_id` is the persistent identity used
+> to derive a named subagent session. The spawning chat session is tracked
+> separately as `parent_session`, but it is not part of that derivation.
+> Opening another chat for the same parent agent therefore resolves the same
+> `(parent_agent_id, name)` subagent session. Rows created by the older
+> `(parent_session, name)` scheme are covered by the orphan policy below.
 
 This is cheap — no LLM call, just a session read. The parent's LLM decides when it needs context from a subagent and pulls it in.
 
@@ -410,5 +425,5 @@ ALMS's model is actually more capable than Claude Code's in two respects:
 ---
 
 *Design Date: 2026-03-12*
-*Status: In progress — Phase 1: #70 and #81 done, #84/#82/#83/#75 remaining*
+*Historical status at authorship: Phase 1 in progress. See the current-status banner above.*
 *Author: Atlas + Alper*

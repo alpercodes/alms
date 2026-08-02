@@ -1,8 +1,8 @@
-# Frontend build and migration
+# Frontend architecture and migration
 
-The browser UI is built with Vite and embedded into the Rust gateway. Phase 5
-adds the typed build boundary without changing the existing visual design or
-rewriting the legacy Preact modules.
+The browser UI is built with Preact, Vite, and strict TypeScript and embedded
+into the Rust gateway. A validated compatibility boundary allows the remaining
+JavaScript screens to migrate without changing the existing visual design.
 
 ## Layout
 
@@ -17,7 +17,7 @@ The source `index.html` loads `typed-entry.ts` before the existing
 `app.js`. The entry installs `globalThis.__almsContracts`, which lets
 existing JavaScript opt into strict Zod validation without a flag-day rewrite.
 The central API client and both SSE hooks decode raw JSON inside that guarded
-boundary, then validate every payload before existing handlers mutate state.
+boundary, then validate every payload before store actions mutate state.
 All currently consumed REST surfaces and SSE event types have explicit schemas;
 unknown routes and event types are rejected rather than bypassing the boundary.
 
@@ -31,12 +31,10 @@ REST reconciliation before the stream resumes beyond the rejected frame.
 - npm is pinned by `packageManager` and the CI install step.
 - Exact dependency versions live in `package-lock.json`.
 
-Phase 5 intentionally upgrades `marked` from 15 to 18 and `@preact/signals`
-from 1 to 2; Preact and DOMPurify remain within their existing majors. ALMS is
-not deployed and does not require compatibility with an older frontend build,
-so the current exact versions are the supported baseline. Markdown sanitizing,
-signal-driven activity, and DM collapsible behavior have focused regression
-coverage.
+ALMS is not deployed and does not require compatibility with an older frontend
+build, so the exact versions in `package-lock.json` are the supported baseline.
+Markdown sanitizing, signal-driven activity, normalized entity updates, and DM
+collapsible behavior have focused regression coverage.
 
 ## Commands
 
@@ -57,9 +55,12 @@ untracked chunks. `make ci` installs the pinned frontend dependencies and runs
 the non-browser frontend gates; Playwright is available as
 `make frontend-test-e2e` and runs in the dedicated GitHub frontend job.
 
-## Migration rule
+## State ownership and migration rule
 
 New frontend code is strict TypeScript. Existing JavaScript migrates
-screen-by-screen behind the mandatory runtime bridge. Phase 6 will move entity
-ownership into normalized typed reducers; Phase 5 deliberately preserves the
-current screen structure and behavior, not obsolete wire compatibility.
+screen-by-screen behind the mandatory runtime bridge. The typed core store owns
+the authoritative normalized representations of agents, sessions, runs,
+activity, messages, and jobs. Legacy screens may consume compatibility signals,
+but server-entity writes go through named store actions. Snapshot-plus-buffer
+reconciliation, lifecycle revisions, event cursors, and mutation generations
+prevent stale network responses from regressing newer state.

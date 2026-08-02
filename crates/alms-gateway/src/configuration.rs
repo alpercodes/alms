@@ -1,13 +1,20 @@
 //! Shared configuration policies used by every mutation surface.
 
+mod resolution;
+
 use alms_core::config::ProviderEntry;
 use alms_core::secrets::SecretsStore;
+pub(crate) use resolution::{
+    ResolveAgentConfigError, ResolveEffectiveModelError, build_resolved_config,
+    model_belongs_to_kind, provider_kind_for_name, resolve_agent_config,
+    resolve_effective_provider_and_model,
+};
 use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ConfigPolicyError {
-    pub code: &'static str,
-    pub message: String,
+pub(crate) struct ConfigPolicyError {
+    pub(crate) code: &'static str,
+    pub(crate) message: String,
 }
 
 impl std::fmt::Display for ConfigPolicyError {
@@ -17,9 +24,9 @@ impl std::fmt::Display for ConfigPolicyError {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ValidatedSummaryPair {
-    pub provider: Option<String>,
-    pub model: Option<String>,
+pub(crate) struct ValidatedSummaryPair {
+    pub(crate) provider: Option<String>,
+    pub(crate) model: Option<String>,
 }
 
 fn normalized(value: Option<&str>) -> Option<String> {
@@ -33,7 +40,7 @@ fn normalized(value: Option<&str>) -> Option<String> {
 ///
 /// The two values are one policy unit: both inherit from the primary LLM
 /// configuration, or both explicitly select the summary wire namespace.
-pub fn validate_summary_pair(
+pub(crate) fn validate_summary_pair(
     provider: Option<&str>,
     model: Option<&str>,
     providers: &BTreeMap<String, ProviderEntry>,

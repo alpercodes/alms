@@ -742,7 +742,7 @@ impl Gateway {
                     // sections and is documented in `docs/api.md` § 10.2.
                     let resolved = {
                         let secrets_guard = self.secrets.read();
-                        match crate::runs::resolve_agent_config(
+                        match crate::configuration::resolve_agent_config(
                             agent_id,
                             &self.session_manager,
                             &self.config.agent_config,

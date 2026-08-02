@@ -225,7 +225,6 @@ impl AppState {
             });
         let session_manager = gateway.session_manager().clone();
         let mut llm = gateway.llm().clone();
-        let agent_id = gateway.agent_id();
         let default_agent_id = gateway.agent_id_handle();
         let mut llm_config = gateway.llm_config().clone();
         let mut agent_config_val = gateway.agent_config().clone();
@@ -416,7 +415,6 @@ impl AppState {
         let run_admission_gates = Arc::new(dashmap::DashMap::new());
 
         let mut coord = Coordinator::with_agent_config(
-            agent_id,
             session_manager.clone(),
             llm.clone(),
             Arc::clone(&agent_config),

@@ -1,6 +1,6 @@
 # Phase 7 — Durable operations and observability
 
-Status: implementation and validation complete on `codex/phase7-durable-operations`.
+Status: completed by PR #1230; archived after merge.
 
 ## Objective
 

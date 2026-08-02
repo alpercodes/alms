@@ -1,4 +1,4 @@
-# ALMS Testing Strategy (MVP → scale-up)
+# ALMS Testing Strategy
 
 This document defines how ALMS should be tested so we can confidently ship an agent loop system that is correct under concurrency, safe around tools, and stable over time.
 
@@ -36,8 +36,9 @@ Targets:
 - scheduler running a job and recording job_run + audit events
 - tool execution path using a “fake tool” that returns deterministic output
 
-### 1.3 End-to-end tests (real daemon, real API)
-Focus: the system works as users experience it.
+### 1.3 Browser and end-to-end tests
+Focus: user-visible state convergence and, where a real daemon is involved,
+the complete HTTP/SSE path.
 
 Targets:
 - start daemon
@@ -47,7 +48,12 @@ Targets:
 - run a cronjob
 - validate audit log entries
 
-Keep E2E minimal; they’re slower and flakier.
+The current Playwright suite is a deterministic browser suite backed by route
+fixtures. It covers dashboard boot, agent-switch isolation, replay-gap
+convergence, and delayed optimistic-send failure. It does not start the Rust
+daemon. Gateway integration and SSE golden tests cover the backend in process;
+a small real-daemon HTTP/SSE suite remains a useful future addition and must
+not be implied by the current Playwright label.
 
 ---
 
@@ -152,25 +158,36 @@ Golden tests:
 
 ---
 
-## 8) CI pipeline (minimal)
+## 8) CI pipeline
 
-MVP CI stages:
-1) format (`cargo fmt --check`)
-2) lint (`cargo clippy`)
-3) unit + component tests (`cargo test`)
-4) optional minimal E2E smoke (start daemon, hit /health)
+GitHub CI runs three parallel jobs:
 
----
+1. **Frontend:** install the pinned Node/npm toolchain with `npm ci`, run the
+   high-severity dependency audit, typecheck, lint, format-check, run Vitest,
+   reproduce the committed Vite bundle, and run the Chromium Playwright suite.
+2. **Rust:** `cargo fmt --all -- --check`, Clippy for all targets/features with
+   warnings denied, `cargo test --all`, and `cargo build --release`.
+3. **Security audit:** check `Cargo.lock` against the RustSec advisory database.
 
-## 9) MVP acceptance criteria (test-driven)
-
-The MVP is “real” when these pass in CI:
-- one agent type runs end-to-end via HTTP
-- at least one tool call works end-to-end
-- sessions persist to SQLite
-- one cronjob can be scheduled and executed
-- audit log contains entries for tool + job runs
+`make ci` reproduces the frontend type/lint/format/unit/build checks plus the
+Rust job. The dependency audit and Playwright suite remain explicit GitHub
+frontend-job gates; Playwright is available locally through
+`make frontend-test-e2e`.
 
 ---
 
-*Authored by Mesut (2026-02-10).*
+## 9) Change acceptance criteria
+
+Every behavioral fix must add a deterministic regression at the narrowest
+authoritative boundary. Concurrency fixes pin ordering with barriers, paused
+time, or injected failures instead of probabilistic sleeps. Persistence fixes
+cover both the failure transaction and restart-visible state. Frontend state
+fixes cover reducer behavior and the relevant browser convergence flow.
+
+Mechanical decomposition changes must keep the full CI matrix green, preserve
+the normal crate-dependency edge set, and introduce no new lifecycle or
+persistence bypass.
+
+---
+
+*Authored by Mesut (2026-02-10); CI and coverage status updated 2026-08-01.*

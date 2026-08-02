@@ -139,7 +139,7 @@ pub struct SubagentCompletion {
 /// `kind` is one of [`alms_tools::subagent_activity_kind`]; `tool` is the tool
 /// name (populated only for `tool_start`).
 ///
-/// Recorded on the [`SubagentHandle`] so the CURRENT status stays queryable
+/// Recorded on the `SubagentHandle` so the CURRENT status stays queryable
 /// after the live `subagent_activity` SSE signal has fired (#1189 follow-up):
 /// the signal is ephemeral (never persisted/replayed) and deduplicated to one
 /// emission per activity transition, so a session-stream subscriber that
@@ -172,7 +172,7 @@ pub struct SubagentActivity {
 /// with (`source_agent`): the subagent's registered name, or
 /// `subagent-{task_id_prefix}` for ephemeral/unnamed subagents. Single source
 /// of truth — used by the relay in `run_agent_loop` AND stored on the
-/// [`SubagentHandle`] so [`Coordinator::subagent_activity_snapshot`] reports
+/// `SubagentHandle` so [`Coordinator::subagent_activity_snapshot`] reports
 /// the exact label the frontend keys its status-bar chips by.
 fn subagent_label(task_id: TaskId, subagent_name: Option<&str>) -> String {
     subagent_name
@@ -204,11 +204,9 @@ pub struct SubagentActivitySnapshot {
 
 /// Handle to a running subagent
 #[derive(Debug)]
-pub struct SubagentHandle {
-    pub task_id: TaskId,
-    pub status: TaskStatus,
-    pub started_at: chrono::DateTime<chrono::Utc>,
-    pub cancel_tx: oneshot::Sender<()>,
+struct SubagentHandle {
+    task_id: TaskId,
+    status: TaskStatus,
     /// The subagent's own cancellation token — the same child token
     /// `run_subagent`'s `select!` waits on. Derived in `spawn_subagent`
     /// (from the parent run's token when present) so it exists before the
@@ -219,34 +217,34 @@ pub struct SubagentHandle {
     /// background subagents) runs unchanged. Powers
     /// [`Coordinator::cancel_subagent_by_session`] / the gateway's
     /// `POST /sessions/{id}/subagent/cancel` endpoint.
-    pub cancel_token: CancellationToken,
-    pub parent_run_id: Option<RunId>,
-    pub parent_session_id: SessionId,
-    pub parent_agent_id: AgentId,
+    cancel_token: CancellationToken,
+    parent_run_id: Option<RunId>,
+    parent_session_id: SessionId,
+    parent_agent_id: AgentId,
     /// The subagent's own session ID (for frontend navigation).
-    pub subagent_session_id: SessionId,
+    subagent_session_id: SessionId,
     /// Whether this was spawned via `dispatch_background` (triggers completion notification).
-    pub is_background: bool,
+    is_background: bool,
     /// The relay's `source_agent` label for this subagent (see
     /// [`subagent_label`]) — the key the frontend's status-bar chips resolve
     /// forwarded signals by.
-    pub label: String,
+    label: String,
     /// The most recent coarse activity signal the relay emitted for this
     /// subagent (post-dedup), or `None` before the first signal. Read by
     /// [`Coordinator::subagent_activity_snapshot`] so a reattaching session
     /// stream can be brought up to date.
-    pub latest_activity: Option<SubagentActivity>,
+    latest_activity: Option<SubagentActivity>,
     /// Receiver for the final TaskResult — taken by `dispatch()` to await completion.
-    pub result_rx: Option<oneshot::Receiver<TaskResult>>,
+    result_rx: Option<oneshot::Receiver<TaskResult>>,
     /// Stored result for background tasks — set by `run_subagent` on completion
     /// so the completion notification system can access the result.
-    pub completed_result: Option<TaskResult>,
+    completed_result: Option<TaskResult>,
     /// Receiver for the structured `AlmsError` produced by the subagent
     /// (when it failed) — taken by `dispatch()` so it can return the
     /// typed variant unchanged instead of stringifying-and-rewrapping
     /// `task_result.result["error"]` as `AlmsError::Runtime(...)`.
     /// `None` for completed / cancelled / timed-out runs. Issue #920.
-    pub error_rx: Option<oneshot::Receiver<AlmsError>>,
+    error_rx: Option<oneshot::Receiver<AlmsError>>,
 }
 
 /// Coordinator manages subagent lifecycle in a pure hierarchy.
@@ -254,15 +252,9 @@ pub struct SubagentHandle {
 /// Any agent can spawn subagents by calling `dispatch()`. Named subagents
 /// must be pre-registered in the agent registry (`alms agent create`);
 /// ephemeral (unnamed) subagents use default config.
-/// There is no peer-to-peer communication between agents.
+/// Peer-to-peer messaging is provided independently by the message bus.
 #[derive(Debug)]
 pub struct Coordinator {
-    /// Main agent ID — write-only after #1051 removed the
-    /// `session_manager.get(parent_session_id)` fallback in `spawn_subagent`.
-    /// Slated for removal in #1069 (constructor-API change deferred from
-    /// #1068's fix-up scope).
-    #[allow(dead_code)]
-    main_agent: AgentId,
     /// Active subagents: TaskId -> SubagentHandle
     subagents: Arc<DashMap<TaskId, SubagentHandle>>,
     /// Named subagents currently executing — prevents concurrent invocations
@@ -318,9 +310,8 @@ pub struct Coordinator {
 }
 
 impl Coordinator {
-    pub fn new(main_agent: AgentId, session_manager: Arc<SessionManager>, llm: LlmClient) -> Self {
+    pub fn new(session_manager: Arc<SessionManager>, llm: LlmClient) -> Self {
         Self {
-            main_agent,
             subagents: Arc::new(DashMap::new()),
             active_named: Arc::new(dashmap::DashSet::new()),
             session_manager,
@@ -344,13 +335,11 @@ impl Coordinator {
     /// so that PATCH /settings updates are visible to subsequently-spawned
     /// subagents without restarting the server.
     pub fn with_agent_config(
-        main_agent: AgentId,
         session_manager: Arc<SessionManager>,
         llm: LlmClient,
         base_agent_config: Arc<parking_lot::RwLock<AgentConfig>>,
     ) -> Self {
         Self {
-            main_agent,
             subagents: Arc::new(DashMap::new()),
             active_named: Arc::new(dashmap::DashSet::new()),
             session_manager,
@@ -477,7 +466,6 @@ impl Coordinator {
         }
 
         let task_id = TaskId::new();
-        let (cancel_tx, cancel_rx) = oneshot::channel();
         let (result_tx, result_rx) = oneshot::channel::<TaskResult>();
         // #920: typed error channel, parallel to the JSON `result_rx`.
         // `run_subagent` fires this when the agent loop returns an error
@@ -531,8 +519,6 @@ impl Coordinator {
         let handle = SubagentHandle {
             task_id,
             status: TaskStatus::Pending,
-            started_at: chrono::Utc::now(),
-            cancel_tx,
             cancel_token: child_cancel_token.clone(),
             parent_run_id,
             parent_session_id,
@@ -632,7 +618,6 @@ impl Coordinator {
                     sub_session_id,
                     subagents,
                     active_named,
-                    cancel_rx,
                     result_tx,
                     error_tx,
                     session_manager,
@@ -728,7 +713,7 @@ impl Coordinator {
     /// own run id has no entry in the gateway's `cancel_tokens` map — so
     /// run-keyed `POST /runs/{id}/cancel` cannot cancel a subagent directly.
     ///
-    /// Fires the handle's [`SubagentHandle::cancel_token`] — the same child
+    /// Fires the handle's `cancel_token` — the same child
     /// token `run_subagent`'s `select!` waits on — so cancellation flows
     /// through the exact same path as a parent-run cancel cascade: the
     /// handle stays in the map and `run_subagent`'s terminal arm performs
@@ -1012,7 +997,6 @@ async fn run_subagent(
     sub_session_id: SessionId,
     subagents: Arc<DashMap<TaskId, SubagentHandle>>,
     active_named: Arc<dashmap::DashSet<(AgentId, String)>>,
-    cancel_rx: oneshot::Receiver<()>,
     result_tx: oneshot::Sender<TaskResult>,
     // #920: typed-error sender, parallel to `result_tx`. Fired with the
     // structured `AlmsError` from `run_agent_loop` when the subagent
@@ -1102,22 +1086,12 @@ async fn run_subagent(
     );
 
     // `child_cancel_token` (derived in `spawn_subagent`, shared with the
-    // SubagentHandle) fires when ANY of:
+    // SubagentHandle) fires when either:
     //   1. The parent run's CancellationToken is cancelled (it is a child
-    //      token of the parent's when one exists), OR
-    //   2. `cancel_subagent_by_session()` fires the handle's stored clone, OR
-    //   3. The explicit `cancel_subagent()` oneshot fires (bridged below).
-    // This unifies all cancellation paths into a single token that
-    // gets attached to the subagent's AgentRuntime.
-
-    // Bridge the oneshot cancel_rx to the child token: when cancel_subagent()
-    // sends on the oneshot, we cancel the child token.
-    let bridge_token = child_cancel_token.clone();
-    let bridge_handle = tokio::spawn(async move {
-        if cancel_rx.await.is_ok() {
-            bridge_token.cancel();
-        }
-    });
+    //      token of the parent's when one exists), or
+    //   2. `cancel_subagent_by_session()` or the test-only `cancel_subagent()`
+    //      fires the handle's stored clone.
+    // The same token is attached to the subagent's AgentRuntime.
 
     // Identity and session are already resolved by `spawn_subagent` and
     // passed in as parameters (#1075). Re-deriving here would mint a fresh
@@ -1289,10 +1263,8 @@ async fn run_subagent(
         }
     };
 
-    // Cancel child token to clean up the bridge task (if it's still waiting
-    // on the oneshot). This is a no-op if the token was already cancelled.
+    // Release any remaining waiters after the subagent reaches a terminal state.
     child_cancel_token.cancel();
-    bridge_handle.abort();
 
     // Commit the coordinator-owned run snapshot before publishing terminal
     // events or completion notifications. A persistence failure is a task
@@ -2355,7 +2327,7 @@ impl Coordinator {
     /// Cancel a running subagent (test-only).
     pub fn cancel_subagent(&self, task_id: TaskId) -> AlmsResult<()> {
         if let Some((_, handle)) = self.subagents.remove(&task_id) {
-            let _ = handle.cancel_tx.send(());
+            handle.cancel_token.cancel();
             info!("Cancelled subagent {:?}", task_id);
             Ok(())
         } else {
@@ -2390,7 +2362,7 @@ mod tests {
             ..LlmConfig::default()
         };
         let llm = LlmClient::new(llm_config).unwrap();
-        Coordinator::new(AgentId::new(), session_manager, llm)
+        Coordinator::new(session_manager, llm)
     }
 
     fn test_session_id() -> SessionId {
@@ -3381,12 +3353,9 @@ mod tests {
                          label: &str,
                          activity: Option<SubagentActivity>| {
             let task_id = TaskId::new();
-            let (cancel_tx, _cancel_rx) = oneshot::channel();
             SubagentHandle {
                 task_id,
                 status,
-                started_at: chrono::Utc::now(),
-                cancel_tx,
                 cancel_token: CancellationToken::new(),
                 parent_run_id: None,
                 parent_session_id: session,
@@ -3691,38 +3660,24 @@ mod tests {
         );
     }
 
-    // -- (d) cancel_subagent removes handle from DashMap -----------------------
+    // -- (d) cancel_subagent cancels token and removes handle ------------------
     //
-    // NOTE: The mock LLM completes synchronously, so by the time we call
-    // cancel_subagent the subagent has likely already finished.  This test
-    // verifies the DashMap removal path, not true mid-execution cancellation.
-    // Testing real cancellation would require a mock LLM with injected latency.
+    // A synthetic handle makes both effects deterministic without racing the
+    // synchronously completing mock LLM.
 
-    #[tokio::test]
-    async fn test_cancel_subagent_removes_handle() {
+    #[test]
+    fn test_cancel_subagent_cancels_token_and_removes_handle() {
         let coord = test_coordinator();
-        let session_id = test_session_id();
-
-        let request = SubagentRequest {
-            task: "Long running task".to_string(),
-            parent_session: session_id,
-            parent_agent_id: test_parent_agent_id(),
-            parent_run_id: None,
-            subagent_name: None,
-            parent_tool_invocation_id: None,
-        };
-        let (task_id, _sub_session_id) = coord
-            .spawn_subagent(request, None, false, None)
-            .await
-            .unwrap();
+        let task_id = TaskId::new();
+        let (handle, token) = synthetic_handle(task_id, SessionId::new(), TaskStatus::Pending);
+        coord.subagents.insert(task_id, handle);
 
         let cancel_result = coord.cancel_subagent(task_id);
         assert!(cancel_result.is_ok(), "cancel should succeed");
-
-        // cancel_subagent removes the handle from the DashMap.
+        assert!(token.is_cancelled(), "cancel should fire the stored token");
         assert!(
             coord.get_status(task_id).is_none(),
-            "Handle should be removed after cancel"
+            "handle should be removed after cancel"
         );
     }
 
@@ -3744,13 +3699,10 @@ mod tests {
         subagent_session_id: SessionId,
         status: TaskStatus,
     ) -> (SubagentHandle, CancellationToken) {
-        let (cancel_tx, _cancel_rx) = oneshot::channel();
         let token = CancellationToken::new();
         let handle = SubagentHandle {
             task_id,
             status,
-            started_at: chrono::Utc::now(),
-            cancel_tx,
             cancel_token: token.clone(),
             parent_run_id: None,
             parent_session_id: SessionId::new(),
@@ -4969,7 +4921,7 @@ mod tests {
                 ..LlmConfig::default()
             };
             let llm = LlmClient::new(llm_config).unwrap();
-            let coord = Coordinator::new(AgentId::new(), session_manager.clone(), llm)
+            let coord = Coordinator::new(session_manager.clone(), llm)
                 .with_workspace_dir(workspace_tmp.path().to_path_buf());
 
             let (_response, sub_session_id) = coord
@@ -5677,164 +5629,6 @@ mod tests {
         assert!(truncated.is_char_boundary(truncated.len()));
     }
 
-    // -- (#921 review fix #5) subagent end-to-end truncation --------------------
-    //
-    // The unit-level test `test_subagent_inherits_parent_config` already
-    // pins the policy inheritance (max_bytes / max_lines / retention_days
-    // propagate from parent to subagent). This test exercises the *runtime*
-    // wiring: a subagent-shaped `AgentRuntime` constructed with the same
-    // builder calls used by `run_subagent` must (a) write spill files
-    // under `{data_dir}/tool-output/sub-{task_id}/`, (b) cap the in-loop
-    // preview to the configured byte budget, and (c) emit a bounded
-    // `truncate_for_emit` value for the audit log + ToolEnd SSE paths.
-    //
-    // Driving this through the full `Coordinator::dispatch` path is hard
-    // because the mock LLM can't synthesize tool calls, so we instead build
-    // the subagent runtime in the same shape `run_subagent` does and
-    // exercise `process_tool_results` + `truncate_for_emit` directly.
-
-    #[tokio::test]
-    async fn test_subagent_runtime_truncates_oversized_tool_output_to_sub_dir() {
-        use alms_core::{AgentId, ToolCallRecord};
-        use alms_runtime::AgentRuntime;
-        use alms_runtime::llm_types::{LlmConfig, LlmMessage, ToolCall};
-        use alms_session::{SessionConfig, SessionManager};
-
-        // Per-test data dir — gateway puts subagent spills under
-        // `{data_dir}/tool-output/sub-{task_id}/` so we mimic that layout.
-        let data_dir = tempfile::tempdir().unwrap();
-        let task_id = TaskId::new();
-
-        // Build the subagent's tool-output spill dir exactly the way
-        // `run_subagent` does at line ~1244-1252.
-        let sub_run_dir = data_dir
-            .path()
-            .join(alms_runtime::tool_output_truncate::TOOL_OUTPUT_DIR_NAME)
-            .join(format!("sub-{}", task_id.0));
-
-        // Build a subagent-shaped AgentConfig with truncation enabled and
-        // small caps so the test stays fast.
-        let config = AgentConfig {
-            tool_output_truncate: alms_core::config::ToolOutputTruncateConfig {
-                enabled: true,
-                max_bytes: 4 * 1024,
-                max_lines: 100,
-                retention_days: 7,
-            },
-            ..AgentConfig::default()
-        };
-
-        let llm_config = LlmConfig {
-            mock: true,
-            ..LlmConfig::default()
-        };
-        let llm = LlmClient::new(llm_config).unwrap();
-
-        // Same builder sequence as `run_subagent`:
-        //   AgentRuntime::new -> with_tool_output_truncate -> (no workspace
-        //   in this test, mirrors ephemeral subagent path with `data_dir`
-        //   set but `attach_workspace` false).
-        let runtime = AgentRuntime::new(AgentId::new(), config, llm)
-            .unwrap()
-            .with_tool_output_truncate(
-                sub_run_dir.clone(),
-                /* enabled */ true,
-                /* max_bytes */ 4 * 1024,
-                /* max_lines */ 100,
-            );
-
-        // Drive `process_tool_results` with a 100 KB tool result.
-        let session_manager = SessionManager::new(SessionConfig::default());
-        let session = session_manager.get_or_create(AgentId::new(), "subagent-test");
-
-        let tool_call = ToolCall::new("call_subagent_huge", "fake_tool", "{}");
-        let raw = "x".repeat(100 * 1024);
-        let result_value = serde_json::Value::String(raw.clone());
-
-        let mut messages: Vec<LlmMessage> = Vec::new();
-        let mut records: Vec<ToolCallRecord> = Vec::new();
-        let mut seq: u32 = 0;
-        let invocation_ids = vec![Uuid::new_v4()];
-
-        runtime.process_tool_results(
-            std::slice::from_ref(&tool_call),
-            vec![Ok(result_value.clone())],
-            &invocation_ids,
-            &mut messages,
-            &mut records,
-            &mut seq,
-            &session_manager,
-            session.id,
-            /* is_dm */ false,
-        );
-
-        // (a) The spill file must land under `tool-output/sub-{task_id}/`,
-        //     NOT directly under `tool-output/` and NOT under any other
-        //     per-run subdir. This is the key distinguishing layout for
-        //     subagents — the parent's gateway-startup retention sweep
-        //     walks every child of `tool-output/` so subagent spills get
-        //     swept the same way parent spills do.
-        let spill_path = sub_run_dir.join("tool_call_subagent_huge.txt");
-        assert!(
-            spill_path.exists(),
-            "subagent spill must land under tool-output/sub-{}/: {}",
-            task_id.0,
-            spill_path.display()
-        );
-        let spilled = std::fs::read_to_string(&spill_path).unwrap();
-        assert_eq!(
-            spilled,
-            result_value.to_string(),
-            "spill bytes must match the original JSON-stringified result"
-        );
-
-        // (b) The subagent's in-loop preview must be bounded by max_bytes
-        //     + the marker budget (4 KB cap + ~1 KB hint), not the original
-        //     100 KB.
-        assert_eq!(messages.len(), 1);
-        let preview = messages[0].content_str();
-        assert!(
-            preview.len() < 8 * 1024,
-            "subagent in-loop preview must be capped: {} bytes (cap = {} + hint)",
-            preview.len(),
-            4 * 1024
-        );
-
-        // (c) `truncate_for_emit` (used by audit log + ToolEnd SSE) must
-        //     also see a bounded value. This is the parent's view of the
-        //     subagent's tool result via the SSE forward / audit chain.
-        let emit_value = runtime.truncate_for_emit(&tool_call.id, &result_value);
-        let emit_str = emit_value
-            .as_str()
-            .expect("truncated emit value must be a JSON string");
-        assert!(
-            emit_str.len() < 8 * 1024,
-            "subagent truncate_for_emit must be capped: {} bytes",
-            emit_str.len()
-        );
-
-        // (d) The persisted session row must carry `truncated_in_loop:
-        //     true` so a follow-up subagent run on the same session sees
-        //     the truncated bytes (not the legacy 2000-byte re-truncated
-        //     ones) when the context builder reconstructs history.
-        let history = session_manager.get_history(session.id).unwrap();
-        let tool_msg = history
-            .iter()
-            .find(|m| matches!(m.role, alms_session::Role::Tool))
-            .expect("subagent tool result must be persisted");
-        let meta = tool_msg.metadata.as_ref().expect("metadata must be set");
-        assert_eq!(
-            meta.get("truncated_in_loop").and_then(|v| v.as_bool()),
-            Some(true)
-        );
-        assert!(
-            meta.get("spill_path")
-                .and_then(|v| v.as_str())
-                .is_some_and(|s| s.contains("sub-")),
-            "persisted spill_path must reference the subagent dir: {meta:?}"
-        );
-    }
-
     // -- #1075 — one session row per subagent invocation -----------------------
 
     /// Count sessions whose `context_id` starts with `subagent_`. Used by the
@@ -6171,7 +5965,7 @@ mod tests {
             None,
             None,
         );
-        runtime.tools().register(Arc::new(invoke_tool));
+        runtime.register_tool(Arc::new(invoke_tool));
 
         let session_manager = SessionManager::new(alms_session::SessionConfig::default());
         let result = runtime

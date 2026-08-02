@@ -1,28 +1,32 @@
-# ALMS Tech Stack (proposed, updated)
+# ALMS Tech Stack Decision
 
 ALMS is not “an app”. It’s closer to a **local-first agent operating system**:
 - a long-running daemon that manages **agents + sessions + tools + scheduling**
 - safe(ish) delegated access to the host (terminal/files/network)
-- channels (Telegram/WhatsApp/etc.) and a UI
+- a Telegram channel adapter (other channels are target work) and an embedded browser UI
 - auditability and policy enforcement
 
-This document proposes a stack that makes the hard parts (state, isolation, concurrency) **boring and correct**, and keeps rapid iteration where it matters (UI/SDK).
+This decision record contains both the implemented baseline and explicit target requirements.
+Sections labeled **Implemented** or **Current** describe repository reality. Sections labeled
+**Target**, **Recommended**, **Roadmap**, or **Non-negotiable** are design direction and must
+not be read as already shipped. The retained stack keeps the hard parts (state, isolation,
+concurrency) boring and correct while allowing rapid browser-UI iteration.
 
 > **North star:** A person can create agents, give them bounded autonomy, schedule work (cron), delegate to sub-agents, and safely grant host access — in a cohesive, well-designed system.
 
 **See also:**
 - `docs/security-model.md` (capabilities, approvals, audit)
-- `docs/proposal.md` (consolidated findings + repo reality check)
+- `docs/proposal.md` (historical 2026-02-10 proposal; not current repository status)
 
 ---
 
 ## 1) Recommendation in one line
 
-**Rust core daemon + SQLite state + native tool registry + HTTP + streaming (SSE/WS) API + TypeScript UI/SDK**.
+**Rust core daemon + SQLite state + native tool registry + HTTP/SSE API + Preact/TypeScript UI**.
 
 ### Why this is the best fit
 - **Correctness under concurrency** is core to an Agent Loop Management System (timeouts, cancellation, queues, subagent lifecycles).
-- **Isolation & capability enforcement** is a first-class requirement once you provide terminal/files access.
+- **Isolation and policy enforcement** are first-class requirements once terminal/files access is available; a unified capability-grant model is still target work.
 - **Durable state** must not rely on brittle file locking.
 - **UX iteration speed** matters a lot, but belongs outside the core daemon.
 
@@ -30,40 +34,39 @@ This document proposes a stack that makes the hard parts (state, isolation, conc
 
 ## 2) Architecture overview (what ALMS is)
 
-### 2.1 Components (conceptual)
+### 2.1 Implemented components
 
-1) **almsd (daemon)** *(naming TBD; current repo uses “gateway” in places)*
+1) **ALMS daemon**
 - Coordinator (multi-agent orchestration)
 - Runtime (LLM I/O + tool-call loops)
 - Scheduler (cron/jobs)
-- Tool host (capability-gated tools)
-- Session store (durable)
-- Channels (Telegram/WhatsApp/etc.)
-- API server (HTTP + streaming)
+- Tool host (policy-controlled tools; unified capabilities are future work)
+- SQLite session/state store
+- Telegram channel adapter; additional channels are future work
+- HTTP/SSE gateway
 
-2) **Clients**
-- Web UI / Desktop UI
-- SDKs
-- CLI
+2) **Implemented clients**
+- Embedded browser UI
+- Rust CLI
 
-### 2.2 Explicit lifecycle semantics (must be designed, not implied)
+A desktop shell and public SDK are future distribution choices, not current components.
 
-**Main Agent**
-- persistent, user-facing
-- plans and delegates
+### 2.2 Current lifecycle and target semantics
+**Main agent (implemented)**
+- persistent and user-facing
+- plans and delegates one level through `invoke_agent`
 
-**Subagents**
-- ephemeral, timeboxed
-- run with *scoped* capabilities
-- report progress + final result
+**Subagents (implemented unless noted)**
+- ephemeral one-shot or named with persistent history
+- inherit the configured sandbox/tool policy; per-invocation capability grants are future work
+- return a final result; structured progress reporting and recursive spawning are future work
 
-**Tools**
-- per-invocation
-- always capability-checked
-- always auditable
+**Tools (implemented)**
+- registered per runtime and governed by posture, filesystem/shell policy, resource limits, and audit paths
+- a single capability-grant model across tools and jobs is a target, not current enforcement
 
-**Cancellation rules**
-- cancel parent session/run ⇒ cascades to subagents ⇒ cancels tool invocations (best-effort)
+**Cancellation (implemented, best effort)**
+- cancelling a parent run cascades to attached subagents and active tool execution
 
 ---
 
@@ -78,24 +81,30 @@ Rust is the best fit for the daemon because ALMS’s hardest problems are:
 
 ### Runtime & web stack
 - Async runtime: **tokio**
-- HTTP: **axum** + **tower**/**tower-http**
-- Streaming: **SSE** for token deltas (simple) + WebSocket for bidirectional control if needed
+- HTTP: **axum** + **tower**
+- Streaming: **SSE** for active event delivery; `/ws` is a no-op compatibility endpoint, not a bidirectional control transport
 - Observability: **tracing** + `tracing-subscriber`
-- Config: `config` or `figment`
+- Config: **config** + TOML + environment overlays
 
-### Suggested internal module layout
-- `coordinator/` — spawn/kill, routing, progress, aggregation
-- `runtime/` — model adapters, prompts, tool-call loop
-- `scheduler/` — cron parsing, job runner, job persistence
-- `tools/` — capability model, tool registry, execution policies
-- `storage/` — DB layer (SQLite), migrations, event log
-- `channels/` — Telegram/WhatsApp/etc.
-- `api/` — HTTP endpoints, SSE/WS
+### Implemented internal layout
+- `alms-core` — shared IDs, lifecycle types, errors, and configuration
+- `alms-session` — SQLite persistence and session state
+- `alms-sandbox` — native tool execution and filesystem/shell policy
+- `alms-tools` — agent-facing coordination and recall tools
+- `alms-runtime` — provider adapters, prompts, context, and agent loop
+- `alms-coordinator` — subagent lifecycle and peer MessageBus
+- `alms-channel` — user-facing channel adapters
+- `alms-gateway` — HTTP/SSE transport and process wiring
+- `alms-cli` — command-line entrypoint
 
 > Keep it **one process** early. Split into microservices only when proven necessary.
 
-### Repo reality check (important)
-The current repository has early implementation scaffolding, but also wiring issues (e.g. gateway/CLI startup inconsistencies, duplicated tool systems, capability model duplication). Treat this doc as the desired direction.
+### Current implementation
+
+The repository implements this as one daemon with an acyclic nine-crate
+workspace. SQLite is authoritative for durable state, SSE is the primary event
+transport, and production tools use one native registry path. Phase 8 changes
+module ownership inside these boundaries; it does not change the stack.
 
 ---
 
@@ -109,21 +118,23 @@ OpenClaw-style JSON + file locks tends to fail under concurrency (races, corrupt
 - straightforward backups
 - a solid base for audit logs
 
-### Rust DB libraries
-- **sqlx** (async, compile-time checked queries) OR
-- `rusqlite` (sync) + a single DB task/queue
+### Rust DB library
 
-### Data model (proposed)
-At minimum:
-- `sessions` (id, context_id, created_at, last_activity, status)
-- `messages` (id, session_id, role, content_json, ts)
-- `agents` (id, type, config_json)
-- `runs` (id, session_id, agent_id, started_at, ended_at, status)
-- `tool_invocations` (id, run_id, tool_name, params_json, result_json, status, ts, duration)
-- `capability_grants` (principal, capability, scope, expires_at)
-- `jobs` (id, schedule, payload, enabled)
-- `job_runs` (id, job_id, started_at, ended_at, status, logs)
-- `audit_log` (append-only: what happened, who requested, what was executed)
+ALMS uses bundled **rusqlite**, with persistence ownership contained in
+`alms-session` and explicit transactional boundaries for multi-record writes.
+
+### Data model (implemented)
+The SQLite store currently owns these tables:
+- `sessions`, `messages`, `agents`, and `runs`
+- `run_tool_calls`
+- `jobs`
+- `audit_events`
+- `context_summaries` and `session_summaries`
+- `schema_migrations`
+
+There is no `capability_grants` or `job_runs` table today. A future unified
+capability model may add grants; job executions currently use the existing job,
+run, session, and audit records.
 
 ### Event log mindset
 Even if you don’t fully event-source on day 1:
@@ -139,57 +150,57 @@ Even if you don’t fully event-source on day 1:
 
 Cron is not a bolt-on; it’s the core autonomy feature.
 
-### Requirements
-- persistent schedules (stored in SQLite)
-- job runner with concurrency limits + backpressure
-- cancellation & timeouts
-- retries (configurable)
-- per-job capability scope
-- job output delivery (to channels, to session logs)
+### Implemented scheduler behavior
+- schedules persist in SQLite
+- bounded channels provide backpressure
+- cancellation, shutdown, and restart recovery are covered by lifecycle tests
+- job output is routed through run/session records and notification delivery
 
-### Safety posture
-- creating/modifying cronjobs should usually require approval
-- jobs run as principal `job:<id>` with scoped capabilities
+### Target additions
+- configurable retry policy
+- a unified per-job capability scope and job:<id> principal model
+- approval policy for creating or modifying high-impact schedules
 
 ---
 
-## 6) Tools & host access (capability-gated)
+## 6) Tools & host access (policy-controlled; capabilities are target work)
 
-### Key rule
-**Never give “raw shell” by default.** Provide host tools that are *policy-controlled*.
+### Current rule
+ALMS exposes a native `shell` tool, so safety comes from guarded posture,
+compiled allow/deny rules, destructive-command rejection, workspace boundaries,
+timeouts, output caps, and audit records. A unified capability grant checked by
+every tool invocation is not implemented yet.
 
-### Two planes model (avoid confusion)
+### Two planes model (current and target)
 
 **Plane A — Host-privileged tools** (dangerous, high value)
-- shell exec
+- shell execution
 - filesystem read/write
 - network requests
 - git
 - process management
 
-These are implemented natively (Rust) but must still:
-- pass capability checks
-- be auditable
-- have strict resource limits
-- optionally require human approval
+These are implemented natively in Rust. Current enforcement includes tool-specific
+policy, posture approval, filesystem boundaries, shell allow/deny rules, resource
+limits, and audit recording. Uniform capability checks remain target work.
 
 **Plane B — Plugin tools** *(future direction; not currently implemented)*
 - third-party extensions
 - deterministic compute
 - transformations
 
-A plugin substrate (e.g. WASM) is not currently in the codebase; earlier wasmtime-based scaffolding was removed because no code called it. If/when plugin tooling returns, the host must still enforce capabilities for any host calls the plugin makes.
+A plugin substrate (for example WASM) is not currently in the codebase; earlier
+wasmtime-based scaffolding was removed because no code called it. Any future
+plugin host must enforce the same policy for privileged host calls.
 
-### Tool execution guardrails (minimum viable)
-For tools like `shell_exec`:
-- argv array (avoid `bash -lc` by default)
-- per-invocation timeout
-- stdout/stderr size caps
-- cwd restrictions / workspace jail
-- environment scrubbing
-- allowlist/denylist patterns (optional)
-- optional “require approval” mode
-- all invocations recorded to `audit_log`
+### Implemented tool-execution guardrails
+For `shell` and filesystem tools:
+- `bash -c` command strings with a persistent working directory
+- compiled shell allow/deny rules plus a hard destructive-command denylist
+- per-invocation timeout and bounded output with spill files for large results
+- workspace-root restrictions and read-before-write checks
+- guarded-posture approval for risky operations
+- invocation records in the audit/run stores
 
 ### Isolation roadmap
 - MVP: controlled `std::process::Command` with strict limits
@@ -202,65 +213,68 @@ For tools like `shell_exec`:
 
 Network is a common exfiltration vector.
 
-Recommended defaults:
-- outbound network **deny-by-default**
-- allowlist only:
-  - LLM endpoints (OpenAI/OpenRouter/etc.)
-  - user-approved domains
-- `http_get` (and similar) is capability-gated and audited
-- SSRF protections: block localhost/metadata IP ranges unless explicitly allowed
+Recommended target defaults:
+- outbound network deny-by-default, with explicit endpoint/domain grants
+- SSRF protections for localhost and metadata ranges
+- capability and audit enforcement shared with other host tools
+
+Current state: `http_get` is a native registered tool, but the unified capability
+grant model and network allowlist/SSRF layer remain future work.
 
 ---
 
-## 8) API: HTTP + streaming (SSE/WS)
+## 8) API: HTTP + streaming (SSE)
 
 ### Why
-- stable boundary between daemon and UI/SDKs
+- stable boundary between daemon, browser UI, CLI, and future clients
 - language-agnostic clients
 
-### Endpoints (suggested)
-- `POST /sessions` (create)
-- `GET /sessions/:id`
-- `POST /agent/run` (non-stream)
-- `POST /agent/run/stream` (SSE)
-- `POST /tools/execute`
-- `POST /jobs` (create)
-- `POST /jobs/:id/run` (manual trigger)
-- `GET /jobs/:id/runs`
+### Implemented surface
+
+The gateway exposes resources for sessions, runs, agents, jobs, approvals,
+settings, audit, workspaces, and operational metrics. Session/run event
+streams use SSE with replay cursors, a gateway epoch, retained-floor signaling,
+and authoritative reconciliation. [`api.md`](api.md) is the endpoint and wire
+contract; this decision record intentionally does not duplicate its route list.
 
 ### Streaming events
-Treat everything as an event stream with correlation IDs:
-- `session_id`, `run_id`, `job_run_id`, `tool_invocation_id`
-- events: token delta, tool_start, tool_end, subagent_start, subagent_progress, subagent_end, job_start/end
+The implemented wire contract uses events such as `token_delta`, `reasoning_delta`,
+`tool_start`, `tool_end`, `subagent_started`, `subagent_activity`,
+`subagent_completed`, `job_completed`, and terminal run events. Exact names and
+payloads are defined in [`api.md`](api.md) and the SSE golden tests.
 
 ---
 
-## 9) UI/SDK stack (TypeScript)
+## 9) Browser UI stack (TypeScript)
 
 ### Why TS here
 - rapid iteration
 - great ecosystem for UI
-- easy SDK distribution
+- a clean base for a future SDK if one is needed
 
-### Recommendation
-- Web UI first (fastest iteration + simplest distribution)
-- Desktop later if needed:
-  - Tauri if you want tight native integration
-  - Electron if you value speed-to-ship over footprint
+### Implemented choice
 
-SDK:
-- TypeScript SDK first; Python later
+- Preact with strict TypeScript and `@preact/signals`
+- Vite for deterministic production builds
+- Zod at HTTP/SSE boundaries
+- normalized entity state with revision/cursor guards
+- Vitest and Testing Library for unit/component coverage
+- Playwright for browser convergence flows
+- generated assets committed and embedded in the Rust binary
+
+A desktop shell or public SDK should be selected only when there is a concrete
+distribution requirement; neither is part of the current stack.
 
 ---
 
 ## 10) LLM providers
 
-### Strategy
-Implement one internal “OpenAI-style” interface; then add adapters:
-- OpenAI
-- OpenRouter
-- Anthropic
-- local (ollama/vLLM) later
+### Implemented strategy
+
+One internal client contract dispatches to native Anthropic and Gemini
+adapters plus a configurable OpenAI-compatible adapter. Provider entries cover
+OpenAI, OpenRouter, local OpenAI-compatible servers, and other compatible
+vendors without adding a new backend service.
 
 Requirements:
 - consistent tool-call schema
@@ -271,12 +285,13 @@ Requirements:
 
 ## 11) Hybrid: when it makes sense (and when it doesn’t)
 
-### The hybrid that *does* make sense
-- **Rust daemon** (everything correctness/security-sensitive)
-- **TypeScript** for UI + SDK
-- optionally: a separate CLI in TS/Go if it accelerates developer UX
+### Implemented hybrid
+- **Rust daemon and CLI** for correctness- and security-sensitive behavior
+- **TypeScript** for the embedded browser UI
 
-This works because the boundary is a clean API.
+A desktop shell or public SDK can reuse the HTTP/SSE boundary when a concrete
+distribution requirement exists. Replacing the working Rust CLI with another
+language is not a current recommendation.
 
 ### Hybrid that is usually a mistake (early)
 Splitting core backend logic across languages (e.g., Go services + Rust sandbox) before the single-process architecture is stable:
@@ -286,39 +301,34 @@ Splitting core backend logic across languages (e.g., Go services + Rust sandbox)
 
 ---
 
-## 12) Non-negotiables (if ALMS should beat OpenClaw)
+## 12) Non-negotiables and their status
 
-1) **SQLite/real DB for state** (avoid file-lock races)
-2) **single capability model** (no parallel enums vs strings)
-3) **one tool registry** (avoid runtime vs sandbox duplication)
-4) **auditable tool execution** (every exec is recorded)
-5) **backpressure + bounded queues** (avoid unbounded memory growth)
-
----
-
-## 13) Immediate next steps (practical)
-
-1) Decide final shape: `almsd` + `alms` CLI + UI
-2) Make the gateway startup story coherent (single entrypoint)
-3) Break crate cycles (protocol/types in `alms-core`)
-4) Pick the single tool execution path (prefer sandbox-owned registry)
-5) Add SQLite storage layer + migrations
-6) Add cron/job tables + runner loop
-7) Add capability grants + approval workflow design
+1) **SQLite/real DB for state** — implemented
+2) **single capability model** — target; not yet implemented
+3) **one production tool registry** — implemented
+4) **auditable tool execution** — implemented for current native paths; keep complete as tools expand
+5) **backpressure + bounded queues** — implemented on stabilized admission/trigger paths; preserve this invariant
 
 ---
 
-## Appendix: Suggested crate boundaries (to avoid cycles)
+## 13) Established decisions
 
-A clean split that tends to work:
-- `alms-core`: types + protocol structs (no tokio, minimal deps)
-- `alms-storage`: sqlite + migrations
-- `alms-tools`: capability model + tool registry + execution host
-- `alms-runtime`: LLM adapters + tool-call loop (depends on tools)
-- `alms-coordinator`: multi-agent orchestration (depends on runtime + storage)
-- `alms-channel`: adapters
-- `alms-gateway`: API server + channel wiring
-- `alms-cli`: thin wrapper
+The daemon/CLI/UI shape, acyclic crate graph, native tool path, SQLite storage
+and migrations, scheduled jobs, bounded admission, lifecycle state machines,
+SSE recovery, and typed frontend boundary are implemented. New infrastructure
+should be introduced only for an observed operating requirement, not as a
+replacement for these stabilized foundations.
+
+---
+
+## Appendix: Crate-boundary rule
+
+Keep shared protocol and lifecycle types in `alms-core`, persistence in
+`alms-session`, native execution in `alms-sandbox`, agent-facing coordination
+tools in `alms-tools`, model/context execution in `alms-runtime`, orchestration
+in `alms-coordinator`, transport in `alms-gateway`, and the CLI thin. Rust's
+workspace resolver rejects cycles; review additionally guards against new
+upward dependencies that would blur these ownership boundaries.
 
 ---
 
@@ -351,5 +361,5 @@ ALMS should be able to run comfortably on hardware where OpenClaw struggles or i
 
 ---
 
-*Authored by Mesut (2026-02-10). Updated based on repo findings + proposal (same date).*
+*Authored by Mesut (2026-02-10). Updated on 2026-08-01 to distinguish implemented state from target requirements.*
 *§14 added by Tesla (2026-03-15).*

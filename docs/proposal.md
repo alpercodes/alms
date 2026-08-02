@@ -1,5 +1,11 @@
 # ALMS Proposal (Mesut)
 
+> **Historical snapshot (2026-02-10).** The repository observations, gaps, and
+> proposed end-state below describe the project at authorship. They are preserved
+> for design context and are not current implementation status. Use
+> [`architecture.md`](architecture.md), [`api.md`](api.md), and the active phase
+> plan for current behavior.
+
 This file is an opinionated, consolidated proposal for what ALMS should become, based on:
 - the current repository state in `</srv/alms`
 - the existing architecture/research docs
@@ -171,9 +177,10 @@ Short version:
 
 ## 7) Task breakdown (who does what)
 
-See `docs/TASKS.md`.
-
-The key near-term objective is to make ALMS **buildable and runnable end-to-end** with a coherent startup path, while locking in the single capability/tool model direction.
+The task ledger used when this proposal was written is preserved at
+`docs/_archive/TASKS.md`. It is historical and is not the current priority
+list. The buildable single-daemon path and unified native tool direction this
+section originally proposed are now implemented.
 
 ---
 

@@ -121,12 +121,26 @@ fn test_app_state_with_mock_llm() -> (
     mpsc::Receiver<RunTrigger>,
     mpsc::Receiver<DmEvent>,
 ) {
+    test_app_state_with_mock_llm_at(":memory:")
+}
+
+/// File-backed variant of [`test_app_state_with_mock_llm`] for tests that
+/// need to reopen the SQLite database and verify restart-visible state.
+fn test_app_state_with_mock_llm_at(
+    db_path: &str,
+) -> (
+    AppState,
+    CancellationToken,
+    mpsc::UnboundedReceiver<SubagentCompletion>,
+    mpsc::Receiver<RunTrigger>,
+    mpsc::Receiver<DmEvent>,
+) {
     let llm_config = alms_runtime::LlmConfig {
         mock: true,
         ..alms_runtime::LlmConfig::default()
     };
     let gateway_config = GatewayConfig {
-        db_path: Some(":memory:".to_string()),
+        db_path: Some(db_path.to_string()),
         llm_config,
         ..GatewayConfig::default()
     };
@@ -3991,7 +4005,7 @@ async fn create_run_resolves_per_agent_config_for_shared_session_via_requested_a
 
     let base_agent_config = state.agent_config.read().clone();
     let secrets = state.secrets.read();
-    let resolved = super::resolve_agent_config(
+    let resolved = crate::configuration::resolve_agent_config(
         runs[0].agent_id,
         &state.session_manager,
         &base_agent_config,
@@ -7123,20 +7137,20 @@ async fn get_run_status_returns_queue_position_for_queued_run() {
     let _ = state.run_manager.insert_run(q2);
 
     // Queued #1 should be position 1 (next up — one Running ahead).
-    let resp_q1 = super::lifecycle::get_run_status(State(state.clone()), Path(q1_id))
+    let resp_q1 = super::read_api::get_run_status(State(state.clone()), Path(q1_id))
         .await
         .expect("get_run_status should succeed for q1");
     assert_eq!(resp_q1.0.queue_position, Some(1));
     assert_eq!(resp_q1.0.status, RunStatus::Queued);
 
     // Queued #2 should be position 2.
-    let resp_q2 = super::lifecycle::get_run_status(State(state.clone()), Path(q2_id))
+    let resp_q2 = super::read_api::get_run_status(State(state.clone()), Path(q2_id))
         .await
         .expect("get_run_status should succeed for q2");
     assert_eq!(resp_q2.0.queue_position, Some(2));
 
     // Running run has no queue_position.
-    let resp_running = super::lifecycle::get_run_status(State(state.clone()), Path(running_id))
+    let resp_running = super::read_api::get_run_status(State(state.clone()), Path(running_id))
         .await
         .expect("get_run_status should succeed for running run");
     assert_eq!(resp_running.0.queue_position, None);
@@ -8817,7 +8831,7 @@ async fn get_run_reasoning_returns_concatenated_text_and_max_event_id() {
         )
         .await;
 
-    let response = super::lifecycle::get_run_reasoning(State(state.clone()), Path(run_id))
+    let response = super::read_api::get_run_reasoning(State(state.clone()), Path(run_id))
         .await
         .expect("get_run_reasoning should succeed for a known run");
     let body = response.0;
@@ -8858,7 +8872,7 @@ async fn get_run_reasoning_returns_concatenated_text_and_max_event_id() {
             SseEventData::reasoning_delta(run_id, "<subagent>", Some("worker-1".into())),
         )
         .await;
-    let response2 = super::lifecycle::get_run_reasoning(State(state.clone()), Path(run_id))
+    let response2 = super::read_api::get_run_reasoning(State(state.clone()), Path(run_id))
         .await
         .expect("get_run_reasoning should succeed after subagent delta");
     assert_eq!(
@@ -8891,7 +8905,7 @@ async fn get_run_reasoning_returns_empty_when_no_reasoning_events_logged() {
     let run_id = run.run_id;
     let _ = state.run_manager.insert_run(run);
 
-    let response = super::lifecycle::get_run_reasoning(State(state.clone()), Path(run_id))
+    let response = super::read_api::get_run_reasoning(State(state.clone()), Path(run_id))
         .await
         .expect("get_run_reasoning should succeed even with no events");
     let body = response.0;
@@ -8952,10 +8966,10 @@ async fn get_run_reasoning_isolates_text_by_run_id() {
         )
         .await;
 
-    let resp_a = super::lifecycle::get_run_reasoning(State(state.clone()), Path(run_a_id))
+    let resp_a = super::read_api::get_run_reasoning(State(state.clone()), Path(run_a_id))
         .await
         .expect("get_run_reasoning should succeed for run A");
-    let resp_b = super::lifecycle::get_run_reasoning(State(state.clone()), Path(run_b_id))
+    let resp_b = super::read_api::get_run_reasoning(State(state.clone()), Path(run_b_id))
         .await
         .expect("get_run_reasoning should succeed for run B");
     assert_eq!(resp_a.0["text"].as_str().unwrap(), "A1 A2");
@@ -9062,7 +9076,7 @@ async fn get_run_reasoning_drops_pre_turn_boundary_deltas() {
         )
         .await;
 
-    let response = super::lifecycle::get_run_reasoning(State(state.clone()), Path(run_id))
+    let response = super::read_api::get_run_reasoning(State(state.clone()), Path(run_id))
         .await
         .expect("get_run_reasoning should succeed");
     let body = response.0;
@@ -9128,7 +9142,7 @@ async fn get_run_reasoning_returns_full_text_when_no_tool_events() {
         )
         .await;
 
-    let response = super::lifecycle::get_run_reasoning(State(state.clone()), Path(run_id))
+    let response = super::read_api::get_run_reasoning(State(state.clone()), Path(run_id))
         .await
         .expect("get_run_reasoning should succeed");
     assert_eq!(
@@ -9210,7 +9224,7 @@ async fn get_run_reasoning_boundary_ignores_subagent_tool_events() {
         )
         .await;
 
-    let response = super::lifecycle::get_run_reasoning(State(state.clone()), Path(run_id))
+    let response = super::read_api::get_run_reasoning(State(state.clone()), Path(run_id))
         .await
         .expect("get_run_reasoning should succeed");
     assert_eq!(
@@ -9282,7 +9296,7 @@ async fn get_run_reasoning_boundary_is_run_scoped() {
         )
         .await;
 
-    let resp_b = super::lifecycle::get_run_reasoning(State(state.clone()), Path(run_b_id))
+    let resp_b = super::read_api::get_run_reasoning(State(state.clone()), Path(run_b_id))
         .await
         .expect("get_run_reasoning should succeed for run B");
     assert_eq!(
@@ -9356,7 +9370,7 @@ async fn get_run_reasoning_boundary_uses_unmatched_tool_start() {
         )
         .await;
 
-    let response = super::lifecycle::get_run_reasoning(State(state.clone()), Path(run_id))
+    let response = super::read_api::get_run_reasoning(State(state.clone()), Path(run_id))
         .await
         .expect("get_run_reasoning should succeed");
     assert_eq!(
@@ -9412,7 +9426,7 @@ async fn get_run_reasoning_live_run_returns_text_cursor_and_terminal_false() {
         )
         .await;
 
-    let response = super::lifecycle::get_run_reasoning(State(state.clone()), Path(run_id))
+    let response = super::read_api::get_run_reasoning(State(state.clone()), Path(run_id))
         .await
         .expect("get_run_reasoning should succeed for a live run");
     let body = response.0;
@@ -9493,7 +9507,7 @@ async fn get_run_reasoning_terminal_completed_run_seals_to_null_cursor() {
         "Running → Completed must transition (test fixture sanity check)"
     );
 
-    let response = super::lifecycle::get_run_reasoning(State(state.clone()), Path(run_id))
+    let response = super::read_api::get_run_reasoning(State(state.clone()), Path(run_id))
         .await
         .expect("get_run_reasoning should succeed for a terminal run");
     let body = response.0;
@@ -9601,7 +9615,7 @@ async fn get_run_reasoning_terminal_seal_event_id_is_above_delta_hwm() {
         )
         .await;
 
-    let response = super::lifecycle::get_run_reasoning(State(state.clone()), Path(run_id))
+    let response = super::read_api::get_run_reasoning(State(state.clone()), Path(run_id))
         .await
         .expect("get_run_reasoning should succeed for a terminal run");
     let body = response.0;
@@ -9688,7 +9702,7 @@ async fn get_run_reasoning_cancel_path_trailing_delta_still_seals() {
         )
         .await;
 
-    let response = super::lifecycle::get_run_reasoning(State(state.clone()), Path(run_id))
+    let response = super::read_api::get_run_reasoning(State(state.clone()), Path(run_id))
         .await
         .expect("get_run_reasoning should succeed for a cancelled run");
     let body = response.0;
@@ -9787,7 +9801,7 @@ async fn get_run_text_returns_concatenated_visible_reply_text() {
         )
         .await;
 
-    let response = super::lifecycle::get_run_text(State(state.clone()), Path(run_id))
+    let response = super::read_api::get_run_text(State(state.clone()), Path(run_id))
         .await
         .expect("get_run_text should succeed for a known run");
     let body = response.0;
@@ -9825,7 +9839,7 @@ async fn get_run_text_returns_concatenated_visible_reply_text() {
             SseEventData::token_delta(run_id, "<subagent>", Some("worker-1".into())),
         )
         .await;
-    let response2 = super::lifecycle::get_run_text(State(state.clone()), Path(run_id))
+    let response2 = super::read_api::get_run_text(State(state.clone()), Path(run_id))
         .await
         .expect("get_run_text should succeed after subagent delta");
     assert_eq!(
@@ -9856,7 +9870,7 @@ async fn get_run_text_returns_empty_when_no_text_events_logged() {
     let run_id = run.run_id;
     let _ = state.run_manager.insert_run(run);
 
-    let response = super::lifecycle::get_run_text(State(state.clone()), Path(run_id))
+    let response = super::read_api::get_run_text(State(state.clone()), Path(run_id))
         .await
         .expect("get_run_text should succeed even with no token_delta events");
     let body = response.0;
@@ -9917,10 +9931,10 @@ async fn get_run_text_isolates_text_by_run_id() {
         )
         .await;
 
-    let resp_a = super::lifecycle::get_run_text(State(state.clone()), Path(run_a_id))
+    let resp_a = super::read_api::get_run_text(State(state.clone()), Path(run_a_id))
         .await
         .expect("get_run_text should succeed for run A");
-    let resp_b = super::lifecycle::get_run_text(State(state.clone()), Path(run_b_id))
+    let resp_b = super::read_api::get_run_text(State(state.clone()), Path(run_b_id))
         .await
         .expect("get_run_text should succeed for run B");
 
@@ -10030,7 +10044,7 @@ async fn get_run_text_drops_pre_turn_boundary_deltas() {
         )
         .await;
 
-    let response = super::lifecycle::get_run_text(State(state.clone()), Path(run_id))
+    let response = super::read_api::get_run_text(State(state.clone()), Path(run_id))
         .await
         .expect("get_run_text should succeed");
     let body = response.0;
@@ -10118,7 +10132,7 @@ async fn get_run_text_boundary_ignores_subagent_tool_events() {
         )
         .await;
 
-    let response = super::lifecycle::get_run_text(State(state.clone()), Path(run_id))
+    let response = super::read_api::get_run_text(State(state.clone()), Path(run_id))
         .await
         .expect("get_run_text should succeed");
     assert_eq!(
@@ -10187,7 +10201,7 @@ async fn get_run_text_boundary_uses_unmatched_tool_start() {
         )
         .await;
 
-    let response = super::lifecycle::get_run_text(State(state.clone()), Path(run_id))
+    let response = super::read_api::get_run_text(State(state.clone()), Path(run_id))
         .await
         .expect("get_run_text should succeed");
     assert_eq!(
@@ -10257,7 +10271,7 @@ async fn get_run_text_last_event_id_bounded_by_session_hwm() {
         )
         .await;
 
-    let response = super::lifecycle::get_run_text(State(state.clone()), Path(run_id))
+    let response = super::read_api::get_run_text(State(state.clone()), Path(run_id))
         .await
         .expect("get_run_text should succeed");
     let returned_id = response.0["last_event_id"]
@@ -10286,7 +10300,7 @@ async fn get_run_text_returns_404_for_unknown_run() {
     let (state, shutdown_token, _cr, _tr, _dr) = test_app_state();
 
     let unknown_run = RunId::new();
-    let result = super::lifecycle::get_run_text(State(state.clone()), Path(unknown_run)).await;
+    let result = super::read_api::get_run_text(State(state.clone()), Path(unknown_run)).await;
     let err = result.expect_err("unknown run must surface a 404, not 200 with empty text");
     assert_eq!(err.0, axum::http::StatusCode::NOT_FOUND);
 
@@ -10322,7 +10336,7 @@ async fn get_run_text_returns_empty_after_run_completes() {
         .await;
 
     // Sanity-check: buffer is populated mid-run.
-    let response = super::lifecycle::get_run_text(State(state.clone()), Path(run_id))
+    let response = super::read_api::get_run_text(State(state.clone()), Path(run_id))
         .await
         .expect("get_run_text should succeed for live run");
     assert_eq!(response.0["text"].as_str().unwrap(), "Hello");
@@ -10336,7 +10350,7 @@ async fn get_run_text_returns_empty_after_run_completes() {
             .mark_run_as_completed(run_id, "Hello".into(), Default::default());
     assert!(transitioned, "mark_run_as_completed should return true");
 
-    let response = super::lifecycle::get_run_text(State(state.clone()), Path(run_id))
+    let response = super::read_api::get_run_text(State(state.clone()), Path(run_id))
         .await
         .expect("get_run_text should still succeed on terminal run");
     assert_eq!(
@@ -10345,6 +10359,172 @@ async fn get_run_text_returns_empty_after_run_completes() {
         "post-terminal rehydration must return empty — the messages GET \
          is the authoritative source for the final assistant reply once \
          the run has completed"
+    );
+
+    shutdown_token.cancel();
+}
+
+/// A notification run must not reach the LLM when its synthetic input cannot
+/// be committed. Otherwise the assistant reply can survive in the run record
+/// while the hidden user turn that triggered it disappears after restart.
+#[tokio::test]
+async fn notification_input_persistence_failure_fails_closed_before_llm() {
+    let directory = tempfile::tempdir().unwrap();
+    let db_path = directory.path().join("notification-persistence-failure.db");
+    let db_path = db_path.to_string_lossy().into_owned();
+    let (state, shutdown_token, _cr, _tr, _dr) = test_app_state_with_mock_llm_at(&db_path);
+    let agent_id = AgentId::new();
+    let context_id = "notification-persistence-failure";
+    let session = state.session_manager.get_or_create(agent_id, context_id);
+    let session_id = session.id;
+
+    let run = Run::new(session_id, agent_id, "deliver this notification".into());
+    let run_id = run.run_id;
+    state
+        .run_manager
+        .insert_run(run.clone())
+        .expect("queued run should be persisted before the failure is injected");
+
+    let cancel_token = CancellationToken::new();
+    state
+        .run_manager
+        .register_cancel_token(run_id, cancel_token.clone());
+    let mut session_events = subscribe_session(&state, session_id);
+
+    // Delete only the SQLite row through the store, deliberately leaving the
+    // SessionManager's in-memory projection intact. The next message INSERT
+    // now fails deterministically on the session foreign key while normal
+    // in-memory reads still succeed — exactly the split-brain shape that
+    // append_message used to hide by logging and returning Ok.
+    let store = state
+        .session_manager
+        .store()
+        .expect("SQLite-backed test state must expose its store")
+        .clone();
+    store
+        .delete_session(session_id)
+        .expect("durable session deletion should inject the FK failure");
+
+    super::lifecycle::execute_run(
+        state.clone(),
+        super::RunParams {
+            run_id,
+            session_id,
+            agent_id,
+            input: run.input,
+            context_id: context_id.to_string(),
+            cancel_token,
+            is_peer_message: false,
+            is_system_triggered: true,
+            input_pre_persisted: false,
+        },
+    )
+    .await;
+
+    let events = drain_events(&mut session_events);
+    let event_types: Vec<&str> = events
+        .iter()
+        .map(|event| event.event_type.as_str())
+        .collect();
+    assert!(
+        event_types.contains(&"run_error"),
+        "persistence failure must emit run_error; got {event_types:?}"
+    );
+    assert!(
+        !events.iter().any(|event| matches!(
+            event.event_type.as_str(),
+            "run_finished" | "token_delta" | "reasoning_delta"
+        )),
+        "failed notification must not emit completion or reply events; got {event_types:?}"
+    );
+
+    // The mock client has no invocation counter. These are the existing,
+    // non-invasive runtime boundaries: `building_context` is emitted as
+    // `run_on_session` begins, and `calling_llm` immediately precedes the
+    // client call. `execute_run` awaits the event forwarder before returning,
+    // so their absence proves this failure stopped before runtime execution.
+    let runtime_phases: Vec<&str> = events
+        .iter()
+        .filter(|event| event.event_type == "status")
+        .filter_map(|event| event.data.get("phase")?.as_str())
+        .collect();
+    assert!(
+        !runtime_phases
+            .iter()
+            .any(|phase| matches!(*phase, "building_context" | "calling_llm")),
+        "notification persistence failure must stop before the runtime/LLM boundary; \
+         got status phases {runtime_phases:?}"
+    );
+
+    let failed = state
+        .run_manager
+        .get_run(run_id)
+        .expect("run should remain queryable");
+    assert_eq!(
+        failed.status(),
+        RunStatus::Failed,
+        "notification persistence failure must stop execution"
+    );
+    assert!(
+        failed.output.is_none(),
+        "failed notification must not retain mock LLM output"
+    );
+    assert!(
+        failed
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("SQLite save_message")),
+        "run should expose the durable input failure, got {:?}",
+        failed.error
+    );
+
+    let history = state.session_manager.get_history(session_id).unwrap();
+    assert!(
+        history.iter().all(|message| {
+            !message
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("notification_input"))
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+        }),
+        "failed notification input must not be published into memory"
+    );
+    assert!(
+        history
+            .iter()
+            .all(|message| message.role != alms_session::Role::Assistant),
+        "failed notification must not publish an assistant reply into memory"
+    );
+    assert!(
+        store.load_messages(session_id).unwrap().is_empty(),
+        "failed notification input must not exist in SQLite"
+    );
+
+    // Reopen through a distinct connection instead of trusting the original
+    // managers' in-memory projections. This is the state a restart can see.
+    let reopened_store = alms_session::SqliteStore::open(&db_path)
+        .expect("notification regression database should reopen");
+    let reopened_run = reopened_store
+        .load_run(run_id)
+        .expect("reopened run query should succeed")
+        .expect("failed run must remain durable after reopen");
+    assert_eq!(reopened_run.status(), RunStatus::Failed);
+    assert!(reopened_run.output.is_none());
+    assert!(
+        reopened_run
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("SQLite save_message")),
+        "reopened run should retain the durable input failure, got {:?}",
+        reopened_run.error
+    );
+    assert!(
+        reopened_store
+            .load_messages(session_id)
+            .expect("reopened message query should succeed")
+            .is_empty(),
+        "failed notification input and assistant reply must remain absent after reopen"
     );
 
     shutdown_token.cancel();

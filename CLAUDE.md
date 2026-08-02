@@ -2,7 +2,7 @@
 
 ## What is this project?
 
-ALMS (Agent Loop Management System) is a Rust-based multi-agent coordination platform. A single daemon exposes an HTTP/SSE API, runs agent loops against LLM providers, executes native tools with per-tool sandboxing (project-root path canonicalization, shell permissions, Landlock on Linux — see [`docs/security-model.md` § 4.4](docs/security-model.md#filesystem-sandboxing) for the platform asymmetry between Linux and Windows/macOS), and manages sessions with snapshot persistence.
+ALMS (Agent Loop Management System) is a Rust-based multi-agent coordination platform. A single daemon exposes an HTTP/SSE API, runs agent loops against LLM providers, executes native tools with per-tool sandboxing (project-root path canonicalization, shell permissions, Landlock on Linux — see [`docs/security-model.md` § 4.4](docs/security-model.md#44-filesystem-sandboxing-implemented) for the platform asymmetry between Linux and Windows/macOS), and manages sessions with snapshot persistence.
 
 ## Build & Run
 
@@ -108,7 +108,7 @@ alms-cli → alms-gateway → alms-runtime      → alms-core
 
 ## Current State
 
-**Version:** `v0.2.3` released and stable on `main` (tag `v0.2.3`); **v0.2.4 in progress** on `develop`. See [`CHANGELOG.md`](CHANGELOG.md) for per-release notes and operator-facing default changes (model/provider defaults, Anthropic thinking budget, agent-loop hard caps), and [`docs/TASKS.md`](docs/TASKS.md) for the prioritized task list.
+**Version:** `v0.2.3` released and stable on `main` (tag `v0.2.3`); **v0.2.4 in progress** on `develop`. See [`CHANGELOG.md`](CHANGELOG.md) for per-release notes and operator-facing default changes (model/provider defaults, Anthropic thinking budget, agent-loop hard caps). The former task ledger is preserved in `docs/_archive/TASKS.md` for history; it is not the current priority list.
 
 **Roughly what works** — the agent runtime (tool loop, token-budgeted context builder, workspace files, episodic memory), the HTTP/SSE gateway + web UI, SQLite persistence, multi-provider LLM support (OpenAI/OpenRouter, Anthropic, Gemini — with reasoning/thinking and prompt/context caching), multi-agent coordination (subagents via `invoke_agent`, peer-to-peer DMs via `send_message`), per-tool sandboxing + shell permissions, the agent registry + CLI, cron/scheduled jobs, and the approval workflow. The **Project Structure** map above and the design docs under `docs/` are the source of truth for how each piece works.
 

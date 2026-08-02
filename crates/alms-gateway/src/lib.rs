@@ -1,8 +1,8 @@
-//! ALMS Gateway - HTTP/WebSocket API and message routing
+//! ALMS Gateway - HTTP/SSE API and message routing
 //!
 //! The gateway provides:
 //! - HTTP REST API for session management
-//! - WebSocket endpoint for real-time communication  
+//! - SSE endpoints for live and replayable event delivery
 //! - Integration between channels (Telegram) and agent runtimes
 //!
 //! ## Usage
@@ -24,7 +24,7 @@ pub mod agents;
 pub mod approvals;
 pub mod auth;
 pub mod auth_keys;
-pub mod configuration;
+pub(crate) mod configuration;
 pub mod cron_utils;
 pub mod event_log;
 pub mod gateway;

@@ -1,8 +1,8 @@
 # Phase 6 — Normalized frontend state and reconnect behavior
 
-Status: implementation complete; Phase 6B pending review and merge
+Status: completed by PRs #1228 and #1229; archived after merge.
 
-Parent plan: `docs/engineering-stabilization-plan.md`
+Parent plan: [`../engineering-stabilization-plan.md`](../engineering-stabilization-plan.md)
 
 ## Objective
 

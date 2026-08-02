@@ -1402,9 +1402,9 @@ mod tests {
     /// This is the contract `AppState::new` now relies on when applying
     /// a persisted server-default provider switch on boot. Pre-fix, the
     /// boot path used `with_provider` (no resolver) and then the
-    /// `runs::resolve_agent_config` path only re-checked `SecretsStore`
-    /// via `with_secrets` — deployments configuring keys exclusively in
-    /// the provider entry would silently boot with an empty key.
+    /// Gateway `configuration::resolve_agent_config` only re-checked
+    /// `SecretsStore` via `with_secrets` — deployments configuring keys
+    /// exclusively in the provider entry would silently boot with an empty key.
     #[test]
     fn test_with_provider_and_secrets_resolves_provider_entry_api_key() {
         // Build a config that mirrors the boot-time shape: starting on
