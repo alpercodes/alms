@@ -5,6 +5,12 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 
+[features]
+# Exposes deterministic persistence-failure injection hooks to downstream
+# crates' test targets (see `JobStore::inject_persistence_failures`). Enabled
+# only as a dev-dependency feature; never in a production build.
+test-support = []
+
 [dependencies]
 alms-core = { path = "../alms-core" }
 rusqlite = { version = "0.32", features = ["bundled"] }

@@ -13128,6 +13128,99 @@ async fn delete_jobs_interleaved_with_close_cannot_resurrect_job() {
     shutdown_token.cancel();
 }
 
+/// The full recurring job entity `record_and_rearm` takes by reference.
+///
+/// [`create_recurring_job`]'s daily cron keeps the next occurrence
+/// unambiguously in the future, so `record_and_rearm` deterministically takes
+/// the normal re-arm branch rather than the D6 coalesced catch-up.
+fn future_recurring_job(state: &AppState, agent_id: AgentId) -> alms_core::job::Job {
+    let job_id = create_recurring_job(state, agent_id, "durable re-arm");
+    state.job_store.get(job_id).expect("job was just created")
+}
+
+/// #1233: a *transient* persistence failure at episode close must not stop a
+/// recurring job. `JobStore::transition_job` persists before committing to
+/// memory, so a failed `save_job` advances neither — pre-fix the `Err` arm
+/// was a bare `error!` and the job was left `Active` with `next_run_at`
+/// pinned to the tick that already fired and no `schedule_once` issued.
+/// The bounded retry budget must absorb the failure and close normally.
+#[tokio::test]
+async fn transient_persistence_failure_at_episode_close_still_rearms_the_job() {
+    let (state, shutdown_token, _cr, _tr, _dr) = test_app_state();
+    let agent_id = AgentId::new();
+    let job = future_recurring_job(&state, agent_id);
+    let episode = completed_episode(&state, agent_id, job.id);
+
+    // Exactly one injected failure — inside the budget.
+    state.job_store.inject_next_persistence_failure();
+    super::notifications::record_and_rearm(&state, &job, &episode, false).await;
+
+    let recorded = state.job_store.get(job.id).expect("job still in store");
+    assert_eq!(recorded.status(), alms_core::JobStatus::Active);
+    assert!(
+        recorded.last_run_at.is_some(),
+        "the retried write must durably record the firing"
+    );
+    assert!(
+        recorded.next_run_at.is_some(),
+        "the recurring job must be re-armed durably after the retry succeeds"
+    );
+    assert_eq!(
+        state.job_store.rearm_failures_total(),
+        0,
+        "a failure absorbed inside the budget is not a degraded close"
+    );
+    assert_eq!(
+        state.scheduler.pending_count().await,
+        1,
+        "the scheduler must hold the job's next firing"
+    );
+
+    shutdown_token.cancel();
+}
+
+/// #1233: when the persistence failure outlives the retry budget, the job
+/// must still not silently stall. Nothing durable can be written — the store
+/// is exactly what is failing — so the guarantee is: re-arm in memory at the
+/// next cron occurrence, and count the degradation in
+/// `job_rearm_failures_total` so `GET /operations/metrics` shows it.
+#[tokio::test]
+async fn exhausted_episode_close_retries_rearm_the_recurring_job_in_memory() {
+    let (state, shutdown_token, _cr, _tr, _dr) = test_app_state();
+    let agent_id = AgentId::new();
+    let job = future_recurring_job(&state, agent_id);
+    let episode = completed_episode(&state, agent_id, job.id);
+
+    state
+        .job_store
+        .inject_persistence_failures(super::notifications::JOB_REARM_MAX_ATTEMPTS);
+    super::notifications::record_and_rearm(&state, &job, &episode, false).await;
+
+    let recorded = state.job_store.get(job.id).expect("job still in store");
+    assert_eq!(
+        recorded.status(),
+        job.status(),
+        "the refused write must leave the job exactly as it was"
+    );
+    assert_eq!(
+        recorded.last_run_at, None,
+        "no partial commit: neither SQLite nor memory advanced"
+    );
+    assert_eq!(
+        state.job_store.rearm_failures_total(),
+        1,
+        "the degraded close must be observable in operations metrics"
+    );
+    assert_eq!(
+        state.scheduler.pending_count().await,
+        1,
+        "the job must still be armed in memory — a silent stall until the \
+         next daemon restart is the defect this closes"
+    );
+
+    shutdown_token.cancel();
+}
+
 fn completed_episode(
     state: &AppState,
     agent_id: AgentId,
@@ -13332,6 +13425,10 @@ async fn operational_metrics_route_exposes_live_snapshot() {
     assert!(json["replay_epoch_mismatches_total"].is_number());
     assert!(json["persistence_snapshot_rejections_total"].is_number());
     assert!(json["job_dispatch_retry_exhaustions_total"].is_number());
+    assert!(json["job_rearm_failures_total"].is_number());
+    assert!(json["stale_run_recovery_failures_total"].is_number());
+    assert!(json["job_boot_catch_ups_total"].is_number());
+    assert!(json["job_bootstrap_failures_total"].is_number());
 
     drop(subscription);
     shutdown_token.cancel();

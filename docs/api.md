@@ -402,12 +402,41 @@ Notes:
 The gateway admits at most 64 pending runs for one agent and 1,024 pending
 runs across all agents. Active runs do not count against these pending limits.
 If the per-agent limit is available but the global limit is full, error_code is
-GATEWAY_QUEUE_FULL instead. Admission happens before the run record, input
-message, cancellation token, or run_created event is created, so a 429 has no
-durable or streaming side effects. The response also carries
+GATEWAY_QUEUE_FULL instead. Queue reservation happens before the run record,
+input message, cancellation token, or run_created event is created, so a 429
+has no durable or streaming side effects. The response also carries
 `Retry-After: 1`; clients should wait at least `retry_after_ms` before
 retrying and should apply their own exponential backoff for repeated
 rejections.
+
+**Concurrent requests on the same session do not fast-fail — they serialize.**
+The queue reservation is reached only *after* acquiring the per-session
+admission gate, which orders the durable commit, the in-memory projection, the
+queue submission, and the `run_created` publication for one session. SQLite
+assigns message sequence numbers while committing, so without this gate
+concurrent handlers could commit A then B but publish and enqueue B then A.
+The practical consequence for clients: a second `POST /runs` on a session that
+already has one in admission waits behind it rather than returning 429
+immediately. The hold window is short and bounded — the guard moves into the
+`run_created` task, which the handler awaits, and the fan-out is synchronous —
+so this is request ordering, not a stall. Different sessions never block each
+other.
+
+**Response 500** (admission projection failed):
+
+```json
+{
+  "error_code": "ADMISSION_PROJECTION_FAILED",
+  "message": "Failed to publish persisted run input: <detail>"
+}
+```
+
+Returned when the run and its input committed durably but could not then be
+projected into in-memory state (session history or the run registry). The
+durable record is authoritative and survives; the request is rejected rather
+than continuing against state the gateway cannot see. Retry the request. The
+sibling `LIFECYCLE_PERSISTENCE_FAILED` (also 500) covers the earlier step, the
+durable admission write itself, and leaves nothing persisted.
 
 **Response 503** (queue unavailable):
 ```json
@@ -1331,9 +1360,44 @@ plus current subscriber gauges:
   "subscribers": { "runs": 0, "sessions": 0, "agents": 0, "activity": 0 },
   "persistence_snapshot_rejections_total": 0,
   "job_dispatch_retry_attempts_total": 0,
-  "job_dispatch_retry_exhaustions_total": 0
+  "job_dispatch_retry_exhaustions_total": 0,
+  "job_rearm_failures_total": 0,
+  "stale_run_recovery_failures_total": 0,
+  "job_boot_catch_ups_total": 0,
+  "job_bootstrap_failures_total": 0
 }
 ```
+
+`job_rearm_failures_total` (#1233) counts episode-close job writes that
+exhausted their bounded retry budget. Non-zero means at least one job advanced
+its schedule **in the scheduler only**. The job entity did not advance at all —
+the write persists before the in-memory commit, so a failure leaves both stale.
+**`GET /jobs` will therefore report a `next_run_at` in the past for that job
+while it is in fact armed for its next occurrence**, and the web UI renders
+that past date verbatim; a stale `next_run_at` next to a non-zero counter is
+the expected symptom, not a second bug. `last_run_at` is stale for the same
+reason. The next successful run overwrites both, and a restart before then
+replays the already-executed tick. Investigate SQLite health when this moves.
+
+`job_bootstrap_failures_total` counts jobs that could not be re-registered
+with the scheduler at startup and were skipped so the daemon could still
+start. Non-zero means those jobs **will not fire at all** until they are
+repaired or recreated; each one is logged at `error!` with its job id.
+
+`stale_run_recovery_failures_total` (#1236) counts run rows the startup sweep
+could not reconcile and skipped so the daemon could still boot. Non-zero means
+at least one durable row still claims `queued`/`running` from a dead process
+and will never complete. Each skipped row is logged at `error!` with its
+`run_id` and a `remediation` field carrying the SQL that clears it.
+
+`job_boot_catch_ups_total` (#1235) counts jobs whose persisted fire time was
+already past due when the daemon started. These form the **catch-up cohort**:
+rather than all firing at `now + 1s`, they are ordered most-overdue-first and
+spaced 15 seconds apart, so a restart after long downtime spreads the missed
+firings instead of producing a concurrent burst. Jobs that are *not* past due
+keep their real schedule and are never staggered. The cohort size scales with
+how long the daemon was down, so a large value after a restart is expected and
+is the number to reach for when reasoning about post-restart LLM spend.
 
 ---
 

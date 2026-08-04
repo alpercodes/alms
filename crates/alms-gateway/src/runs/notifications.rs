@@ -16,6 +16,12 @@ use tracing::{debug, error, info, instrument, warn};
 use super::lifecycle::execute_run_guarded;
 const JOB_DISPATCH_MAX_ATTEMPTS: u32 = 3;
 const JOB_DISPATCH_RETRY_BASE_SECS: u64 = 5;
+/// Bounded retry budget for the durable episode-close job write (#1233).
+pub(super) const JOB_REARM_MAX_ATTEMPTS: u32 = 3;
+/// Base backoff between episode-close write retries. Short on purpose: the
+/// write is a local SQLite statement, and `close_episode` holds the job's
+/// completion/cancellation gate across the retries.
+const JOB_REARM_RETRY_BASE_MS: u64 = 100;
 
 // ---------------------------------------------------------------------------
 // Scheduler integration
@@ -361,7 +367,8 @@ pub(super) async fn record_and_rearm(
         JobSchedule::Once { .. } => {
             // A one-shot closes as Completed. Refusal means another terminal
             // transition (normally operator cancellation) won the race.
-            match state.job_store.record_run_with_reason(
+            match record_run_with_retry(
+                state,
                 job_id,
                 now,
                 JobStatus::Completed,
@@ -371,12 +378,28 @@ pub(super) async fn record_and_rearm(
                 } else {
                     alms_core::JobTerminalReason::Completed
                 }),
-            ) {
+            )
+            .await
+            {
                 Ok(RecordRunOutcome::Recorded) => {}
                 Ok(outcome) => {
                     info!(job_id = %job_id, ?outcome, "record_run not applied at episode close")
                 }
-                Err(e) => error!(job_id = %job_id, "Failed to record job run: {e}"),
+                Err(error) => {
+                    // #1233: the one-shot ran but could not be marked
+                    // terminal. Nothing durable can be written — the store is
+                    // what is failing — so the honest outcome is: count it,
+                    // and say plainly that a restart will replay this job.
+                    state.job_store.record_rearm_failure();
+                    error!(
+                        job_id = %job_id,
+                        attempts = JOB_REARM_MAX_ATTEMPTS,
+                        %error,
+                        "One-shot job completion could not be persisted after the retry budget. \
+                         The job stays non-terminal and WILL RE-FIRE at the next daemon restart; \
+                         run `DELETE /jobs/{job_id}` to suppress the replay (#1233)"
+                    );
+                }
             }
         }
         JobSchedule::Recurring { cron } => {
@@ -390,9 +413,8 @@ pub(super) async fn record_and_rearm(
                     .map(|t| t <= now)
                     .unwrap_or(false);
             if missed {
-                match state
-                    .job_store
-                    .record_run(job_id, now, JobStatus::Active, Some(now))
+                match record_run_with_retry(state, job_id, now, JobStatus::Active, Some(now), None)
+                    .await
                 {
                     Ok(RecordRunOutcome::Recorded) => {
                         // Route through the scheduler with a zero delay so the
@@ -414,16 +436,14 @@ pub(super) async fn record_and_rearm(
                             "Job cancelled/removed during episode close — catch-up skipped (S1)"
                         );
                     }
-                    Err(e) => error!(job_id = %job_id, "Failed to record job run: {e}"),
+                    Err(error) => rearm_after_failed_close(state, job_id, cron, now, &error).await,
                 }
             } else {
                 let next = cron_utils::next_after(cron, now);
                 if next.is_none() {
                     warn!("Recurring cron '{}' has no future occurrences", cron);
                 }
-                match state
-                    .job_store
-                    .record_run(job_id, now, JobStatus::Active, next)
+                match record_run_with_retry(state, job_id, now, JobStatus::Active, next, None).await
                 {
                     Ok(RecordRunOutcome::Recorded) => {
                         if let Some(next) = next {
@@ -440,11 +460,114 @@ pub(super) async fn record_and_rearm(
                             "Job cancelled/removed during episode close — re-arm skipped (S1)"
                         );
                     }
-                    Err(e) => error!(job_id = %job_id, "Failed to record job run: {e}"),
+                    Err(error) => rearm_after_failed_close(state, job_id, cron, now, &error).await,
                 }
             }
         }
     }
+}
+
+/// Persist an episode-close job write under a bounded retry budget (#1233).
+///
+/// `JobStore::transition_job` persists BEFORE committing to memory, so an
+/// `Err` here means neither SQLite nor memory advanced: the job is still
+/// `Active` with `next_run_at` pinned to the tick that already fired. Before
+/// this budget existed, the caller's only response was an `error!` line, so a
+/// single transient SQLite failure silently stopped a recurring job until the
+/// next daemon restart (Tim's S1 on #1225, carried forward through #1230).
+///
+/// The only other `Err` source is lifecycle-revision exhaustion at
+/// `MAX_LIFECYCLE_REVISION` (`i64::MAX`), which is unreachable in practice;
+/// retrying it is harmless because the retries are bounded and sub-second.
+async fn record_run_with_retry(
+    state: &AppState,
+    job_id: JobId,
+    ran_at: chrono::DateTime<Utc>,
+    new_status: JobStatus,
+    next_run_at: Option<chrono::DateTime<Utc>>,
+    terminal_reason: Option<alms_core::JobTerminalReason>,
+) -> alms_core::AlmsResult<RecordRunOutcome> {
+    let mut attempt = 1u32;
+    loop {
+        let result = state.job_store.record_run_with_reason(
+            job_id,
+            ran_at,
+            new_status,
+            next_run_at,
+            terminal_reason,
+        );
+        match result {
+            Ok(outcome) => return Ok(outcome),
+            Err(error) if attempt < JOB_REARM_MAX_ATTEMPTS => {
+                warn!(
+                    %job_id,
+                    attempt,
+                    max_attempts = JOB_REARM_MAX_ATTEMPTS,
+                    %error,
+                    "Episode-close job write failed — retrying"
+                );
+                let backoff = JOB_REARM_RETRY_BASE_MS.saturating_mul(1u64 << (attempt - 1));
+                tokio::time::sleep(std::time::Duration::from_millis(backoff)).await;
+                attempt += 1;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+/// Keep a recurring job alive after its episode-close write exhausted the
+/// retry budget (#1233).
+///
+/// The guarantee is deliberately narrower than a clean close, because the
+/// durable store is exactly what is failing: nothing new can be persisted.
+/// What this does guarantee is that the job does not *silently stop*.
+///
+/// - The job is re-armed **in memory** at its next cron occurrence, so the
+///   schedule keeps running. The next occurrence is used rather than an
+///   immediate catch-up so a persistently failing store cannot turn every
+///   close into another immediate firing.
+/// - The failure is counted in `job_rearm_failures_total`, surfaced by
+///   `GET /operations/metrics`, so the degradation is observable rather than
+///   buried in a log line.
+/// - **Both SQLite and memory keep the stale `next_run_at`.**
+///   `JobStore::transition_job` persists before `*entry = candidate`, so a
+///   failed write advances neither. The in-memory job is what `GET /jobs`
+///   serves, so the API reports a `next_run_at` in the *past* while the
+///   scheduler is actually armed for the next occurrence, and `jobs-tab.js`
+///   renders that past date verbatim — this is the symptom an operator sees
+///   first. The next successful run overwrites it; a restart before then
+///   replays that tick through the staggered boot catch-up (#1235).
+async fn rearm_after_failed_close(
+    state: &AppState,
+    job_id: JobId,
+    cron: &str,
+    now: chrono::DateTime<Utc>,
+    error: &alms_core::AlmsError,
+) {
+    state.job_store.record_rearm_failure();
+    let Some(next) = cron_utils::next_after(cron, now) else {
+        error!(
+            %job_id,
+            attempts = JOB_REARM_MAX_ATTEMPTS,
+            %error,
+            "Episode-close job write failed after the retry budget and cron '{cron}' has no \
+             future occurrence — the job is stopped (#1233)"
+        );
+        return;
+    };
+    let delay = (next - now).to_std().unwrap_or(std::time::Duration::ZERO);
+    state
+        .scheduler
+        .schedule_once(job_id, tokio::time::Instant::now() + delay)
+        .await;
+    error!(
+        %job_id,
+        attempts = JOB_REARM_MAX_ATTEMPTS,
+        %error,
+        next_fire_at = %next,
+        "Episode-close job write failed after the retry budget — job re-armed IN MEMORY ONLY. \
+         The persisted next_run_at is stale until the next successful run (#1233)"
+    );
 }
 
 /// The D5 deadline sweep: force-close episodes past their 4-hour deadline
@@ -1168,8 +1291,10 @@ pub(super) async fn enqueue_triggered_run(
     // - Deadline-detached episodes (D5) always deliver their late results:
     //   a detached subagent/DM completing after the 4h sweep produces the
     //   documented orphan run on the job session — for RECURRING jobs
-    //   (re-armed `Active`) and for spent ONE-SHOTS (recorded `Cancelled`
-    //   by the #763 status quirk, but never operator-cancelled) alike.
+    //   (re-armed `Active`) and for spent ONE-SHOTS (recorded `Completed`
+    //   or `Failed`, never operator-cancelled) alike. Keying on status
+    //   instead would also have to enumerate every terminal variant; the
+    //   intent set is one membership check that cannot drift.
     // - A run targeting the session of an operator-killed job serves no
     //   one (the completion card is never coming), so it is suppressed.
     //   If an episode resolve reserved a continuation for a run suppressed

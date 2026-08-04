@@ -2,6 +2,7 @@
 
 use super::*;
 use alms_core::{RunTransition, TransitionOutcome};
+use rusqlite::{Transaction, TransactionBehavior};
 
 impl SqliteStore {
     // ── Runs ─────────────────────────────────────────────────────────────────
@@ -224,17 +225,40 @@ impl SqliteStore {
     ///
     /// These are stale leftovers from a previous process that crashed or was
     /// killed. Queued runs may still own an initial user message hidden by
-    /// `pending_input`; release that message in the same transaction as the
+    /// `pending_input`; release that message in the same savepoint as the
     /// terminal run transition so restart recovery cannot expose a split state.
     /// Inputs belonging to runs that were already terminal before the restart
     /// are also released without changing the run's terminal state. This covers
     /// cancellation winning before the queued worker claims its input.
     /// Returns the number of runs updated.
+    ///
+    /// **Per-row failures are non-fatal (#1236).** Each row is reconciled in
+    /// its own savepoint: one row that cannot be reconciled rolls back only
+    /// its own writes, is logged with its `run_id` and the SQL an operator
+    /// would run to clear it, is counted in
+    /// [`Self::stale_run_recovery_failures_total`], and recovery continues for
+    /// every other row. Phase 7 made all three of those arms hard errors on a
+    /// single whole-sweep transaction, which meant one inconsistent row rolled
+    /// back recovery for every other run *and* stopped `Gateway::new` — an
+    /// unbootable daemon with no skip-recovery flag and no repair path. This
+    /// partially softens `0043d6b` ("Fail closed on partial session
+    /// reconciliation") by design: a daemon that will not start is a worse
+    /// outcome than one stale run row. The broader fail-open-vs-fail-closed
+    /// policy question is tracked in #1237.
+    ///
+    /// The transaction is `Immediate` (#1224's rule): the sweep reads before it
+    /// writes, which is the `SQLITE_BUSY_SNAPSHOT` shape a deferred
+    /// transaction hits when a second process is writing concurrently. In-
+    /// process the single `conn` mutex already serializes this, but the failure
+    /// mode it prevents — "gateway will not start, confusing SQLite error" —
+    /// is exactly what the per-row handling above exists to avoid.
     pub fn mark_stale_runs_failed(&self) -> AlmsResult<usize> {
         let mut conn = self.conn.lock();
-        let transaction = conn.transaction().map_err(|error| {
-            AlmsError::Runtime(format!("SQLite begin stale-run recovery: {error}"))
-        })?;
+        let mut transaction = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| {
+                AlmsError::Runtime(format!("SQLite begin stale-run recovery: {error}"))
+            })?;
         let stale_runs = {
             let mut stmt = transaction
                 .prepare(
@@ -301,44 +325,26 @@ impl SqliteStore {
         let mut count = 0;
         let claimed_at = Timestamp::now().0.to_rfc3339();
         for mut run in stale_runs {
-            match run.transition(RunTransition::Fail {
-                error: "stale: gateway restarted".to_string(),
-                terminal_reason: "gateway_restarted".to_string(),
-            }) {
-                TransitionOutcome::Applied { .. } => {
-                    let affected = Self::save_run_on(&transaction, &run)?;
-                    if affected != 1 {
-                        self.record_persistence_snapshot_rejection();
-                        return Err(AlmsError::Runtime(format!(
-                            "stale run {} lost its authoritative recovery transition",
-                            run.run_id.0
-                        )));
-                    }
-                    Self::settle_pending_input_on(
-                        &transaction,
-                        run.session_id,
-                        run.run_id,
-                        &claimed_at,
-                    )?;
-                    count += 1;
-                }
-                TransitionOutcome::Rejected { .. } => {
-                    return Err(AlmsError::Runtime(format!(
-                        "stale run {} could not be quarantined at lifecycle revision {}",
-                        run.run_id.0,
-                        run.lifecycle_revision()
-                    )));
-                }
-                TransitionOutcome::NoOp { .. } => {
-                    return Err(AlmsError::Runtime(format!(
-                        "stale run {} produced a no-op recovery transition",
-                        run.run_id.0
-                    )));
-                }
+            let run_id = run.run_id;
+            let session_id = run.session_id;
+            let outcome = Self::in_savepoint(&mut transaction, |savepoint| {
+                self.quarantine_stale_run_on(savepoint, &mut run, &claimed_at)
+            });
+            match outcome {
+                Ok(()) => count += 1,
+                Err(error) => self.report_unreconcilable_run(run_id, session_id, &error),
             }
         }
         for run in terminal_runs_with_pending_input {
-            Self::settle_pending_input_on(&transaction, run.session_id, run.run_id, &claimed_at)?;
+            let run_id = run.run_id;
+            let session_id = run.session_id;
+            let outcome = Self::in_savepoint(&mut transaction, |savepoint| {
+                Self::settle_pending_input_on(savepoint, session_id, run_id, &claimed_at)?;
+                Ok(())
+            });
+            if let Err(error) = outcome {
+                self.report_unreconcilable_run(run_id, session_id, &error);
+            }
         }
         transaction.commit().map_err(|error| {
             AlmsError::Runtime(format!("SQLite commit stale-run recovery: {error}"))
@@ -346,72 +352,157 @@ impl SqliteStore {
         Ok(count)
     }
 
+    /// Run `body` inside a nested savepoint so a per-row failure rolls back
+    /// only that row's writes and leaves the enclosing sweep transaction
+    /// usable for the rows that follow (#1236).
+    ///
+    /// That isolation is not absolute, and the exception is the useful one:
+    /// constraint and application errors (including a `RAISE(ABORT)` trigger)
+    /// are contained to the savepoint, but `SQLITE_FULL`, `SQLITE_IOERR`,
+    /// `SQLITE_NOMEM`, and `SQLITE_INTERRUPT` can roll back the entire
+    /// transaction. That degrades in the right direction — the sweep's
+    /// `commit()` then fails and `mark_stale_runs_failed` returns `Err`,
+    /// restoring fail-closed behaviour for exactly the catastrophic,
+    /// whole-database cases where booting past the problem is not the right
+    /// answer.
+    fn in_savepoint<T>(
+        transaction: &mut Transaction<'_>,
+        body: impl FnOnce(&Connection) -> AlmsResult<T>,
+    ) -> AlmsResult<T> {
+        let savepoint = transaction.savepoint().map_err(|error| {
+            AlmsError::Runtime(format!("SQLite begin stale-run savepoint: {error}"))
+        })?;
+        // `Savepoint`'s drop path rolls back, so the `?` below discards the
+        // row's partial writes without touching the enclosing transaction.
+        let value = body(&savepoint)?;
+        savepoint.commit().map_err(|error| {
+            AlmsError::Runtime(format!("SQLite commit stale-run savepoint: {error}"))
+        })?;
+        Ok(value)
+    }
+
+    /// Transition one stale run to `failed` and release its pending input.
+    fn quarantine_stale_run_on(
+        &self,
+        conn: &Connection,
+        run: &mut Run,
+        claimed_at: &str,
+    ) -> AlmsResult<()> {
+        match run.transition(RunTransition::Fail {
+            error: "stale: gateway restarted".to_string(),
+            terminal_reason: "gateway_restarted".to_string(),
+        }) {
+            TransitionOutcome::Applied { .. } => {}
+            TransitionOutcome::Rejected { .. } => {
+                return Err(AlmsError::Runtime(format!(
+                    "stale run {} could not be quarantined at lifecycle revision {}",
+                    run.run_id.0,
+                    run.lifecycle_revision()
+                )));
+            }
+            TransitionOutcome::NoOp { .. } => {
+                return Err(AlmsError::Runtime(format!(
+                    "stale run {} produced a no-op recovery transition",
+                    run.run_id.0
+                )));
+            }
+        }
+        let affected = Self::save_run_on(conn, run)?;
+        if affected != 1 {
+            self.record_persistence_snapshot_rejection();
+            return Err(AlmsError::Runtime(format!(
+                "stale run {} lost its authoritative recovery transition",
+                run.run_id.0
+            )));
+        }
+        Self::settle_pending_input_on(conn, run.session_id, run.run_id, claimed_at)?;
+        Ok(())
+    }
+
+    /// Log an unreconcilable run row so the line is actionable on its own —
+    /// the `run_id` plus the exact SQL that clears it — and count it for
+    /// `GET /operations/metrics` (#1236).
+    fn report_unreconcilable_run(&self, run_id: RunId, session_id: SessionId, error: &AlmsError) {
+        self.record_stale_run_recovery_failure();
+        tracing::error!(
+            run_id = %run_id.0,
+            session_id = %session_id.0,
+            %error,
+            remediation = %Self::stale_run_remediation_sql(run_id, session_id),
+            "Stale run could not be reconciled at startup — skipped so the daemon can boot. \
+             The row still claims queued/running from a dead process and will never complete; \
+             clear it with the `remediation` SQL after stopping the daemon (#1236)"
+        );
+    }
+
+    /// The SQL an operator runs to clear one unreconcilable stale run.
+    ///
+    /// Two details that are easy to get wrong and are the whole point of
+    /// generating this rather than writing it in a runbook:
+    ///
+    /// - `lifecycle_revision` is capped with `MIN(..., i64::MAX)`. Revision
+    ///   exhaustion at `MAX_LIFECYCLE_REVISION` (`i64::MAX`) is one of the
+    ///   ways a row becomes unreconcilable in the first place, and a bare
+    ///   `+ 1` on `i64::MAX` overflows to a REAL in SQLite, after which the
+    ///   column no longer reads back as an integer revision.
+    /// - The `json_valid` guard is inside each `json_extract` via `CASE`, not
+    ///   a preceding `AND` term, for the same reason
+    ///   [`Self::settle_pending_input_on`] does it: SQLite does not promise a
+    ///   `WHERE` evaluation order, so a preceding guard can be evaluated after
+    ///   the `json_extract` it is supposed to protect and abort the operator's
+    ///   remediation on an unrelated malformed row in the same session.
+    fn stale_run_remediation_sql(run_id: RunId, session_id: SessionId) -> String {
+        let run_id = run_id.0;
+        let session_id = session_id.0;
+        format!(
+            "UPDATE runs SET status = 'failed', error = 'stale: gateway restarted', \
+             terminal_reason = 'gateway_restarted', ended_at = strftime('%Y-%m-%dT%H:%M:%SZ','now'), \
+             lifecycle_revision = MIN(lifecycle_revision + 1, 9223372036854775807) \
+             WHERE run_id = '{run_id}'; \
+             UPDATE messages SET metadata = json_set(json_set(metadata, '$.pending_input', json('false')), \
+             '$.input_claimed_at', strftime('%Y-%m-%dT%H:%M:%SZ','now')) \
+             WHERE session_id = '{session_id}' AND metadata IS NOT NULL \
+             AND json_extract(CASE WHEN json_valid(metadata) THEN metadata ELSE '{{}}' END, '$.run_id') = '{run_id}' \
+             AND json_extract(CASE WHEN json_valid(metadata) THEN metadata ELSE '{{}}' END, '$.pending_input') = 1;"
+        )
+    }
+
+    /// Release the hidden `pending_input` prompt owned by one run.
+    ///
+    /// One statement, evaluated inside SQLite (#1238 S6). The sibling
+    /// `terminal_runs_with_pending_input` query keeps messages as the outer
+    /// loop specifically so startup performs one history scan rather than one
+    /// per terminal run; the previous Rust-side implementation here read and
+    /// JSON-parsed every metadata-bearing message in the session once per
+    /// recovered run, reintroducing exactly what that comment warns against.
+    /// The `json_extract` predicate is the same shape the sibling query
+    /// already uses, including the `json_valid` CASE guard — SQLite does not
+    /// promise a `WHERE` evaluation order, so the guard has to be inside each
+    /// `json_extract` rather than a preceding `AND` term.
     fn settle_pending_input_on(
         conn: &Connection,
         session_id: SessionId,
         run_id: RunId,
         claimed_at: &str,
     ) -> AlmsResult<usize> {
-        let sid = session_id.0.to_string();
-        let mut stmt = conn
-            .prepare(
-                "SELECT id, metadata FROM messages \
-                 WHERE session_id = ?1 AND metadata IS NOT NULL ORDER BY seq",
-            )
-            .map_err(|error| {
-                AlmsError::Runtime(format!("SQLite prepare pending-input recovery: {error}"))
-            })?;
-        let rows = stmt
-            .query_map(params![&sid], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })
-            .map_err(|error| {
-                AlmsError::Runtime(format!("SQLite query pending-input recovery: {error}"))
-            })?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| {
-                AlmsError::Runtime(format!("SQLite parse pending-input recovery: {error}"))
-            })?;
-        drop(stmt);
-
-        let run_id = run_id.0.to_string();
-        let mut settled = 0;
-        for (message_id, metadata_json) in rows {
-            let Ok(mut metadata) = serde_json::from_str::<serde_json::Value>(&metadata_json) else {
-                continue;
-            };
-            if metadata.get("run_id").and_then(serde_json::Value::as_str) != Some(&run_id)
-                || metadata
-                    .get("pending_input")
-                    .and_then(serde_json::Value::as_bool)
-                    != Some(true)
-            {
-                continue;
-            }
-            let Some(object) = metadata.as_object_mut() else {
-                continue;
-            };
-            object.insert("pending_input".to_string(), serde_json::Value::Bool(false));
-            object.insert(
-                "input_claimed_at".to_string(),
-                serde_json::Value::String(claimed_at.to_string()),
-            );
-            let updated = conn
-                .execute(
-                    "UPDATE messages SET metadata = ?1 WHERE id = ?2 AND session_id = ?3",
-                    params![serde_json::to_string(&metadata)?, message_id, &sid],
-                )
-                .map_err(|error| {
-                    AlmsError::Runtime(format!("SQLite settle pending input: {error}"))
-                })?;
-            if updated != 1 {
-                return Err(AlmsError::Runtime(format!(
-                    "pending input message was not updated for stale run {run_id}"
-                )));
-            }
-            settled += 1;
-        }
-        Ok(settled)
+        conn.execute(
+            r#"UPDATE messages
+                  SET metadata = json_set(
+                        json_set(metadata, '$.pending_input', json('false')),
+                        '$.input_claimed_at', ?3)
+                WHERE session_id = ?1
+                  AND metadata IS NOT NULL
+                  AND json_extract(
+                        CASE WHEN json_valid(metadata) THEN metadata ELSE '{}' END,
+                        '$.run_id'
+                      ) = ?2
+                  AND json_extract(
+                        CASE WHEN json_valid(metadata) THEN metadata ELSE '{}' END,
+                        '$.pending_input'
+                      ) = 1"#,
+            params![session_id.0.to_string(), run_id.0.to_string(), claimed_at],
+        )
+        .map_err(|error| AlmsError::Runtime(format!("SQLite settle pending input: {error}")))
     }
 }
 
@@ -655,8 +746,12 @@ mod tests {
         assert_eq!(c.output.as_deref(), Some("done"));
     }
 
+    /// #1236: an unreconcilable row rolls back to its own savepoint — the run
+    /// keeps its pre-sweep status and the prompt is not partially released —
+    /// but the sweep itself succeeds so the daemon still boots. Pre-#1236 the
+    /// whole sweep aborted and `Gateway::new` propagated the error.
     #[test]
-    fn stale_run_recovery_rolls_back_status_when_pending_input_update_fails() {
+    fn stale_run_recovery_skips_the_unreconcilable_row_and_still_boots() {
         let store = SqliteStore::open_in_memory().unwrap();
         let session = new_session();
         store.save_session(&session).unwrap();
@@ -672,6 +767,13 @@ mod tests {
             })),
         };
         store.save_run_with_initial_message(&run, &message).unwrap();
+
+        // A second stale run with no injected fault — it must still recover.
+        let mut healthy = new_run(session.id, session.agent_id);
+        healthy.mark_running();
+        let healthy_id = healthy.run_id;
+        store.save_run(&healthy).unwrap();
+
         store
             .conn
             .lock()
@@ -685,15 +787,22 @@ mod tests {
             )
             .unwrap();
 
-        let error = store.mark_stale_runs_failed().unwrap_err();
+        let recovered = store
+            .mark_stale_runs_failed()
+            .expect("one bad row must not stop startup recovery");
+        assert_eq!(recovered, 1, "the healthy stale run still recovers");
+        assert_eq!(store.stale_run_recovery_failures_total(), 1);
+
         assert!(
-            error
-                .to_string()
-                .contains("injected pending-input recovery failure")
+            matches!(
+                store.load_run(run.run_id).unwrap().unwrap().status(),
+                RunStatus::Queued
+            ),
+            "the skipped row keeps its pre-sweep status"
         );
         assert!(matches!(
-            store.load_run(run.run_id).unwrap().unwrap().status(),
-            RunStatus::Queued
+            store.load_run(healthy_id).unwrap().unwrap().status(),
+            RunStatus::Failed
         ));
         let messages = store.load_messages(session.id).unwrap();
         assert_eq!(
@@ -702,7 +811,149 @@ mod tests {
         );
         assert!(
             messages[0].metadata.as_ref().unwrap()["input_claimed_at"].is_null(),
-            "the failed transaction must not partially release the prompt"
+            "the rolled-back savepoint must not partially release the prompt"
+        );
+    }
+
+    /// #1236: the remediation line an operator gets must be actionable on its
+    /// own — it names the run and carries runnable SQL for both halves of the
+    /// split state (the run row and its hidden pending input).
+    ///
+    /// Exercised against the two conditions that actually produce an
+    /// unreconcilable row rather than an empty schema: a run whose lifecycle
+    /// revision is already exhausted at `i64::MAX` (a bare `+ 1` there
+    /// overflows to a REAL), and a sibling message with malformed JSON
+    /// metadata in the same session (a preceding `AND json_valid(...)` guard
+    /// can be evaluated after the `json_extract` it protects and abort).
+    #[test]
+    fn unreconcilable_run_remediation_sql_clears_the_row_it_names() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let session = new_session();
+        store.save_session(&session).unwrap();
+
+        let stuck = Run::from_persisted(
+            RunId::new(),
+            session.id,
+            session.agent_id,
+            RunStatus::Queued,
+            "stuck".to_string(),
+            None,
+            None,
+            None,
+            chrono::Utc::now(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            alms_core::MAX_LIFECYCLE_REVISION,
+            None,
+        );
+        store.save_run(&stuck).unwrap();
+        store
+            .save_message(
+                session.id,
+                &Message {
+                    id: "stuck-input".to_string(),
+                    role: Role::User,
+                    content: Content::Text("stuck".to_string()),
+                    timestamp: Timestamp::now(),
+                    metadata: Some(serde_json::json!({
+                        "pending_input": true,
+                        "run_id": stuck.run_id.0.to_string(),
+                    })),
+                },
+            )
+            .unwrap();
+        // A sibling row in the same session whose metadata is not valid JSON.
+        store
+            .save_message(
+                session.id,
+                &Message {
+                    id: "malformed-neighbour".to_string(),
+                    role: Role::Assistant,
+                    content: Content::Text("noise".to_string()),
+                    timestamp: Timestamp::now(),
+                    metadata: Some(serde_json::json!({"unrelated": true})),
+                },
+            )
+            .unwrap();
+        store
+            .conn
+            .lock()
+            .execute(
+                "UPDATE messages SET metadata = '{not valid json' WHERE id = ?1",
+                params!["malformed-neighbour"],
+            )
+            .unwrap();
+
+        let sql = SqliteStore::stale_run_remediation_sql(stuck.run_id, session.id);
+        assert!(sql.contains(&stuck.run_id.0.to_string()));
+        assert!(sql.contains(&session.id.0.to_string()));
+
+        store
+            .conn
+            .lock()
+            .execute_batch(&sql)
+            .expect("remediation SQL must survive an exhausted revision and malformed neighbour");
+
+        let cleared = store.load_run(stuck.run_id).unwrap().unwrap();
+        assert_eq!(
+            cleared.status(),
+            RunStatus::Failed,
+            "the remediation must actually clear the row it names"
+        );
+        assert_eq!(cleared.terminal_reason(), Some("gateway_restarted"));
+        assert_eq!(
+            cleared.lifecycle_revision(),
+            alms_core::MAX_LIFECYCLE_REVISION,
+            "an exhausted revision must saturate, not overflow into a REAL"
+        );
+
+        let messages = store.load_messages(session.id).unwrap();
+        let input = messages
+            .iter()
+            .find(|message| message.id == "stuck-input")
+            .expect("the pending input must still exist");
+        let metadata = input.metadata.as_ref().unwrap();
+        assert_eq!(metadata["pending_input"], false);
+        assert!(metadata["input_claimed_at"].is_string());
+    }
+
+    /// The messages half of the remediation must not re-stamp a message that
+    /// was already claimed — it carries the same `pending_input = 1` predicate
+    /// the sweep's own `settle_pending_input_on` uses.
+    #[test]
+    fn remediation_sql_does_not_restamp_already_claimed_input() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let session = new_session();
+        store.save_session(&session).unwrap();
+        let run = new_run(session.id, session.agent_id);
+        store
+            .save_message(
+                session.id,
+                &Message {
+                    id: "already-claimed".to_string(),
+                    role: Role::User,
+                    content: Content::Text("hello".to_string()),
+                    timestamp: Timestamp::now(),
+                    metadata: Some(serde_json::json!({
+                        "pending_input": false,
+                        "input_claimed_at": "2020-01-01T00:00:00Z",
+                        "run_id": run.run_id.0.to_string(),
+                    })),
+                },
+            )
+            .unwrap();
+
+        let sql = SqliteStore::stale_run_remediation_sql(run.run_id, session.id);
+        store.conn.lock().execute_batch(&sql).unwrap();
+
+        let messages = store.load_messages(session.id).unwrap();
+        let metadata = messages[0].metadata.as_ref().unwrap();
+        assert_eq!(
+            metadata["input_claimed_at"], "2020-01-01T00:00:00Z",
+            "an already-claimed input must keep its original claim timestamp"
         );
     }
 

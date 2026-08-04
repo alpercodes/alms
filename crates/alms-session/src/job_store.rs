@@ -7,8 +7,8 @@ use alms_core::job::{
 };
 use alms_core::{AlmsError, AlmsResult, MAX_LIFECYCLE_REVISION};
 use dashmap::DashMap;
-#[cfg(test)]
-use std::sync::atomic::AtomicBool;
+#[cfg(any(test, feature = "test-support"))]
+use std::sync::atomic::AtomicU32;
 use std::sync::{
     Arc,
     atomic::{AtomicU64, Ordering},
@@ -45,16 +45,22 @@ pub enum DispatchFailureOutcome {
 }
 /// Manages scheduled jobs in memory, with optional SQLite write-through.
 ///
-/// On startup, all non-terminal jobs are loaded from SQLite so the scheduler
-/// can re-register pending/active/retrying work without resurrecting outcomes.
+/// On startup, the complete persisted job history is loaded from SQLite —
+/// terminal rows included — so cancelled, completed, and retry-exhausted jobs
+/// stay observable after a restart instead of silently disappearing from
+/// `GET /jobs`. `bootstrap_scheduler` re-registers only the non-terminal ones,
+/// so loading history never resurrects a finished outcome.
 #[derive(Debug, Clone)]
 pub struct JobStore {
     jobs: Arc<DashMap<JobId, Job>>,
     store: Option<Arc<SqliteStore>>,
     retry_attempts: Arc<AtomicU64>,
     retry_exhaustions: Arc<AtomicU64>,
-    #[cfg(test)]
-    fail_next_persistence: Arc<AtomicBool>,
+    rearm_failures: Arc<AtomicU64>,
+    boot_catch_ups: Arc<AtomicU64>,
+    bootstrap_failures: Arc<AtomicU64>,
+    #[cfg(any(test, feature = "test-support"))]
+    fail_next_persistence: Arc<AtomicU32>,
 }
 
 impl Default for JobStore {
@@ -71,8 +77,11 @@ impl JobStore {
             store: None,
             retry_attempts: Arc::new(AtomicU64::new(0)),
             retry_exhaustions: Arc::new(AtomicU64::new(0)),
-            #[cfg(test)]
-            fail_next_persistence: Arc::new(AtomicBool::new(false)),
+            rearm_failures: Arc::new(AtomicU64::new(0)),
+            boot_catch_ups: Arc::new(AtomicU64::new(0)),
+            bootstrap_failures: Arc::new(AtomicU64::new(0)),
+            #[cfg(any(test, feature = "test-support"))]
+            fail_next_persistence: Arc::new(AtomicU32::new(0)),
         }
     }
 
@@ -82,6 +91,45 @@ impl JobStore {
 
     pub fn retry_exhaustions_total(&self) -> u64 {
         self.retry_exhaustions.load(Ordering::Relaxed)
+    }
+
+    /// Episode-close writes that exhausted their retry budget (#1233).
+    ///
+    /// Non-zero means at least one job advanced its schedule in memory only:
+    /// the durable `next_run_at` / `last_run_at` for that job is stale until
+    /// its next successful run, and a restart replays the recorded tick.
+    pub fn rearm_failures_total(&self) -> u64 {
+        self.rearm_failures.load(Ordering::Relaxed)
+    }
+
+    /// Record an episode-close write that exhausted its retry budget (#1233).
+    pub fn record_rearm_failure(&self) {
+        self.rearm_failures.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Jobs whose persisted fire time was already past due at boot and were
+    /// therefore staggered into the catch-up cohort (#1235). Counts jobs that
+    /// were actually registered, not merely planned.
+    pub fn boot_catch_ups_total(&self) -> u64 {
+        self.boot_catch_ups.load(Ordering::Relaxed)
+    }
+
+    /// Jobs that could not be re-registered with the scheduler at startup and
+    /// were skipped so the daemon could still start (#1236 applied to jobs).
+    ///
+    /// Non-zero means those jobs will not fire until repaired or recreated.
+    pub fn bootstrap_failures_total(&self) -> u64 {
+        self.bootstrap_failures.load(Ordering::Relaxed)
+    }
+
+    /// Record a job that could not be bootstrapped into the scheduler.
+    pub fn record_bootstrap_failure(&self) {
+        self.bootstrap_failures.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record the size of the boot-time catch-up cohort (#1235).
+    pub fn record_boot_catch_ups(&self, count: u64) {
+        self.boot_catch_ups.fetch_add(count, Ordering::Relaxed);
     }
 
     /// Create a SQLite-backed store and reload the complete job history.
@@ -301,8 +349,8 @@ impl JobStore {
             )));
         }
         if outcome.is_applied() {
-            #[cfg(test)]
-            if self.fail_next_persistence.swap(false, Ordering::AcqRel) {
+            #[cfg(any(test, feature = "test-support"))]
+            if self.take_injected_persistence_failure() {
                 return Err(AlmsError::Runtime(
                     "injected job persistence failure".to_string(),
                 ));
@@ -316,9 +364,46 @@ impl JobStore {
         Ok(Some(outcome))
     }
 
-    #[cfg(test)]
-    fn inject_next_persistence_failure(&self) {
-        self.fail_next_persistence.store(true, Ordering::Release);
+    /// Test hook: fail the durable write of the next applied transition.
+    ///
+    /// Neither memory nor SQLite advances on that failure, which is the exact
+    /// shape a transient SQLite error produces at episode close (#1233).
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn inject_next_persistence_failure(&self) {
+        self.inject_persistence_failures(1);
+    }
+
+    /// Test hook: fail the durable write of the next `count` applied
+    /// transitions, so a bounded retry budget can be driven to exhaustion.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn inject_persistence_failures(&self, count: u32) {
+        self.fail_next_persistence.store(count, Ordering::Release);
+    }
+
+    /// Consume one injected failure, if any remain.
+    ///
+    /// A `compare_exchange_weak` countdown rather than `fetch_update`: the
+    /// latter is deprecated on current nightly (renamed to the still-unstable
+    /// `try_update`), and this block only compiles under `cfg(test)` or the
+    /// `test-support` feature, so it is precisely the code an unpinned
+    /// toolchain bump can break without a plain `cargo clippy` noticing.
+    #[cfg(any(test, feature = "test-support"))]
+    fn take_injected_persistence_failure(&self) -> bool {
+        let mut remaining = self.fail_next_persistence.load(Ordering::Acquire);
+        loop {
+            if remaining == 0 {
+                return false;
+            }
+            match self.fail_next_persistence.compare_exchange_weak(
+                remaining,
+                remaining - 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(observed) => remaining = observed,
+            }
+        }
     }
 
     /// Flush the SQLite WAL to disk. No-op if no SQLite store is attached.

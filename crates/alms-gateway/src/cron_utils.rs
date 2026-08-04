@@ -19,21 +19,18 @@ pub fn next_after(expr: &str, after: DateTime<Utc>) -> Option<DateTime<Utc>> {
     schedule.after(&after).next()
 }
 
-/// Compute the next fire time for a job given the current time.
+/// The job's own next schedule time, **unclamped**.
 ///
-/// - `Once`: returns `run_at`, clamped 1 second into the future if past-due
-///   (so missed jobs fire almost immediately on restart).
-/// - `Recurring`: returns the next cron occurrence after `now`.
-pub fn compute_next_fire(job: &Job, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+/// - `Once`: returns `run_at` verbatim, even when it is already past due.
+/// - `Recurring`: returns the next cron occurrence strictly after `now`.
+///
+/// Deliberately does not clamp a past-due one-shot into the future. Whether a
+/// missed tick fires — and how soon — is `bootstrap_scheduler`'s decision,
+/// which staggers the past-due cohort (#1235); a clamp here would hide the
+/// past-dueness and let such a job escape the stagger.
+pub fn schedule_fire_at(job: &Job, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
     match &job.schedule {
-        JobSchedule::Once { run_at } => {
-            let t = if *run_at <= now {
-                now + chrono::Duration::seconds(1)
-            } else {
-                *run_at
-            };
-            Some(t)
-        }
+        JobSchedule::Once { run_at } => Some(*run_at),
         JobSchedule::Recurring { cron } => next_after(cron, now),
     }
 }
@@ -57,22 +54,34 @@ mod tests {
     }
 
     #[test]
-    fn test_compute_next_fire_once_future() {
+    fn test_schedule_fire_at_once_future() {
         let run_at = Utc::now() + chrono::Duration::hours(1);
         let job = make_once_job(run_at);
-        let next = compute_next_fire(&job, Utc::now()).unwrap();
-        assert_eq!(next, run_at);
+        assert_eq!(schedule_fire_at(&job, Utc::now()), Some(run_at));
+    }
+
+    /// A past-due one-shot reports its real (past) time so the caller can see
+    /// that it is a missed tick. `bootstrap_scheduler` owns the catch-up
+    /// decision and the #1235 stagger; clamping here would hide it.
+    #[test]
+    fn test_schedule_fire_at_once_past_due_is_not_clamped() {
+        let run_at = Utc::now() - chrono::Duration::hours(1);
+        let job = make_once_job(run_at);
+        assert_eq!(schedule_fire_at(&job, Utc::now()), Some(run_at));
     }
 
     #[test]
-    fn test_compute_next_fire_once_past_due() {
-        let run_at = Utc::now() - chrono::Duration::hours(1);
-        let job = make_once_job(run_at);
+    fn test_schedule_fire_at_recurring_is_always_future() {
         let now = Utc::now();
-        let next = compute_next_fire(&job, now).unwrap();
-        // Should be ~1s in the future, not the past run_at
-        assert!(next > now);
-        assert!(next <= now + chrono::Duration::seconds(2));
+        let job = Job::new(
+            alms_core::AgentId::new(),
+            "test".to_string(),
+            JobSchedule::Recurring {
+                cron: "0 * * * *".to_string(),
+            },
+            None,
+        );
+        assert!(schedule_fire_at(&job, now).unwrap() > now);
     }
 
     fn make_once_job(run_at: DateTime<Utc>) -> Job {

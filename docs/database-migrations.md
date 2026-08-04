@@ -99,6 +99,39 @@ main file while the daemon is running.
 
 ## Roll back to the checkpoint binary
 
+> ### ⚠️ Rolling back the binary without restoring the backup RE-EXECUTES COMPLETED JOBS
+>
+> This is a **fail-open** hazard, not a compatibility inconvenience. Nothing
+> in the checkpoint binary stops it. If you redeploy
+> `v0.2.4-pre-stabilization` and leave a schema-3 database in place, then
+> roughly **one second after startup, every finished one-shot job and every
+> retry-exhausted job fires again** — real agent prompts, real LLM spend, real
+> side effects.
+>
+> The chain, verified against the checkpoint source:
+>
+> 1. The checkpoint has **no `sqlite/migrations.rs`**. The newer-schema
+>    refusal guard arrived in #1224, *after* the checkpoint, so it opens a
+>    schema-3 database without complaint.
+> 2. Its `str_to_job_status` maps only `active` and `cancelled`. Everything
+>    else — including the new `completed` and `failed` — falls through to
+>    **`Pending`**.
+> 3. Its `load_all_jobs` filter is `WHERE status != 'cancelled'`, so those
+>    rows load.
+> 4. Its `bootstrap_scheduler` skips only `Cancelled`, and `compute_next_fire`
+>    clamps a past-due one-shot to one second out.
+>
+> **Restoring the pre-migration backup is mandatory, not advisory.** If no
+> usable backup exists, do not roll back the binary — stay on the current
+> release and open an issue instead.
+>
+> Leaving the schema-3 database in place fails *open* rather than closed
+> because the checkpoint's own load filter excludes only `cancelled`, and
+> making migration v3 write a status the checkpoint excludes would mean
+> re-encoding completion as `cancelled` — exactly the ambiguity schema 3
+> exists to remove. The hazard is therefore documented rather than designed
+> away.
+
 Schema 3 is not semantically compatible with the pre-stabilization checkpoint:
 the checkpoint does not understand the `completed` and `failed` job states.
 Rolling back code therefore also requires restoring the database backup taken
@@ -110,6 +143,20 @@ before the migration.
 4. Ensure no WAL/SHM files from schema 3 remain beside the restored file.
 5. Run `PRAGMA integrity_check;`.
 6. Start `v0.2.4-pre-stabilization` and verify core reads.
+
+Step 3 is the step that prevents the re-execution described above. Do not skip
+it, and do not start the checkpoint binary between steps 1 and 3.
+
+If you must inspect a schema-3 database with the checkpoint binary and accept
+no job execution at all, cancel every job first so the checkpoint's
+`status != 'cancelled'` filter excludes them:
+
+~~~sql
+UPDATE jobs SET status = 'cancelled' WHERE status IN ('completed', 'failed');
+~~~
+
+Run that against a **copy**, never the preserved schema-3 original — it
+destroys the completed/failed distinction schema 3 introduced.
 
 Never edit or delete `schema_migrations` to force an older binary to open a
 newer database. Restore a compatible snapshot instead.

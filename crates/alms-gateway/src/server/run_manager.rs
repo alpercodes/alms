@@ -361,6 +361,14 @@ impl RunManager {
     /// First marks any stale `queued`/`running` rows as `failed` (leftovers
     /// from a previous process that crashed or was killed), then loads recent
     /// terminal runs (completed/failed/cancelled) from the last 7 days.
+    ///
+    /// Since #1236 a row that cannot be reconciled is skipped inside the sweep
+    /// (logged with its remediation SQL and counted in
+    /// `stale_run_recovery_failures_total`), so the `Err` arm below is reached
+    /// only when the sweep transaction itself cannot begin or commit — a
+    /// whole-database problem, not one bad row. Such a skipped row is then
+    /// also excluded from the in-memory projection: booting past it must not
+    /// mean serving it as a live pending run.
     pub fn hydrate_from_store(&self) {
         let Some(store) = &self.sqlite_store else {
             return;
@@ -386,12 +394,43 @@ impl RunManager {
 
         match store.load_all_runs() {
             Ok(runs) => {
-                let loaded = runs.len();
+                let mut loaded = 0usize;
+                let mut unreconciled = 0usize;
                 for run in runs {
+                    // `load_all_runs` has no status filter, so after a
+                    // successful sweep any row still `Queued`/`Running` is by
+                    // definition one the sweep failed to reconcile — it is
+                    // already counted in `stale_run_recovery_failures_total`
+                    // and logged with its remediation SQL. Leaving it durable
+                    // is right; projecting it into the live registry is not.
+                    // A phantom pending run reads as real to `has_active_runs`
+                    // (making the session permanently undeletable via
+                    // `DELETE /sessions/{id}`, which is the operator's natural
+                    // remediation), pins `has_active_run: true` on the sidebar
+                    // forever, and — because it predates this process — sorts
+                    // to the head of the `created_at ASC` queue, shifting every
+                    // real queue position for that agent.
+                    if matches!(
+                        run.status(),
+                        alms_core::RunStatus::Queued | alms_core::RunStatus::Running
+                    ) {
+                        unreconciled += 1;
+                        continue;
+                    }
                     self.runs.insert(run.run_id, run);
+                    loaded += 1;
                 }
                 if loaded > 0 {
                     info!("Loaded {} persisted runs from SQLite", loaded);
+                }
+                if unreconciled > 0 {
+                    tracing::error!(
+                        unreconciled,
+                        "Skipped {unreconciled} unreconciled queued/running run row(s) during \
+                         hydration — they stay durable and are reported by \
+                         stale_run_recovery_failures_total, but are not projected as live runs \
+                         (#1236)"
+                    );
                 }
             }
             Err(e) => {
@@ -1701,10 +1740,23 @@ mod tests {
         assert_eq!(recovered.output, None);
     }
 
+    /// #1236: a run row that cannot be reconciled — here one whose lifecycle
+    /// revision is exhausted, so the recovery transition is rejected — is
+    /// skipped rather than aborting startup. Until #1236 this arm errored the
+    /// whole sweep, `hydrate_from_store` bailed, and (via `Gateway::new`) the
+    /// daemon would not boot at all. One bad row must not blank out run state
+    /// or keep the gateway down; it is counted and logged with its remediation
+    /// SQL instead.
+    ///
+    /// It must ALSO not be projected into the live registry. Booting past the
+    /// row is the point; serving it as a real pending run is not — that would
+    /// make its session permanently undeletable (`DELETE /sessions/{id}`
+    /// returns 409 `ACTIVE_RUNS`), pin the sidebar's active-run indicator on
+    /// forever, and shift every real queue position for the agent.
     #[test]
-    fn hydration_fails_closed_when_stale_revision_is_exhausted() {
+    fn unreconcilable_stale_run_is_skipped_without_blocking_hydration() {
         let store = Arc::new(alms_session::SqliteStore::open_in_memory().unwrap());
-        let run = Run::from_persisted(
+        let exhausted = Run::from_persisted(
             RunId::new(),
             SessionId::new(),
             AgentId::new(),
@@ -1722,14 +1774,37 @@ mod tests {
             alms_core::MAX_LIFECYCLE_REVISION,
             None,
         );
-        let run_id = run.run_id;
-        store.save_run(&run).unwrap();
+        let exhausted_id = exhausted.run_id;
+        store.save_run(&exhausted).unwrap();
 
-        let manager = RunManager::new().with_store(store);
+        let mut healthy = Run::new(SessionId::new(), AgentId::new(), "healthy".to_string());
+        assert!(healthy.mark_running());
+        let healthy_id = healthy.run_id;
+        store.save_run(&healthy).unwrap();
+
+        let manager = RunManager::new().with_store(Arc::clone(&store));
         manager.hydrate_from_store();
+
+        assert_eq!(
+            store.stale_run_recovery_failures_total(),
+            1,
+            "the unreconcilable row must be counted, not silently dropped"
+        );
+        assert_eq!(
+            manager.get_run(healthy_id).map(|run| run.status()),
+            Some(alms_core::RunStatus::Failed),
+            "the other stale run must still be quarantined and hydrated"
+        );
         assert!(
-            manager.get_run(run_id).is_none(),
-            "failed recovery must not hydrate an active exhausted run"
+            manager.get_run(exhausted_id).is_none(),
+            "failed recovery must not hydrate an active exhausted run: a phantom \
+             pending run makes its session permanently undeletable, pins the \
+             active-run indicator, and shifts real queue positions"
+        );
+        assert!(
+            store.load_run(exhausted_id).unwrap().is_some(),
+            "the row stays durable and operator-findable — only the in-memory \
+             projection is suppressed"
         );
     }
 

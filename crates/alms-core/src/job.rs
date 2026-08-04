@@ -318,8 +318,13 @@ impl Job {
                 self.status = JobStatus::Cancelled;
                 self.next_run_at = None;
                 self.terminal_reason = Some(JobTerminalReason::OperatorCancelled);
-                self.retry_count = 0;
-                self.last_error = None;
+                // `retry_count` / `last_error` deliberately survive
+                // cancellation (#1238 S7). Clearing them on a *successful*
+                // run is right — the failures are resolved. Clearing them
+                // here is not: the most likely reason an operator cancels a
+                // job is that they watched it fail three times, so wiping the
+                // counter and the last error erases the evidence the UI was
+                // showing them at the moment they acted on it.
                 JobStatus::Cancelled
             }
         };
@@ -517,5 +522,44 @@ mod tests {
         );
         assert_eq!(job.retry_count(), 0);
         assert_eq!(job.last_error(), None);
+    }
+
+    /// #1238 S7: cancelling must NOT erase the retry diagnostic. Clearing it
+    /// on a successful run is right (the failures are resolved); clearing it
+    /// on cancel destroys the very evidence that prompted the cancellation.
+    #[test]
+    fn cancelling_a_retrying_job_preserves_its_retry_diagnostic() {
+        let mut job = job(JobSchedule::Recurring {
+            cron: "* * * * *".to_string(),
+        });
+        for error in ["first", "second"] {
+            assert!(
+                job.transition(JobTransition::RecordDispatchFailure {
+                    error: error.to_string(),
+                    retry_at: Utc::now(),
+                    max_attempts: 5,
+                })
+                .is_applied()
+            );
+        }
+
+        assert!(job.transition(JobTransition::Cancel).is_applied());
+
+        assert_eq!(job.status(), JobStatus::Cancelled);
+        assert_eq!(
+            job.terminal_reason(),
+            Some(JobTerminalReason::OperatorCancelled)
+        );
+        assert_eq!(job.next_run_at, None);
+        assert_eq!(
+            job.retry_count(),
+            2,
+            "the operator cancelled BECAUSE it kept failing — keep the count"
+        );
+        assert_eq!(
+            job.last_error(),
+            Some("second"),
+            "the last error the UI rendered must survive the cancellation"
+        );
     }
 }

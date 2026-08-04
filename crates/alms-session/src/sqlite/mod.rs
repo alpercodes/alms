@@ -186,6 +186,7 @@ CREATE INDEX IF NOT EXISTS idx_session_summaries_agent
 pub struct SqliteStore {
     conn: Arc<Mutex<Connection>>,
     persistence_snapshot_rejections: Arc<std::sync::atomic::AtomicU64>,
+    stale_run_recovery_failures: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl std::fmt::Debug for SqliteStore {
@@ -199,6 +200,7 @@ impl Clone for SqliteStore {
         Self {
             conn: Arc::clone(&self.conn),
             persistence_snapshot_rejections: Arc::clone(&self.persistence_snapshot_rejections),
+            stale_run_recovery_failures: Arc::clone(&self.stale_run_recovery_failures),
         }
     }
 }
@@ -212,6 +214,7 @@ impl SqliteStore {
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
             persistence_snapshot_rejections: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            stale_run_recovery_failures: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         })
     }
 
@@ -223,6 +226,7 @@ impl SqliteStore {
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
             persistence_snapshot_rejections: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            stale_run_recovery_failures: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         })
     }
 
@@ -233,6 +237,20 @@ impl SqliteStore {
 
     pub(super) fn record_persistence_snapshot_rejection(&self) {
         self.persistence_snapshot_rejections
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Run rows that could not be reconciled by the startup stale-run sweep
+    /// (#1236). Each one is a durable row still claiming `queued`/`running`
+    /// from a dead process; the sweep logs the `run_id` and its remediation
+    /// SQL, then continues so one bad row cannot keep the daemon down.
+    pub fn stale_run_recovery_failures_total(&self) -> u64 {
+        self.stale_run_recovery_failures
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub(super) fn record_stale_run_recovery_failure(&self) {
+        self.stale_run_recovery_failures
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 

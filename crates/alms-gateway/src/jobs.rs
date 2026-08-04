@@ -225,7 +225,13 @@ pub async fn cancel_job(
             Some(job) => api_error(
                 StatusCode::CONFLICT,
                 "JOB_TERMINAL",
-                format!("job is already terminal ({:?})", job.status()).to_lowercase(),
+                // Lowercase only the status variant, not the whole sentence
+                // (#1238 N2) — harmless today, wrong the moment the wording
+                // gains a proper noun.
+                format!(
+                    "job is already terminal ({})",
+                    format!("{:?}", job.status()).to_lowercase()
+                ),
             )
             .into_response(),
             None => api_error(StatusCode::NOT_FOUND, "NOT_FOUND", "job not found").into_response(),

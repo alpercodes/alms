@@ -342,64 +342,193 @@ async fn shutdown_signal(token: CancellationToken, run_manager: RunManager) {
     }
 }
 
+/// Delay before the first boot-time catch-up firing (#1235). Preserves the
+/// pre-stagger head start so a single missed job still fires promptly.
+const BOOT_CATCH_UP_LEAD_SECS: i64 = 1;
+
+/// Fixed spacing between successive boot-time catch-up firings (#1235).
+///
+/// Phase 7 made persisted `next_run_at` win for every schedule type, so a
+/// past-due tick became `now + 1s` — after any downtime, every recurring job
+/// plus every unfired one-shot fired within one second of startup,
+/// concurrently, bounded only by the agent queue. Restarting the gateway
+/// became a spend event proportional to how long the daemon was down.
+///
+/// Fixed spacing is chosen over jitter or a concurrency cap because it is
+/// deterministic (directly testable, reproducible in an incident) and it caps
+/// the catch-up *rate* rather than just the instantaneous concurrency: a
+/// concurrency cap still lets N jobs run as fast as the queue drains them.
+/// The spread is intentionally unbounded in cohort size — spreading 200
+/// missed jobs over 50 minutes is the desired outcome, not a burst.
+const BOOT_CATCH_UP_SPACING_SECS: i64 = 15;
+
 /// Re-register all non-terminal persisted jobs with the scheduler on startup.
+///
+/// Jobs whose fire time is still in the future keep their real schedule.
+/// Jobs that are already past due form the **catch-up cohort** and are
+/// staggered by [`plan_catch_up_cohort`] instead of all firing at once.
 async fn bootstrap_scheduler(state: &AppState) -> AlmsResult<()> {
     let now = chrono::Utc::now();
     let jobs = state.job_store.list();
-    let mut registered = 0usize;
+    let mut scheduled: Vec<(alms_core::JobId, chrono::DateTime<chrono::Utc>)> = Vec::new();
+    let mut catch_up: Vec<(alms_core::JobId, chrono::DateTime<chrono::Utc>)> = Vec::new();
 
     for job in jobs {
-        let Some(fire_at) = bootstrap_fire_at(&job, now) else {
-            if !job.status().is_terminal() {
-                tracing::warn!("Job {} has no future fire time, skipping bootstrap", job.id);
+        match bootstrap_fire_at(&job, now) {
+            Some(BootstrapFire::Scheduled(fire_at)) => scheduled.push((job.id, fire_at)),
+            Some(BootstrapFire::CatchUp { due_at }) => catch_up.push((job.id, due_at)),
+            None => {
+                if !job.status().is_terminal() {
+                    tracing::warn!("Job {} has no future fire time, skipping bootstrap", job.id);
+                }
             }
-            continue;
-        };
+        }
+    }
+
+    // Catch-up entries are tagged so the cohort counter reflects what was
+    // actually registered, not what was merely planned.
+    let mut registrations: Vec<(alms_core::JobId, chrono::DateTime<chrono::Utc>, bool)> = scheduled
+        .into_iter()
+        .map(|(id, at)| (id, at, false))
+        .collect();
+    registrations.extend(
+        plan_catch_up_cohort(catch_up, now)
+            .into_iter()
+            .map(|(id, at)| (id, at, true)),
+    );
+
+    let mut registered = 0usize;
+    let mut registered_catch_ups = 0u64;
+    let mut skipped = 0usize;
+    for (job_id, fire_at, is_catch_up) in registrations {
         // Persist the recovery point before projecting it into the scheduler.
-        state.job_store.update_next_run_at(job.id, Some(fire_at))?;
+        //
+        // A per-row failure is skipped rather than propagated (#1236's
+        // argument, applied to jobs). `update_next_run_at` errors on a
+        // `save_job` failure or on lifecycle-revision exhaustion; propagating
+        // it aborted this whole loop AND `serve_with_gateway`, so one bad job
+        // row meant no jobs scheduled at all and a daemon that would not
+        // start. The stagger sharpens that: the cohort is ordered
+        // most-overdue-first, so the likeliest-corrupt legacy row is processed
+        // first and would take the largest share of the cohort with it. The
+        // fail-open-vs-fail-closed policy this shares with the stale-run sweep
+        // is tracked in #1237; both sweeps now skip rather than brick.
+        if let Err(error) = state.job_store.update_next_run_at(job_id, Some(fire_at)) {
+            state.job_store.record_bootstrap_failure();
+            skipped += 1;
+            tracing::error!(
+                %job_id,
+                %fire_at,
+                %error,
+                "Could not persist a job's startup fire time — skipping it so the remaining \
+                 jobs still schedule and the daemon still starts. This job will not fire until \
+                 it is repaired or recreated (#1236)"
+            );
+            continue;
+        }
         let delay = (fire_at - now)
             .to_std()
             .unwrap_or(std::time::Duration::ZERO);
         let instant = tokio::time::Instant::now() + delay;
-        state.scheduler.schedule_once(job.id, instant).await;
+        state.scheduler.schedule_once(job_id, instant).await;
         registered += 1;
+        if is_catch_up {
+            registered_catch_ups += 1;
+        }
     }
 
     if registered > 0 {
         info!("Bootstrapped {} job(s) into scheduler", registered);
     }
+    if skipped > 0 {
+        tracing::error!(
+            skipped,
+            "{skipped} job(s) could not be bootstrapped and will not fire — see \
+             job_bootstrap_failures_total"
+        );
+    }
+    if registered_catch_ups > 0 {
+        state.job_store.record_boot_catch_ups(registered_catch_ups);
+        let span_secs = BOOT_CATCH_UP_LEAD_SECS
+            + BOOT_CATCH_UP_SPACING_SECS * (registered_catch_ups.saturating_sub(1) as i64);
+        tracing::warn!(
+            cohort = registered_catch_ups,
+            spacing_secs = BOOT_CATCH_UP_SPACING_SECS,
+            span_secs,
+            "Boot catch-up: {registered_catch_ups} job(s) were past due and will fire staggered \
+             over ~{span_secs}s, most-overdue first (#1235)"
+        );
+    }
     Ok(())
 }
 
-/// Resolve the authoritative startup fire time for one persisted job.
+/// How one persisted job should be re-registered at startup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BootstrapFire {
+    /// A future intent — fire at exactly this time, unstaggered.
+    Scheduled(chrono::DateTime<chrono::Utc>),
+    /// A missed tick. Carries the original due time so the catch-up cohort
+    /// can be ordered most-overdue-first.
+    CatchUp {
+        due_at: chrono::DateTime<chrono::Utc>,
+    },
+}
+
+/// Resolve how one persisted job re-enters the scheduler at startup.
 ///
 /// `next_run_at` is the durable scheduler intent written before the in-memory
 /// projection. It therefore wins for every schedule type, not only retries.
-/// A past-due intent is caught up once immediately; the cron expression is
-/// consulted only for legacy/new rows that have no persisted intent yet.
+/// The cron expression is consulted only for legacy/new rows that have no
+/// persisted intent yet.
 fn bootstrap_fire_at(
     job: &alms_core::job::Job,
     now: chrono::DateTime<chrono::Utc>,
-) -> Option<chrono::DateTime<chrono::Utc>> {
+) -> Option<BootstrapFire> {
     if job.status().is_terminal() {
         return None;
     }
-    job.next_run_at
-        .map(|persisted| {
-            if persisted <= now {
-                now + chrono::Duration::seconds(1)
-            } else {
-                persisted
-            }
+    let due_at = job
+        .next_run_at
+        .or_else(|| cron_utils::schedule_fire_at(job, now))?;
+    Some(if due_at <= now {
+        BootstrapFire::CatchUp { due_at }
+    } else {
+        BootstrapFire::Scheduled(due_at)
+    })
+}
+
+/// Assign staggered fire times to the boot-time catch-up cohort (#1235).
+///
+/// Ordered most-overdue-first so the longest-waiting job goes first, then
+/// spaced by [`BOOT_CATCH_UP_SPACING_SECS`]. Ties break on `JobId` so the
+/// plan is stable rather than dependent on `DashMap` iteration order.
+fn plan_catch_up_cohort(
+    mut cohort: Vec<(alms_core::JobId, chrono::DateTime<chrono::Utc>)>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Vec<(alms_core::JobId, chrono::DateTime<chrono::Utc>)> {
+    cohort.sort_by(|(left_id, left_due), (right_id, right_due)| {
+        left_due
+            .cmp(right_due)
+            .then_with(|| left_id.0.cmp(&right_id.0))
+    });
+    cohort
+        .into_iter()
+        .enumerate()
+        .map(|(index, (job_id, _))| {
+            let offset = BOOT_CATCH_UP_LEAD_SECS + BOOT_CATCH_UP_SPACING_SECS * (index as i64);
+            (job_id, now + chrono::Duration::seconds(offset))
         })
-        .or_else(|| cron_utils::compute_next_fire(job, now))
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
-    use super::bootstrap_fire_at;
+    use super::{
+        BOOT_CATCH_UP_LEAD_SECS, BOOT_CATCH_UP_SPACING_SECS, BootstrapFire, bootstrap_fire_at,
+        plan_catch_up_cohort,
+    };
     use alms_core::{
-        AgentId,
+        AgentId, JobId,
         job::{Job, JobSchedule, JobTransition},
     };
     use chrono::{TimeZone as _, Utc};
@@ -423,7 +552,7 @@ mod tests {
 
         assert_eq!(
             bootstrap_fire_at(&job, now),
-            Some(now + chrono::Duration::seconds(1))
+            Some(BootstrapFire::CatchUp { due_at: persisted })
         );
     }
 
@@ -433,7 +562,10 @@ mod tests {
         let persisted = Utc.with_ymd_and_hms(2026, 7, 14, 11, 0, 0).unwrap();
         let job = recurring_job(Some(persisted));
 
-        assert_eq!(bootstrap_fire_at(&job, now), Some(persisted));
+        assert_eq!(
+            bootstrap_fire_at(&job, now),
+            Some(BootstrapFire::Scheduled(persisted))
+        );
     }
 
     #[test]
@@ -443,5 +575,83 @@ mod tests {
         assert!(job.transition(JobTransition::Cancel).is_applied());
 
         assert_eq!(bootstrap_fire_at(&job, now), None);
+    }
+
+    /// A past-due one-shot with no persisted intent (a legacy row) must still
+    /// be classified as a missed tick. `cron_utils` no longer clamps it into
+    /// the future, which used to hide the past-dueness from this decision.
+    #[test]
+    fn bootstrap_catches_up_past_due_one_shot_without_persisted_intent() {
+        let now = Utc.with_ymd_and_hms(2026, 7, 14, 10, 1, 0).unwrap();
+        let run_at = Utc.with_ymd_and_hms(2026, 7, 14, 9, 0, 0).unwrap();
+        let job = Job::new(
+            AgentId::new(),
+            "legacy one-shot".to_string(),
+            JobSchedule::Once { run_at },
+            None,
+        );
+
+        assert_eq!(
+            bootstrap_fire_at(&job, now),
+            Some(BootstrapFire::CatchUp { due_at: run_at })
+        );
+    }
+
+    /// #1235: N past-due jobs must not all fire in the same instant. Before
+    /// the stagger, every one of them was scheduled at `now + 1s`, so a
+    /// restart after long downtime produced a concurrent burst bounded only
+    /// by the agent queue.
+    #[test]
+    fn boot_catch_up_cohort_is_staggered_not_simultaneous() {
+        let now = Utc.with_ymd_and_hms(2026, 7, 14, 10, 0, 0).unwrap();
+        let cohort: Vec<_> = (1..=5)
+            .map(|minutes_late| (JobId::new(), now - chrono::Duration::minutes(minutes_late)))
+            .collect();
+
+        let planned = plan_catch_up_cohort(cohort, now);
+
+        assert_eq!(planned.len(), 5);
+        let fire_times: Vec<_> = planned.iter().map(|(_, at)| *at).collect();
+        let unique: std::collections::BTreeSet<_> = fire_times.iter().collect();
+        assert_eq!(
+            unique.len(),
+            fire_times.len(),
+            "no two catch-up jobs may share a fire instant"
+        );
+        for window in fire_times.windows(2) {
+            assert_eq!(
+                window[1] - window[0],
+                chrono::Duration::seconds(BOOT_CATCH_UP_SPACING_SECS),
+                "catch-up firings are evenly spaced"
+            );
+        }
+        assert_eq!(
+            fire_times[0],
+            now + chrono::Duration::seconds(BOOT_CATCH_UP_LEAD_SECS),
+            "the first catch-up keeps the pre-stagger head start"
+        );
+    }
+
+    /// The longest-waiting job goes first, and the plan is stable regardless
+    /// of the order the store happened to hand the jobs over in.
+    #[test]
+    fn boot_catch_up_cohort_fires_most_overdue_first() {
+        let now = Utc.with_ymd_and_hms(2026, 7, 14, 10, 0, 0).unwrap();
+        let oldest = (JobId::new(), now - chrono::Duration::hours(6));
+        let middle = (JobId::new(), now - chrono::Duration::hours(2));
+        let newest = (JobId::new(), now - chrono::Duration::minutes(5));
+
+        let planned = plan_catch_up_cohort(vec![newest, oldest, middle], now);
+
+        assert_eq!(
+            planned.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            vec![oldest.0, middle.0, newest.0]
+        );
+    }
+
+    #[test]
+    fn empty_catch_up_cohort_plans_nothing() {
+        let now = Utc.with_ymd_and_hms(2026, 7, 14, 10, 0, 0).unwrap();
+        assert!(plan_catch_up_cohort(Vec::new(), now).is_empty());
     }
 }

@@ -34,6 +34,79 @@ Per-release notes for ALMS, with an emphasis on **operator-facing changes** — 
 
 ### Notable changes
 
+- **Durable job recovery and run admission** (Phase 7, PR #1230; follow-ups in
+  #1233 / #1235 / #1236 / #1238). The largest operator-facing change in the
+  stabilization series, and the one with a one-way database migration.
+
+  **⚠️ Schema 3 is a one-way migration with a rollback re-execution hazard.**
+  Rolling the binary back to `v0.2.4-pre-stabilization` **without restoring
+  the pre-migration database backup will re-execute every completed one-shot
+  and every retry-exhausted job**, about one second after the rolled-back
+  daemon starts — real agent prompts, real LLM spend, real side effects. This
+  is fail-*open* and nothing in the checkpoint binary prevents it: that build
+  predates the newer-schema refusal guard, maps the unknown `completed` /
+  `failed` statuses to `Pending`, and its startup filter excludes only
+  `cancelled`. **Back up before upgrading**; see
+  [`docs/database-migrations.md`](docs/database-migrations.md) §
+  "Roll back to the checkpoint binary" for the full chain and the procedure.
+
+  - **New job statuses on the wire: `completed` and `failed`.** Jobs are no
+    longer forced through `cancelled` to express a finished one-shot.
+    `terminal_reason` gains `retry_exhausted` alongside `completed`,
+    `deadline_reached`, and `operator_cancelled`. Migration v3 rewrites legacy
+    one-shot rows that encoded completion as `cancelled` + reason
+    `completed`/`deadline_reached` to the distinct `completed` status; rows
+    with a NULL reason are conservatively left `cancelled`, and
+    `operator_cancelled` is untouched. **Clients that branch on job status
+    must handle the two new values.**
+  - **Bounded dispatch retries are durable.** The job entity gains
+    `retry_count` and `last_error` (schema 3 columns), so a job that fails to
+    dispatch retries with exponential backoff across restarts and, on
+    exhaustion, lands in `failed` / `retry_exhausted` instead of disappearing.
+    Both fields survive cancellation (#1238) so cancelling a job you watched
+    fail does not erase the diagnostic.
+  - **`DELETE /jobs/{id}` on an already-terminal job returns `409
+    JOB_TERMINAL`** (distinct from the existing `409 ALREADY_CANCELLED`).
+  - **New authenticated endpoint `GET /operations/metrics`** — process-lifetime
+    counters and live subscriber gauges (`docs/api.md` § 8.1). Counters only,
+    no payload data.
+  - **Boot-time catch-up: restarting now replays missed job ticks.** A
+    persisted `next_run_at` is authoritative for every schedule type, so a
+    tick missed while the daemon was down is *caught up* at boot rather than
+    skipped to the next occurrence. This makes restart the recovery mechanism
+    for a failed re-arm — and it means **restarting the gateway costs LLM
+    spend proportional to how long it was down.** #1235 staggers that catch-up
+    cohort (most-overdue first, 15s apart) so a restart after long downtime
+    spreads the firings instead of running them all within one second;
+    `job_boot_catch_ups_total` reports the cohort size. Jobs that are not past
+    due keep their exact schedule.
+  - **A transient persistence failure no longer silently stops a recurring
+    job** (#1233). The episode-close write now has a bounded retry budget, and
+    on exhaustion the job is re-armed in memory at its next occurrence rather
+    than left with no scheduler entry. Surfaced as
+    `job_rearm_failures_total`; non-zero means a job's persisted schedule is
+    stale until its next successful run.
+  - **One bad row no longer prevents the daemon from starting** (#1236).
+    Startup stale-run recovery reconciles each row in its own savepoint; a row
+    that fails is logged with its `run_id` and the SQL to clear it, counted in
+    `stale_run_recovery_failures_total`, and skipped so the rest still
+    recover — and it is *not* projected into the live run registry, so it
+    cannot masquerade as a pending run (which would make its session
+    undeletable and pin the sidebar's active-run indicator). Job bootstrap got
+    the same treatment: a job whose startup fire time cannot be persisted is
+    skipped and counted in `job_bootstrap_failures_total` instead of aborting
+    startup for every other job. Both deliberately relax the fail-closed
+    behaviour introduced by "Fail closed on partial session reconciliation":
+    an unbootable daemon is a worse outcome than one stale row. **Non-zero
+    values on either counter need operator attention** — the affected runs and
+    jobs stay broken until repaired.
+  - **Run admission is one durable fact.** A run, its initial user message,
+    and the session activity timestamp now commit in a single transaction, and
+    same-session admissions serialize on a per-session gate so database order,
+    in-memory history, queue order, and the session SSE feed cannot diverge.
+    A new `500 ADMISSION_PROJECTION_FAILED` covers the case where the durable
+    write succeeded but the in-memory projection did not.
+
 - **Normalized frontend entity state and authoritative reconnect recovery**
   (PR #1228): agents, sessions, runs, and activity now share one typed reducer
   with revision/cursor guards. SSE replay gaps and epoch resets reconcile from
@@ -55,10 +128,12 @@ Per-release notes for ALMS, with an emphasis on **operator-facing changes** — 
   idempotent terminal outcomes, and a monotonically increasing revision.
   Run and job SQLite upserts compare revisions so delayed coordinator,
   scheduler, or recovery snapshots cannot resurrect cancelled work or replace
-  a newer terminal result. One-shot jobs retain the legacy cancelled status
-  for compatibility while the additive terminal reason distinguishes normal
-  completion, deadline completion, and operator cancellation. Restart recovery
-  also advances the run revision and records the gateway-restarted reason.
+  a newer terminal result. One-shot jobs retained the legacy cancelled status
+  for compatibility while the additive terminal reason distinguished normal
+  completion, deadline completion, and operator cancellation — **superseded by
+  Phase 7 below**, which introduced real `completed` / `failed` job statuses
+  and migrated those legacy rows. Restart recovery also advances the run
+  revision and records the gateway-restarted reason.
 - **Transactional, versioned SQLite migrations** (PR #1224): startup now
   records ordered schema changes in `schema_migrations`, applies each step
   together with its version row in one `BEGIN IMMEDIATE` transaction, and
@@ -85,7 +160,7 @@ Per-release notes for ALMS, with an emphasis on **operator-facing changes** — 
 - **Sidebar active-run dot now lights on cross-agent sessions** (#1211 / PR #1220): the web UI's blinking active-run indicator previously only lit on the *currently-viewed* session — a run on a session owned by another agent (a scheduled **Job**, a **DM**, or another agent's chat surfaced in the sidebar's cross-agent sections) never lit its dot until you clicked into it. Root cause: the sidebar subscribed only to the *active agent's* per-agent SSE feed (`GET /agents/{id}/events`), which by design never carries other agents' activity. **New endpoint:** `GET /events/session-activity` (see `docs/api.md` § 5.10) — a global, cross-agent SSE feed carrying `session_activity_started` / `session_activity_ended` across every agent's sessions, served from a dedicated broadcast namespace (separate from the per-agent sender map + event log, so no operator-supplied agent id can collide with it and leak activity across the per-agent isolation boundary). The sidebar now subscribes to it and seeds its indicators from every surfaced session. No config or wire-break — the per-agent feed (§ 5.9) is unchanged and remains for agent-scoped consumers.
   - Both the per-agent and global `session_activity_*` payloads now include the additive `has_active_run` boolean: the backend's authoritative post-transition answer for the whole session. Consumers must use it instead of treating every individual `session_activity_ended` as inactivity, because overlapping runs can share one session.
 
-- **Scheduled jobs now stay active until the agent's full task is done (#1198, "job episodes")**: a job that messages a peer (`send_message`) or dispatches a background subagent no longer reports *Completed* at first-turn end. The job's completion card, `record_run`, and the recurring re-arm are deferred until the whole arc settles — the DM resolves / the subagent completes, the agent resumes **on the job session** (with the transcript and its full job context) for more tool rounds, possibly starting further DMs/subagents — and only when a turn ends with nothing pending does the job complete. Operator-visible effects: **(a)** completion cards for "chatty" jobs arrive later (at true completion); the persisted marker's **metadata** gains an optional `episode` object (`turns` / `dm_count` / `subagent_count` / `timed_out` / `detached`) — metadata-only for now, the card UI does not render it yet (phase 2); **(b)** a hard **4-hour episode deadline** backstops the wait — on expiry the job completes with a deadline note and still-live work is *detached* (left running), never force-cancelled; **(c)** recurring firings that come due while an episode is open **queue, coalesced to exactly one immediate catch-up** at close (no overlap, no per-tick pile-up); **(d)** `GET /jobs` exposes an `episode` object for in-flight jobs (pending counts, deadline remaining); **(e)** `DELETE /jobs/{id}` now also ends the episode's pending DMs (`user_cancelled`) and cancels its pending subagents — and (#1206) the teardown no longer spawns follow-up LLM turns on the killed job's session (the DM-ended self-notification and cancelled-subagent notification runs are suppressed at the source; their history markers still persist). The suppression keys on the operator's `DELETE`, **not** on job status: a *one-shot* job that hits the 4h deadline with detached work still running (also recorded `Cancelled` — there is no `Completed` status) still gets its late results delivered as notification turns on the job session. Job sessions are now legitimate DM sources on the message bus, so a job agent whose conversation ends gets its resume turn on the job session instead of the invisible `notifications:` session. Episodes are in-memory: a daemon restart drops them (recurring jobs self-heal at the next tick). Also fixes a latent bug: a background subagent that *panicked* before emitting its completion stranded the parent's "running" chip forever — a Drop-armed guard now emits a `Failed` completion. Design: `docs/jobs-await-completion-design.md`.
+- **Scheduled jobs now stay active until the agent's full task is done (#1198, "job episodes")**: a job that messages a peer (`send_message`) or dispatches a background subagent no longer reports *Completed* at first-turn end. The job's completion card, `record_run`, and the recurring re-arm are deferred until the whole arc settles — the DM resolves / the subagent completes, the agent resumes **on the job session** (with the transcript and its full job context) for more tool rounds, possibly starting further DMs/subagents — and only when a turn ends with nothing pending does the job complete. Operator-visible effects: **(a)** completion cards for "chatty" jobs arrive later (at true completion); the persisted marker's **metadata** gains an optional `episode` object (`turns` / `dm_count` / `subagent_count` / `timed_out` / `detached`) — metadata-only for now, the card UI does not render it yet (phase 2); **(b)** a hard **4-hour episode deadline** backstops the wait — on expiry the job completes with a deadline note and still-live work is *detached* (left running), never force-cancelled; **(c)** recurring firings that come due while an episode is open **queue, coalesced to exactly one immediate catch-up** at close (no overlap, no per-tick pile-up); **(d)** `GET /jobs` exposes an `episode` object for in-flight jobs (pending counts, deadline remaining); **(e)** `DELETE /jobs/{id}` now also ends the episode's pending DMs (`user_cancelled`) and cancels its pending subagents — and (#1206) the teardown no longer spawns follow-up LLM turns on the killed job's session (the DM-ended self-notification and cancelled-subagent notification runs are suppressed at the source; their history markers still persist). The suppression keys on the operator's `DELETE`, **not** on job status: a *one-shot* job that hits the 4h deadline with detached work still running still gets its late results delivered as notification turns on the job session. *(Corrected: this entry originally said such a job is "also recorded `Cancelled` — there is no `Completed` status". Both halves are false as of Phase 7 below — `completed` and `failed` are now real job statuses, and a deadline-closed one-shot records `completed` with terminal reason `deadline_reached`. Keying suppression on operator intent rather than status remains correct, and is now also more robust: it does not have to enumerate terminal variants.)* Job sessions are now legitimate DM sources on the message bus, so a job agent whose conversation ends gets its resume turn on the job session instead of the invisible `notifications:` session. Episodes are in-memory: a daemon restart drops them (recurring jobs self-heal at the next tick). Also fixes a latent bug: a background subagent that *panicked* before emitting its completion stranded the parent's "running" chip forever — a Drop-armed guard now emits a `Failed` completion. Design: `docs/jobs-await-completion-design.md`.
 
 
 - **Context-debug row no longer auto-appears on notification runs** (PR #1195): the "Context sent to LLM" debug row now honors the per-agent Debug mode toggle on every run type. A #546-era convenience force-enabled `debug_mode` for system-triggered notification runs landing on a user-facing session — **subagent-completion** and **DM-ended** notification runs (job completions were never affected; they don't create a run) — which, after the per-agent toggle landed (#1003), silently overrode a toggle set to off. Most visibly: the row appeared on the parent's turn after a background `invoke_agent` subagent returned, with Debug mode disabled. Operators who want the context snapshot for notification runs enable Debug mode on the agent in Settings — the toggle now gates those runs exactly like normal turns.

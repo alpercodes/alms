@@ -31,6 +31,9 @@ tracing.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+# Test-only persistence-failure injection for the episode-close retry budget
+# (#1233). Dev-dependency feature: the hook is compiled out of release builds.
+alms-session = { path = "../alms-session", features = ["test-support"] }
 tempfile = "3"
 # Pulls tokio's `test-util` feature, required by the run-manager drain tests
 # (`wait_drain` under a paused clock) — see #1158.

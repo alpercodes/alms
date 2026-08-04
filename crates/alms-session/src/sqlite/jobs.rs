@@ -54,6 +54,14 @@ impl SqliteStore {
     }
 
     /// Load all non-terminal jobs, oldest first.
+    ///
+    /// **No production callers (#1238 N3).** `JobStore::load_from_store` uses
+    /// [`Self::load_all_jobs_unfiltered`] so terminal jobs stay observable in
+    /// `GET /jobs` after a restart; this filtered variant survives only as the
+    /// assertion surface for the terminal-status filter that migration v3
+    /// changed (`crates/alms-session/tests/schema_migrations.rs` and the
+    /// `job_store` unit tests). Do not add it to a startup path — doing so
+    /// would silently drop completed, failed, and cancelled jobs from the API.
     pub fn load_all_jobs(&self) -> AlmsResult<Vec<Job>> {
         self.query_jobs(
             "SELECT id, agent_id, prompt, schedule, status, created_at, next_run_at, last_run_at, \
