@@ -48,28 +48,32 @@ function getSessionMeta(session) {
  * Whether a session row should render the blinking active-run dot.
  *
  * PURE function of its inputs — the reactive signals are read by the
- * CALLER (`SessionItem`) directly in its render body and passed in. That
- * is load-bearing for reactivity, not a style choice:
+ * CALLER (`SessionItem`) in its render body and passed in.
  *
- * Pre-#1211 this read `bgRuns.value` / `activeRunId.value` *inside* the
- * helper. `SessionItem` therefore only subscribed to `activeSessionId`
- * (read in its body for `isActive`) reliably; its subscription to
- * `bgRuns` existed solely through this buried nested read. Under
- * @preact/signals@1.3.0 that left non-selected rows effectively
- * un-subscribed from live `bgRuns` changes, so a `session_activity_started`
- * event on ANOTHER session never re-rendered its row — the dot stayed
- * dark until an unrelated signal (`activeSessionId`, i.e. clicking the
- * row) forced a re-render. That is exactly the #1211 symptom: the dot
- * only lit on the currently-selected session. Backend emission of
- * `session_activity_started` for every run (lifecycle.rs) and the
- * `bgRuns` seed were already correct; the gap was purely that the row
- * did not reactively CONSULT them.
+ * This shape is deliberate but it is NOT what makes the row reactive.
+ * @preact/signals tracks dependencies dynamically for the whole render
+ * pass, so a `.value` read is captured wherever it happens — component
+ * body or several frames down. Read depth does not matter.
  *
- * Taking the values as arguments forces the reads into the component
- * body, matching the direct-body-read pattern the rest of the UI uses to
- * stay reliably reactive under @preact/signals (see agent-header-bar.js
- * and app.js, which both moved signal reads out of indirection for the
- * same reason).
+ * What does matter, and is the real reason to hoist the reads: a `.value`
+ * that is never EVALUATED is never subscribed. The `&&` below short-
+ * circuits, so evaluating the signals at the call site guarantees all
+ * three are read on every render regardless of which branch wins. Keep
+ * that property if you refactor this.
+ *
+ * (An earlier version of this comment claimed the pre-#1211 shape — the
+ * signals read inside this helper — left non-selected rows unsubscribed.
+ * That was a misdiagnosis, corrected in #1232. The old code read
+ * `bgRuns.value` during render too; #1211's actual cause was that the
+ * sidebar subscribed only to the active agent's per-agent SSE feed, so
+ * other agents' activity never arrived. `bgRuns` was not failing to be
+ * observed, it was failing to change — which is what PR #1220 fixed with
+ * the global `/events/session-activity` feed.)
+ *
+ * The durable guarantee is behavioral, not structural:
+ * `frontend/sidebar-activity-reactivity.test.ts` renders the real
+ * SessionList and asserts a run starting on a NON-selected session lights
+ * that row. Change this file however you like as long as that still passes.
  *
  * @param {string} sessionId
  * @param {string|null} activeSessionIdValue - `activeSessionId.value`
@@ -217,13 +221,11 @@ function SessionItem({ session, activeAgentName }) {
     const deleteTimer = useSignal(null);
     const activeSessionIdValue = activeSessionId.value;
     const isActive = session.id === activeSessionIdValue;
-    // Read the active-run signals in the component BODY (not only inside
-    // hasActiveRun) so @preact/signals reliably subscribes this row to
-    // both `activeRunId` and `bgRuns`. Without the body-level reads the
-    // dot only lit on the selected session (#1211) — see hasActiveRun's
-    // doc comment. All three values are always read (JS evaluates the
-    // arguments eagerly), so the subscription can't drop out via
-    // short-circuiting inside the predicate.
+    // Evaluate all three active-run signals here so every render reads
+    // every one of them: JS evaluates call arguments eagerly, so the
+    // subscription cannot drop out via the `&&` short-circuit inside
+    // hasActiveRun. Read depth itself is irrelevant to @preact/signals
+    // tracking — see hasActiveRun's doc comment.
     const hasRun = hasActiveRun(
         session.id,
         activeSessionIdValue,

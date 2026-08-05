@@ -34,6 +34,7 @@ Per-release notes for ALMS, with an emphasis on **operator-facing changes** — 
 
 ### Notable changes
 
+- **Frontend dependency baseline audited and recorded** (#1232) — the `marked` 15→18 and `@preact/signals` 1→2 bumps that #1227 shipped unreviewed were verified against our usage (no rendering regressions; per-row sidebar reactivity intact), pinned by new markdown and active-run-dot tests, and documented in `docs/frontend.md`.
 - **Durable job recovery and run admission** (Phase 7, PR #1230; follow-ups in
   #1233 / #1235 / #1236 / #1238). The largest operator-facing change in the
   stabilization series, and the one with a one-way database migration.
