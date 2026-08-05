@@ -34,6 +34,7 @@ use alms_core::{AgentId, SessionId};
 use alms_tools::message_sender::ConversationEndReason;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::time::{Duration, Instant};
 
 /// Maximum message forwarding depth. Prevents infinite A -> B -> A loops.
 const MAX_DM_DEPTH: u32 = 20;
@@ -43,6 +44,55 @@ const MAX_DM_DEPTH: u32 = 20;
 /// Raised from 60s to 1800s (30 minutes) because complex agent runs can
 /// easily exceed one minute. See discussion on #362 / decision D5 in #384.
 const DEPTH_EXPIRY_SECS: u64 = 1800;
+
+/// A per-DM-pair inactivity stamp, taken when the pair was last touched.
+///
+/// Recorded at activity time (`ActivityStamp::now`) and queried with
+/// [`ActivityStamp::is_expired`] once `DEPTH_EXPIRY_SECS` of quiet have
+/// passed. It stores the *deadline* rather than the activity instant, so
+/// expiry is a forward comparison (`now >= deadline`) instead of a backward
+/// one (`now - stamp >= window`).
+///
+/// That representation is what makes an expired stamp constructible without
+/// subtracting from `Instant::now()`. Backdating a real `Instant` is not
+/// portable: on Windows the `Instant` epoch is system boot, so
+/// `Instant::now() - Duration::from_secs(DEPTH_EXPIRY_SECS + 1)` underflows
+/// and panics with "overflow when subtracting duration from instant" whenever
+/// machine uptime is below 30 minutes. Tests use
+/// [`ActivityStamp::already_expired`] instead, which never subtracts and so
+/// cannot depend on how recently the machine booted. See #1240.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ActivityStamp {
+    /// The instant at which the stamped entry becomes reclaimable.
+    expires_at: Instant,
+}
+
+impl ActivityStamp {
+    /// Stamp activity as happening now: expires `DEPTH_EXPIRY_SECS` from now.
+    pub(crate) fn now() -> Self {
+        Self {
+            expires_at: Instant::now() + Duration::from_secs(DEPTH_EXPIRY_SECS),
+        }
+    }
+
+    /// Whether `DEPTH_EXPIRY_SECS` have elapsed since the stamped activity.
+    pub(crate) fn is_expired(&self) -> bool {
+        Instant::now() >= self.expires_at
+    }
+
+    /// Stamp an entry that is *already* past its inactivity window.
+    ///
+    /// Test-only seam for fabricating an expired entry. `Instant` is
+    /// monotonic and non-decreasing, so the `Instant::now()` read inside a
+    /// later [`is_expired`](Self::is_expired) is always `>=` this one and the
+    /// stamp always reads as expired — with no dependence on system uptime.
+    #[cfg(test)]
+    pub(crate) fn already_expired() -> Self {
+        Self {
+            expires_at: Instant::now(),
+        }
+    }
+}
 
 /// Buffer capacity for the bounded `RunTrigger` channel (#842 / B11).
 ///

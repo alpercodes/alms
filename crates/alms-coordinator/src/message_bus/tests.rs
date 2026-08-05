@@ -195,12 +195,10 @@ async fn test_depth_resets_after_activity_expires() {
         .unwrap_err();
     assert!(matches!(err, SendError::DepthExceeded));
 
-    // Simulate activity expiry: insert a last_activity timestamp in the past.
+    // Simulate activity expiry: stamp this pair as already past its window.
     let dm_ctx = dm_context_id("alice", "bob");
-    bus.last_activity.insert(
-        dm_ctx.clone(),
-        std::time::Instant::now() - std::time::Duration::from_secs(DEPTH_EXPIRY_SECS + 1),
-    );
+    bus.last_activity
+        .insert(dm_ctx.clone(), ActivityStamp::already_expired());
 
     // After activity expires, depth should be reset -- sending should succeed.
     let receipt = bus
@@ -325,11 +323,9 @@ async fn test_expired_entries_cleaned_up() {
     assert!(bus.last_activity.contains_key(&ab_ctx));
     assert!(bus.last_activity.contains_key(&ac_ctx));
 
-    // Expire alice-bob by backdating its last_activity
-    bus.last_activity.insert(
-        ab_ctx.clone(),
-        std::time::Instant::now() - std::time::Duration::from_secs(DEPTH_EXPIRY_SECS + 1),
-    );
+    // Expire alice-bob by stamping its last_activity as already past
+    bus.last_activity
+        .insert(ab_ctx.clone(), ActivityStamp::already_expired());
 
     // Sending any message triggers opportunistic cleanup of expired pairs
     bus.send("alice", a, "charlie", c, "still here", None)
@@ -419,12 +415,10 @@ async fn test_orphaned_depth_entry_is_healed_by_send_floor_stamp() {
         "send() must (re)stamp last_activity for the pair (B7 floor)"
     );
 
-    // Confirm reclaimability end-to-end: backdate it and sweep — the pair is
+    // Confirm reclaimability end-to-end: expire it and sweep — the pair is
     // now removed, where the orphan never would have been.
-    bus.last_activity.insert(
-        ab_ctx.clone(),
-        std::time::Instant::now() - std::time::Duration::from_secs(DEPTH_EXPIRY_SECS + 1),
-    );
+    bus.last_activity
+        .insert(ab_ctx.clone(), ActivityStamp::already_expired());
     bus.send("alice", a, "charlie", c, "sweep", None)
         .await
         .unwrap();
@@ -2905,13 +2899,11 @@ async fn test_end_conversation_after_expiry_sweep_still_ends() {
     let ab_ctx = dm_context_id("alice", "bob");
     let ab_session = SessionId::deterministic_dm("alice", "bob");
 
-    // Backdate alice-bob activity, then trigger the opportunistic sweep
+    // Expire alice-bob activity, then trigger the opportunistic sweep
     // via an unrelated send (same mechanism as
     // `test_expired_entries_cleaned_up`).
-    bus.last_activity.insert(
-        ab_ctx.clone(),
-        std::time::Instant::now() - std::time::Duration::from_secs(DEPTH_EXPIRY_SECS + 1),
-    );
+    bus.last_activity
+        .insert(ab_ctx.clone(), ActivityStamp::already_expired());
     bus.send("alice", alice_id, "charlie", charlie_id, "hi", None)
         .await
         .unwrap();
@@ -2986,7 +2978,7 @@ async fn test_end_conversation_after_sweep_is_idempotent() {
     bus.depths.remove(&ab_ctx);
     bus.last_activity.remove(&ab_ctx);
     bus.expired_pairs
-        .insert(ab_ctx.clone(), std::time::Instant::now());
+        .insert(ab_ctx.clone(), ActivityStamp::now());
 
     // First end consumes the tombstone and emits the full end.
     bus.end_conversation(
@@ -3047,7 +3039,7 @@ async fn test_new_send_clears_sweep_tombstone() {
 
     // Simulate a swept pair.
     bus.expired_pairs
-        .insert(ab_ctx.clone(), std::time::Instant::now());
+        .insert(ab_ctx.clone(), ActivityStamp::now());
 
     // New send restarts the conversation — tombstone must be dropped.
     bus.send("alice", alice_id, "bob", bob_id, "fresh start", None)

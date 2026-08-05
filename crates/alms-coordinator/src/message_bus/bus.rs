@@ -4,7 +4,7 @@
 //! DMs via shared sessions, and `end_conversation()` handles the DM
 //! lifecycle end (marker write, depth reset, peer notification).
 
-use super::{DEPTH_EXPIRY_SECS, DmEvent, MAX_DM_DEPTH, MessageSource, RunTrigger};
+use super::{ActivityStamp, DmEvent, MAX_DM_DEPTH, MessageSource, RunTrigger};
 use alms_core::{AgentId, SessionId, dm_context_id};
 use alms_session::SessionManager;
 use alms_tools::message_sender::{
@@ -14,7 +14,6 @@ use async_trait::async_trait;
 use chrono::Utc;
 use dashmap::DashMap;
 use std::sync::Arc;
-use std::time::Instant;
 use tokio::sync::{Mutex as AsyncMutex, mpsc};
 use tracing::{debug, info, instrument, warn};
 
@@ -64,7 +63,7 @@ pub struct MessageBus {
     /// Depth increments each time the sender changes within the same pair.
     pub(super) depths: DashMap<String, (String, u32)>,
     /// Per-DM-pair last activity timestamp for depth expiry.
-    pub(super) last_activity: DashMap<String, Instant>,
+    pub(super) last_activity: DashMap<String, ActivityStamp>,
     /// Per-DM-pair per-agent source session tracking.
     ///
     /// Key: `(dm_context, agent_name)` -- e.g. `("dm:alice:bob", "alice")`.
@@ -91,7 +90,7 @@ pub struct MessageBus {
     /// entry. Entries are removed when consumed, when the pair becomes
     /// active again (`send`), or after `DEPTH_EXPIRY_SECS` via the
     /// opportunistic cleanup pass.
-    pub(super) expired_pairs: DashMap<String, Instant>,
+    pub(super) expired_pairs: DashMap<String, ActivityStamp>,
     /// Serializes each DM pair's complete state and persistence transaction.
     /// Its key space matches the deterministic set of persisted DM sessions.
     pub(super) transactions: DashMap<String, Arc<AsyncMutex<()>>>,
@@ -141,7 +140,7 @@ impl MessageBus {
         let expired: Vec<String> = self
             .last_activity
             .iter()
-            .filter(|entry| entry.value().elapsed().as_secs() >= DEPTH_EXPIRY_SECS)
+            .filter(|entry| entry.value().is_expired())
             .map(|entry| entry.key().clone())
             .collect();
 
@@ -160,10 +159,11 @@ impl MessageBus {
             let still_expired = self
                 .last_activity
                 .get(&context)
-                .is_some_and(|last| last.elapsed().as_secs() >= DEPTH_EXPIRY_SECS);
+                .is_some_and(|last| last.is_expired());
             if still_expired {
                 if self.depths.remove(&context).is_some() {
-                    self.expired_pairs.insert(context.clone(), Instant::now());
+                    self.expired_pairs
+                        .insert(context.clone(), ActivityStamp::now());
                 }
                 self.remove_source_sessions_for_dm(&context);
                 self.last_activity.remove(&context);
@@ -173,7 +173,7 @@ impl MessageBus {
         let stale_tombstones: Vec<String> = self
             .expired_pairs
             .iter()
-            .filter(|entry| entry.value().elapsed().as_secs() >= DEPTH_EXPIRY_SECS)
+            .filter(|entry| entry.value().is_expired())
             .map(|entry| entry.key().clone())
             .collect();
         for context in stale_tombstones {
@@ -191,7 +191,7 @@ impl MessageBus {
             if self
                 .expired_pairs
                 .get(&context)
-                .is_some_and(|swept| swept.elapsed().as_secs() >= DEPTH_EXPIRY_SECS)
+                .is_some_and(|swept| swept.is_expired())
             {
                 self.expired_pairs.remove(&context);
             }
@@ -323,7 +323,7 @@ impl MessageSender for MessageBus {
         // transaction, and the success path re-stamps the timestamp
         // after the append — so this is the floor, not the only write.
         self.last_activity
-            .insert(dm_context.clone(), Instant::now());
+            .insert(dm_context.clone(), ActivityStamp::now());
 
         // --- Track source session for notification routing ---
         //
@@ -430,7 +430,7 @@ impl MessageSender for MessageBus {
         // idle time since the last *delivered* message rather than since the
         // send was attempted.
         self.last_activity
-            .insert(dm_context.clone(), Instant::now());
+            .insert(dm_context.clone(), ActivityStamp::now());
 
         // --- Trigger run on recipient ---
         let trigger = RunTrigger {
