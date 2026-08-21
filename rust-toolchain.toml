@@ -1,4 +1,8 @@
 [toolchain]
-channel = "nightly"
+# Pinned to a dated nightly so the lint/format gate is reproducible. An
+# unpinned `nightly` lets an unchanged commit change its CI verdict as new
+# lints land upstream (issue #1248). Keep this date in sync with the
+# `toolchain:` input in .github/workflows/ci.yml -- bump both together.
+channel = "nightly-2026-08-21"
 components = ["rustfmt", "clippy", "rust-src"]
 profile = "minimal"

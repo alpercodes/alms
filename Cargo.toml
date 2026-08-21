@@ -76,7 +76,9 @@ cron = "0.15"
 uuid = { version = "1.13", features = ["v4", "v5", "serde"] }
 
 # Async traits
-async-trait = "0.1"
+# >=0.1.92: earlier versions emit a redundant `#[must_use]` in the expansion,
+# which trips `clippy::double_must_use` on nightly-2026-08-21 (issue #1248).
+async-trait = "0.1.92"
 
 # Futures
 futures = "0.3"

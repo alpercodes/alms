@@ -54,9 +54,15 @@ jobs:
     steps:
     - uses: actions/checkout@v4
 
-    - name: Install Rust nightly
-      uses: dtolnay/rust-toolchain@nightly
+    - name: Install pinned Rust nightly
+      # Dated pin rather than `@nightly`: a floating nightly lets an unchanged
+      # commit change its CI verdict when new lints land upstream (issue #1248).
+      # This action exports RUSTUP_TOOLCHAIN, which overrides rust-toolchain.toml,
+      # so both must name the same date -- bump them together.
+      # `@master` is the action's documented ref for an explicit toolchain input.
+      uses: dtolnay/rust-toolchain@master
       with:
+        toolchain: nightly-2026-08-21
         components: rustfmt, clippy
 
     - name: Cache build artifacts

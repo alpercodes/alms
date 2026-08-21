@@ -1,0 +1,32 @@
+# cargo-audit configuration.
+#
+# Read by the `cargo audit` binary run from the repo root. The CI
+# `rustsec/audit-check` action shells out to that same binary, so this file is
+# the single source of truth for the ignore set -- local runs and CI cannot
+# silently disagree (issue #1248).
+#
+# Note: `audit-check` fails the job on *warnings* as well as vulnerabilities,
+# so an informational `unmaintained` advisory is enough to turn the gate red.
+#
+# Every entry here must carry a date, a rationale, and an exit condition.
+
+[advisories]
+ignore = [
+    # RUSTSEC-2026-0249 -- `smartstring` is unmaintained (upstream repo archived
+    # 2026-05-03). Informational only: there is no vulnerability, and no patched
+    # version exists because every version is "affected".
+    #
+    # Reachability: dev-dependency only. The chain is
+    #   smartstring <- swc_ecma_parser 39 <- [dev-dependencies] alms-gateway
+    # i.e. it is pulled in solely by `tests/static_assets_parse.rs`, the JS
+    # parse-sweep from #829. It is never linked into a shipped artifact.
+    #
+    # Exit condition: swc_ecma_parser 45 replaced smartstring with compact_str
+    # (the advisory's own recommended alternative). Taking it requires three
+    # coupled major bumps -- swc_common 21->26, swc_ecma_ast 23->29,
+    # swc_ecma_parser 39->45 -- against the parse-sweep's API surface, so it is
+    # deferred to its own PR rather than bundled into a CI unblock.
+    #
+    # Added 2026-08-21. Revisit when the swc bump lands, and drop this entry.
+    "RUSTSEC-2026-0249",
+]
