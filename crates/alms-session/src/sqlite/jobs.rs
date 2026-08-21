@@ -109,7 +109,7 @@ impl SqliteStore {
             .filter_map(|r| match r {
                 Ok(j) => Some(j),
                 Err(e) => {
-                    tracing::warn!("Skipping unparseable job row: {e}");
+                    self.record_skipped_row(PersistenceTable::Jobs, e);
                     None
                 }
             })

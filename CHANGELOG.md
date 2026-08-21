@@ -108,6 +108,46 @@ Per-release notes for ALMS, with an emphasis on **operator-facing changes** — 
     A new `500 ADMISSION_PROJECTION_FAILED` covers the case where the durable
     write succeeded but the in-memory projection did not.
 
+- **Silent row loss in the persistence layer is now countable** (#1241), and
+  the policy behind it is written down (#1237).
+  - **New counters on `GET /operations/metrics`: `persistence_rows_skipped_total`
+    and `persistence_rows_skipped_by_table`.** Every list-shaped loader in
+    `alms-session` drops rows it cannot parse — a corrupt `agents` row simply
+    vanished from the registry, a corrupt `sessions` row from the sidebar,
+    with only a `warn!` line as evidence. All 28 drop points (25 across 14
+    loaders, plus 3 on write paths) now increment a shared counter attributed
+    to the table the row came from. **Non-zero means the daemon is serving an
+    incomplete view of the database.** It counts *skips, not distinct rows*:
+    the loaders run on every read, so one bad row on a hot path increments it
+    repeatedly — read the rate, not the total. Remediation never needs a
+    restart, but it differs per producer: at a loader, fix or delete the row
+    and the next read picks it up; at the two write-path sites the operation
+    has already committed and nothing re-runs it, so the `warn!` `detail`
+    prefix tells you which hand-repair applies (`docs/api.md` § 8.1).
+  - **Breaking for log-based alerting: those ~25 sites changed their log line.**
+    Each used to emit its own message — `"Skipping unparseable agent row: …"`,
+    `"Skipping unparseable session row: …"`, `"Skipping tool call record: bad
+    role"` and the rest. They now emit a single `"Skipping unparseable
+    persistence row"` with structured `table` and `detail` fields. **Any log
+    filter or alert keyed on the old strings goes quiet without failing** —
+    re-key it on the new message, on `table=`, or preferably on the counter.
+  - **Also documented in `docs/api.md` § 8.1: the twelve scalar counters on
+    `/operations/metrics` are grouped** into Rejections (expected non-zero
+    under load — alert on a slope), Quarantine (alert on `> 0`), and Workload.
+    The field order of the JSON response follows the grouping; key order was
+    never semantic, but scripts pretty-printing the payload will see it move.
+  - **`docs/architecture.md` gains the reconciliation policy: *absence must be
+    a safe belief*.** When a startup pass or loader finds a row it cannot
+    repair, ALMS quarantines it — left durable and untouched, kept out of live
+    in-memory state, logged, and counted — rather than refusing to run.
+    Quarantine is legal
+    only where the daemon behaves correctly believing the row is absent; where
+    absence would re-execute completed work the failure stays fatal. That
+    makes the schema-version guard in `sqlite/migrations.rs` the **only**
+    sanctioned fatal reconciliation site, and it documents the deliberate
+    decision **not** to add a `--skip-recovery` escape hatch. No behaviour
+    change on its own — it names what #1233 / #1235 / #1236 / #1241 already do.
+
 - **Normalized frontend entity state and authoritative reconnect recovery**
   (PR #1228): agents, sessions, runs, and activity now share one typed reducer
   with revision/cursor guards. SSE replay gaps and epoch resets reconcile from

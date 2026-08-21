@@ -271,7 +271,10 @@ impl SqliteStore {
                     })
                 }
                 Err(e) => {
-                    tracing::warn!("Skipping unparseable timeline row: {e}");
+                    self.record_skipped_row(
+                        PersistenceTable::Timeline,
+                        format_args!("agent {agent_id_str}: {e}"),
+                    );
                     None
                 }
             })

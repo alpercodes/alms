@@ -1348,8 +1348,10 @@ Audit records align with `docs/security-model.md`:
 
 ### 8.1 Operational metrics
 
-`GET /operations/metrics` is authenticated and returns process-lifetime counters
-plus current subscriber gauges:
+`GET /operations/metrics` is authenticated and returns process-lifetime
+counters plus current subscriber gauges. Fields are serialized in the group
+order described below; the blank lines here mark the group boundaries and are
+not part of the response.
 
 ```json
 {
@@ -1357,16 +1359,69 @@ plus current subscriber gauges:
   "lifecycle_transition_rejections_total": 0,
   "replay_gaps_total": 0,
   "replay_epoch_mismatches_total": 0,
-  "subscribers": { "runs": 0, "sessions": 0, "agents": 0, "activity": 0 },
   "persistence_snapshot_rejections_total": 0,
   "job_dispatch_retry_attempts_total": 0,
   "job_dispatch_retry_exhaustions_total": 0,
+
   "job_rearm_failures_total": 0,
   "stale_run_recovery_failures_total": 0,
+  "job_bootstrap_failures_total": 0,
+  "persistence_rows_skipped_total": 0,
+  "persistence_rows_skipped_by_table": {
+    "agents": 0,
+    "audit_events": 0,
+    "jobs": 0,
+    "messages": 0,
+    "run_tool_calls": 0,
+    "runs": 0,
+    "session_summaries": 0,
+    "sessions": 0,
+    "timeline": 0
+  },
+
   "job_boot_catch_ups_total": 0,
-  "job_bootstrap_failures_total": 0
+
+  "subscribers": { "runs": 0, "sessions": 0, "agents": 0, "activity": 0 }
 }
 ```
+
+**Read the groups, not the names.** The wire names do not say which group a
+counter belongs to, and the three groups want opposite reactions from an
+operator — one is expected to be non-zero, one means something is broken. The
+grouping below is the same one carried by the `OperationalMetricsSnapshot`
+field comments in `alms-gateway/src/operations.rs`; **change the two
+together.**
+
+**1. Rejections** — `queue_saturation_rejections_total`,
+`lifecycle_transition_rejections_total`, `replay_gaps_total`,
+`replay_epoch_mismatches_total`, `persistence_snapshot_rejections_total`,
+`job_dispatch_retry_attempts_total`, `job_dispatch_retry_exhaustions_total`.
+
+A request, transition, or dispatch the daemon refused or had to retry.
+**Expected to be non-zero under load** — read them as a rate, not as an
+absolute, and alert on a slope rather than on `> 0`. Nothing durable is in
+doubt.
+
+**2. Quarantine** — `job_rearm_failures_total`,
+`stale_run_recovery_failures_total`, `job_bootstrap_failures_total`,
+`persistence_rows_skipped_total` (and its `persistence_rows_skipped_by_table`
+breakdown).
+
+Durable state the daemon declined to believe. **Any non-zero value means the
+daemon is serving an incomplete view of the database** and something needs
+repairing; alerting on `> 0` is correct here. See
+[`docs/architecture.md` § "Reconciliation policy: absence must be a safe
+belief"](architecture.md#reconciliation-policy-absence-must-be-a-safe-belief)
+for what each site owes an operator. Per-counter detail follows below.
+
+**3. Workload** — `job_boot_catch_ups_total`.
+
+Work done, not trust withheld. A large value after a long outage is expected,
+not a fault.
+
+`subscribers` is in none of the three: it is a point-in-time **gauge** of live
+SSE subscribers per stream, and unlike everything above it goes down as well
+as up.
 
 `job_rearm_failures_total` (#1233) counts episode-close job writes that
 exhausted their bounded retry budget. Non-zero means at least one job advanced
@@ -1398,6 +1453,63 @@ firings instead of producing a concurrent burst. Jobs that are *not* past due
 keep their real schedule and are never staggered. The cohort size scales with
 how long the daemon was down, so a large value after a restart is expected and
 is the number to reach for when reasoning about post-restart LLM spend.
+
+`persistence_rows_skipped_total` (#1241) counts durable rows the daemon could
+not parse and therefore dropped, with `persistence_rows_skipped_by_table`
+giving the per-table breakdown. Non-zero means the daemon is serving an
+**incomplete view of the database**: an agent missing from the registry, a
+session missing from the sidebar, messages missing from a context window. Each
+drop is logged at `warn!` with a `table` field and whatever identifies the row
+— often only the parse error, because the column that failed to parse is
+frequently the id.
+
+Three things to know before reading the number:
+
+- **It counts skips, not distinct rows.** Most of these sites are loaders that
+  run on every read, not once at startup, so one corrupt row on a hot path
+  increments the counter on every load that passes over it. The rate matters
+  more than the total; a counter climbing steadily under normal traffic is one
+  bad row, not many.
+- **The key set is stable.** Every table is reported including the zeroes, and
+  reported even when no SQLite store is configured, so a scraper never sees
+  keys appear and disappear. `timeline` is the `messages`/`runs` union behind
+  `GET /timeline` rather than a table of its own.
+- **The key names the table the row came from, not the symptom — and one table
+  can have several producers.** `sessions` is incremented by the three session
+  loaders (symptom: a session missing from the sidebar), *and* by `delete_agent`
+  (symptom: an agent deleted while one of its sessions keeps its messages, runs,
+  and tool-call rows — durable orphans, not lost data), *and* by the Telegram
+  context-id migration (symptom: a session left on the legacy
+  `telegram_{chat_id}` context id). Same number, three different remediations.
+  **The `detail` field on the `warn!` line is the disambiguator** — the
+  write-path sites prefix it (`delete_agent <id>: ...`,
+  `telegram context-id migration: ...`), the loaders do not.
+
+**Remediation never requires a restart, but it is a different action for each
+of the three producers** — read the `detail` prefix first, then pick from the
+list below. "Fix the row and the daemon re-reads it" is true only for the
+loaders; at the two write-path sites the operation has already committed and
+nothing re-runs it, so repairing the row on its own changes nothing.
+
+- **A loader drop** — no `detail` prefix. Find the row with
+  `sqlite3 .alms/alms.db` (the `warn!` detail names the failing column), then
+  fix or delete it. The daemon picks up the repair on the next read.
+- **A `delete_agent` drop** — `detail` starts `delete_agent <agent_id>:`. The
+  delete transaction committed without that session, and the agent is already
+  gone, so there is nothing left to re-run. Finish the delete by hand: locate
+  the stranded session (`SELECT session_id FROM messages WHERE session_id NOT
+  IN (SELECT id FROM sessions)`, and the same for `runs`), delete its
+  dependent rows in FK order — `context_summaries`, `session_summaries`,
+  `audit_events`, `messages`, `run_tool_calls`, `runs` — and then the
+  `sessions` row itself if it survived.
+- **A Telegram context-id migration drop** — `detail` starts
+  `telegram context-id migration:`. There is no next read here either: the
+  migration runs once per agent at channel startup
+  (`alms-gateway/src/gateway.rs`, "Phase 2b"), so a repaired row is not
+  revisited until the next one. Apply the rename in the same statement that
+  repairs the row — `UPDATE sessions SET context_id =
+  'telegram_<agent_name>_<chat_id>' WHERE id = ...` — rather than waiting for
+  a restart to do it.
 
 ---
 

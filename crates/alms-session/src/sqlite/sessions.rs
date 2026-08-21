@@ -123,7 +123,7 @@ impl SqliteStore {
             .filter_map(|r| match r {
                 Ok(s) => Some(s),
                 Err(e) => {
-                    tracing::warn!("Skipping unparseable session row: {e}");
+                    self.record_skipped_row(PersistenceTable::Sessions, e);
                     None
                 }
             })
@@ -166,7 +166,10 @@ impl SqliteStore {
             .filter_map(|r| match r {
                 Ok(s) => Some(s),
                 Err(e) => {
-                    tracing::warn!("Skipping unparseable session row: {e}");
+                    self.record_skipped_row(
+                        PersistenceTable::Sessions,
+                        format_args!("agent {}: {e}", agent_id.0),
+                    );
                     None
                 }
             })
@@ -191,7 +194,7 @@ impl SqliteStore {
             .filter_map(|r| match r {
                 Ok(s) => Some(s),
                 Err(e) => {
-                    tracing::warn!("Skipping unparseable session row: {e}");
+                    self.record_skipped_row(PersistenceTable::Sessions, e);
                     None
                 }
             })
@@ -235,7 +238,21 @@ impl SqliteStore {
             .map_err(|e| {
                 AlmsError::Runtime(format!("SQLite query migrate_telegram_context_ids: {e}"))
             })?
-            .filter_map(|r| r.ok())
+            // Third-branch site (see the reconciliation policy in
+            // `docs/architecture.md`): a row dropped here keeps its legacy
+            // `telegram_{chat_id}` context id — not lost, but not migrated
+            // either, so the table is left in two formats at once. Counted so
+            // a silent partial migration is visible (#1241).
+            .filter_map(|r| match r {
+                Ok(row) => Some(row),
+                Err(e) => {
+                    self.record_skipped_row(
+                        PersistenceTable::Sessions,
+                        format_args!("telegram context-id migration: {e}"),
+                    );
+                    None
+                }
+            })
             .filter(|(_id, ctx)| {
                 // Old format: "telegram_" + (optional "-") + digits
                 let suffix = &ctx["telegram_".len()..];
@@ -277,7 +294,7 @@ impl SqliteStore {
 
 #[cfg(test)]
 mod tests {
-    use super::super::test_helpers::{new_message, new_session};
+    use super::super::test_helpers::{corrupt_with_sql, new_message, new_session};
     use super::super::*;
 
     #[test]
@@ -577,5 +594,31 @@ mod tests {
         // Control session's data is untouched.
         assert_eq!(store.count_tool_calls(other_run_id).unwrap(), 1);
         assert!(store.load_run(other_run_id).unwrap().is_some());
+    }
+
+    /// #1241: a corrupt session row vanishes from the sidebar. It always did;
+    /// what changes is that the disappearance is now countable.
+    #[test]
+    fn corrupt_session_row_is_dropped_and_counted() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let session = new_session();
+        store.save_session(&session).unwrap();
+
+        corrupt_with_sql(&store, "UPDATE sessions SET id = 'not-a-uuid'");
+
+        assert!(store.load_all_sessions().unwrap().is_empty());
+        assert!(store.list_sessions().unwrap().is_empty());
+        assert!(
+            store
+                .load_sessions_by_agent(session.agent_id)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            store.rows_skipped_for(PersistenceTable::Sessions),
+            3,
+            "each of the three loaders passes over the same bad row"
+        );
+        assert_eq!(store.rows_skipped_total(), 3);
     }
 }

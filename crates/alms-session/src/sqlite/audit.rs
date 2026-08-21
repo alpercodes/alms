@@ -66,7 +66,7 @@ impl SqliteStore {
             .filter_map(|r| match r {
                 Ok(v) => Some(v),
                 Err(e) => {
-                    tracing::warn!("Skipping unparseable audit row: {e}");
+                    self.record_skipped_row(PersistenceTable::AuditEvents, e);
                     None
                 }
             })
@@ -84,7 +84,10 @@ impl SqliteStore {
                     let session_uuid = match uuid::Uuid::parse_str(&sid) {
                         Ok(u) => u,
                         Err(e) => {
-                            tracing::warn!("Skipping audit row: bad session UUID {sid}: {e}");
+                            self.record_skipped_row(
+                                PersistenceTable::AuditEvents,
+                                format_args!("bad session UUID {sid}: {e}"),
+                            );
                             return None;
                         }
                     };
@@ -100,7 +103,10 @@ impl SqliteStore {
                     let params = match serde_json::from_str(&params_str) {
                         Ok(p) => p,
                         Err(e) => {
-                            tracing::warn!("Skipping audit row {sid}: bad params JSON: {e}");
+                            self.record_skipped_row(
+                                PersistenceTable::AuditEvents,
+                                format_args!("session {sid}: bad params JSON: {e}"),
+                            );
                             return None;
                         }
                     };
@@ -114,7 +120,10 @@ impl SqliteStore {
                     let ts = match chrono::DateTime::parse_from_rfc3339(&ts_str) {
                         Ok(t) => t,
                         Err(e) => {
-                            tracing::warn!("Skipping audit row {sid}: bad timestamp: {e}");
+                            self.record_skipped_row(
+                                PersistenceTable::AuditEvents,
+                                format_args!("session {sid}: bad timestamp: {e}"),
+                            );
                             return None;
                         }
                     };

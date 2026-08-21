@@ -220,7 +220,7 @@ impl SqliteStore {
             .filter_map(|r| match r {
                 Ok(agent) => Some(agent),
                 Err(e) => {
-                    tracing::warn!("Skipping unparseable agent row: {}", e);
+                    self.record_skipped_row(PersistenceTable::Agents, e);
                     None
                 }
             })
@@ -269,7 +269,7 @@ impl SqliteStore {
             .filter_map(|r| match r {
                 Ok(agent) => Some(agent),
                 Err(e) => {
-                    tracing::warn!("Skipping unparseable agent row: {}", e);
+                    self.record_skipped_row(PersistenceTable::Agents, e);
                     None
                 }
             })
@@ -311,7 +311,23 @@ impl SqliteStore {
                 .map_err(|e| AlmsError::Runtime(format!("SQLite prepare session query: {e}")))?;
             stmt.query_map(params![&id_str], |row| row.get(0))
                 .map_err(|e| AlmsError::Runtime(format!("SQLite query agent sessions: {e}")))?
-                .filter_map(|r| r.ok())
+                // Third-branch site (see the reconciliation policy in
+                // `docs/architecture.md`): a row dropped here is a session
+                // whose messages, runs, and tool-call rows survive this delete
+                // with no parent agent and no retry path — orphaned, not lost.
+                // Failing the delete instead would make the agent permanently
+                // undeletable, which is worse. Counted so the leak is visible;
+                // see #1241.
+                .filter_map(|r| match r {
+                    Ok(id) => Some(id),
+                    Err(e) => {
+                        self.record_skipped_row(
+                            PersistenceTable::Sessions,
+                            format_args!("delete_agent {id_str}: unreadable session id: {e}"),
+                        );
+                        None
+                    }
+                })
                 .collect()
         };
 
@@ -435,7 +451,23 @@ impl SqliteStore {
                     Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
                 })
                 .map_err(|e| AlmsError::Runtime(format!("SQLite query dm-candidates: {e}")))?
-                .filter_map(|r| r.ok())
+                // Third-branch site (see the reconciliation policy in
+                // `docs/architecture.md`): a row dropped here is a DM session
+                // this agent participated in that survives the delete with a
+                // now-dangling participant in its `context_id` — orphaned, not
+                // lost. Failing the delete instead would make the agent
+                // permanently undeletable, which is worse. Counted so the leak
+                // is visible; see #1241.
+                .filter_map(|r| match r {
+                    Ok(candidate) => Some(candidate),
+                    Err(e) => {
+                        self.record_skipped_row(
+                            PersistenceTable::Sessions,
+                            format_args!("delete_agent {id_str}: unreadable dm candidate: {e}"),
+                        );
+                        None
+                    }
+                })
                 .collect()
             };
 
@@ -588,7 +620,7 @@ impl SqliteStore {
 
 #[cfg(test)]
 mod tests {
-    use super::super::test_helpers::new_message;
+    use super::super::test_helpers::{corrupt_with_sql, new_message};
     use super::super::*;
     use crate::types::Session;
     use alms_core::job::{Job, JobSchedule};
@@ -2094,5 +2126,38 @@ mod tests {
         assert_eq!(tg_agents.len(), 2);
         assert_eq!(tg_agents[0].name, "with-tg");
         assert_eq!(tg_agents[1].name, "also-tg");
+    }
+
+    /// #1241: a row the loader cannot parse is dropped — the pre-existing and
+    /// correct policy — but the drop must be counted, not just logged.
+    #[test]
+    fn corrupt_agent_row_is_dropped_and_counted() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        store.create_agent(&new_agent("atlas")).unwrap();
+        assert_eq!(store.list_agents().unwrap().len(), 1);
+        assert_eq!(store.rows_skipped_total(), 0);
+
+        // `created_at` is parsed as RFC-3339 by `parse_agent_row`, so this is
+        // a row that exists on disk and cannot become an `AgentRecord`.
+        corrupt_with_sql(&store, "UPDATE agents SET created_at = 'not-a-timestamp'");
+
+        assert!(
+            store.list_agents().unwrap().is_empty(),
+            "an unparseable agent must not be projected into the registry"
+        );
+        assert_eq!(store.rows_skipped_for(PersistenceTable::Agents), 1);
+        assert_eq!(store.rows_skipped_total(), 1);
+        let by_table = store.rows_skipped_by_table();
+        assert_eq!(by_table["agents"], 1);
+        assert_eq!(by_table["sessions"], 0, "skips are attributed per table");
+
+        // These loaders run on every read, not once at startup, so the same
+        // corrupt row is counted again by the next caller.
+        assert!(store.list_agents().unwrap().is_empty());
+        assert_eq!(store.rows_skipped_for(PersistenceTable::Agents), 2);
+
+        // The counters describe the database, not the handle: clones of the
+        // store share the connection and must share the accounting.
+        assert_eq!(store.clone().rows_skipped_total(), 2);
     }
 }

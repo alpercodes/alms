@@ -13429,6 +13429,26 @@ async fn operational_metrics_route_exposes_live_snapshot() {
     assert!(json["stale_run_recovery_failures_total"].is_number());
     assert!(json["job_boot_catch_ups_total"].is_number());
     assert!(json["job_bootstrap_failures_total"].is_number());
+    assert!(json["persistence_rows_skipped_total"].is_number());
+
+    // The per-table breakdown reports every known table, including the
+    // zeroes, so a scraper's key set is stable across deployments — and
+    // stable even with no SQLite store configured, as here (#1241).
+    let by_table = json["persistence_rows_skipped_by_table"]
+        .as_object()
+        .expect("per-table breakdown should be an object");
+    assert_eq!(
+        by_table.len(),
+        alms_session::sqlite::PersistenceTable::ALL.len()
+    );
+    for table in alms_session::sqlite::PersistenceTable::ALL {
+        assert_eq!(
+            by_table.get(table.as_str()),
+            Some(&serde_json::json!(0)),
+            "missing or non-zero entry for {}",
+            table.as_str()
+        );
+    }
 
     drop(subscription);
     shutdown_token.cancel();

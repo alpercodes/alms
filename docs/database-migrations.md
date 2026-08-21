@@ -42,6 +42,23 @@ Startup fails closed when:
 Do not catch and ignore migration failures. The daemon must not load data from
 a schema it cannot prove is current.
 
+**The newer-than-supported refusal is the one sanctioned fatal reconciliation
+site in ALMS.** Everywhere else — the stale-run sweep, the job scheduler
+bootstrap, every loader in `alms-session` — a row the daemon cannot repair or
+parse is *quarantined* and the daemon boots anyway, because those sites behave
+correctly while believing the row is absent. This guard is the exception
+precisely because that is not true here: a completion record you cannot read is
+indistinguishable from "not yet run", so absence would re-execute work that
+already happened. That is also exactly the hazard the rollback section below
+describes. See
+[Reconciliation policy: absence must be a safe belief](architecture.md#reconciliation-policy-absence-must-be-a-safe-belief)
+for the full rule, the test to apply at a new site, and the reasons **not** to
+add an `--ignore-schema-version` escape hatch.
+
+The other fail-closed conditions above are a different class: they mean the
+schema itself cannot be established, so no row is interpretable at all. They
+are upstream of the reconciliation rule, not exceptions to it.
+
 WAL is now a startup requirement for file-backed databases. Some network
 filesystems and restricted container volumes do not support SQLite WAL locking;
 those deployments previously fell back silently to rollback-journal mode but

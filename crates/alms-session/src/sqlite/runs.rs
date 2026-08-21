@@ -176,7 +176,10 @@ impl SqliteStore {
             .filter_map(|r| match r {
                 Ok(run) => Some(run),
                 Err(e) => {
-                    tracing::warn!("Skipping unparseable run row: {e}");
+                    self.record_skipped_row(
+                        PersistenceTable::Runs,
+                        format_args!("session {}: {e}", session_id.0),
+                    );
                     None
                 }
             })
@@ -212,7 +215,7 @@ impl SqliteStore {
             .filter_map(|r| match r {
                 Ok(run) => Some(run),
                 Err(e) => {
-                    tracing::warn!("Skipping unparseable run row: {e}");
+                    self.record_skipped_row(PersistenceTable::Runs, e);
                     None
                 }
             })
@@ -508,7 +511,7 @@ impl SqliteStore {
 
 #[cfg(test)]
 mod tests {
-    use super::super::test_helpers::new_session;
+    use super::super::test_helpers::{corrupt_with_sql, new_session};
     use super::super::*;
     use alms_core::run::{Run, RunStatus, RunTransition, TokenUsage};
 
@@ -1267,5 +1270,31 @@ mod tests {
             session.last_activity
         );
         assert_eq!(store.persistence_snapshot_rejections_total(), 1);
+    }
+
+    /// #1241: the run loaders skip a row they cannot parse and count it. Note
+    /// the startup sweep in `mark_stale_runs_failed` deliberately does *not*
+    /// share this path — it fails the whole query rather than silently
+    /// reconciling a subset, and its own skips land in
+    /// `stale_run_recovery_failures_total` (#1236).
+    #[test]
+    fn corrupt_run_row_is_dropped_and_counted() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let session = new_session();
+        store.save_session(&session).unwrap();
+        let run = new_run(session.id, session.agent_id);
+        store.save_run(&run).unwrap();
+
+        corrupt_with_sql(&store, "UPDATE runs SET agent_id = 'not-a-uuid'");
+
+        assert!(
+            store
+                .load_runs_by_session(session.id, 10)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(store.load_all_runs().unwrap().is_empty());
+        assert_eq!(store.rows_skipped_for(PersistenceTable::Runs), 2);
+        assert_eq!(store.rows_skipped_total(), 2);
     }
 }

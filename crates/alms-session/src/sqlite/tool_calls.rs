@@ -110,17 +110,17 @@ impl SqliteStore {
                     let role: ToolCallRole = role_str
                         .parse()
                         .inspect_err(|e| {
-                            tracing::warn!(
-                                run_id = %run_id.0,
-                                "Skipping tool call record: bad role: {e}"
+                            self.record_skipped_row(
+                                PersistenceTable::RunToolCalls,
+                                format_args!("run {}: bad role: {e}", run_id.0),
                             );
                         })
                         .ok()?;
                     let timestamp = chrono::DateTime::parse_from_rfc3339(&ts_str)
                         .inspect_err(|e| {
-                            tracing::warn!(
-                                run_id = %run_id.0,
-                                "Skipping tool call record: bad timestamp: {e}"
+                            self.record_skipped_row(
+                                PersistenceTable::RunToolCalls,
+                                format_args!("run {}: bad timestamp: {e}", run_id.0),
                             );
                         })
                         .ok()?
@@ -137,7 +137,10 @@ impl SqliteStore {
                     })
                 }
                 Err(e) => {
-                    tracing::warn!("Skipping unparseable tool call row: {e}");
+                    self.record_skipped_row(
+                        PersistenceTable::RunToolCalls,
+                        format_args!("run {}: {e}", run_id.0),
+                    );
                     None
                 }
             })
@@ -231,9 +234,9 @@ impl SqliteStore {
                 )) => {
                     let run_id: RunId = uuid::Uuid::parse_str(&run_id_str)
                         .inspect_err(|e| {
-                            tracing::warn!(
-                                session_id = %session_id.0,
-                                "Skipping tool call record: bad run_id: {e}"
+                            self.record_skipped_row(
+                                PersistenceTable::RunToolCalls,
+                                format_args!("session {}: bad run_id: {e}", session_id.0),
                             );
                         })
                         .ok()
@@ -241,17 +244,17 @@ impl SqliteStore {
                     let role: ToolCallRole = role_str
                         .parse()
                         .inspect_err(|e| {
-                            tracing::warn!(
-                                session_id = %session_id.0,
-                                "Skipping tool call record: bad role: {e}"
+                            self.record_skipped_row(
+                                PersistenceTable::RunToolCalls,
+                                format_args!("session {}: bad role: {e}", session_id.0),
                             );
                         })
                         .ok()?;
                     let timestamp = chrono::DateTime::parse_from_rfc3339(&ts_str)
                         .inspect_err(|e| {
-                            tracing::warn!(
-                                session_id = %session_id.0,
-                                "Skipping tool call record: bad timestamp: {e}"
+                            self.record_skipped_row(
+                                PersistenceTable::RunToolCalls,
+                                format_args!("session {}: bad timestamp: {e}", session_id.0),
                             );
                         })
                         .ok()?
@@ -271,7 +274,10 @@ impl SqliteStore {
                     })
                 }
                 Err(e) => {
-                    tracing::warn!("Skipping unparseable tool call row: {e}");
+                    self.record_skipped_row(
+                        PersistenceTable::RunToolCalls,
+                        format_args!("session {}: {e}", session_id.0),
+                    );
                     None
                 }
             })
@@ -680,5 +686,38 @@ mod tests {
             "a legacy NULL-session_id row must still be found via the runs join"
         );
         assert_eq!(session_calls[0].run_id, run.run_id);
+    }
+
+    /// #1241: the tool-call loaders drop rows from *inside* a successful
+    /// `query_map` (bad role, bad timestamp) rather than from the `Err` arm.
+    /// Those inner drops are counted too — they are the same silent loss.
+    #[test]
+    fn corrupt_tool_call_row_is_dropped_and_counted() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let run_id = RunId::new();
+        let session_id = SessionId::new();
+        store
+            .save_tool_calls(
+                run_id,
+                session_id,
+                &[new_tool_call_record(0, ToolCallRole::Assistant, "echo")],
+            )
+            .unwrap();
+        assert_eq!(store.load_tool_calls(run_id).unwrap().len(), 1);
+
+        crate::sqlite::test_helpers::corrupt_with_sql(
+            &store,
+            "UPDATE run_tool_calls SET role = 'not-a-role'",
+        );
+
+        assert!(store.load_tool_calls(run_id).unwrap().is_empty());
+        assert!(
+            store
+                .load_tool_calls_for_session(session_id)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(store.rows_skipped_for(PersistenceTable::RunToolCalls), 2);
+        assert_eq!(store.rows_skipped_total(), 2);
     }
 }

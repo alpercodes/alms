@@ -19,6 +19,7 @@ mod audit;
 mod jobs;
 mod messages;
 mod migrations;
+mod row_skips;
 mod runs;
 mod session_summaries;
 mod sessions;
@@ -29,6 +30,7 @@ mod timeline;
 mod tool_calls;
 
 pub use migrations::CURRENT_SCHEMA_VERSION;
+pub use row_skips::PersistenceTable;
 pub use timeline::{TimelineEvent, TimelinePage};
 pub use tool_calls::SessionToolCall;
 
@@ -187,6 +189,7 @@ pub struct SqliteStore {
     conn: Arc<Mutex<Connection>>,
     persistence_snapshot_rejections: Arc<std::sync::atomic::AtomicU64>,
     stale_run_recovery_failures: Arc<std::sync::atomic::AtomicU64>,
+    row_skips: Arc<row_skips::RowSkipCounters>,
 }
 
 impl std::fmt::Debug for SqliteStore {
@@ -201,6 +204,7 @@ impl Clone for SqliteStore {
             conn: Arc::clone(&self.conn),
             persistence_snapshot_rejections: Arc::clone(&self.persistence_snapshot_rejections),
             stale_run_recovery_failures: Arc::clone(&self.stale_run_recovery_failures),
+            row_skips: Arc::clone(&self.row_skips),
         }
     }
 }
@@ -215,6 +219,7 @@ impl SqliteStore {
             conn: Arc::new(Mutex::new(conn)),
             persistence_snapshot_rejections: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             stale_run_recovery_failures: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            row_skips: Arc::default(),
         })
     }
 
@@ -227,6 +232,7 @@ impl SqliteStore {
             conn: Arc::new(Mutex::new(conn)),
             persistence_snapshot_rejections: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             stale_run_recovery_failures: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            row_skips: Arc::default(),
         })
     }
 
@@ -252,6 +258,76 @@ impl SqliteStore {
     pub(super) fn record_stale_run_recovery_failure(&self) {
         self.stale_run_recovery_failures
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Quarantine one durable row the store could not parse (#1241).
+    ///
+    /// Call this instead of a bare `tracing::warn!` at every `filter_map` skip
+    /// site. Dropping the row is the correct policy — an unparseable row is a
+    /// row we cannot believe — but the quarantine rule
+    /// (`docs/architecture.md` § "Reconciliation policy") requires the drop to
+    /// be counted, not just logged, so a corrupting database is visible on
+    /// `GET /operations/metrics` rather than only to whoever is tailing logs.
+    ///
+    /// **Most callers are loaders, where absence just means the row is not
+    /// served. Three are not.** `delete_agent` (twice) and
+    /// `migrate_telegram_context_ids` collect ids in order to delete or
+    /// rewrite them, so a drop there *strands* durable rows that no later read
+    /// repairs. Those are the policy's "third branch", and a new write-path
+    /// caller owes the same two things they do: a comment naming what it
+    /// strands, and a `detail` prefixed with the site. If a drop would instead
+    /// cause something to be **deleted** that should have survived, this
+    /// helper is the wrong answer — that is not quarantinable.
+    ///
+    /// `detail` carries whatever the caller already has in hand. For most
+    /// sites that is only the parse error, because the column that failed to
+    /// parse is often the id itself.
+    ///
+    /// **This must never touch `self.conn`.** Every call site runs inside a
+    /// `query_map`/`filter_map` iteration while the caller still holds
+    /// `self.conn.lock()`, and that lock is a `parking_lot::Mutex` —
+    /// non-reentrant, so re-locking it on the same thread is a hard deadlock,
+    /// not a panic. Concretely: do **not** re-query the row to give the log a
+    /// better identifier. The daemon would hang on the first corrupt row it
+    /// met in production, with no error and no panic to point at. If a site
+    /// needs a stronger identifier, the caller must select it in the original
+    /// query and pass it in via `detail`.
+    pub(super) fn record_skipped_row(
+        &self,
+        table: PersistenceTable,
+        detail: impl std::fmt::Display,
+    ) {
+        self.row_skips.record(table);
+        tracing::warn!(
+            table = table.as_str(),
+            detail = %detail,
+            "Skipping unparseable persistence row"
+        );
+    }
+
+    /// Durable rows the store could not parse and therefore dropped, summed
+    /// across every table (#1241).
+    ///
+    /// Non-zero means the daemon is serving an incomplete view of the
+    /// database: an agent missing from the registry, a session missing from
+    /// the sidebar, a message missing from a context window. For the loader
+    /// sites the count is per *read*, not per distinct row — a corrupt row on
+    /// a hot path is counted again on every load that passes over it, so the
+    /// rate matters more than the absolute value.
+    pub fn rows_skipped_total(&self) -> u64 {
+        self.row_skips.total()
+    }
+
+    /// Per-table breakdown of [`Self::rows_skipped_total`], keyed by SQL table
+    /// name. Always reports every known table, including the zeroes.
+    pub fn rows_skipped_by_table(&self) -> std::collections::BTreeMap<&'static str, u64> {
+        self.row_skips.by_table()
+    }
+
+    /// Per-table skip count. Test affordance for asserting that a specific
+    /// loader quarantined a row.
+    pub fn rows_skipped_for(&self, table: PersistenceTable) -> u64 {
+        self.row_skips.get(table)
     }
 
     /// Return the latest successfully committed schema migration.

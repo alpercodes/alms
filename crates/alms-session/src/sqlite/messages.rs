@@ -64,6 +64,8 @@ impl SqliteStore {
         //    unparseable content JSON or timestamps.
         // Both phases run sequentially, so no concurrency concern; the split
         // across two closures is just due to the two-pass processing.
+        // It is a local tally for the per-session summary line below; the
+        // process-lifetime accounting is `record_skipped_row` (#1241).
         let mut skipped: usize = 0;
         let raw_rows: Vec<_> = stmt
             .query_map([session_id.0.to_string()], |row| {
@@ -79,7 +81,10 @@ impl SqliteStore {
             .filter_map(|r| match r {
                 Ok(v) => Some(v),
                 Err(e) => {
-                    tracing::warn!("Skipping unparseable message row: {e}");
+                    self.record_skipped_row(
+                        PersistenceTable::Messages,
+                        format_args!("session {}: {e}", session_id.0),
+                    );
                     skipped += 1;
                     None
                 }
@@ -92,7 +97,10 @@ impl SqliteStore {
                 let content: Content = match serde_json::from_str(&content_json) {
                     Ok(c) => c,
                     Err(e) => {
-                        tracing::warn!("Skipping message {id}: bad content JSON: {e}");
+                        self.record_skipped_row(
+                            PersistenceTable::Messages,
+                            format_args!("message {id}: bad content JSON: {e}"),
+                        );
                         skipped += 1;
                         return None;
                     }
@@ -100,7 +108,10 @@ impl SqliteStore {
                 let ts = match chrono::DateTime::parse_from_rfc3339(&ts_str) {
                     Ok(t) => t,
                     Err(e) => {
-                        tracing::warn!("Skipping message {id}: bad timestamp: {e}");
+                        self.record_skipped_row(
+                            PersistenceTable::Messages,
+                            format_args!("message {id}: bad timestamp: {e}"),
+                        );
                         skipped += 1;
                         return None;
                     }
@@ -137,7 +148,7 @@ impl SqliteStore {
 
 #[cfg(test)]
 mod tests {
-    use super::super::test_helpers::{new_message, new_session};
+    use super::super::test_helpers::{corrupt_with_sql, new_message, new_session};
     use super::super::*;
 
     #[test]
@@ -205,5 +216,31 @@ mod tests {
         // Ordering must be: first-updated, second, third.
         assert!(matches!(&messages[1].content, Content::Text(t) if t == "second"));
         assert!(matches!(&messages[2].content, Content::Text(t) if t == "third"));
+    }
+
+    /// #1241: the second-phase skip (valid columns, unparseable content JSON)
+    /// is counted under `messages` just like the column-extraction skip.
+    #[test]
+    fn corrupt_message_row_is_dropped_and_counted() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let session = new_session();
+        store.save_session(&session).unwrap();
+        store
+            .save_message(session.id, &new_message("keep"))
+            .unwrap();
+        store
+            .save_message(session.id, &new_message("lose"))
+            .unwrap();
+
+        corrupt_with_sql(
+            &store,
+            "UPDATE messages SET content = '{not valid json' WHERE content LIKE '%lose%'",
+        );
+
+        let loaded = store.load_messages(session.id).unwrap();
+        assert_eq!(loaded.len(), 1, "the readable message must still load");
+        assert!(matches!(&loaded[0].content, Content::Text(t) if t == "keep"));
+        assert_eq!(store.rows_skipped_for(PersistenceTable::Messages), 1);
+        assert_eq!(store.rows_skipped_total(), 1);
     }
 }

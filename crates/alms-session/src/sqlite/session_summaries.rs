@@ -201,7 +201,10 @@ impl SqliteStore {
             .filter_map(|r| match r {
                 Ok(s) => Some(s),
                 Err(e) => {
-                    tracing::warn!("Skipping unparseable session_summary row: {e}");
+                    self.record_skipped_row(
+                        PersistenceTable::SessionSummaries,
+                        format_args!("agent {agent_str}: {e}"),
+                    );
                     None
                 }
             })
@@ -214,7 +217,10 @@ impl SqliteStore {
                 .filter_map(|r| match r {
                     Ok(s) => Some(s),
                     Err(e) => {
-                        tracing::warn!("Skipping unparseable session_summary row: {e}");
+                        self.record_skipped_row(
+                            PersistenceTable::SessionSummaries,
+                            format_args!("agent {agent_str}: {e}"),
+                        );
                         None
                     }
                 })

@@ -193,6 +193,11 @@ Schema changes use ordered, transactional migrations with a durable
 `schema_migrations` history and fail closed on unknown future versions. See
 [Database migrations, compatibility, and rollback](database-migrations.md).
 
+Rows that cannot be parsed or reconciled are **quarantined**, not fatal: they
+stay durable, are kept out of live in-memory state, and are counted on
+`GET /operations/metrics`. See
+[Reconciliation policy: absence must be a safe belief](#reconciliation-policy-absence-must-be-a-safe-belief).
+
 **On-disk layout (post-#945 / #946 — workspace v2):**
 
 ```
@@ -241,6 +246,257 @@ HTTP/SSE control plane. Handles top-level user interactions and exposes coordina
 ### Channel Adapters (`alms-channel`)
 
 Telegram reaches registered top-level agents through the channel adapter. The embedded web UI consumes the gateway API: it can open a child session's own stream and cancel a live child by session ID. The channel adapter does not expose a route for users to create arbitrary coordinator tasks directly.
+
+---
+
+## Reconciliation policy: absence must be a safe belief
+
+A system-wide invariant about what the daemon is permitted to **believe**. It
+governs every startup sweep, recovery pass, and loader that reads durable
+state — it is not a database-operations procedure.
+
+> **The rule.** When a startup pass, recovery sweep, or loader finds a row it
+> cannot repair or parse, ALMS **quarantines** it rather than refusing to run.
+> The row stays durable and untouched; it is **not projected into live
+> in-memory state**; it is counted on `GET /operations/metrics`; and it is
+> logged with whatever identifies it and, where one exists, its remediation.
+> The daemon boots.
+>
+> Quarantine is legal only where the daemon behaves correctly while believing
+> the row is **absent**. Where absence would cause already-completed work to
+> run again, the failure is fatal instead. Where absence is merely *untidy* —
+> it strands durable rows but re-executes nothing — quarantine still applies,
+> but the site must say what it strands.
+
+**The test to apply at a new site — one question:**
+
+> *If I drop this row entirely, does the daemon do anything it would not have
+> done had the row been correct?*
+>
+> - **No** → quarantine. Absence is safe.
+> - **Yes, it re-executes something already done in the world** → fatal.
+> - **Yes, but only by *stranding* durable rows — orphans or unmigrated rows
+>   left behind, with nothing re-executing and nothing removed that should
+>   have survived** → quarantine, *and* the call site must name what it
+>   strands in a comment and prefix its log `detail` with the site, so the
+>   drop is distinguishable from a loader drop on the same table.
+
+**The stranding in the third branch must be additive.** A drop that causes
+rows to be *deleted* which should have been kept is not this branch and not
+quarantinable: durable garbage is tolerable only because it is still
+repairable by hand, and data that is gone is not.
+
+**"Fatal" is scoped to where the site runs.** At a startup or recovery site it
+means the daemon refuses to open the database — that is the sense used in
+"Exactly one fatal site" below. At a request-scoped write path it means the
+operation fails and its transaction rolls back; the daemon keeps serving
+either way. The branch you pick is the same wherever you are; the remedy it
+names is not.
+
+That is the whole classification, and it is narrow on purpose. It is *not*
+"classify by risk" — "could this cause incorrect execution?" invites a
+judgement call at every site, whereas "can this row be absent, and if not,
+what exactly survives?" has an answer you can defend in a review.
+
+**The third branch is for write paths, and it was added because the first two
+gave no answer at one.** A collection loop that gathers ids *in order to delete
+or rewrite them* is inside the rule's scope but off both of its horns.
+`delete_agent` is the case: a session id it cannot read is a session whose
+messages, runs, and tool-call rows survive the delete with no parent agent and
+no retry path, because the agent row is gone. Absence is **not** safe there —
+the rows leak, permanently. But nothing re-executes, so fatal is wrong, and
+actively the worse answer: failing the delete makes the agent permanently
+undeletable, which is the #1236 pattern of a false belief disabling its own
+remedy. Quarantine, counted, with the leak named at the site is the least bad
+outcome — and the leak stays recoverable by hand precisely because the rows are
+all still there. Durable garbage is a real third outcome; a rule that pretends
+otherwise gets quoted at a site it cannot classify.
+
+**Check which way the collected list points before reaching for this branch.**
+The additive qualifier is what keeps it safe, and the same idiom supports both
+polarities. `delete_agent`'s DM-candidate loop gathers sessions *to purge*, so
+a dropped row leaks a session that should have gone. Written the other way
+round — gathering the sessions to *keep*, which is how a retention sweep or a
+session GC would naturally be written — a dropped row would **delete a live
+session instead of leaking a dead one**. Nothing re-executes in either case and
+both leave durable state inconsistent, which is why the branch is worded around
+stranding rather than around inconsistency: only the first is additive, and
+only the first is quarantinable.
+
+### Why the axis is not "fail closed vs. run degraded"
+
+Refusing to boot is not a safety property. It is availability spent to buy one,
+and it only pays off if the operator acts before harm occurs. ALMS is a
+single-process daemon: refusing to boot removes the API, the UI,
+`DELETE /jobs`, `DELETE /sessions`, and every diagnostic the product ships,
+leaving the operator with `sqlite3` against a stopped daemon. Startup is the
+moment we have the *least* leverage to help them, so it is the worst place to
+choose unavailability.
+
+The hazard was never "the daemon is running". It is "the daemon believes
+something false". So the rule bites on **projection into live state**, not on
+continuation.
+
+#1236 is the proof. It made the right *policy* call — skip the unreconcilable
+run row, keep booting — and still shipped a defect, because
+`hydrate_from_store` then loaded that same row into the live run registry as
+`Queued`. The phantom made the session permanently undeletable
+(`DELETE /sessions/{id}` → 409 `ACTIVE_RUNS`), pinned the sidebar's active-run
+indicator on forever, and — being older than every real run — sorted to the
+head of the FIFO queue and shifted every real queue position for that agent.
+Same policy, two implementations, one safe and one not.
+
+### The four obligations
+
+A site may quarantine only if it does **all four**:
+
+1. **A counter on `GET /operations/metrics`** — visible without log access.
+2. **One `warn!`/`error!` line carrying the strongest identifier available** —
+   the row id where the row is identifiable, otherwise the table and the
+   failing column. Bounded (once per row) at a one-shot sweep; unbounded (once
+   per read) at a loader.
+3. **A bounded blast radius: the quarantined fact must not reach live state.**
+4. **A remediation that does not require stopping the daemon.** Through the
+   product where the entity is addressable; `sqlite3` against the *live*
+   database where it is not.
+
+All four are requirements, with no exempt class. Obligations 2 and 4 are
+stated in terms of what is *available* at the site rather than in terms of a
+row id and a product endpoint, because at a loader neither necessarily exists
+— see below. That is a weaker guarantee, not a waived one, and the next
+section says exactly how much weaker.
+
+**Obligation 3 is the one to check in review.** The skip and the projection
+almost always live in different functions, and a reviewer checks the function
+that changed.
+
+Obligations 3 and 4 are more entangled than they look. In #1236 the phantom
+`Queued` run was *what made* `DELETE /sessions/{id}` return 409 — so fixing
+obligation 3 restored obligation 4 for free. **A false belief often disables
+its own remedy.** Expect those two failures together, and suspect a missing
+obligation 3 whenever the in-product repair path is blocked.
+
+#### How one-shot sweeps and per-read loaders discharge obligations 2 and 4
+
+A startup sweep runs once, so it can afford an `error!` per row carrying the
+row id and the exact repair SQL, and its counter is effectively a count of
+distinct bad rows. A loader runs on *every read*: the same corrupt row is
+re-encountered by every caller, so its log stays at `warn!` and its counter
+necessarily counts **skips, not rows** (see `persistence_rows_skipped_total`).
+
+**Obligation 2** is discharged at a loader by the strongest identifier
+available rather than by the row id, because frequently there is no row id to
+give: the column that failed to parse *is* the identifier — `sessions.id`,
+`runs.agent_id`, `agents.created_at` are the cases we have tests for. What the
+operator gets is the table and the failing column, and the line cannot be
+bounded. That is genuinely less than a sweep offers, and **the counter is what
+carries the weight instead**. It is the reason #1241 was worth doing on its
+own: it converts "did we silently lose rows?" from an archaeology exercise
+across log files into a question with an answer.
+
+**Obligation 4** is discharged at a loader by `sqlite3` against the *live*
+database rather than through the product — and it has to be, for the same
+reason. The in-product repair for a corrupt `sessions` row would be
+`DELETE /sessions/{id}`, which cannot be addressed when the unparseable column
+is the id. What obligation 4 protects is the operator's ability to act **while
+the daemon serves**, and that is intact: edit or delete the row and the next
+read picks up the repair. Where the entity *is* addressable — the stale-run
+and job-bootstrap sweeps — the product path is required, not optional.
+
+### Every reconciliation site we have
+
+| Site | Is absence safe? | Policy | Accounting |
+|---|---|---|---|
+| `mark_stale_runs_failed` (`alms-session/src/sqlite/runs.rs`) — a `queued`/`running` row left by a dead process | **Yes.** The run is dead either way; nothing re-executes. | Quarantine | `stale_run_recovery_failures_total`; `error!` with the `run_id` and its remediation SQL. The row is also excluded from `RunManager::hydrate_from_store`, so it is never served as a live pending run (obligation 3). |
+| `bootstrap_scheduler` (`alms-gateway/src/server/mod.rs`) — a job whose startup fire time cannot be persisted | **Yes.** "This job is not scheduled" is truthful and safe. | Quarantine | `job_bootstrap_failures_total`; `error!` with the job id. |
+| The 25 row-drop points across 14 **loaders** in `alms-session` — any row that fails to parse | **Yes**, by the same argument. Nothing re-executes and nothing is left behind; the row is simply not served. | Quarantine | `persistence_rows_skipped_total`, per table (#1241); `warn!` with the table and the parse error. |
+| The 3 row-drop points on **write paths** in `alms-session` — `delete_agent` (session ids, DM candidates) and `migrate_telegram_context_ids` | **No — third branch.** Nothing re-executes, but the delete leaves that session's dependent rows orphaned, or the session keeps its legacy `telegram_{chat_id}` context id. | Quarantine, with the leak named at the site | `persistence_rows_skipped_total` under `sessions` (#1241); `warn!` whose `detail` is prefixed with the site, so it is distinguishable from a loader drop on the same table. |
+| Schema-version guard (`alms-session/src/sqlite/migrations.rs`) — a database newer than the binary | **No.** You cannot interpret rows you cannot read, and job completion state is among them: a completion record you cannot read is indistinguishable from "not yet run", so already-executed jobs fire again. | **Fatal** — `refusing to open` | n/a |
+
+The jobs row deserves its justification spelled out, because it is the one most
+likely to be cited wrongly later. Jobs are non-fatal **not** because
+availability beats correctness, but because *"this job is not scheduled"* is a
+true and safe statement, whereas *"no jobs at all are scheduled and the daemon
+is down"* is neither. Availability is the by-product, not the justification. If
+this were written down as "availability wins", someone would cite it at the
+migration guard next year.
+
+**Scope note.** The rule is about *rows*. Some parsers also apply field-level
+fallbacks — an unrecognised `reasoning_effort` becomes `None`, an unrecognised
+`worktree_mode` becomes `Off` — which keep the row and degrade one column.
+Those are deliberately *not* counted in `persistence_rows_skipped_total`, which
+would otherwise stop meaning "rows the daemon cannot see".
+
+Do not read that as "field-level fallbacks are a uniformly weaker class", and
+do not assume they are all logged. **Two of them are neither** (#1246).
+`parse_run_row` degrades two *foreign keys* silently — `job_id` and
+`parent_run_id` each go through `.and_then(|s| Uuid::parse_str(&s).ok())` with
+no log and no counter — and `delete_agent`'s agent-name lookup is a bare
+`.ok()` whose `None` skips the entire DM-cleanup branch. A fallback on a
+foreign key is not a defaulted column: `job_id → None` makes the run stop being
+attributable to its job, so `cancel_runs_for_job` misses it. That is a false
+belief projected into live state, which is the precise hazard this rule exists
+to name — arguably worse than dropping the row. Those sites are unaddressed and
+out of #1241's scope, not blessed by it.
+
+### Exactly one fatal site
+
+Applied across the system, the rule yields **exactly one sanctioned fatal
+reconciliation site** — the schema-version guard in
+`alms-session/src/sqlite/migrations.rs` — and it was already fatal before the
+rule was written down.
+
+That is a feature, not an accident. "One fatal site" is easy to state, easy to
+test, and easy to notice when someone adds a second. **A second fatal site
+should be conspicuous**, and adding one needs an explicit argument that absence
+is unsafe — that is, that dropping the row would cause work already done in the
+world to be done again. Absent that argument, the answer is quarantine.
+
+The qualifier *reconciliation* is load-bearing. Startup also fails closed when
+the schema itself cannot be established — a gap in migration history, a
+migration body that will not apply, a file-backed database that refuses WAL.
+Those are not judgements about what to believe about a row; they mean **no**
+row can be trusted to be interpretable, which is upstream of the rule rather
+than an exception to it. See
+[Database migrations, compatibility, and rollback](database-migrations.md).
+
+### No escape-hatch flag
+
+Do **not** add a `--skip-recovery` flag or its env-var equivalent. It gets set
+once during an incident at 2am and then lives in the systemd unit forever;
+nobody removes it. It silently converts a one-time degraded boot into a
+permanent policy change, which is worse than either policy chosen deliberately.
+
+It is also unnecessary under this rule: if quarantine is the default the daemon
+always boots, so the operator always has the API. **The escape hatch *is* the
+running daemon.** Remediation belongs on the API surface, not in a startup
+flag.
+
+The one place a flag might seem justified — the migration refusal — is where it
+is most dangerous. An `--ignore-schema-version` switch is the rollback-
+corruption hazard with a CLI flag attached (see
+[Database migrations, compatibility, and rollback](database-migrations.md)). If
+that capability is ever wanted, it belongs in a separate offline `alms db`
+subcommand that refuses to start the server, not in a serving flag.
+
+### Boundary condition: the rule assumes a single writer
+
+**This classification is only valid while exactly one process writes the
+database.** A `running` row can be treated as absent only because no other
+process is executing it. If ALMS ever supports two daemons against one
+database — or any second writer to `runs` — then `running` rows stop being
+safely absent and move to the **fatal** class, and every entry in the table
+above must be re-derived from the test rather than inherited.
+
+Any change that introduces a second writer must revisit this section in the
+same change.
+
+**Nothing currently enforces this.** The assumption is stated here and checked
+by nobody: two daemons against one `.alms/alms.db` would each quarantine the
+other's live `running` rows, and the first symptom would be lost runs rather
+than an error. #1247 tracks making it fail at boot — an advisory lock on the
+database file, or an `owner_pid`/`boot_id` row written under `BEGIN IMMEDIATE`
+at open.
 
 ---
 
