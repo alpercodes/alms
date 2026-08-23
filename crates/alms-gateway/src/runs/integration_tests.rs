@@ -8358,6 +8358,116 @@ async fn http_cancel_persists_before_firing_the_cancellation_token() {
     shutdown_token.cancel();
 }
 
+/// #1254 regression — when the HTTP `cancel_run` handler wins the race and
+/// `execute_run`'s terminal arm consequently takes its "already terminal"
+/// skip branch, the session stream must STILL receive the terminal event.
+///
+/// The skip line in the reported log reads like a dropped event, which is
+/// what made this look like a defect. It is not: `cancel_run` OWNS the
+/// broadcast when it wins, and the terminal arm stays silent precisely so
+/// the event is not duplicated. This test pins that ownership so the two
+/// sides can never both defer to each other.
+///
+/// Which skip branch, precisely: the terminal-transition barrier sits
+/// before `match result`, so the mock-LLM loop has already returned
+/// `Ok(_)` by the time the cancel lands and the token can no longer steer
+/// it into a `Cancelled` arm. What runs is the **completed arm's**
+/// already-terminal gate ("Run {} was already terminal when its loop
+/// returned Ok"), which is structurally identical to the four
+/// `Cancelled`/`Failed`/`Err` gates below it: same `marked_*` transition
+/// bool, same silence, same reliance on the winner having broadcast. That
+/// the run finishes with `run_cancelled` and no `run_finished` is exactly
+/// this gate suppressing itself. The reported production line came from
+/// the `CancelledWithToolCalls` sibling; that arm needs a hanging LLM to
+/// reach and is not what this test drives.
+///
+/// Deterministic by construction — the barrier parks `execute_run`
+/// immediately before its terminal transition, so the cancel is guaranteed
+/// to land first rather than relying on timing.
+///
+/// Asserts the BROADCAST, not the persisted status: the status was already
+/// correct in production and is exactly what hid the reported symptom.
+#[tokio::test]
+async fn http_cancel_emits_terminal_sse_even_when_the_terminal_arm_skips() {
+    use axum::extract::{Path, State};
+
+    let (state, shutdown_token, _cr, _tr, _dr) = test_app_state_with_mock_llm();
+    let agent_id = AgentId::new();
+    let session = state
+        .session_manager
+        .get_or_create(agent_id, "test-1254-cancel-broadcast");
+    let session_id = session.id;
+
+    let run = Run::new(session_id, agent_id, "complete in mock mode".into());
+    let run_id = run.run_id;
+    let _ = state.run_manager.insert_run(run.clone());
+    let cancel_token = CancellationToken::new();
+    state
+        .run_manager
+        .register_cancel_token(run_id, cancel_token.clone());
+
+    // Subscribe before anything runs so this is a live-delivery assertion.
+    let mut session_rx = subscribe_session(&state, session_id);
+    let barrier = super::lifecycle::install_terminal_transition_barrier(run_id);
+
+    let exec_state = state.clone();
+    let handle = tokio::spawn(async move {
+        super::lifecycle::execute_run(
+            exec_state,
+            super::RunParams {
+                run_id,
+                session_id,
+                agent_id,
+                input: run.input,
+                context_id: "test-1254-cancel-broadcast".to_string(),
+                cancel_token,
+                is_peer_message: false,
+                is_system_triggered: false,
+                input_pre_persisted: false,
+            },
+        )
+        .await;
+    });
+
+    // `execute_run` is now parked immediately before its terminal transition.
+    barrier.wait().await;
+
+    // The HTTP cancel wins the race: it flips the run terminal and owns the
+    // terminal broadcast.
+    let _ = super::lifecycle::cancel_run(State(state.clone()), Path(run_id))
+        .await
+        .expect("cancel_run should succeed for a Running run");
+
+    // Release `execute_run`. Its completed arm now finds the state already
+    // terminal and takes the already-terminal skip branch.
+    barrier.wait().await;
+    tokio::time::timeout(std::time::Duration::from_secs(10), handle)
+        .await
+        .expect("execute_run must leave the terminal transition")
+        .expect("execute_run task should not panic");
+
+    let events = drain_events(&mut session_rx);
+    let terminal: Vec<&str> = events
+        .iter()
+        .map(|event| event.event_type.as_str())
+        .filter(|kind| matches!(*kind, "run_cancelled" | "run_finished" | "run_error"))
+        .collect();
+
+    assert_eq!(
+        terminal,
+        vec!["run_cancelled"],
+        "cancelling must put exactly one terminal event on the session \
+         stream even though `execute_run`'s terminal arm skipped its own \
+         broadcast (#1254); saw terminal events {terminal:?} out of {:?}",
+        events
+            .iter()
+            .map(|event| event.event_type.as_str())
+            .collect::<Vec<_>>()
+    );
+
+    shutdown_token.cancel();
+}
+
 /// #1046 regression — race between the HTTP `cancel_run` handler and
 /// `execute_run`'s terminal `Cancelled` arm produces EXACTLY ONE
 /// `run_cancelled` SSE event for the same run.
@@ -10798,6 +10908,112 @@ async fn cancel_subagent_endpoint_cancels_live_subagent() {
         second.unwrap_err().0,
         axum::http::StatusCode::NOT_FOUND,
         "the second cancel must be a 404"
+    );
+
+    shutdown_token.cancel();
+}
+
+/// #1254 regression — cancelling a parent must put a terminal SSE event on
+/// the in-flight subagent's OWN session, not merely a `cancelled` row in the
+/// database.
+///
+/// This is the acceptance case the issue flagged as uncovered: the parent's
+/// cancellation token propagates to a FOREGROUND subagent (in the reported
+/// session, subagent `d19b6d62` went terminal 1ms after its parent), and the
+/// fullscreen subagent-session view has to learn about it from the SSE feed.
+///
+/// The assertion is deliberately on the BROADCAST, not on `TaskStatus` —
+/// the persisted status was already correct in production, and that is
+/// precisely what hid the reported symptom for so long.
+#[tokio::test]
+async fn cancelled_subagent_emits_terminal_sse_on_its_own_session() {
+    let (state, shutdown_token, _cr, _tr, _dr) = test_app_state_with_mock_llm();
+
+    // The parent's cancellation token — the same object the HTTP
+    // `cancel_run` handler fires via `RunManager::cancel_run`.
+    let parent_cancel_token = CancellationToken::new();
+
+    let request = alms_coordinator::SubagentRequest {
+        task: "long-running foreground research".to_string(),
+        parent_session: SessionId::new(),
+        parent_agent_id: AgentId::new(),
+        parent_run_id: None,
+        subagent_name: None,
+        parent_tool_invocation_id: None,
+    };
+    // `is_background = false` — the foreground `invoke_agent` shape.
+    let (task_id, sub_session_id) = state
+        .coordinator
+        .spawn_subagent(request, None, false, Some(parent_cancel_token.clone()))
+        .await
+        .expect("spawn_subagent should succeed");
+    let result_rx = state
+        .coordinator
+        .take_result_rx(task_id)
+        .expect("result receiver should be available");
+
+    // Subscribe BEFORE the cancel so this is a live-delivery assertion and
+    // not just a replay of the persisted session log.
+    let mut session_subscription = state.run_manager.subscribe_session(sub_session_id);
+
+    // Cancel the PARENT. Propagation through the child token is what drives
+    // the subagent terminal — nothing cancels the subagent directly.
+    parent_cancel_token.cancel();
+
+    let task_result = result_rx.await.expect("should receive a task result");
+    assert_eq!(
+        task_result.status,
+        TaskStatus::Cancelled,
+        "the subagent must land Cancelled via parent-token propagation; got {:?}",
+        task_result.status
+    );
+
+    // Await the terminal ON THE SUBSCRIPTION, not on `session_events_from`.
+    // The self-sink's drain task orders the terminal event after all of the
+    // subagent's buffered content, so it lands asynchronously — `result_rx`
+    // resolving does not mean it has already been broadcast.
+    //
+    // Reading the persisted log instead would be the wrong surface: #1254's
+    // symptom was "the client never received it", and `send_event` writes
+    // the log and fans out in the same call, so a log-based assertion still
+    // passes with `fan_out_to` broken or with the terminal rerouted through
+    // the log-skipping `send_transient_session_event`. Draining the channel
+    // is what actually pins delivery — and it needs no sleep, because
+    // `recv()` wakes on the send.
+    let mut delivered: Vec<String> = Vec::new();
+    let saw_terminal = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while let Some(event) = session_subscription.recv().await {
+            let event_type = event.event_type.clone();
+            delivered.push(event_type.clone());
+            if event_type == "run_cancelled" {
+                return true;
+            }
+        }
+        false
+    })
+    .await
+    .unwrap_or(false);
+    assert!(
+        saw_terminal,
+        "the cancelled subagent's own session must receive `run_cancelled` \
+         on its live SSE stream (#1254); delivered: {delivered:?}"
+    );
+
+    // Whatever is already queued behind the terminal — a second broadcast
+    // from a racing path would be sitting right here.
+    delivered.extend(
+        drain_events(&mut session_subscription)
+            .into_iter()
+            .map(|event| event.event_type),
+    );
+    let cancelled_count = delivered
+        .iter()
+        .filter(|kind| kind.as_str() == "run_cancelled")
+        .count();
+    assert_eq!(
+        cancelled_count, 1,
+        "the cancelled subagent's own session must receive EXACTLY one \
+         `run_cancelled` SSE event (#1254); delivered: {delivered:?}"
     );
 
     shutdown_token.cancel();

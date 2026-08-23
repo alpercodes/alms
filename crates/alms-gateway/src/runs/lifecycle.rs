@@ -2839,8 +2839,10 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
                 // The partial tool-call records and the run-boundary marker
                 // were already persisted above (diagnostic and idempotent).
                 info!(
-                    "Run {} returned Ok but was already terminal — \
-                     terminal-arm bookkeeping skipped (cancel / shutdown won)",
+                    "Run {} was already terminal when its loop returned Ok — the path \
+                     that won the race (cancel / shutdown) already emitted the terminal \
+                     SSE, so this arm stays silent to keep the event exactly-once \
+                     (#1046). Not a dropped event. Terminal-arm bookkeeping skipped",
                     run_id.0
                 );
             }
@@ -2950,8 +2952,10 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
                 info!("Run {} cancelled", run_id.0);
             } else {
                 info!(
-                    "Run {} loop returned Cancelled but state was already terminal — \
-                     SSE broadcast skipped (DM peer notification fired unconditionally)",
+                    "Run {} was already terminal when its loop returned Cancelled — \
+                     the path that won the race already emitted the terminal SSE, so \
+                     this arm stays silent to keep the event exactly-once (#1046). \
+                     Not a dropped event. DM peer notification fired unconditionally",
                     run_id.0
                 );
             }
@@ -3039,9 +3043,11 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
                 );
             } else {
                 info!(
-                    "Run {} loop returned CancelledWithToolCalls but state was already \
-                     terminal — SSE broadcast skipped ({} tool calls persisted; \
-                     DM peer notification fired unconditionally)",
+                    "Run {} was already terminal when its loop returned \
+                     CancelledWithToolCalls — the path that won the race already \
+                     emitted the terminal SSE, so this arm stays silent to keep the \
+                     event exactly-once (#1046). Not a dropped event. \
+                     {} tool calls persisted; DM peer notification fired unconditionally",
                     run_id.0,
                     tool_calls.len()
                 );
@@ -3159,9 +3165,12 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
                 );
             } else {
                 error!(
-                    "Run {} loop returned FailedWithToolCalls but state was already \
-                     terminal — SSE broadcast skipped ({} tool calls persisted; \
-                     DM peer notification fired unconditionally): {}",
+                    "Run {} was already terminal when its loop returned \
+                     FailedWithToolCalls — the path that won the race already emitted \
+                     the terminal SSE, so this arm stays silent to keep the event \
+                     exactly-once (#1046). Not a dropped event. \
+                     {} tool calls persisted; DM peer notification fired \
+                     unconditionally: {}",
                     run_id.0,
                     tool_calls.len(),
                     source
@@ -3248,8 +3257,10 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
                 );
             } else {
                 error!(
-                    "Run {} loop returned Err but state was already terminal — \
-                     SSE broadcast skipped (DM peer notification fired unconditionally): {}",
+                    "Run {} was already terminal when its loop returned Err — the path \
+                     that won the race already emitted the terminal SSE, so this arm \
+                     stays silent to keep the event exactly-once (#1046). Not a \
+                     dropped event. DM peer notification fired unconditionally: {}",
                     run_id.0, e
                 );
             }
