@@ -16,6 +16,7 @@ pub mod background;
 pub mod classification;
 pub mod exec;
 pub mod output;
+pub(crate) mod pathnorm;
 pub mod permissions;
 pub mod security;
 pub mod spill;
@@ -207,8 +208,16 @@ impl ShellTool {
     ///
     /// This replaces the persistent cwd. Useful when attaching an agent workspace.
     pub fn with_default_cwd(mut self, cwd: PathBuf) -> Self {
+        // #1255: normalise both sides before comparing. The raw
+        // `starts_with` this replaced warned whenever the configured
+        // default cwd and the sandbox root were spelled in different but
+        // equivalent forms (relative vs absolute, `\\?\`-prefixed, or
+        // differently cased on Windows).
         if let Some(ref root) = self.sandbox_root
-            && !cwd.starts_with(root)
+            && !pathnorm::is_within(
+                &pathnorm::canonical_for_comparison(root),
+                &pathnorm::canonical_for_comparison(&cwd),
+            )
         {
             warn!(
                 default_cwd = %cwd.display(),

@@ -398,6 +398,28 @@ so an operator scanning their config should treat them as inert.
 3. The canonical path must `starts_with(project_root)` — rejects symlink escapes, `..` traversal, and absolute paths outside the root.
 4. For new files (`fs_write`), the nearest existing ancestor is canonicalized and remaining components are appended.
 
+**Shell cwd containment (#1255):** the `shell` tool keeps a persistent
+working directory across calls, re-reading it after every command from a
+`pwd` marker appended to the command line. That reported string is *not*
+in the same form as the pinned sandbox root: the Git-Bash engine reports
+MSYS form (`/c/dev/ws`), the builtin engine reports native Windows form
+(`C:\dev\ws`), and `std::fs::canonicalize` produces extended-length form
+(`\\?\C:\dev\ws`). Both sides are therefore normalised — MSYS drive paths
+rewritten to drive form, `\\?\` stripped, symlinks resolved — before a
+component-wise containment test that folds ASCII case on Windows.
+Containment has always been component-wise — `Path::starts_with` matches
+whole components, so a sibling like `ws-evil` was never treated as inside
+`ws`, and no prefix-matching vulnerability was ever shipped. What #1255
+fixed is the *form* mismatch: the two sides reached that comparison in
+incompatible spellings of the same directory, sharing no leading
+components at all, so the sandbox rejected its own root. The MSYS
+rewrite is applied only
+under `cfg(windows)` and only when the rewritten path names a real
+directory: on Unix `/c/...` is an ordinary absolute path and is never
+reinterpreted. A cwd that fails containment is discarded and the previous
+cwd retained, so a `cd` out of the sandbox cannot persist into the next
+command.
+
 **UNC path blocking**: All file tools (`fs_read`, `fs_write`, `fs_list`, `fs_edit`, `fs_grep`, `fs_glob`) reject Windows UNC paths (`\\server\share`), extended-length UNC paths (`\\?\UNC\server\share`), and URI-style equivalents (`//server/share`) before any filesystem I/O. This prevents NTLM credential theft via SMB auto-authentication. The check runs on all platforms (not just Windows) because the daemon may be accessed from a Windows client, and forward-slash UNC paths are valid on some Linux SMB configurations. Device namespace paths (`\\.\`) are also blocked by the same check.
 
 **Device path blocking**: All file I/O tools (`fs_read`, `fs_write`, `fs_edit`) block known system device paths (`/dev/zero`, `/dev/random`, `/dev/urandom`, `/dev/stdin`, `/dev/stdout`, `/dev/stderr`, `/dev/tty`, `/dev/console`, `/proc/self/fd/0-2` on Unix; `CON`, `PRN`, `AUX`, `NUL`, `COM1`-`COM9`, `LPT1`-`LPT9` on Windows) and reject non-regular files via `is_file()` check. Both raw and canonicalized paths are checked to prevent symlink-based bypasses.

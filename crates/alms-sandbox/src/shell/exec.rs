@@ -4,6 +4,7 @@
 //! and detecting the post-execution working directory via a `pwd` marker.
 
 use super::output::truncate_output_bytes;
+use super::pathnorm;
 use super::security::{command_matches_denylist, is_secret_env_var, platform_critical_env_vars};
 use super::spill::{ShellSpillPolicy, write_spill};
 use super::types::{MAX_OUTPUT_BYTES, ShellInput, ShellOutput, ShellState};
@@ -134,20 +135,32 @@ pub(crate) async fn execute_command(
             // Validate the new cwd against sandbox root before storing.
             // If the command changed directory outside the sandbox (e.g. `cd /etc`),
             // keep the old cwd to prevent sandbox escape on subsequent calls.
+            //
+            // #1255: store the NORMALISED path that `validate_cwd` returns,
+            // not the raw `pwd` string. The Git-Bash engine reports MSYS form
+            // (`/c/dev/ws`) and feeding that straight back to
+            // `Command::current_dir` resolves it against the current drive,
+            // so even a cwd that passed containment would land the next
+            // command somewhere else entirely.
             if !unrestricted && let Some(root) = sandbox_root {
-                if validate_cwd(&new_path, root).is_ok() {
-                    let mut cwd_lock = state.cwd.lock().await;
-                    *cwd_lock = new_path;
-                } else {
-                    warn!(
-                        new_cwd = %new_path.display(),
-                        sandbox_root = %root.display(),
-                        "Post-command cwd is outside sandbox root; keeping previous cwd"
-                    );
+                match validate_cwd(&new_path, root) {
+                    Ok(resolved) => {
+                        let mut cwd_lock = state.cwd.lock().await;
+                        *cwd_lock = resolved;
+                    }
+                    Err(_) => {
+                        warn!(
+                            new_cwd = %new_path.display(),
+                            sandbox_root = %root.display(),
+                            "Post-command cwd is outside sandbox root; keeping previous cwd"
+                        );
+                    }
                 }
             } else {
+                // Unsandboxed runs skip containment but still need the MSYS →
+                // Windows rewrite for the same `current_dir` reason.
                 let mut cwd_lock = state.cwd.lock().await;
-                *cwd_lock = new_path;
+                *cwd_lock = pathnorm::resolve_reported_cwd(&new_path);
             }
         }
     }
@@ -1039,20 +1052,30 @@ fn trim_ascii_whitespace(s: &[u8]) -> &[u8] {
 }
 
 /// Validate that a cwd is within the sandbox root.
-fn validate_cwd(cwd: &Path, sandbox_root: &Path) -> SandboxResult<()> {
-    // Canonicalize both for comparison
-    let canonical_root =
-        std::fs::canonicalize(sandbox_root).unwrap_or_else(|_| sandbox_root.to_path_buf());
-    let canonical_cwd = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+///
+/// Returns the **normalised** cwd on success so the caller can store a path
+/// this process can actually hand to `Command::current_dir`. That return
+/// value is load-bearing on Windows: the Git-Bash engine reports its cwd in
+/// MSYS form (`/c/dev/ws`), which `current_dir` would otherwise resolve
+/// against the current drive as `C:\c\dev\ws`.
+///
+/// #1255: both sides are normalised via [`pathnorm`] before comparison
+/// rather than string-matched. The pre-fix version compared whatever form
+/// each side happened to be in — an MSYS `pwd` against a `\\?\`-prefixed
+/// canonicalised root — so the sandbox decided its own root was outside
+/// itself and reverted every legitimate `cd`.
+fn validate_cwd(cwd: &Path, sandbox_root: &Path) -> SandboxResult<PathBuf> {
+    let canonical_root = pathnorm::canonical_for_comparison(sandbox_root);
+    let canonical_cwd = pathnorm::resolve_reported_cwd(cwd);
 
-    if !canonical_cwd.starts_with(&canonical_root) {
+    if !pathnorm::is_within(&canonical_root, &canonical_cwd) {
         return Err(SandboxError::SandboxViolation(format!(
             "Working directory '{}' is outside sandbox root '{}'",
             cwd.display(),
             sandbox_root.display()
         )));
     }
-    Ok(())
+    Ok(canonical_cwd)
 }
 
 /// Configure the environment for a spawned process.
@@ -1566,5 +1589,152 @@ mod tests {
         {
             assert!(validate_cwd(Path::new("C:\\Windows"), &root).is_err());
         }
+    }
+
+    /// #1255 — the sandbox root must contain itself.
+    ///
+    /// The pre-fix comparison could reject the root when the two sides were
+    /// spelled differently, which is exactly what the 15 production warnings
+    /// were: `new_cwd = /c/dev/alms-test-workspace` against
+    /// `sandbox_root = \\?\C:\dev\alms-test-workspace`.
+    #[test]
+    fn validate_cwd_accepts_the_root_itself() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        assert!(
+            validate_cwd(&root, &root).is_ok(),
+            "the sandbox root can never be outside itself"
+        );
+    }
+
+    /// #1255 — an un-canonicalised root (no `\\?\` prefix on Windows) must
+    /// still match a canonicalised cwd.
+    #[test]
+    fn validate_cwd_matches_across_canonicalisation_forms() {
+        let dir = tempfile::tempdir().unwrap();
+        let raw_root = dir.path().to_path_buf();
+        let canonical_root = std::fs::canonicalize(&raw_root).unwrap();
+        let nested = canonical_root.join(".alms").join("tool-output");
+        std::fs::create_dir_all(&nested).unwrap();
+
+        // Raw root vs canonical nested path, and the reverse pairing.
+        assert!(validate_cwd(&nested, &raw_root).is_ok());
+        assert!(validate_cwd(&raw_root, &canonical_root).is_ok());
+    }
+
+    /// #1255 — the returned path must be usable as a real working directory,
+    /// not the raw string the shell reported.
+    #[test]
+    fn validate_cwd_returns_a_resolvable_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let nested = root.join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+
+        let resolved = validate_cwd(&nested, &root).expect("nested dir is inside the root");
+        assert!(
+            resolved.is_dir(),
+            "validate_cwd must hand back a directory that exists: {}",
+            resolved.display()
+        );
+    }
+
+    /// A sibling directory whose name merely shares a string prefix with the
+    /// root is still an escape.
+    ///
+    /// Standing guard, not a #1255 regression test: `Path::starts_with` was
+    /// already component-wise, so this never failed. It is here to keep the
+    /// new component comparison from regressing into a string one.
+    #[test]
+    fn validate_cwd_rejects_string_prefix_sibling() {
+        let parent = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(parent.path()).unwrap().join("ws");
+        let sibling = std::fs::canonicalize(parent.path())
+            .unwrap()
+            .join("ws-evil");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&sibling).unwrap();
+
+        assert!(
+            validate_cwd(&sibling, &root).is_err(),
+            "'ws-evil' shares a string prefix with 'ws' but is a different directory"
+        );
+    }
+
+    /// #1255 — the MSYS / Git-Bash form that the shell engine actually
+    /// reports on Windows must be accepted for the root and for a nested
+    /// path, and a genuine escape must still be rejected.
+    ///
+    /// Windows-only: on Unix `/c/...` is an ordinary absolute path and is
+    /// deliberately never reinterpreted as a drive. The pure string
+    /// transform behind this is covered cross-platform in
+    /// [`super::super::pathnorm`], which is what CI (Linux) exercises.
+    #[cfg(windows)]
+    #[test]
+    fn validate_cwd_accepts_msys_form_reported_by_git_bash() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let nested = root.join(".alms").join("tool-output");
+        std::fs::create_dir_all(&nested).unwrap();
+
+        // Build the MSYS spelling the way Git-Bash's `pwd` would report it:
+        // `C:\dev\ws` -> `/c/dev/ws`.
+        let to_msys = |p: &Path| -> PathBuf {
+            let s = super::super::pathnorm::strip_verbatim_prefix(p)
+                .to_string_lossy()
+                .to_string();
+            let (drive, tail) = s.split_at(2);
+            PathBuf::from(format!(
+                "/{}{}",
+                drive[..1].to_ascii_lowercase(),
+                tail.replace('\\', "/")
+            ))
+        };
+
+        let msys_root = to_msys(&root);
+        let msys_nested = to_msys(&nested);
+
+        assert!(
+            validate_cwd(&msys_root, &root).is_ok(),
+            "MSYS-form root must be recognised as the root: {}",
+            msys_root.display()
+        );
+        assert!(
+            validate_cwd(&msys_nested, &root).is_ok(),
+            "MSYS-form nested path must be recognised as inside the root: {}",
+            msys_nested.display()
+        );
+        // A real escape is still an escape in MSYS form.
+        assert!(
+            validate_cwd(Path::new("/c/Windows"), &root).is_err(),
+            "MSYS-form escape must still be rejected"
+        );
+    }
+
+    /// #1255 — a differently-cased spelling of the root must still contain
+    /// the same directory on Windows.
+    ///
+    /// Note what this does and does not pin. It is an end-to-end acceptance
+    /// check, and it passes with `pathnorm::FOLD_CASE` forced to `false`:
+    /// `std::fs::canonicalize` is `GetFinalPathNameByHandle`, which returns
+    /// the on-disk casing, so both sides have already been case-normalised
+    /// before the comparison runs. Case folding is only load-bearing where
+    /// canonicalisation did not happen. The folding *policy* is pinned
+    /// separately and directly, by `pathnorm`'s
+    /// `fold_case_policy_tracks_the_platform` and
+    /// `case_folding_matches_only_when_enabled`.
+    #[cfg(windows)]
+    #[test]
+    fn validate_cwd_accepts_a_differently_cased_root_spelling_on_windows() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let nested = root.join("SubDir");
+        std::fs::create_dir_all(&nested).unwrap();
+
+        let upper = PathBuf::from(root.to_string_lossy().to_uppercase());
+        assert!(
+            validate_cwd(&nested, &upper).is_ok(),
+            "an upper-cased root names the same directory on Windows"
+        );
     }
 }
