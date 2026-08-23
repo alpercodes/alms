@@ -1,5 +1,5 @@
 use crate::server::AppState;
-use alms_session::sqlite::PersistenceTable;
+use alms_session::sqlite::{DegradedField, PersistenceTable};
 use axum::{Json, extract::State};
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -14,19 +14,35 @@ pub struct SubscriberMetrics {
 
 /// Process-lifetime counters behind `GET /operations/metrics`.
 ///
-/// The twelve scalar counters fall into three groups, declared in group order
-/// because the wire names alone do not distinguish them. **This grouping is
-/// mirrored in `docs/api.md` § 8.1 and the two must be changed together** —
+/// The thirteen scalar counters fall into three groups, declared in group
+/// order because the wire names alone do not distinguish them. **This grouping
+/// is mirrored in `docs/api.md` § 8.1 and the two must be changed together** —
 /// the names do not carry the group, so the prose has to, and prose drifts.
 ///
 /// 1. **Rejections** — a request, transition, or dispatch the daemon refused
 ///    or had to retry. Expected to be non-zero under load; read as a rate,
 ///    not as an absolute. Nothing durable is in doubt.
-/// 2. **Quarantine counters** — durable state the daemon declined to believe
-///    (`*_failures_total`, `persistence_rows_skipped_total`). Any non-zero
-///    value means the daemon is running on an incomplete view of the
-///    database. See `docs/architecture.md` § "Reconciliation policy: absence
-///    must be a safe belief" for what each site owes an operator.
+/// 2. **Quarantine and degradation counters** — durable state the daemon
+///    could not take at face value (`*_failures_total`,
+///    `persistence_rows_skipped_total`, `persistence_fields_degraded_total`).
+///    Any non-zero value means the daemon is running on a view of the database
+///    that does not match what is on disk. See `docs/architecture.md` §
+///    "Reconciliation policy: absence must be a safe belief" for what each
+///    site owes an operator.
+///
+///    **The group holds two different faults, and the second is the worse
+///    one.** A *quarantine* counter means trust was withheld: the row was
+///    dropped and kept out of live state, so the policy's obligation 3 holds
+///    and the daemon's view is merely incomplete. A *degradation* counter
+///    (`persistence_fields_degraded_total`, #1246) means trust was misplaced:
+///    the row **is** in live state carrying a column the parser could not
+///    read. Obligation 3 cannot apply — there is no way to withhold one
+///    column without dropping the row, and at those sites dropping is worse —
+///    so the fault propagates instead of being contained, and is invisible
+///    from the outside. Incomplete beats wrong:
+///    `persistence_fields_degraded_total` deserves the louder alert of the
+///    two. Which *field* moved decides the urgency; see `docs/api.md` § 8.1
+///    for the per-field consequences.
 /// 3. **Workload counters** — `job_boot_catch_ups_total` is the only one, and
 ///    it measures work done rather than trust withheld. A large value after a
 ///    long outage is expected, not a fault.
@@ -66,6 +82,22 @@ pub struct OperationalMetricsSnapshot {
     /// `GET /timeline`, not a table). Every known table is reported,
     /// including the zeroes, so the key set is stable across deployments.
     pub persistence_rows_skipped_by_table: BTreeMap<&'static str, u64>,
+    /// Durable columns a parser could not read and replaced with a fallback,
+    /// **keeping the row** (#1246), summed across every field. Distinct from
+    /// `persistence_rows_skipped_total` on purpose: these rows are served, not
+    /// withheld, so the bad value reaches live state and is invisible from the
+    /// outside. The worst of the four is
+    /// `session_summaries.last_run_id`, the compare-and-swap sentinel for
+    /// episodic summaries: degraded, it makes every future summary upsert for
+    /// that session report a false conflict and burn three LLM
+    /// summarizations. Like the row-skip counter, the loader-backed fields
+    /// count occurrences rather than distinct rows.
+    pub persistence_fields_degraded_total: u64,
+    /// Per-field breakdown of `persistence_fields_degraded_total`, keyed
+    /// `<table>.<column>` so the key names the exact cell to inspect with
+    /// `sqlite3`. Every known field is reported, including the zeroes, so the
+    /// key set is stable across deployments.
+    pub persistence_fields_degraded_by_field: BTreeMap<&'static str, u64>,
     // -- Workload -----------------------------------------------------------
     /// Jobs that were already past due at boot and were staggered into the
     /// catch-up cohort (#1235). Sized by how long the daemon was down.
@@ -97,6 +129,19 @@ pub async fn get_operational_metrics(
         },
         |store| store.rows_skipped_by_table(),
     );
+    let persistence_fields_degraded_total = store.map_or(0, |store| store.fields_degraded_total());
+    // Same reasoning as the table key set above: report every known field even
+    // with no SQLite store configured, so a scraper never sees keys appear and
+    // disappear between deployments.
+    let persistence_fields_degraded_by_field = store.map_or_else(
+        || {
+            DegradedField::ALL
+                .iter()
+                .map(|field| (field.as_str(), 0))
+                .collect()
+        },
+        |store| store.fields_degraded_by_field(),
+    );
 
     Json(OperationalMetricsSnapshot {
         queue_saturation_rejections_total: state.agent_queue.saturation_rejections(),
@@ -111,6 +156,8 @@ pub async fn get_operational_metrics(
         job_bootstrap_failures_total: state.job_store.bootstrap_failures_total(),
         persistence_rows_skipped_total,
         persistence_rows_skipped_by_table,
+        persistence_fields_degraded_total,
+        persistence_fields_degraded_by_field,
         job_boot_catch_ups_total: state.job_store.boot_catch_ups_total(),
         subscribers: SubscriberMetrics {
             runs: run_metrics.run_subscribers,

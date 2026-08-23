@@ -16,6 +16,7 @@
 
 mod agents;
 mod audit;
+mod field_degradation;
 mod jobs;
 mod messages;
 mod migrations;
@@ -29,6 +30,7 @@ mod test_helpers;
 mod timeline;
 mod tool_calls;
 
+pub use field_degradation::DegradedField;
 pub use migrations::CURRENT_SCHEMA_VERSION;
 pub use row_skips::PersistenceTable;
 pub use timeline::{TimelineEvent, TimelinePage};
@@ -190,6 +192,7 @@ pub struct SqliteStore {
     persistence_snapshot_rejections: Arc<std::sync::atomic::AtomicU64>,
     stale_run_recovery_failures: Arc<std::sync::atomic::AtomicU64>,
     row_skips: Arc<row_skips::RowSkipCounters>,
+    field_degradations: Arc<field_degradation::FieldDegradationCounters>,
 }
 
 impl std::fmt::Debug for SqliteStore {
@@ -205,6 +208,7 @@ impl Clone for SqliteStore {
             persistence_snapshot_rejections: Arc::clone(&self.persistence_snapshot_rejections),
             stale_run_recovery_failures: Arc::clone(&self.stale_run_recovery_failures),
             row_skips: Arc::clone(&self.row_skips),
+            field_degradations: Arc::clone(&self.field_degradations),
         }
     }
 }
@@ -220,6 +224,7 @@ impl SqliteStore {
             persistence_snapshot_rejections: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             stale_run_recovery_failures: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             row_skips: Arc::default(),
+            field_degradations: Arc::default(),
         })
     }
 
@@ -233,6 +238,7 @@ impl SqliteStore {
             persistence_snapshot_rejections: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             stale_run_recovery_failures: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             row_skips: Arc::default(),
+            field_degradations: Arc::default(),
         })
     }
 
@@ -330,6 +336,77 @@ impl SqliteStore {
         self.row_skips.get(table)
     }
 
+    /// Record one durable column the parser could not read and replaced with a
+    /// fallback, **keeping the row** (#1246).
+    ///
+    /// This is deliberately *not* [`Self::record_skipped_row`], and the two
+    /// must not be merged. A skipped row is one the daemon declined to believe
+    /// and kept out of live state; a degraded field is a row that **is** in
+    /// live state with one column the parser could not read. Counting these
+    /// under `persistence_rows_skipped_total` would break that counter's
+    /// meaning — "rows the daemon cannot see" — because these rows are
+    /// perfectly visible, just wrong.
+    ///
+    /// Reach for this only where dropping the row is *worse* than keeping it
+    /// degraded; that argument has to be made per site, and the existing four
+    /// are argued in [`field_degradation`]. If the row is unusable without the
+    /// column, the answer is a row skip, not this.
+    ///
+    /// `detail` follows the [`Self::record_skipped_row`] convention: write
+    /// paths prefix it with the site (`delete_agent <id>: ...`) so an operator
+    /// can tell a write-path degradation from a loader's.
+    ///
+    /// **This must never touch `self.conn`**, for exactly the reason spelled
+    /// out on [`Self::record_skipped_row`]: every call site runs while the
+    /// caller still holds the non-reentrant `parking_lot` connection lock, so
+    /// re-querying the row to improve the log message is a hard deadlock. Pass
+    /// a stronger identifier in via `detail` instead.
+    pub(super) fn record_degraded_field(
+        &self,
+        field: DegradedField,
+        detail: impl std::fmt::Display,
+    ) {
+        self.field_degradations.record(field);
+        tracing::warn!(
+            field = field.as_str(),
+            detail = %detail,
+            "Degrading unparseable persistence field"
+        );
+    }
+
+    /// Durable columns the store could not read and replaced with a fallback,
+    /// summed across every field (#1246).
+    ///
+    /// Non-zero means the daemon is serving rows that are **present but
+    /// wrong**, which is a different and generally worse fault than
+    /// [`Self::rows_skipped_total`]: the degraded value is projected into live
+    /// state rather than withheld from it, and it is invisible from the
+    /// outside — a run whose `job_id` did not parse looks exactly like a run
+    /// that simply has no job.
+    ///
+    /// Like the row-skip counter this counts *occurrences, not distinct rows*
+    /// for the loader-backed fields. How fast that climbs depends on the
+    /// field: the two `runs.*` columns are read only by the boot-time sweep
+    /// and hydration, so they move once or twice per restart, while
+    /// `session_summaries.last_run_id` sits on a live read path and is
+    /// re-counted on every episodic-summary load.
+    pub fn fields_degraded_total(&self) -> u64 {
+        self.field_degradations.total()
+    }
+
+    /// Per-field breakdown of [`Self::fields_degraded_total`], keyed
+    /// `<table>.<column>`. Always reports every known field, including the
+    /// zeroes.
+    pub fn fields_degraded_by_field(&self) -> std::collections::BTreeMap<&'static str, u64> {
+        self.field_degradations.by_field()
+    }
+
+    /// Per-field degradation count. Test affordance for asserting that a
+    /// specific parser degraded a specific column.
+    pub fn fields_degraded_for(&self, field: DegradedField) -> u64 {
+        self.field_degradations.get(field)
+    }
+
     /// Return the latest successfully committed schema migration.
     pub fn schema_version(&self) -> AlmsResult<u32> {
         migrations::read_schema_version(&self.conn.lock())
@@ -423,6 +500,22 @@ fn run_status_to_str(status: RunStatus) -> &'static str {
     }
 }
 
+/// #1246 scope note: this is an *enum* fallback, but it is not one of the mild
+/// ones. The discriminator is not "enum versus foreign key" — it is whether the
+/// fallback value is one an operator could legitimately have configured.
+/// `reasoning_effort -> None` and `worktree_mode -> Off` pass that test;
+/// `status -> Queued` does not, because "queued" is a claim about the world.
+///
+/// The consequence is a misdiagnosis: `load_all_runs` has no status filter, so
+/// the row reaches `hydrate_from_store`, which classifies it as an
+/// unreconciled queued row, drops it, and logs an error pointing at
+/// `stale_run_recovery_failures_total` — a sweep that never touched the row,
+/// because `mark_stale_runs_failed` filters `status IN ('queued','running')`
+/// and a garbage status is not selected. The run vanishes from history and the
+/// operator is sent to the wrong counter.
+///
+/// Left uncounted deliberately (#1246 counts foreign keys), but do not cite
+/// this function as an example of a benign enum fallback.
 fn str_to_run_status(s: &str) -> RunStatus {
     match s {
         "running" => RunStatus::Running,
@@ -633,7 +726,12 @@ fn parse_agent_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentRecord> {
 ///   9: prompt_tokens, 10: completion_tokens, 11: job_id,
 ///   12: parent_run_id, 13: created_at, 14: resolved_config (#837),
 ///   15: lifecycle_revision, 16: terminal_reason
-fn parse_run_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Run> {
+///
+/// Takes `store` solely to record the two foreign-key degradations below on
+/// `GET /operations/metrics` (#1246). It must not touch `store.conn`: every
+/// caller is inside a `query_map`/`query_row` while holding the connection
+/// lock, which is non-reentrant.
+fn parse_run_row(store: &SqliteStore, row: &rusqlite::Row<'_>) -> rusqlite::Result<Run> {
     let run_id_str: String = row.get(0)?;
     let session_id_str: String = row.get(1)?;
     let agent_id_str: String = row.get(2)?;
@@ -726,11 +824,55 @@ fn parse_run_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Run> {
         }),
         _ => None,
     };
+    // #1246: these two are *foreign keys*, not defaulted columns, so their
+    // fallback is not the benign field-level degradation the rest of this
+    // parser does. `job_id -> None` is not "the default job", it is "no job",
+    // which is a claim about the world: `GET /runs` reports `job_id: null`
+    // and `derive_trigger` labels the run "user" instead of "scheduled".
+    //
+    // It is *not* a cancellation hazard, despite how it reads.
+    // `cancel_runs_for_job` only considers `Queued`/`Running` runs, and
+    // `hydrate_from_store` refuses to project `Queued`/`Running` rows into the
+    // live map at all (#1236/#1239) — so every run reaching live state through
+    // this parser is terminal by construction, and live runs enter via
+    // `insert_persisted_run` without round-tripping through here.
+    //
+    // Dropping the row is still the worse option, on the boot cost alone:
+    // `mark_stale_runs_failed` collects with `collect::<Result<_, _>>()` and
+    // `Gateway::new` propagates that with `?` (`alms-gateway/src/gateway.rs`),
+    // so a row-level error here is an unbootable daemon. Hence: keep the row,
+    // degrade the column, and make it visible. See `field_degradation` for the
+    // full argument.
     let job_id = job_id_str
-        .and_then(|s| uuid::Uuid::parse_str(&s).ok())
+        .and_then(|s| match uuid::Uuid::parse_str(&s) {
+            Ok(id) => Some(id),
+            Err(e) => {
+                store.record_degraded_field(
+                    DegradedField::RunsJobId,
+                    format_args!(
+                        "run {run_id_str}: unparseable job_id {s:?}: {e}; the run is no longer \
+                         attributable to its job, so it reports job_id: null and is labelled a \
+                         user-triggered run instead of a scheduled one"
+                    ),
+                );
+                None
+            }
+        })
         .map(alms_core::job::JobId);
     let parent_run_id = parent_run_id_str
-        .and_then(|s| uuid::Uuid::parse_str(&s).ok())
+        .and_then(|s| match uuid::Uuid::parse_str(&s) {
+            Ok(id) => Some(id),
+            Err(e) => {
+                store.record_degraded_field(
+                    DegradedField::RunsParentRunId,
+                    format_args!(
+                        "run {run_id_str}: unparseable parent_run_id {s:?}: {e}; run reads as \
+                         top-level instead of as a subagent run"
+                    ),
+                );
+                None
+            }
+        })
         .map(RunId);
     // #837: parse the JSON-encoded layered run-config snapshot. NULL
     // (old rows) and corrupt JSON both surface as `None` — the latter

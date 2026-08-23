@@ -1378,6 +1378,13 @@ not part of the response.
     "sessions": 0,
     "timeline": 0
   },
+  "persistence_fields_degraded_total": 0,
+  "persistence_fields_degraded_by_field": {
+    "agents.name": 0,
+    "runs.job_id": 0,
+    "runs.parent_run_id": 0,
+    "session_summaries.last_run_id": 0
+  },
 
   "job_boot_catch_ups_total": 0,
 
@@ -1402,17 +1409,30 @@ A request, transition, or dispatch the daemon refused or had to retry.
 absolute, and alert on a slope rather than on `> 0`. Nothing durable is in
 doubt.
 
-**2. Quarantine** — `job_rearm_failures_total`,
+**2. Quarantine and degradation** — `job_rearm_failures_total`,
 `stale_run_recovery_failures_total`, `job_bootstrap_failures_total`,
 `persistence_rows_skipped_total` (and its `persistence_rows_skipped_by_table`
-breakdown).
+breakdown), `persistence_fields_degraded_total` (and its
+`persistence_fields_degraded_by_field` breakdown).
 
-Durable state the daemon declined to believe. **Any non-zero value means the
-daemon is serving an incomplete view of the database** and something needs
-repairing; alerting on `> 0` is correct here. See
+Durable state the daemon could not take at face value. **Any non-zero value
+means the daemon is serving a view of the database that does not match what is
+on disk** and something needs repairing; alerting on `> 0` is correct here. See
 [`docs/architecture.md` § "Reconciliation policy: absence must be a safe
 belief"](architecture.md#reconciliation-policy-absence-must-be-a-safe-belief)
 for what each site owes an operator. Per-counter detail follows below.
+
+**The group holds two different faults, and they want different urgency.** The
+*quarantine* counters mean trust was **withheld**: the row was dropped and kept
+out of live state, so the daemon's view is incomplete but nothing it serves is
+wrong. `persistence_fields_degraded_total` (#1246) means trust was
+**misplaced**: the row *is* being served, carrying a column the parser could
+not read. The fault is projected into live state rather than contained, and it
+is invisible from the outside — a degraded value does not read as corrupt, it
+reads as an ordinary value. **Incomplete beats wrong**, so treat a non-zero
+`persistence_fields_degraded_total` as the more urgent of the two — then read
+`persistence_fields_degraded_by_field`, because the four fields differ by more
+than an order of magnitude in what they cost you.
 
 **3. Workload** — `job_boot_catch_ups_total`.
 
@@ -1454,14 +1474,17 @@ keep their real schedule and are never staggered. The cohort size scales with
 how long the daemon was down, so a large value after a restart is expected and
 is the number to reach for when reasoning about post-restart LLM spend.
 
-`persistence_rows_skipped_total` (#1241) counts durable rows the daemon could
-not parse and therefore dropped, with `persistence_rows_skipped_by_table`
-giving the per-table breakdown. Non-zero means the daemon is serving an
-**incomplete view of the database**: an agent missing from the registry, a
-session missing from the sidebar, messages missing from a context window. Each
-drop is logged at `warn!` with a `table` field and whatever identifies the row
-— often only the parse error, because the column that failed to parse is
-frequently the id.
+`persistence_rows_skipped_total` (#1241) counts durable rows the daemon either
+could not parse, or could not classify safely enough to act on — and therefore
+left out of whatever it was doing, with `persistence_rows_skipped_by_table`
+giving the per-table breakdown. Non-zero means one of two things, and the
+`detail` field tells you which: the daemon is serving an **incomplete view of
+the database** (an agent missing from the registry, a session missing from the
+sidebar, messages missing from a context window), or an **operation completed
+without finishing its cleanup** (a delete that committed while one of its
+sessions was left standing). Each skip is logged at `warn!` with a `table`
+field and whatever identifies the row — for the loaders often only the parse
+error, because the column that failed to parse is frequently the id.
 
 Three things to know before reading the number:
 
@@ -1477,31 +1500,48 @@ Three things to know before reading the number:
 - **The key names the table the row came from, not the symptom — and one table
   can have several producers.** `sessions` is incremented by the three session
   loaders (symptom: a session missing from the sidebar), *and* by `delete_agent`
-  (symptom: an agent deleted while one of its sessions keeps its messages, runs,
-  and tool-call rows — durable orphans, not lost data), *and* by the Telegram
-  context-id migration (symptom: a session left on the legacy
-  `telegram_{chat_id}` context id). Same number, three different remediations.
+  in **two different shapes** — a row the delete could not read (symptom: an
+  agent deleted while one of its sessions keeps its messages, runs, and
+  tool-call rows — durable orphans, not lost data) and a DM-cascade peer probe
+  that failed (symptom: a DM session left unpurged because the daemon could not
+  prove its other participant was gone — nothing orphaned and nothing lost,
+  just uncollected) — *and* by the Telegram context-id migration (symptom: a
+  session left on the legacy `telegram_{chat_id}` context id). Same number,
+  four different remediations.
   **The `detail` field on the `warn!` line is the disambiguator** — the
   write-path sites prefix it (`delete_agent <id>: ...`,
   `telegram context-id migration: ...`), the loaders do not.
 
 **Remediation never requires a restart, but it is a different action for each
-of the three producers** — read the `detail` prefix first, then pick from the
+of the four shapes** — read the `detail` prefix first, then pick from the
 list below. "Fix the row and the daemon re-reads it" is true only for the
-loaders; at the two write-path sites the operation has already committed and
-nothing re-runs it, so repairing the row on its own changes nothing.
+loaders. At every write-path site below, the operation has already committed
+and nothing re-runs it, so repairing the row on its own changes nothing.
 
 - **A loader drop** — no `detail` prefix. Find the row with
   `sqlite3 .alms/alms.db` (the `warn!` detail names the failing column), then
   fix or delete it. The daemon picks up the repair on the next read.
-- **A `delete_agent` drop** — `detail` starts `delete_agent <agent_id>:`. The
-  delete transaction committed without that session, and the agent is already
-  gone, so there is nothing left to re-run. Finish the delete by hand: locate
-  the stranded session (`SELECT session_id FROM messages WHERE session_id NOT
-  IN (SELECT id FROM sessions)`, and the same for `runs`), delete its
-  dependent rows in FK order — `context_summaries`, `session_summaries`,
-  `audit_events`, `messages`, `run_tool_calls`, `runs` — and then the
-  `sessions` row itself if it survived.
+- **A `delete_agent` orphan** — `detail` starts `delete_agent <agent_id>:` and
+  reports an unreadable session id or DM candidate. The delete transaction
+  committed without that session, and the agent is already gone, so there is
+  nothing left to re-run. Finish the delete by hand: locate the stranded
+  session (`SELECT session_id FROM messages WHERE session_id NOT IN (SELECT id
+  FROM sessions)`, and the same for `runs`), delete its dependent rows in FK
+  order — `context_summaries`, `session_summaries`, `audit_events`, `messages`,
+  `run_tool_calls`, `runs` — and then the `sessions` row itself if it survived.
+- **A `delete_agent` unpurged DM** — `detail` starts `delete_agent <agent_id>:
+  dm-cascade peer probe for session <session_id> failed`. **The orphan query
+  above will not find this one**, and that is not a bug in either: the DM
+  `sessions` row deliberately survives, because the probe could not prove the
+  other participant was gone and purging on an unproven absence is the one
+  thing this site refuses to do (#1246). Nothing is orphaned and nothing is
+  lost — a DM session simply was not collected. The `detail` names the session
+  id, so start there rather than with a query. To sweep for it generally, list
+  the DM sessions with `SELECT id, context_id FROM sessions WHERE context_id
+  LIKE 'dm:%'` and check each `context_id`'s two named participants against
+  `agents`; delete only those where **neither** participant still exists, in
+  the same FK order as above. If either is still live the session is correct as
+  it stands and there is nothing to do.
 - **A Telegram context-id migration drop** — `detail` starts
   `telegram context-id migration:`. There is no next read here either: the
   migration runs once per agent at channel startup
@@ -1510,6 +1550,99 @@ nothing re-runs it, so repairing the row on its own changes nothing.
   repairs the row — `UPDATE sessions SET context_id =
   'telegram_<agent_name>_<chat_id>' WHERE id = ...` — rather than waiting for
   a restart to do it.
+
+`persistence_fields_degraded_total` (#1246) counts durable **columns** a parser
+could not read and replaced with a fallback, **keeping the row**, with
+`persistence_fields_degraded_by_field` giving the per-field breakdown. Each one
+is logged at `warn!` with a `field` key and a `detail` naming the row and the
+consequence. The keys are `<table>.<column>`, so the key *is* the `sqlite3`
+query you need.
+
+It is deliberately **not** part of `persistence_rows_skipped_total`. That
+counter means "rows the daemon cannot see"; these rows are perfectly visible,
+just wrong — and folding them together would destroy both numbers. The four
+fields, **worst first**:
+
+- **`session_summaries.last_run_id`** — the one to alert on. This column is not
+  attribution; it is the compare-and-swap sentinel for episodic-summary
+  upserts. Degraded to null, every future summary write for that session takes
+  the `WHERE last_run_id IS NULL` branch, matches nothing, and comes back as a
+  **conflict** — so the agent burns three LLM summarization calls, gives up,
+  and logs `Failed to persist session summary due to concurrent updates` when
+  there is no concurrent update. **Episodic memory for that session is stuck
+  permanently**, and the error names the wrong cause. It is also the only one
+  of the four on a live read path, so it is the only one whose counter can
+  climb between restarts.
+- **`agents.name`** — `DELETE /agents/{id_or_name}` could not read an agent
+  name, so a DM session was left uncleaned. Two shapes, same counter: the
+  deleted agent's own name was unreadable and the whole **DM-cleanup pass was
+  skipped**, or a *peer's* name was unreadable so that one DM session could not
+  be classified and was deliberately left alone rather than risk purging a live
+  peer's conversation. Either way the delete itself succeeded, and any shared
+  DM session whose participants are now all gone survives as an unreachable
+  row, along with its `messages`, `audit_events`, and `context_summaries`.
+  `detail` is prefixed `delete_agent <agent_id>:`, following the same
+  write-path convention as the row-skip counter.
+- **`runs.job_id`** — the run is hydrated with no job, so it is no longer
+  attributable to the job that spawned it: `GET /runs` reports `job_id: null`
+  and the run's trigger is labelled `user` instead of `scheduled`. **Nothing is
+  left running** — this parser is only reached by the boot-time stale-run sweep
+  and by hydration, both of which see terminal rows, so a degraded `job_id`
+  cannot hide an active run from `DELETE /jobs/{job_id}`.
+- **`runs.parent_run_id`** — the run reads as top-level instead of as a
+  subagent run of its parent, with a null `parent_session_id` breadcrumb.
+  Subagent attribution in the UI and in `GET /runs/{id}` is wrong for that row.
+
+**Remediation.** For `session_summaries.last_run_id`, repair the cell and the
+next episodic-summary load picks it up without a restart. Find them with
+`SELECT agent_id, session_id, last_run_id FROM session_summaries WHERE
+last_run_id IS NOT NULL AND last_run_id NOT GLOB '[0-9a-f]*-*-*-*-*'`, then
+either `UPDATE ... SET last_run_id = '<the run that produced this summary>'` or
+`SET last_run_id = NULL`. Null is safe here and unsticks the session: it puts
+the row on the same branch the upsert already takes, and this time the `WHERE
+last_run_id IS NULL` predicate matches.
+
+For the two `runs.*` fields, repairing the cell **takes effect at the next
+start, not the next request**. The `Run` in the live registry is never
+refreshed from disk, and the only production readers of this parser are the
+boot sweep and hydration — so the running daemon keeps serving the degraded
+value however many times you fix the row. Repair it anyway, then restart when
+convenient: `UPDATE runs SET job_id = '<uuid>' WHERE run_id = '<id>'`, or `SET
+job_id = NULL` if the job is gone and detaching the run is what you actually
+want (same end state, but *believed on purpose*). Find them with `SELECT
+run_id, job_id FROM runs WHERE job_id IS NOT NULL AND job_id NOT GLOB
+'[0-9a-f]*-*-*-*-*'`.
+
+For `agents.name` there is no next read: the delete already committed and
+nothing re-runs it. Finish it by hand — find unreachable DM sessions with
+`SELECT id, context_id FROM sessions WHERE context_id LIKE 'dm:%'` and drop the
+ones whose named participants no longer appear in `agents`, deleting dependent
+rows in FK order (`context_summaries`, `session_summaries`, `audit_events`,
+`messages`, `run_tool_calls`, `runs`, then `sessions`). Repair the name cells
+first — `SELECT id, typeof(name) FROM agents WHERE typeof(name) <> 'text'` —
+or the next delete hits the same branch, and DM purging stays suppressed for
+*every* agent while any one name is unreadable. **If that query returns no
+rows, the readability check itself failed rather than finding a bad cell** —
+it fails closed, so an I/O or corruption error on `agents` reports the same
+"could not be proven readable" as a genuine BLOB name does. Look for a SQLite
+error in the same log window instead of chasing a cell that is fine.
+
+Like the row-skip counter, these count **occurrences, not distinct rows**, but
+how fast that accumulates differs by field.
+`session_summaries.last_run_id` sits on a live read path and is re-counted on
+every episodic-summary load. The two `runs.*` fields move roughly once or twice
+per boot (the sweep runs from `Gateway::new` and again inside hydration) and
+never per request. `agents.name` is a write path, and it increments **on calls
+that then fail and roll back**, since the counter fires inside the transaction.
+Its two shapes accumulate at different rates: the deleted agent's own
+unreadable name is one increment per `DELETE /agents/{id}` call, but the peer
+arm records inside the per-DM-candidate loop, so a single corrupt name anywhere
+in `agents` adds one increment for **every** DM session the deleted agent had.
+A jump of ten from one delete is one bad cell, not ten.
+
+> These counters are currently visible only on this endpoint — there is no CLI
+> subcommand and no UI surface for `/operations/metrics`, so scrape it or
+> `curl` it.
 
 ---
 

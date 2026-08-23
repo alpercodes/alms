@@ -195,7 +195,9 @@ Schema changes use ordered, transactional migrations with a durable
 
 Rows that cannot be parsed or reconciled are **quarantined**, not fatal: they
 stay durable, are kept out of live in-memory state, and are counted on
-`GET /operations/metrics`. See
+`GET /operations/metrics`. A handful of *columns* are degraded rather than
+dropped, where dropping the row would be worse; those are counted separately
+and more loudly, because a degraded column does reach live state. See
 [Reconciliation policy: absence must be a safe belief](#reconciliation-policy-absence-must-be-a-safe-belief).
 
 **On-disk layout (post-#945 / #946 — workspace v2):**
@@ -366,6 +368,18 @@ row id and a product endpoint, because at a loader neither necessarily exists
 — see below. That is a weaker guarantee, not a waived one, and the next
 section says exactly how much weaker.
 
+**These bind a site that *quarantines*. A field-level degradation is not a
+quarantine and cannot satisfy obligation 3** — see the scope note below.
+Keeping the row *is* projecting it into live state, so there is no version of
+that site which bounds the blast radius; the only way to discharge obligation 3
+would be to drop the row, which at those four sites is the worse outcome. Do
+not read this as a fourth escape hatch. It is a narrower permission: a site may
+degrade a field instead of dropping the row **only** with an argument that
+dropping is actively worse, and it still owes obligations 1, 2, and 4 in full,
+against a *louder* counter precisely because obligation 3 is unavailable. If
+you cannot make that argument, the row is unusable without the column and the
+answer is a row skip.
+
 **Obligation 3 is the one to check in review.** The skip and the projection
 almost always live in different functions, and a reviewer checks the function
 that changed.
@@ -410,7 +424,9 @@ and job-bootstrap sweeps — the product path is required, not optional.
 | `mark_stale_runs_failed` (`alms-session/src/sqlite/runs.rs`) — a `queued`/`running` row left by a dead process | **Yes.** The run is dead either way; nothing re-executes. | Quarantine | `stale_run_recovery_failures_total`; `error!` with the `run_id` and its remediation SQL. The row is also excluded from `RunManager::hydrate_from_store`, so it is never served as a live pending run (obligation 3). |
 | `bootstrap_scheduler` (`alms-gateway/src/server/mod.rs`) — a job whose startup fire time cannot be persisted | **Yes.** "This job is not scheduled" is truthful and safe. | Quarantine | `job_bootstrap_failures_total`; `error!` with the job id. |
 | The 25 row-drop points across 14 **loaders** in `alms-session` — any row that fails to parse | **Yes**, by the same argument. Nothing re-executes and nothing is left behind; the row is simply not served. | Quarantine | `persistence_rows_skipped_total`, per table (#1241); `warn!` with the table and the parse error. |
-| The 3 row-drop points on **write paths** in `alms-session` — `delete_agent` (session ids, DM candidates) and `migrate_telegram_context_ids` | **No — third branch.** Nothing re-executes, but the delete leaves that session's dependent rows orphaned, or the session keeps its legacy `telegram_{chat_id}` context id. | Quarantine, with the leak named at the site | `persistence_rows_skipped_total` under `sessions` (#1241); `warn!` whose `detail` is prefixed with the site, so it is distinguishable from a loader drop on the same table. |
+| The 4 row-drop points on **write paths** in `alms-session` — `delete_agent` (session ids, DM candidates, and the peer probe in the row below) and `migrate_telegram_context_ids` | **No — third branch.** Nothing re-executes, but the delete leaves that session's dependent rows orphaned, or the session keeps its legacy `telegram_{chat_id}` context id. | Quarantine, with the leak named at the site | `persistence_rows_skipped_total` under `sessions` (#1241); `warn!` whose `detail` is prefixed with the site, so it is distinguishable from a loader drop on the same table. |
+| The 4 **field-level degradation** points — `parse_run_row` (`job_id`, `parent_run_id`), `parse_session_summary_row` (`last_run_id`), and `delete_agent`'s agent-name lookup | **Not the question here.** The row is *kept*; dropping it is what would be unsafe (see the scope note below). | Degrade the column, keep the row — obligation 3 is unattainable and is traded for a louder counter | `persistence_fields_degraded_total`, per `<table>.<column>` (#1246); `warn!` naming the row and the consequence. |
+| DM-cascade peer probe in `delete_agent` — `SELECT 1 FROM agents WHERE name = ?` | **No, and the failure direction is the point.** A false "peer absent" *deletes* a DM session whose peer is alive, which is not additive and not quarantinable. But refusing to answer is: the session is simply not purged. | Quarantine the *answer*, not the row — only a peer **proven** absent may purge; anything unprovable leaves the DM session stranded and lets the delete commit | `persistence_fields_degraded_total` under `agents.name` when the peer's own name is unreadable, `persistence_rows_skipped_total` under `sessions` when the probe itself fails (#1246). |
 | Schema-version guard (`alms-session/src/sqlite/migrations.rs`) — a database newer than the binary | **No.** You cannot interpret rows you cannot read, and job completion state is among them: a completion record you cannot read is indistinguishable from "not yet run", so already-executed jobs fire again. | **Fatal** — `refusing to open` | n/a |
 
 The jobs row deserves its justification spelled out, because it is the one most
@@ -421,23 +437,100 @@ is down"* is neither. Availability is the by-product, not the justification. If
 this were written down as "availability wins", someone would cite it at the
 migration guard next year.
 
-**Scope note.** The rule is about *rows*. Some parsers also apply field-level
-fallbacks — an unrecognised `reasoning_effort` becomes `None`, an unrecognised
-`worktree_mode` becomes `Off` — which keep the row and degrade one column.
-Those are deliberately *not* counted in `persistence_rows_skipped_total`, which
-would otherwise stop meaning "rows the daemon cannot see".
+**Scope note: field-level fallbacks are a second class, not a weaker one.**
+The rule above is about *rows*. Some parsers instead apply **field-level**
+fallbacks, keeping the row and degrading one column. Those are deliberately not
+counted in `persistence_rows_skipped_total`, which would otherwise stop meaning
+"rows the daemon cannot see" — the rows are still served, they are just wrong.
+They have their own counter, `persistence_fields_degraded_total` (#1246), with
+a `<table>.<column>` breakdown.
 
-Do not read that as "field-level fallbacks are a uniformly weaker class", and
-do not assume they are all logged. **Two of them are neither** (#1246).
-`parse_run_row` degrades two *foreign keys* silently — `job_id` and
-`parent_run_id` each go through `.and_then(|s| Uuid::parse_str(&s).ok())` with
-no log and no counter — and `delete_agent`'s agent-name lookup is a bare
-`.ok()` whose `None` skips the entire DM-cleanup branch. A fallback on a
-foreign key is not a defaulted column: `job_id → None` makes the run stop being
-attributable to its job, so `cancel_runs_for_job` misses it. That is a false
-belief projected into live state, which is the precise hazard this rule exists
-to name — arguably worse than dropping the row. Those sites are unaddressed and
-out of #1241's scope, not blessed by it.
+**Do not read "the row survives" as "this is the milder outcome".** It is the
+less *contained* one, because a row skip discharges obligation 3 and a field
+degradation cannot. A skipped row is kept out of live state, so the blast
+radius is bounded by definition: the daemon's view is incomplete but nothing it
+serves is false. A degraded field is projected into live state by construction
+— there is no way to withhold one column without dropping the whole row — and
+it is invisible from the outside, because a degraded value does not read as
+"corrupt", it reads as an ordinary value. `runs.job_id → None` reads as "this
+run has no job".
+
+The worked example is `session_summaries.last_run_id`, because there the false
+diagnosis *is* the damage. That column is the compare-and-swap sentinel for
+episodic summary upserts (#1123). Degraded to `None`,
+`upsert_session_summary_optimistic` takes its `WHERE last_run_id IS NULL`
+branch, matches nothing against the non-NULL garbage cell, falls through to the
+`INSERT`, trips the unique constraint, and reports a **conflict**. The caller
+reloads the same degraded `None` and retries three times — each attempt a fresh
+LLM summarization call — then logs a concurrency error naming a cause that is
+not the cause. Episodic memory for that session can never be updated again, and
+every signal the operator has points somewhere else. That is a false belief
+projected into live state, which is the precise hazard this whole rule exists
+to name.
+
+**Which class a site belongs to is decided by the same one-question test,**
+applied to the *field* rather than the row: if dropping the row would leave the
+daemon behaving no worse than the degraded row does, drop it — that is a row
+skip, and `persistence_rows_skipped_total` is the counter. Degrading is
+justified only where **dropping is actively worse**, and that argument has to
+be made per field. `DegradedField::ALL` is the enforced inventory — a test
+pins the exact label set, so a fifth site cannot be added without failing it.
+The four we have (#1246) are:
+
+| Field | Read path | Why it degrades rather than drops |
+|---|---|---|
+| `runs.job_id` | Boot only | The run is no longer attributable to its job: `GET /runs` reports `job_id: null` and `derive_trigger` labels it `"user"` instead of `"scheduled"`. Dropping costs the boot: `mark_stale_runs_failed` collects its sweep with `collect::<Result<_, _>>()` and `Gateway::new` propagates that with `?` (`alms-gateway/src/gateway.rs`), so a row-level parse error there means the daemon does not start (#1236) — while the durable row keeps claiming `queued`/`running` forever, because the sweep can no longer see it. Note that `hydrate_from_store`'s *own* call to the same sweep swallows the error and returns; it is specifically the `Gateway::new` call that makes this fatal. |
+| `runs.parent_run_id` | Boot only | Same shape, smaller still: the run reads as top-level rather than as a subagent run of its parent, plus a null `parent_session_id` breadcrumb. Dropping a whole run to fix one attribution field is plainly worse. |
+| `session_summaries.last_run_id` | **Live** | Not attribution at all — it is the episodic-summary CAS sentinel, and degrading it deadlocks every future summary write for that session behind a false conflict, at three LLM calls per attempt (see above). Dropping the row loses the summary for the same remediation, and hides the cause. This is the only degradation site on a live read path, so it is the one whose counter can climb fast. |
+| `agents.name` | Write path | Does not mis-attribute a row — it makes `delete_agent` skip DM cleanup, stranding shared DM sessions whose participants are all gone. Additive stranding, so it is the third branch above; counted and named at the site. This site distinguishes `QueryReturnedNoRows` (no such agent — skipping cleanup is *correct*, not a fault, and is not counted) from a genuine read failure, and also covers the DM-cascade peer-probe row in the site table above. |
+
+**Do not discriminate by column kind.** The distinction is not "enum fallbacks
+are mild, foreign-key fallbacks are not" — it is whether **the fallback value
+is one the operator could legitimately have configured.** `reasoning_effort →
+None` and `worktree_mode → Off` pass that test: they land on a config default a
+human could have chosen, nothing downstream can tell the difference, and there
+is no difference to tell. `job_id → None` fails it — `None` is not "the default
+job", it is "no job", and that is a claim about the world rather than a setting.
+
+`str_to_run_status` is the case that proves the discriminator matters, because
+it is an *enum* fallback that fails the test: an unrecognised status becomes
+`Queued`, `load_all_runs` has no status filter, and hydration then classifies
+the row as an unreconciled queued row, drops it, and logs an error pointing at
+`stale_run_recovery_failures_total` — a sweep that never touched it, since
+`mark_stale_runs_failed` selects only `status IN ('queued','running')`. The run
+disappears from history and the operator is sent to the wrong counter. It is
+left uncounted (#1246 scoped itself to foreign keys) and documented at the site;
+do not cite it as an example of a benign enum fallback.
+`runs.lifecycle_revision` (`row.get(15).unwrap_or_default()` → `0`) is a third
+fallback in the same parser that fits neither bucket cleanly; it is at least
+partly covered downstream by `persistence_snapshot_rejections`.
+
+**Check the polarity of a fallback before picking a counter for it.** Every
+other site in this section fails towards *keeping* rows, which is why
+quarantine works: the damage is additive and repairable by hand. The DM-cascade
+peer probe in `delete_agent` points the other way. It reads `SELECT 1 FROM
+agents WHERE name = ?` to decide whether a shared DM session is unreachable,
+and a `false` sends the session to the purge list — so a fallback there
+*deletes* a DM session whose peer is alive, which the "must be additive"
+qualifier above puts outside the quarantinable class entirely.
+
+The rule that site enforces is **only a peer proven absent may purge**, which
+is stricter than "only `QueryReturnedNoRows` means absent" and deliberately so.
+`QueryReturnedNoRows` is not by itself proof of absence for a probe keyed on
+`name`: if the peer's *own* `agents.name` cell is a BLOB or NULL, `name = ?`
+with a text parameter matches nothing — SQLite never compares a BLOB equal to a
+TEXT value, and TEXT column affinity does not convert an already-stored BLOB —
+so a live peer is indistinguishable from an absent one through exactly the
+branch the site trusts. The probe therefore only accepts a miss as absence when
+every `agents.name` cell in the table is readable text, and that check fails
+closed.
+
+Note the *disposition* for the two unprovable cases: they strand, they do not
+fail. Refusing the delete would be safe too, but between two safe options the
+same test that decided `agents.name` decides this one — a corrupt `agents`
+table must not make every agent that has ever had a DM permanently
+undeletable, which is the #1236 pattern of a false belief disabling its own
+remedy. Stranding is additive and counted; the delete commits.
 
 ### Exactly one fatal site
 

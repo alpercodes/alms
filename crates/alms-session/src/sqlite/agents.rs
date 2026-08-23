@@ -106,6 +106,13 @@ impl SqliteStore {
     ///
     /// Does NOT update `name` or `is_default` -- use `set_default_agent()` for
     /// default changes, and name is immutable after creation.
+    ///
+    /// **That immutability is load-bearing, not incidental.** DM `context_id`s
+    /// embed the name at creation time, and the peer probe in
+    /// [`Self::delete_agent`] reads "no agent by this name" as proof the peer
+    /// is gone. Adding `name` here without migrating those `context_id`s in
+    /// the same transaction turns that proof false and purges live peers' DM
+    /// sessions -- see the precondition note on `classify_peer_presence`.
     pub fn update_agent(&self, agent: &AgentRecord) -> AlmsResult<()> {
         let affected = self
             .conn
@@ -296,13 +303,54 @@ impl SqliteStore {
         //    `AgentId::nil()` and identify participants only via the
         //    `context_id = "dm:<a>:<b>"` format, so we have to match by name
         //    rather than by foreign key.
-        let agent_name: Option<String> = tx
-            .query_row(
-                "SELECT name FROM agents WHERE id = ?1",
-                params![&id_str],
-                |row| row.get::<_, String>(0),
-            )
-            .ok();
+        //
+        //    #1246: this used to be a bare `.ok()`, which collapsed two
+        //    unrelated outcomes into the same silent `None`. They are split
+        //    here because only one of them is a fault:
+        //
+        //      - `QueryReturnedNoRows` — there is no such agent. Skipping the
+        //        DM-cleanup branch is *correct*; step 6 reports `Ok(false)`
+        //        and nothing is stranded. Not counted, not logged.
+        //      - Any other error — the row exists but its `name` could not be
+        //        read (NULL/non-text cell, or a SQL failure). Step 4b is
+        //        skipped, so shared DM sessions whose participants are all
+        //        gone survive as unreachable rows: nothing enumerates them and
+        //        their `messages`/`audit_events`/`context_summaries` leak with
+        //        no UI surface.
+        //
+        //    The second is the policy's third branch — the stranding is
+        //    *additive*, nothing that should have survived is deleted — so it
+        //    is quarantinable, but it must be counted and named rather than
+        //    swallowed. Failing the delete instead would make the agent
+        //    permanently undeletable, which is the #1236 pattern of a false
+        //    belief disabling its own remedy. (The DM-cascade peer probe in
+        //    step 4b rules the same way for the same reason.)
+        //
+        //    Note the tense in the `detail`. This fires inside the
+        //    transaction, and steps 1-6 plus the commit can all still fail
+        //    afterwards — in which case the counter has moved and nothing was
+        //    deleted or stranded. The counter is a rate signal, not a ledger,
+        //    and the row-skip sites below have the same property; the message
+        //    must not claim more than that.
+        let agent_name: Option<String> = match tx.query_row(
+            "SELECT name FROM agents WHERE id = ?1",
+            params![&id_str],
+            |row| row.get::<_, String>(0),
+        ) {
+            Ok(name) => Some(name),
+            Err(rusqlite::Error::QueryReturnedNoRows) => None,
+            Err(e) => {
+                self.record_degraded_field(
+                    DegradedField::AgentsName,
+                    format_args!(
+                        "delete_agent {id_str}: unreadable agent name: {e}; skipping DM cleanup, \
+                         so if this delete commits any shared DM session whose participants are \
+                         all gone is left stranded unreachable"
+                    ),
+                );
+                None
+            }
+        };
 
         // 1. Collect session IDs belonging to this agent
         let session_ids: Vec<String> = {
@@ -477,6 +525,35 @@ impl SqliteStore {
             // still live in the `agents` table at this point in the
             // transaction (step 6 removes it), so the peer lookup is the
             // only thing that matters: peer-absent ⇒ both-gone ⇒ purge.
+            //
+            // #1246: the probe below is the one fallback in this function
+            // that points at *deletion* rather than at stranding, so it gets
+            // the strictest rule in the file: **only a peer proven absent may
+            // purge.** `peer_exists = false` sends the session to `to_purge`,
+            // and the purge deletes the session row plus every dependent
+            // table keyed on it — so a wrong `false` is "delete a DM session
+            // whose peer is alive and still using it": data that should have
+            // survived, gone. The reconciliation policy puts that outside the
+            // quarantinable class entirely ("durable garbage is tolerable
+            // only because it is still repairable by hand, and data that is
+            // gone is not").
+            //
+            // Two distinct outcomes look exactly like "absent" from the
+            // probe's return value and are not, so [`classify_peer_presence`]
+            // splits them out. Neither purges; both leave the DM session
+            // stranded, which is additive and lands in the policy's third
+            // branch precisely as the two sibling drop sites in this function
+            // do. Deliberately *not* fatal: failing the delete would make
+            // every agent that has ever had a DM undeletable for as long as
+            // the fault lasts, which is the same #1236 pattern — a false
+            // belief disabling its own remedy — that step 0's agent-name
+            // lookup refuses forty lines up. Two safe dispositions were
+            // available here and the cheaper one is also the consistent one.
+            //
+            // `agent_names_all_readable` is consulted only when the probe
+            // found nothing, and is cached across candidates: it is a full
+            // scan of `agents`, and the all-present happy path never pays it.
+            let mut names_all_readable: Option<bool> = None;
             let mut to_purge: Vec<String> = Vec::new();
             for (sid, ctx_id) in &dm_candidates {
                 // `dm_peer` returns `None` when:
@@ -489,15 +566,46 @@ impl SqliteStore {
                     continue;
                 };
 
-                let peer_exists: bool = tx
-                    .query_row(
-                        "SELECT 1 FROM agents WHERE name = ?1",
-                        params![peer],
-                        |_| Ok(true),
-                    )
-                    .unwrap_or(false);
-                if !peer_exists {
-                    to_purge.push(sid.clone());
+                let probe = tx.query_row(
+                    "SELECT 1 FROM agents WHERE name = ?1",
+                    params![peer],
+                    |_| Ok(true),
+                );
+                let all_readable = probe.is_ok()
+                    || *names_all_readable.get_or_insert_with(|| agent_names_all_readable(&tx));
+
+                match classify_peer_presence(&probe, all_readable) {
+                    PeerPresence::Present => {}
+                    PeerPresence::ProvenAbsent => to_purge.push(sid.clone()),
+                    PeerPresence::UnreadablePeerName => {
+                        self.record_degraded_field(
+                            DegradedField::AgentsName,
+                            format_args!(
+                                "delete_agent {id_str}: peer {peer:?} of DM session {sid} could \
+                                 not be probed because at least one agents.name cell could not \
+                                 be proven readable; keeping the session rather than risk \
+                                 purging a live peer's DM, so it is stranded if the peer \
+                                 really is gone"
+                            ),
+                        );
+                    }
+                    PeerPresence::ProbeFailed => {
+                        // Not an `agents.name` degradation — that column was
+                        // never reached. What could not be classified is the
+                        // DM *session* row, and the consequence matches the
+                        // two sibling skips in this function exactly: it
+                        // survives the delete with no cleanup.
+                        if let Err(e) = &probe {
+                            self.record_skipped_row(
+                                PersistenceTable::Sessions,
+                                format_args!(
+                                    "delete_agent {id_str}: dm-cascade peer probe for session \
+                                     {sid} failed ({e}); keeping the session rather than purge on \
+                                     an unproven absence"
+                                ),
+                            );
+                        }
+                    }
                 }
             }
 
@@ -618,10 +726,104 @@ impl SqliteStore {
     }
 }
 
+/// What the DM-cascade peer probe in [`SqliteStore::delete_agent`] was able to
+/// *prove* about the peer agent's existence (#1246).
+///
+/// The purge it feeds deletes a session row and every table keyed on it, so
+/// the only answer allowed to reach `to_purge` is [`Self::ProvenAbsent`]. The
+/// other two `Err` shapes are the ones a reader is likely to collapse back
+/// into "absent"; they are named separately so that collapsing them requires
+/// deleting a variant rather than deleting a `match` arm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PeerPresence {
+    /// A row with that name exists. Keep the session.
+    Present,
+    /// The probe matched nothing *and* every `agents.name` cell in the table
+    /// is readable text, so "no match" really does mean "no such agent".
+    ProvenAbsent,
+    /// The probe matched nothing, but at least one `agents.name` cell is not
+    /// readable text. SQLite never compares a BLOB equal to a TEXT parameter
+    /// (and column affinity does not convert an already-stored BLOB), and a
+    /// NULL is equal to nothing at all — so a **live** peer whose own name
+    /// cell is corrupt is indistinguishable from an absent one. Purging on
+    /// that is the exact data loss this site exists to prevent, reached
+    /// through the one branch that used to be trusted.
+    UnreadablePeerName,
+    /// The probe statement itself failed (I/O, corruption, a busy database).
+    ProbeFailed,
+}
+
+/// Map a peer-probe result onto what it actually proves.
+///
+/// Split out as a pure function so the **polarity** is pinned by tests rather
+/// than by the paragraph at the call site: the failure mode this guards is a
+/// future edit collapsing every `Err` back to "absent", which no end-to-end
+/// test can catch without fault injection.
+///
+/// `agent_names_all_readable` is the answer from [`agent_names_all_readable`],
+/// and is only meaningful when the probe found nothing.
+///
+/// # Precondition: `agents.name` is write-once
+///
+/// [`PeerPresence::ProvenAbsent`] is a proof only while an agent's name never
+/// changes. `dm:<a>:<b>` context ids embed the participants' names **at
+/// creation time** and are never rewritten, so this probe really asks "is
+/// there an agent still named what this peer was called back then?". Today
+/// that is the same question as "does this peer still exist", because
+/// [`SqliteStore::create_agent`] is the only writer of `agents.name` and
+/// [`SqliteStore::update_agent`]'s `SET` list omits it.
+///
+/// Add a rename path and the two questions come apart: a renamed but **live**
+/// peer stops matching its own DM context ids, every one of its DM sessions
+/// classifies as `ProvenAbsent`, and the caller purges them along with every
+/// message in them -- the exact loss this site exists to prevent, reached
+/// through the one branch it trusts. A rename feature must therefore rewrite
+/// the affected `context_id`s in the same transaction, or key DM sessions on
+/// [`AgentId`] instead of on the name. Relaxing the `SET` list alone is not
+/// enough.
+fn classify_peer_presence(
+    probe: &rusqlite::Result<bool>,
+    agent_names_all_readable: bool,
+) -> PeerPresence {
+    match probe {
+        Ok(_) => PeerPresence::Present,
+        Err(rusqlite::Error::QueryReturnedNoRows) if agent_names_all_readable => {
+            PeerPresence::ProvenAbsent
+        }
+        Err(rusqlite::Error::QueryReturnedNoRows) => PeerPresence::UnreadablePeerName,
+        Err(_) => PeerPresence::ProbeFailed,
+    }
+}
+
+/// `true` when every `agents.name` cell is readable text, which is the
+/// precondition that makes a name-keyed "no match" trustworthy as "no such
+/// agent" (#1246).
+///
+/// **Fails closed.** If the check itself cannot run we report `false`: the
+/// cost of a wrong `false` is a stranded DM session, additive and repairable
+/// by hand; the cost of a wrong `true` is a deleted one, which is not.
+///
+/// This is deliberately table-wide rather than peer-specific — a corrupt name
+/// cannot be looked up by name, which is the whole problem. One bad cell
+/// therefore suppresses DM purging for the whole delete. That over-triggers in
+/// the safe direction, and the condition is itself a counted, remediated fault.
+fn agent_names_all_readable(tx: &rusqlite::Transaction<'_>) -> bool {
+    match tx.query_row(
+        "SELECT 1 FROM agents WHERE typeof(name) <> 'text' LIMIT 1",
+        [],
+        |_| Ok(()),
+    ) {
+        Ok(()) => false,
+        Err(rusqlite::Error::QueryReturnedNoRows) => true,
+        Err(_) => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::test_helpers::{corrupt_with_sql, new_message};
     use super::super::*;
+    use super::{PeerPresence, agent_names_all_readable, classify_peer_presence};
     use crate::types::Session;
     use alms_core::job::{Job, JobSchedule};
     use alms_core::registry::AgentRecord;
@@ -2159,5 +2361,312 @@ mod tests {
         // The counters describe the database, not the handle: clones of the
         // store share the connection and must share the accounting.
         assert_eq!(store.clone().rows_skipped_total(), 2);
+    }
+
+    /// #1246: `delete_agent`'s name lookup used to be a bare `.ok()`, so an
+    /// unreadable `agents.name` silently skipped the whole DM-cleanup branch.
+    /// The delete still has to succeed — failing it would make the agent
+    /// permanently undeletable — but the stranding it causes must be counted
+    /// and logged rather than swallowed.
+    #[test]
+    fn delete_agent_counts_an_unreadable_name_and_strands_the_dm_session() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let alice = new_agent("alice");
+        let bob = new_agent("bob");
+        store.create_agent(&alice).unwrap();
+        store.create_agent(&bob).unwrap();
+
+        let dm = Session::new(AgentId::nil(), "dm:alice:bob");
+        store.save_session(&dm).unwrap();
+
+        // Delete alice normally: bob is still alive, so the DM survives.
+        assert!(store.delete_agent(alice.id).unwrap());
+        assert_eq!(store.fields_degraded_total(), 0);
+
+        // Now make bob's name unreadable as text. `name` is `TEXT NOT NULL`,
+        // but SQLite is dynamically typed, so a BLOB sits happily in the cell
+        // and `row.get::<_, String>` cannot convert it. This is the shape a
+        // hand-edited or partially-corrupted database produces.
+        corrupt_with_sql(
+            &store,
+            &format!(
+                "UPDATE agents SET name = X'DEADBEEF' WHERE id = '{}'",
+                bob.id.0
+            ),
+        );
+
+        // The delete still succeeds...
+        assert!(
+            store.delete_agent(bob.id).unwrap(),
+            "an unreadable name must not make the agent undeletable"
+        );
+
+        // ...but step 4b was skipped, so the DM session both of whose
+        // participants are now gone survives as an unreachable row. That is
+        // the leak the counter exists to make visible.
+        {
+            let conn = store.conn.lock();
+            let dm_count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sessions WHERE id = ?1",
+                    params![dm.id.0.to_string()],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                dm_count, 1,
+                "the DM session is stranded — this is the degradation, not a bug in the test"
+            );
+        }
+
+        assert_eq!(store.fields_degraded_for(DegradedField::AgentsName), 1);
+        assert_eq!(store.fields_degraded_total(), 1);
+        assert_eq!(
+            store.rows_skipped_total(),
+            0,
+            "a skipped cleanup branch is not a skipped row"
+        );
+    }
+
+    /// The other half of the split #1246 introduced: "there is no such agent"
+    /// is `QueryReturnedNoRows`, not a fault. Skipping DM cleanup is *correct*
+    /// there — there is nothing to clean up — so it must not be counted or it
+    /// would make `persistence_fields_degraded_total` climb on every delete of
+    /// an already-deleted agent.
+    #[test]
+    fn delete_agent_does_not_count_a_missing_agent_as_a_degradation() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let agent = new_agent("atlas");
+        store.create_agent(&agent).unwrap();
+
+        assert!(store.delete_agent(agent.id).unwrap());
+        // Second delete: the row is already gone.
+        assert!(!store.delete_agent(agent.id).unwrap());
+        // And an id that never existed.
+        assert!(!store.delete_agent(AgentId::new()).unwrap());
+
+        assert_eq!(
+            store.fields_degraded_total(),
+            0,
+            "an absent agent is the normal path, not a degraded field"
+        );
+    }
+
+    /// The DM-cascade peer probe must not treat an error as "peer absent":
+    /// that fallback *deletes* a live DM session, which the reconciliation
+    /// policy explicitly puts outside the quarantinable class. This test pins
+    /// the benign half of the split — a peer that genuinely does not exist is
+    /// still `QueryReturnedNoRows` and must still purge — so the stricter
+    /// error handling cannot silently disable the #1002 cascade.
+    #[test]
+    fn dm_cascade_still_purges_when_the_peer_is_genuinely_absent() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let alice = new_agent("alice");
+        let bob = new_agent("bob");
+        store.create_agent(&alice).unwrap();
+        store.create_agent(&bob).unwrap();
+
+        let dm = Session::new(AgentId::nil(), "dm:alice:bob");
+        store.save_session(&dm).unwrap();
+        store.save_message(dm.id, &new_message("hi bob")).unwrap();
+
+        assert!(store.delete_agent(alice.id).unwrap());
+        assert!(store.delete_agent(bob.id).unwrap());
+
+        let conn = store.conn.lock();
+        let dm_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sessions WHERE id = ?1",
+                params![dm.id.0.to_string()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            dm_count, 0,
+            "both participants gone: the DM session must still cascade"
+        );
+        let msg_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM messages WHERE session_id = ?1",
+                params![dm.id.0.to_string()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(msg_count, 0);
+    }
+
+    /// The residual `QueryReturnedNoRows` does not cover, and the reason
+    /// "only `QueryReturnedNoRows` may mean absent" is not by itself a safety
+    /// guarantee for a probe keyed on `name`.
+    ///
+    /// If the **peer's** own `agents.name` cell is a BLOB — the exact
+    /// corruption `delete_agent_counts_an_unreadable_name_and_strands_the_dm_session`
+    /// builds, one row over — then `SELECT 1 FROM agents WHERE name = ?1`
+    /// with a TEXT parameter matches nothing: SQLite never compares a BLOB
+    /// equal to a TEXT value, and TEXT column affinity does not convert an
+    /// already-stored BLOB. The probe therefore reports `QueryReturnedNoRows`
+    /// for a peer that is alive and still using the session.
+    ///
+    /// Before #1246's follow-up that purged the DM session and every message
+    /// in it. The session must survive.
+    #[test]
+    fn dm_cascade_does_not_purge_when_the_peer_name_is_unreadable() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let alice = new_agent("alice");
+        let bob = new_agent("bob");
+        store.create_agent(&alice).unwrap();
+        store.create_agent(&bob).unwrap();
+
+        let dm = Session::new(AgentId::nil(), "dm:alice:bob");
+        store.save_session(&dm).unwrap();
+        store.save_message(dm.id, &new_message("hi bob")).unwrap();
+
+        // Corrupt the *peer's* name, not the deleted agent's. Alice's own
+        // name still reads fine, so step 0 succeeds and the DM-cleanup branch
+        // runs in full — this exercises the probe, not the step-0 skip.
+        corrupt_with_sql(
+            &store,
+            &format!(
+                "UPDATE agents SET name = X'DEADBEEF' WHERE id = '{}'",
+                bob.id.0
+            ),
+        );
+
+        assert!(store.delete_agent(alice.id).unwrap());
+
+        let conn = store.conn.lock();
+        let dm_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sessions WHERE id = ?1",
+                params![dm.id.0.to_string()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            dm_count, 1,
+            "bob is alive: an unreadable peer name must never be read as an absent peer"
+        );
+        let msg_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM messages WHERE session_id = ?1",
+                params![dm.id.0.to_string()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(msg_count, 1, "the DM's messages must survive with it");
+        drop(conn);
+
+        assert_eq!(
+            store.fields_degraded_for(DegradedField::AgentsName),
+            1,
+            "the unprovable probe is counted as the agents.name fault it is"
+        );
+        assert_eq!(
+            store.rows_skipped_total(),
+            0,
+            "nothing failed to parse -- this is a degradation, not a row skip"
+        );
+    }
+
+    /// Failing the delete is *not* the disposition here. An unprovable peer
+    /// leaves the DM session alone and lets the delete finish, so a corrupt
+    /// `agents` table cannot make every agent that has ever had a DM
+    /// undeletable — the same #1236 argument step 0 makes for its own lookup.
+    #[test]
+    fn an_unprovable_peer_does_not_make_the_agent_undeletable() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let alice = new_agent("alice");
+        let bob = new_agent("bob");
+        store.create_agent(&alice).unwrap();
+        store.create_agent(&bob).unwrap();
+        store
+            .save_session(&Session::new(AgentId::nil(), "dm:alice:bob"))
+            .unwrap();
+        corrupt_with_sql(
+            &store,
+            &format!(
+                "UPDATE agents SET name = X'DEADBEEF' WHERE id = '{}'",
+                bob.id.0
+            ),
+        );
+
+        assert!(
+            store.delete_agent(alice.id).unwrap(),
+            "the delete must still commit"
+        );
+        assert!(
+            store.load_agent_by_id(alice.id).unwrap().is_none(),
+            "and alice must actually be gone, not rolled back"
+        );
+    }
+
+    /// #1246: the polarity of the peer probe is the thing that must not
+    /// regress, and the destructive arm is not reachable from a unit test
+    /// without fault injection. So the mapping is pinned directly instead of
+    /// by prose: restoring `.unwrap_or(false)`, or folding any `Err` back into
+    /// "absent", has to break one of these.
+    #[test]
+    fn only_a_proven_absent_peer_may_purge() {
+        assert_eq!(
+            classify_peer_presence(&Ok(true), true),
+            PeerPresence::Present
+        );
+        // A readable-names table makes "no match" trustworthy.
+        assert_eq!(
+            classify_peer_presence(&Err(rusqlite::Error::QueryReturnedNoRows), true),
+            PeerPresence::ProvenAbsent
+        );
+        // ...and an unreadable name anywhere in the table takes that away.
+        assert_eq!(
+            classify_peer_presence(&Err(rusqlite::Error::QueryReturnedNoRows), false),
+            PeerPresence::UnreadablePeerName
+        );
+        // Any other error proves nothing, whatever the names look like.
+        for names_readable in [true, false] {
+            assert_eq!(
+                classify_peer_presence(
+                    &Err(rusqlite::Error::SqliteFailure(
+                        rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CORRUPT),
+                        Some("database disk image is malformed".into()),
+                    )),
+                    names_readable
+                ),
+                PeerPresence::ProbeFailed
+            );
+        }
+
+        // The property the whole site turns on, stated as an assertion:
+        // exactly one classification is allowed to delete data.
+        let purges = |p: PeerPresence| matches!(p, PeerPresence::ProvenAbsent);
+        assert!(purges(PeerPresence::ProvenAbsent));
+        assert!(!purges(PeerPresence::Present));
+        assert!(!purges(PeerPresence::UnreadablePeerName));
+        assert!(!purges(PeerPresence::ProbeFailed));
+    }
+
+    /// The precondition behind `ProvenAbsent`, and its fail-closed direction.
+    #[test]
+    fn agent_names_readability_probe_reports_the_corrupt_cell() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let agent = new_agent("atlas");
+        store.create_agent(&agent).unwrap();
+
+        {
+            let mut conn = store.conn.lock();
+            let tx = conn.transaction().unwrap();
+            assert!(
+                agent_names_all_readable(&tx),
+                "a healthy table makes a name-keyed miss trustworthy"
+            );
+        }
+
+        corrupt_with_sql(&store, "UPDATE agents SET name = X'DEADBEEF'");
+
+        let mut conn = store.conn.lock();
+        let tx = conn.transaction().unwrap();
+        assert!(
+            !agent_names_all_readable(&tx),
+            "one non-text name cell is enough to make every miss unprovable"
+        );
     }
 }

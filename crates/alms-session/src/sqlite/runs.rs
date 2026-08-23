@@ -142,7 +142,7 @@ impl SqliteStore {
                     parent_run_id, created_at, resolved_config, lifecycle_revision, terminal_reason \
              FROM runs WHERE run_id = ?1",
             params![run_id.0.to_string()],
-            parse_run_row,
+            |row| parse_run_row(self, row),
         );
         match result {
             Ok(run) => Ok(Some(run)),
@@ -168,10 +168,9 @@ impl SqliteStore {
             .map_err(|e| AlmsError::Runtime(format!("SQLite prepare load_runs_by_session: {e}")))?;
 
         let rows = stmt
-            .query_map(
-                params![session_id.0.to_string(), limit as i64],
-                parse_run_row,
-            )
+            .query_map(params![session_id.0.to_string(), limit as i64], |row| {
+                parse_run_row(self, row)
+            })
             .map_err(|e| AlmsError::Runtime(format!("SQLite query load_runs_by_session: {e}")))?
             .filter_map(|r| match r {
                 Ok(run) => Some(run),
@@ -210,7 +209,7 @@ impl SqliteStore {
             .map_err(|e| AlmsError::Runtime(format!("SQLite prepare load_all_runs: {e}")))?;
 
         let rows = stmt
-            .query_map(params![cutoff], parse_run_row)
+            .query_map(params![cutoff], |row| parse_run_row(self, row))
             .map_err(|e| AlmsError::Runtime(format!("SQLite query load_all_runs: {e}")))?
             .filter_map(|r| match r {
                 Ok(run) => Some(run),
@@ -273,7 +272,7 @@ impl SqliteStore {
                 .map_err(|e| {
                     AlmsError::Runtime(format!("SQLite prepare mark_stale_runs_failed: {e}"))
                 })?;
-            stmt.query_map([], parse_run_row)
+            stmt.query_map([], |row| parse_run_row(self, row))
                 .map_err(|e| {
                     AlmsError::Runtime(format!("SQLite query mark_stale_runs_failed: {e}"))
                 })?
@@ -315,7 +314,7 @@ impl SqliteStore {
                         "SQLite prepare terminal pending-input recovery: {e}"
                     ))
                 })?;
-            stmt.query_map([], parse_run_row)
+            stmt.query_map([], |row| parse_run_row(self, row))
                 .map_err(|e| {
                     AlmsError::Runtime(format!("SQLite query terminal pending-input recovery: {e}"))
                 })?
@@ -1296,5 +1295,137 @@ mod tests {
         assert!(store.load_all_runs().unwrap().is_empty());
         assert_eq!(store.rows_skipped_for(PersistenceTable::Runs), 2);
         assert_eq!(store.rows_skipped_total(), 2);
+    }
+
+    /// #1246: an unparseable `job_id` is a *foreign key*, not a defaulted
+    /// column. The row survives — dropping it would not repair the hazard and
+    /// would break the startup sweep — but the degradation is counted so it is
+    /// visible without log access.
+    #[test]
+    fn corrupt_job_id_degrades_the_field_and_keeps_the_run() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let session = new_session();
+        store.save_session(&session).unwrap();
+        let run = new_run(session.id, session.agent_id);
+        let run_id = run.run_id;
+        store.save_run(&run).unwrap();
+
+        corrupt_with_sql(&store, "UPDATE runs SET job_id = 'not-a-uuid'");
+
+        let loaded = store
+            .load_run(run_id)
+            .unwrap()
+            .expect("the run must still hydrate: a degraded FK is not a row drop");
+        assert_eq!(loaded.run_id, run_id);
+        assert!(
+            loaded.job_id.is_none(),
+            "the unparseable job_id degrades to None"
+        );
+
+        assert_eq!(store.fields_degraded_for(DegradedField::RunsJobId), 1);
+        assert_eq!(store.fields_degraded_total(), 1);
+    }
+
+    /// The same shape one column over, with a smaller blast radius: the run
+    /// reads as top-level instead of as a subagent run of its parent.
+    #[test]
+    fn corrupt_parent_run_id_degrades_the_field_and_keeps_the_run() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let session = new_session();
+        store.save_session(&session).unwrap();
+        let run = new_run(session.id, session.agent_id);
+        let run_id = run.run_id;
+        store.save_run(&run).unwrap();
+
+        corrupt_with_sql(&store, "UPDATE runs SET parent_run_id = 'not-a-uuid'");
+
+        let loaded = store.load_run(run_id).unwrap().expect("run should hydrate");
+        assert!(loaded.parent_run_id.is_none());
+        assert_eq!(store.fields_degraded_for(DegradedField::RunsParentRunId), 1);
+        assert_eq!(store.fields_degraded_total(), 1);
+    }
+
+    /// The load-bearing invariant of #1246: a degraded *field* must never
+    /// touch `persistence_rows_skipped_total`, and a skipped *row* must never
+    /// touch `persistence_fields_degraded_total`. The two counters answer
+    /// different questions — "which rows can the daemon not see?" versus
+    /// "which rows is it serving with a wrong column?" — and either one
+    /// bleeding into the other makes both unreadable.
+    #[test]
+    fn degraded_fields_and_skipped_rows_are_counted_separately() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let session = new_session();
+        store.save_session(&session).unwrap();
+        let run = new_run(session.id, session.agent_id);
+        store.save_run(&run).unwrap();
+
+        // A degraded FK: row survives, field counter moves, row counter does not.
+        corrupt_with_sql(&store, "UPDATE runs SET job_id = 'not-a-uuid'");
+        assert_eq!(store.load_runs_by_session(session.id, 10).unwrap().len(), 1);
+        assert_eq!(store.fields_degraded_total(), 1);
+        assert_eq!(
+            store.rows_skipped_total(),
+            0,
+            "a degraded field must not inflate persistence_rows_skipped_total"
+        );
+
+        // An unparseable identity column: row is dropped, row counter moves.
+        // The FK is never reached, so the field counter stays where it was.
+        corrupt_with_sql(&store, "UPDATE runs SET agent_id = 'not-a-uuid'");
+        assert!(
+            store
+                .load_runs_by_session(session.id, 10)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(store.rows_skipped_for(PersistenceTable::Runs), 1);
+        assert_eq!(
+            store.fields_degraded_total(),
+            1,
+            "a skipped row must not inflate persistence_fields_degraded_total"
+        );
+    }
+
+    /// The counters are shared across clones of the store, like the row-skip
+    /// counters they sit beside: every clone wraps the same connection, so the
+    /// totals describe the database rather than a handle to it.
+    #[test]
+    fn field_degradations_are_shared_across_store_clones() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let session = new_session();
+        store.save_session(&session).unwrap();
+        let run = new_run(session.id, session.agent_id);
+        store.save_run(&run).unwrap();
+
+        corrupt_with_sql(&store, "UPDATE runs SET job_id = 'not-a-uuid'");
+        store.load_run(run.run_id).unwrap();
+
+        assert_eq!(store.clone().fields_degraded_total(), 1);
+        assert_eq!(
+            store.clone().fields_degraded_by_field()["runs.job_id"],
+            1,
+            "the per-field breakdown is keyed <table>.<column>"
+        );
+    }
+
+    /// The loader-backed fields count *occurrences, not distinct rows* — the
+    /// same caveat `persistence_rows_skipped_total` carries. One corrupt row
+    /// read three times is three increments, which is why the docs tell an
+    /// operator to read the rate rather than the total.
+    #[test]
+    fn field_degradation_counts_occurrences_not_distinct_rows() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let session = new_session();
+        store.save_session(&session).unwrap();
+        let run = new_run(session.id, session.agent_id);
+        store.save_run(&run).unwrap();
+
+        corrupt_with_sql(&store, "UPDATE runs SET job_id = 'not-a-uuid'");
+
+        store.load_run(run.run_id).unwrap();
+        store.load_run(run.run_id).unwrap();
+        store.load_run(run.run_id).unwrap();
+
+        assert_eq!(store.fields_degraded_for(DegradedField::RunsJobId), 3);
     }
 }

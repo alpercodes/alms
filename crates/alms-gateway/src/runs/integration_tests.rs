@@ -13450,6 +13450,31 @@ async fn operational_metrics_route_exposes_live_snapshot() {
         );
     }
 
+    // #1246: field degradations are a separate counter from row skips, with
+    // the same stable-key-set guarantee. The two must stay distinct on the
+    // wire — one means "rows the daemon cannot see", the other "rows it is
+    // serving with a column it could not read".
+    assert!(json["persistence_fields_degraded_total"].is_number());
+    let by_field = json["persistence_fields_degraded_by_field"]
+        .as_object()
+        .expect("per-field breakdown should be an object");
+    assert_eq!(
+        by_field.len(),
+        alms_session::sqlite::DegradedField::ALL.len()
+    );
+    for field in alms_session::sqlite::DegradedField::ALL {
+        assert_eq!(
+            by_field.get(field.as_str()),
+            Some(&serde_json::json!(0)),
+            "missing or non-zero entry for {}",
+            field.as_str()
+        );
+        assert!(
+            field.as_str().contains('.'),
+            "field keys are <table>.<column> so they name the cell to inspect"
+        );
+    }
+
     drop(subscription);
     shutdown_token.cancel();
 }

@@ -131,9 +131,10 @@ Per-release notes for ALMS, with an emphasis on **operator-facing changes** — 
     persistence row"` with structured `table` and `detail` fields. **Any log
     filter or alert keyed on the old strings goes quiet without failing** —
     re-key it on the new message, on `table=`, or preferably on the counter.
-  - **Also documented in `docs/api.md` § 8.1: the twelve scalar counters on
+  - **Also documented in `docs/api.md` § 8.1: the scalar counters on
     `/operations/metrics` are grouped** into Rejections (expected non-zero
-    under load — alert on a slope), Quarantine (alert on `> 0`), and Workload.
+    under load — alert on a slope), Quarantine and degradation (alert on
+    `> 0`), and Workload.
     The field order of the JSON response follows the grouping; key order was
     never semantic, but scripts pretty-printing the payload will see it move.
   - **`docs/architecture.md` gains the reconciliation policy: *absence must be
@@ -147,6 +148,70 @@ Per-release notes for ALMS, with an emphasis on **operator-facing changes** — 
     sanctioned fatal reconciliation site, and it documents the deliberate
     decision **not** to add a `--skip-recovery` escape hatch. No behaviour
     change on its own — it names what #1233 / #1235 / #1236 / #1241 already do.
+
+- **Foreign-key fallbacks in the persistence layer are no longer silent**
+  (#1246), and they are counted apart from row skips.
+  - **New counters on `GET /operations/metrics`:
+    `persistence_fields_degraded_total` and
+    `persistence_fields_degraded_by_field`** (keyed `<table>.<column>`, every
+    known field reported including the zeroes). Four parsers replaced an
+    unreadable column with a fallback and kept the row, with no log and no
+    counter: `runs.job_id` and `runs.parent_run_id` in `parse_run_row`,
+    `session_summaries.last_run_id` in `parse_session_summary_row`, and the
+    agent-name lookup in `delete_agent`. All four now `warn!` and increment.
+  - **`session_summaries.last_run_id` was a real bug, not just missing
+    telemetry, and it is the one to alert on.** That column is the
+    compare-and-swap sentinel for episodic-summary upserts. When it failed to
+    parse, every subsequent summary write for that session came back as a
+    *conflict* — so the agent burned three LLM summarization calls, gave up,
+    and logged `Failed to persist session summary due to concurrent updates`
+    with no concurrent update anywhere in sight. Episodic memory for the
+    session was stuck permanently and every signal pointed at the wrong cause.
+    It is also the only one of the four on a live read path.
+  - **Deliberately a separate counter from `persistence_rows_skipped_total`,
+    which is unchanged.** That number means *rows the daemon cannot see*;
+    these rows are perfectly visible, just wrong. Folding them together would
+    have destroyed both. **Alert on the new counter at least as loudly as the
+    old one** — a skipped row is trust withheld and bounded, a degraded field
+    is trust misplaced and projected into live state.
+  - **The two `runs.*` fields are attribution defects, and repairing them
+    needs a restart.** A degraded `job_id` makes `GET /runs` report a null job
+    and label the run `user` instead of `scheduled`; `parent_run_id` turns a
+    subagent run into a top-level one. Nothing is left running, and no cancel
+    is missed — the parser is reached only by the boot-time stale-run sweep
+    and by hydration, both of which see terminal rows. Because the live `Run`
+    is never refreshed from disk, fixing the cell takes effect at next start;
+    `docs/api.md` § 8.1 says so explicitly rather than implying it self-heals.
+  - **`DELETE /agents/{id_or_name}` distinguishes cases it used to conflate.**
+    "No such agent" is the normal path and skips DM cleanup correctly — not
+    counted. A genuinely unreadable `agents.name` skips the same branch but
+    strands shared DM sessions whose participants are all gone; that is now
+    counted and logged with a `delete_agent <id>:` prefix. The delete still
+    succeeds in every case, so an agent never becomes undeletable.
+  - **Fixed: `DELETE /agents/{id_or_name}` could delete a live peer's DM
+    session, messages and all.** The DM-cascade peer probe treated any
+    unsuccessful `SELECT 1 FROM agents WHERE name = ?` as "peer absent" and
+    sent the shared DM session to the purge list. Two ways to reach that: a
+    transient SQLite error, or — with no error at all — a peer whose own
+    `name` cell is not readable text, since SQLite never compares a BLOB or
+    NULL equal to a text parameter, so the probe simply matches nothing. The
+    rule is now **only a peer proven absent may purge**: a miss counts as
+    absence only when every `agents.name` cell in the table is readable text,
+    and anything unprovable leaves the DM session alone. **No behaviour change
+    for callers** — the delete still commits; the DM session is stranded
+    instead of destroyed, and counted so the leak is visible.
+  - **`docs/architecture.md`'s reconciliation-policy scope note is corrected.**
+    It previously implied field-level fallbacks were a uniformly weaker class
+    than row drops. They are a *second* class, and the less contained one: a
+    row skip discharges the policy's obligation 3 (the bad fact never reaches
+    live state), and a field degradation structurally cannot. The note now
+    says when degrading is allowed at all — only where dropping the row is
+    actively worse — carries a per-field table of read paths and consequences,
+    and adds the polarity check that keeps a fallback from *deleting* data. It
+    also fixes the discriminator for which fallbacks are benign: not "enum
+    versus foreign key", but whether the fallback value is one the operator
+    could legitimately have configured. `str_to_run_status`'s `_ => Queued` is
+    an enum fallback that fails that test and is documented at the site.
 
 - **Normalized frontend entity state and authoritative reconnect recovery**
   (PR #1228): agents, sessions, runs, and activity now share one typed reducer
