@@ -113,18 +113,51 @@ pub(crate) fn strip_verbatim_prefix(path: &Path) -> PathBuf {
     path.to_path_buf()
 }
 
-/// Canonicalise `path` into the form used for containment comparison.
+/// A path normalised for containment comparison, plus whether that
+/// normalisation actually happened.
+///
+/// The distinction is not cosmetic. [`normalise`] falls back to its raw
+/// input when canonicalisation fails, so the containment test run against an
+/// unresolved path supports only "not confirmed inside" — never "confirmed
+/// outside". A caller that just needs a value to compare can ignore that and
+/// use [`canonical_for_comparison`]; a caller that *reports the verdict to
+/// the agent* must not state a cause the comparison never established
+/// (#1262).
+#[derive(Debug, Clone)]
+pub(crate) struct Normalised {
+    /// The path to compare with: canonical when `resolved`, the raw input
+    /// otherwise.
+    pub(crate) path: PathBuf,
+
+    /// Whether [`std::fs::canonicalize`] succeeded on the input.
+    pub(crate) resolved: bool,
+}
+
+/// Canonicalise `path` into the form used for containment comparison,
+/// reporting whether the canonicalisation actually succeeded.
 ///
 /// Resolves symlinks and `..`, then drops the `\\?\` prefix that
 /// [`std::fs::canonicalize`] adds on Windows. Falls back to the input
 /// unchanged when the path cannot be resolved (it does not exist, or the
 /// volume is unreadable) — the caller still gets a well-defined value to
-/// compare, and an unresolvable path simply will not match a resolvable root.
-pub(crate) fn canonical_for_comparison(path: &Path) -> PathBuf {
+/// compare, and an unresolvable path simply will not match a resolvable root
+/// — but `resolved: false` records that fallback rather than hiding it.
+pub(crate) fn normalise(path: &Path) -> Normalised {
     match std::fs::canonicalize(path) {
-        Ok(canonical) => strip_verbatim_prefix(&canonical),
-        Err(_) => path.to_path_buf(),
+        Ok(canonical) => Normalised {
+            path: strip_verbatim_prefix(&canonical),
+            resolved: true,
+        },
+        Err(_) => Normalised {
+            path: path.to_path_buf(),
+            resolved: false,
+        },
     }
+}
+
+/// [`normalise`] for callers that only need the comparable path.
+pub(crate) fn canonical_for_comparison(path: &Path) -> PathBuf {
+    normalise(path).path
 }
 
 /// Resolve a working directory string reported by the shell engine into a
@@ -138,17 +171,22 @@ pub(crate) fn canonical_for_comparison(path: &Path) -> PathBuf {
 /// This matters beyond the containment check — storing the raw `/c/dev/ws`
 /// string and handing it to `current_dir` would resolve it against the
 /// current drive (`C:\c\dev\ws`) and break the next command outright.
-pub(crate) fn resolve_reported_cwd(reported: &Path) -> PathBuf {
+pub(crate) fn resolve_reported(reported: &Path) -> Normalised {
     #[cfg(windows)]
     {
         if !reported.is_dir()
             && let Some(converted) = msys_to_windows(reported)
             && converted.is_dir()
         {
-            return canonical_for_comparison(&converted);
+            return normalise(&converted);
         }
     }
-    canonical_for_comparison(reported)
+    normalise(reported)
+}
+
+/// [`resolve_reported`] for callers that only need the resolved path.
+pub(crate) fn resolve_reported_cwd(reported: &Path) -> PathBuf {
+    resolve_reported(reported).path
 }
 
 /// Compare two path components under the platform's case-sensitivity rules.

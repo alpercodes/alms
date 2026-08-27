@@ -418,7 +418,38 @@ under `cfg(windows)` and only when the rewritten path names a real
 directory: on Unix `/c/...` is an ordinary absolute path and is never
 reinterpreted. A cwd that fails containment is discarded and the previous
 cwd retained, so a `cd` out of the sandbox cannot persist into the next
-command.
+command. The revert is also **reported to the agent** (#1262): the tool
+result's `stdout` gains a `[cwd unchanged: '<attempted>' <verdict>;
+subsequent commands still run in '<kept>']` line, on both the foreground and
+background (`check_task`) paths, and the sandboxed variant of the tool
+description states the confinement up front. Containment itself is
+unchanged — this is a correctness fix for the agent loop, which previously
+saw `exit_code: 0` and no signal at all, and went on misreading every
+relative path. The notice does not appear for `unrestricted` /
+`[security].allow_full_os_access` instances, which skip containment
+entirely.
+
+`<verdict>` distinguishes the two ways containment can fail, because the
+check itself does not prove the same thing in both. `canonical_for_comparison`
+falls back to returning its input when `std::fs::canonicalize` fails, so a
+path the daemon *could not resolve* is rejected by exactly the same
+`is_within` comparison as a path that genuinely escaped. Both fail closed —
+that part is deliberate — but only one of them establishes where the
+directory actually is:
+
+| Outcome | Condition | `<verdict>` |
+|---|---|---|
+| `OutsideRoot` | root **and** candidate both canonicalised, and the candidate is not under the root | `is outside the sandbox root` |
+| `NotVerifiable` | either side failed to canonicalise, so the comparison decided nothing | `could not be confirmed inside the sandbox root` |
+
+The distinction is load-bearing rather than pedantic: under Windows Git Bash,
+a sandbox root reached through the `/tmp` mount is unresolvable on *every*
+command (#1266), so collapsing the two cases would tell an agent its own
+legitimate workspace was out of bounds, every turn, with a cause the daemon
+never determined. A confidently wrong explanation delivered repeatedly is
+worse for the agent loop than no explanation, which is the failure this
+notice exists to fix. Making the rejection *behaviour* depend on the reason —
+rather than only the wording — is tracked separately in #1261.
 
 **UNC path blocking**: All file tools (`fs_read`, `fs_write`, `fs_list`, `fs_edit`, `fs_grep`, `fs_glob`) reject Windows UNC paths (`\\server\share`), extended-length UNC paths (`\\?\UNC\server\share`), and URI-style equivalents (`//server/share`) before any filesystem I/O. This prevents NTLM credential theft via SMB auto-authentication. The check runs on all platforms (not just Windows) because the daemon may be accessed from a Windows client, and forward-slash UNC paths are valid on some Linux SMB configurations. Device namespace paths (`\\.\`) are also blocked by the same check.
 

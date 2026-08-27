@@ -7,7 +7,9 @@ use super::output::truncate_output_bytes;
 use super::pathnorm;
 use super::security::{command_matches_denylist, is_secret_env_var, platform_critical_env_vars};
 use super::spill::{ShellSpillPolicy, write_spill};
-use super::types::{MAX_OUTPUT_BYTES, ShellInput, ShellOutput, ShellState};
+use super::types::{
+    CwdRejection, CwdRevert, MAX_OUTPUT_BYTES, ShellInput, ShellOutput, ShellState,
+};
 use crate::{SandboxError, error::SandboxResult};
 use alms_core::config::ShellEngine;
 use std::collections::HashMap;
@@ -48,6 +50,11 @@ pub(crate) fn command_excerpt(command: &str) -> String {
 /// `{run_dir}/shell_{tool_call_id}.log` (issue #756). The returned
 /// [`ShellOutput::spill_path`] carries the absolute path so the caller can
 /// surface it to the agent.
+///
+/// When the command ends in a directory outside the sandbox root, the
+/// persistent cwd is left where it was and [`ShellOutput::cwd_revert`]
+/// records the attempted/kept pair — again for the caller to surface, so the
+/// agent learns that its `cd` did not stick (issue #1262).
 // The per-execution argument shape intentionally kept flat for readability:
 // bundling these into a struct obscures the call path from `ShellTool::execute`
 // and `background::submit_background_task` without removing any real
@@ -128,6 +135,11 @@ pub(crate) async fn execute_command(
     // ASCII so decoding just the stdout bytes as UTF-8 (lossy) for the
     // marker search is safe — replacement chars in user output cannot match
     // the marker pattern.
+    //
+    // A containment revert is recorded in `cwd_revert` so the tool layer can
+    // tell the agent its `cd` did not stick (issue #1262) — the `warn!` below
+    // only ever reached the operator's logs.
+    let mut cwd_revert: Option<CwdRevert> = None;
     {
         let stdout_for_marker = String::from_utf8_lossy(&raw_stdout);
         if let Some(new_cwd) = extract_cwd_from_output(&stdout_for_marker, pwd_marker) {
@@ -143,17 +155,29 @@ pub(crate) async fn execute_command(
             // so even a cwd that passed containment would land the next
             // command somewhere else entirely.
             if !unrestricted && let Some(root) = sandbox_root {
-                match validate_cwd(&new_path, root) {
+                match check_cwd(&new_path, root) {
                     Ok(resolved) => {
                         let mut cwd_lock = state.cwd.lock().await;
                         *cwd_lock = resolved;
                     }
-                    Err(_) => {
+                    Err(reason) => {
                         warn!(
                             new_cwd = %new_path.display(),
                             sandbox_root = %root.display(),
-                            "Post-command cwd is outside sandbox root; keeping previous cwd"
+                            reason = ?reason,
+                            "Post-command cwd did not pass containment; keeping previous cwd"
                         );
+                        // Read the *live* cwd rather than reusing the
+                        // pre-command snapshot: background tasks share one
+                        // `ShellState`, so a concurrent command may have
+                        // moved it. What the agent needs to be told is where
+                        // its next command will actually run.
+                        let kept = state.cwd.lock().await.clone();
+                        cwd_revert = Some(CwdRevert {
+                            attempted: new_path.clone(),
+                            kept,
+                            reason,
+                        });
                     }
                 }
             } else {
@@ -213,6 +237,7 @@ pub(crate) async fn execute_command(
         stdout,
         stderr,
         spill_path,
+        cwd_revert,
     })
 }
 
@@ -1051,7 +1076,7 @@ fn trim_ascii_whitespace(s: &[u8]) -> &[u8] {
     &s[start..end]
 }
 
-/// Validate that a cwd is within the sandbox root.
+/// Decide whether a cwd may be adopted, and on rejection say *why*.
 ///
 /// Returns the **normalised** cwd on success so the caller can store a path
 /// this process can actually hand to `Command::current_dir`. That return
@@ -1064,18 +1089,53 @@ fn trim_ascii_whitespace(s: &[u8]) -> &[u8] {
 /// each side happened to be in — an MSYS `pwd` against a `\\?\`-prefixed
 /// canonicalised root — so the sandbox decided its own root was outside
 /// itself and reverted every legitimate `cd`.
-fn validate_cwd(cwd: &Path, sandbox_root: &Path) -> SandboxResult<PathBuf> {
-    let canonical_root = pathnorm::canonical_for_comparison(sandbox_root);
-    let canonical_cwd = pathnorm::resolve_reported_cwd(cwd);
+///
+/// #1262: the rejection carries a [`CwdRejection`] because the accept/reject
+/// bit alone does not identify the cause. `pathnorm::normalise` falls back to
+/// its raw input when canonicalisation fails, so an unresolvable path lands
+/// in exactly the same reject arm as a real escape. Deriving the reason here,
+/// from the same two `Normalised` values the verdict was computed from, is
+/// what keeps it in step with the verdict — a separate classifier run later
+/// could disagree with the decision it purports to explain.
+///
+/// **Behaviour is unchanged**: the accept/reject decision is still
+/// `is_within` over the same two normalised paths, and every rejection still
+/// fails closed. Only the explanation is new.
+fn check_cwd(cwd: &Path, sandbox_root: &Path) -> Result<PathBuf, CwdRejection> {
+    let root = pathnorm::normalise(sandbox_root);
+    let candidate = pathnorm::resolve_reported(cwd);
 
-    if !pathnorm::is_within(&canonical_root, &canonical_cwd) {
-        return Err(SandboxError::SandboxViolation(format!(
-            "Working directory '{}' is outside sandbox root '{}'",
+    if pathnorm::is_within(&root.path, &candidate.path) {
+        return Ok(candidate.path);
+    }
+
+    // "Outside the root" is a claim about where the path *is*, and the
+    // comparison above only supports it when both sides were real resolved
+    // paths. If either fell back to its raw spelling, all that was
+    // established is that containment could not be confirmed.
+    Err(if root.resolved && candidate.resolved {
+        CwdRejection::OutsideRoot
+    } else {
+        CwdRejection::NotVerifiable
+    })
+}
+
+/// Validate that a cwd is within the sandbox root, as a [`SandboxError`].
+///
+/// Thin wrapper over [`check_cwd`] for the pre-command check, which has no
+/// use for the structured reason beyond wording the message accurately.
+fn validate_cwd(cwd: &Path, sandbox_root: &Path) -> SandboxResult<PathBuf> {
+    check_cwd(cwd, sandbox_root).map_err(|reason| {
+        let verdict = match reason {
+            CwdRejection::OutsideRoot => "is outside",
+            CwdRejection::NotVerifiable => "could not be confirmed inside",
+        };
+        SandboxError::SandboxViolation(format!(
+            "Working directory '{}' {verdict} sandbox root '{}'",
             cwd.display(),
             sandbox_root.display()
-        )));
-    }
-    Ok(canonical_cwd)
+        ))
+    })
 }
 
 /// Configure the environment for a spawned process.
@@ -1636,6 +1696,65 @@ mod tests {
             resolved.is_dir(),
             "validate_cwd must hand back a directory that exists: {}",
             resolved.display()
+        );
+    }
+
+    /// #1262 — a rejection has two possible causes and the daemon may only
+    /// report the one it actually established. This is the case where it
+    /// *did*: a real directory, successfully canonicalised, genuinely not
+    /// under the root.
+    #[test]
+    fn check_cwd_reports_a_resolved_escape_as_outside_the_root() {
+        let root_dir = tempfile::tempdir().unwrap();
+        let outside_dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(root_dir.path()).unwrap();
+        let outside = std::fs::canonicalize(outside_dir.path()).unwrap();
+
+        assert_eq!(
+            check_cwd(&outside, &root),
+            Err(CwdRejection::OutsideRoot),
+            "both sides resolved, so the escape is an established fact"
+        );
+    }
+
+    /// #1262 — and this is the case where it did *not*. `normalise` falls
+    /// back to the raw input when `canonicalize` fails, so an unresolvable
+    /// path is rejected by the same `is_within` comparison as a real escape.
+    /// Failing closed is correct; claiming the path was outside the root is
+    /// not, because nothing here determined where it is.
+    ///
+    /// This is the shape of #1266, where Windows Git Bash reports `%TEMP%`
+    /// through its `/tmp` mount and *every* command lands on this branch.
+    #[test]
+    fn check_cwd_reports_an_unresolvable_cwd_as_not_verifiable() {
+        let root_dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(root_dir.path()).unwrap();
+        let unresolvable = Path::new("/alms-1262-no-such-directory/nested");
+
+        assert!(
+            std::fs::canonicalize(unresolvable).is_err(),
+            "fixture precondition: the path must not resolve"
+        );
+        assert_eq!(
+            check_cwd(unresolvable, &root),
+            Err(CwdRejection::NotVerifiable),
+            "an unresolved path supports 'not confirmed inside', not 'outside'"
+        );
+    }
+
+    /// The reason reaches the operator-facing error too — the pre-command
+    /// check words its message from the same classification.
+    #[test]
+    fn validate_cwd_message_matches_the_established_cause() {
+        let root_dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(root_dir.path()).unwrap();
+        let err = validate_cwd(Path::new("/alms-1262-no-such-directory"), &root)
+            .expect_err("an unresolvable cwd must still be refused");
+
+        let message = err.to_string();
+        assert!(
+            message.contains("could not be confirmed inside"),
+            "the error must not overstate what was determined; got: {message}"
         );
     }
 

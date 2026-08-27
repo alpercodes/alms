@@ -35,7 +35,10 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::{error, warn};
-use types::{DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS, ShellInput, ShellState};
+use types::{
+    CwdRejection, CwdRevert, DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS, ShellInput, ShellOutput,
+    ShellState,
+};
 use uuid::Uuid;
 
 /// Build the per-`ShellTool` PWD marker.
@@ -50,6 +53,20 @@ use uuid::Uuid;
 /// preserves the marker so cwd recovery semantics remain consistent.
 fn new_pwd_marker() -> String {
     format!("__ALMS_PWD_{}__", Uuid::new_v4().simple())
+}
+
+/// Append a bracketed daemon marker line to captured stdout.
+///
+/// Markers are the shell tool's convention for telling the agent something
+/// the command itself could not (`[full output spilled to: ...]`,
+/// `[cwd unchanged: ...]`). They go on their own line, so a marker is never
+/// glued to the tail of a partial line of real output.
+fn append_marker_line(stdout: &str, marker: &str) -> String {
+    if stdout.is_empty() || stdout.ends_with('\n') {
+        format!("{stdout}{marker}")
+    } else {
+        format!("{stdout}\n{marker}")
+    }
 }
 
 /// The tool name used for registration. Agents call it as `"shell"`.
@@ -316,14 +333,85 @@ impl ShellTool {
             Some(path) => {
                 let workspace_root = self.sandbox_root.as_deref();
                 let rel = spill::relative_spill_path(path, workspace_root);
-                if stdout.is_empty() || stdout.ends_with('\n') {
-                    format!("{stdout}[full output spilled to: {rel}]")
-                } else {
-                    format!("{stdout}\n[full output spilled to: {rel}]")
-                }
+                append_marker_line(stdout, &format!("[full output spilled to: {rel}]"))
             }
             None => stdout.to_string(),
         }
+    }
+
+    /// Append the agent-visible `[cwd unchanged: ...]` notice to `stdout`
+    /// when a command's final working directory failed containment and the
+    /// persistent cwd was therefore kept where it was (issue #1262). Returns
+    /// the stdout unchanged when no revert happened — which is every command
+    /// in an unsandboxed run, where containment does not apply at all.
+    ///
+    /// The notice rides in the stdout body, the same channel as
+    /// `append_spill_marker`, because that is the one field every consumer
+    /// already reads: the agent (the whole result JSON is stringified into
+    /// the tool message, but stdout is where it looks for what happened) and
+    /// the web UI, whose shell renderer only surfaces `exit_code` / `stdout`
+    /// / `stderr` and drops unknown fields into the raw-JSON toggle. A new
+    /// top-level field would reach the model but would be invisible to the
+    /// human watching the run without a frontend change.
+    ///
+    /// Not stderr: a reverted `cd` is not the command's own diagnostic
+    /// output, and agents routinely treat a non-empty stderr as a failure
+    /// signal even when `exit_code` is 0.
+    fn append_cwd_revert_notice(&self, stdout: &str, revert: Option<&CwdRevert>) -> String {
+        match revert {
+            Some(revert) => {
+                // State only what the containment check actually determined.
+                // A rejection is not by itself evidence the path was outside
+                // the root: `pathnorm::normalise` falls back to its raw input
+                // when canonicalisation fails, so an unresolvable cwd is
+                // rejected on the very same branch as a real escape — and
+                // under Windows Git Bash's `/tmp` mount (#1266) that branch
+                // is *every* command. A confident but wrong explanation
+                // delivered every turn would be worse for the agent loop than
+                // none at all, which is the failure this notice exists to fix
+                // one level up.
+                let verdict = match revert.reason {
+                    CwdRejection::OutsideRoot => "is outside the sandbox root",
+                    CwdRejection::NotVerifiable => "could not be confirmed inside the sandbox root",
+                };
+                append_marker_line(
+                    stdout,
+                    &format!(
+                        "[cwd unchanged: '{}' {verdict}; \
+                         subsequent commands still run in '{}']",
+                        // `attempted` stays in the form the shell reported
+                        // it, so it matches what the agent's own `pwd`
+                        // printed. `kept` is a daemon-held path that may
+                        // still carry the `\\?\` prefix `canonicalize` adds
+                        // on Windows — strip it so the agent sees a spelling
+                        // it can actually use.
+                        revert.attempted.display(),
+                        pathnorm::strip_verbatim_prefix(&revert.kept).display()
+                    ),
+                )
+            }
+            None => stdout.to_string(),
+        }
+    }
+
+    /// Whether cwd containment applies to this instance. Mirrors the
+    /// `!unrestricted && let Some(root) = sandbox_root` guard in
+    /// `exec::execute_command` — both a root to contain against and a
+    /// non-`unrestricted` policy are required, and the description the agent
+    /// reads must agree with the rule the daemon enforces.
+    fn cwd_is_contained(&self) -> bool {
+        !self.unrestricted && self.sandbox_root.is_some()
+    }
+
+    /// Apply every agent-visible stdout decoration to a completed execution.
+    ///
+    /// Single entry point so the foreground path and `handle_check_task`
+    /// cannot drift apart on which markers a result carries — the spill
+    /// marker had to be retrofitted onto the background path once already
+    /// (issue #811).
+    fn decorate_stdout(&self, output: &ShellOutput) -> String {
+        let with_spill = self.append_spill_marker(&output.stdout, output.spill_path.as_ref());
+        self.append_cwd_revert_notice(&with_spill, output.cwd_revert.as_ref())
     }
 
     /// Handle a request to check background task status.
@@ -331,17 +419,19 @@ impl ShellTool {
         match background::check_background_task(&self.state, task_id).await {
             Some(result) => {
                 if let Some(ref output) = result.output {
-                    // Mirror the foreground spill-marker contract (issue #811):
-                    // background-task large outputs are spilled to disk too,
-                    // and the agent needs the path to recover them via fs_read.
-                    let stdout_with_marker =
-                        self.append_spill_marker(&output.stdout, output.spill_path.as_ref());
+                    // Mirror the foreground marker contract: background-task
+                    // large outputs are spilled to disk too and the agent
+                    // needs the path to recover them via fs_read (issue
+                    // #811), and a background command's `cd` is contained by
+                    // exactly the same rule as a foreground one — it runs
+                    // against the shared `ShellState` (issue #1262).
+                    let stdout_with_markers = self.decorate_stdout(output);
                     Ok(serde_json::json!({
                         "task_id": result.task_id,
                         "status": "completed",
                         "command": result.command,
                         "exit_code": output.exit_code,
-                        "stdout": stdout_with_marker,
+                        "stdout": stdout_with_markers,
                         "stderr": output.stderr,
                     }))
                 } else if let Some(ref error) = result.error {
@@ -366,6 +456,40 @@ impl ShellTool {
     }
 }
 
+/// The mode-independent body of the shell tool description.
+///
+/// A `macro_rules!` rather than a `const` so `concat!` can splice it into the
+/// sandboxed variant below at compile time. `Tool::description` returns a
+/// borrow, so both variants have to be `&'static str` — this keeps them so
+/// without the shared prose existing in two places that can drift apart.
+macro_rules! shell_description_base {
+    () => {
+        "Execute a shell command (via bash -c) and return its output. \
+         The working directory persists between calls. \
+         Supports background execution and configurable timeouts. \
+         Commands run with the daemon's filesystem access; on Linux 5.13+, \
+         Landlock restricts filesystem access to the sandbox root when enabled."
+    };
+}
+
+/// Description for an instance with no sandbox root, or one running
+/// unrestricted (`[security].allow_full_os_access`). Containment is skipped
+/// outright in that mode (`exec.rs`), so the confinement sentence below would
+/// be a lie here — the point of splitting the description in two.
+const SHELL_DESCRIPTION_UNRESTRICTED: &str = shell_description_base!();
+
+/// Description for a sandboxed instance — the shape every agent workspace
+/// gets. The cwd confinement is the one restriction the agent is guaranteed
+/// to hit, and unlike Landlock it applies on every platform, so it is stated
+/// unconditionally here rather than hedged (#1262).
+const SHELL_DESCRIPTION_SANDBOXED: &str = concat!(
+    shell_description_base!(),
+    " The working directory is confined to the sandbox root: a command that \
+      ends up outside it (e.g. `cd /etc`) leaves the persistent working \
+      directory where it was, and the result says so with a \
+      '[cwd unchanged: ...]' line."
+);
+
 #[async_trait::async_trait]
 impl Tool for ShellTool {
     fn name(&self) -> &str {
@@ -373,11 +497,16 @@ impl Tool for ShellTool {
     }
 
     fn description(&self) -> &str {
-        "Execute a shell command (via bash -c) and return its output. \
-        The working directory persists between calls. \
-        Supports background execution and configurable timeouts. \
-        Commands run with the daemon's filesystem access; on Linux 5.13+, \
-        Landlock restricts filesystem access to the sandbox root when enabled."
+        // Branch on the live fields rather than caching a string at
+        // construction time. `sandbox_root` / `unrestricted` are set once by
+        // the constructors and no builder mutates them today, but a cached
+        // copy would be one new builder away from silently lying to the
+        // agent about which mode it is in.
+        if self.cwd_is_contained() {
+            SHELL_DESCRIPTION_SANDBOXED
+        } else {
+            SHELL_DESCRIPTION_UNRESTRICTED
+        }
     }
 
     fn is_builtin(&self) -> bool {
@@ -572,17 +701,16 @@ impl Tool for ShellTool {
         )
         .await?;
 
-        // If a spill file was written, append the agent-visible marker line
-        // to stdout so the LLM sees the spill path in the normal tool result
-        // body and can `fs_read` it. See `append_spill_marker` for the path-
-        // resolution details. Background-task results go through the same
-        // helper from `handle_check_task` (issue #811).
-        let stdout_with_marker =
-            self.append_spill_marker(&output.stdout, output.spill_path.as_ref());
+        // Append the agent-visible marker lines to stdout so the LLM sees
+        // them in the normal tool result body: the spill path it can
+        // `fs_read` (issue #811) and any cwd revert it would otherwise never
+        // learn about (issue #1262). Background-task results go through the
+        // same helper from `handle_check_task`.
+        let stdout_with_markers = self.decorate_stdout(&output);
 
         Ok(serde_json::json!({
             "exit_code": output.exit_code,
-            "stdout": stdout_with_marker,
+            "stdout": stdout_with_markers,
             "stderr": output.stderr,
         }))
     }
@@ -927,6 +1055,320 @@ mod tests {
             stdout.trim(),
             root.display()
         );
+
+        // #1262: and the agent has to be *told*. Before the revert notice
+        // this test passed while the agent's only evidence was `exit_code: 0`
+        // plus a real listing of /etc.
+        let reverted_stdout = result.unwrap()["stdout"].as_str().unwrap().to_string();
+        assert!(
+            reverted_stdout.contains("[cwd unchanged:"),
+            "the reverted `cd /etc` must be surfaced to the agent; got: {reverted_stdout:?}"
+        );
+    }
+
+    /// A holder directory for tests that run a real shell and care about the
+    /// cwd it reports back.
+    ///
+    /// Deliberately **not** `tempfile::tempdir()`: Windows Git Bash reports
+    /// `%TEMP%` through its `/tmp` mount point, and `/tmp/...` is neither a
+    /// usable Windows path nor a drive path `pathnorm::msys_to_windows` can
+    /// rewrite — so a sandbox root under the system temp dir reads as
+    /// out-of-root on *every* command there (a pre-existing resolution gap,
+    /// sibling of #1261). Rooting these fixtures under the workspace
+    /// `target/` dir keeps them on a path both shells can round-trip, so the
+    /// test measures the containment rule instead of the mount table.
+    fn shell_cwd_test_dir() -> tempfile::TempDir {
+        let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("target")
+            .join("shell-cwd-tests");
+        std::fs::create_dir_all(&base).expect("create the shell-cwd test base dir");
+        tempfile::Builder::new()
+            .prefix("case-")
+            .tempdir_in(&base)
+            .expect("create a shell-cwd test dir")
+    }
+
+    /// #1262 — a reverted `cd` must reach the agent through the tool result,
+    /// not just the daemon's `warn!` log. Covers the in-root case too: a
+    /// notice on every result would be noise the agent learns to ignore.
+    #[tokio::test]
+    async fn test_shell_tool_reverted_cwd_is_visible_to_the_agent() {
+        let dir = shell_cwd_test_dir();
+        let outside = std::fs::canonicalize(dir.path()).unwrap();
+        let root = outside.join("alms-cwd-revert-root");
+        std::fs::create_dir_all(&root).unwrap();
+        let tool = ShellTool::sandboxed(root.clone());
+
+        let result = tool
+            .execute(serde_json::json!({"command": "cd .. && pwd"}))
+            .await
+            .unwrap();
+
+        // The command itself succeeds — which is exactly why `exit_code`
+        // can never be the agent's signal that the `cd` was undone.
+        assert_eq!(result["exit_code"], 0);
+
+        let stdout = result["stdout"].as_str().unwrap();
+        assert!(
+            stdout.contains("[cwd unchanged:"),
+            "the revert must be surfaced in the agent-visible stdout; got: {stdout:?}"
+        );
+        assert!(
+            stdout.contains("outside the sandbox root"),
+            "the notice must say why the cd was undone; got: {stdout:?}"
+        );
+        assert!(
+            stdout.contains("alms-cwd-revert-root"),
+            "the notice must name the cwd the next command actually runs in; got: {stdout:?}"
+        );
+
+        // ...and a command that stays inside the root is left alone. A
+        // notice on every result would be noise the agent learns to ignore.
+        let inside = tool
+            .execute(serde_json::json!({"command": "pwd"}))
+            .await
+            .unwrap();
+        let inside_stdout = inside["stdout"].as_str().unwrap();
+        assert!(
+            !inside_stdout.contains("[cwd unchanged:"),
+            "an in-root command must not carry the revert notice; got: {inside_stdout:?}"
+        );
+    }
+
+    /// #1262 — the same, end to end through the background path: submit,
+    /// poll, and read the notice out of the `check_task` result.
+    #[tokio::test]
+    async fn test_shell_tool_background_reverted_cwd_is_visible_to_the_agent() {
+        let dir = shell_cwd_test_dir();
+        let outside = std::fs::canonicalize(dir.path()).unwrap();
+        let root = outside.join("alms-bg-revert-root");
+        std::fs::create_dir_all(&root).unwrap();
+        let tool = ShellTool::sandboxed(root.clone());
+
+        let submitted = tool
+            .execute(serde_json::json!({
+                "command": "cd .. && pwd",
+                "run_in_background": true
+            }))
+            .await
+            .unwrap();
+        assert_eq!(submitted["status"], "submitted");
+        let task_id = submitted["task_id"].as_str().unwrap().to_string();
+
+        // Poll instead of sleeping a fixed interval: spawning a shell can be
+        // slow (Git Bash on Windows especially) and a timing guess would
+        // make this flaky rather than wrong.
+        let mut checked = serde_json::Value::Null;
+        for _ in 0..50 {
+            checked = tool
+                .execute(serde_json::json!({"check_task": task_id}))
+                .await
+                .unwrap();
+            if checked["status"] != "not_found_or_still_running" {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert_eq!(
+            checked["status"], "completed",
+            "background task should have completed; got: {checked}"
+        );
+
+        let stdout = checked["stdout"].as_str().unwrap();
+        assert!(
+            stdout.contains("[cwd unchanged:"),
+            "background results must carry the revert notice too; got: {stdout:?}"
+        );
+        assert!(
+            stdout.contains("alms-bg-revert-root"),
+            "the notice must name the kept cwd; got: {stdout:?}"
+        );
+    }
+
+    /// A completed execution carrying a cwd revert, with no shell involved.
+    /// `reason` is explicit at every call site because it is the one input
+    /// that changes what the notice claims (#1262).
+    fn reverted_output(stdout: &str, reason: CwdRejection) -> ShellOutput {
+        ShellOutput {
+            exit_code: 0,
+            stdout: stdout.to_string(),
+            stderr: String::new(),
+            spill_path: None,
+            cwd_revert: Some(CwdRevert {
+                attempted: PathBuf::from("/etc"),
+                kept: PathBuf::from("/work/agent-root"),
+                reason,
+            }),
+        }
+    }
+
+    /// #1262 — the foreground result body is `decorate_stdout`'s output.
+    /// The end-to-end tests above prove the notice fires; this one pins what
+    /// it *says*, without depending on a shell to produce it.
+    #[test]
+    fn test_decorate_stdout_carries_the_cwd_revert_notice() {
+        let tool = ShellTool::sandboxed(PathBuf::from("/work/agent-root"));
+        let decorated =
+            tool.decorate_stdout(&reverted_output("etc-listing\n", CwdRejection::OutsideRoot));
+
+        assert!(
+            decorated.starts_with("etc-listing\n"),
+            "the command's own output must survive intact; got: {decorated:?}"
+        );
+        assert!(
+            decorated.contains("[cwd unchanged:"),
+            "the revert must be surfaced to the agent; got: {decorated:?}"
+        );
+        assert!(
+            decorated.contains("'/etc' is outside the sandbox root"),
+            "the notice must name the directory that was refused; got: {decorated:?}"
+        );
+        assert!(
+            decorated.contains("still run in '/work/agent-root'"),
+            "the notice must name the cwd the next command runs in; got: {decorated:?}"
+        );
+    }
+
+    /// #1262 — the two rejection causes must not be conflated. `check_cwd`
+    /// fails closed on a path it could not canonicalise, which is the same
+    /// arm a genuine escape takes, so the notice may only claim "outside the
+    /// sandbox root" where the check actually established that. Under
+    /// Windows Git Bash's `/tmp` mount (#1266) the unverifiable case is
+    /// *every* command, so a wrong claim here is not a rare edge — it is a
+    /// false explanation repeated every turn, aimed at the component that
+    /// reasons about it.
+    #[test]
+    fn test_unverifiable_cwd_notice_does_not_claim_the_path_was_outside() {
+        let tool = ShellTool::sandboxed(PathBuf::from("/work/agent-root"));
+        let decorated =
+            tool.decorate_stdout(&reverted_output("listing\n", CwdRejection::NotVerifiable));
+
+        assert!(
+            decorated.contains("'/etc' could not be confirmed inside the sandbox root"),
+            "an unresolvable cwd must be reported as unconfirmed; got: {decorated:?}"
+        );
+        assert!(
+            !decorated.contains("is outside the sandbox root"),
+            "the notice must not assert a cause the check never established; \
+             got: {decorated:?}"
+        );
+        assert!(
+            decorated.contains("still run in '/work/agent-root'"),
+            "the actionable half must survive either way; got: {decorated:?}"
+        );
+    }
+
+    /// The notice goes on its own line even when the command's output does
+    /// not end in a newline — otherwise it is glued to the tail of real
+    /// output and reads as part of it.
+    #[test]
+    fn test_cwd_revert_notice_is_never_glued_to_partial_output() {
+        let tool = ShellTool::sandboxed(PathBuf::from("/work/agent-root"));
+        let decorated = tool.decorate_stdout(&reverted_output(
+            "no trailing newline",
+            CwdRejection::OutsideRoot,
+        ));
+        assert!(
+            decorated.contains("no trailing newline\n[cwd unchanged:"),
+            "expected a line break before the notice; got: {decorated:?}"
+        );
+    }
+
+    /// No revert, no decoration.
+    #[test]
+    fn test_decorate_stdout_leaves_a_clean_run_alone() {
+        let tool = ShellTool::sandboxed(PathBuf::from("/work/agent-root"));
+        let output = ShellOutput {
+            exit_code: 0,
+            stdout: "hello\n".to_string(),
+            stderr: String::new(),
+            spill_path: None,
+            cwd_revert: None,
+        };
+        assert_eq!(tool.decorate_stdout(&output), "hello\n");
+    }
+
+    /// #1262 — background results are built by `handle_check_task`, a
+    /// separate serialisation path that had to have the spill marker
+    /// retrofitted onto it once already (#811). Injecting a completed task
+    /// straight into the state exercises that JSON shape on every platform.
+    #[tokio::test]
+    async fn test_check_task_result_carries_the_cwd_revert_notice() {
+        let tool = ShellTool::sandboxed(PathBuf::from("/work/agent-root"));
+        tool.state.background_tasks.lock().await.insert(
+            "bg_1".to_string(),
+            types::BackgroundTaskResult {
+                task_id: "bg_1".to_string(),
+                command: "cd /etc && ls".to_string(),
+                output: Some(reverted_output("etc-listing\n", CwdRejection::OutsideRoot)),
+                error: None,
+            },
+        );
+
+        let result = tool
+            .execute(serde_json::json!({"check_task": "bg_1"}))
+            .await
+            .unwrap();
+
+        assert_eq!(result["status"], "completed");
+        let stdout = result["stdout"].as_str().unwrap();
+        assert!(
+            stdout.contains("[cwd unchanged:"),
+            "background results must carry the revert notice too; got: {stdout:?}"
+        );
+        assert!(
+            stdout.contains("still run in '/work/agent-root'"),
+            "the notice must name the kept cwd; got: {stdout:?}"
+        );
+    }
+
+    /// #1262 — the description an agent reads must state the one restriction
+    /// it is guaranteed to hit in sandboxed mode.
+    #[test]
+    fn test_sandboxed_description_states_cwd_confinement() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = ShellTool::sandboxed(dir.path().to_path_buf());
+        let desc = tool.description();
+        assert!(
+            desc.contains("confined to the sandbox root"),
+            "sandboxed description must state the cwd confinement; got: {desc}"
+        );
+        assert!(
+            desc.contains("[cwd unchanged: ...]"),
+            "the description must name the marker the agent will actually see; got: {desc}"
+        );
+        // The two variants share one body by construction (`concat!`), so
+        // prose added to the base can never reach only one of them.
+        assert!(
+            SHELL_DESCRIPTION_SANDBOXED.starts_with(SHELL_DESCRIPTION_UNRESTRICTED),
+            "the sandboxed description must be the base description plus the confinement sentence"
+        );
+    }
+
+    /// #1262 — and must not claim confinement where `exec.rs` skips it.
+    /// Trading the old omission for a false claim would be no better.
+    #[test]
+    fn test_unrestricted_description_makes_no_confinement_claim() {
+        let dir = tempfile::tempdir().unwrap();
+        let cases = [
+            ("no sandbox root", ShellTool::new()),
+            ("explicit no root", ShellTool::with_policy(None, true)),
+            // The `[security].allow_full_os_access` shape: a root is still
+            // configured, but `unrestricted` skips the containment check.
+            (
+                "root plus unrestricted",
+                ShellTool::with_policy(Some(dir.path().to_path_buf()), true),
+            ),
+        ];
+        for (label, tool) in cases {
+            let desc = tool.description();
+            assert!(
+                !desc.contains("confined to the sandbox root"),
+                "{label}: containment does not apply here, so the description must not claim it; got: {desc}"
+            );
+        }
     }
 
     #[tokio::test]
