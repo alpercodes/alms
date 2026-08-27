@@ -1392,69 +1392,29 @@ mod tests {
 
     // ── #947: WARN-log assertions for [security].allow_full_os_access ──
 
-    /// In-memory `MakeWriter` that captures every line emitted by the
-    /// fmt subscriber so tests can assert on log content.
+    /// Captured-log harness shared with `agents.rs`. It installs one
+    /// process-global capture subscriber and routes events through a
+    /// thread-local buffer.
     ///
-    /// Implemented as a `Mutex<Vec<u8>>` shared via `Arc` so the writer
-    /// closure (which the subscriber calls per event) and the test body
-    /// (which reads the captured lines) point at the same buffer.
-    #[derive(Clone, Default)]
-    struct CapturedLogs(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
-
-    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
-        type Writer = LogWriter;
-        fn make_writer(&'a self) -> Self::Writer {
-            LogWriter(self.0.clone())
-        }
-    }
-
-    struct LogWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
-
-    impl std::io::Write for LogWriter {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(buf);
-            Ok(buf.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    impl CapturedLogs {
-        fn captured(&self) -> String {
-            String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
-        }
-    }
+    /// Do **not** reach for `tracing::subscriber::with_default` here:
+    /// it is thread-scoped while `tracing`'s callsite-`Interest` cache
+    /// is process-global, which is the #1221 flake — a callsite first
+    /// touched by another test on a subscriber-less thread caches
+    /// `Interest::never()` and this test's capture comes back empty.
+    use crate::test_log_capture::capture_logs;
 
     /// `warn_full_os_access_at_boot` emits one structured WARN per
     /// listed agent. Acceptance check from #947: "WARN at agent-create
     /// / first-observation-at-boot".
     #[test]
     fn boot_warn_emits_for_each_listed_agent() {
-        use tracing_subscriber::fmt::format::FmtSpan;
-
-        let logs = CapturedLogs::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(logs.clone())
-            .with_max_level(tracing::Level::WARN)
-            .with_target(true)
-            .with_span_events(FmtSpan::NONE)
-            .without_time()
-            // No ANSI colour codes — keeps assertions on the captured
-            // text simple.
-            .with_ansi(false)
-            .finish();
-
         let security_config = alms_core::config::SecurityConfig {
             allow_full_os_access: vec!["alice".into(), "bob".into()],
         };
 
-        // Drive the helper under our subscriber.
-        tracing::subscriber::with_default(subscriber, || {
+        let captured = capture_logs(tracing::Level::WARN, || {
             warn_full_os_access_at_boot(&security_config);
         });
-
-        let captured = logs.captured();
 
         // The structured fields each appear in the output (the fmt
         // subscriber renders them as `field_name=value`).
@@ -1486,21 +1446,11 @@ mod tests {
     /// Empty `allow_full_os_access` is a complete no-op: no WARN at boot.
     #[test]
     fn boot_warn_silent_when_list_is_empty() {
-        let logs = CapturedLogs::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(logs.clone())
-            .with_max_level(tracing::Level::WARN)
-            .with_target(true)
-            .without_time()
-            .with_ansi(false)
-            .finish();
-
         let security_config = alms_core::config::SecurityConfig::default();
-        tracing::subscriber::with_default(subscriber, || {
+        let captured = capture_logs(tracing::Level::WARN, || {
             warn_full_os_access_at_boot(&security_config);
         });
 
-        let captured = logs.captured();
         assert!(
             !captured.contains("alms.security"),
             "no WARN must fire when the list is empty: {captured}"

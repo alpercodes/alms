@@ -1476,58 +1476,14 @@ mod tests {
 
     // ── #1025: AlreadyAbsent arm must WARN-log delete_branch failures ──
 
-    /// In-memory captured-log harness mirrored from the existing
-    /// `alms-gateway::agents::tests::CapturedLogs` setup used by the
-    /// #1029 compensation tests. Writes every `tracing` event the
-    /// scoped subscriber receives into an `Arc<Mutex<Vec<u8>>>` so
-    /// the test body can grep for structured fields after the
-    /// `with_default` scope closes.
-    ///
-    /// Scoped to a single `with_default(...)` block per test invocation
-    /// so parallel `cargo test` jobs don't race on a shared global
-    /// subscriber. (`with_default` is known to flake under heavy
-    /// parallelism — see #1033 — but the harness is good enough for
-    /// a single-call assertion like this one.)
-    #[derive(Clone, Default)]
-    struct CapturedLogs(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
-
-    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
-        type Writer = LogWriter;
-        fn make_writer(&'a self) -> Self::Writer {
-            LogWriter(self.0.clone())
-        }
-    }
-
-    struct LogWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
-
-    impl std::io::Write for LogWriter {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(buf);
-            Ok(buf.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    impl CapturedLogs {
-        fn captured(&self) -> String {
-            String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
-        }
-    }
-
-    fn capture_logs<F: FnOnce()>(level: tracing::Level, f: F) -> String {
-        let logs = CapturedLogs::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(logs.clone())
-            .with_max_level(level)
-            .with_target(true)
-            .without_time()
-            .with_ansi(false)
-            .finish();
-        tracing::subscriber::with_default(subscriber, f);
-        logs.captured()
-    }
+    /// Captured-log harness. Previously a per-test
+    /// `tracing::subscriber::with_default` scope, which is thread-scoped
+    /// while `tracing`'s callsite-`Interest` cache is process-global —
+    /// so a callsite first touched by another test on a subscriber-less
+    /// thread cached `Interest::never()` and this test's capture came
+    /// back empty. That is #1221 (and the flakiness the old comment here
+    /// noted as "#1033"); `test_log_capture` is immune to it.
+    use crate::test_log_capture::capture_logs;
 
     /// #1025 regression guard: `remove_worktree` on a missing worktree
     /// directory still tries `git branch -D alms/<name>` as best-effort

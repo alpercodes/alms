@@ -8,6 +8,10 @@ pub mod registry;
 pub mod run;
 pub mod secrets;
 pub mod source_label;
+/// Interest-cache-safe `tracing` capture harness for this crate's
+/// log-asserting unit tests — see the module docs and #1221.
+#[cfg(test)]
+pub(crate) mod test_log_capture;
 pub mod worktree;
 
 pub use channel::{Channel, ChannelConfig, IncomingMessage, OutgoingMessage};

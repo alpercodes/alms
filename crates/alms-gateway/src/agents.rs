@@ -2809,56 +2809,16 @@ mod tests {
     // ── #964: PATCH /agents worktree side-effect must compensate on
     //          SQLite persist failure ────────────────────────────────
 
-    /// Captured-log harness mirrors the existing #947 boot-WARN tests
-    /// in `gateway.rs`. We need it here so the compensation tests can
-    /// assert on the structured `alms.worktree` events the helper
-    /// emits — `tracing::subscriber::with_default` is the documented
-    /// way to scope a custom subscriber to a single test invocation
-    /// without racing parallel tests.
-    #[derive(Clone, Default)]
-    struct CapturedLogs(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
-
-    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
-        type Writer = LogWriter;
-        fn make_writer(&'a self) -> Self::Writer {
-            LogWriter(self.0.clone())
-        }
-    }
-
-    struct LogWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
-
-    impl std::io::Write for LogWriter {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(buf);
-            Ok(buf.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    impl CapturedLogs {
-        fn captured(&self) -> String {
-            String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
-        }
-    }
-
-    /// Run `f` under a fmt subscriber that captures every event at
-    /// the given level or higher into an in-memory buffer. Returns
-    /// the captured stdout. `with_target(true)` is required so
-    /// assertions can match on `alms.worktree`.
-    fn capture_logs<F: FnOnce()>(level: tracing::Level, f: F) -> String {
-        let logs = CapturedLogs::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(logs.clone())
-            .with_max_level(level)
-            .with_target(true)
-            .without_time()
-            .with_ansi(false)
-            .finish();
-        tracing::subscriber::with_default(subscriber, f);
-        logs.captured()
-    }
+    /// Captured-log harness, shared with the #947 boot-WARN tests in
+    /// `gateway.rs`. The compensation tests below assert on the
+    /// structured `alms.worktree` events the helper emits.
+    ///
+    /// Do **not** reach for `tracing::subscriber::with_default` here:
+    /// it is thread-scoped while `tracing`'s callsite-`Interest` cache
+    /// is process-global, which is the #1221 flake — a callsite first
+    /// touched by another test on a subscriber-less thread caches
+    /// `Interest::never()` and this test's capture comes back empty.
+    use crate::test_log_capture::capture_logs;
 
     /// Initialize a fresh git repo with one commit at `dir`. Mirrors
     /// the helper inside `worktree::tests` — duplicated here so the
