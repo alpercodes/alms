@@ -5,8 +5,16 @@
 # the single source of truth for the ignore set -- local runs and CI cannot
 # silently disagree (issue #1248).
 #
-# Note: `audit-check` fails the job on *warnings* as well as vulnerabilities,
-# so an informational `unmaintained` advisory is enough to turn the gate red.
+# Note: an informational `unmaintained` advisory alone has been enough to turn
+# the CI gate red -- but not, as previously recorded here, because `audit-check`
+# treats warnings as failures. It does not: its verdict is "fail only on
+# non-informational vulnerabilities". What happened is that *any* finding makes
+# the action try to publish its advisory table as a check run, that POST was
+# rejected with "Resource not accessible by integration" for lack of
+# `checks: write`, and on push events the action rethrows the permission error
+# instead of falling back to stdout -- so the job died before reaching its own
+# verdict. The `permissions:` block on the `audit-rust` job in
+# `.github/workflows/ci.yml` addresses that (issue #1252).
 #
 # Every entry here must carry a date, a rationale, and an exit condition.
 

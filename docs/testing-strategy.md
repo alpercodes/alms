@@ -160,18 +160,32 @@ Golden tests:
 
 ## 8) CI pipeline
 
-GitHub CI runs three parallel jobs:
+GitHub CI runs four parallel jobs:
 
-1. **Frontend:** install the pinned Node/npm toolchain with `npm ci`, run the
-   high-severity dependency audit, typecheck, lint, format-check, run Vitest,
-   reproduce the committed Vite bundle, and run the Chromium Playwright suite.
+1. **Frontend:** install the pinned Node/npm toolchain with `npm ci`, typecheck,
+   lint, format-check, run Vitest, reproduce the committed Vite bundle, and run
+   the Chromium Playwright suite.
 2. **Rust:** `cargo fmt --all -- --check`, Clippy for all targets/features with
    warnings denied, `cargo test --all`, and `cargo build --release`.
-3. **Security audit:** check `Cargo.lock` against the RustSec advisory database.
+3. **Security audit (Rust):** check `Cargo.lock` against the RustSec advisory
+   database.
+4. **Security audit (frontend):** check `package-lock.json` against the npm
+   advisory database.
+
+The two audit jobs are deliberately separate from the jobs they used to sit
+inside (issue #1252). They answer a different question -- "has the outside world
+changed its mind about a dependency we already ship", not "did this change break
+something" -- and mixing the two meant a newly published advisory could skip
+every real frontend check while reporting a single red cross that read like a
+frontend break. A red audit job is triaged, not treated as a defect in whatever
+change happened to run next; a red **Frontend** or **CI** job blocks. The full
+policy is written down as a comment block next to the jobs in
+`.github/workflows/ci.yml`.
 
 `make ci` reproduces the frontend type/lint/format/unit/build checks plus the
-Rust job. The dependency audit and Playwright suite remain explicit GitHub
-frontend-job gates; Playwright is available locally through
+Rust job. The dependency audits and Playwright suite remain explicit GitHub
+gates; the frontend audit is reproducible locally with `npm run ui:audit` and
+the Rust one with `cargo audit`, and Playwright is available through
 `make frontend-test-e2e`.
 
 ---
@@ -190,4 +204,4 @@ persistence bypass.
 
 ---
 
-*Authored by Mesut (2026-02-10); CI and coverage status updated 2026-08-01.*
+*Authored by Mesut (2026-02-10); CI and coverage status updated 2026-08-24.*

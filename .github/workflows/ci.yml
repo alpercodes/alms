@@ -30,9 +30,6 @@ jobs:
     - name: Install frontend dependencies
       run: npm ci
 
-    - name: Audit frontend dependencies
-      run: npm run ui:audit
-
     - name: Typecheck, lint, format, and unit test
       run: npm run ui:check
 
@@ -80,15 +77,60 @@ jobs:
     - name: Build release
       run: cargo build --release
 
-  # Dependency vulnerability audit against the RustSec advisory DB.
+  # ---------------------------------------------------------------------------
+  # Dependency advisory audits (issue #1252)
+  #
+  # These jobs answer a different question from `CI` and `Frontend`: not "did
+  # this change break something" but "has the outside world changed its mind
+  # about a dependency we already ship". They are separate jobs so that a red
+  # cross is attributable to one question or the other.
+  #
+  # Policy:
+  #   * A red `CI` or `Frontend` means this change broke something. That blocks.
+  #   * A red `Security audit (...)` means an advisory landed. It is triaged --
+  #     assessed, then fixed or filed -- not treated as a defect in whatever PR
+  #     happened to run next. It does not hold up unrelated work, and nobody is
+  #     required to clear someone else's advisory to land their own change.
+  #
+  # Why separate jobs and not just a reordered step: `npm audit` used to be the
+  # first check step of `Frontend`, under `bash -e`. When it tripped, typecheck,
+  # lint, format, Vitest, the bundle-reproducibility check and Playwright were
+  # all skipped, and the job showed one red cross that read as "the frontend is
+  # broken" when it meant "we did not check the frontend at all". That happened
+  # twice in two days (#1243 undici, #1249 nanoid). `cargo audit` had been its
+  # own job since #1144, so this only brings the frontend into line.
+  #
+  # `--omit=dev` is rejected as a fix. Both incidents were dev-only transitives,
+  # so it would have suppressed exactly the signals worth keeping. The defect
+  # was step ordering, not audit scope.
+  # ---------------------------------------------------------------------------
+
+  # Rust: Cargo.lock against the RustSec advisory DB.
   # Added with PR #1144 (review S2): the brush shell engine (#1143) pulls
   # ~80 new transitive packages, a meaningful audit surface for a
-  # security-sensitive component. Audits Cargo.lock only — no build, so
-  # it runs as a cheap parallel job. A fuller cargo-deny setup (licenses,
-  # bans, sources) is deliberately deferred to a separate infra issue.
-  audit:
-    name: Security audit
+  # security-sensitive component. Audits Cargo.lock only -- no build, and no
+  # Node toolchain -- so it stays a cheap parallel job. A fuller cargo-deny
+  # setup (licenses, bans, sources) is deliberately deferred to a separate
+  # infra issue. The ignore set lives in `.cargo/audit.toml` so that local
+  # `cargo audit` runs and CI cannot silently disagree (#1248).
+  audit-rust:
+    name: Security audit (Rust)
     runs-on: ubuntu-latest
+    # `rustsec/audit-check` publishes its advisory table as a check run, and it
+    # attempts that POST whenever there is anything at all to report --
+    # informational warnings included. Without `checks: write` the POST returns
+    # "Resource not accessible by integration"; on push events (where
+    # GITHUB_HEAD_REF is unset) the action rethrows instead of falling back to
+    # stdout, so the job failed on *any* finding before its actual verdict
+    # ("fail only on non-informational vulnerabilities") was ever reached. That,
+    # not a deliberate fail-on-warning rule, is what kept this job red on an
+    # unmaintained advisory alone -- see the note in `.cargo/audit.toml`.
+    #
+    # A job-level `permissions:` block replaces the defaults wholesale, so
+    # `contents: read` has to be restated for actions/checkout.
+    permissions:
+      contents: read
+      checks: write
     steps:
     - uses: actions/checkout@v4
 
@@ -96,3 +138,33 @@ jobs:
       uses: rustsec/audit-check@v2
       with:
         token: ${{ secrets.GITHUB_TOKEN }}
+
+  # Frontend: package-lock.json against the npm advisory DB. Mirrors the Rust
+  # job above, but needs the pinned Node/npm toolchain: `npm audit` resolves the
+  # lockfile with the local npm, and an unpinned npm has already produced a
+  # lockfile that failed CI (#1248). `.node-version` plus the `packageManager`
+  # and `engines` pins in `package.json` are what keep CI and local runs in
+  # agreement.
+  #
+  # The severity threshold lives in the `ui:audit` script in `package.json`, not
+  # here, so that local `npm run ui:audit` and CI use one definition.
+  audit-frontend:
+    name: Security audit (frontend)
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install pinned Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version-file: .node-version
+        cache: npm
+
+    - name: Install pinned npm
+      run: npm install --global npm@11.18.0
+
+    - name: Install frontend dependencies
+      run: npm ci
+
+    - name: Audit frontend dependencies
+      run: npm run ui:audit
