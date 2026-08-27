@@ -258,11 +258,16 @@ export function RunBoundary({ status, error }) {
     `;
 }
 
-export function DmEndedMessage({ peer, reason }) {
+// `detail` (#1258) is the failure text of an errored end. Interrupted DM ends
+// no longer start a notification run that would explain itself in prose, so
+// this banner is the only place the operator can read why the conversation
+// stopped. Omitted for every other end, where the banner stays as it was.
+export function DmEndedMessage({ peer, reason, detail }) {
     return html`
         <div class="dm-ended-banner">
             <span class="dm-ended-label">DM conversation with ${peer} ended</span>
             <span class="dm-ended-reason">${reason}</span>
+            ${detail && html`<span class="dm-ended-detail">${detail}</span>`}
         </div>
     `;
 }

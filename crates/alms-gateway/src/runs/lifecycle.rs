@@ -1062,7 +1062,7 @@ const PEER_ERROR_MESSAGE_MAX_LEN: usize = 300;
 /// already collapses to a short fixed label, so the truncation step is
 /// effectively a no-op — but it remains a safety net in case the
 /// sanitiser's contract widens in the future.
-fn truncate_error_for_peer(err: &AlmsError) -> String {
+pub(super) fn truncate_error_for_peer(err: &AlmsError) -> String {
     let s = sanitize_error_for_session(err);
     if s.len() <= PEER_ERROR_MESSAGE_MAX_LEN {
         return s;
@@ -1075,6 +1075,32 @@ fn truncate_error_for_peer(err: &AlmsError) -> String {
     let mut truncated = s[..end].to_string();
     truncated.push_str("...");
     truncated
+}
+
+/// Compose a peer-facing failure message from a self-authored `prefix` and a
+/// foreign `error` string.
+///
+/// Some `Errored` ends describe *what* failed in our own words and only
+/// interpolate a foreign error as the tail ("reply delivery failed: {e}",
+/// "Run panic could not be persisted: {e}"). Those tails are the leak vector
+/// — a `SendError::Internal` wraps storage errors that can carry database
+/// paths — so only the tail goes through [`truncate_error_for_peer`].
+///
+/// The prefix is deliberately kept outside the sanitiser: it is our text, it
+/// is secret-free, and it carries the useful "what failed" half. Routing the
+/// whole composed string through `sanitize_error_for_session` instead would
+/// match none of its keywords and collapse the lot to the bare label
+/// `"Runtime error"`.
+///
+/// #1258 made this matter on two new surfaces: the peer-facing message is now
+/// rendered in the browser's DM-ended banner (`detail`) and persisted as the
+/// `dm_ended_notification` marker's own text, not just fed to a notification
+/// run's LLM context.
+pub(super) fn peer_error_with_prefix(prefix: &str, error: &str) -> String {
+    format!(
+        "{prefix}{}",
+        truncate_error_for_peer(&AlmsError::Runtime(error.to_string()))
+    )
 }
 
 /// Resolve cancellation/completion persistence provenance from the
@@ -2813,9 +2839,14 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
                     run_id,
                     completion_persistence_error,
                 );
-                let conversation_reason = completion_peer_error
-                    .map_or(ConversationEndReason::UserCancelled, |message| {
-                        ConversationEndReason::Errored { message }
+                // #1258: `interrupted: true` either way — see the `Cancelled`
+                // arm below.
+                let conversation_reason =
+                    completion_peer_error.map_or(ConversationEndReason::UserCancelled, |message| {
+                        ConversationEndReason::Errored {
+                            message,
+                            interrupted: true,
+                        }
                     });
                 if let Err(e) = super::dm_lifecycle::handle_dm_run_failure(
                     &state,
@@ -2926,9 +2957,15 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
                 run_id,
                 cancellation_persistence_error,
             );
-            let conversation_reason = cancellation_peer_error
-                .map_or(ConversationEndReason::UserCancelled, |message| {
-                    ConversationEndReason::Errored { message }
+            // #1258: `interrupted: true` either way — the run was cancelled,
+            // so no turn of this DM completed; the `Errored` upgrade only
+            // swaps in the teardown-persistence failure as the reason text.
+            let conversation_reason =
+                cancellation_peer_error.map_or(ConversationEndReason::UserCancelled, |message| {
+                    ConversationEndReason::Errored {
+                        message,
+                        interrupted: true,
+                    }
                 });
             if let Err(e) = super::dm_lifecycle::handle_dm_run_failure(
                 &state,
@@ -3013,9 +3050,15 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
                 run_id,
                 cancellation_persistence_error,
             );
-            let conversation_reason = cancellation_peer_error
-                .map_or(ConversationEndReason::UserCancelled, |message| {
-                    ConversationEndReason::Errored { message }
+            // #1258: `interrupted: true` either way — the run was cancelled,
+            // so no turn of this DM completed; the `Errored` upgrade only
+            // swaps in the teardown-persistence failure as the reason text.
+            let conversation_reason =
+                cancellation_peer_error.map_or(ConversationEndReason::UserCancelled, |message| {
+                    ConversationEndReason::Errored {
+                        message,
+                        interrupted: true,
+                    }
                 });
             if let Err(e) = super::dm_lifecycle::handle_dm_run_failure(
                 &state,
@@ -3120,9 +3163,15 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
 
             // Best-effort: notify the DM peer that the conversation ended
             // due to a runtime error. The truncated `source` string is
-            // surfaced in the peer's `dm_ended` notification so the peer
-            // (and human user watching the DM) sees a useful reason instead
-            // of a stale "in-flight" indicator until the 1800s sweep.
+            // surfaced in the DM-ended notification so the human user sees a
+            // useful reason instead of a stale "in-flight" indicator until
+            // the 1800s sweep.
+            //
+            // #1258: for this arm the peer AGENT no longer sees it — a died
+            // run is an interrupted end, which starts no notification run,
+            // and the `dm_ended_notification` marker is synthetic and
+            // stripped from LLM context. The human still gets it, on the
+            // DM-ended banner's `detail` line and in the persisted marker.
             //
             // NOT gated on `failed_transitioned` — `handle_dm_run_failure`
             // is an independent side effect per #1050's design (see the
@@ -3135,10 +3184,13 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
                 agent_name.as_deref(),
                 &context_id,
                 is_peer_message,
+                // #1258: `interrupted: true` — the run died mid-turn, so
+                // whatever this DM turn was going to produce does not exist.
                 ConversationEndReason::Errored {
                     message: truncate_error_for_peer(&alms_core::AlmsError::Runtime(
                         failure_message.clone(),
                     )),
+                    interrupted: true,
                 },
             )
             .await
@@ -3234,10 +3286,13 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
                 agent_name.as_deref(),
                 &context_id,
                 is_peer_message,
+                // #1258: `interrupted: true` — the run died mid-turn, so
+                // whatever this DM turn was going to produce does not exist.
                 ConversationEndReason::Errored {
                     message: truncate_error_for_peer(&alms_core::AlmsError::Runtime(
                         failure_message.clone(),
                     )),
+                    interrupted: true,
                 },
             )
             .await
@@ -3366,14 +3421,27 @@ where
     const PANIC_REASON: &str = "Run panicked during execution";
     error!(run_id = %run_id.0, %session_id, "{PANIC_REASON}");
 
-    let (transitioned, failure_message, persistence_failed) = match state
+    // `failure_message` is the operator-facing text (run record + `run_error`
+    // SSE on the run's own session, where the raw storage error is the useful
+    // thing and the operator owns the run). `peer_failure_message` is the same
+    // fact with the storage error sanitised (#911 / #930 / #931): since #1258
+    // the DM-peer copy is rendered in the browser's DM-ended banner and
+    // persisted as the marker's own text, so a raw storage error — which can
+    // carry a database path — must not ride along.
+    let (transitioned, failure_message, peer_failure_message, persistence_failed) = match state
         .run_manager
         .try_mark_run_as_failed(run_id, PANIC_REASON.to_string())
     {
-        Ok(transitioned) => (transitioned, PANIC_REASON.to_string(), false),
+        Ok(transitioned) => (
+            transitioned,
+            PANIC_REASON.to_string(),
+            PANIC_REASON.to_string(),
+            false,
+        ),
         Err(error) => (
             false,
             format!("Run panic could not be persisted: {error}"),
+            peer_error_with_prefix("Run panic could not be persisted: ", &error.to_string()),
             true,
         ),
     };
@@ -3395,8 +3463,11 @@ where
             None,
             &context_id,
             is_peer_message,
+            // #1258: `interrupted: true` — a panic is the strongest form of
+            // "the turn never finished".
             ConversationEndReason::Errored {
-                message: failure_message,
+                message: peer_failure_message,
+                interrupted: true,
             },
         )
         .await
@@ -3541,6 +3612,41 @@ mod tests {
         let err = AlmsError::Cancelled;
         let out = truncate_error_for_peer(&err);
         assert_eq!(out, "Run cancelled by user");
+    }
+
+    /// #1258 / Tim's S3: the two `Errored` sites that interpolate a foreign
+    /// error into self-authored text must sanitise the TAIL only. Since #1258
+    /// that string is rendered in the browser's DM-ended banner and persisted
+    /// as the marker's own text, so a storage error's database path cannot be
+    /// allowed to ride along.
+    #[test]
+    fn peer_error_with_prefix_sanitises_the_tail_only() {
+        let out = peer_error_with_prefix(
+            "reply delivery failed: ",
+            "Delivery failed: sqlite error at C:\\dev\\alms\\.alms\\alms.db: disk I/O error",
+        );
+        assert!(
+            out.starts_with("reply delivery failed: "),
+            "the self-authored prefix says WHAT failed and must survive; got {out:?}"
+        );
+        assert!(
+            !out.contains("alms.db") && !out.contains("C:\\"),
+            "the foreign tail must be collapsed by the sanitiser, not passed \
+             through; got {out:?}"
+        );
+    }
+
+    /// The prefix must stay OUTSIDE the sanitiser. Routing the composed
+    /// string through `sanitize_error_for_session` instead matches none of
+    /// its keywords and collapses the lot to `"Runtime error"`, which is
+    /// strictly less useful than what the peer had before.
+    #[test]
+    fn peer_error_with_prefix_does_not_collapse_the_whole_message() {
+        let out = peer_error_with_prefix("Run panic could not be persisted: ", "429 rate limited");
+        assert_eq!(
+            out,
+            "Run panic could not be persisted: LLM rate limit exceeded"
+        );
     }
 
     /// Regression test for #931: a `Runtime` error whose Display string

@@ -290,7 +290,12 @@ export function DmConversationView() {
                 if (m.type === 'notification') {
                     const md = m.metadata || {};
                     if (md.type === 'dm_ended_notification') {
-                        const text = `DM with ${md.peer || 'unknown'} ended -- ${DM_END_REASON_LABELS[md.reason] || md.reason || 'ended'}`;
+                        const reason = DM_END_REASON_LABELS[md.reason] || md.reason || 'ended';
+                        // #1258: an errored end carries its failure text here
+                        // because no notification run explains it any more.
+                        const text = md.detail
+                            ? `DM with ${md.peer || 'unknown'} ended -- ${reason}: ${md.detail}`
+                            : `DM with ${md.peer || 'unknown'} ended -- ${reason}`;
                         return html`<${DmDivider} key=${m.id} text=${text} />`;
                     }
                     return html`<${DmDivider} key=${m.id} text=${m.text} />`;

@@ -133,8 +133,14 @@ pub(super) async fn handle_dm_run_completion(ctx: DmRunCompletionContext<'_>) ->
         ctx.agent_name,
         ctx.context_id,
         ctx.is_peer_message,
+        // #1258: `interrupted: false` — the run *completed*, it just had
+        // nothing deliverable on its LAST turn. Earlier turns of this DM may
+        // have been delivered and exist only in the DM session, so the
+        // notification run (and the #429 transcript it carries) is still the
+        // only thing that brings them to the operator's chat.
         ConversationEndReason::Errored {
             message: "agent run completed without producing a reply".to_string(),
+            interrupted: false,
         },
     )
     .await
@@ -302,8 +308,22 @@ async fn deliver_implicit_reply(ctx: &DmRunCompletionContext<'_>, reply: &str) -
                 ctx.agent_name,
                 ctx.context_id,
                 ctx.is_peer_message,
+                // #1258: `interrupted: false` — same shape as Exit 3. The run
+                // completed and produced a reply; only the last delivery hop
+                // failed, so the exchange up to that point is real and still
+                // needs relaying.
+                //
+                // The `SendError` tail is sanitised (#911 / #930 / #931): its
+                // `Internal` variant wraps storage errors that can carry
+                // paths, and since #1258 this string reaches the browser (the
+                // `dm_conversation_ended` `detail` field) and the persisted
+                // marker text, not just the peer's run input.
                 ConversationEndReason::Errored {
-                    message: format!("reply delivery failed: {e}"),
+                    message: super::lifecycle::peer_error_with_prefix(
+                        "reply delivery failed: ",
+                        &e.to_string(),
+                    ),
+                    interrupted: false,
                 },
             )
             .await
@@ -397,8 +417,11 @@ pub(super) async fn notify_dm_peer_of_setup_failure(
         agent_name,
         context_id,
         is_peer_message,
+        // #1258: `interrupted: true` — the run never started its loop, so no
+        // turn of this DM ever completed on this side.
         ConversationEndReason::Errored {
             message: error_message,
+            interrupted: true,
         },
     )
     .await;

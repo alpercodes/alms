@@ -555,3 +555,12 @@ html[data-theme='light'] .msg-warning-code {
   white-space: nowrap;
   font-style: italic;
 }
+/* #1258: failure text of an errored end. Unlike the label and the reason it
+   may be a long provider message, so it wraps and is allowed to shrink
+   instead of stretching the divider. */
+.dm-ended-detail {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  font-style: italic;
+  opacity: 0.85;
+}

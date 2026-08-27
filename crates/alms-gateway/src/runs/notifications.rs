@@ -791,12 +791,33 @@ async fn notify_job_completion(
 ///   a pure recipient (run on the invisible `notifications:` session), an
 ///   internal `job_*` source, a DIFFERENT user-facing chat than the target,
 ///   or an episode-rerouted run on a job session — in all of them `target` is
-///   not among the run targets, so the marker persists (#1218 P2).
+///   not among the run targets, so the marker persists (#1218 P2). Since #1258
+///   an *interrupted* end (cancel, or a run that died mid-turn) produces no run
+///   on the trigger's own target. The only run targets it can still have are
+///   #1198 job-episode continuations, and `runs/mod.rs` classifies `job_*`
+///   sessions as internal, so they can never be the `find_user_facing_session`
+///   target — for an interrupted end the marker is therefore always the
+///   delivery.
+///
+/// `detail` is the failure text of an `errored` end. It rides on both surfaces
+/// (SSE field + marker metadata) because an interrupted end no longer spends an
+/// LLM turn explaining itself — the banner is where the operator learns *why*
+/// (#1258).
+///
+/// Known gap (#1258): an agent with no user-facing session at all — a purely
+/// background or channel-driven one — gets `None` from
+/// `find_user_facing_session` and this function early-returns. Pre-#1258 an
+/// interrupted end at least landed a run on `notifications:{agent}`, so the
+/// end was in that agent's history; now it is recorded only as the bus's
+/// (reader-invisible) `dm_ended` row on the DM session. A fallback that
+/// persists the marker on the trigger's own target when no user-facing
+/// session exists would close it.
 pub(super) async fn notify_dm_ended_to_webchat(
     state: &AppState,
     agent_id: alms_core::AgentId,
     peer_name: &str,
     reason: &str,
+    detail: Option<&str>,
     context_id: &str,
     run_target_session_ids: &[SessionId],
 ) {
@@ -848,27 +869,53 @@ pub(super) async fn notify_dm_ended_to_webchat(
                 reason,
                 context_id,
                 !persist_marker,
+                detail,
             ),
         )
         .await;
 
     // Persist the reloadable marker (same condition as the banner suppression).
     if persist_marker {
+        // Mirrors the frontend's `DM_END_REASON_LABELS` so the persisted text
+        // and the rendered banner agree. `user_cancelled` / `errored` used to
+        // fall through raw here because those ends always came with a run that
+        // explained them in prose; since #1258 they do not, so the marker is
+        // the explanation and must read like one.
         let reason_text = match reason {
-            "ignored" => "no further replies".to_string(),
-            "depth_exceeded" => "message limit reached".to_string(),
-            other => other.to_string(),
+            "ignored" => "no further replies",
+            "depth_exceeded" => "message limit reached",
+            "user_cancelled" => "cancelled by user",
+            "errored" => "run failed",
+            other => other,
+        };
+        let content = match detail {
+            Some(detail) => format!(
+                "[DM conversation ended] Conversation with {peer_name} ended \
+                 ({reason_text}: {detail})."
+            ),
+            None => format!(
+                "[DM conversation ended] Conversation with {peer_name} ended ({reason_text})."
+            ),
         };
         super::markers::persist_lifecycle_marker(
             &state.session_manager,
             target_session_id,
             "dm_ended_notification",
-            format!("[DM conversation ended] Conversation with {peer_name} ended ({reason_text})."),
-            serde_json::json!({
-                "peer": peer_name,
-                "reason": reason,
-                "context_id": context_id,
-            }),
+            content,
+            {
+                let mut meta = serde_json::json!({
+                    "peer": peer_name,
+                    "reason": reason,
+                    "context_id": context_id,
+                });
+                // Reload mirror of the SSE `detail` field. Absent (not null)
+                // for every non-`errored` end, so pre-#1258 markers keep the
+                // exact same shape.
+                if let Some(detail) = detail {
+                    meta["detail"] = serde_json::json!(detail);
+                }
+                meta
+            },
         );
     }
 
@@ -1535,7 +1582,7 @@ pub(super) fn format_dm_ended_notification(
             ConversationEndReason::UserCancelled => {
                 "Your DM conversation was cancelled by the user.".to_string()
             }
-            ConversationEndReason::Errored { message } => {
+            ConversationEndReason::Errored { message, .. } => {
                 format!(
                     "Your DM conversation with agent \"{from_name}\" ended \
                      because the run failed: {message}"
@@ -1556,7 +1603,7 @@ pub(super) fn format_dm_ended_notification(
             ConversationEndReason::UserCancelled => {
                 "The DM conversation was cancelled by the user.".to_string()
             }
-            ConversationEndReason::Errored { message } => {
+            ConversationEndReason::Errored { message, .. } => {
                 format!(
                     "The conversation with agent \"{from_name}\" ended because \
                      the run failed: {message}"
@@ -1680,6 +1727,82 @@ pub(super) fn format_dm_conversation_history(messages: &[alms_session::Message])
 /// session, not to the notification session.  We format a richer
 /// notification here and pass `is_peer = false` so `execute_run` uses
 /// `runtime.run()`, which persists the input to the notification session.
+///
+/// # Interrupted ends get no run (#1258)
+///
+/// A `ConversationEnded` whose reason
+/// [`is_interrupted`](alms_tools::message_sender::ConversationEndReason::is_interrupted)
+/// — the DM run was cancelled, or it died mid-turn — creates **no**
+/// notification run. It is delivered as the persisted
+/// `dm_ended_notification` marker plus its live banner instead, both of which
+/// `notify_dm_ended_to_webchat` already produces for every routing where the
+/// run lands elsewhere.
+///
+/// The bug this fixes: a DM run dying on an upstream 429 put a fresh,
+/// unrequested run on the operator's web-chat 470ms after they cancelled a run
+/// on that same session — indistinguishable from the cancel having been
+/// ignored. The turn bought nothing: the run that was going to produce this
+/// DM's outcome never finished, so all the notification could say was "the DM
+/// stopped", which the marker states directly and for free.
+///
+/// # Why the cut is "was the turn cut short", not "is the transcript empty"
+///
+/// What makes a notification run load-bearing is transcript content that never
+/// reached the operator's web-chat: in the #556 flow the peer's replies live
+/// only in the `dm:` session, and the notification run is what relays them
+/// (the #429 history embedding). So the tempting predicate is "does the DM
+/// have a transcript" — and it does not work:
+///
+/// - `MessageBus::end_conversation` refuses to run at all unless the DM
+///   session exists, and the session only exists because a `send_message`
+///   persisted a message into it. The initiating message alone makes the
+///   history non-empty, so "transcript is empty" is essentially never true.
+/// - In the #1258 incident itself the DM held the peer's opening message —
+///   the ended run was the *recipient's*. A transcript predicate would not
+///   have suppressed the reported run.
+///
+/// The predicate that actually separates the cases is whether a **run reached
+/// the end of its turn**, which is what `is_interrupted` encodes:
+///
+/// - `ignored` / `depth_exceeded` — a run completed and the DM ran its
+///   course. Keeps its run.
+/// - `errored { interrupted: false }` — a run completed but its result was
+///   unusable (`dm_lifecycle` Exit 3's "no deliverable reply", or a failed
+///   final delivery hop). Earlier turns may have been delivered and exist
+///   only in the DM session, so this keeps its run too. Without this edge the
+///   fix would silently drop the very transcripts it was designed to protect.
+/// - `errored { interrupted: true }` — the run died (LLM failure, panic,
+///   setup failure, teardown persistence failure). No run.
+/// - `user_cancelled` — unconditional, regardless of transcript: the operator
+///   asked for work on this session to stop, and starting a turn is the one
+///   thing they said not to do. The transcript is not destroyed — it stays in
+///   the DM session and the DM conversation view still renders it.
+///
+/// The one exception is a #1198 job-episode continuation: those runs exist to
+/// resume the *job*, not to narrate the DM, so an interrupted end that resolves
+/// an open episode still fires them (otherwise the job stalls until its
+/// deadline).
+///
+/// # Consequence: an interrupted end is invisible to the agent
+///
+/// Recorded because it is invisible from the diff. After an interrupted end
+/// there is no agent-visible signal anywhere:
+///
+/// - the `dm_ended_notification` marker is `Role::System` + `synthetic`, so
+///   `strip_mid_history_system_markers` removes it before the provider (and
+///   the `notification_input` user message that `markers.rs` documents as the
+///   agent's copy is exactly the thing this suppression skips);
+/// - the bus's `dm_ended` record is empty-text, so `dm_filter`'s
+///   `is_synthetic_marker` hides it from `read_messages` / `read_session`.
+///
+/// So the bus state is consistent — depth reset, tombstone written, neither
+/// side can keep sending — but ask the agent "what did the peer say?" and it
+/// does not know the conversation ended. The operator is told; the agent is
+/// not. That is the accepted trade for #1258: the operator is the one who
+/// cancelled, is watching, and can open the DM view. If the agent ever needs
+/// telling without spending a turn, the machinery is `persist_error_marker`
+/// (#874), which survives the strip pass and is rewritten into an `[Error] …`
+/// user message on the next turn.
 pub(crate) async fn run_trigger_loop(
     mut rx: mpsc::Receiver<alms_coordinator::message_bus::RunTrigger>,
     state: AppState,
@@ -1692,11 +1815,23 @@ pub(crate) async fn run_trigger_loop(
         let context_id = trigger.context_id;
 
         // #1218 P2 (#3): the ConversationEnded arm stashes what the web-chat
-        // DM-ended forward needs — `(from_name, reason_str, dm_context)` — and
-        // the forward itself is deferred until AFTER the final run routing
-        // (`run_targets`) is known, so the marker persists unless the run
-        // itself lands on the marker target (see the forward below the match).
-        let mut dm_ended_webchat: Option<(String, String, String)> = None;
+        // DM-ended forward needs — `(from_name, reason_str, detail,
+        // dm_context)` — and the forward itself is deferred until AFTER the
+        // final run routing (`run_targets`) is known, so the marker persists
+        // unless the run itself lands on the marker target (see the forward
+        // below the match).
+        let mut dm_ended_webchat: Option<(String, String, Option<String>, String)> = None;
+
+        // #1258: was this end *interrupted* (a run cut short) rather than a
+        // run that completed? Such an end has no outcome to relay, so it must
+        // not put an unrequested run on the operator's session — the persisted
+        // marker below is the delivery. Computed from the source directly
+        // rather than assigned inside the match arm, so a future arm cannot
+        // silently inherit the `false` default.
+        let end_was_interrupted = matches!(
+            &trigger.source,
+            MessageSource::ConversationEnded { reason, .. } if reason.is_interrupted()
+        );
 
         // Build a source label for SSE `run_created` events and determine
         // whether this is a peer DM run (which needs the DM addendum) or
@@ -1799,7 +1934,12 @@ pub(crate) async fn run_trigger_loop(
                         .as_ref()
                         .map(|peer_name| alms_core::dm_context_id(from_name, peer_name))
                         .unwrap_or_default();
-                    dm_ended_webchat = Some((from_name.clone(), reason_str, dm_context));
+                    dm_ended_webchat = Some((
+                        from_name.clone(),
+                        reason_str,
+                        reason.detail().map(str::to_string),
+                        dm_context,
+                    ));
                 }
 
                 // -- Fetch DM conversation history (#429) --
@@ -1884,9 +2024,16 @@ pub(crate) async fn run_trigger_loop(
         // their continuation (each on its own job session, stamped with its
         // own job id). The trigger's original target receives a run only
         // when no episode resolved.
-        let run_targets: Vec<(SessionId, String, Option<JobId>)> = if episode_routes.is_empty() {
-            vec![(session_id, context_id.clone(), None)]
-        } else {
+        //
+        // #1258: an INTERRUPTED end (operator cancel, or a run that died
+        // mid-turn) yields NO trigger-target run. An end whose run *completed*
+        // — including `errored` with an unusable result — still gets one, so
+        // its transcript reaches the operator's chat. The episode override
+        // still wins over the suppression — a job continuation resumes the
+        // job, not the DM, and dropping it would stall the job until its
+        // deadline — so the suppression applies only to the trigger's own
+        // target, exactly where the operator sits.
+        let run_targets: Vec<(SessionId, String, Option<JobId>)> = if !episode_routes.is_empty() {
             episode_routes
                 .into_iter()
                 .map(|route| {
@@ -1900,6 +2047,18 @@ pub(crate) async fn run_trigger_loop(
                     (route.job_session_id, route.context_id, Some(route.job_id))
                 })
                 .collect()
+        } else if end_was_interrupted {
+            info!(
+                session_id = %session_id.0,
+                agent_id = %agent_id.0,
+                source = %source_label,
+                "DM end was interrupted (cancelled, or the run died mid-turn) \
+                 — delivering the notification as a marker, starting no run \
+                 (#1258)"
+            );
+            Vec::new()
+        } else {
+            vec![(session_id, context_id.clone(), None)]
         };
 
         // #1218 P2 (#3): forward the DM-ended signal to the agent's web-chat
@@ -1912,7 +2071,7 @@ pub(crate) async fn run_trigger_loop(
         // notification in that same chat. When #1205 episode routing reroutes
         // the run to a job session, the web-chat is not a run target, so the
         // marker persists.
-        if let Some((from_name, reason_str, dm_context)) = dm_ended_webchat {
+        if let Some((from_name, reason_str, detail, dm_context)) = dm_ended_webchat {
             let run_target_ids: Vec<SessionId> =
                 run_targets.iter().map(|(sid, _, _)| *sid).collect();
             notify_dm_ended_to_webchat(
@@ -1920,6 +2079,7 @@ pub(crate) async fn run_trigger_loop(
                 agent_id,
                 &from_name,
                 &reason_str,
+                detail.as_deref(),
                 &dm_context,
                 &run_target_ids,
             )

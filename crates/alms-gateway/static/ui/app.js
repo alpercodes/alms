@@ -257,14 +257,14 @@ function ChatView() {
                         return html`<${SystemMessage} key=${m.id} text=${m.text} />`;
                     }
                     if (m.type === 'dm_ended') {
-                        return html`<${DmEndedMessage} key=${m.id} peer=${m.peer} reason=${m.reason} />`;
+                        return html`<${DmEndedMessage} key=${m.id} peer=${m.peer} reason=${m.reason} detail=${m.detail} />`;
                     }
                     if (m.type === 'notification') {
                         // Synthetic system markers restored from session history.
                         // Route to the correct visual component based on metadata.type.
                         const md = m.metadata || {};
                         if (md.type === 'dm_ended_notification') {
-                            return html`<${DmEndedMessage} key=${m.id} peer=${md.peer || 'unknown'} reason=${DM_END_REASON_LABELS[md.reason] || md.reason || 'conversation ended'} />`;
+                            return html`<${DmEndedMessage} key=${m.id} peer=${md.peer || 'unknown'} reason=${DM_END_REASON_LABELS[md.reason] || md.reason || 'conversation ended'} detail=${md.detail} />`;
                         }
                         // Other synthetic markers: render as system message
                         return html`<${SystemMessage} key=${m.id} text=${m.text} />`;

@@ -1686,6 +1686,356 @@ async fn dm_conversation_ended_trigger_creates_notification_and_marker() {
     shutdown_token.cancel();
 }
 
+// ---------------------------------------------------------------------------
+// #1258 — an interrupted DM end is delivered as a marker, not as a run
+// ---------------------------------------------------------------------------
+
+/// What the operator's session ended up with after ONE `ConversationEnded`
+/// trigger was driven through `run_trigger_loop`.
+struct DmEndDelivery {
+    /// Runs created on the operator's web-chat session.
+    runs: Vec<Run>,
+    /// Persisted `dm_ended_notification` markers on that session.
+    markers: Vec<alms_session::Message>,
+    /// `dm_conversation_ended` SSE frames delivered to that session.
+    events: Vec<SseEventData>,
+}
+
+/// Drive one `ConversationEnded` trigger whose target IS the agent's
+/// user-facing web-chat — the shape of the #1258 incident, where the
+/// notification landed on the very session the operator had just cancelled a
+/// run on (`source_session_id = Some(web-chat)`, the #556 initiator-ends
+/// routing).
+///
+/// Every arm of the delivery is captured, so a caller asserting "no run" is
+/// also forced to say what the operator DOES get instead — the assertion
+/// cannot pass by the trigger having been silently dropped.
+async fn drive_dm_end_on_operator_session(reason: ConversationEndReason) -> DmEndDelivery {
+    let (state, shutdown_token, _cr, _tr, _dr) = test_app_state();
+
+    let agent_id = AgentId::new();
+    let peer_agent_id = AgentId::new();
+
+    // The operator's web-chat: both the trigger's target and the answer
+    // `find_user_facing_session` gives the marker forward.
+    let web_session = state.session_manager.get_or_create(agent_id, "web");
+    let web_session_id = web_session.id;
+    let mut web_rx = subscribe_session(&state, web_session_id);
+
+    let (test_tx, test_rx) = mpsc::channel(8);
+    test_tx
+        .send(RunTrigger {
+            agent_id,
+            session_id: web_session_id,
+            input: "DM ended".to_string(),
+            source: MessageSource::ConversationEnded {
+                from_agent: peer_agent_id,
+                from_name: "scout".to_string(),
+                reason,
+                self_notification: true,
+                source_session_id: Some(web_session_id),
+            },
+            context_id: web_session.context_id.clone(),
+        })
+        .await
+        .unwrap();
+    drop(test_tx);
+
+    super::notifications::run_trigger_loop(test_rx, state.clone()).await;
+
+    let runs = state.run_manager.list_by_session(web_session_id, 10);
+    let markers: Vec<alms_session::Message> = state
+        .session_manager
+        .get_history(web_session_id)
+        .expect("web-chat session must exist")
+        .into_iter()
+        .filter(|m| {
+            m.metadata.as_ref().is_some_and(|meta| {
+                meta.get("type").and_then(|v| v.as_str()) == Some("dm_ended_notification")
+            })
+        })
+        .collect();
+    let events: Vec<SseEventData> = drain_events(&mut web_rx)
+        .into_iter()
+        .filter(|e| e.event_type == "dm_conversation_ended")
+        .collect();
+
+    shutdown_token.cancel();
+
+    DmEndDelivery {
+        runs,
+        markers,
+        events,
+    }
+}
+
+/// #1258, the reported incident: a DM run dies on an upstream 429, and 470ms
+/// after the operator cancelled a run on their web-chat the DM-ended
+/// notification puts a NEW run on that same session — work they did not ask
+/// for, about a conversation they were not watching, indistinguishable from
+/// the cancel having been ignored.
+///
+/// The run that was going to produce this DM's outcome died mid-turn, so it
+/// must cost no further turn: the operator learns about it from the persisted
+/// banner marker instead, which also has to carry the failure text now that no
+/// prose turn explains it.
+#[tokio::test]
+async fn errored_dm_end_delivers_marker_and_starts_no_run() {
+    let delivered = drive_dm_end_on_operator_session(ConversationEndReason::Errored {
+        message: "LLM rate limit exceeded".to_string(),
+        interrupted: true,
+    })
+    .await;
+
+    assert!(
+        delivered.runs.is_empty(),
+        "an errored DM end whose run died must not start a run on the \
+         operator's session; got {:?}",
+        delivered.runs
+    );
+
+    assert_eq!(
+        delivered.markers.len(),
+        1,
+        "the operator must still learn the DM ended — exactly one reloadable \
+         marker; got {:?}",
+        delivered.markers
+    );
+    let meta = delivered.markers[0]
+        .metadata
+        .as_ref()
+        .expect("marker carries metadata");
+    assert_eq!(meta.get("reason").and_then(|v| v.as_str()), Some("errored"));
+    assert_eq!(
+        meta.get("detail").and_then(|v| v.as_str()),
+        Some("LLM rate limit exceeded"),
+        "the marker must carry the failure text — with no run to narrate it, \
+         this is the only place the operator can read WHY"
+    );
+    let alms_session::Content::Text(ref content) = delivered.markers[0].content else {
+        panic!("marker content must be text");
+    };
+    assert!(
+        content.contains("run failed") && content.contains("LLM rate limit exceeded"),
+        "marker text must read as an explanation, not a raw reason code; got {content:?}"
+    );
+
+    let ended = delivered
+        .events
+        .first()
+        .expect("the phase-clear SSE is unconditional");
+    assert_ne!(
+        ended.data.get("suppress_banner").and_then(|v| v.as_bool()),
+        Some(true),
+        "with no run standing in for it, the live banner must render"
+    );
+    assert_eq!(
+        ended.data.get("detail").and_then(|v| v.as_str()),
+        Some("LLM rate limit exceeded"),
+        "the live banner must carry the same failure text as the marker"
+    );
+}
+
+/// #1258, the other half of "interrupted": the operator cancelled. A cancel is
+/// the strongest possible *stop doing things here* signal, so the end that
+/// follows it must not reappear as a fresh run on the same session.
+#[tokio::test]
+async fn user_cancelled_dm_end_delivers_marker_and_starts_no_run() {
+    let delivered = drive_dm_end_on_operator_session(ConversationEndReason::UserCancelled).await;
+
+    assert!(
+        delivered.runs.is_empty(),
+        "a user-cancelled DM end must not start a run on the operator's \
+         session; got {:?}",
+        delivered.runs
+    );
+    assert_eq!(
+        delivered.markers.len(),
+        1,
+        "the cancel must still be recorded for reload; got {:?}",
+        delivered.markers
+    );
+    let meta = delivered.markers[0]
+        .metadata
+        .as_ref()
+        .expect("marker carries metadata");
+    assert_eq!(
+        meta.get("reason").and_then(|v| v.as_str()),
+        Some("user_cancelled")
+    );
+    assert!(
+        meta.get("detail").is_none(),
+        "a cancel carries no failure text — `detail` must stay off non-errored \
+         markers so their shape is unchanged"
+    );
+    let alms_session::Content::Text(ref content) = delivered.markers[0].content else {
+        panic!("marker content must be text");
+    };
+    assert!(
+        content.contains("cancelled by user"),
+        "marker text must read as an explanation, not a raw reason code; got {content:?}"
+    );
+    assert!(
+        !delivered.events.is_empty(),
+        "the phase-clear SSE is unconditional — otherwise the web-chat is \
+         stuck showing 'Chatting with scout'"
+    );
+}
+
+/// The control for the two tests above, on byte-identical wiring: a
+/// *concluded* end still gets its notification run. Only the reason differs,
+/// so "no run was created" above cannot be an artefact of the harness — this
+/// same setup does create one.
+///
+/// It also pins the thing the #1258 suppression must not break: a DM that ran
+/// its course carries a transcript the agent has to relay (the #429 history
+/// embedding), and that relaying is the run.
+#[tokio::test]
+async fn concluded_dm_end_still_starts_its_notification_run() {
+    let delivered = drive_dm_end_on_operator_session(ConversationEndReason::Ignored).await;
+
+    assert_eq!(
+        delivered.runs.len(),
+        1,
+        "a concluded DM end must still relay its outcome as a run; got {:?}",
+        delivered.runs
+    );
+    assert!(
+        delivered.markers.is_empty(),
+        "the run IS the visible notification here, so the marker stays \
+         suppressed (#1215 'initiator gets both'); got {:?}",
+        delivered.markers
+    );
+    let ended = delivered
+        .events
+        .first()
+        .expect("the phase-clear SSE is unconditional");
+    assert_eq!(
+        ended.data.get("suppress_banner").and_then(|v| v.as_bool()),
+        Some(true),
+        "the run is the notification, so the live banner is suppressed"
+    );
+}
+
+/// #1258 / Tim's review of PR #1267 — the edge that keeps the suppression
+/// from becoming the very bug it was written to avoid.
+///
+/// `Errored` covers two materially different things. `dm_lifecycle`'s Exit 3
+/// (#1154, "agent run completed without producing a reply") and its
+/// delivery-failure sibling both describe a run that **completed** — it just
+/// had nothing usable on its LAST turn, possibly after several delivered
+/// ones. Those earlier turns exist only in the `dm:` session; the
+/// notification run and its #429 transcript are what carry them to the
+/// operator's chat.
+///
+/// So this end must keep its run even though the reason string is `errored`.
+/// Suppressing it would trade a spurious spinner for a silently dropped
+/// answer — which is exactly why blanket "no run for a DM-ended
+/// notification" was rejected in the first place.
+///
+/// Same harness as the two suppression tests above and as the concluded
+/// control: only `interrupted` differs.
+#[tokio::test]
+async fn errored_dm_end_from_a_completed_run_still_starts_its_notification_run() {
+    let delivered = drive_dm_end_on_operator_session(ConversationEndReason::Errored {
+        message: "agent run completed without producing a reply".to_string(),
+        interrupted: false,
+    })
+    .await;
+
+    assert_eq!(
+        delivered.runs.len(),
+        1,
+        "an `errored` end whose run COMPLETED still has a transcript to \
+         relay, so it must keep its notification run; got {:?}",
+        delivered.runs
+    );
+    assert!(
+        delivered.markers.is_empty(),
+        "the run IS the visible notification here, so the marker stays \
+         suppressed (#1215 'initiator gets both'); got {:?}",
+        delivered.markers
+    );
+    let ended = delivered
+        .events
+        .first()
+        .expect("the phase-clear SSE is unconditional");
+    assert_eq!(
+        ended.data.get("reason").and_then(|v| v.as_str()),
+        Some("errored"),
+        "the `interrupted` split is a routing input, not a wire change — both \
+         `Errored` shapes stay `errored` on the SSE"
+    );
+    assert_eq!(
+        ended.data.get("suppress_banner").and_then(|v| v.as_bool()),
+        Some(true),
+        "the run is the notification, so the live banner is suppressed"
+    );
+}
+
+/// #1258 / Tim's review of PR #1267 — why the suppression keys on "was the
+/// turn cut short", not on "is the transcript empty".
+///
+/// The tempting predicate is the transcript: a notification run is
+/// load-bearing precisely when it carries DM content the operator's web-chat
+/// has never seen. It does not work as a predicate, because a DM that is
+/// eligible to end always has content. `MessageBus::end_conversation`
+/// refuses to run unless the DM session exists, and the session exists only
+/// because a `send_message` persisted a message into it — so the initiating
+/// message alone makes the history non-empty.
+///
+/// That is not a corner case, it is the reported incident: the ended run was
+/// the *recipient's*, so the peer's opening message was already in the
+/// transcript. A transcript-gated suppression would have let #1258's run
+/// through.
+#[tokio::test]
+async fn an_interrupted_dm_end_still_has_a_transcript() {
+    let (state, shutdown_token, _cr, mut trigger_rx, _dr) = test_app_state_with_sqlite();
+    let (alice_id, bob_id) = seed_alice_bob(&state);
+
+    // Alice opens the DM. This is the ONLY message in it — the shape of the
+    // #1258 incident at the moment bob's run died.
+    let receipt = state
+        .message_bus
+        .send("alice", alice_id, "bob", bob_id, "please review X", None)
+        .await
+        .expect("send must succeed");
+    let _ = trigger_rx.try_recv(); // drain bob's DM-delivery trigger
+
+    // Bob's DM run dies on an upstream 429 before he says anything.
+    state
+        .message_bus
+        .end_conversation(
+            "bob",
+            bob_id,
+            "alice",
+            alice_id,
+            ConversationEndReason::Errored {
+                message: "LLM rate limit exceeded".to_string(),
+                interrupted: true,
+            },
+        )
+        .await
+        .expect("end must succeed");
+
+    let messages = state
+        .session_manager
+        .get_history(receipt.session_id)
+        .expect("DM session must exist");
+    let transcript = super::notifications::format_dm_conversation_history(&messages);
+    assert!(
+        !transcript.is_empty(),
+        "an interrupted DM still has a transcript, so `conversation_history` \
+         cannot be the suppression predicate; got {transcript:?}"
+    );
+    assert!(
+        transcript.contains("please review X"),
+        "the initiating message is what makes it non-empty; got {transcript:?}"
+    );
+
+    shutdown_token.cancel();
+}
+
 /// #1215: when a `ConversationEnded` trigger carries a `source_session_id`
 /// (the agent initiated/ended from a user-facing session), the notification
 /// RUN is routed to that source session and is itself the visible
@@ -4784,6 +5134,7 @@ async fn handle_dm_run_failure_errored_resets_depth_and_emits_sse() {
         true,
         ConversationEndReason::Errored {
             message: "LLM provider error".to_string(),
+            interrupted: true,
         },
     )
     .await;
@@ -4825,8 +5176,17 @@ async fn handle_dm_run_failure_errored_resets_depth_and_emits_sse() {
         } => {
             assert_eq!(from_name, "bob", "from_name must be the failed run's agent");
             match reason {
-                ConversationEndReason::Errored { message } => {
+                ConversationEndReason::Errored {
+                    message,
+                    interrupted,
+                } => {
                     assert_eq!(message, "LLM provider error");
+                    assert!(
+                        interrupted,
+                        "the caller's `interrupted` classification must reach \
+                         the trigger unchanged — it is what decides whether \
+                         the peer's end costs a turn (#1258)"
+                    );
                 }
                 other => panic!("expected Errored reason, got {other:?}"),
             }
@@ -4972,6 +5332,7 @@ async fn handle_dm_run_failure_double_end_is_idempotent() {
         true,
         ConversationEndReason::Errored {
             message: "first".into(),
+            interrupted: true,
         },
     )
     .await
@@ -4989,6 +5350,7 @@ async fn handle_dm_run_failure_double_end_is_idempotent() {
         true,
         ConversationEndReason::Errored {
             message: "second".into(),
+            interrupted: true,
         },
     )
     .await
@@ -11172,11 +11534,17 @@ async fn dm_completion_gate_failed_send_no_longer_silently_completes() {
         matches!(
             trigger.source,
             MessageSource::ConversationEnded {
-                reason: ConversationEndReason::Errored { .. },
+                reason: ConversationEndReason::Errored {
+                    interrupted: false,
+                    ..
+                },
                 ..
             }
         ),
-        "trigger must carry the Errored reason; got {:?}",
+        "trigger must carry the Errored reason, classified as NOT interrupted \
+         — this run COMPLETED, it just had nothing deliverable on its last \
+         turn, so its transcript still has to reach the operator's chat \
+         (#1258); got {:?}",
         trigger.source
     );
 
@@ -11577,9 +11945,16 @@ async fn dm_setup_failure_notifies_peer_without_agent_name() {
         } => {
             assert_eq!(from_name, "bob", "helper must resolve the agent name by ID");
             assert!(
-                matches!(reason, ConversationEndReason::Errored { message }
-                    if message.contains("failed to resolve agent config")),
-                "reason must carry the setup-failure message; got {reason:?}"
+                matches!(
+                    reason,
+                    ConversationEndReason::Errored {
+                        message,
+                        interrupted: true,
+                    } if message.contains("failed to resolve agent config")
+                ),
+                "reason must carry the setup-failure message, classified as an \
+                 interrupted end — the run never started its loop, so no turn \
+                 of this DM completed (#1258); got {reason:?}"
             );
         }
         other => panic!("expected ConversationEnded source, got {other:?}"),
@@ -12417,6 +12792,84 @@ async fn conversation_ended_routes_continuation_onto_job_session() {
     shutdown_token.cancel();
 }
 
+/// #1258 exception: the "interrupted ends get no run" rule is scoped to the
+/// trigger's OWN target — the session the operator sits on. A #1198 job
+/// episode awaiting the DM still gets its continuation run even when the DM
+/// died on a failure, because that run resumes the JOB rather than narrating
+/// the DM; dropping it would hang the episode until the 4h deadline sweep.
+#[tokio::test]
+async fn interrupted_dm_end_still_fires_its_job_episode_continuation() {
+    let (state, shutdown_token, _cr, _tr, _dr) = test_app_state_with_sqlite();
+    let (alice_id, bob_id) = seed_alice_bob(&state);
+
+    let job_id = create_recurring_job(&state, alice_id, "ask bob");
+    let job_context = format!("job_{}", job_id.0);
+    let job_session_id = state
+        .session_manager
+        .get_or_create(alice_id, &job_context)
+        .id;
+    let turn1 = RunId::new();
+    state
+        .job_episodes
+        .open(job_id, job_session_id, alice_id, turn1);
+    let dm_session_id = SessionId::deterministic_dm("alice", "bob");
+    assert!(matches!(
+        state
+            .job_episodes
+            .on_run_complete(job_id, turn1, vec![dm_session_id], vec![]),
+        super::job_episode::RunCompletion::Open
+    ));
+
+    let notif_session = state
+        .session_manager
+        .get_or_create(alice_id, "notifications:alice");
+
+    let (test_tx, test_rx) = mpsc::channel(8);
+    test_tx
+        .send(RunTrigger {
+            agent_id: alice_id,
+            session_id: notif_session.id,
+            input: "DM ended marker".to_string(),
+            source: MessageSource::ConversationEnded {
+                from_agent: bob_id,
+                from_name: "bob".to_string(),
+                reason: ConversationEndReason::Errored {
+                    message: "LLM rate limit exceeded".to_string(),
+                    interrupted: true,
+                },
+                self_notification: false,
+                source_session_id: None,
+            },
+            context_id: notif_session.context_id.clone(),
+        })
+        .await
+        .unwrap();
+    drop(test_tx);
+    super::notifications::run_trigger_loop(test_rx, state.clone()).await;
+
+    let runs = state.run_manager.list_by_session(job_session_id, 10);
+    assert_eq!(
+        runs.len(),
+        1,
+        "the job's continuation must survive an interrupted DM end; got {runs:?}"
+    );
+    assert_eq!(
+        runs[0].job_id,
+        Some(job_id),
+        "continuation run must carry the episode's job_id"
+    );
+    assert!(
+        state
+            .run_manager
+            .list_by_session(notif_session.id, 10)
+            .is_empty(),
+        "the trigger's own target still gets nothing — the episode override \
+         reroutes, it does not duplicate"
+    );
+
+    shutdown_token.cancel();
+}
+
 /// #1205 (Tim's S2 on PR #1202): TWO open episodes of the same agent both
 /// pending the same deterministic DM session — one `ConversationEnded`
 /// trigger must produce a continuation run for BOTH episodes (each on its
@@ -12976,8 +13429,16 @@ async fn cancel_job_teardown_ends_pending_dms() {
 /// so pre-fix they were unstamped orphans that each burned an LLM turn
 /// post-kill. Post-fix they are suppressed at the source: after the
 /// teardown-emitted signals are processed, NO live/queued run exists for
-/// the job. The peer's own ended-notification (not on a job session) must
-/// still be created.
+/// the job.
+///
+/// The suppression must stay SCOPED to the cancelled job's context: with the
+/// operator-cancel intent registered, a trigger targeting a non-job context is
+/// still allowed to create its run. That is asserted at the end of this test
+/// on a *concluded* end, which is the only end class that still buys a turn
+/// since #1258. (Pre-#1258 the peer's `UserCancelled` ended-notification
+/// carried the scoping guard; it is an interrupted end now and spends
+/// nothing, so it can no longer distinguish "scoped correctly" from
+/// "suppressed by #1258".)
 #[tokio::test]
 async fn cancel_job_teardown_leaves_no_runs_for_the_job() {
     let (state, shutdown_token, _cr, mut trigger_rx, _dr) = test_app_state_with_sqlite();
@@ -13093,14 +13554,80 @@ async fn cancel_job_teardown_leaves_no_runs_for_the_job() {
          signals; got {job_runs:?}"
     );
 
-    // Scoping guard: the PEER's ended-notification (not on a job session)
-    // must still be created — the suppression may not eat legitimate
-    // notifications.
+    // #1258: teardown ends the DM with `UserCancelled` — an INTERRUPTED end,
+    // which no longer buys an LLM turn anywhere. The peer therefore gets no
+    // notification run either; `DELETE /jobs` spends nothing.
+    //
+    // (Pre-#1258 this asserted the opposite, as a scoping guard that the #1206
+    // job-session suppression had not eaten a legitimate notification. The
+    // guard is preserved below in the form that still holds: suppressing the
+    // RUN must not suppress the RECORD of the end. The positive
+    // "notifications: runs are still created" case now lives on a concluded
+    // end — see `notification_stays_on_invisible_session_when_no_source`.)
     let bob_notif_session = SessionId::deterministic("notifications:bob");
     let bob_runs = state.run_manager.list_by_session(bob_notif_session, 10);
     assert!(
-        !bob_runs.is_empty(),
-        "the peer's DM-ended notification run must still be created"
+        bob_runs.is_empty(),
+        "an operator-cancelled DM end must not spend a turn on the peer's \
+         notification session; got {bob_runs:?}"
+    );
+
+    // ...but the end is still RECORDED: the shared DM session carries the
+    // `dm_ended` marker, so neither agent believes the conversation is open
+    // and a reader of that session sees why it stopped.
+    let dm_messages = state
+        .session_manager
+        .get_history(dm_session_id)
+        .expect("DM session must exist");
+    assert!(
+        dm_messages.iter().any(|m| {
+            m.metadata
+                .as_ref()
+                .and_then(|meta| meta.get("message_type"))
+                .and_then(|v| v.as_str())
+                == Some("dm_ended")
+        }),
+        "teardown must still write the dm_ended marker; got {dm_messages:?}"
+    );
+
+    // #1206 scoping guard (Tim's S4 on PR #1267). The assertions above are all
+    // about runs NOT being created, so on their own they cannot tell a
+    // correctly scoped suppression apart from one that has widened to "any
+    // trigger while an operator-cancelled job exists". Drive one more trigger
+    // through the SAME state — `operator_cancelled_jobs` still holds this job
+    // — targeting a NON-job context, and require that it does create its run.
+    //
+    // It has to be a CONCLUDED end: since #1258 an interrupted one buys no
+    // turn regardless of scoping, which is exactly why the peer's
+    // `UserCancelled` notification above stopped being able to carry this
+    // guard.
+    let (scope_tx, scope_rx) = mpsc::channel(1);
+    scope_tx
+        .send(RunTrigger {
+            agent_id: bob_id,
+            session_id: bob_notif_session,
+            input: "DM ended".to_string(),
+            source: MessageSource::ConversationEnded {
+                from_agent: alice_id,
+                from_name: "alice".to_string(),
+                reason: ConversationEndReason::Ignored,
+                self_notification: false,
+                source_session_id: None,
+            },
+            context_id: "notifications:bob".to_string(),
+        })
+        .await
+        .unwrap();
+    drop(scope_tx);
+    super::notifications::run_trigger_loop(scope_rx, state.clone()).await;
+
+    let bob_runs_after = state.run_manager.list_by_session(bob_notif_session, 10);
+    assert!(
+        !bob_runs_after.is_empty(),
+        "the #1206 job-session suppression must stay scoped to the cancelled \
+         job's own context — a concluded DM end on notifications:bob must \
+         still create its run while that job is registered as \
+         operator-cancelled; got {bob_runs_after:?}"
     );
 
     shutdown_token.cancel();

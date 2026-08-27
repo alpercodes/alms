@@ -439,6 +439,44 @@ test('#1154 B10: a genuinely different conversation (different peer) still rende
 });
 
 // ---------------------------------------------------------------------------
+// #1258: an interrupted DM end starts no notification run, so the banner is
+// the only live surface that can say WHY the conversation stopped. The
+// backend sends that text as `detail`; the handler must carry it onto the
+// banner entry, and must not invent one when the end has no failure text.
+// ---------------------------------------------------------------------------
+
+test('#1258: an errored end carries its failure text onto the banner', () => {
+    reset();
+    T.activeSession.value = { session_type: 'dm' };
+    const es = openStream('sess-1');
+
+    es.emit('dm_conversation_ended', {
+        peer: 'scout',
+        reason: 'errored',
+        context_id: 'dm:bimbam:scout',
+        detail: 'LLM rate limit exceeded',
+    });
+
+    const banners = T.chatMessages.value.filter(m => m.type === 'dm_ended');
+    assert.equal(banners.length, 1);
+    assert.equal(banners[0].detail, 'LLM rate limit exceeded',
+        'without a notification run to narrate it, the banner is where the operator reads why');
+});
+
+test('#1258: an end with no failure text leaves detail unset', () => {
+    reset();
+    T.activeSession.value = { session_type: 'dm' };
+    const es = openStream('sess-1');
+
+    es.emit('dm_conversation_ended', { peer: 'scout', reason: 'ignored', context_id: 'dm:bimbam:scout' });
+
+    const banners = T.chatMessages.value.filter(m => m.type === 'dm_ended');
+    assert.equal(banners.length, 1);
+    assert.equal(banners[0].detail, null,
+        'a concluded end has no failure text — the banner must stay as it was');
+});
+
+// ---------------------------------------------------------------------------
 // #1215/#1218: suppress_banner decouples the live banner from the phase-clear.
 // The web-chat forward sets it when the DM-end notification RUN is itself the
 // visible notification in that chat; the frontend must then clear the phase

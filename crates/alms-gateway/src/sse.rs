@@ -686,6 +686,7 @@ impl SseEventData {
                 context_id: context_id.to_string(),
                 ts: Utc::now(),
                 suppress_banner: false,
+                detail: None,
             },
         )
     }
@@ -701,6 +702,12 @@ impl SseEventData {
     /// "initiator gets both" (#1215) while keeping the phase-clear
     /// unconditional (#1218 C1). DM-session emitters must NOT use this — they
     /// always render the banner — hence the separate constructor.
+    ///
+    /// `detail` (#1258) carries the failure text of an `errored` end. It is the
+    /// live mirror of the persisted marker's `detail` metadata: once an
+    /// interrupted DM-end no longer spends an LLM turn explaining itself, the
+    /// banner is the only place the operator can learn *why* the conversation
+    /// stopped.
     pub fn dm_conversation_ended_webchat(
         session_id: alms_core::SessionId,
         ended_by: &str,
@@ -708,6 +715,7 @@ impl SseEventData {
         reason: &str,
         context_id: &str,
         suppress_banner: bool,
+        detail: Option<&str>,
     ) -> Self {
         Self::new(
             "dm_conversation_ended",
@@ -719,6 +727,7 @@ impl SseEventData {
                 context_id: context_id.to_string(),
                 ts: Utc::now(),
                 suppress_banner,
+                detail: detail.map(str::to_string),
             },
         )
     }
@@ -1274,6 +1283,12 @@ struct DmConversationEndedData {
     /// for every DM-session emission, which must still render the banner.
     #[serde(default, skip_serializing_if = "is_false")]
     suppress_banner: bool,
+    /// #1258: the failure text behind an `errored` end (already bounded at
+    /// 300 chars by `PEER_ERROR_MESSAGE_MAX_LEN`). Set only by the web-chat
+    /// forward, and only for `errored`; omitted everywhere else so every
+    /// pre-#1258 emission stays byte-identical on the wire.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    detail: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1945,6 +1960,7 @@ mod tests {
             "ignored",
             "dm:alice:bob",
             true,
+            None,
         );
         assert_eq!(suppressed.event_type, "dm_conversation_ended");
         assert_eq!(suppressed.data["suppress_banner"], true);
@@ -1957,10 +1973,57 @@ mod tests {
             "ignored",
             "dm:alice:bob",
             false,
+            None,
         );
         assert!(
             not_suppressed.data.get("suppress_banner").is_none(),
             "suppress_banner=false must be omitted from the wire"
+        );
+    }
+
+    /// #1258: an interrupted DM-end spends no LLM turn, so the banner is the
+    /// only live surface that can carry the failure text. It must reach the
+    /// wire when present — and stay off it otherwise, so every DM-session
+    /// emission and every non-`errored` forward is byte-identical to pre-#1258.
+    #[test]
+    fn test_dm_conversation_ended_detail_field() {
+        let session_id = alms_core::SessionId::new();
+
+        let with_detail = SseEventData::dm_conversation_ended_webchat(
+            session_id,
+            "system",
+            "scout",
+            "errored",
+            "dm:bimbam:scout",
+            false,
+            Some("LLM rate limit exceeded"),
+        );
+        assert_eq!(with_detail.data["detail"], "LLM rate limit exceeded");
+
+        let without_detail = SseEventData::dm_conversation_ended_webchat(
+            session_id,
+            "system",
+            "scout",
+            "ignored",
+            "dm:bimbam:scout",
+            false,
+            None,
+        );
+        assert!(
+            without_detail.data.get("detail").is_none(),
+            "detail must be omitted from the wire when the end carries no failure text"
+        );
+
+        let dm_session_emission = SseEventData::dm_conversation_ended(
+            session_id,
+            "bimbam",
+            "scout",
+            "errored",
+            "dm:bimbam:scout",
+        );
+        assert!(
+            dm_session_emission.data.get("detail").is_none(),
+            "DM-session emissions must stay byte-identical to pre-#1258"
         );
     }
 

@@ -407,6 +407,10 @@ const sseSchemaEntries = [
         context_id: z.string(),
         ts: timestampSchema,
         suppress_banner: z.boolean().optional(),
+        // #1258: failure text of an `errored` end. Present only on the
+        // web-chat forward, where an interrupted DM end no longer spends an
+        // LLM turn explaining itself.
+        detail: z.string().optional(),
       })
       .passthrough(),
   ],

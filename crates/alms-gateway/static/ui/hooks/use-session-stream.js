@@ -1742,6 +1742,10 @@ export function openSessionStream(sessionId, opts) {
         if (!suppressBanner && !alreadyEnded) {
             appendMessage({
                 id: nextMsgId(), type: 'dm_ended', peer, reason, contextId,
+                // #1258: an interrupted end (cancel/failure) no longer starts
+                // a run that would narrate itself, so the banner is where the
+                // operator reads WHY. Absent for every other end.
+                detail: data.detail || null,
             });
         }
         // Reset the status bar -- the DM conversation is over, so the
