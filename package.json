@@ -15,12 +15,12 @@
     "ui:format:check": "prettier --check frontend vite.config.ts playwright.config.ts eslint.config.js package.json tsconfig.json tsconfig.boundary.json",
     "ui:test": "vitest run",
     "ui:test:e2e": "playwright test",
-    "ui:audit": "npm audit --audit-level=high",
+    "ui:audit": "npm audit --audit-level=moderate",
     "ui:check": "npm run ui:typecheck && npm run ui:lint && npm run ui:format:check && npm run ui:test"
   },
   "dependencies": {
     "@preact/signals": "2.9.3",
-    "dompurify": "3.4.12",
+    "dompurify": "3.4.14",
     "htm": "3.1.1",
     "marked": "18.0.6",
     "preact": "10.29.7",

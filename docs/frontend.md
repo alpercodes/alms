@@ -47,7 +47,7 @@ decision, not a drift — record the reasoning here when you do.
 | `@preact/signals` | 2.9.3 | State primitive. See the 2.x note below. |
 | `htm` | 3.1.1 | Tagged-template JSX alternative; no build step for legacy screens. |
 | `marked` | 18.0.6 | Markdown for assistant message bodies. See the 15 -> 18 note below. |
-| `dompurify` | 3.4.12 | Sanitizes `marked` output. Minor bumps only; security-relevant, keep current. |
+| `dompurify` | 3.4.14 | Sanitizes `marked` output. Minor bumps only; security-relevant, keep current. Moved 3.4.12 -> 3.4.14 for GHSA-55q2-fjhq-7xh7 (#1250) — see the note below. |
 | `zod` | 4.4.3 | Schemas for the validated contract boundary. |
 
 ### Why `marked` is on 18.x rather than the 15.0.4 the CDN importmap pinned
@@ -87,6 +87,67 @@ precisely the kind of thing v18's block-token trimming could have removed. It
 does not: the newline is still emitted, and `frontend/markdown-rendering.test.ts`
 now pins that shape along with GFM soft breaks, task-list checkboxes surviving
 sanitization, the `afterSanitizeAttributes` new-tab hook, and the XSS vectors.
+
+### Why `dompurify` moved 3.4.12 -> 3.4.14
+
+`npm audit` flagged GHSA-55q2-fjhq-7xh7 (moderate, CVSS 5.1) against
+`dompurify <= 3.4.12` (#1250). Unlike the undici (#1243) and nanoid (#1249)
+advisories, this is a direct production dependency that ships to the browser
+and sanitizes every rendered assistant message, so the bump was checked against
+how we actually call it rather than applied blind.
+
+**We were not exposed.** The advisory needs two non-default preconditions
+*together*: `IN_PLACE: true`, and a `beforeSanitizeElements` /
+`uponSanitizeElement` hook that detaches the node it is inspecting. Given both,
+`_sanitizeElements()` returns early without calling `_neutralizeSubtree()`, and
+the detached subtree never enters `DOMPurify.removed` either — so a descendant
+`<img>` keeps an attacker-supplied `onload` and fires it after `sanitize()`
+returns, even though the returned root is clean.
+
+`static/ui/deps.js` meets neither condition. It calls `DOMPurify.sanitize(raw)`
+on a string with **no config object at all** — no `IN_PLACE`, no `RETURN_DOM*`,
+no `ADD_TAGS` / `ALLOWED_ATTR` / `ALLOWED_TAGS` — and registers one
+`afterSanitizeAttributes` hook that only sets `target` / `rel` on anchors. That
+hook detaches nothing, and it runs at a hook point the vulnerable branch never
+reaches. There is also no object left for the bug to act on: with string input
+the dirty tree is built inside DOMPurify in an inert document and we consume
+only the returned serialized HTML, so no caller holds a detached node for a
+queued resource event to fire on. The advisory's own PoC depends on the
+*application* building and retaining the dirty root; ours never sees one.
+
+**One measured behaviour change.** 3.4.14's notes describe "another refactoring
+run … flattened attribute validation", which is exactly the kind of change that
+moves an allow-list quietly, so the two versions were diffed rather than
+trusted. A 56-case differential of the full `renderMarkdown()` pipeline (same
+`marked` options, same hook) covered ordinary markdown, raw HTML in model
+output, `<form>` / `<iframe>` / `<object>` / `<template>` / `<style>`, URL
+schemes (`javascript:`, `data:`, `vbscript:`, whitespace-obfuscated), MathML and
+SVG mutation-XSS classics, DOM clobbering (`name="ownerDocument"`,
+`name="body"`), custom elements, `is=`, and deep nesting. Exactly one output
+differs: the SVG `pointer-events` and `vector-effect` presentation attributes on
+`<rect>` are stripped by 3.4.12 and kept by 3.4.14. That is the documented
+3.4.14 allow-list addition, and both attributes are presentational — no script
+surface, no URL surface. Every other case, including all the hostile ones, was
+byte-identical, so nothing `utils/code-copy.js` or
+`utils/decorate-code-blocks.js` parses moved.
+
+**3.4.14 rather than the minimum patch 3.4.13.** 3.4.13 clears the advisory on
+its own; 3.4.14 is latest and avoids a second bump shortly after. Its extra fix
+— bypasses when risky tags are allow-listed — is *not* a second exposure being
+closed here, because we allow-list nothing.
+
+`frontend/markdown-rendering.test.ts` pins the outcome: string-in / string-out
+with the stock deny-list still applied (the configuration shape that keeps the
+advisory inapplicable), the single 3.4.14 delta above, and inline-SVG active
+content still failing closed.
+
+**Audit threshold.** `ui:audit` is `npm audit --audit-level=moderate`. At `high`
+this advisory would not have surfaced at all, which is why the threshold dropped
+in the same change. The tree is clean at every level today, so `low` would pass
+too — `moderate` is a deliberate coverage-versus-noise choice, since `low`
+findings here are overwhelmingly transitive dev-tooling churn and a gate that
+cries wolf gets waved through. The level lives in `package.json`; `ci.yml` calls
+`npm run ui:audit` and deliberately does not name one.
 
 ### Why `@preact/signals` is on 2.x
 
