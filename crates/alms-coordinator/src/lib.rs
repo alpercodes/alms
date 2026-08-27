@@ -5362,6 +5362,44 @@ mod tests {
         );
     }
 
+    /// #1277 — the context id `derive_subagent_identity` mints must be
+    /// readable back by `alms_core::parse_subagent_context`, which is what
+    /// lets the gateway put the subagent's name on its session envelope.
+    ///
+    /// This pins the producer/parser agreement at the producer: the two
+    /// shapes are structurally identical (`subagent_{parent}_{trailing}`),
+    /// so nothing about the format itself tells a reader that the ephemeral
+    /// trailing segment is a task id rather than a name. If this derivation
+    /// changes shape, the label silently degrades to "unknown owner" (blank)
+    /// unless this row is updated with it.
+    #[test]
+    fn test_derived_subagent_context_round_trips_through_the_core_parser() {
+        let parent_agent_id = AgentId::new();
+        let mk = |name: Option<&str>| SubagentRequest {
+            task: "t".into(),
+            parent_session: SessionId::new(),
+            parent_agent_id,
+            parent_run_id: None,
+            subagent_name: name.map(str::to_string),
+            parent_tool_invocation_id: None,
+        };
+
+        let (_, named_ctx) = derive_subagent_identity(TaskId::new(), &mk(Some("reviewer")));
+        assert_eq!(
+            alms_core::parse_subagent_context(&named_ctx),
+            Some(alms_core::SubagentOwner::Named("reviewer")),
+            "named subagent context {named_ctx} must yield its name"
+        );
+
+        let (_, ephemeral_ctx) = derive_subagent_identity(TaskId::new(), &mk(None));
+        assert_eq!(
+            alms_core::parse_subagent_context(&ephemeral_ctx),
+            Some(alms_core::SubagentOwner::Ephemeral),
+            "ephemeral subagent context {ephemeral_ctx} carries a task id, \
+             which must never be reported as a name"
+        );
+    }
+
     /// Integration-level regression for #1051 — mirrors
     /// `test_named_subagent_persistent_session` but spans TWO parent chat
     /// sessions. The second dispatch (from session B) must land in the

@@ -802,6 +802,13 @@ Job safety:
   trusted ownership record. Both shapes embed the spawning parent's agent id —
   `subagent_{parent_agent_id}_{name}` (named, #1051) and
   `subagent_{parent_agent_id}_{task_id}` (ephemeral, #1181/#1185).
+- The reserved shape now has a **second consumer**: `parse_subagent_context`
+  (alms-core, #1277) recovers the session's display owner from it for the
+  `agent_name` field on session envelopes. A change to the context format must
+  visit both it and `read_subagent_session`'s access check — one decides who
+  may read the transcript, the other decides whose name is rendered on it. The
+  parser's named arm is `validate_agent_name`-gated, which also bounds the
+  model-supplied name before it reaches the UI as a label.
 - Ephemeral subagent transcript reads by `session_id` are **ownership-checked
   by parent id, not bearer-capability**: knowing the session UUID is NOT
   sufficient. The UUID intentionally leaks beyond the spawning parent (it

@@ -190,7 +190,7 @@ filter; DM sessions are gated on `include_dms`.
 |-------|------|-------------|
 | `session_type` | string | Session type derived from the `context_id`. Always present. See table below. |
 | `participants` | string[] | Participant names parsed from the DM context ID (e.g. `["alice", "bob"]`). Only present when `session_type` is `"dm"`. |
-| `agent_name` | string | Agent name extracted from the notification context ID (e.g. `"alice"` from `"notifications:alice"`). Only present when `session_type` is `"notification"`. |
+| `agent_name` | string | The session's owning agent, recovered from the `context_id`. In **this** listing that means `notification` sessions only (`"alice"` from `"notifications:alice"`). Subagent sessions are enriched with it too (#1277), but they are never listed here — see the note below for that shape and where to observe it. Absent when the context carries no recoverable owner. |
 | `has_active_run` | bool | `true` if any queued or running run is currently tied to this session, `false` otherwise. Drives the sidebar's "active" indicator on the initial load and after SSE reconnect. Always present. Pairs with the global session-activity SSE feed (`GET /events/session-activity`, section 5.10) which emits live `session_activity_started` / `session_activity_ended` transitions across every agent's sessions between calls to this endpoint (originally the per-agent feed of section 5.9, #856; made cross-agent in #1211). |
 
 **`session_type` values**
@@ -202,13 +202,15 @@ filter; DM sessions are gated on `include_dms`.
 | `"notification"` | `notifications:{agent}` | Notification session for an agent (DM endings, subagent completions). |
 | `"telegram"` | `telegram_{name}_{chat_id}` | Telegram channel session. |
 | `"job"` | `job_{id}` | Scheduled job session. |
-| `"subagent"` | `subagent_{task}` | Subagent execution session. |
+| `"subagent"` | `subagent_{parent_agent_id}_{name}` (named, #1051)<br>`subagent_{parent_agent_id}_{task_id}` (ephemeral, #1181/#1185) | Subagent execution session. Classification is on the `subagent_` prefix alone, so the legacy pre-#1185 `subagent_{task_id}` form still lands here — but it parses as neither shape and so carries no `agent_name`. |
 | `"episodic"` | `episodic:{id}` | Episodic memory session. |
 
 > **Note**: DM sessions only appear when `?include_dms=true` is set.
 > DM sessions use `AgentId::nil()` as a sentinel, so the `agent_id` filter does not apply to them.
 > Notification sessions are always included in the response and participate in the `agent_id` filter.
 > Job sessions (`job_{id}`) are always included and participate in the `agent_id` filter (#1197). Subagent and episodic sessions are always excluded from the listing.
+>
+> Because subagent sessions are excluded here, their `agent_name` enrichment (#1277) is only observable on `GET /session/{session_id}` — an endpoint this document does not yet have a section for (#1284). It resolves to the subagent's own name for the named context shape, to the literal `(subagent)` marker for the ephemeral one (an ephemeral subagent has no name; parentheses are illegal in agent names, so the marker can never be read as one), and is absent when the `context_id` matches neither — which the UI renders as no name at all rather than falling back to whichever agent is selected.
 
 ### 4.2 Create session
 `POST /sessions`

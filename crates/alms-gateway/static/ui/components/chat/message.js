@@ -1,6 +1,5 @@
 import { html, useSignal, useRef, useEffect, renderMarkdown } from '../../deps.js';
-import { activeAgent } from '../../state/agents.js';
-import { activeSessionOwnerName } from '../../state/sessions.js';
+import { activeMessageAuthorName } from '../../state/sessions.js';
 import { filterMessages } from '../../state/chat-actions.js';
 import { fmtMessageTime } from '../../utils/format.js';
 import { decorateCodeBlocks } from '../../utils/decorate-code-blocks.js';
@@ -78,24 +77,39 @@ function MarkdownBody({ html: htmlStr }) {
     `;
 }
 
-export function Message({ type, role, text, sealed, fromAgent, reasoning, ts }) {
-    const cls = type === 'user' ? 'user' : 'agent';
-    // Prefer the agent that OWNS the active session over the sidebar's
-    // active agent (#1212): job/subagent sessions are cross-agent
-    // read-only surfaces that don't switch the active agent when opened,
-    // so `activeAgent` can point at a completely different agent while
-    // the operator reads agent A's job session. For ordinary chat
-    // sessions the owner IS the active agent, so nothing changes; when
-    // the owner can't be resolved (DM sessions, boot races) we fall back
-    // to the previous behaviour.
-    const agentName = activeSessionOwnerName.value || activeAgent.value?.name;
-    // DM messages carry a fromAgent name — use it as the label so the
-    // user can see which agent sent the message.  Falls back to the
-    // session-owner / active agent name for normal assistant messages.
-    // (#546, #1212)
-    const label = type === 'user' ? '>'
+/**
+ * The author label for a row of authored content — the one definition of the
+ * #1277 rule, shared by `Message` and `ImageMessage`.
+ *
+ * `activeMessageAuthorName` is the agent that OWNS the active session,
+ * falling back to the sidebar's active agent only where that is provably the
+ * same agent (#1212, #1277). Job / subagent sessions are cross-agent
+ * read-only surfaces that don't switch the active agent when opened, so
+ * `activeAgent` can name a completely different agent than the one whose
+ * session is on screen. It resolves to null rather than guessing, and an
+ * unresolved author then renders no name at all rather than borrowing the
+ * sidebar's selection.
+ *
+ * DM rows carry a `fromAgent` name and use it directly, so the user can see
+ * which agent sent the message. (#546)
+ *
+ * This is a shared function rather than a rule each row restates because the
+ * restatements are what #1277 was: the copy in `app.js`'s message-list
+ * `.map()` is reachable by no test, so it could drift back to `activeAgent`
+ * with the whole suite still green.
+ */
+function authorLabel(isUser, fromAgent) {
+    // Read unconditionally, exactly as the inline call sites did — this read
+    // is what subscribes the rendering component to owner changes.
+    const agentName = activeMessageAuthorName.value;
+    return isUser ? '>'
         : fromAgent ? `${fromAgent} $`
         : (agentName ? `${agentName} $` : '$');
+}
+
+export function Message({ type, role, text, sealed, fromAgent, reasoning, ts }) {
+    const cls = type === 'user' ? 'user' : 'agent';
+    const label = authorLabel(type === 'user', fromAgent);
     const streaming = type === 'agent' && sealed === false;
     // The reasoning panel renders above the visible text for both streaming
     // and sealed messages. When empty it renders nothing, so we can
@@ -146,6 +160,87 @@ export function Message({ type, role, text, sealed, fromAgent, reasoning, ts }) 
             ${(hasBody || streaming) && html`
                 <div class="msg-body ${streaming ? 'streaming-cursor' : ''}">${text}</div>
             `}
+        </div>
+    `;
+}
+
+/**
+ * Chat image row (#546).
+ *
+ * Lifted out of the message-list `.map()` in `app.js` for the same reason as
+ * `ThinkingMessage` below: inline in `App` it carried a hand-copy of the
+ * `Message` label rule, and no test in `frontend/` imports `app.js` at all,
+ * so that copy could be reverted to `activeAgent` — the #1277 defect itself
+ * — with the entire suite still green. Here it shares `authorLabel` with
+ * `Message`, so there is one rule and one harness.
+ *
+ * `role` is the stored message role; a DM image also carries `fromAgent`, and
+ * those render as agent rows (on the correct side, under the sender's name)
+ * even though the role that delivered them is `user`.
+ */
+export function ImageMessage({ role, fromAgent, ts, url, alt }) {
+    const isUser = role === 'user' && !fromAgent;
+    const cls = isUser ? 'user' : 'agent';
+    const label = authorLabel(isUser, fromAgent);
+    return html`
+        <div class="msg ${cls}">
+            <div class="msg-label-row">
+                <div class="msg-label">${label}</div>
+                ${ts && html`<${MessageTimestamp} ts=${ts} />`}
+            </div>
+            <div class="msg-body">
+                ${url
+                    ? html`<img src=${url} alt=${alt || ''} style="max-width:100%;border-radius:8px;" />`
+                    : `[Image${alt ? ': ' + alt : ''}]`
+                }
+                ${alt && html`<div style="font-size:var(--text-xs);color:var(--text-secondary);margin-top:var(--space-2);">${alt}</div>`}
+            </div>
+        </div>
+    `;
+}
+
+/**
+ * Live "thinking" / queue-state indicator for an in-flight run.
+ *
+ * Lifted out of the message-list `.map()` in `app.js` so its author label
+ * reads the same `activeMessageAuthorName` computed as `Message` above,
+ * from the same file. It previously read `activeAgent` directly — the
+ * #1277 defect one branch over. A subagent drill-down with a live run is a
+ * designed state (the breadcrumb renders a "Cancel subagent" control for
+ * exactly that case), and on it this indicator named the PARENT.
+ *
+ * `'Agent'` is kept as the neutral placeholder rather than degrading to a
+ * bare `$` the way the authored-content labels do. This row is transient
+ * run status, not something an agent said, and the codebase already
+ * prefers a neutral literal over a blank for the same "cannot name the
+ * reasoner" case (`Agent reasoning` in `dm-conversation-view.js`, #1162).
+ * It is unambiguous for the same reason `(subagent)` is: `validate_agent_name`
+ * rejects uppercase, so `Agent` can never be a registered agent's name.
+ */
+export function ThinkingMessage({ pending, queuedBehind, source }) {
+    let label = 'Thinking';
+    let indicatorClass = 'thinking-indicator';
+    if (pending) {
+        label = 'Sending';
+        indicatorClass = 'pending-indicator';
+    } else if (queuedBehind > 0) {
+        // 1-indexed: queuedBehind === 1 means "next up".
+        // Source: run_created.queued_behind (initial)
+        // and run_queue_position SSE decrements (#831).
+        label = `Queued \u2014 position ${queuedBehind}`;
+        indicatorClass = 'queued-indicator';
+    } else if (source && source.startsWith('peer:')) {
+        label = 'Replying to message from ' + source.slice(5);
+    } else if (source === 'job') {
+        label = 'Running scheduled job';
+    } else if (source === 'subagent') {
+        label = 'Processing subagent result';
+    }
+    const authorName = activeMessageAuthorName.value || 'Agent';
+    return html`
+        <div class="msg agent">
+            <div class="msg-label">${authorName} $</div>
+            <div class="msg-body ${indicatorClass}">${label}</div>
         </div>
     `;
 }

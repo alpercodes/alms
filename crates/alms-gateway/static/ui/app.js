@@ -2,7 +2,7 @@ import { html, render, signal, effect, useEffect, useRef, useSignal } from './de
 import { boot } from './hooks/use-boot.js';
 import { Header } from './components/header.js';
 import { Sidebar } from './components/sidebar/index.js';
-import { Message, MessageTimestamp, ErrorMessage, WarningMessage, SystemMessage, DmEndedMessage, RunBoundary, TokenBadge } from './components/chat/message.js';
+import { Message, ImageMessage, ThinkingMessage, ErrorMessage, WarningMessage, SystemMessage, DmEndedMessage, RunBoundary, TokenBadge } from './components/chat/message.js';
 import { ToolRow, ToolGroup } from './components/chat/tool-row.js';
 import { ContextDebugRow } from './components/chat/context-debug-row.js';
 import { ApprovalCard } from './components/chat/approval-card.js';
@@ -216,33 +216,9 @@ function ChatView() {
                             sessionId=${m.sessionId} summary=${m.summary} />`;
                     }
                     if (m.type === 'image') {
-                        // DM images carry fromAgent — treat them as agent
-                        // messages so they render on the correct side. (#546)
-                        const isDmImage = !!(m.fromAgent);
-                        const cls = (m.role === 'user' && !isDmImage) ? 'user' : 'agent';
-                        // Session owner first (#1212) — same rationale as the
-                        // Message label: cross-agent surfaces (job/subagent)
-                        // don't switch the active agent, so `activeAgent`
-                        // can name the wrong agent.
-                        const agentName = activeSessionOwnerName.value || activeAgent.value?.name;
-                        const label = (m.role === 'user' && !isDmImage) ? '>'
-                            : m.fromAgent ? `${m.fromAgent} $`
-                            : (agentName ? `${agentName} $` : '$');
-                        return html`
-                            <div key=${m.id} class="msg ${cls}">
-                                <div class="msg-label-row">
-                                    <div class="msg-label">${label}</div>
-                                    ${m.ts && html`<${MessageTimestamp} ts=${m.ts} />`}
-                                </div>
-                                <div class="msg-body">
-                                    ${m.url
-                                        ? html`<img src=${m.url} alt=${m.alt || ''} style="max-width:100%;border-radius:8px;" />`
-                                        : `[Image${m.alt ? ': ' + m.alt : ''}]`
-                                    }
-                                    ${m.alt && html`<div style="font-size:var(--text-xs);color:var(--text-secondary);margin-top:var(--space-2);">${m.alt}</div>`}
-                                </div>
-                            </div>
-                        `;
+                        return html`<${ImageMessage} key=${m.id}
+                            role=${m.role} fromAgent=${m.fromAgent} ts=${m.ts}
+                            url=${m.url} alt=${m.alt} />`;
                     }
                     if (m.type === 'error') {
                         return html`<${ErrorMessage} key=${m.id} text=${m.text} code=${m.code} />`;
@@ -273,31 +249,8 @@ function ChatView() {
                         return html`<${TokenBadge} key=${m.id} usage=${m.usage} />`;
                     }
                     if (m.type === 'thinking') {
-                        let label = 'Thinking';
-                        let indicatorClass = 'thinking-indicator';
-                        if (m.pending) {
-                            label = 'Sending';
-                            indicatorClass = 'pending-indicator';
-                        } else if (m.queuedBehind > 0) {
-                            // 1-indexed: queuedBehind === 1 means "next up".
-                            // Source: run_created.queued_behind (initial)
-                            // and run_queue_position SSE decrements (#831).
-                            label = `Queued \u2014 position ${m.queuedBehind}`;
-                            indicatorClass = 'queued-indicator';
-                        } else if (m.source && m.source.startsWith('peer:')) {
-                            label = 'Replying to message from ' + m.source.slice(5);
-                        } else if (m.source === 'job') {
-                            label = 'Running scheduled job';
-                        } else if (m.source === 'subagent') {
-                            label = 'Processing subagent result';
-                        }
-                        const thinkingName = activeAgent.value?.name || 'Agent';
-                        return html`
-                            <div key=${m.id} class="msg agent">
-                                <div class="msg-label">${thinkingName} $</div>
-                                <div class="msg-body ${indicatorClass}">${label}</div>
-                            </div>
-                        `;
+                        return html`<${ThinkingMessage} key=${m.id}
+                            pending=${m.pending} queuedBehind=${m.queuedBehind} source=${m.source} />`;
                     }
                     return null;
                 })}

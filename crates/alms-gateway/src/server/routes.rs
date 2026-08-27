@@ -20,7 +20,7 @@ use crate::runs::{
 };
 use crate::settings::{get_settings, patch_settings};
 use crate::workspace::{get_workspace, open_workspace, update_workspace_file};
-use alms_core::{AgentId, SessionId, dm_participants};
+use alms_core::{AgentId, SessionId, SubagentOwner, dm_participants, parse_subagent_context};
 use alms_session::{Content, Role, Session};
 use axum::{
     Json, Router,
@@ -332,7 +332,10 @@ async fn health_check() -> impl IntoResponse {
 /// - `session_type`: one of `"chat"`, `"dm"`, `"notification"`, `"job"`,
 ///   `"subagent"`, `"telegram"`, `"episodic"` (derived from `context_id`)
 /// - `participants`: `[name1, name2]` for DM sessions (parsed from `context_id`)
-/// - `agent_name`: agent name extracted from `notifications:{agent}` context IDs
+/// - `agent_name`: the session's owning agent, recovered from the
+///   `context_id` — the agent for `notifications:{agent}`, the
+///   subagent for `subagent_{parent}_{name}` (#1277). Absent when the
+///   context carries no recoverable owner.
 /// - `has_active_run`: `true` if any queued or running run is currently
 ///   tied to this session — drives the sidebar's "active" indicator on
 ///   the initial load and after SSE reconnect (#856). Pairs with the
@@ -414,13 +417,22 @@ async fn list_sessions(
     Json(serde_json::json!({ "sessions": result }))
 }
 
+/// Display label for an ephemeral (unnamed) subagent session (#1277).
+///
+/// An ephemeral subagent has no name — only a task id, which must never be
+/// rendered as if it were one. The parentheses are load-bearing: agent names
+/// are restricted to lowercase alphanumerics and hyphens
+/// (`validate_agent_name`), so this string cannot be confused for a real
+/// agent, and no agent can ever be registered under it.
+const EPHEMERAL_SUBAGENT_LABEL: &str = "(subagent)";
+
 /// Build the enriched JSON object for a single session, used both by the
 /// `GET /sessions` list endpoint and the `GET /session/{session_id}`
 /// single-session lookup.
 ///
 /// Adds the same fields list_sessions has always exposed
 /// (`session_type`, `has_active_run`, `participants` for DM,
-/// `agent_name` for notification sessions), plus — when
+/// `agent_name` for notification and subagent sessions), plus — when
 /// `include_parent_session_id` is true — a `parent_session_id` field
 /// for sessions whose `session_type` is `"subagent"`.
 ///
@@ -475,6 +487,30 @@ fn enrich_session_json(
                 obj["agent_name"] = serde_json::json!(agent_name);
             }
         }
+        "subagent" => {
+            // #1277: a subagent session is stored under a DERIVED agent id
+            // (`AgentId::deterministic(parent, name)` for named subagents,
+            // a fresh `AgentId::new()` for ephemeral ones), so the frontend's
+            // agents-list lookup resolves nothing and its label fell back to
+            // whichever agent happened to be active — the PARENT. The
+            // `context_id` is the only surviving carrier of the identity, so
+            // recover it here, exactly as the notification arm above does.
+            //
+            // Left unset for an unparseable context: an absent `agent_name`
+            // renders as no name, which is the correct answer for "unknown
+            // owner". Do not substitute a placeholder here — the ephemeral
+            // marker below is a statement that there IS no name, not a
+            // stand-in for one we failed to read.
+            match parse_subagent_context(&session.context_id) {
+                Some(SubagentOwner::Named(name)) => {
+                    obj["agent_name"] = serde_json::json!(name);
+                }
+                Some(SubagentOwner::Ephemeral) => {
+                    obj["agent_name"] = serde_json::json!(EPHEMERAL_SUBAGENT_LABEL);
+                }
+                None => {}
+            }
+        }
         _ => {}
     }
 
@@ -521,7 +557,7 @@ fn enrich_session_json(
 /// Returns the same fields as a single entry from `GET /sessions`
 /// (`id`, `agent_id`, `context_id`, `created_at`, `last_activity`,
 /// `status`, `session_type`, `has_active_run`, plus `participants` /
-/// `agent_name` for the DM / notification cases) and additionally
+/// `agent_name` for the DM / notification / subagent cases) and additionally
 /// surfaces `parent_session_id` for subagent sessions so the frontend
 /// can render the "← Back to parent session" breadcrumb and the
 /// "Subagent session — read-only" header on resolver-led boot.
@@ -1252,6 +1288,102 @@ mod tests {
         assert!(
             body.get("parent_session_id").is_none(),
             "parent_session_id should be omitted for notification sessions"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Subagent envelope owner enrichment (#1277)
+    // -----------------------------------------------------------------
+    //
+    // A subagent session is stored under a DERIVED agent id, never the
+    // subagent's registry id, so the frontend cannot resolve its owner
+    // from the agents list — it fell back to the active agent and put the
+    // PARENT's name on the subagent's bubbles. `agent_name` is the only
+    // channel that carries the real owner across, so these rows assert the
+    // field's VALUE, not merely its presence.
+
+    #[tokio::test]
+    async fn get_session_metadata_named_subagent_envelope_carries_the_subagent_name() {
+        let state = test_app_state();
+        let parent_agent_id = AgentId::new();
+        // Stored under the derived id (`AgentId::deterministic`), as
+        // `derive_subagent_identity` does — deliberately NOT a registered
+        // agent id, which is what defeats the client-side lookup.
+        let derived_id = AgentId::deterministic(parent_agent_id, "reviewer");
+        let session = state.session_manager.get_or_create(
+            derived_id,
+            format!("subagent_{}_reviewer", parent_agent_id.0),
+        );
+        let session_id = session.id;
+
+        let (status, body) = invoke_get_session_metadata(state, session_id).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["session_type"], "subagent");
+        assert_eq!(body["agent_name"], "reviewer");
+        assert_ne!(
+            body["agent_name"],
+            serde_json::json!(parent_agent_id.0.to_string()),
+            "the envelope must name the subagent, never the parent"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_session_metadata_ephemeral_subagent_envelope_carries_a_non_name_marker() {
+        let state = test_app_state();
+        let parent_agent_id = AgentId::new();
+        let task_id = uuid::Uuid::new_v4();
+        let session = state.session_manager.get_or_create(
+            AgentId::new(),
+            format!("subagent_{}_{}", parent_agent_id.0, task_id),
+        );
+        let session_id = session.id;
+
+        let (status, body) = invoke_get_session_metadata(state, session_id).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["session_type"], "subagent");
+        // Asserted as a LITERAL, not against `EPHEMERAL_SUBAGENT_LABEL`.
+        // Comparing the constant to itself is tautological: it moves on both
+        // sides of the assertion, so changing the marker's value would leave
+        // this row (and the `is_err()` row below, since most illegal strings
+        // stay illegal) passing, while `frontend/subagent-session-label.test.ts`
+        // never sees the Rust constant at all. Spelling the value out here is
+        // what makes the label a wire contract a change has to come through,
+        // and gives the frontend's "Mirrors `EPHEMERAL_SUBAGENT_LABEL`"
+        // comment something that actually breaks when the mirror drifts.
+        assert_eq!(body["agent_name"], "(subagent)");
+        // The failure this guards is the task id being rendered as a name.
+        assert_ne!(
+            body["agent_name"],
+            serde_json::json!(task_id.to_string()),
+            "an ephemeral subagent's task id must never be surfaced as its name"
+        );
+        assert!(
+            alms_core::validate_agent_name(EPHEMERAL_SUBAGENT_LABEL).is_err(),
+            "the ephemeral marker must be un-registrable as an agent name so it \
+             can never be mistaken for one"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_session_metadata_unreadable_subagent_envelope_omits_agent_name() {
+        let state = test_app_state();
+        // Legacy pre-#1185 ephemeral shape: no parent segment, so the owner
+        // is not recoverable. Omitting the field makes the UI render no
+        // name — the required degradation is blank, not a guess.
+        let session = state
+            .session_manager
+            .get_or_create(AgentId::new(), format!("subagent_{}", uuid::Uuid::new_v4()));
+        let session_id = session.id;
+
+        let (status, body) = invoke_get_session_metadata(state, session_id).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["session_type"], "subagent");
+        assert!(
+            body.get("agent_name").is_none(),
+            "an unreadable subagent context must carry no agent_name; got {body}"
         );
     }
 

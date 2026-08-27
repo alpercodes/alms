@@ -49,7 +49,7 @@ pub use source_label::{derive_source_label, truncate_to_char_boundary};
 /// - `"dm:{a}:{b}"` -> `"dm"`
 /// - `"notifications:{agent}"` -> `"notification"`
 /// - `"job_{id}"` -> `"job"`
-/// - `"subagent_{task}"` -> `"subagent"`
+/// - `"subagent_{parent_agent_id}_{name|task_id}"` -> `"subagent"`
 /// - `"episodic:{id}"` -> `"episodic"`
 /// - `"telegram_{id}"` -> `"telegram"`
 /// - anything else -> `"chat"`
@@ -68,6 +68,74 @@ pub fn classify_session_type(context_id: &str) -> &'static str {
         "telegram"
     } else {
         "chat"
+    }
+}
+
+/// The owner encoded in a coordinator-reserved subagent `context_id`.
+///
+/// A subagent session is NOT stored under the subagent's registry id — a
+/// named one is keyed on `AgentId::deterministic(parent_agent_id, name)`
+/// (#1051) and an ephemeral one on a fresh `AgentId::new()`. Neither
+/// resolves against the agent registry, so the `context_id` is the only
+/// place the display identity survives. See [`parse_subagent_context`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubagentOwner<'a> {
+    /// `subagent_{parent_agent_id}_{name}` — a named subagent. The name is
+    /// `validate_agent_name`-valid: `invoke_agent` rejects the call before
+    /// dispatch otherwise.
+    Named(&'a str),
+    /// `subagent_{parent_agent_id}_{task_id}` — an unnamed, one-shot
+    /// subagent. There is no name to recover; the task id is deliberately
+    /// NOT surfaced as one.
+    Ephemeral,
+}
+
+/// Recover the display owner of a subagent session from its `context_id`.
+///
+/// Both shapes `derive_subagent_identity` produces are structurally
+/// identical — `subagent_{parent_agent_id}_{trailing}` — so the
+/// named/ephemeral split is decided by what `trailing` IS, never by its
+/// position. Taking the trailing segment unconditionally would render an
+/// ephemeral subagent's task id as if it were an agent name (#1277).
+///
+/// The two trailing forms are disjoint by construction:
+/// `validate_agent_name` rejects any name that parses as a UUID, precisely
+/// so names can't collide with id-shaped lookups. The UUID test still runs
+/// FIRST so the discrimination doesn't silently depend on that rule holding
+/// — if agent names were ever relaxed to admit UUID shapes, an ephemeral
+/// task id would still classify as ephemeral rather than leak as a name.
+///
+/// Returns `None` for anything that isn't one of the two current shapes —
+/// a non-subagent context, the legacy pre-#1185 `subagent_{task_id}` form
+/// (no parent segment), a non-UUID parent segment, or a trailing segment
+/// that is neither a UUID nor a valid agent name. Callers must treat `None`
+/// as "unknown owner" and display nothing: guessing is what turned a
+/// resolution miss into a confident mislabel in the first place.
+///
+/// # The `validate_agent_name` gate is also an output constraint
+///
+/// The name returned by [`SubagentOwner::Named`] originates in an
+/// LLM-supplied `invoke_agent` parameter and ends up rendered as an
+/// identity label in the web UI. Gating the named arm on
+/// `validate_agent_name` therefore does double duty: it is the
+/// named/ephemeral discriminator, AND it constrains what can reach the DOM
+/// to `[a-z0-9-]`, 1–64 chars. A "just take the trailing segment" parse
+/// would have handed arbitrary model-controlled text to a label. Keep the
+/// gate even if the discrimination is ever reworked.
+pub fn parse_subagent_context(context_id: &str) -> Option<SubagentOwner<'_>> {
+    let rest = context_id.strip_prefix("subagent_")?;
+
+    // Neither a UUID nor an agent name contains '_', so the first '_' is
+    // unambiguously the parent/trailing separator.
+    let (parent, trailing) = rest.split_once('_')?;
+    Uuid::parse_str(parent).ok()?;
+
+    if Uuid::parse_str(trailing).is_ok() {
+        Some(SubagentOwner::Ephemeral)
+    } else if validate_agent_name(trailing).is_ok() {
+        Some(SubagentOwner::Named(trailing))
+    } else {
+        None
     }
 }
 
@@ -568,5 +636,80 @@ mod tests {
         assert_eq!(classify_session_type("web"), "chat");
         assert_eq!(classify_session_type("default"), "chat");
         assert_eq!(classify_session_type("my-custom-context"), "chat");
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_subagent_context tests (#1277)
+    // -----------------------------------------------------------------------
+
+    /// Build the context ids exactly as `derive_subagent_identity` does, so
+    /// these rows fail if that format ever moves.
+    fn named_context(parent: AgentId, name: &str) -> String {
+        format!("subagent_{}_{}", parent.0, name)
+    }
+
+    #[test]
+    fn parse_subagent_context_recovers_the_name_of_a_named_subagent() {
+        let parent = AgentId::new();
+        assert_eq!(
+            parse_subagent_context(&named_context(parent, "reviewer")),
+            Some(SubagentOwner::Named("reviewer"))
+        );
+        // Hyphens are legal in agent names and must survive the split.
+        assert_eq!(
+            parse_subagent_context(&named_context(parent, "code-reviewer-2")),
+            Some(SubagentOwner::Named("code-reviewer-2"))
+        );
+    }
+
+    #[test]
+    fn parse_subagent_context_never_reports_a_task_id_as_a_name() {
+        let parent = AgentId::new();
+        let task_id = Uuid::new_v4();
+        let ctx = format!("subagent_{}_{}", parent.0, task_id);
+        // The ephemeral shape is structurally identical to the named one, so
+        // a "take the trailing segment" parse would hand a UUID to the UI as
+        // if it were the subagent's name.
+        assert_eq!(parse_subagent_context(&ctx), Some(SubagentOwner::Ephemeral));
+    }
+
+    #[test]
+    fn parse_subagent_context_rejects_shapes_it_cannot_read() {
+        // Not a subagent context at all.
+        assert_eq!(parse_subagent_context("job_abc"), None);
+        // Legacy pre-#1185 ephemeral shape: no parent segment to split on.
+        assert_eq!(
+            parse_subagent_context(&format!("subagent_{}", Uuid::new_v4())),
+            None
+        );
+        // Parent segment isn't a UUID — not a coordinator-minted context.
+        assert_eq!(parse_subagent_context("subagent_notauuid_reviewer"), None);
+        // Trailing segment is neither a UUID nor a name the agent registry
+        // would ever accept (uppercase is rejected by validate_agent_name).
+        let parent = AgentId::new();
+        assert_eq!(
+            parse_subagent_context(&named_context(parent, "Reviewer")),
+            None
+        );
+        assert_eq!(parse_subagent_context(&named_context(parent, "")), None);
+    }
+
+    #[test]
+    fn parse_subagent_context_agrees_with_validate_agent_name() {
+        // The named arm must not admit anything the registry would reject:
+        // the parse is the only thing standing between a raw context segment
+        // and a rendered agent label.
+        let parent = AgentId::new();
+        for name in ["reviewer", "a", "agent-1"] {
+            assert!(validate_agent_name(name).is_ok(), "fixture {name} invalid");
+            assert_eq!(
+                parse_subagent_context(&named_context(parent, name)),
+                Some(SubagentOwner::Named(name))
+            );
+        }
+        for name in ["-lead", "lead-", "UPPER", "with space", "default"] {
+            assert!(validate_agent_name(name).is_err(), "fixture {name} valid");
+            assert_eq!(parse_subagent_context(&named_context(parent, name)), None);
+        }
     }
 }

@@ -11,6 +11,7 @@ export declare const isDmSession: ReadonlySignal<boolean>;
 export declare const isNotificationSession: ReadonlySignal<boolean>;
 export declare const isInternalSession: ReadonlySignal<boolean>;
 export declare const activeSessionOwnerName: ReadonlySignal<string | null>;
+export declare const activeMessageAuthorName: ReadonlySignal<string | null>;
 export declare const dmParticipants: ReadonlySignal<readonly string[] | null>;
 export declare function replaceSessionScopes(
   agentSessions: readonly SessionEntity[],

@@ -1,6 +1,6 @@
 import { signal, computed } from '../deps.js';
-import { agents } from './agents.js';
-import { sessionOwnerName } from '../utils/session-owner.js';
+import { agents, activeAgent } from './agents.js';
+import { sessionOwnerName, messageAuthorName } from '../utils/session-owner.js';
 import { entityState } from './entity-state.js';
 
 export const sessions = entityState.agentSessions;
@@ -122,11 +122,36 @@ export const isInternalSession = computed(() => {
  * job/subagent/notification sessions are cross-agent surfaces that do
  * NOT switch the active agent when opened, so attribution derived from
  * `activeAgent` can show a different agent's name. Consumers should use
- * this with an `activeAgent` fallback:
- * `activeSessionOwnerName.value || activeAgent.value?.name`.
+ * this where a wrong name is worse than no name at all (the internal
+ * session header). Consumers that need a fallback must use
+ * `activeMessageAuthorName` rather than `|| activeAgent.value?.name` —
+ * see #1277 for what that shorthand cost.
  */
 export const activeSessionOwnerName = computed(() =>
     sessionOwnerName(activeSession.value, agents.value)
+);
+
+/**
+ * Name to render as the author of an assistant bubble in the active
+ * session, or null to render no name.
+ *
+ * Wraps `messageAuthorName`, which owns the rule for when falling back to
+ * the sidebar's `activeAgent` is legitimate. This exists as a single
+ * computed so the bubble-rendering call sites cannot re-derive (and
+ * re-break) that rule independently. See #1212 / #1277.
+ *
+ * `activeSessionId` is passed alongside the envelope because it is the
+ * honest "is a session selected" signal: subagent envelopes reach the
+ * store through one best-effort fetch, so an envelope-only gate would
+ * fall back to the sidebar's agent whenever that fetch failed.
+ */
+export const activeMessageAuthorName = computed(() =>
+    messageAuthorName(
+        activeSession.value,
+        agents.value,
+        activeAgent.value,
+        activeSessionId.value,
+    )
 );
 
 /**
