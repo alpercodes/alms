@@ -717,11 +717,17 @@ pub async fn create_run(
     // agent's resolved shape.
     {
         let base_agent_config = state.agent_config.read().clone();
+        // #1148: snapshot the LIVE server-default client, not a boot-time
+        // clone, so a `PATCH /settings` model/provider switch is validated
+        // (and, below, executed) against the pair the run will actually
+        // send on. Bound to a local first so the read guard is released
+        // before the match body rather than held across it.
+        let server_llm = state.llm.read().clone();
         match resolve_agent_config(
             agent_id,
             &state.session_manager,
             &base_agent_config,
-            &state.llm,
+            &server_llm,
             Some(&state.secrets.read()),
         ) {
             Err(ResolveAgentConfigError::MissingModelAfterProviderSwitch {
@@ -1462,13 +1468,20 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
     // DMs / subagent completions). Mark the run as failed with the same
     // structured message so the run record carries an actionable error.
     let base_agent_config = state.agent_config.read().clone();
+    // #1148: the server-default `(model, provider)` pair is live-mutable
+    // via `PATCH /settings`, so read the shared client here rather than a
+    // boot-time clone. Agents carrying a per-agent override still win —
+    // `resolve_agent_config` layers those on top of whatever base it is
+    // handed. In-flight runs are unaffected: each run resolves once, here,
+    // and holds the resulting client by value for its duration.
+    let server_llm = state.llm.read().clone();
     let resolve_outcome = {
         let secrets_guard = state.secrets.read();
         resolve_agent_config(
             agent_id,
             &state.session_manager,
             &base_agent_config,
-            &state.llm,
+            &server_llm,
             Some(&secrets_guard),
         )
     };

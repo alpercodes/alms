@@ -833,13 +833,11 @@ const apiContracts: ReadonlyArray<{
     method: "PATCH",
     matches: (url) => url.pathname === "/settings",
     boundary: "PATCH /settings",
-    schema: z
-      .object({
-        status: z.literal("ok"),
-        restart_required: z.literal(true).optional(),
-        restart_reason: stringSchema.optional(),
-      })
-      .passthrough(),
+    // #1148: `restart_required` / `restart_reason` were dropped from this
+    // envelope when the server-default model/provider pair became live for
+    // the next run. They were the only fields the handler ever emitted
+    // beyond `status`, and nothing on the wire sets them any more.
+    schema: z.object({ status: z.literal("ok") }).passthrough(),
   },
   {
     method: "GET",

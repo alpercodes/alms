@@ -4231,6 +4231,478 @@ async fn create_run_ignores_stale_per_run_override_fields() {
     shutdown_token.cancel();
 }
 
+// =====================================================================
+// #1148 — the server-default `(model, provider)` pair is live for the
+// NEXT run, with no daemon restart.
+//
+// These are the end-to-end pins. Everything below drives the real
+// `create_run` -> queue -> `execute_run` chain and asserts against
+// `run.resolved_config()` — the snapshot `mark_run_as_running_with_config`
+// takes from the `LlmClient` the agent loop is about to send on. A test
+// that only asserted `state.server_llm_default` changed would pass with
+// the run path still reading a boot-time clone, i.e. it would pass
+// against the bug.
+// =====================================================================
+
+/// Everything a #1148 test needs kept alive for its duration.
+///
+/// The `data_dir` tempdir is load-bearing, not tidiness. `AppState::new`
+/// reads `{data_dir}/settings.json` at boot and `persist_settings` writes
+/// it on every accepted PATCH, so a harness that leaves `data_dir` at the
+/// `GatewayConfig::default()` cwd-relative `./.alms` would have one test's
+/// PATCH silently become the next test's boot-time server default —
+/// order-dependent failures that only reproduce when the suite is run in
+/// a particular sequence. Each harness gets its own directory instead.
+struct LlmDefaultHarness {
+    state: AppState,
+    _data_dir: tempfile::TempDir,
+    _shutdown_token: CancellationToken,
+    _completion_rx: mpsc::UnboundedReceiver<SubagentCompletion>,
+    _trigger_rx: mpsc::Receiver<RunTrigger>,
+    _dm_event_rx: mpsc::Receiver<DmEvent>,
+}
+
+/// Build an `AppState` with a mock LLM, a SQLite store, an isolated
+/// `data_dir`, and a populated `[llm.providers]` map, so `PATCH /settings`
+/// can validate provider switches (the map is config-file-only and
+/// `GatewayConfig::default()` leaves it empty).
+fn llm_default_harness(provider: &str, model: &str) -> LlmDefaultHarness {
+    let mut providers = std::collections::BTreeMap::new();
+    providers.insert(
+        "openrouter".to_string(),
+        alms_core::config::ProviderEntry {
+            kind: alms_core::config::ProviderKind::OpenAiCompatible,
+            base_url: "https://openrouter.ai/api/v1".into(),
+            api_key_env: None,
+            api_key: Some("sk-or-test".into()),
+            model: None,
+            auth_scheme: alms_core::config::AuthScheme::Bearer,
+            quirks: alms_core::config::ProviderQuirks::default(),
+        },
+    );
+    providers.insert(
+        "anthropic".to_string(),
+        alms_core::config::ProviderEntry {
+            kind: alms_core::config::ProviderKind::Anthropic,
+            base_url: "https://api.anthropic.com/v1".into(),
+            api_key_env: None,
+            api_key: Some("sk-ant-test".into()),
+            // No entry-level model on purpose: it is what makes a
+            // provider-only switch fall through to the #863 decision.
+            model: None,
+            auth_scheme: alms_core::config::AuthScheme::Header {
+                name: "x-api-key".into(),
+            },
+            quirks: alms_core::config::ProviderQuirks::default(),
+        },
+    );
+    let llm_config = alms_runtime::LlmConfig {
+        mock: true,
+        provider: provider.to_string(),
+        default_model: model.to_string(),
+        providers,
+        ..alms_runtime::LlmConfig::default()
+    };
+    let data_dir = tempfile::tempdir().expect("tempdir for isolated settings.json");
+    let gateway_config = GatewayConfig {
+        db_path: Some(":memory:".to_string()),
+        data_dir: Some(data_dir.path().to_path_buf()),
+        llm_config,
+        ..GatewayConfig::default()
+    };
+    let gateway = crate::gateway::Gateway::new(gateway_config).unwrap();
+    let scheduler = Arc::new(alms_runtime::Scheduler::new());
+    let shutdown_token = CancellationToken::new();
+    let (completion_tx, completion_rx) = mpsc::unbounded_channel();
+    let (trigger_tx, trigger_rx) = mpsc::channel(64);
+    let (dm_event_tx, dm_event_rx) = mpsc::channel(64);
+    let state = AppState::new(
+        gateway,
+        scheduler,
+        shutdown_token.clone(),
+        completion_tx,
+        trigger_tx,
+        dm_event_tx,
+    )
+    .unwrap();
+    LlmDefaultHarness {
+        state,
+        _data_dir: data_dir,
+        _shutdown_token: shutdown_token,
+        _completion_rx: completion_rx,
+        _trigger_rx: trigger_rx,
+        _dm_event_rx: dm_event_rx,
+    }
+}
+
+/// Seed an agent record with the given per-agent overrides.
+fn seed_llm_default_test_agent(
+    state: &AppState,
+    name: &str,
+    model: Option<&str>,
+    provider: Option<&str>,
+) -> AgentId {
+    use alms_core::registry::AgentRecord;
+    use chrono::Utc;
+
+    let agent_id = AgentId::new();
+    let now = Utc::now();
+    let agent = AgentRecord {
+        id: agent_id,
+        name: name.to_string(),
+        description: String::new(),
+        model: model.map(str::to_string),
+        posture: None,
+        provider: provider.map(str::to_string),
+        telegram_token: None,
+        thinking_budget_tokens: None,
+        reasoning_effort: None,
+        gemini_thinking_budget: None,
+        summary_provider: None,
+        summary_model: None,
+        worktree_mode: alms_core::WorktreeMode::Off,
+        debug_mode: false,
+        is_default: false,
+        created_at: now,
+        last_active: now,
+    };
+    state
+        .session_manager
+        .store()
+        .expect("SQLite-backed state should have a store")
+        .create_agent(&agent)
+        .expect("agent seed should succeed");
+    agent_id
+}
+
+/// Apply a `PATCH /settings` body and assert it was accepted.
+///
+/// Goes through the real handler (not a direct `server_llm_default`
+/// write) so every test below exercises the validation + commit + client
+/// rebuild chain an operator's UI click actually takes.
+async fn patch_server_default(state: &AppState, patch: serde_json::Value) {
+    use axum::Json;
+    use axum::extract::State;
+    use axum::response::IntoResponse;
+
+    let resp = crate::settings::patch_settings(State(state.clone()), Json(patch.clone()))
+        .await
+        .into_response();
+    assert_eq!(
+        resp.status(),
+        axum::http::StatusCode::OK,
+        "PATCH /settings {patch} must be accepted"
+    );
+}
+
+/// Drive one `POST /runs` to `run_started` and return the
+/// `ResolvedRunConfig` the run path actually committed.
+async fn resolved_config_for_one_run(
+    state: &AppState,
+    agent_id: AgentId,
+    context_id: &str,
+) -> alms_core::ResolvedRunConfig {
+    use alms_core::CreateRunRequest;
+    use axum::Json;
+    use axum::extract::State;
+
+    let session = state.session_manager.get_or_create(agent_id, context_id);
+    let session_id = session.id;
+    // Subscribe BEFORE `create_run`: the producer persists the resolved
+    // snapshot via `mark_run_as_running_with_config` immediately before
+    // broadcasting `run_started` (#895 ordering), so observing the event
+    // is sufficient to know the snapshot is queryable.
+    let mut session_rx = subscribe_session(state, session_id);
+
+    let req = CreateRunRequest {
+        session_id,
+        ..serde_json::from_value(serde_json::json!({
+            "session_id": session_id.0.to_string(),
+            "input": { "type": "text", "text": "which model am I?" },
+        }))
+        .expect("CreateRunRequest must deserialize")
+    };
+
+    let (status, resp) = match super::lifecycle::create_run(State(state.clone()), Json(req)).await {
+        Ok(ok) => ok,
+        Err((code, body)) => panic!("create_run failed: status={code:?} body={:?}", body.0),
+    };
+    assert_eq!(status, axum::http::StatusCode::CREATED);
+    let run_id = resp.0.run_id;
+
+    loop {
+        let event = tokio::time::timeout(std::time::Duration::from_secs(10), session_rx.recv())
+            .await
+            .expect("test must observe run_started within 10s")
+            .expect("session sender must not close before run_started");
+        if event.event_type == "run_started" {
+            break;
+        }
+    }
+
+    state
+        .run_manager
+        .get_run(run_id)
+        .expect("run must exist after create_run enqueued it")
+        .resolved_config()
+        .expect("resolved_config must be populated once the run reaches Running")
+        .clone()
+}
+
+/// **The core acceptance test for #1148.** A `PATCH /settings` that moves
+/// the server-default model must reach the *next* run — no restart.
+///
+/// Pre-fix, `state.llm` was a by-value clone taken in `AppState::new`, so
+/// this run resolved against the boot model and the operator was told
+/// (correctly, at the time) that a restart was required. Post-fix the
+/// PATCH rebuilds the shared client the run path reads.
+///
+/// The assertion is on `run.resolved_config().model` — the snapshot taken
+/// from the client the agent loop is about to send on — not on
+/// `server_llm_default`, which would still be green with the bug present.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn patched_server_default_model_reaches_the_next_run_without_restart() {
+    let harness = llm_default_harness("openrouter", "z-ai/glm-5.2");
+    let state = &harness.state;
+    // No per-agent model or provider — this agent inherits the server
+    // default, which is the population the issue is about.
+    let agent_id = seed_llm_default_test_agent(state, "inherits-default", None, None);
+
+    // Baseline: the boot pair is what a run resolves to today.
+    let before = resolved_config_for_one_run(state, agent_id, "web-before").await;
+    assert_eq!(before.model, "z-ai/glm-5.2");
+    assert_eq!(before.provider, "openrouter");
+
+    // Operator changes the server-default model in the UI.
+    patch_server_default(
+        state,
+        serde_json::json!({ "model": "moonshotai/kimi-k2.5" }),
+    )
+    .await;
+
+    // ...and the very next run uses it. No restart in between.
+    let after = resolved_config_for_one_run(state, agent_id, "web-after").await;
+    assert_eq!(
+        after.model, "moonshotai/kimi-k2.5",
+        "#1148: the next run must resolve against the patched server default. \
+         A boot-time `state.llm` clone would still report z-ai/glm-5.2 here."
+    );
+    assert_eq!(
+        after.provider, "openrouter",
+        "a model-only PATCH must not disturb the provider"
+    );
+}
+
+/// A live server-default switch must not step on agents that carry their
+/// own model. Per-agent overrides are the higher-precedence layer and
+/// stay that way — `PATCH /settings` only moves the value agents fall
+/// back to.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn patched_server_default_does_not_override_a_per_agent_model() {
+    let harness = llm_default_harness("openrouter", "z-ai/glm-5.2");
+    let state = &harness.state;
+    let pinned =
+        seed_llm_default_test_agent(state, "pinned-agent", Some("openai/gpt-4o-mini"), None);
+    let inheriting = seed_llm_default_test_agent(state, "inheriting-agent", None, None);
+
+    patch_server_default(
+        state,
+        serde_json::json!({ "model": "moonshotai/kimi-k2.5" }),
+    )
+    .await;
+
+    let pinned_cfg = resolved_config_for_one_run(state, pinned, "web").await;
+    assert_eq!(
+        pinned_cfg.model, "openai/gpt-4o-mini",
+        "a per-agent model must still win over a freshly patched server default"
+    );
+
+    let inheriting_cfg = resolved_config_for_one_run(state, inheriting, "web").await;
+    assert_eq!(
+        inheriting_cfg.model, "moonshotai/kimi-k2.5",
+        "an agent without an override must pick the new default up — the same \
+         PATCH has to move one agent and not the other"
+    );
+}
+
+/// A live server-default **provider** switch retargets the wire for the
+/// next run: provider name and model both move, and the mock adapter the
+/// run resolves is rebuilt from `[llm.providers.anthropic]`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn patched_server_default_provider_reaches_the_next_run_without_restart() {
+    let harness = llm_default_harness("openrouter", "z-ai/glm-5.2");
+    let state = &harness.state;
+    let agent_id = seed_llm_default_test_agent(state, "inherits-default", None, None);
+
+    patch_server_default(
+        state,
+        serde_json::json!({
+            "provider": "anthropic",
+            "model": "claude-sonnet-4-6",
+        }),
+    )
+    .await;
+
+    let after = resolved_config_for_one_run(state, agent_id, "web").await;
+    assert_eq!(after.provider, "anthropic");
+    assert_eq!(after.model, "claude-sonnet-4-6");
+}
+
+/// **The coherence constraint.** The `#863`
+/// `MISSING_MODEL_AFTER_PROVIDER_SWITCH` decision must be computed
+/// against the *live* server-default pair, not the boot-time one.
+///
+/// The agent here pins `provider: anthropic` and carries no model. While
+/// the server default is also `anthropic` that is not a switch at all, so
+/// the run inherits the server-default model and starts fine. The moment
+/// the operator moves the server default to `openrouter`, the same agent
+/// record becomes a genuine provider switch with no model available at
+/// any layer — and `POST /runs` must reject it with the structured 400
+/// before any LLM call.
+///
+/// If the run path still read a boot-time client, the second `create_run`
+/// would happily succeed and the agent would send an OpenRouter slug to
+/// Anthropic's wire. Getting this wrong is what turns a config change
+/// into a fleet of opaque downstream 4xx errors, so it is pinned
+/// end-to-end rather than at the helper.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn missing_model_after_provider_switch_is_judged_against_the_live_default() {
+    use alms_core::CreateRunRequest;
+    use axum::Json;
+    use axum::extract::State;
+
+    let harness = llm_default_harness("anthropic", "claude-sonnet-4-6");
+    let state = &harness.state;
+    // Per-agent provider matching the server default => not a switch.
+    let agent_id = seed_llm_default_test_agent(state, "anthropic-pinned", None, Some("anthropic"));
+
+    let before = resolved_config_for_one_run(state, agent_id, "web-before").await;
+    assert_eq!(before.provider, "anthropic");
+    assert_eq!(
+        before.model, "claude-sonnet-4-6",
+        "baseline: no provider switch, so the server-default model applies"
+    );
+
+    // Move the server default off anthropic. The agent record is
+    // untouched — but it is now a provider switch with no model anywhere.
+    patch_server_default(
+        state,
+        serde_json::json!({
+            "provider": "openrouter",
+            "model": "z-ai/glm-5.2",
+        }),
+    )
+    .await;
+
+    let session = state.session_manager.get_or_create(agent_id, "web-after");
+    let req = CreateRunRequest {
+        session_id: session.id,
+        ..serde_json::from_value(serde_json::json!({
+            "session_id": session.id.0.to_string(),
+            "input": { "type": "text", "text": "should be rejected" },
+        }))
+        .expect("CreateRunRequest must deserialize")
+    };
+    let err = super::lifecycle::create_run(State(state.clone()), Json(req))
+        .await
+        .expect_err(
+            "the live provider switch must be rejected — a boot-time client \
+             would have let this run through with a cross-namespace model",
+        );
+    assert_eq!(err.0, axum::http::StatusCode::BAD_REQUEST);
+    assert_eq!(
+        err.1.0["error_code"], "MISSING_MODEL_AFTER_PROVIDER_SWITCH",
+        "the structured 400 must still fire, now against the live pair: {:?}",
+        err.1.0
+    );
+    assert_eq!(err.1.0["new_provider"], "anthropic");
+    assert_eq!(
+        err.1.0["prev_provider"], "openrouter",
+        "`prev_provider` must name the LIVE server default, not the boot one"
+    );
+}
+
+/// In-flight runs are unaffected: a PATCH that lands while a run is
+/// already executing must not retarget that run's wire. The run resolves
+/// its client once at start and holds it by value for the duration.
+///
+/// **Coverage boundary — this is the weakest of the five #1148 pins, and
+/// deliberately so.** `resolved_config()` is written once by
+/// `try_mark_run_as_running_with_config` and never rewritten, and nothing
+/// here holds the run open past `run_started` — with the mock adapter it
+/// has most likely already finished. So the assertion would stay green
+/// even if the runtime *did* re-read the shared handle mid-run.
+///
+/// The property itself is structurally guaranteed rather than test-
+/// enforced: `llm` is moved into `AgentRuntime::new` and the loop owns it
+/// by value, so there is no handle left to re-read. Holding a run open to
+/// give the assertion something to fail against would need a tool-gated
+/// mock adapter that does not exist in-repo. What this test does earn is
+/// the other half of the claim — that the PATCH landed and moved the live
+/// client — which is asserted explicitly below.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn patching_the_default_mid_run_does_not_disturb_the_in_flight_run() {
+    use alms_core::CreateRunRequest;
+    use axum::Json;
+    use axum::extract::State;
+
+    let harness = llm_default_harness("openrouter", "z-ai/glm-5.2");
+    let state = &harness.state;
+    let agent_id = seed_llm_default_test_agent(state, "inherits-default", None, None);
+
+    let session = state.session_manager.get_or_create(agent_id, "web");
+    let session_id = session.id;
+    let mut session_rx = subscribe_session(state, session_id);
+
+    let req = CreateRunRequest {
+        session_id,
+        ..serde_json::from_value(serde_json::json!({
+            "session_id": session_id.0.to_string(),
+            "input": { "type": "text", "text": "in flight" },
+        }))
+        .expect("CreateRunRequest must deserialize")
+    };
+    let (_status, resp) = super::lifecycle::create_run(State(state.clone()), Json(req))
+        .await
+        .expect("create_run should succeed");
+    let run_id = resp.0.run_id;
+
+    loop {
+        let event = tokio::time::timeout(std::time::Duration::from_secs(10), session_rx.recv())
+            .await
+            .expect("test must observe run_started within 10s")
+            .expect("session sender must not close before run_started");
+        if event.event_type == "run_started" {
+            break;
+        }
+    }
+
+    // The run has already resolved and committed its config. PATCH now.
+    patch_server_default(
+        state,
+        serde_json::json!({ "model": "moonshotai/kimi-k2.5" }),
+    )
+    .await;
+
+    let snapshot = state
+        .run_manager
+        .get_run(run_id)
+        .expect("run must exist")
+        .resolved_config()
+        .expect("resolved_config must be populated")
+        .clone();
+    assert_eq!(
+        snapshot.model, "z-ai/glm-5.2",
+        "the already-running run must keep the pair it resolved at start"
+    );
+    assert_eq!(
+        state.llm.read().default_model(),
+        "moonshotai/kimi-k2.5",
+        "…while the live client HAS moved — otherwise the assertion above \
+         would pass simply because the PATCH never landed"
+    );
+}
+
 #[tokio::test]
 async fn create_run_rejects_agent_session_mismatch() {
     use alms_core::{CreateRunRequest, RunInput};
@@ -4359,7 +4831,7 @@ async fn create_run_resolves_per_agent_config_for_shared_session_via_requested_a
         runs[0].agent_id,
         &state.session_manager,
         &base_agent_config,
-        &state.llm,
+        &state.llm.read().clone(),
         Some(&secrets),
     )
     .expect("success path: per-agent provider+model both supplied");

@@ -183,10 +183,6 @@ function ApiKeysSection() {
  */
 export function SettingsModal({ open, onClose }) {
     const saved = useSignal(false);
-    // Surfaced when a successful Apply included a `model` / `provider`
-    // change. The wire response carries `restart_required: true` in that
-    // case (no live LLM client hot-swap on this surface).
-    const restartHint = useSignal(false);
 
     // Server-level editable signals — Context
     const ctxStrategy = useSignal('');
@@ -216,13 +212,11 @@ export function SettingsModal({ open, onClose }) {
     const toolsMaxOutput = useSignal('');
 
     // Server-default LLM (model + provider) — the top-level `llm.model`
-    // / `llm.provider` knob that new agents inherit when they don't carry
-    // a per-agent override. PATCH-able for persistence but takes effect
-    // on the next daemon restart (the run path reads `state.llm` /
-    // `state.llm_config` clones that aren't behind `Arc<RwLock>`). The
-    // UI mirrors the Logging section's restart-required contract via a
-    // visible hint and a per-Apply restart banner (when these fields
-    // actually changed).
+    // / `llm.provider` knob that agents inherit when they don't carry a
+    // per-agent override. Live-mutable since #1148: the backend commits
+    // the pair, rebuilds the shared LlmClient the run path reads, and
+    // persists to settings.json, so the change lands on the next run
+    // with no daemon restart. No restart banner here any more.
     const defaultModel = useSignal('');
     const defaultProvider = useSignal('');
 
@@ -334,7 +328,6 @@ export function SettingsModal({ open, onClose }) {
             debugModeTouched.value = false;
 
             saved.value = false;
-            restartHint.value = false;
             serverError.value = '';
         }
     }, [open]);
@@ -495,9 +488,10 @@ export function SettingsModal({ open, onClose }) {
         // under `llm` — the wire shape mirrors the matching keys in
         // `alms.toml`'s `[llm]` section and the existing top-level
         // `model` / `provider` fields in GET /settings. Empty-string
-        // values are rejected by the backend (restart-required, no
-        // clear sentinel), so we omit the field when the form value
-        // is empty rather than sending `""`.
+        // values are rejected by the backend (there is no clear
+        // sentinel — "no server default" is not a runnable state), so we
+        // omit the field when the form value is empty rather than
+        // sending `""`.
         if (defaultModel.value && defaultModel.value !== (defaults.model || '')) {
             body.model = defaultModel.value;
         }
@@ -506,17 +500,13 @@ export function SettingsModal({ open, onClose }) {
         }
 
         // PATCH server settings if anything changed.
-        let restartRequired = false;
         if (Object.keys(body).length > 0) {
             try {
-                const resp = await patchSettings(body);
-                // Backend signals `restart_required: true` when model /
-                // provider changed (they don't live-mutate the in-memory
-                // LlmClient clone). Capture the flag so the success
-                // banner mentions it.
-                if (resp && resp.restart_required) {
-                    restartRequired = true;
-                }
+                // #1148: every mutable section — including the
+                // server-default model / provider — takes effect on the
+                // next run, so the response is a plain `{status: "ok"}`
+                // and there is no restart flag to surface.
+                await patchSettings(body);
                 await refreshServerDefaults();
             } catch (err) {
                 // 422 responses have { errors: ["...", "..."] } spread onto the thrown object
@@ -565,15 +555,11 @@ export function SettingsModal({ open, onClose }) {
         // `!serverError.value` covers both paths with one edit.
         if (!serverError.value) {
             saved.value = true;
-            restartHint.value = restartRequired;
         }
         serverSaving.value = false;
 
-        // Close after brief feedback, unless there was a server error
-        // OR a restart-required hint needs to stay visible (operator
-        // should explicitly dismiss those — they can't be missed in a
-        // 600ms flash).
-        if (!serverError.value && !restartRequired) {
+        // Close after brief feedback, unless there was a server error.
+        if (!serverError.value) {
             setTimeout(() => onClose(), 600);
         }
     };
@@ -631,25 +617,24 @@ export function SettingsModal({ open, onClose }) {
                     <//>
                 <//>
 
-                <!-- Default LLM (server-level, editable, restart-required).
+                <!-- Default LLM (server-level, editable, live).
                      Pre-PR-941 this row was a disabled-display of the per-run
                      model picker; PR-941 removed that path entirely, which
                      left no UI surface for the actual server-default model.
-                     The section is restored here as a persistence-only knob
-                     (the run path reads by-value clones of the LlmClient
-                     that are not behind a shared lock, so a hot-swap would
-                     need a bigger refactor — out of scope for this
-                     restoration). Backend persists into settings.json and
-                     re-applies on the next daemon start; on PATCH the
-                     response carries restart_required:true so the operator
-                     gets a yellow banner instead of a 600ms Saved! flash. -->
+                     The section was restored as a persistence-only knob and
+                     made live in #1148: the backend now rebuilds the shared
+                     LlmClient the run path reads, so the next run picks the
+                     pair up with no daemon restart. Same 600ms Saved! flash
+                     as every other section. -->
                 <${Section} key="defaults" title="Default LLM (model / provider)" defaultOpen=${true}>
                     <span class="settings-hint settings-section-desc">
-                        Server-default LLM identity — new agents inherit these values when they don't
+                        Server-default LLM identity — agents inherit these values when they don't
                         carry a per-agent override (per-agent values live on the agent record and are
-                        edited from the Agents panel). Changes here are persisted to
-                        <code>settings.json</code> and take effect on the next daemon restart; in-flight
-                        runs continue to use the boot-time snapshot, mirroring the Logging section.
+                        edited from the Agents panel). Changes apply to the next run — no restart —
+                        and are persisted to <code>settings.json</code> so they survive one. Runs
+                        already in flight keep the model they started on. Telegram-triggered runs
+                        use a boot-time snapshot until the daemon is restarted, same as the
+                        reasoning &amp; caching defaults below.
                     </span>
                     <${EditRow} label="Default LLM model"
                         desc="Model id sent to the resolved provider's wire (e.g. z-ai/glm-5.2, claude-sonnet-4-6, gpt-5.4). Pick from the suggestions list or type any model the provider accepts.">
@@ -939,16 +924,6 @@ export function SettingsModal({ open, onClose }) {
                 ${serverError.value && html`
                     <div class="settings-error">
                         Failed to save server settings: ${serverError.value}
-                    </div>
-                `}
-
-                ${restartHint.value && html`
-                    <div class="settings-hint" style="background:#3a2d10;border:1px solid #8a6b1a;color:#f0c264;padding:10px;border-radius:6px;margin:8px 0;">
-                        <strong>Saved — restart required.</strong>
-                        Server-default model / provider changes are persisted to
-                        <code>settings.json</code> but won't reach in-flight runs
-                        until the daemon restarts. New runs created after the
-                        restart will pick up the new values.
                     </div>
                 `}
 

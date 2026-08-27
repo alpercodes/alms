@@ -129,15 +129,17 @@ pub struct AppState {
     pub agent_queue: Arc<SessionQueue<AgentId>>,
     /// Snapshot of LLM config — read once at startup so handlers avoid locking the gateway.
     ///
-    /// `default_model` and `provider` here are seeded from the boot config
-    /// (TOML / env / compiled defaults) merged with any persisted
-    /// `model` / `provider` PATCHes from a previous run. The handler
-    /// snapshot itself is by-value clone — PATCHing those two fields
-    /// updates the persisted state and the live `Arc<RwLock<String>>`
-    /// next to this field, but **does not** propagate to in-flight runs
-    /// until the daemon restarts (the run path reads `state.llm` and
-    /// this snapshot, both of which are clones taken at handler entry).
-    /// Same restart-required contract as the Logging block.
+    /// Only the *static* half of this snapshot is authoritative: the
+    /// `[llm.providers]` map, `stream_chunk_timeout_secs`, and the other
+    /// config-file-only knobs, none of which are PATCH-mutable.
+    ///
+    /// **`default_model` / `provider` on this struct are boot-time values
+    /// and go stale after the first `PATCH /settings` that changes them.**
+    /// Since #1148 the live server-default pair is
+    /// [`AppState::server_llm_default`] (operator-facing surface) and
+    /// [`AppState::llm`] (the client the run path actually sends on).
+    /// Read those two, never these fields, when you need the pair that is
+    /// in force right now.
     pub llm_config: alms_runtime::LlmConfig,
     /// Live source of truth for the server-default LLM `(model, provider)` —
     /// PATCH /settings writes here, GET /settings reads here, and
@@ -146,21 +148,63 @@ pub struct AppState {
     /// Wrapped in `Arc<RwLock>` so the PATCH handler can see its own
     /// write reflected on the next GET without round-tripping through the
     /// `state.llm_config` clone (which is by-value and not mutable from
-    /// inside a handler). Restart is still required for the value to
-    /// reach `state.llm` and downstream run paths, but the operator-facing
-    /// settings surface stays consistent in the meantime.
+    /// inside a handler).
+    ///
+    /// Since #1148 this pair is also *live for runs*: after committing a
+    /// change here, `PATCH /settings` calls
+    /// [`AppState::refresh_llm_from_server_default`] to rebuild
+    /// [`AppState::llm`] from it, so the next run picks the new default up
+    /// with no daemon restart. The two are written together under the same
+    /// handler; this struct stays the authoritative pair (it is what
+    /// `persist_settings` serialises) and the client is derived from it.
     pub server_llm_default: Arc<parking_lot::RwLock<ServerLlmDefault>>,
     /// Agent config — mutable via PATCH /settings (context, llm provider
     /// defaults, and the `sandbox_root` / `shell_policy` mirrors of the
     /// tools section). Shared with the Coordinator (`Arc::clone`) so all
     /// HTTP-triggered run paths observe the same live config; the
-    /// Telegram path inherits a boot-time snapshot — see
-    /// `gateway.rs::Gateway::run_telegram` and `docs/api.md` § 10.2.
+    /// Telegram path inherits a boot-time snapshot — see the Telegram
+    /// loop inside `gateway.rs::Gateway::run_until_shutdown` and
+    /// `docs/api.md` § 10.2.
     pub agent_config: Arc<parking_lot::RwLock<alms_runtime::AgentConfig>>,
     /// Default agent ID — shared with Gateway, updated live on set-default.
     pub default_agent_id: Arc<parking_lot::RwLock<AgentId>>,
-    /// LLM client clone — read once at startup so run execution avoids locking the gateway.
-    pub llm: alms_runtime::LlmClient,
+    /// Live server-default LLM client — the base every run path layers
+    /// per-agent overrides on top of (`configuration::resolve_agent_config`).
+    ///
+    /// Behind an `Arc<RwLock>` (#1148) rather than held by value so
+    /// `PATCH /settings` can rebuild it in place when the server-default
+    /// `(model, provider)` pair changes. The same handle is shared with
+    /// the `Coordinator` (`Arc::clone`, via
+    /// `Coordinator::with_agent_config_and_shared_llm`) so subagents spawned after the
+    /// switch inherit the new default too — the propagation contract the
+    /// shared `agent_config` lock already provides.
+    ///
+    /// Read it with `state.llm.read().clone()` and drop the guard before
+    /// any `.await`: the lock is a `parking_lot::RwLock` and must never be
+    /// held across a suspension point.
+    ///
+    /// Propagation is HTTP-path only, like every other live-mutable
+    /// setting: Telegram-triggered runs resolve against the `LlmClient`
+    /// owned by `Gateway` (a boot-time clone) and keep the boot pair until
+    /// the daemon restarts. See the Telegram loop inside
+    /// `gateway.rs::Gateway::run_until_shutdown` and `docs/api.md` § 10.2.
+    pub llm: Arc<parking_lot::RwLock<alms_runtime::LlmClient>>,
+    /// Serialises `PATCH /settings` handler bodies end to end (#1148).
+    ///
+    /// The handler validates against the live `(provider, model)` pair,
+    /// commits several statements later, rebuilds [`AppState::llm`] after
+    /// that, and finally rewrites `settings.json` — holding no lock across
+    /// the sequence. Two concurrent PATCHes can therefore interleave and
+    /// leave the live client on a pair neither request asked for, which is
+    /// exactly what the per-request coherence gates exist to prevent. One
+    /// mutex around the whole handler is the cheap fix; PATCH /settings is
+    /// not a hot path.
+    ///
+    /// Guard lifetime is enforced by the compiler rather than by
+    /// convention: `patch_settings` contains no `.await`, and clippy's
+    /// `await_holding_lock` (warn-by-default, `-D warnings` in CI) fires
+    /// the moment someone adds one below the guard.
+    pub settings_patch_lock: Arc<parking_lot::Mutex<()>>,
     /// Auth token — read once at startup.
     pub auth_token_value: Option<String>,
     /// Shared secrets store for API key management.
@@ -192,6 +236,65 @@ impl AppState {
             .entry(job_id)
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
             .clone()
+    }
+
+    /// Rebuild [`Self::llm`] from the live [`Self::server_llm_default`]
+    /// pair so the next run sends on the patched `(model, provider)`
+    /// without a daemon restart (#1148).
+    ///
+    /// Called by `PATCH /settings` after the pair has been validated and
+    /// committed. Order mirrors the boot path in [`Self::new`]: apply the
+    /// provider first (which re-derives base URL, auth scheme, quirks,
+    /// wire kind and API key from `[llm.providers.<name>]`, and may set a
+    /// model from the entry), then pin the committed model on top.
+    ///
+    /// The provider apply is idempotent — `LlmClient::apply_provider`
+    /// re-derives every provider-shaped field from the (immutable)
+    /// `[llm.providers]` map rather than mutating incrementally — so
+    /// repeated PATCHes, including switching away and back, always land
+    /// on the same client for the same pair.
+    ///
+    /// Key resolution goes through `with_provider_and_secrets`, matching
+    /// both the boot path and `resolve_agent_config`'s per-agent provider
+    /// switch: `SecretsStore` first, then the provider entry's
+    /// `api_key_env` / `api_key`. **That choice of call is load-bearing
+    /// and pinned here, at the call site.** `with_provider` would compile,
+    /// read almost identically, and hand `apply_provider` a `|_| None`
+    /// resolver — which on a provider *change* takes the "clearing stale
+    /// key" branch and leaves the shared client with an empty API key, so
+    /// every subsequent default-agent run 401s with nothing tying the
+    /// failure back to the PATCH. That bug shipped once already on the
+    /// sibling boot path (#1081). A test of `with_provider_and_secrets`
+    /// cannot catch it — the mutation is here, not in the callee — so
+    /// `patch_provider_switch_re_resolves_the_api_key_on_the_live_client`
+    /// asserts `LlmClient::has_api_key()` after going through the handler.
+    ///
+    /// In-flight runs are unaffected — they resolved their client at run
+    /// start and hold it by value for the duration.
+    pub(crate) fn refresh_llm_from_server_default(&self) {
+        let target = self.server_llm_default.read().clone();
+        // Clone out, mutate, write back: `with_provider_and_secrets` and
+        // `with_model` consume `self`, and holding the client write lock
+        // across the secrets read lock would invert the ordering used by
+        // the run path (secrets first, client second).
+        let current = self.llm.read().clone();
+        let rebuilt = {
+            let secrets_guard = self.secrets.read();
+            current
+                .with_provider_and_secrets(&target.provider, &secrets_guard)
+                .with_model(&target.model)
+        };
+        // Publish first, then log: the message states a past-tense fact
+        // ("rebuilt"), so emitting it above the write would claim
+        // something that is still one statement away from being true.
+        *self.llm.write() = rebuilt;
+        tracing::info!(
+            target: "alms.config",
+            provider = %target.provider,
+            model = %target.model,
+            "Server-default LLM client rebuilt from PATCH /settings — \
+             effective on the next run, no restart required"
+        );
     }
 
     pub fn new(
@@ -398,6 +501,15 @@ impl AppState {
         // Create the shared agent config Arc *once* — both the Coordinator and
         // AppState reference the same lock so PATCH /settings updates propagate.
         let agent_config = Arc::new(parking_lot::RwLock::new(agent_config_val));
+        // Same trick for the server-default LlmClient (#1148): one lock,
+        // shared by `AppState` (HTTP / scheduler / DM / notification run
+        // paths) and the `Coordinator` (subagent spawns), so a
+        // `PATCH /settings` model/provider switch reaches every
+        // server-default consumer on its next run instead of waiting for a
+        // daemon restart. `llm` above already carries any persisted pair
+        // re-applied from `settings.json`, so the handle starts in sync
+        // with `server_llm_default` below.
+        let llm = Arc::new(parking_lot::RwLock::new(llm));
         let job_store = match session_manager.store() {
             Some(store) => Arc::new(JobStore::with_store(Arc::clone(store))?),
             None => Arc::new(JobStore::new()),
@@ -414,9 +526,13 @@ impl AppState {
         };
         let run_admission_gates = Arc::new(dashmap::DashMap::new());
 
-        let mut coord = Coordinator::with_agent_config(
+        // #1148: hand the coordinator the SAME `llm` handle `AppState`
+        // keeps, alongside the `agent_config` handle it already shared, so
+        // a live server-default switch reaches subagents spawned after the
+        // PATCH instead of splitting one run tree across two models.
+        let mut coord = Coordinator::with_agent_config_and_shared_llm(
             session_manager.clone(),
-            llm.clone(),
+            Arc::clone(&llm),
             Arc::clone(&agent_config),
         )
         .with_completion_channel(completion_tx)
@@ -520,6 +636,7 @@ impl AppState {
             agent_config,
             default_agent_id,
             llm,
+            settings_patch_lock: Arc::new(parking_lot::Mutex::new(())),
             auth_token_value,
             secrets,
             message_bus,

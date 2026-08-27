@@ -1061,8 +1061,38 @@ impl LlmClient {
         &self.config.api_key
     }
 
-    /// Get the current base URL (test-only).
-    #[cfg(test)]
+    /// Whether a non-empty API key is currently resolved.
+    ///
+    /// Carries no secret material — the key itself stays test-only, and
+    /// this deliberately answers only the yes/no question. It exists so
+    /// callers in other crates can pin that a provider switch
+    /// re-resolved credentials (#1148): [`Self::apply_provider`] clears
+    /// the *outgoing* provider's key whenever the switch's resolver
+    /// returns `None`, so a call site that reaches for
+    /// [`Self::with_provider`] instead of
+    /// [`Self::with_provider_and_secrets`] leaves the shared client
+    /// unable to authenticate and every subsequent run 401s with nothing
+    /// tying the failure back to the switch.
+    ///
+    /// That exact bug shipped once already, on the gateway's boot path
+    /// (#1081), and could not be regression-tested from `alms-gateway`
+    /// because the only observable was `#[cfg(test)]`-gated to this
+    /// crate — a callee test cannot kill a call-site mutation. This
+    /// accessor is what closes that.
+    pub fn has_api_key(&self) -> bool {
+        !self.config.api_key.is_empty()
+    }
+
+    /// Get the current base URL.
+    ///
+    /// Reflects any `apply_provider` switch, so it is the URL this client
+    /// would actually talk to right now. The gateway surfaces it on
+    /// `GET /settings` (#1148) — reading it from the client rather than
+    /// re-deriving it from `[llm.providers]` keeps that display honest
+    /// after a live server-default provider switch, and avoids a second
+    /// copy of `apply_provider`'s sugar-name fallback.
+    ///
+    /// Carries no secret material — the API key accessor stays test-only.
     pub fn base_url(&self) -> &str {
         &self.config.base_url
     }
@@ -1442,6 +1472,87 @@ mod tests {
         // cleared (the pre-fix `with_provider` boot path would have
         // ended up with an empty key here).
         assert_eq!(switched.api_key(), "sk-ant-from-entry");
+    }
+
+    /// Switching the server-default provider away and back must land on a
+    /// fully working client — same wire *and* a resolvable API key.
+    ///
+    /// This is the contract `AppState::refresh_llm_from_server_default`
+    /// (#1148) rests on. That helper rebuilds the shared client in place
+    /// on every `PATCH /settings` that moves the server-default pair,
+    /// rather than deriving each rebuild from a pristine boot client.
+    /// That is only safe because `apply_provider` re-derives every
+    /// provider-shaped field from the immutable `[llm.providers]` map
+    /// instead of mutating incrementally.
+    ///
+    /// The API key is the field where "incremental" would bite:
+    /// `apply_provider` deliberately *clears* the outgoing provider's key
+    /// on a switch so one provider's credentials are never sent to
+    /// another. If the return trip did not re-resolve from the entry, an
+    /// operator who switched provider and changed their mind would be
+    /// left with an empty key and every subsequent run would fail with an
+    /// opaque 401 they could not trace back to the PATCH.
+    #[test]
+    fn test_provider_round_trip_restores_entry_api_key() {
+        let mut providers = std::collections::BTreeMap::new();
+        providers.insert(
+            "openrouter".into(),
+            alms_core::config::ProviderEntry {
+                kind: alms_core::config::ProviderKind::OpenAiCompatible,
+                base_url: "https://openrouter.ai/api/v1".into(),
+                api_key_env: None,
+                api_key: Some("sk-or-from-entry".into()),
+                model: None,
+                auth_scheme: AuthScheme::Bearer,
+                quirks: alms_core::config::ProviderQuirks::default(),
+            },
+        );
+        providers.insert(
+            "anthropic".into(),
+            alms_core::config::ProviderEntry {
+                kind: alms_core::config::ProviderKind::Anthropic,
+                base_url: "https://api.anthropic.com/v1".into(),
+                api_key_env: None,
+                api_key: Some("sk-ant-from-entry".into()),
+                model: None,
+                auth_scheme: AuthScheme::Header {
+                    name: "x-api-key".into(),
+                },
+                quirks: alms_core::config::ProviderQuirks::default(),
+            },
+        );
+        let config = LlmConfig {
+            provider: "openrouter".into(),
+            api_key: "sk-or-from-entry".into(),
+            base_url: "https://openrouter.ai/api/v1".into(),
+            default_model: "z-ai/glm-5.2".into(),
+            providers,
+            ..LlmConfig::default()
+        };
+        let client = LlmClient::new(config).unwrap();
+        let secrets = alms_core::secrets::SecretsStore::empty();
+
+        // Away: the OpenRouter key must be gone, replaced by Anthropic's.
+        let switched = client
+            .clone()
+            .with_provider_and_secrets("anthropic", &secrets)
+            .with_model("claude-sonnet-4-6");
+        assert_eq!(switched.api_key(), "sk-ant-from-entry");
+
+        // Back: everything the original client had, restored.
+        let returned = switched
+            .with_provider_and_secrets("openrouter", &secrets)
+            .with_model("z-ai/glm-5.2");
+        assert_eq!(returned.provider(), "openrouter");
+        assert_eq!(returned.base_url(), "https://openrouter.ai/api/v1");
+        assert_eq!(returned.default_model(), "z-ai/glm-5.2");
+        assert_eq!(
+            returned.api_key(),
+            "sk-or-from-entry",
+            "the return trip must re-resolve the entry key — apply_provider \
+             cleared it on the way out, so an incremental rebuild would leave \
+             the client with empty credentials"
+        );
     }
 
     /// Variant of the above using `api_key_env` to confirm the env-var

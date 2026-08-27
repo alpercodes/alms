@@ -1864,13 +1864,38 @@ Note: Top-level flat keys (`context_strategy`, `enabled_tools`) are preserved fo
 ### 10.2 Update server settings
 `PATCH /settings`
 
-Partially update server-level configuration at runtime. The `context`, `session`, `tools`, and `llm` (#809) sections are mutable. Changes take effect on the next run; in-flight runs are unaffected. Logging requires a restart and is not accepted here.
+Partially update server-level configuration at runtime. The `context`, `session`, `tools`, and `llm` (#809) sections are mutable, as are the top-level `model` / `provider` keys (#1148). Changes take effect on the next run; in-flight runs are unaffected. Logging requires a restart and is not accepted here.
 
-> **Live-mutation propagation — HTTP path only.** `PATCH /settings` mutations to all four mutable sections (`context`, `session`, `tools`, `llm`) propagate to the **next `POST /runs` immediately**, with no daemon restart required. Telegram-triggered runs read from a boot-time snapshot of the `AgentConfig` held inside the `Gateway` and continue to use that snapshot until the daemon is restarted. This is pre-existing behaviour for the `context` / `session` / `tools` sections; the new `llm` block in #809 inherits the same limitation. Tooling and frontends building on `PATCH /settings` should treat HTTP and Telegram as separate propagation domains.
+> **Live-mutation propagation — HTTP path only.** `PATCH /settings` mutations to all four mutable sections (`context`, `session`, `tools`, `llm`) and to the top-level `model` / `provider` pair propagate to the **next `POST /runs` immediately**, with no daemon restart required. Telegram-triggered runs read from a boot-time snapshot of the `AgentConfig` and `LlmClient` held inside the `Gateway` and continue to use that snapshot until the daemon is restarted. This is pre-existing behaviour for the `context` / `session` / `tools` sections; the `llm` block (#809) and the server-default pair (#1148) inherit the same limitation. Tooling and frontends building on `PATCH /settings` should treat HTTP and Telegram as separate propagation domains.
 >
 > **Persistence — `settings.json` wins over `alms.toml` on restart.** Once any field has been PATCHed, the entire mutable surface is written to `{data_dir}/settings.json` and that file is the source of truth on the next boot. Subsequent edits to the corresponding sections of `alms.toml` are silently overwritten by the persisted snapshot. To revert a PATCHed value to a TOML- or env-var-driven configuration, edit `settings.json` directly (or remove it) before restart.
 
 Within `tools`, only `shell_policy`, `sandbox_root`, `timeout_secs`, and `max_output_bytes` are dynamically mutable. **`tools.shell_permissions` is configured in `alms.toml` only** — its allow/deny regex patterns are compiled once at startup and baked into each `ShellTool` instance (see `docs/agent-runtime-design.md` for the config schema and `docs/security-model.md` § 4.3 for the policy semantics). This applies to every field in the block: `allowed_commands`, `denied_commands`, and `classifier_overrides` are all config-file-only and are **not** PATCH-mutable. Sending `shell_permissions` in a `PATCH /settings` body is ignored; restart the gateway to pick up new patterns.
+
+#### Top-level `model` / `provider` — the server-default LLM pair
+
+`model` and `provider` sit at the top level of the PATCH body (not nested under `llm`), mirroring the `[llm]` section of `alms.toml` and the top-level `model` / `provider` keys `GET /settings` returns. They are the **server default** — the bottom layer of the two-layer precedence chain. Agents carrying a per-agent `model` / `provider` on their registry record (`PATCH /agents/{id}`) are unaffected by changes here; agents without one pick the new pair up on their next run.
+
+Since #1148 this pair is **live**. An accepted PATCH commits it, rebuilds the shared `LlmClient` that `POST /runs`, the scheduler, peer-DM triggers, subagent spawns and completion notifications all resolve from, and persists it to `settings.json` for restart survival. The response is a plain `{ "status": "ok" }` — there is no `restart_required` flag on this endpoint any more. Runs already executing keep the client they resolved at start.
+
+Validation. The pair is committed **all or nothing**: if any rule below fails, neither `model` nor `provider` lands — not on the live client, not in `settings.json`. A body naming both keys that is rejected for one of them therefore leaves the running daemon exactly as it was, and the error explains which half was at fault. This holds for a rejection on *either* half, in either direction: `{"provider": "typo", "model": "gpt-4o"}` does not commit the model, and `{"provider": "anthropic", "model": ""}` does not commit the provider (nor `[llm.providers.anthropic].model`, which the body never named). A body whose two halves are *both* invalid gets one error each.
+
+The guarantee is structural rather than case-by-case: the handler validates the entire would-be post-patch pair first and only then commits, with a single gate between the two phases, so no rule can be evaluated after a commit it should have prevented.
+
+| Rule | Failure |
+|------|---------|
+| `provider` must be a key in `[llm.providers]` | 422, `provider '<name>' is not configured — known providers: [...]` |
+| `model` / `provider` must be non-empty when present | 422, `empty string not accepted` — there is no clear sentinel; "no server default" is not a runnable state |
+| The post-patch `(provider, model)` pair must be wire-compatible | 422, `INCOMPATIBLE_MODEL_FOR_PROVIDER` |
+| `[context].max_input_tokens` must fit the post-patch pair's context window | 400, `INVALID_TOKEN_BUDGET_FOR_PROVIDER` (see § 10.2 budget validation) |
+
+The compatibility rule is the same `model_belongs_to_kind` gate the runtime applies to per-agent provider switches (#860 / #863 / #942): `anthropic` wires accept `claude-*`, `gemini` wires accept `gemini-*` / `models/gemini-*`, and `OpenAiCompatible` wires accept everything (OpenRouter routes vendor-prefixed slugs from every namespace). It fires in both directions — on a provider-only PATCH whose surviving model belongs to the old namespace, and on a model-only PATCH whose new model cannot be spoken by the provider that stays in force. Supply both keys in one body for a cross-namespace switch.
+
+The `[llm.providers]` map itself is **config-file-only** and is not PATCH-mutable; add or edit `[llm.providers.<name>]` in `alms.toml` and restart before switching to a new provider.
+
+> **Partial failure across sections — the pair can outlive its own 422.** "All or nothing" scopes to the pair, not to the whole body. A request that mixes a valid `model` / `provider` with an invalid *other* section (a bad `context.strategy`, say) is rejected with `422` / `status: "partial"`, but the pair has already been committed and applied to the live client by then — only persistence is gated on a globally clean request, which is the same contract the `context` / `session` / `tools` / `llm` sections have always had. The operator-visible consequence is specific to this pair being live: **the running daemon uses the new model while `settings.json` still holds the old one, so a restart silently reverts it.** If you meant the switch to stick, re-send `model` / `provider` on their own and check for a `200`.
+
+Concurrent `PATCH /settings` requests are serialised server-side, so two overlapping switches cannot interleave into a pair neither of them asked for.
 
 Within `llm`, each provider-family sub-block mirrors the shape of `[llm.anthropic]` / `[llm.openai]` / `[llm.gemini]` in `alms.toml`. Mutations feed the server-default layer of the two-layer precedence chain (per-agent > server default; per-run overrides were removed in #941) and are picked up on the next `POST /runs` without a restart. All provider-family sub-blocks and fields are optional; fields that are `None` in the patch body are left unchanged. API keys and endpoints are **not** in scope — those live under a separate security surface.
 
@@ -1894,6 +1919,8 @@ The reasoning / caching knobs on `/settings.llm.*` use **two different "no overr
 **Request body** (all fields optional):
 ```json
 {
+  "model": "claude-sonnet-4-6",
+  "provider": "anthropic",
   "context": {
     "strategy": "compact",
     "max_input_tokens": 128000,

@@ -267,8 +267,20 @@ pub struct Coordinator {
     active_named: Arc<dashmap::DashSet<(AgentId, String)>>,
     /// Shared session manager — used to give each subagent its own context
     session_manager: Arc<SessionManager>,
-    /// LLM client — cloned for each subagent runtime
-    llm: LlmClient,
+    /// Live server-default LLM client — cloned for each subagent runtime
+    /// at spawn time.
+    ///
+    /// Behind an `Arc<RwLock>` (rather than held by value) so the
+    /// gateway can share the *same* handle it hands to `AppState` and
+    /// `PATCH /settings` can rebuild the server-default `(model,
+    /// provider)` pair in place (#1148). Without the shared handle a
+    /// live default switch would reach the parent run but not the
+    /// subagents it spawns, splitting one run tree across two models.
+    /// Constructors that take an `LlmClient` by value wrap it in a
+    /// private handle nobody else can rebuild;
+    /// [`Coordinator::with_agent_config_and_shared_llm`] takes the
+    /// gateway's shared one instead.
+    llm: Arc<parking_lot::RwLock<LlmClient>>,
     /// Base agent config — subagents inherit sandbox settings from this.
     /// Shared with the gateway's AppState so PATCH /settings updates are
     /// visible to subsequently-spawned subagents.
@@ -315,7 +327,7 @@ impl Coordinator {
             subagents: Arc::new(DashMap::new()),
             active_named: Arc::new(dashmap::DashSet::new()),
             session_manager,
-            llm,
+            llm: Arc::new(parking_lot::RwLock::new(llm)),
             base_agent_config: Arc::new(parking_lot::RwLock::new(AgentConfig::default())),
             workspace_dir: None,
             data_dir: None,
@@ -339,6 +351,33 @@ impl Coordinator {
         llm: LlmClient,
         base_agent_config: Arc<parking_lot::RwLock<AgentConfig>>,
     ) -> Self {
+        Self::with_agent_config_and_shared_llm(
+            session_manager,
+            Arc::new(parking_lot::RwLock::new(llm)),
+            base_agent_config,
+        )
+    }
+
+    /// Create a coordinator that shares BOTH live server-default handles
+    /// with the gateway's `AppState` (#1148).
+    ///
+    /// `PATCH /settings` rebuilds the `LlmClient` behind `llm` in place
+    /// whenever the server-default `(model, provider)` pair changes, and
+    /// rewrites `base_agent_config` for the `context` / `session` /
+    /// `tools` / `llm` sections. Taking both as shared handles is what
+    /// keeps a parent run and the subagents it spawns on the same
+    /// server-default layer: `AppState` reads its own copy of the very
+    /// same `Arc`s, so a live switch cannot reach one and miss the other.
+    ///
+    /// Passing an owned client instead (see
+    /// [`Coordinator::with_agent_config`]) is correct for callers with no
+    /// gateway to share with — the coordinator then owns a handle nobody
+    /// else can rebuild.
+    pub fn with_agent_config_and_shared_llm(
+        session_manager: Arc<SessionManager>,
+        llm: Arc<parking_lot::RwLock<LlmClient>>,
+        base_agent_config: Arc<parking_lot::RwLock<AgentConfig>>,
+    ) -> Self {
         Self {
             subagents: Arc::new(DashMap::new()),
             active_named: Arc::new(dashmap::DashSet::new()),
@@ -355,6 +394,16 @@ impl Coordinator {
             subagent_self_sink: None,
             security_config: alms_core::config::SecurityConfig::default(),
         }
+    }
+
+    /// Snapshot the server-default client the way `spawn_subagent` does.
+    ///
+    /// Test-only mirror of the single production read site so a test can
+    /// assert the shared-handle contract from #1148 without driving a
+    /// full subagent spawn.
+    #[cfg(test)]
+    fn llm_snapshot(&self) -> LlmClient {
+        self.llm.read().clone()
     }
 
     /// Set the workspace base directory. Named subagents will get workspaces
@@ -585,7 +634,11 @@ impl Coordinator {
         let subagents = self.subagents.clone();
         let active_named = self.active_named.clone();
         let session_manager = self.session_manager.clone();
-        let llm = self.llm.clone();
+        // Snapshot the live server-default client under the lock so a
+        // `PATCH /settings` model/provider switch (#1148) is reflected in
+        // subsequently-spawned subagents, exactly like `base_agent_config`
+        // below.
+        let llm = self.llm.read().clone();
         // Snapshot the current config under the lock so that PATCH /settings
         // updates are reflected in subsequently-spawned subagents.
         let base_agent_config = self.base_agent_config.read().clone();
@@ -2363,6 +2416,88 @@ mod tests {
         };
         let llm = LlmClient::new(llm_config).unwrap();
         Coordinator::new(session_manager, llm)
+    }
+
+    // -- #1148: live server-default LLM handle -------------------------------
+
+    /// A coordinator built with
+    /// [`Coordinator::with_agent_config_and_shared_llm`] must read the
+    /// shared client at *use* time, so a `PATCH /settings` rebuild the
+    /// gateway performs after construction is visible to
+    /// subsequently-spawned subagents.
+    ///
+    /// Pre-#1148 the coordinator held the client by value, so a live
+    /// server-default switch reached the parent run (which reads
+    /// `AppState`'s handle) but not the subagents it spawned — one run
+    /// tree, two models, no operator-visible signal. `llm_snapshot()` is
+    /// the test-only mirror of the single read site in `spawn_subagent`.
+    #[test]
+    fn shared_llm_handle_is_read_at_use_time_not_at_construction() {
+        let session_manager = Arc::new(SessionManager::new(alms_session::SessionConfig::default()));
+        let shared = Arc::new(parking_lot::RwLock::new(
+            LlmClient::new(LlmConfig {
+                mock: true,
+                provider: "openrouter".into(),
+                default_model: "z-ai/glm-5.2".into(),
+                ..LlmConfig::default()
+            })
+            .unwrap(),
+        ));
+        let coord = Coordinator::with_agent_config_and_shared_llm(
+            session_manager,
+            Arc::clone(&shared),
+            Arc::new(parking_lot::RwLock::new(AgentConfig::default())),
+        );
+
+        assert_eq!(
+            coord.llm_snapshot().default_model(),
+            "z-ai/glm-5.2",
+            "baseline: the coordinator starts on the pair it was built with"
+        );
+
+        // Simulate the gateway's `AppState::refresh_llm_from_server_default`
+        // rebuilding the shared client after a `PATCH /settings`.
+        {
+            let mut guard = shared.write();
+            *guard = guard.clone().with_model("moonshotai/kimi-k2.5");
+        }
+
+        assert_eq!(
+            coord.llm_snapshot().default_model(),
+            "moonshotai/kimi-k2.5",
+            "the coordinator must read the SHARED handle at use time — a \
+             by-value copy taken at construction would still report the \
+             boot model and split the run tree across two models"
+        );
+    }
+
+    /// A coordinator built from an owned client keeps a private handle:
+    /// mutating an unrelated one must not affect it. Pins that the sharing
+    /// above comes from the explicit constructor rather than from some
+    /// incidental aliasing.
+    #[test]
+    fn coordinator_built_from_an_owned_client_keeps_its_own_handle() {
+        let session_manager = Arc::new(SessionManager::new(alms_session::SessionConfig::default()));
+        let original = LlmClient::new(LlmConfig {
+            mock: true,
+            default_model: "z-ai/glm-5.2".into(),
+            ..LlmConfig::default()
+        })
+        .unwrap();
+        let unrelated = Arc::new(parking_lot::RwLock::new(original.clone()));
+        let coord = Coordinator::new(session_manager, original);
+
+        {
+            let mut guard = unrelated.write();
+            *guard = guard.clone().with_model("moonshotai/kimi-k2.5");
+        }
+
+        assert_eq!(
+            coord.llm_snapshot().default_model(),
+            "z-ai/glm-5.2",
+            "a coordinator that was never handed the shared handle must keep \
+             the client it was constructed with"
+        );
     }
 
     fn test_session_id() -> SessionId {

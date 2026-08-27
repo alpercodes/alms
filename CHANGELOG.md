@@ -34,6 +34,41 @@ Per-release notes for ALMS, with an emphasis on **operator-facing changes** — 
 
 ### Notable changes
 
+- **The server-default LLM model / provider no longer needs a restart** (#1148).
+  Changing `model` / `provider` in the Settings modal (or via `PATCH /settings`)
+  now takes effect on the **next run**, matching the `context` / `session` /
+  `tools` / `llm` sections. Previously the pair was persistence-only: it was
+  written to `settings.json`, the response carried `restart_required: true`,
+  and the UI showed a yellow "restart required" banner. Both wire fields
+  (`restart_required`, `restart_reason`) and the banner are **gone** — clients
+  reading them should stop; the response is now always a plain
+  `{"status": "ok"}`. Agents carrying a per-agent `model` / `provider` on their
+  registry record are unaffected as before; only agents falling back to the
+  server default move. Runs already in flight keep the model they started on,
+  and the pair is still persisted for restart survival.
+  - `GET /settings.base_url` now reports the live client's URL. It was stale
+    after a persisted provider switch even across a restart, so a daemon could
+    report the old endpoint beside the new provider name.
+  - ⚠️ **New rejection:** a `PATCH /settings` that would leave the server
+    default with a model from another provider's namespace is now refused with
+    `422 INCOMPATIBLE_MODEL_FOR_PROVIDER` instead of being accepted and biting
+    on the next restart. (It is a namespace check — `claude-*` on Anthropic
+    wires, `gemini-*` on Gemini — not a model catalogue.) This already applied to provider switches; it now also
+    covers a **model-only** PATCH (e.g. `{"model": "gpt-4o"}` while the
+    server-default provider is `anthropic`). `OpenAiCompatible` providers —
+    OpenAI, OpenRouter, DeepSeek and friends — accept every namespace and are
+    unaffected. Send `model` and `provider` together for a cross-namespace
+    switch.
+  - ⚠️ **Mixed-section rejections leave the pair applied but unpersisted.** If
+    one body PATCHes the pair *and* some other section, and only the other
+    section fails, the `422` still leaves the new pair on the live client while
+    `settings.json` keeps the old one — so a restart silently reverts it.
+    Re-send `model` / `provider` alone and check for a `200`. A body rejected
+    for the pair itself commits neither half.
+  - **Telegram-triggered runs still use a boot-time snapshot** and pick the new
+    pair up only after a restart. This is the same documented HTTP-vs-Telegram
+    propagation split that already applies to every other live-mutable section
+    (`docs/api.md` § 10.2), not a new limitation.
 - **A cancelled or failed DM no longer starts a run on your session** (#1258). When a DM ended because its run was cancelled or died (an upstream 429, a tool panic, a posture trip), the gateway started a fresh LLM turn on the operator's web-chat to tell the agent about it. Cancelling a run and then watching a new spinner appear ~half a second later on the same session was indistinguishable from the cancel having been ignored. Such an end now arrives as the existing "DM conversation with {peer} ended" banner — persisted, so it survives reload — and spends no turn. The banner gained a `detail` line carrying the failure text (`dm_conversation_ended` SSE + `dm_ended_notification` marker metadata, both optional and absent for non-failure ends), since no turn narrates the failure any more. DM ends whose run *completed* still get their notification run, because they carry a transcript the agent has to relay: `ignored` and `depth_exceeded`, and also a failed end where the run finished but produced nothing deliverable or could not deliver its last reply — those may follow several real exchanges that live only in the DM session. Job-episode continuations (#1198) also still fire, so a job awaiting a DM is never stalled by the change. One consequence to be aware of: after an interrupted end the *operator* is told, but the *agent* is not — the DM transcript is still there in the DM view, but the agent has no signal the conversation closed.
 - **A reverted shell `cd` is now visible to the agent** (#1262) — when a command's final working directory fails containment, the shell tool keeps the previous working directory (unchanged) and now says so in the result: `stdout` gains a `[cwd unchanged: '<attempted>' <verdict>; subsequent commands still run in '<kept>']` line, on both the foreground and the background (`check_task`) path. Previously the revert was a daemon-side `warn!` only, so the agent saw `exit_code: 0`, assumed it had moved, and misread every relative path afterwards. `<verdict>` reports only what the check established: `is outside the sandbox root` when both the root and the candidate resolved and the candidate genuinely was not under the root, and `could not be confirmed inside the sandbox root` when either path could not be canonicalised (the check fails closed either way, but an unresolvable path proves nothing about where it is — under Windows Git Bash's `/tmp` mount that is every command, see #1266). The sandboxed tool description now states the confinement too; unrestricted / `[security].allow_full_os_access` instances skip containment and get neither the sentence nor the notice.
 - **Frontend dependency baseline audited and recorded** (#1232) — the `marked` 15→18 and `@preact/signals` 1→2 bumps that #1227 shipped unreviewed were verified against our usage (no rendering regressions; per-row sidebar reactivity intact), pinned by new markdown and active-run-dot tests, and documented in `docs/frontend.md`.
