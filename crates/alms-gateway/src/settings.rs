@@ -699,44 +699,117 @@ pub async fn patch_settings(
     }
 
     // ── Session ────────────────────────────────────────────────────────
+    //
+    // ── Shape: validate the whole section, then commit it (#1275) ───────
+    //
+    // This block used to commit every named field first and cross-validate
+    // afterwards, and its "revert" wrote `ctx_max` — the context window —
+    // rather than the pre-PATCH value. Two things followed. A rejected
+    // PATCH left `max_context_tokens` at a number the operator never sent;
+    // and because the check ran for *any* `body.session` rather than only
+    // for bodies naming the field, `{"session": {"max_messages": 50}}`
+    // could return `422` *and* move `max_context_tokens` once
+    // `context.max_input_tokens` had been raised past it — an error about
+    // one knob that silently changed another.
+    //
+    // Same treatment as the server-default pair block below (#1271): two
+    // phases that do not overlap.
+    //
+    //   Phase 1 — validate. Reads live state; writes only
+    //             `session_errors`. Mutates nothing shared.
+    //   Phase 2 — commit. Runs only when `session_errors` is empty and
+    //             contains no rejection path of its own, so no field can
+    //             land ahead of the gate that should have stopped it and
+    //             there is nothing to "revert".
+    //
+    // The section is all-or-nothing like the pair: a rejected `session`
+    // body leaves every session field at its pre-PATCH value. An unrelated
+    // section failing in the same body still leaves this one committed but
+    // unpersisted, which is the documented `status: "partial"` contract
+    // every section follows.
     if let Some(sess_patch) = &body.session {
-        let mut sess = state.session_config.write();
+        let mut session_errors: Vec<String> = Vec::new();
 
-        if let Some(v) = sess_patch.max_messages {
-            sess.max_messages = v;
-        }
-        if let Some(v) = sess_patch.max_context_tokens {
-            sess.max_context_tokens = v;
-        }
-        if let Some(v) = sess_patch.idle_timeout_secs {
-            sess.idle_timeout_secs = v;
-        }
-        if let Some(v) = sess_patch.auto_archive {
-            sess.auto_archive = v;
-        }
-        if let Some(v) = sess_patch.archive_ttl_secs {
-            sess.archive_ttl_secs = v;
+        // ── Phase 1: cross-section invariant ───────────────────────────
+        //
+        // Session storage must hold at least one full context window.
+        // Judged on the would-be post-PATCH pair, never on committed
+        // state: the session half is the body's value when it named one
+        // and the live value otherwise, and `ctx_max` is the post-PATCH
+        // context window (the context block above is itself
+        // validate-then-commit, so what it committed is what runs will
+        // use).
+        //
+        // Scoped to bodies that actually name one half of the invariant,
+        // mirroring the `compact_trigger_pct` / `compact_retain_pct` gap
+        // check above. A body naming neither half cannot move the two
+        // values relative to each other, so judging it can only produce
+        // an error about fields the operator did not send — which is how
+        // the old shape came to reject a lone `max_messages` change.
+        //
+        // This does tolerate a live pair that already violates, and that
+        // is deliberate: `session.max_context_tokens` has no runtime
+        // consumer. It is written here, read by `GET /settings` and
+        // `persist_settings`, and nowhere else — `SessionManager` takes a
+        // by-value clone at boot and reads only `idle_timeout_secs` from
+        // it. Nothing budgets against the pair, so the tolerated state is
+        // inert, while a 422 naming two fields the body never sent is a
+        // real rejection. The gap is real but belongs one level up: this
+        // is a cross-section rule living inside one section's block, so a
+        // context-only body escapes it entirely (tracked separately).
+        let live_max_context_tokens = state.session_config.read().max_context_tokens;
+        let next_max_context_tokens = sess_patch
+            .max_context_tokens
+            .unwrap_or(live_max_context_tokens);
+        let names_either_half = sess_patch.max_context_tokens.is_some()
+            || body
+                .context
+                .as_ref()
+                .is_some_and(|ctx_patch| ctx_patch.max_input_tokens.is_some());
+        if names_either_half {
+            let ctx_max = state.agent_config.read().context_config.max_input_tokens;
+            if next_max_context_tokens < ctx_max {
+                session_errors.push(format!(
+                    "session.max_context_tokens ({next_max_context_tokens}) must be >= \
+                     context.max_input_tokens ({ctx_max})",
+                ));
+            }
         }
 
-        // Cross-section validation: session storage must hold at least one
-        // full context window.
-        let ctx_max = state.agent_config.read().context_config.max_input_tokens;
-        if sess.max_context_tokens < ctx_max {
-            errors.push(format!(
-                "session.max_context_tokens ({}) must be >= context.max_input_tokens ({ctx_max})",
-                sess.max_context_tokens,
-            ));
-            // Revert to safe value
-            sess.max_context_tokens = ctx_max;
-        }
+        // ── Phase 2: commit ────────────────────────────────────────────
+        //
+        // Reached only when the whole section validated. Nothing here can
+        // reject. Each field is still written only when the body named it,
+        // so no unnamed field can move under any outcome.
+        let session_ok = session_errors.is_empty();
+        errors.append(&mut session_errors);
+        if session_ok {
+            let mut sess = state.session_config.write();
 
-        info!(
-            max_messages = sess.max_messages,
-            max_context_tokens = sess.max_context_tokens,
-            idle_timeout_secs = sess.idle_timeout_secs,
-            auto_archive = sess.auto_archive,
-            "Updated session config via PATCH /settings"
-        );
+            if let Some(v) = sess_patch.max_messages {
+                sess.max_messages = v;
+            }
+            if let Some(v) = sess_patch.max_context_tokens {
+                sess.max_context_tokens = v;
+            }
+            if let Some(v) = sess_patch.idle_timeout_secs {
+                sess.idle_timeout_secs = v;
+            }
+            if let Some(v) = sess_patch.auto_archive {
+                sess.auto_archive = v;
+            }
+            if let Some(v) = sess_patch.archive_ttl_secs {
+                sess.archive_ttl_secs = v;
+            }
+
+            info!(
+                max_messages = sess.max_messages,
+                max_context_tokens = sess.max_context_tokens,
+                idle_timeout_secs = sess.idle_timeout_secs,
+                auto_archive = sess.auto_archive,
+                "Updated session config via PATCH /settings"
+            );
+        }
     }
 
     // ── Tools ──────────────────────────────────────────────────────────
@@ -7508,5 +7581,291 @@ mod tests {
             "rejected 503 PATCH must not persist settings.json — found at {}",
             path.display(),
         );
+    }
+
+    // ==================================================================
+    // PATCH /settings § session — validate-then-commit (#1275)
+    //
+    // The section used to commit every named field first and cross-
+    // validate afterwards, with a "revert" that wrote `ctx_max` rather
+    // than the pre-PATCH value. These tests pin the properties the
+    // two-phase restructure buys; the first three are the ones that die
+    // when the Phase 2 gate (`session_ok`) is forced open, and the fourth
+    // is what dies if Phase 2 stops committing at all.
+    // ==================================================================
+
+    /// Coherent baseline — context window 128_000, session storage
+    /// 256_000 — plus recognisable non-default values on every other
+    /// session knob, so a commit is always distinguishable from the
+    /// defaults.
+    fn session_invariant_test_state() -> crate::server::AppState {
+        let state = settings_test_app_state();
+        state.agent_config.write().context_config.max_input_tokens = 128_000;
+        {
+            let mut sess = state.session_config.write();
+            sess.max_messages = 200;
+            sess.max_context_tokens = 256_000;
+            sess.idle_timeout_secs = 3600;
+            sess.auto_archive = true;
+            sess.archive_ttl_secs = 7200;
+        }
+        state
+    }
+
+    /// A rejected `session` PATCH leaves *every* session field at its
+    /// pre-PATCH value — `max_context_tokens` included. Pre-fix the
+    /// handler committed all five fields before the cross-section check
+    /// ran and then "reverted" `max_context_tokens` to the context
+    /// window, so a 422 landed four of the operator's values plus a fifth
+    /// number nobody had sent.
+    #[tokio::test]
+    async fn rejected_session_patch_leaves_every_field_at_its_pre_patch_value() {
+        use axum::body::to_bytes;
+        use axum::response::IntoResponse;
+
+        let mut state = session_invariant_test_state();
+        let tmp = tempfile::tempdir().unwrap();
+        state.data_dir = tmp.path().to_path_buf();
+
+        // Every knob named, with `max_context_tokens` below the live
+        // context window — so the section is rejected as a whole.
+        let body = PatchSettingsRequest {
+            session: Some(PatchSession {
+                max_messages: Some(50),
+                max_context_tokens: Some(64_000),
+                idle_timeout_secs: Some(99),
+                auto_archive: Some(false),
+                archive_ttl_secs: Some(111),
+            }),
+            ..Default::default()
+        };
+        let resp = patch_settings(
+            axum::extract::State(state.clone()),
+            Json(serde_json::to_value(&body).unwrap()),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(
+            json["errors"][0]
+                .as_str()
+                .is_some_and(|e| e.contains("session.max_context_tokens")),
+            "the 422 must name the field at fault; got: {json}"
+        );
+
+        let sess = state.session_config.read();
+        assert_eq!(
+            sess.max_context_tokens, 256_000,
+            "must hold the pre-PATCH value — not 64_000 (the rejected value) \
+             and not 128_000 (the old 'revert to ctx_max', a number the \
+             operator never sent)"
+        );
+        assert_eq!(
+            sess.max_messages, 200,
+            "no session field may commit behind the section's own rejection"
+        );
+        assert_eq!(sess.idle_timeout_secs, 3600);
+        assert!(sess.auto_archive);
+        assert_eq!(sess.archive_ttl_secs, 7200);
+    }
+
+    /// A `session` body that does not name `max_context_tokens` cannot
+    /// change it under any outcome.
+    ///
+    /// The old check fired for *any* `body.session`, not just bodies
+    /// touching the invariant. Once `context.max_input_tokens` had been
+    /// raised past the live session storage — reachable through a plain
+    /// `{"context": ...}` PATCH, which never runs this check —
+    /// `{"session": {"max_messages": 50}}` returned 422 *and* rewrote
+    /// `max_context_tokens`. The operator asked to change a message cap,
+    /// got an error, and a different setting moved.
+    #[tokio::test]
+    async fn session_patch_that_does_not_name_max_context_tokens_cannot_change_it() {
+        use axum::response::IntoResponse;
+
+        let mut state = session_invariant_test_state();
+        let tmp = tempfile::tempdir().unwrap();
+        state.data_dir = tmp.path().to_path_buf();
+        // Live state already violates the invariant, as an earlier
+        // context-only PATCH could leave it.
+        state.agent_config.write().context_config.max_input_tokens = 300_000;
+
+        let body = PatchSettingsRequest {
+            session: Some(PatchSession {
+                max_messages: Some(50),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let resp = patch_settings(
+            axum::extract::State(state.clone()),
+            Json(serde_json::to_value(&body).unwrap()),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "a body naming neither half of the invariant cannot make the \
+             relationship worse, so it must not be judged against it"
+        );
+        let sess = state.session_config.read();
+        assert_eq!(
+            sess.max_context_tokens, 256_000,
+            "a field the body never named must not move under any outcome"
+        );
+        assert_eq!(sess.max_messages, 50, "the named field must commit");
+    }
+
+    /// The invariant's other half. A body that raises
+    /// `context.max_input_tokens` above the live session storage *does*
+    /// touch the invariant, so it is still rejected — and the session
+    /// section commits nothing, including the unrelated field it named.
+    #[tokio::test]
+    async fn session_patch_rejected_via_the_context_half_commits_no_session_field() {
+        use axum::response::IntoResponse;
+
+        let _env = crate::test_env_locks::BudgetValidationEnvGuard::unset();
+
+        let mut state = session_invariant_test_state();
+        let tmp = tempfile::tempdir().unwrap();
+        state.data_dir = tmp.path().to_path_buf();
+
+        let body = PatchSettingsRequest {
+            context: Some(PatchContext {
+                max_input_tokens: Some(300_000),
+                ..Default::default()
+            }),
+            session: Some(PatchSession {
+                max_messages: Some(50),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let resp = patch_settings(
+            axum::extract::State(state.clone()),
+            Json(serde_json::to_value(&body).unwrap()),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let sess = state.session_config.read();
+        assert_eq!(
+            sess.max_messages, 200,
+            "the whole session section is gated on its own validation"
+        );
+        assert_eq!(sess.max_context_tokens, 256_000);
+        // The context section validates and commits on its own terms; its
+        // value landing beside a 422 from another section is the
+        // documented `status: "partial"` cross-section contract.
+        assert_eq!(
+            state.agent_config.read().context_config.max_input_tokens,
+            300_000
+        );
+    }
+
+    /// The invariant's accepting boundary, and the only path that reaches
+    /// it expecting a 200.
+    ///
+    /// Structural gap this closes: every other test that evaluates the
+    /// rule expects a rejection, so the `unwrap_or(live_max_context_tokens)`
+    /// fallback was only ever exercised on a body already heading for a
+    /// 422. This body names no session half, so the *live* value is what
+    /// the rule must judge — `unwrap_or(0)` turns this 200 into a 422.
+    /// Equality then pins the comparison itself: session storage equal to
+    /// the context window satisfies "at least one full context window",
+    /// so `<` → `<=` fails here too. One test, both mutants.
+    #[tokio::test]
+    async fn context_half_raised_to_the_live_session_ceiling_is_accepted() {
+        use axum::response::IntoResponse;
+
+        let _env = crate::test_env_locks::BudgetValidationEnvGuard::unset();
+
+        let mut state = session_invariant_test_state();
+        let tmp = tempfile::tempdir().unwrap();
+        state.data_dir = tmp.path().to_path_buf();
+
+        let body = PatchSettingsRequest {
+            // Raised to exactly the live session storage (256_000) —
+            // equal, not above, so the invariant still holds.
+            context: Some(PatchContext {
+                max_input_tokens: Some(256_000),
+                ..Default::default()
+            }),
+            // A session block is required to reach the rule at all, but
+            // it names neither half of it.
+            session: Some(PatchSession {
+                max_messages: Some(50),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let resp = patch_settings(
+            axum::extract::State(state.clone()),
+            Json(serde_json::to_value(&body).unwrap()),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "session storage equal to the context window satisfies \
+             'must be >=' — the section must commit, not reject"
+        );
+        let sess = state.session_config.read();
+        assert_eq!(sess.max_messages, 50, "the named session field commits");
+        assert_eq!(
+            sess.max_context_tokens, 256_000,
+            "the body named no session half, so the live value is what the \
+             rule judged — and it must not move"
+        );
+        assert_eq!(
+            state.agent_config.read().context_config.max_input_tokens,
+            256_000,
+            "the context half commits on its own terms"
+        );
+    }
+
+    /// Phase 2 commits. Without this the three gate tests above would all
+    /// pass against a handler that never writes anything at all.
+    #[tokio::test]
+    async fn accepted_session_patch_commits_every_named_field() {
+        use axum::response::IntoResponse;
+
+        let mut state = session_invariant_test_state();
+        let tmp = tempfile::tempdir().unwrap();
+        state.data_dir = tmp.path().to_path_buf();
+
+        let body = PatchSettingsRequest {
+            session: Some(PatchSession {
+                max_messages: Some(50),
+                // >= the live 128_000 context window.
+                max_context_tokens: Some(512_000),
+                idle_timeout_secs: Some(99),
+                auto_archive: Some(false),
+                archive_ttl_secs: Some(111),
+            }),
+            ..Default::default()
+        };
+        let resp = patch_settings(
+            axum::extract::State(state.clone()),
+            Json(serde_json::to_value(&body).unwrap()),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let sess = state.session_config.read();
+        assert_eq!(sess.max_messages, 50);
+        assert_eq!(sess.max_context_tokens, 512_000);
+        assert_eq!(sess.idle_timeout_secs, 99);
+        assert!(!sess.auto_archive);
+        assert_eq!(sess.archive_ttl_secs, 111);
     }
 }
