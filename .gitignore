@@ -14,8 +14,16 @@ secrets.json
 .env
 .env.local
 
-# Claude Code local state (agents, settings, scratch, memory — everything personal)
-.claude/
+# Claude Code local state (agents, settings, scratch — everything personal)
+#
+# `.claude/*` rather than `.claude/`: git cannot re-include a path whose parent
+# directory is excluded, so `.claude/` would make the negation below a no-op.
+# Excluding the *contents* keeps everything ignored while allowing one child back.
+.claude/*
+# Review agents' accumulated notes. Tracked deliberately: they are ignored-but-
+# untracked otherwise, which survives `checkout`/`reset --hard` but NOT
+# `git clean -xdf` — one sweep and months of findings are gone with no history.
+!.claude/agent-memory/
 CLAUDE.local.md
 
 # IDE
