@@ -541,7 +541,8 @@ impl Coordinator {
         // session map and creating a duplicate session row — leaving the
         // handle's `sub_session_id` pointing at an empty orphan while the
         // subagent's actual messages land on the second row (#1075).
-        let (sub_agent_id, sub_context_id) = derive_subagent_identity(task_id, &request);
+        let (sub_agent_id, sub_context_id) =
+            derive_subagent_identity(&self.session_manager, task_id, &request);
         let sub_session_id = self
             .session_manager
             .get_or_create(sub_agent_id, &sub_context_id)
@@ -1743,7 +1744,12 @@ fn agent_config_for_subagent(
 /// Named subagent sessions are keyed on `(parent_agent_id, name)` — not
 /// `(parent_session, name)` — so the same named subagent resolves to the
 /// same persistent session no matter which of the parent agent's chat
-/// sessions invoked it. See #1051 for the design decision.
+/// sessions invoked it. See #1051 for the design decision. The `agent_id`
+/// half of that key is the invoked agent's **registry id** since #1278, so
+/// the work lands in that agent's own timeline; the resolution rules
+/// (including the unregistered-name fallback) live in
+/// [`SessionManager::named_subagent_key`], which the by-name readback in
+/// `ReadSubagentSessionTool` shares so the two cannot drift.
 ///
 /// Ephemeral (unnamed) subagent contexts embed the parent agent id too —
 /// `subagent_{parent_agent_id}_{task_id}` — so `read_subagent_session`'s
@@ -1756,11 +1762,13 @@ fn agent_config_for_subagent(
 /// agent that learned it could read the transcript (Tim / Codex on PR #1185).
 /// The context format is coordinator-reserved — see
 /// `docs/security-model.md` § subagent session readback.
-fn derive_subagent_identity(task_id: TaskId, request: &SubagentRequest) -> (AgentId, String) {
+fn derive_subagent_identity(
+    session_manager: &SessionManager,
+    task_id: TaskId,
+    request: &SubagentRequest,
+) -> (AgentId, String) {
     if let Some(ref name) = request.subagent_name {
-        let stable_id = AgentId::deterministic(request.parent_agent_id, name);
-        let stable_ctx = format!("subagent_{}_{}", request.parent_agent_id.0, name);
-        (stable_id, stable_ctx)
+        session_manager.named_subagent_key(request.parent_agent_id, name)
     } else {
         (
             AgentId::new(),
@@ -2506,6 +2514,21 @@ mod tests {
 
     fn test_parent_agent_id() -> AgentId {
         AgentId::new()
+    }
+
+    /// A store-less `SessionManager` for the identity-derivation rows below.
+    ///
+    /// No SQLite store means no agent registry, which is the
+    /// unregistered-name branch of `named_subagent_key`: the key falls back
+    /// to `AgentId::deterministic(parent, name)`. That is deliberate here —
+    /// these rows pin the #1051 *keying* invariants (stable across parent
+    /// sessions, disjoint across parent agents), and the fallback id is the
+    /// arm those invariants have to hold on when no registry can speak.
+    /// The registry arm is covered by
+    /// `SessionManager::named_subagent_key`'s own tests in `alms-session`
+    /// and by `named_subagent_identity_uses_the_registry_id` below.
+    fn registryless_session_manager() -> SessionManager {
+        SessionManager::new(alms_session::SessionConfig::default())
     }
 
     // -- BackgroundCompletionGuard (#1198 step 7) -------------------------------
@@ -4011,7 +4034,8 @@ mod tests {
             subagent_name: None,
             parent_tool_invocation_id: None,
         };
-        let (sub_agent_id, sub_context_id) = derive_subagent_identity(task_id, &request);
+        let (sub_agent_id, sub_context_id) =
+            derive_subagent_identity(&session_manager, task_id, &request);
         let cancel_token = CancellationToken::new();
         cancel_token.cancel();
         let prompts = DashMap::new();
@@ -5308,8 +5332,9 @@ mod tests {
             parent_tool_invocation_id: None,
         };
 
-        let (id_a, ctx_a) = derive_subagent_identity(TaskId::new(), &req_a);
-        let (id_b, ctx_b) = derive_subagent_identity(TaskId::new(), &req_b);
+        let manager = registryless_session_manager();
+        let (id_a, ctx_a) = derive_subagent_identity(&manager, TaskId::new(), &req_a);
+        let (id_b, ctx_b) = derive_subagent_identity(&manager, TaskId::new(), &req_b);
 
         assert_eq!(
             id_a, id_b,
@@ -5349,8 +5374,9 @@ mod tests {
             parent_tool_invocation_id: None,
         };
 
-        let (id_a, ctx_a) = derive_subagent_identity(TaskId::new(), &mk(parent_a));
-        let (id_b, ctx_b) = derive_subagent_identity(TaskId::new(), &mk(parent_b));
+        let manager = registryless_session_manager();
+        let (id_a, ctx_a) = derive_subagent_identity(&manager, TaskId::new(), &mk(parent_a));
+        let (id_b, ctx_b) = derive_subagent_identity(&manager, TaskId::new(), &mk(parent_b));
 
         assert_ne!(
             id_a, id_b,
@@ -5384,19 +5410,138 @@ mod tests {
             parent_tool_invocation_id: None,
         };
 
-        let (_, named_ctx) = derive_subagent_identity(TaskId::new(), &mk(Some("reviewer")));
+        let manager = registryless_session_manager();
+        let (_, named_ctx) =
+            derive_subagent_identity(&manager, TaskId::new(), &mk(Some("reviewer")));
         assert_eq!(
             alms_core::parse_subagent_context(&named_ctx),
             Some(alms_core::SubagentOwner::Named("reviewer")),
             "named subagent context {named_ctx} must yield its name"
         );
 
-        let (_, ephemeral_ctx) = derive_subagent_identity(TaskId::new(), &mk(None));
+        let (_, ephemeral_ctx) = derive_subagent_identity(&manager, TaskId::new(), &mk(None));
         assert_eq!(
             alms_core::parse_subagent_context(&ephemeral_ctx),
             Some(alms_core::SubagentOwner::Ephemeral),
             "ephemeral subagent context {ephemeral_ctx} carries a task id, \
              which must never be reported as a name"
+        );
+    }
+
+    // -- (n) #1278 — a named subagent is filed under the invoked agent ----------
+
+    fn register_agent(manager: &SessionManager, name: &str) -> AgentId {
+        let record = alms_core::AgentRecord {
+            id: AgentId::new(),
+            name: name.to_string(),
+            description: String::new(),
+            model: None,
+            posture: None,
+            provider: None,
+            telegram_token: None,
+            thinking_budget_tokens: None,
+            reasoning_effort: None,
+            gemini_thinking_budget: None,
+            summary_provider: None,
+            summary_model: None,
+            worktree_mode: alms_core::WorktreeMode::Off,
+            debug_mode: false,
+            is_default: false,
+            created_at: chrono::Utc::now(),
+            last_active: chrono::Utc::now(),
+        };
+        manager.store().unwrap().create_agent(&record).unwrap();
+        record.id
+    }
+
+    /// #1278: dispatch files a named subagent's session under the INVOKED
+    /// agent's registry id, which is what puts the work in that agent's own
+    /// timeline. Pinned at the derivation because everything downstream
+    /// (the session row, the `Run` record, the sidebar grouping) reads this
+    /// one value.
+    #[test]
+    fn named_subagent_identity_uses_the_registry_id() {
+        let store = alms_session::SqliteStore::open_in_memory().unwrap();
+        let manager =
+            SessionManager::with_store(alms_session::SessionConfig::default(), store).unwrap();
+        let parent_agent_id = AgentId::new();
+        let reviewer = register_agent(&manager, "reviewer");
+
+        let request = SubagentRequest {
+            task: "t".into(),
+            parent_session: SessionId::new(),
+            parent_agent_id,
+            parent_run_id: None,
+            subagent_name: Some("reviewer".into()),
+            parent_tool_invocation_id: None,
+        };
+
+        let (agent_id, context_id) = derive_subagent_identity(&manager, TaskId::new(), &request);
+
+        assert_eq!(agent_id, reviewer);
+        assert_ne!(
+            agent_id,
+            AgentId::deterministic(parent_agent_id, "reviewer"),
+            "the pre-#1278 derived id resolved against no registered agent"
+        );
+        assert_eq!(
+            context_id,
+            format!("subagent_{}_reviewer", parent_agent_id.0),
+            "the context must stay byte-identical — the parent-ownership \
+             check in read_subagent_session reads it"
+        );
+    }
+
+    /// Ephemeral subagents have no registry agent to be filed under, so
+    /// #1278 does not apply to them: still a fresh id per invocation, still
+    /// a task-id context. #1279's `(subagent)` label depends on the second
+    /// half of that staying true.
+    #[test]
+    fn ephemeral_subagent_identity_is_untouched_by_the_registry() {
+        let store = alms_session::SqliteStore::open_in_memory().unwrap();
+        let manager =
+            SessionManager::with_store(alms_session::SessionConfig::default(), store).unwrap();
+        let parent_agent_id = AgentId::new();
+        register_agent(&manager, "reviewer");
+
+        let mk = || SubagentRequest {
+            task: "t".into(),
+            parent_session: SessionId::new(),
+            parent_agent_id,
+            parent_run_id: None,
+            subagent_name: None,
+            parent_tool_invocation_id: None,
+        };
+
+        let task_a = TaskId::new();
+        let task_b = TaskId::new();
+        let (id_a, ctx_a) = derive_subagent_identity(&manager, task_a, &mk());
+        let (id_b, ctx_b) = derive_subagent_identity(&manager, task_b, &mk());
+
+        assert_ne!(id_a, id_b, "each ephemeral invocation gets a fresh id");
+        assert_ne!(ctx_a, ctx_b);
+        assert_eq!(
+            alms_core::parse_subagent_context(&ctx_a),
+            Some(alms_core::SubagentOwner::Ephemeral)
+        );
+
+        // The ephemeral id must be RANDOM, not merely distinct per
+        // invocation. Routing this branch through `named_subagent_key`
+        // (task id standing in for a name) would also yield a different id
+        // every time, and would also land on the derived branch since no
+        // agent can be registered under a UUID-shaped name — but it would
+        // make the id a pure function of `(parent_agent_id, task_id)`,
+        // both of which the parent already holds. `SessionId::deterministic`
+        // runs over a hardcoded in-repo namespace, so a derivable agent id
+        // is a derivable SESSION id. Distinctness alone does not pin
+        // unpredictability, and a mutation proved it.
+        assert_ne!(
+            id_a,
+            AgentId::deterministic(parent_agent_id, &task_a.0.to_string())
+        );
+        assert_ne!(
+            id_b,
+            AgentId::deterministic(parent_agent_id, &task_b.0.to_string())
         );
     }
 

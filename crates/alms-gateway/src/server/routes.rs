@@ -20,7 +20,10 @@ use crate::runs::{
 };
 use crate::settings::{get_settings, patch_settings};
 use crate::workspace::{get_workspace, open_workspace, update_workspace_file};
-use alms_core::{AgentId, SessionId, SubagentOwner, dm_participants, parse_subagent_context};
+use alms_core::{
+    AgentId, SessionId, SubagentOwner, dm_participants, parse_subagent_context,
+    parse_subagent_parent,
+};
 use alms_session::{Content, Role, Session};
 use axum::{
     Json, Router,
@@ -336,6 +339,14 @@ async fn health_check() -> impl IntoResponse {
 ///   `context_id` — the agent for `notifications:{agent}`, the
 ///   subagent for `subagent_{parent}_{name}` (#1277). Absent when the
 ///   context carries no recoverable owner.
+/// - `parent_agent_id`: for subagent sessions only, the agent that
+///   invoked the subagent, recovered from the `context_id` (#1278).
+///   Absent when the context carries no readable parent.
+///
+/// Named subagent sessions are listed (#1278) — they are filed under the
+/// invoked agent's registry id, so they belong in that agent's timeline.
+/// Ephemeral subagent and episodic sessions are not; see the `"subagent"`
+/// arm below for why the split falls there.
 /// - `has_active_run`: `true` if any queued or running run is currently
 ///   tied to this session — drives the sidebar's "active" indicator on
 ///   the initial load and after SSE reconnect (#856). Pairs with the
@@ -386,8 +397,40 @@ async fn list_sessions(
                     continue;
                 }
             }
+            "subagent" => {
+                // #1278: a NAMED subagent session is filed under the invoked
+                // agent's registry id, so it belongs in that agent's own
+                // timeline — which is Alper's actual complaint ("the invoked
+                // agent's work is not in its own timeline"). Same `agent_id`
+                // filter semantics as the notification / job arms above.
+                //
+                // EPHEMERAL subagent sessions stay excluded, and not as an
+                // arbitrary cut-off: an ephemeral subagent has no registry
+                // agent, so there is no timeline for it to appear in — its
+                // `agent_id` is a fresh `AgentId::new()` that matches no
+                // agent filter and no sidebar group. Listing them would also
+                // put one permanent row in the sidebar per one-shot
+                // `invoke_agent` call. They remain reachable the way they
+                // already were: by session id, via `GET /session/{id}` and
+                // the parent's `invoke_agent` result / `subagent_started`.
+                //
+                // A context this binary cannot parse is excluded too — that
+                // is the pre-#1278 behaviour, and an unreadable owner is
+                // exactly the case #1277 decided must not be guessed at.
+                if !matches!(
+                    parse_subagent_context(&session.context_id),
+                    Some(SubagentOwner::Named(_))
+                ) {
+                    continue;
+                }
+                if let Some(agent_id) = params.agent_id
+                    && session.agent_id != agent_id
+                {
+                    continue;
+                }
+            }
             _ if is_internal => {
-                // Other internal sessions (subagent, episodic): always excluded
+                // Other internal sessions (episodic): always excluded
                 continue;
             }
             _ => {
@@ -405,10 +448,12 @@ async fn list_sessions(
         // `include_parent_session_id = false` here: the per-subagent-session
         // `parent_run_id` -> parent `session_id` walk would be an N x lookup
         // across all subagent rows in `runs`, and the sidebar does not need
-        // it (subagent sessions are filtered out of `list_sessions` entirely
-        // unless an inclusion flag is added later). The new
-        // `GET /session/{session_id}` endpoint (Iris's spec for #1065) is
-        // the cheap one-shot probe path that pays for it.
+        // it. Named subagent rows DO reach the sidebar since #1278, but the
+        // attribution they render is the invoking agent, which comes from
+        // `parent_agent_id` — parsed straight out of the `context_id` for
+        // free. The parent SESSION breadcrumb is a different (and much more
+        // expensive) question, and `GET /session/{session_id}` (Iris's spec
+        // for #1065) stays the one-shot probe path that pays for it.
         let obj = enrich_session_json(&state, &session, session_type, false);
 
         result.push(obj);
@@ -488,13 +533,20 @@ fn enrich_session_json(
             }
         }
         "subagent" => {
-            // #1277: a subagent session is stored under a DERIVED agent id
-            // (`AgentId::deterministic(parent, name)` for named subagents,
-            // a fresh `AgentId::new()` for ephemeral ones), so the frontend's
-            // agents-list lookup resolves nothing and its label fell back to
+            // #1277: the frontend's agents-list lookup on `agent_id` could
+            // not name a subagent session, so its label fell back to
             // whichever agent happened to be active — the PARENT. The
-            // `context_id` is the only surviving carrier of the identity, so
-            // recover it here, exactly as the notification arm above does.
+            // `context_id` carries the identity, so recover it here,
+            // exactly as the notification arm above does.
+            //
+            // #1278 made `agent_id` resolve too, for the named case: those
+            // sessions are now filed under the invoked agent's registry id.
+            // This arm stays authoritative anyway, and the two agree by
+            // construction — the registry id is looked up BY this same name
+            // (`SessionManager::named_subagent_key`). It has to stay because
+            // it is still the only answer for the two cases `agent_id`
+            // cannot cover: an ephemeral subagent (fresh `AgentId::new()`),
+            // and a named one whose agent was never registered.
             //
             // Left unset for an unparseable context: an absent `agent_name`
             // renders as no name, which is the correct answer for "unknown
@@ -509,6 +561,23 @@ fn enrich_session_json(
                     obj["agent_name"] = serde_json::json!(EPHEMERAL_SUBAGENT_LABEL);
                 }
                 None => {}
+            }
+
+            // #1278: who ASKED for the work. Once the row lives in the
+            // invoked agent's own timeline, its own name is what the
+            // surrounding group header already says — the invoking parent is
+            // the part that distinguishes two rows from each other. Read
+            // straight out of the `context_id`, so it costs nothing and is
+            // available for ephemeral rows too (`GET /session/{id}` serves
+            // them even though the listing does not).
+            //
+            // Emitted as an id, not a name: resolving it would need a
+            // registry lookup per row, and the client already holds the
+            // agents list it would be resolved against. Omitted — not
+            // null — when the context carries no readable parent, matching
+            // `agent_name` above.
+            if let Some(parent) = parse_subagent_parent(&session.context_id) {
+                obj["parent_agent_id"] = serde_json::json!(parent);
             }
         }
         _ => {}
@@ -1483,14 +1552,149 @@ mod tests {
         }
     }
 
+    // -----------------------------------------------------------------
+    // Named subagent sessions in the invoked agent's timeline (#1278)
+    // -----------------------------------------------------------------
+
+    /// File a session exactly as post-#1278 dispatch does for a named
+    /// subagent: under the INVOKED agent's registry id, on a context that
+    /// still names the invoking parent.
+    fn seed_named_subagent(
+        state: &AppState,
+        invoked_agent_id: AgentId,
+        parent_agent_id: AgentId,
+        name: &str,
+    ) -> String {
+        let context_id = alms_core::named_subagent_context_id(parent_agent_id, name);
+        state
+            .session_manager
+            .get_or_create(invoked_agent_id, &context_id);
+        context_id
+    }
+
     #[tokio::test]
-    async fn list_sessions_still_excludes_subagent_and_episodic_sessions() {
-        // The #1197 carve-out is for job sessions only — the other
-        // internal prefixes stay hidden from the sidebar.
+    async fn list_sessions_surfaces_a_named_subagent_session_in_its_own_timeline() {
+        let state = test_app_state();
+        let reviewer = AgentId::new();
+        let parent = AgentId::new();
+        let context_id = seed_named_subagent(&state, reviewer, parent, "reviewer");
+
+        let sessions = invoke_list_sessions(state, None, None).await;
+
+        let row = sessions
+            .iter()
+            .find(|s| s["context_id"] == serde_json::json!(context_id))
+            .unwrap_or_else(|| panic!("named subagent session missing: {sessions:?}"));
+        assert_eq!(row["session_type"], "subagent");
+        assert_eq!(
+            row["agent_id"],
+            serde_json::json!(reviewer),
+            "the row must group under the agent that did the work"
+        );
+        assert_eq!(row["agent_name"], "reviewer");
+        assert_eq!(
+            row["parent_agent_id"],
+            serde_json::json!(parent),
+            "the row must carry who asked for the work"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_sessions_scopes_a_named_subagent_row_to_the_invoked_agent() {
+        // The `agent_id` filter is what makes this a *timeline* rather than
+        // a global list: reviewer's per-agent fetch returns the row, and
+        // the parent's does not — the parent's own chat sessions are a
+        // different surface, and its `invoke_agent` breadcrumbs live on the
+        // run it started.
+        let state = test_app_state();
+        let reviewer = AgentId::new();
+        let parent = AgentId::new();
+        let context_id = seed_named_subagent(&state, reviewer, parent, "reviewer");
+
+        let for_reviewer = invoke_list_sessions(state.clone(), Some(reviewer), None).await;
+        assert!(
+            for_reviewer
+                .iter()
+                .any(|s| s["context_id"] == serde_json::json!(context_id)),
+            "invoked agent's own fetch is missing its subagent session: {for_reviewer:?}"
+        );
+
+        let for_parent = invoke_list_sessions(state, Some(parent), None).await;
+        assert!(
+            !for_parent
+                .iter()
+                .any(|s| s["context_id"] == serde_json::json!(context_id)),
+            "the subagent row leaked into the invoking parent's fetch: {for_parent:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_sessions_shows_a_self_invoked_subagent_row_to_its_own_parent() {
+        // The exception to the rule above, and the reason it is stated as
+        // "scoped to the invoked agent" rather than "hidden from the
+        // parent". `invoke_agent { name: "atlas" }` from atlas is not
+        // forbidden — self-invoke guards are out of scope for #1278 — and
+        // it yields `subagent_{atlas}_atlas` filed under atlas. Here the
+        // invoked agent and the invoking parent are the same agent, so the
+        // row correctly appears in "the parent's" fetch. Pinned so a future
+        // reader does not read the sibling test's message as a rule and
+        // "fix" this into a leak.
+        let state = test_app_state();
+        let atlas = AgentId::new();
+        let context_id = seed_named_subagent(&state, atlas, atlas, "atlas");
+
+        let rows = invoke_list_sessions(state, Some(atlas), None).await;
+        let row = rows
+            .iter()
+            .find(|s| s["context_id"] == serde_json::json!(context_id))
+            .unwrap_or_else(|| panic!("self-invoked subagent row missing: {rows:?}"));
+        assert_eq!(
+            row["parent_agent_id"],
+            serde_json::json!(atlas),
+            "the parent recovered from the context is the agent itself"
+        );
+        assert_eq!(row["agent_id"], serde_json::json!(atlas));
+    }
+
+    #[tokio::test]
+    async fn list_sessions_separates_two_parents_rows_for_one_invoked_agent() {
+        let state = test_app_state();
+        let reviewer = AgentId::new();
+        let parent_a = AgentId::new();
+        let parent_b = AgentId::new();
+        let ctx_a = seed_named_subagent(&state, reviewer, parent_a, "reviewer");
+        let ctx_b = seed_named_subagent(&state, reviewer, parent_b, "reviewer");
+
+        let rows = invoke_list_sessions(state, Some(reviewer), None).await;
+
+        let find = |ctx: &String| {
+            rows.iter()
+                .find(|s| s["context_id"] == serde_json::json!(ctx))
+                .unwrap_or_else(|| panic!("row for {ctx} missing: {rows:?}"))
+                .clone()
+        };
+        // Both live in reviewer's timeline, and the ONLY thing telling
+        // them apart in the sidebar is the invoking parent.
+        assert_eq!(find(&ctx_a)["parent_agent_id"], serde_json::json!(parent_a));
+        assert_eq!(find(&ctx_b)["parent_agent_id"], serde_json::json!(parent_b));
+    }
+
+    #[tokio::test]
+    async fn list_sessions_still_excludes_episodic_and_nameless_subagent_sessions() {
+        // The #1278 carve-out is for NAMED subagent sessions only. An
+        // ephemeral one has no registry agent, so there is no timeline for
+        // it to appear in — and listing them would add a permanent sidebar
+        // row per one-shot invoke_agent call. Episodic sessions and
+        // contexts this binary cannot parse stay hidden as before.
         let state = test_app_state();
         let agent_id = AgentId::new();
-        let sub_context = format!("subagent_{}", uuid::Uuid::new_v4());
-        state.session_manager.get_or_create(agent_id, &sub_context);
+        let parent = AgentId::new();
+        let ephemeral = format!("subagent_{}_{}", parent.0, uuid::Uuid::new_v4());
+        let legacy = format!("subagent_{}", uuid::Uuid::new_v4());
+        let unreadable = format!("subagent_{}_NotAName", parent.0);
+        for ctx in [&ephemeral, &legacy, &unreadable] {
+            state.session_manager.get_or_create(agent_id, ctx);
+        }
         state
             .session_manager
             .get_or_create(agent_id, "episodic:some-summary");
@@ -1503,5 +1707,49 @@ mod tests {
                 .any(|s| s["session_type"] == "subagent" || s["session_type"] == "episodic"),
             "internal subagent/episodic sessions leaked into GET /sessions: {sessions:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn get_session_metadata_subagent_envelope_carries_the_invoking_parent() {
+        // `GET /session/{id}` serves the sessions the listing does not, so
+        // the parent attribution has to be there for ephemeral rows too.
+        let state = test_app_state();
+        let parent = AgentId::new();
+        let named = state.session_manager.get_or_create(
+            AgentId::new(),
+            alms_core::named_subagent_context_id(parent, "reviewer"),
+        );
+        let ephemeral = state.session_manager.get_or_create(
+            AgentId::new(),
+            format!("subagent_{}_{}", parent.0, uuid::Uuid::new_v4()),
+        );
+
+        for session_id in [named.id, ephemeral.id] {
+            let (status, body) = invoke_get_session_metadata(state.clone(), session_id).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(body["session_type"], "subagent");
+            assert_eq!(body["parent_agent_id"], serde_json::json!(parent));
+        }
+    }
+
+    #[tokio::test]
+    async fn get_session_metadata_omits_parent_agent_id_when_the_context_is_unreadable() {
+        // Same rule `agent_name` follows: an unreadable owner is reported
+        // as absent, never guessed at (#1277).
+        let state = test_app_state();
+        let session = state
+            .session_manager
+            .get_or_create(AgentId::new(), format!("subagent_{}", uuid::Uuid::new_v4()));
+        let session_id = session.id;
+
+        let (status, body) = invoke_get_session_metadata(state, session_id).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["session_type"], "subagent");
+        assert!(
+            body.get("parent_agent_id").is_none(),
+            "a legacy context carries no readable parent; got {body}"
+        );
+        assert!(body.get("agent_name").is_none());
     }
 }

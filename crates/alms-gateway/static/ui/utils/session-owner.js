@@ -18,12 +18,21 @@
 //   2. `agent_id` — resolved against the in-memory agents list. This arm
 //      covers chat sessions and JOB sessions, which are stored under the
 //      owning agent's real id (`fire_job_run` uses
-//      `get_or_create(job.agent_id, "job_{id}")`). It does NOT cover
-//      subagent sessions: those are stored under a DERIVED id
-//      (`AgentId::deterministic(parent_agent_id, name)` for named ones,
-//      a fresh `AgentId::new()` for ephemeral ones) which matches no
-//      registered agent, so they depend entirely on arm 1. Mirrors
-//      `crossAgentOwner` in components/sidebar/session-list.js.
+//      `get_or_create(job.agent_id, "job_{id}")`). Since #1278 it also
+//      resolves for a NAMED subagent session, which is filed under the
+//      invoked agent's registry id — and it agrees with arm 1, because
+//      the registry id was looked up by that same name. Arm 1 still wins
+//      by order and is still the only answer for the cases arm 2 cannot
+//      reach: an ephemeral subagent (fresh `AgentId::new()`) and a named
+//      one whose agent was never registered (still the pre-#1278 derived
+//      id).
+//
+//      Note this is NOT the same question `crossAgentOwner` in
+//      components/sidebar/session-list.js answers for a subagent row:
+//      that one deliberately reports the INVOKING parent, because its
+//      answer is rendered next to a group header that already names the
+//      owner. Here the owner is what's wanted — these names go on the
+//      session's own assistant bubbles.
 //
 // Returns null when there is no clear single owner:
 //   - DM sessions (stored under the AgentId::nil() sentinel, which never
@@ -82,11 +91,11 @@ export function sessionOwnerName(session, agentList) {
  *
  * Gating the fallback on "is there an envelope" is default-deny about
  * what is IN the envelope but default-allow about the envelope being
- * missing — and for subagent sessions the envelope arrives through
- * exactly one fallible path. They are excluded from `list_sessions`
- * outright (`routes.rs` — "Other internal sessions (subagent, episodic):
- * always excluded"), so the ONLY thing that ever populates
- * `activeSession` for them is the single-session GET in
+ * missing — and for subagent sessions the envelope can still arrive
+ * through a fallible path. #1278 put NAMED subagent rows on
+ * `list_sessions`, but ephemeral ones stay excluded (`routes.rs`, the
+ * `"subagent"` arm), so for those the ONLY thing that ever populates
+ * `activeSession` is the single-session GET in
  * `utils/load-session.js`, inside a `try` whose `catch` is explicitly
  * "Non-fatal — log and continue". A 404 or a network blip there leaves
  * `activeSession` null while a subagent session is very much on screen,

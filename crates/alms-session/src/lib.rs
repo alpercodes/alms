@@ -763,6 +763,90 @@ impl SessionManager {
         self.store.as_ref()
     }
 
+    /// Resolve the `(agent_id, context_id)` key a **named** subagent
+    /// session is filed under (#1278).
+    ///
+    /// The single source of truth for that key. Two callers must agree on
+    /// it exactly or a named subagent silently forks into two session rows:
+    /// the coordinator's `derive_subagent_identity` (write) and
+    /// `ReadSubagentSessionTool`'s by-name lookup (read).
+    ///
+    /// # Which agent id
+    ///
+    /// The invoked agent's **registry id**, when a registry record exists
+    /// for `name`. Before #1278 the key was
+    /// `AgentId::deterministic(parent_agent_id, name)`, which resolves
+    /// against no registered agent — so a named subagent's transcript was
+    /// filed under an id nothing in the product could look up, and the
+    /// invoked agent's own work never appeared in its own timeline. The
+    /// `context_id` is unchanged (see
+    /// [`alms_core::named_subagent_context_id`]): the parent-ownership
+    /// check reads its bytes.
+    ///
+    /// # When there is no registry record
+    ///
+    /// `invoke_agent` validates the *shape* of a subagent name but does not
+    /// require it to be registered — an unregistered name runs with default
+    /// config and a `WARN`. There is no registry id to file such a session
+    /// under, so it keeps the derived one. This is the only surviving use
+    /// of `AgentId::deterministic` for subagent keying, and it is a live
+    /// case rather than a legacy accommodation.
+    ///
+    /// # This answer does not depend on what is already stored
+    ///
+    /// The key is a pure function of the registry *when the registry can be
+    /// read*, deliberately: it never looks at whether a session already sits
+    /// on either key. So a name invoked before its agent was registered
+    /// lands on the derived id, and the invocation after the registration
+    /// lands on the registry id and starts a fresh session — the earlier
+    /// transcript stays in the database but is no longer reachable by name.
+    ///
+    /// The qualifier is load-bearing. A store error is *not* the same answer
+    /// as "no such agent" even though both fall back to the derived id: an
+    /// absent agent gives the same key on every invocation, whereas a
+    /// transient read failure files one invocation on a different key than
+    /// the invocation either side of it, forking the named subagent's
+    /// session. That is exactly the order-dependence the paragraph above
+    /// claims is excluded, so it is logged rather than swallowed — the
+    /// #1241/#1246 rule that "absent" and "unreadable" must not collapse
+    /// into one silent `None`. Nothing is corrupted (the fallback is the
+    /// pre-#1278 derived id, not a fresh one) and failing the invocation
+    /// instead would make a named subagent unusable for as long as the
+    /// fault lasts, so the fork is the cheaper disposition — but it must be
+    /// visible.
+    ///
+    /// Databases written before #1278 lose their named subagent history the
+    /// same way, and there is no migration to re-home them. That is an
+    /// accepted, deliberate break (ALMS has no production deployments):
+    /// keying on "what happens to be stored" would make the identity of a
+    /// named subagent depend on invocation order, which is a far worse
+    /// thing to carry forward than one lost transcript.
+    pub fn named_subagent_key(&self, parent_agent_id: AgentId, name: &str) -> (AgentId, String) {
+        let context_id = alms_core::named_subagent_context_id(parent_agent_id, name);
+
+        let registry_id = self.store.as_ref().and_then(|store| {
+            match store.load_agent_by_name(name) {
+                Ok(record) => record.map(|r| r.id),
+                Err(e) => {
+                    tracing::warn!(
+                        subagent_name = %name,
+                        parent_agent_id = %parent_agent_id.0,
+                        error = %e,
+                        "Agent registry unreadable while keying a named subagent; filing this \
+                         invocation under the derived fallback id, which forks its session from \
+                         invocations that resolved the registry id"
+                    );
+                    None
+                }
+            }
+        });
+
+        match registry_id {
+            Some(agent_id) => (agent_id, context_id),
+            None => (AgentId::deterministic(parent_agent_id, name), context_id),
+        }
+    }
+
     /// Flush the SQLite WAL to disk. No-op if no SQLite store is attached.
     pub fn flush_wal(&self) -> AlmsResult<()> {
         if let Some(store) = &self.store {
@@ -1238,5 +1322,207 @@ mod tests {
         // Non-existent session should return None (not panic).
         let found = mgr.find_last_message(bogus, |_| true);
         assert!(found.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // named_subagent_key (#1278)
+    // -----------------------------------------------------------------------
+
+    fn register_agent(mgr: &SessionManager, name: &str) -> AgentId {
+        let record = alms_core::AgentRecord {
+            id: AgentId::new(),
+            name: name.to_string(),
+            description: String::new(),
+            model: None,
+            posture: None,
+            provider: None,
+            telegram_token: None,
+            thinking_budget_tokens: None,
+            reasoning_effort: None,
+            gemini_thinking_budget: None,
+            summary_provider: None,
+            summary_model: None,
+            worktree_mode: alms_core::WorktreeMode::Off,
+            debug_mode: false,
+            is_default: false,
+            created_at: chrono::Utc::now(),
+            last_active: chrono::Utc::now(),
+        };
+        mgr.store().unwrap().create_agent(&record).unwrap();
+        record.id
+    }
+
+    /// The point of #1278: a named subagent's session is filed under the
+    /// INVOKED agent's registry id, so it lands in that agent's own
+    /// timeline instead of under an id nothing can look up.
+    #[test]
+    fn named_subagent_key_files_under_the_invoked_agents_registry_id() {
+        let mgr = make_manager();
+        let parent = AgentId::new();
+        let reviewer = register_agent(&mgr, "reviewer");
+
+        let (agent_id, context_id) = mgr.named_subagent_key(parent, "reviewer");
+
+        assert_eq!(agent_id, reviewer);
+        assert_ne!(
+            agent_id,
+            AgentId::deterministic(parent, "reviewer"),
+            "the pre-#1278 derived id must no longer be the filing key"
+        );
+        assert_eq!(context_id, format!("subagent_{}_reviewer", parent.0));
+    }
+
+    /// The `context_id` is load-bearing for the parent-ownership check in
+    /// `read_subagent_session` and for the sidebar's owner label, and #1278
+    /// deliberately did not touch it. Two different parents invoking the
+    /// same registered agent therefore share the agent id and are kept
+    /// apart by the context — one row each, both in reviewer's timeline.
+    #[test]
+    fn named_subagent_key_keeps_parents_apart_by_context_not_by_agent_id() {
+        let mgr = make_manager();
+        let parent_a = AgentId::new();
+        let parent_b = AgentId::new();
+        let reviewer = register_agent(&mgr, "reviewer");
+
+        let (id_a, ctx_a) = mgr.named_subagent_key(parent_a, "reviewer");
+        let (id_b, ctx_b) = mgr.named_subagent_key(parent_b, "reviewer");
+
+        assert_eq!(id_a, reviewer);
+        assert_eq!(id_b, reviewer);
+        assert_ne!(ctx_a, ctx_b);
+        assert_eq!(
+            alms_core::parse_subagent_parent(&ctx_a),
+            Some(parent_a),
+            "the ownership check reads the parent out of these bytes"
+        );
+        assert_eq!(alms_core::parse_subagent_parent(&ctx_b), Some(parent_b));
+    }
+
+    /// `invoke_agent` validates the SHAPE of a subagent name, not its
+    /// presence in the registry — an unregistered name runs on defaults.
+    /// There is no registry id to file it under, so the key stays on the
+    /// pre-#1278 derived id rather than inventing one.
+    #[test]
+    fn named_subagent_key_falls_back_to_the_derived_id_for_an_unregistered_name() {
+        let mgr = make_manager();
+        let parent = AgentId::new();
+
+        let (agent_id, context_id) = mgr.named_subagent_key(parent, "never-registered");
+
+        assert_eq!(agent_id, AgentId::deterministic(parent, "never-registered"));
+        assert_eq!(
+            context_id,
+            format!("subagent_{}_never-registered", parent.0)
+        );
+    }
+
+    /// A store-less manager has no registry to consult at all. Same answer
+    /// as an unregistered name — never a panic, never a fresh id.
+    #[test]
+    fn named_subagent_key_falls_back_without_a_store() {
+        let mgr = SessionManager::new(SessionConfig::default());
+        let parent = AgentId::new();
+
+        assert_eq!(
+            mgr.named_subagent_key(parent, "reviewer"),
+            (
+                AgentId::deterministic(parent, "reviewer"),
+                format!("subagent_{}_reviewer", parent.0)
+            )
+        );
+    }
+
+    /// The key is a function of the REGISTRY, never of what is already
+    /// stored. Pinned because the tempting alternative — "keep whichever
+    /// key already has a session" — would make a named subagent's identity
+    /// depend on invocation order, and it is exactly the shape a reader
+    /// would reach for on seeing the orphan below.
+    ///
+    /// There is no migration re-homing pre-#1278 rows: a session filed
+    /// under the derived id before its agent was registered is left where
+    /// it is and stops being reachable by name. That break is deliberate
+    /// and accepted (ALMS has no production deployments).
+    #[test]
+    fn named_subagent_key_follows_the_registry_even_past_an_existing_session() {
+        let mgr = make_manager();
+        let parent = AgentId::new();
+        let derived_id = AgentId::deterministic(parent, "reviewer");
+        let context_id = format!("subagent_{}_reviewer", parent.0);
+
+        // Invoked while unregistered: the session lands on the derived key.
+        let orphaned = mgr.get_or_create(derived_id, &context_id);
+
+        // The agent is registered afterwards.
+        let reviewer = register_agent(&mgr, "reviewer");
+        assert_ne!(reviewer, derived_id);
+
+        let key = mgr.named_subagent_key(parent, "reviewer");
+        assert_eq!(key, (reviewer, context_id));
+        assert_ne!(
+            mgr.get_or_create(key.0, &key.1).id,
+            orphaned.id,
+            "the next invocation starts a fresh session under the registry id"
+        );
+    }
+
+    /// The key is stable across repeated lookups — creating the session in
+    /// between must not change the answer (the corollary of the rule above,
+    /// stated from the direction callers actually hit it).
+    #[test]
+    fn named_subagent_key_is_stable_across_repeated_lookups() {
+        let mgr = make_manager();
+        let parent = AgentId::new();
+        register_agent(&mgr, "reviewer");
+
+        let first = mgr.named_subagent_key(parent, "reviewer");
+        let session = mgr.get_or_create(first.0, &first.1);
+        let second = mgr.named_subagent_key(parent, "reviewer");
+
+        assert_eq!(first, second);
+        assert_eq!(mgr.get_or_create(second.0, &second.1).id, session.id);
+    }
+
+    /// An unreadable registry is not the same event as an absent agent, and
+    /// the two must not converge on one silent `None` (#1241/#1246). They do
+    /// share a *disposition* — the derived fallback, which is why nothing is
+    /// corrupted — and this pins that specifically: a store failure must
+    /// yield the same key an unregistered name yields, never a fresh id.
+    ///
+    /// The part that is not pinnable here is the `warn!`: `alms-session` has
+    /// no capture harness, and the fault it names is real but cheap — one
+    /// invocation forks onto the fallback key while its neighbours resolve
+    /// the registry id, so a named subagent's session splits in two for as
+    /// long as the store is unwell.
+    #[test]
+    fn named_subagent_key_falls_back_to_the_derived_id_when_the_registry_is_unreadable() {
+        let mgr = make_manager();
+        let parent = AgentId::new();
+        register_agent(&mgr, "reviewer");
+
+        let healthy = mgr.named_subagent_key(parent, "reviewer");
+        assert_ne!(
+            healthy.0,
+            AgentId::deterministic(parent, "reviewer"),
+            "control: with a readable registry the key is the registry id"
+        );
+
+        // `load_agent_by_name` now returns Err, not Ok(None).
+        mgr.store().unwrap().drop_agents_table_for_test().unwrap();
+
+        let degraded = mgr.named_subagent_key(parent, "reviewer");
+        assert_eq!(
+            degraded,
+            (
+                AgentId::deterministic(parent, "reviewer"),
+                format!("subagent_{}_reviewer", parent.0)
+            ),
+            "an unreadable registry falls back to the derived id — the same answer an \
+             unregistered name gives, so the fork is recoverable rather than a fresh identity"
+        );
+        assert_eq!(
+            degraded.1, healthy.1,
+            "the context_id is independent of the registry, so the parent-ownership check \
+             that reads it is unaffected by the degradation"
+        );
     }
 }

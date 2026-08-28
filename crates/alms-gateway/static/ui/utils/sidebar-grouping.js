@@ -205,18 +205,25 @@ export function sortCrossAgentRows(rows, activeAgentName) {
  *     are a cross-agent surface sourced from `crossAgentSessions` and
  *     do not belong in the per-agent list.
  *
- * The filter drops `notification` and `job` rows. DMs are already
- * excluded by the per-agent fetch's `include_dms: false` query flag,
- * and subagent / episodic types are excluded by the backend's
- * `is_internal_context_id` filter. `job` joined the list with #1197:
- * `/sessions` now always returns scheduled-job sessions (they surface
- * in the sidebar's collapsed Jobs group, sourced from
- * `crossAgentSessions`) — without dropping them here, an agent whose
- * only session activity is a scheduled job would skip the boot-flow
- * chat-creation fallback and land in the read-only job view, the exact
- * failure mode Codex P2 pinned for notifications on PR #1100. If a
- * future backend change adds a new always-returned surface, extend the
- * list here (and update the test).
+ * The filter drops `notification`, `job` and `subagent` rows. DMs are
+ * already excluded by the per-agent fetch's `include_dms: false` query
+ * flag, and episodic sessions are excluded by the backend.
+ *
+ * `job` joined the list with #1197 and `subagent` with #1278, both for
+ * the same reason: `/sessions` started returning them unconditionally.
+ * Without dropping them here, an agent whose only session activity is a
+ * scheduled job — or being invoked as somebody's named subagent — would
+ * skip the boot-flow chat-creation fallback and land in a read-only
+ * view, the exact failure mode Codex P2 pinned for notifications on
+ * PR #1100. Subagent rows are a *rendered* surface for that agent (the
+ * sidebar shows them inside its accordion group, sourced from
+ * `crossAgentSessions`) but never a *selectable* one at boot: they are
+ * read-only, and the operator asked for that agent, not for the last
+ * errand it ran. "Read-only" covers the row as well as the transcript —
+ * see `isSessionDeletable` below, which withholds the delete control.
+ *
+ * If a future backend change adds a new always-returned surface, extend
+ * the list here (and update the test).
  *
  * Returns a new array; does not mutate the input.
  *
@@ -229,6 +236,7 @@ export function filterChatSessions(sessions) {
         s
         && s.session_type !== 'notification'
         && s.session_type !== 'job'
+        && s.session_type !== 'subagent'
     );
 }
 
@@ -252,4 +260,57 @@ export function filterChatSessions(sessions) {
 export function filterJobSessions(sessions) {
     if (!Array.isArray(sessions)) return [];
     return sessions.filter(s => s && s.session_type === 'job');
+}
+
+/**
+ * Filter a `/sessions` response down to subagent sessions only (#1278).
+ *
+ * Unlike jobs and notifications these do NOT get their own cross-agent
+ * section: a named subagent session is filed under the invoked agent's
+ * registry id, so it renders inside that agent's own accordion group —
+ * the operator's complaint was precisely that the invoked agent's work
+ * was nowhere in its own timeline. Sourced from `crossAgentSessions`
+ * because the per-agent list is chat-only (`filterChatSessions`, so the
+ * boot fallback can't land on a read-only row) and because an agent's
+ * subagent rows should be visible without switching into it first.
+ *
+ * One row per (invoked agent, invoking parent) pair, not per invocation:
+ * the coordinator keys a named subagent on `(parent_agent_id, name)`, so
+ * repeat invocations accumulate in one session. Ephemeral subagents —
+ * which would be one row per call — are never returned by the backend
+ * listing at all.
+ *
+ * Returns a new array; does not mutate the input.
+ *
+ * @param {Array<object>} sessions Raw `/sessions` payload entries.
+ * @returns {Array<object>}
+ */
+export function filterSubagentSessions(sessions) {
+    if (!Array.isArray(sessions)) return [];
+    return sessions.filter(s => s && s.session_type === 'subagent');
+}
+
+/**
+ * Whether a sidebar row may offer the delete control.
+ *
+ * #1278 put named subagent rows in the sidebar, and every other row type
+ * there is something the operator started and can end. A subagent session
+ * is neither: the coordinator owns its lifecycle, it is not selectable at
+ * boot, and its transcript view is read-only — the comments in this file
+ * and in `session-list.js` say so three times. Rendering a destructive
+ * `DELETE /session/{id}` button on it contradicted all three, and nothing
+ * on that path checks for an active run, so the target may be a session a
+ * live coordinator loop is still writing (`sub_session_id` is held for the
+ * duration of the subagent's `AgentRuntime` loop).
+ *
+ * Deliberately narrow: jobs and notifications keep their delete control.
+ * Those rows are inert once written, and the precedent for deleting them
+ * predates this. The subagent row is the one that is concurrently written
+ * by something other than the operator.
+ *
+ * @param {object} session Raw `/sessions` payload entry.
+ * @returns {boolean}
+ */
+export function isSessionDeletable(session) {
+    return !!session && session.session_type !== 'subagent';
 }

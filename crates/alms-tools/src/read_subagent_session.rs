@@ -3,9 +3,10 @@
 //!
 //! Instead of carrying full subagent transcripts in the parent's context
 //! window, the parent calls this tool when it needs detail from a specific
-//! subagent's session. Named subagents resolve by `name` (the same
-//! deterministic `(parent_agent_id, name)` derivation as invoke_agent,
-//! #1051). Ephemeral / unnamed subagents have no name to derive from, so
+//! subagent's session. Named subagents resolve by `name` through the same
+//! `(parent_agent_id, name)` keying invoke_agent dispatches on (#1051),
+//! via the shared `SessionManager::named_subagent_key` (#1278). Ephemeral
+//! / unnamed subagents have no name to derive from, so
 //! they resolve by `session_id` instead (#1181) — the id every invoke_agent
 //! result, `subagent_started` event, and completion notification already
 //! surfaces to the parent.
@@ -39,6 +40,12 @@ pub struct ReadSubagentSessionTool {
     /// Parent agent's persistent ID — drives the `(parent_agent_id, name)`
     /// keying that mirrors `invoke_agent` (#1051), and the ownership check
     /// on the by-`session_id` path (#1181).
+    ///
+    /// Note both uses read the *parent*, and #1278 changed only the agent
+    /// id a named subagent session is FILED under (to the invoked agent's
+    /// registry id), never the `context_id` the ownership check parses. So
+    /// the by-id authorization below is unaffected by that move — see
+    /// [`Self::check_subagent_session_access`].
     parent_agent_id: AgentId,
 }
 
@@ -75,6 +82,14 @@ impl ReadSubagentSessionTool {
     /// (`subagent_{task_id}`, no parent linkage) are DENIED: their ownership
     /// cannot be verified, and denying them is strictly no worse than
     /// pre-#1181 behaviour (ephemeral readback never worked at all).
+    ///
+    /// **The check reads the `context_id` and nothing else.** That is why
+    /// #1278 — which moved a named subagent session's `agent_id` onto the
+    /// invoked agent's registry id — could not weaken it: the parent is
+    /// embedded in the context, the context was left byte-for-byte
+    /// unchanged, and `session.agent_id` was never an input here. A future
+    /// change that starts deriving ownership from `session.agent_id` would
+    /// be authorizing on the INVOKED agent instead of the invoking one.
     ///
     /// Returns the subagent's name for an owned named session, `None` for an
     /// owned ephemeral one, or a caller-facing error message.
@@ -219,15 +234,17 @@ impl Tool for ReadSubagentSessionTool {
                 ));
             }
             (Some(name), None) => {
-                // Derive the same deterministic identity that invoke_agent
-                // uses (#1051): keyed on `(parent_agent_id, name)`, so the
-                // same named subagent resolves to the same session across
-                // every chat the parent agent participates in.
-                let stable_id = AgentId::deterministic(self.parent_agent_id, name);
-                let stable_ctx = format!("subagent_{}_{}", self.parent_agent_id.0, name);
+                // Resolve through the SAME helper `invoke_agent`'s dispatch
+                // writes with (`SessionManager::named_subagent_key`), never a
+                // local re-derivation: the two halves of the key have
+                // different rules (the context is a pure format, the agent id
+                // depends on the registry — #1278) and a second spelling of
+                // them here is a silent "no session found" waiting to happen.
+                let key = self
+                    .session_manager
+                    .named_subagent_key(self.parent_agent_id, name);
 
                 // Check if the session exists without creating it
-                let key = (stable_id, stable_ctx);
                 if !self.session_manager.has_session(&key) {
                     return Ok(serde_json::json!({
                         "error": format!("No session found for subagent '{name}'. It may not have been invoked yet."),
@@ -235,7 +252,7 @@ impl Tool for ReadSubagentSessionTool {
                     }));
                 }
 
-                let session = self.session_manager.get_or_create(stable_id, &key.1);
+                let session = self.session_manager.get_or_create(key.0, &key.1);
                 (session, Value::from(name))
             }
             (None, Some(sid_str)) => {
@@ -390,18 +407,18 @@ mod tests {
         }
     }
 
-    /// Populate a named subagent's session with messages, using the same
-    /// deterministic derivation that invoke_agent uses (#1051: keyed on
-    /// `(parent_agent_id, name)`).
+    /// Populate a named subagent's session with messages, on the same key
+    /// `invoke_agent`'s dispatch writes to (#1051: keyed on
+    /// `(parent_agent_id, name)`; #1278: the agent half is the invoked
+    /// agent's registry id when it has one).
     fn populate_subagent(
         tool: &ReadSubagentSessionTool,
         mgr: &SessionManager,
         name: &str,
         messages: Vec<Message>,
     ) {
-        let stable_id = AgentId::deterministic(tool.parent_agent_id, name);
-        let stable_ctx = format!("subagent_{}_{}", tool.parent_agent_id.0, name);
-        let session = mgr.get_or_create(stable_id, &stable_ctx);
+        let (agent_id, context_id) = mgr.named_subagent_key(tool.parent_agent_id, name);
+        let session = mgr.get_or_create(agent_id, &context_id);
         for msg in messages {
             mgr.append_message(session.id, msg).unwrap();
         }
@@ -983,5 +1000,117 @@ mod tests {
             "different parent agent must not resolve to the same subagent \
              session (got: {result_c})"
         );
+    }
+
+    // -- #1278: the session moved, the ownership check did not ---------------
+
+    /// A registry-backed manager, so `named_subagent_key` takes the #1278
+    /// arm rather than the store-less fallback the rows above exercise.
+    fn registry_tool(name: &str) -> (ReadSubagentSessionTool, Arc<SessionManager>, AgentId) {
+        let store = alms_session::SqliteStore::open_in_memory().unwrap();
+        let mgr = Arc::new(SessionManager::with_store(SessionConfig::default(), store).unwrap());
+        let record = alms_core::AgentRecord {
+            id: AgentId::new(),
+            name: name.to_string(),
+            description: String::new(),
+            model: None,
+            posture: None,
+            provider: None,
+            telegram_token: None,
+            thinking_budget_tokens: None,
+            reasoning_effort: None,
+            gemini_thinking_budget: None,
+            summary_provider: None,
+            summary_model: None,
+            worktree_mode: alms_core::WorktreeMode::Off,
+            debug_mode: false,
+            is_default: false,
+            created_at: alms_core::Timestamp::now().0,
+            last_active: alms_core::Timestamp::now().0,
+        };
+        mgr.store().unwrap().create_agent(&record).unwrap();
+        let tool = ReadSubagentSessionTool::new(mgr.clone(), AgentId::new());
+        (tool, mgr, record.id)
+    }
+
+    /// The by-name readback must follow dispatch onto the registry id.
+    /// Re-deriving `AgentId::deterministic(parent, name)` here — as this
+    /// tool did before #1278 — would miss the session dispatch actually
+    /// wrote and report "not invoked yet" for a subagent that just ran.
+    #[tokio::test]
+    async fn by_name_follows_the_session_onto_the_invoked_agents_registry_id() {
+        let (tool, mgr, reviewer) = registry_tool("reviewer");
+        let context_id = alms_core::named_subagent_context_id(tool.parent_agent_id, "reviewer");
+
+        // Exactly what dispatch does post-#1278.
+        let session = mgr.get_or_create(reviewer, &context_id);
+        mgr.append_message(session.id, make_msg(Role::Assistant, "reviewed it"))
+            .unwrap();
+
+        let result = tool
+            .execute(serde_json::json!({ "name": "reviewer" }))
+            .await
+            .unwrap();
+
+        assert_eq!(result["session_id"], session.id.0.to_string());
+        assert_eq!(result["message_count"], 1);
+        assert_eq!(result["messages"][0]["content"], "reviewed it");
+    }
+
+    /// The security half of #1278. `check_subagent_session_access`
+    /// authorizes on the parent embedded in the `context_id`, and the
+    /// context did not move — so the invoking parent still gets in even
+    /// though `session.agent_id` is now the invoked agent's registry id.
+    #[tokio::test]
+    async fn by_session_id_still_admits_the_invoking_parent_after_the_move() {
+        let (tool, mgr, reviewer) = registry_tool("reviewer");
+        let context_id = alms_core::named_subagent_context_id(tool.parent_agent_id, "reviewer");
+        let session = mgr.get_or_create(reviewer, &context_id);
+        mgr.append_message(session.id, make_msg(Role::Assistant, "reviewed it"))
+            .unwrap();
+
+        assert_eq!(
+            session.agent_id, reviewer,
+            "test setup: the session must be filed under the invoked agent"
+        );
+
+        let result = tool
+            .execute(serde_json::json!({ "session_id": session.id.0.to_string() }))
+            .await
+            .unwrap();
+
+        assert_eq!(result["subagent"], "reviewer");
+        assert_eq!(result["messages"][0]["content"], "reviewed it");
+    }
+
+    /// ...and the denial half. A peer that merely learned the session UUID
+    /// is still refused — including the INVOKED agent itself, which now
+    /// owns the row. This tool answers "sessions of subagents *you*
+    /// invoked", and the new `agent_id` is deliberately not an input to
+    /// that question: authorizing on it would hand the transcript to
+    /// whoever the work was delegated TO rather than BY.
+    #[tokio::test]
+    async fn by_session_id_denies_everyone_but_the_invoking_parent_after_the_move() {
+        let (tool, mgr, reviewer) = registry_tool("reviewer");
+        let context_id = alms_core::named_subagent_context_id(tool.parent_agent_id, "reviewer");
+        let session = mgr.get_or_create(reviewer, &context_id);
+
+        for (label, snooper_parent) in [
+            ("unrelated peer", AgentId::new()),
+            ("invoked agent", reviewer),
+        ] {
+            let snooper = ReadSubagentSessionTool::new(mgr.clone(), snooper_parent);
+            let result = snooper
+                .execute(serde_json::json!({ "session_id": session.id.0.to_string() }))
+                .await
+                .unwrap();
+            assert!(
+                result["error"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("belongs to another agent's subagent"),
+                "{label} must be denied, got: {result}"
+            );
+        }
     }
 }

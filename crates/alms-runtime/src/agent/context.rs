@@ -122,12 +122,41 @@ impl AgentRuntime {
         // block could push assembled history above `history_budget` and
         // cause `build_compact` to start dropping messages verbatim
         // before `maybe_summarize` ever fired.
-        let episodic_text: Option<String> =
-            if self.config.context_config.run_summary_mode != RunSummaryMode::Off {
-                self.load_episodic_summaries(session_manager, session_id)
-            } else {
-                None
-            };
+        //
+        // Never on a subagent run (#1278). This restores the symmetry the
+        // write side has always had: `derive_source_label` returns `None`
+        // for a `subagent_` context and both writers early-return on it, so
+        // no `session_summaries` row is ever *created* for a subagent
+        // session. The read side had no such gate, and #1278 made that
+        // matter: a named subagent now runs under the invoked agent's
+        // registry id, so `load_session_summaries(self.agent_id)` — which
+        // filters on `agent_id` alone — would inject the invoked agent's
+        // summaries of its own operator chats, Telegram threads, DMs
+        // (labelled `DM with <peer>`) and scheduled jobs into a context
+        // whose output goes back verbatim to the invoking parent as the
+        // `invoke_agent` result.
+        //
+        // That is not a check being crossed so much as one being routed
+        // around: every session-reading *tool* is agent-scoped
+        // (`read_session`, `list_my_sessions`, `read_messages`,
+        // `read_subagent_session`), and the context builder is the one
+        // reader with no boundary at all. Gating here is also the cheap
+        // direction — `run_summary_mode` defaults to `Llm`, so this fired
+        // on stock configuration and spent `run_summary_budget` (15% of
+        // `max_input_tokens`) on every named subagent run.
+        //
+        // Keyed on the run's own `context_id`, not on the agent, so it
+        // covers ephemeral subagents identically and needs no knowledge of
+        // how the session was filed.
+        let is_subagent_run = alms_core::classify_session_type(context_id) == "subagent";
+        let episodic_text: Option<String> = if self.config.context_config.run_summary_mode
+            != RunSummaryMode::Off
+            && !is_subagent_run
+        {
+            self.load_episodic_summaries(session_manager, session_id)
+        } else {
+            None
+        };
 
         // For the `compact` strategy (formerly `sliding-summary`, #869),
         // attempt to compress old messages before building context. On

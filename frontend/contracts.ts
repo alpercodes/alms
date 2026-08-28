@@ -52,6 +52,11 @@ export const sessionSchema = z
     participants: z.tuple([stringSchema, stringSchema]).optional(),
     agent_name: stringSchema.optional(),
     parent_session_id: uuidSchema.nullable().optional(),
+    // #1278: on a subagent session, the agent that invoked it. Omitted
+    // (not null) on every other session type and on a subagent context
+    // whose parent segment is unreadable — the sidebar treats an absent
+    // value as "no attribution to render" rather than guessing.
+    parent_agent_id: uuidSchema.optional(),
   })
   .passthrough()
   .superRefine((session, context) => {

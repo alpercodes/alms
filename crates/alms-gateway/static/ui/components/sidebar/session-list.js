@@ -26,6 +26,8 @@ import {
     isOwnedByActiveAgent,
     sortCrossAgentRows,
     filterJobSessions,
+    filterSubagentSessions,
+    isSessionDeletable,
 } from '../../utils/sidebar-grouping.js';
 
 /**
@@ -179,31 +181,59 @@ function jobLabel(session) {
 }
 
 /**
+ * Format a named subagent session label (#1278).
+ *
+ * The row renders inside the INVOKED agent's accordion group, whose
+ * header already carries that agent's name — so repeating it in the
+ * label says nothing. What distinguishes two of these rows from each
+ * other is the invoking parent, and that is rendered separately as the
+ * `.session-agent-attribution` badge (see `crossAgentOwner`). Same split
+ * `notificationLabel` uses: constant label, badge does the
+ * disambiguation.
+ *
+ * Falls back to the raw context_id when the backend hasn't enriched the
+ * row with `agent_name` — an unenriched subagent row means the owner was
+ * unreadable, and "subagent" alone would be an unclickable mystery.
+ */
+function subagentLabel(session) {
+    if (session.agent_name) {
+        return 'subagent';
+    }
+    return session.context_id || session.id.slice(0, 8);
+}
+
+/**
  * Derive a human-readable label for any session type.
  */
 function sessionLabel(session) {
     if (session.session_type === 'dm') return dmLabel(session);
     if (session.session_type === 'notification') return notificationLabel(session);
     if (session.session_type === 'job') return jobLabel(session);
+    if (session.session_type === 'subagent') return subagentLabel(session);
     return session.context_id || session.id.slice(0, 8);
 }
 
 /**
- * Determine which agent "owns" a cross-agent surface row from the
- * operator's perspective.
+ * Determine which agent a row should be ATTRIBUTED to in the badge.
  *
- * Notification sessions carry a real `agent_name` set by the backend
- * from the `notifications:{agent}` context_id — that's the recipient
- * agent. Job sessions (#1197) are stored under the owning agent's real
- * `agent_id`, so the name resolves via the in-memory `agents` list —
- * the Jobs group is cross-agent, and without the badge two agents'
- * jobs would render as indistinguishable "job xxxxxxxx" rows. DM
- * sessions carry a `participants` array (both agents share the
- * session) so there's no single owner; the row label already shows
- * both names.
+ * For most surfaces that is the owning agent. Notification sessions
+ * carry a real `agent_name` set by the backend from the
+ * `notifications:{agent}` context_id — that's the recipient agent. Job
+ * sessions (#1197) are stored under the owning agent's real `agent_id`,
+ * so the name resolves via the in-memory `agents` list — the Jobs group
+ * is cross-agent, and without the badge two agents' jobs would render
+ * as indistinguishable "job xxxxxxxx" rows. DM sessions carry a
+ * `participants` array (both agents share the session) so there's no
+ * single owner; the row label already shows both names.
  *
- * Returns null when the session has no clear owning agent or when
- * the field hasn't been enriched (legacy data).
+ * Subagent sessions (#1278) are the one case where the badge is
+ * deliberately NOT the owner. The row already sits inside its owner's
+ * accordion group — that is the whole point of #1278 — so the useful
+ * attribution is the invoking parent, resolved from `parent_agent_id`.
+ * `attributionTitle` keeps the tooltip honest about the difference.
+ *
+ * Returns null when the session has no clear agent to attribute or when
+ * the field hasn't been enriched (legacy data, deleted agent).
  */
 function crossAgentOwner(session) {
     if (session.session_type === 'notification' && session.agent_name) {
@@ -213,7 +243,25 @@ function crossAgentOwner(session) {
         const owner = agents.value.find(a => a.id === session.agent_id);
         return owner ? owner.name : null;
     }
+    if (session.session_type === 'subagent' && session.parent_agent_id) {
+        const parent = agents.value.find(a => a.id === session.parent_agent_id);
+        return parent ? parent.name : null;
+    }
     return null;
+}
+
+/**
+ * Tooltip for the attribution badge.
+ *
+ * The badge means "owned by" everywhere except on a subagent row, where
+ * it names the agent that DELEGATED the work rather than the one that
+ * did it. Labelling that "Owned by" would state the relationship
+ * backwards — the owner is the group the row is sitting in.
+ */
+function attributionTitle(session, name) {
+    return session.session_type === 'subagent'
+        ? 'Invoked by ' + name
+        : 'Owned by ' + name;
 }
 
 function SessionItem({ session, activeAgentName }) {
@@ -298,7 +346,8 @@ function SessionItem({ session, activeAgentName }) {
     // explicit owner badge so identical-looking rows from different
     // agents ("alice notifications" vs "bob notifications", two
     // agents' job rows) stay distinguishable. DMs already show both
-    // participants in the label.
+    // participants in the label. Subagent rows (#1278) use the same
+    // badge for the INVOKING parent — see `crossAgentOwner`.
     const ownerName = crossAgentOwner(session);
     const ownedByActive = isOwnedByActiveAgent(session, activeAgentName);
     const ownedClass = ownedByActive ? ' session-item-active-agent' : '';
@@ -313,8 +362,8 @@ function SessionItem({ session, activeAgentName }) {
              onKeyDown=${(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); selectSession(session.id); } }}>
             ${session.session_type !== 'chat' && html`<span class="session-type-icon session-type-icon-${meta.cls || 'default'}" aria-hidden="true" title=${meta.label}>${meta.icon}</span>`}
             <span class="session-label">${label}</span>
-            ${ownerName && html`<span class="session-agent-attribution" title=${'Owned by ' + ownerName}>${ownerName}</span>`}
-            ${confirming.value
+            ${ownerName && html`<span class="session-agent-attribution" title=${attributionTitle(session, ownerName)}>${ownerName}</span>`}
+            ${isSessionDeletable(session) && (confirming.value
                 ? html`
                     <span class="session-delete-confirm-group" role="group" aria-label="Confirm delete">
                         <button class="session-confirm-btn session-confirm-yes"
@@ -336,7 +385,7 @@ function SessionItem({ session, activeAgentName }) {
                             onClick=${onDeleteClick}
                             onKeyDown=${(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onDeleteClick(e); } }}>\u00D7</button>
                 `
-            }
+            )}
         </div>
     `;
 }
@@ -539,19 +588,21 @@ export function SessionList() {
     // (`crates/alms-gateway/src/runs/mod.rs`) one-to-one \u2014 `dm`,
     // `notification`, `job`, `subagent`, `episodic`. `dm`,
     // `notification` and (since #1197) `job` get their own cross-agent
-    // sections rendered below; `subagent` / `episodic` are
-    // internal-context sessions the operator should never see as
-    // ordinary chat rows. The backend `/sessions` listing excludes
-    // subagent/episodic by default and now always returns job rows
-    // (#1197) alongside notifications, and the #1065 resolver-led-boot
-    // fix in `utils/load-session.js` Step 0 injects internal envelopes
-    // directly into `sessions.value` so the active subagent session
-    // can be resolved by `activeSession` / `isInternalSession`.
-    // Without listing every internal type here, that injection would
-    // leak subagent/episodic rows \u2014 and job rows would duplicate into
-    // the chat groups (Codex P2 on PR #1074). Keep this list in
-    // lock-step with the backend prefix list if a new internal
-    // context_id family is added.
+    // sections rendered below; `episodic` is an internal-context
+    // session the operator should never see at all.
+    //
+    // `subagent` is excluded HERE even though those rows do render
+    // (#1278) \u2014 they are appended to each agent group from
+    // `crossAgentSessions` a few lines down. Sourcing them from one
+    // list only is what keeps a row from appearing twice: the #1065
+    // resolver-led-boot fix in `utils/load-session.js` Step 0 injects
+    // internal envelopes directly into `sessions.value` so the active
+    // subagent session can be resolved by `activeSession` /
+    // `isInternalSession`, and that injected copy would otherwise
+    // render alongside the cross-agent one. Job rows had the same
+    // duplication (Codex P2 on PR #1074). Keep this list in lock-step
+    // with the backend prefix list if a new internal context_id family
+    // is added.
     const chatSessions = allSessions.filter(s =>
         s.session_type !== 'dm'
         && s.session_type !== 'notification'
@@ -560,6 +611,23 @@ export function SessionList() {
         && s.session_type !== 'episodic'
     );
     const grouped = groupSessionsByAgent(chatSessions);
+
+    // Named subagent sessions (#1278) render inside the INVOKED agent's
+    // group — they are that agent's work, and being nowhere in its own
+    // timeline was the complaint. Sourced from `crossAgentSessions`, not
+    // `sessions`, for two reasons: `filterChatSessions` deliberately keeps
+    // them out of the per-agent scope (so the boot fallback can never
+    // auto-select a read-only row), and the cross-agent list means an
+    // agent's subagent rows are already present when its group is
+    // expanded rather than arriving a fetch later.
+    //
+    // Rows land under `session.agent_id`, which post-#1278 IS the invoked
+    // agent's registry id. An agent id that matches no registered agent —
+    // a subagent invoked under a name that was never registered, or one
+    // whose agent has since been deleted — groups under a key nothing
+    // iterates, so it renders nowhere. That is the intended degradation:
+    // there is no timeline to put it in.
+    const subagentRows = groupSessionsByAgent(filterSubagentSessions(crossAgent));
 
     // Per-agent session counts for the header badge. The active
     // agent's count comes from the in-memory `sessions` list above
@@ -572,6 +640,12 @@ export function SessionList() {
     // on PR #1010 \u2014 Tim flagged the active-only badge in his review;
     // using cross-agent data keeps the count truthful for all agents
     // without an extra round-trip.)
+    //
+    // Subagent rows are deliberately NOT excluded here: they are rendered
+    // inside the agent group (see `subagentRows`), so a count that dropped
+    // them would disagree with the number of items the operator sees on
+    // expanding a non-active agent. The active agent's count is taken from
+    // the rendered list itself, which includes them for the same reason.
     const crossAgentChats = crossAgent.filter(s =>
         s.session_type !== 'dm'
         && s.session_type !== 'notification'
@@ -612,10 +686,18 @@ export function SessionList() {
                 ${allAgents.map(agent => {
                     const expanded = isAgentExpanded(expandedId, agent.id);
                     const isActive = agent.id === activeAgentIdValue;
-                    // The active agent's session items render from the
+                    // The active agent's chat items render from the
                     // per-agent in-memory list; non-active agents
                     // render header-only and switch+load on click.
-                    const groupSessions = grouped.get(agent.id) || [];
+                    // Subagent rows (#1278) come from the cross-agent
+                    // list and are appended after the chats, so the
+                    // agent's own conversations stay at the top of its
+                    // group and the errands it ran for other agents sit
+                    // below them.
+                    const groupSessions = [
+                        ...(grouped.get(agent.id) || []),
+                        ...(subagentRows.get(agent.id) || []),
+                    ];
                     // Count source: per-agent list for the active
                     // agent, cross-agent list for everyone else. Both
                     // are populated from the same backend query (one

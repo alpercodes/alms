@@ -73,11 +73,20 @@ pub fn classify_session_type(context_id: &str) -> &'static str {
 
 /// The owner encoded in a coordinator-reserved subagent `context_id`.
 ///
-/// A subagent session is NOT stored under the subagent's registry id — a
-/// named one is keyed on `AgentId::deterministic(parent_agent_id, name)`
-/// (#1051) and an ephemeral one on a fresh `AgentId::new()`. Neither
-/// resolves against the agent registry, so the `context_id` is the only
-/// place the display identity survives. See [`parse_subagent_context`].
+/// The `context_id` is the authoritative carrier of a subagent session's
+/// display identity, because the `agent_id` half of the session key does
+/// not always answer the question:
+///
+/// - A **named** subagent session is filed under the invoked agent's
+///   registry id when that agent is registered (#1278), so the registry
+///   lookup and this parse agree. When the name was never registered the
+///   session stays on `AgentId::deterministic(parent_agent_id, name)`,
+///   which resolves against nothing — and the parse is the only answer.
+/// - An **ephemeral** subagent session is filed under a fresh
+///   `AgentId::new()`. There is no registry agent to resolve, by
+///   construction.
+///
+/// See [`parse_subagent_context`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SubagentOwner<'a> {
     /// `subagent_{parent_agent_id}_{name}` — a named subagent. The name is
@@ -123,12 +132,7 @@ pub enum SubagentOwner<'a> {
 /// would have handed arbitrary model-controlled text to a label. Keep the
 /// gate even if the discrimination is ever reworked.
 pub fn parse_subagent_context(context_id: &str) -> Option<SubagentOwner<'_>> {
-    let rest = context_id.strip_prefix("subagent_")?;
-
-    // Neither a UUID nor an agent name contains '_', so the first '_' is
-    // unambiguously the parent/trailing separator.
-    let (parent, trailing) = rest.split_once('_')?;
-    Uuid::parse_str(parent).ok()?;
+    let (_, trailing) = split_subagent_context(context_id)?;
 
     if Uuid::parse_str(trailing).is_ok() {
         Some(SubagentOwner::Ephemeral)
@@ -137,6 +141,53 @@ pub fn parse_subagent_context(context_id: &str) -> Option<SubagentOwner<'_>> {
     } else {
         None
     }
+}
+
+/// Recover the *spawning parent* encoded in a subagent `context_id`.
+///
+/// Both shapes embed the parent agent id — that embedding is what lets
+/// `read_subagent_session` enforce parent ownership from the context alone
+/// instead of treating the session UUID as a bearer capability (#1185).
+/// This exposes it for display: since #1278 a named subagent session is
+/// filed under the *invoked* agent's registry id, so the sidebar row lands
+/// in that agent's own timeline and the thing left to say about it is who
+/// asked for the work.
+///
+/// Returns `None` for exactly the inputs [`parse_subagent_context`] rejects
+/// a *parent segment* for: a non-subagent context, the legacy pre-#1185
+/// `subagent_{task_id}` form, or a non-UUID parent segment. Unlike
+/// `parse_subagent_context` it does **not** constrain the trailing segment
+/// — the parent is well-defined even when the owner is not, and the two
+/// answers are independent.
+pub fn parse_subagent_parent(context_id: &str) -> Option<AgentId> {
+    split_subagent_context(context_id).map(|(parent, _)| parent)
+}
+
+/// Mint the `context_id` for a **named** subagent session.
+///
+/// The single source of truth for the shape [`parse_subagent_context`] and
+/// [`parse_subagent_parent`] read back, and — critically — the value that
+/// stays byte-for-byte stable across #1278. #1278 moved the `agent_id` half
+/// of the session key onto the invoked agent's registry id; the context is
+/// what carries the parent-ownership check
+/// (`ReadSubagentSessionTool::check_subagent_session_access`) and the
+/// named/ephemeral discrimination, so it deliberately did **not** change.
+pub fn named_subagent_context_id(parent_agent_id: AgentId, name: &str) -> String {
+    format!("subagent_{}_{}", parent_agent_id.0, name)
+}
+
+/// Split `subagent_{parent_agent_id}_{trailing}` into its parent id and its
+/// trailing segment. The one place the shape is taken apart, so the parent
+/// gate cannot drift between the two public readers above.
+fn split_subagent_context(context_id: &str) -> Option<(AgentId, &str)> {
+    let rest = context_id.strip_prefix("subagent_")?;
+
+    // Neither a UUID nor an agent name contains '_', so the first '_' is
+    // unambiguously the parent/trailing separator.
+    let (parent, trailing) = rest.split_once('_')?;
+    let parent = Uuid::parse_str(parent).ok()?;
+
+    Some((AgentId(parent), trailing))
 }
 
 /// Error message returned to the LLM when both `send_message` and
@@ -643,9 +694,11 @@ mod tests {
     // -----------------------------------------------------------------------
 
     /// Build the context ids exactly as `derive_subagent_identity` does, so
-    /// these rows fail if that format ever moves.
+    /// these rows fail if that format ever moves. Goes through the public
+    /// minter rather than re-spelling the format, so the round trip
+    /// mint -> parse is what is under test.
     fn named_context(parent: AgentId, name: &str) -> String {
-        format!("subagent_{}_{}", parent.0, name)
+        named_subagent_context_id(parent, name)
     }
 
     #[test]
@@ -711,5 +764,70 @@ mod tests {
             assert!(validate_agent_name(name).is_err(), "fixture {name} valid");
             assert_eq!(parse_subagent_context(&named_context(parent, name)), None);
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_subagent_parent tests (#1278)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parse_subagent_parent_recovers_the_spawning_parent_from_both_shapes() {
+        let parent = AgentId::new();
+        assert_eq!(
+            parse_subagent_parent(&named_context(parent, "reviewer")),
+            Some(parent)
+        );
+        assert_eq!(
+            parse_subagent_parent(&format!("subagent_{}_{}", parent.0, Uuid::new_v4())),
+            Some(parent)
+        );
+    }
+
+    /// The parent gate is shared with `parse_subagent_context`: anything one
+    /// rejects *for lack of a readable parent segment* the other must reject
+    /// too, or the ownership check and the display label would disagree
+    /// about which contexts are coordinator-minted.
+    #[test]
+    fn parse_subagent_parent_rejects_every_shape_without_a_readable_parent() {
+        for ctx in [
+            "job_abc",
+            "notifications:alice",
+            "web-chat-1",
+            "subagent_notauuid_reviewer",
+            &format!("subagent_{}", Uuid::new_v4()),
+        ] {
+            assert_eq!(parse_subagent_parent(ctx), None, "ctx {ctx}");
+            assert_eq!(parse_subagent_context(ctx), None, "ctx {ctx}");
+        }
+    }
+
+    /// The trailing segment is `parse_subagent_context`'s business, not
+    /// `parse_subagent_parent`'s. A context whose owner is unreadable still
+    /// has a perfectly well-defined parent, and the sidebar's "invoked by"
+    /// attribution depends on that independence.
+    #[test]
+    fn parse_subagent_parent_ignores_an_unreadable_trailing_segment() {
+        let parent = AgentId::new();
+        let ctx = named_context(parent, "Reviewer");
+        assert_eq!(parse_subagent_context(&ctx), None);
+        assert_eq!(parse_subagent_parent(&ctx), Some(parent));
+    }
+
+    /// #1278 moved the `agent_id` half of a named subagent's session key
+    /// onto the invoked agent's registry id and left the context untouched.
+    /// This pins the untouched half: `check_subagent_session_access` reads
+    /// ownership out of exactly these bytes.
+    #[test]
+    fn named_subagent_context_id_has_the_shape_the_ownership_check_reads() {
+        let parent = AgentId::new();
+        let ctx = named_subagent_context_id(parent, "reviewer");
+
+        assert_eq!(ctx, format!("subagent_{}_reviewer", parent.0));
+        assert_eq!(classify_session_type(&ctx), "subagent");
+        assert_eq!(parse_subagent_parent(&ctx), Some(parent));
+        assert_eq!(
+            parse_subagent_context(&ctx),
+            Some(SubagentOwner::Named("reviewer"))
+        );
     }
 }

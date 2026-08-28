@@ -41,6 +41,8 @@ const {
     sortCrossAgentRows,
     filterChatSessions,
     filterJobSessions,
+    filterSubagentSessions,
+    isSessionDeletable,
 } = await import(url.pathToFileURL(SIDEBAR_GROUPING_PATH).href);
 
 // ---------------------------------------------------------------------
@@ -639,4 +641,173 @@ test('#1197: filterJobSessions returns a new array (does not mutate input)', () 
     const out = filterJobSessions(raw);
     assert.deepEqual(raw.map(s => s.id), before);
     assert.notEqual(out, raw);
+});
+
+// ---------------------------------------------------------------------
+// #1278 — named subagent rows in the invoked agent's own timeline
+// ---------------------------------------------------------------------
+//
+// `/sessions` started returning NAMED subagent rows so the invoked
+// agent's work shows up in its own sidebar group. That makes them the
+// third always-returned surface after notifications (#1100) and jobs
+// (#1197), and each of those needed the same two things: kept OUT of
+// the per-agent selectable scope, and available as their own slice for
+// rendering.
+
+test('#1278: filterChatSessions drops subagent rows', () => {
+    const raw = [
+        { id: 'c1', session_type: 'chat', agent_id: 'agent_a' },
+        { id: 's1', session_type: 'subagent', agent_id: 'agent_a' },
+    ];
+    assert.deepEqual(
+        filterChatSessions(raw).map(s => s.id),
+        ['c1'],
+    );
+});
+
+test('#1278: filterChatSessions models the "subagent-only agent" boot edge case', () => {
+    // The failure mode this prevents: an agent that has only ever run as
+    // somebody's named subagent. Its `/sessions` response is one
+    // read-only subagent row; without the filter `loadAgentSessions`
+    // would see `agentSessions.length > 0`, skip the chat-creation
+    // fallback, and drop the operator into a read-only transcript
+    // instead of a fresh chat — the exact shape Codex P2 pinned for
+    // notifications on PR #1100 and #1197 repeated for jobs.
+    const subagentOnlyResponse = [
+        {
+            id: 'sub-1',
+            session_type: 'subagent',
+            agent_id: 'agent_reviewer',
+            agent_name: 'reviewer',
+            parent_agent_id: 'agent_atlas',
+            has_active_run: false,
+        },
+    ];
+    assert.equal(filterChatSessions(subagentOnlyResponse).length, 0);
+});
+
+test('#1278: filterSubagentSessions keeps only subagent rows', () => {
+    const raw = [
+        { id: 'c1', session_type: 'chat' },
+        { id: 's1', session_type: 'subagent', agent_id: 'agent_reviewer' },
+        { id: 'n1', session_type: 'notification' },
+        { id: 'j1', session_type: 'job' },
+        { id: 's2', session_type: 'subagent', agent_id: 'agent_reviewer' },
+    ];
+    assert.deepEqual(
+        filterSubagentSessions(raw).map(s => s.id),
+        ['s1', 's2'],
+    );
+});
+
+test('#1278: filterSubagentSessions preserves backend sort order', () => {
+    const raw = [
+        { id: 's3', session_type: 'subagent' },
+        { id: 'c1', session_type: 'chat' },
+        { id: 's1', session_type: 'subagent' },
+        { id: 's2', session_type: 'subagent' },
+    ];
+    assert.deepEqual(
+        filterSubagentSessions(raw).map(s => s.id),
+        ['s3', 's1', 's2'],
+    );
+});
+
+test('#1278: subagent rows group under the INVOKED agent, not the parent', () => {
+    // The whole point of #1278 at the sidebar: the row is filed under
+    // the agent that did the work, so `groupSessionsByAgent` — which the
+    // accordion uses — puts it in that agent's group. The invoking
+    // parent travels separately, as `parent_agent_id`, for the badge.
+    const rows = filterSubagentSessions([
+        {
+            id: 's1',
+            session_type: 'subagent',
+            agent_id: 'agent_reviewer',
+            parent_agent_id: 'agent_atlas',
+        },
+        {
+            id: 's2',
+            session_type: 'subagent',
+            agent_id: 'agent_reviewer',
+            parent_agent_id: 'agent_larry',
+        },
+    ]);
+    const grouped = groupSessionsByAgent(rows);
+
+    assert.deepEqual(
+        (grouped.get('agent_reviewer') || []).map(s => s.id),
+        ['s1', 's2'],
+        'rows from both parents belong to the invoked agent',
+    );
+    assert.equal(grouped.get('agent_atlas'), undefined);
+    assert.equal(grouped.get('agent_larry'), undefined);
+});
+
+test('#1278: filterSubagentSessions returns empty for non-array input', () => {
+    assert.deepEqual(filterSubagentSessions(null), []);
+    assert.deepEqual(filterSubagentSessions(undefined), []);
+    assert.deepEqual(filterSubagentSessions('not an array'), []);
+    assert.deepEqual(filterSubagentSessions({}), []);
+});
+
+test('#1278: filterSubagentSessions skips null / non-object entries', () => {
+    const raw = [
+        null,
+        { id: 's1', session_type: 'subagent' },
+        undefined,
+        { id: 'c1', session_type: 'chat' },
+    ];
+    assert.deepEqual(
+        filterSubagentSessions(raw).map(s => s.id),
+        ['s1'],
+    );
+});
+
+test('#1278: filterSubagentSessions returns a new array (does not mutate input)', () => {
+    const raw = [
+        { id: 's1', session_type: 'subagent' },
+        { id: 'c1', session_type: 'chat' },
+    ];
+    const before = raw.map(s => s.id);
+    const out = filterSubagentSessions(raw);
+    assert.deepEqual(raw.map(s => s.id), before);
+    assert.notEqual(out, raw);
+});
+
+// ---------------------------------------------------------------------
+// isSessionDeletable — #1278 Tim S4
+// ---------------------------------------------------------------------
+
+test('#1278: subagent rows offer no delete control', () => {
+    // The row is described as read-only in three places and the operator
+    // does not own its lifecycle. Nothing on `DELETE /session/{id}` checks
+    // for an active run, so the button could target a session a live
+    // coordinator loop is still writing.
+    assert.equal(isSessionDeletable({ id: 's1', session_type: 'subagent' }), false);
+});
+
+test('#1278: every other sidebar row keeps its delete control', () => {
+    // Deliberately narrow. Jobs and notifications set the precedent for a
+    // deletable non-chat row and are inert once written; widening the gate
+    // to them would be an unrelated behaviour change.
+    for (const type of ['chat', 'dm', 'notification', 'job', 'telegram']) {
+        assert.equal(
+            isSessionDeletable({ id: 's1', session_type: type }),
+            true,
+            `${type} rows must stay deletable`,
+        );
+    }
+});
+
+test('#1278: isSessionDeletable is false for null / missing input', () => {
+    // Guard rather than a crash: the render site uses this as the whole
+    // condition, so a falsy session must not throw mid-render.
+    assert.equal(isSessionDeletable(null), false);
+    assert.equal(isSessionDeletable(undefined), false);
+});
+
+test('#1278: a session with no session_type is still deletable', () => {
+    // Legacy / unenriched rows default to deletable, matching the
+    // pre-#1278 behaviour for everything that is not explicitly a subagent.
+    assert.equal(isSessionDeletable({ id: 's1' }), true);
 });

@@ -818,6 +818,34 @@ Job safety:
   agent — so the tool only serves a session whose embedded parent id equals
   the calling agent's id. Legacy ephemeral contexts without the embedded
   parent id (`subagent_{task_id}`, pre-v0.2.4 hardening) are denied outright.
+- Since #1278 a **named** subagent session's `agent_id` is the *invoked*
+  agent's registry id, not the invoking parent's. It is deliberately **not**
+  an authorization input: `check_subagent_session_access` reads ownership only
+  out of the `context_id`, which still embeds the spawning parent. Authorizing
+  on `session.agent_id` would grant the transcript to the agent the work was
+  delegated *to* rather than *by*. Note the consequence in the other
+  direction: because the row is now filed under the invoked agent,
+  `read_session`'s `session.agent_id == self.agent_id` check admits that agent
+  to its own subagent transcripts — reachable only with the session UUID,
+  since `list_my_sessions` still filters `subagent` contexts out.
+- The same move puts the invoked agent's registry id on the subagent run's
+  **context build**, which is a different question from tool authorization
+  because the context builder has no per-agent boundary at all. Episodic
+  summaries are therefore **not loaded on any subagent run** (#1278): without
+  that gate, `load_session_summaries(agent_id)` — which filters on `agent_id`
+  alone — would inject the invoked agent's summaries of its own operator
+  chats, Telegram threads, DMs and scheduled jobs into a context whose output
+  returns verbatim to the invoking parent as the `invoke_agent` result, with
+  no tool call involved. The gate restores symmetry with the write side, which
+  has never produced a `session_summaries` row for a `subagent_` context
+  (`derive_source_label` returns `None` and both writers early-return).
+- Ownership for **deletion** reads out of the same place authorization does.
+  `delete_agent`'s cascade selects a subagent session by the parent embedded
+  in its `context_id`, never by the `agent_id` column it is filed under, so
+  deleting the invoked agent cannot destroy the invoking parent's transcripts,
+  runs or audit events — and deleting the parent takes them even though they
+  are filed elsewhere. `DELETE /agents/{id_or_name}` is a repeatable runtime
+  operation, so this is not covered by #1278's accepted one-time keying break.
 
 ---
 

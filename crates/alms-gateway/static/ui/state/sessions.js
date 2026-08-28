@@ -25,10 +25,16 @@ export const activeSessionId = signal(null);
  *
  * Populated alongside `sessions` from a second `listSessions(null, …)`
  * call (no agent filter) — see `fetchCrossAgentSurfaces` in
- * `hooks/use-boot.js`. Internal types (subagent, episodic) are
- * excluded by the backend's listing rules; notifications and
- * scheduled-job sessions (#1197) are always included; DMs are gated
- * on the `include_dms` query flag.
+ * `hooks/use-boot.js`. Episodic and ephemeral-subagent sessions are
+ * excluded by the backend's listing rules; notifications, scheduled-job
+ * sessions (#1197) and NAMED subagent sessions (#1278) are always
+ * included; DMs are gated on the `include_dms` query flag.
+ *
+ * The named-subagent rows are why this signal — not the per-agent
+ * `sessions` one — feeds the sidebar's per-agent subagent items: they
+ * are filed under the INVOKED agent, which is frequently not the active
+ * one, and `filterChatSessions` keeps them out of the per-agent scope so
+ * the boot flow can never auto-select a read-only row.
  */
 export const crossAgentSessions = entityState.crossAgentSessions;
 export function replaceSessionScopes(agentSessions, crossSessions) {

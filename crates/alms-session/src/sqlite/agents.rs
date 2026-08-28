@@ -352,32 +352,137 @@ impl SqliteStore {
             }
         };
 
-        // 1. Collect session IDs belonging to this agent
-        let session_ids: Vec<String> = {
+        // 1. Collect the sessions this delete owns.
+        //
+        // #1278 moved the `agent_id` half of a named subagent session's key
+        // onto the *invoked* agent's registry id, which makes `WHERE agent_id
+        // = ?1` the wrong ownership question for one session class. A row
+        // `subagent_{P}_{R}` is agent P's history — P asked for the work, P's
+        // `invoke_agent` result quotes it, and P's runs are its
+        // `parent_run_id` — but since #1278 it is *filed* under R. A bare
+        // `agent_id` cascade would therefore let "delete R" destroy P's
+        // transcripts, runs and audit events. That is not the break #1278
+        // accepted: that one was a single keying change at upgrade, whereas
+        // `DELETE /agents/{id_or_name}` is a repeatable runtime operation,
+        // and `docs/security-model.md` § 7 calls audit logging append-only.
+        //
+        // So ownership here reads out of the same place *authorization*
+        // reads out of: the `context_id`'s embedded parent
+        // (`parse_subagent_parent`, the same parse
+        // `ReadSubagentSessionTool::check_subagent_session_access` uses).
+        // The rule is one sentence — **a subagent session belongs to the
+        // parent named in its `context_id`, never to the agent whose id it
+        // happens to be filed under** — and it cuts both ways:
+        //
+        //   - 1a skips a subagent row filed under this agent but parented by
+        //     someone else, and
+        //   - 1b collects a subagent row parented by this agent whatever it
+        //     is filed under.
+        //
+        // 1b also closes a leak that predates #1278: named subagent sessions
+        // for an *unregistered* name (`AgentId::deterministic(P, name)`) and
+        // ephemeral ones (`AgentId::new()`) are filed under ids no agent
+        // holds, so no `delete_agent` call ever collected them and they
+        // accumulated forever. They are P's history too, and now they go
+        // when P goes.
+        //
+        // Self-invocation (`subagent_{A}_{A}`, filed under A and parented by
+        // A) satisfies both halves; `seen` keeps the id set unique so step 2
+        // does not run its child deletes twice.
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut session_ids: Vec<String> = Vec::new();
+
+        // 1a. Sessions filed under this agent, minus other parents' subagents.
+        {
             let mut stmt = tx
-                .prepare("SELECT id FROM sessions WHERE agent_id = ?1")
+                .prepare("SELECT id, context_id FROM sessions WHERE agent_id = ?1")
                 .map_err(|e| AlmsError::Runtime(format!("SQLite prepare session query: {e}")))?;
-            stmt.query_map(params![&id_str], |row| row.get(0))
-                .map_err(|e| AlmsError::Runtime(format!("SQLite query agent sessions: {e}")))?
+            let rows = stmt
+                .query_map(params![&id_str], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
+                .map_err(|e| AlmsError::Runtime(format!("SQLite query agent sessions: {e}")))?;
+            for row in rows {
                 // Third-branch site (see the reconciliation policy in
                 // `docs/architecture.md`): a row dropped here is a session
-                // whose messages, runs, and tool-call rows survive this delete
-                // with no parent agent and no retry path — orphaned, not lost.
-                // Failing the delete instead would make the agent permanently
-                // undeletable, which is worse. Counted so the leak is visible;
-                // see #1241.
-                .filter_map(|r| match r {
-                    Ok(id) => Some(id),
+                // that survives this delete whole — row, messages, runs and
+                // tool-call rows — with no agent and no retry path:
+                // orphaned, not lost. This is deliberately *more*
+                // conservative than the pre-#1278 shape, which deleted the
+                // session row by `agent_id` and left only its children
+                // behind. An unreadable row is a row whose owner could not
+                // be determined, and since #1278 "filed under this agent" no
+                // longer implies "owned by this agent" — so the safe
+                // disposition for an unknown owner is to keep all of it.
+                // Failing the delete instead would make the agent
+                // permanently undeletable, which is worse. Counted so the
+                // leak is visible; see #1241.
+                let (sid, ctx_id) = match row {
+                    Ok(pair) => pair,
                     Err(e) => {
                         self.record_skipped_row(
                             PersistenceTable::Sessions,
-                            format_args!("delete_agent {id_str}: unreadable session id: {e}"),
+                            format_args!("delete_agent {id_str}: unreadable session row: {e}"),
                         );
-                        None
+                        continue;
                     }
+                };
+                // A subagent context that names a *different* parent is that
+                // parent's history; it merely ran on this agent.
+                if let Some(parent) = alms_core::parse_subagent_parent(&ctx_id)
+                    && parent != id
+                {
+                    continue;
+                }
+                if seen.insert(sid.clone()) {
+                    session_ids.push(sid);
+                }
+            }
+        }
+
+        // 1b. Subagent sessions this agent spawned, wherever they are filed.
+        //
+        // `LIKE 'subagent%'` is a prefix filter only — the literal contains
+        // no `_` or `%`, so it needs no ESCAPE clause — and it deliberately
+        // over-matches: `parse_subagent_parent` below is the authority on
+        // both the shape and the parent, so the context format is never
+        // encoded a second time in SQL where it could drift. Unindexed, but
+        // `delete_agent` is a rare operator action and the scan is bounded
+        // by the subagent sessions in the table.
+        {
+            let mut stmt = tx
+                .prepare("SELECT id, context_id FROM sessions WHERE context_id LIKE 'subagent%'")
+                .map_err(|e| {
+                    AlmsError::Runtime(format!("SQLite prepare subagent session query: {e}"))
+                })?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
                 })
-                .collect()
-        };
+                .map_err(|e| AlmsError::Runtime(format!("SQLite query subagent sessions: {e}")))?;
+            for row in rows {
+                // Same third branch as 1a, and additive in the same way: a
+                // subagent session this agent spawned survives the delete
+                // with a dangling parent in its `context_id`. Nothing that
+                // should have survived is deleted.
+                let (sid, ctx_id) = match row {
+                    Ok(pair) => pair,
+                    Err(e) => {
+                        self.record_skipped_row(
+                            PersistenceTable::Sessions,
+                            format_args!(
+                                "delete_agent {id_str}: unreadable subagent session row: {e}"
+                            ),
+                        );
+                        continue;
+                    }
+                };
+                if alms_core::parse_subagent_parent(&ctx_id) == Some(id) && seen.insert(sid.clone())
+                {
+                    session_ids.push(sid);
+                }
+            }
+        }
 
         // 2. Delete dependent rows for each session (FK order)
         for sid in &session_ids {
@@ -421,9 +526,17 @@ impl SqliteStore {
                 .map_err(|e| AlmsError::Runtime(format!("SQLite delete runs for session: {e}")))?;
         }
 
-        // 3. Delete the sessions themselves
-        tx.execute("DELETE FROM sessions WHERE agent_id = ?1", params![&id_str])
-            .map_err(|e| AlmsError::Runtime(format!("SQLite delete agent sessions: {e}")))?;
+        // 3. Delete the sessions themselves.
+        //
+        // By id, not by `agent_id`: step 1 is now the single authority on
+        // which sessions this delete owns, and a bulk `WHERE agent_id = ?1`
+        // would silently re-delete the foreign-parent subagent rows 1a just
+        // decided to spare. The set is exactly the one step 2 cleaned, so
+        // every FK dependent is already gone.
+        for sid in &session_ids {
+            tx.execute("DELETE FROM sessions WHERE id = ?1", params![sid])
+                .map_err(|e| AlmsError::Runtime(format!("SQLite delete agent sessions: {e}")))?;
+        }
 
         // 4. Clear DM-orphan rows the agent created in shared DM sessions (#992).
         //
@@ -439,20 +552,52 @@ impl SqliteStore {
         // then `session_summaries`, then `runs`. No FK enforces this --
         // it's an audit-clarity choice. We do NOT delete the shared DM
         // session row itself: the surviving partner still uses it.
+        //
+        // #1278: each of these is a bare `agent_id`/`from_agent` sweep over
+        // rows whose session survived step 3, and one class of surviving
+        // session is now *another parent's* subagent transcript that this
+        // agent merely executed (see step 1). Its `runs` rows carry
+        // `agent_id = <this agent>` and a `parent_run_id` pointing into the
+        // parent's own history, so an unqualified sweep would strip the run
+        // and tool-call trail out of a transcript step 1 deliberately
+        // spared — the same cross-agent destruction, one table down.
+        //
+        // The `NOT IN` subquery is exact rather than approximate, and
+        // without re-parsing the context format: step 3 has already deleted
+        // every subagent session this delete owns, so any `subagent%`
+        // session still standing at this point is by construction parented
+        // by somebody else. `session_id IS NULL` is admitted explicitly
+        // because `run_tool_calls.session_id` is nullable and SQL's `NULL
+        // NOT IN (...)` is NULL, which would otherwise start sparing
+        // session-less tool calls that have nothing to do with subagents.
+        const NOT_ON_A_FOREIGN_SUBAGENT_SESSION: &str = "session_id IS NULL OR session_id NOT IN \
+             (SELECT id FROM sessions WHERE context_id LIKE 'subagent%')";
         tx.execute(
-            "DELETE FROM run_tool_calls WHERE from_agent = ?1",
+            &format!(
+                "DELETE FROM run_tool_calls WHERE from_agent = ?1 \
+                 AND ({NOT_ON_A_FOREIGN_SUBAGENT_SESSION})"
+            ),
             params![&id_str],
         )
         .map_err(|e| AlmsError::Runtime(format!("SQLite delete dm-orphan run_tool_calls: {e}")))?;
         tx.execute(
-            "DELETE FROM session_summaries WHERE agent_id = ?1",
+            &format!(
+                "DELETE FROM session_summaries WHERE agent_id = ?1 \
+                 AND ({NOT_ON_A_FOREIGN_SUBAGENT_SESSION})"
+            ),
             params![&id_str],
         )
         .map_err(|e| {
             AlmsError::Runtime(format!("SQLite delete dm-orphan session_summaries: {e}"))
         })?;
-        tx.execute("DELETE FROM runs WHERE agent_id = ?1", params![&id_str])
-            .map_err(|e| AlmsError::Runtime(format!("SQLite delete dm-orphan runs: {e}")))?;
+        tx.execute(
+            &format!(
+                "DELETE FROM runs WHERE agent_id = ?1 \
+                 AND ({NOT_ON_A_FOREIGN_SUBAGENT_SESSION})"
+            ),
+            params![&id_str],
+        )
+        .map_err(|e| AlmsError::Runtime(format!("SQLite delete dm-orphan runs: {e}")))?;
 
         // 4b. Cascade-delete shared DM sessions whose other participant is
         //     also gone (#1002).
@@ -2668,5 +2813,270 @@ mod tests {
             !agent_names_all_readable(&tx),
             "one non-text name cell is enough to make every miss unprovable"
         );
+    }
+
+    // ── #1278: subagent sessions cascade with their PARENT, not their filer ──
+    //
+    // Since #1278 a named subagent session is filed under the *invoked*
+    // agent's registry id while its `context_id` still names the invoking
+    // parent. The four tests below pin both directions of the resulting
+    // ownership rule, because a happy-path delete test passes either way —
+    // the failure mode is entirely about whose rows go with whom.
+
+    /// Seed `subagent_{parent}_{name}` filed under `filer`, with one row in
+    /// every table the cascade touches. Returns the session and its run id.
+    fn seed_subagent_session(
+        store: &SqliteStore,
+        parent: AgentId,
+        filer: AgentId,
+        context_id: &str,
+    ) -> (Session, alms_core::RunId) {
+        let session = Session::new(filer, context_id);
+        store.save_session(&session).unwrap();
+        store
+            .save_message(session.id, &new_message("subagent transcript"))
+            .unwrap();
+        store
+            .save_audit(&AuditEvent::allow(
+                session.id,
+                "shell",
+                serde_json::json!({"cmd": "cargo test"}),
+                serde_json::json!("ok"),
+            ))
+            .unwrap();
+
+        // The run is registered under the FILER (`Run::for_subagent` is
+        // called with `sub_agent_id`), and its `parent_run_id` points into
+        // the PARENT's history — which is what makes destroying it
+        // cross-agent data loss rather than a tidy-up.
+        let parent_run = Run::new(session.id, parent, "delegate".to_string());
+        let run = Run::for_subagent(
+            session.id,
+            filer,
+            "do the work".to_string(),
+            parent_run.run_id,
+        );
+        let run_id = run.run_id;
+        store.save_run(&run).unwrap();
+        store
+            .save_tool_call(
+                run_id,
+                session.id,
+                &ToolCallRecord {
+                    seq: 0,
+                    role: ToolCallRole::Assistant,
+                    tool_name: Some("shell".to_string()),
+                    tool_id: Some("call_0".to_string()),
+                    params: Some(r#"{"cmd":"cargo test"}"#.to_string()),
+                    result: None,
+                    timestamp: chrono::Utc::now(),
+                    from_agent: Some(filer.0.to_string()),
+                },
+            )
+            .unwrap();
+
+        (session, run_id)
+    }
+
+    fn count_where_session(store: &SqliteStore, table: &str, session_id: SessionId) -> i64 {
+        let conn = store.conn.lock();
+        conn.query_row(
+            &format!("SELECT COUNT(*) FROM {table} WHERE session_id = ?1"),
+            params![session_id.0.to_string()],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    fn assert_subagent_rows(store: &SqliteStore, session_id: SessionId, expected: i64, why: &str) {
+        for table in ["sessions", "messages", "audit_events", "runs"] {
+            let n: i64 = {
+                let conn = store.conn.lock();
+                let column = if table == "sessions" {
+                    "id"
+                } else {
+                    "session_id"
+                };
+                conn.query_row(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE {column} = ?1"),
+                    params![session_id.0.to_string()],
+                    |r| r.get(0),
+                )
+                .unwrap()
+            };
+            assert_eq!(
+                n, expected,
+                "`{table}` rows for the subagent session: {why}"
+            );
+        }
+        assert_eq!(
+            count_where_session(store, "run_tool_calls", session_id),
+            expected,
+            "`run_tool_calls` rows for the subagent session: {why}"
+        );
+    }
+
+    #[test]
+    fn delete_agent_spares_a_subagent_transcript_belonging_to_another_parent() {
+        // The #1278 regression. `parent` invoked `reviewer` as a named
+        // subagent, so the transcript is filed under reviewer's registry id
+        // but is parent's history. Deleting reviewer must not touch it.
+        //
+        // Pre-fix this failed on every table at once: step 1's
+        // `WHERE agent_id = ?1` selected the session, step 2 hard-deleted
+        // its messages/audit/runs/tool-calls, and step 3 deleted the row.
+        let store = SqliteStore::open_in_memory().unwrap();
+        let parent = new_agent("parent");
+        let reviewer = new_agent("reviewer");
+        store.create_agent(&parent).unwrap();
+        store.create_agent(&reviewer).unwrap();
+
+        let ctx = alms_core::named_subagent_context_id(parent.id, "reviewer");
+        let (subagent, sub_run_id) = seed_subagent_session(&store, parent.id, reviewer.id, &ctx);
+
+        // Reviewer's own chat session — this one SHOULD go.
+        let own = Session::new(reviewer.id, "chat-reviewer");
+        store.save_session(&own).unwrap();
+        store
+            .save_run(&Run::new(own.id, reviewer.id, "hi".into()))
+            .unwrap();
+
+        assert!(store.delete_agent(reviewer.id).unwrap());
+
+        assert_subagent_rows(
+            &store,
+            subagent.id,
+            1,
+            "deleting the invoked agent must not destroy the invoking parent's transcript",
+        );
+        // Named specifically: the run carries `parent_run_id` into the
+        // parent's own history, and step 4's `DELETE FROM runs WHERE
+        // agent_id = ?1` reaches rows step 1 spared.
+        assert!(
+            store.load_run(sub_run_id).unwrap().is_some(),
+            "the subagent run is filed under the deleted agent but belongs to the parent's \
+             audit trail — step 4's per-agent sweep must skip it"
+        );
+        assert_subagent_rows(
+            &store,
+            own.id,
+            0,
+            "the deleted agent's own session still goes",
+        );
+    }
+
+    #[test]
+    fn delete_agent_takes_the_subagent_sessions_it_spawned() {
+        // The other direction, and the reason the fix is not just an
+        // exclusion: when the PARENT is deleted its subagent transcripts
+        // must go with it, even though they are filed under a different
+        // agent's id and so are invisible to `WHERE agent_id = ?1`.
+        let store = SqliteStore::open_in_memory().unwrap();
+        let parent = new_agent("parent");
+        let reviewer = new_agent("reviewer");
+        store.create_agent(&parent).unwrap();
+        store.create_agent(&reviewer).unwrap();
+
+        let ctx = alms_core::named_subagent_context_id(parent.id, "reviewer");
+        let (subagent, sub_run_id) = seed_subagent_session(&store, parent.id, reviewer.id, &ctx);
+
+        // Reviewer's own chat session must survive the parent's delete.
+        let own = Session::new(reviewer.id, "chat-reviewer");
+        store.save_session(&own).unwrap();
+
+        assert!(store.delete_agent(parent.id).unwrap());
+
+        assert_subagent_rows(
+            &store,
+            subagent.id,
+            0,
+            "a subagent transcript belongs to the parent that spawned it, wherever it is filed",
+        );
+        assert!(store.load_run(sub_run_id).unwrap().is_none());
+        let survives: i64 = {
+            let conn = store.conn.lock();
+            conn.query_row(
+                "SELECT COUNT(*) FROM sessions WHERE id = ?1",
+                params![own.id.0.to_string()],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            survives, 1,
+            "deleting the parent must not reach the invoked agent's own sessions"
+        );
+    }
+
+    #[test]
+    fn delete_agent_takes_unfiled_subagent_sessions_it_spawned() {
+        // Ephemeral subagents (`AgentId::new()`) and named subagents whose
+        // name was never registered (`AgentId::deterministic`) are filed
+        // under ids no agent holds, so before #1278's parent-side sweep no
+        // `delete_agent` call ever enumerated them and they accumulated
+        // forever. They are the parent's history and go when the parent does.
+        let store = SqliteStore::open_in_memory().unwrap();
+        let parent = new_agent("parent");
+        store.create_agent(&parent).unwrap();
+
+        let task_id = uuid::Uuid::new_v4();
+        let (ephemeral, _) = seed_subagent_session(
+            &store,
+            parent.id,
+            AgentId::new(),
+            &format!("subagent_{}_{}", parent.id.0, task_id),
+        );
+        let (unregistered, _) = seed_subagent_session(
+            &store,
+            parent.id,
+            AgentId::deterministic(parent.id, "ghost"),
+            &alms_core::named_subagent_context_id(parent.id, "ghost"),
+        );
+
+        assert!(store.delete_agent(parent.id).unwrap());
+
+        assert_subagent_rows(
+            &store,
+            ephemeral.id,
+            0,
+            "ephemeral subagent session of this parent",
+        );
+        assert_subagent_rows(
+            &store,
+            unregistered.id,
+            0,
+            "unregistered-name subagent session of this parent",
+        );
+    }
+
+    #[test]
+    fn delete_agent_removes_a_self_invoked_subagent_session() {
+        // Tim N1: nothing forbids `invoke_agent { name: "atlas" }` from
+        // atlas, which yields `subagent_{atlas}_atlas` filed under atlas.
+        // That row matches BOTH halves of step 1 — filed under the agent
+        // and parented by it — and must still be deleted rather than
+        // falling between them.
+        //
+        // What this does NOT pin is the `seen` dedupe: every delete in
+        // step 2/3 is idempotent, so collecting the id twice produces the
+        // same end state and removing `seen` fails nothing here. `seen` is
+        // there to keep the work linear and the id set honest, not to
+        // protect a behaviour — do not read this test as covering it.
+        let store = SqliteStore::open_in_memory().unwrap();
+        let atlas = new_agent("atlas");
+        store.create_agent(&atlas).unwrap();
+
+        let ctx = alms_core::named_subagent_context_id(atlas.id, "atlas");
+        let (self_invoked, run_id) = seed_subagent_session(&store, atlas.id, atlas.id, &ctx);
+
+        assert!(store.delete_agent(atlas.id).unwrap());
+
+        assert_subagent_rows(
+            &store,
+            self_invoked.id,
+            0,
+            "a self-invoked subagent session is owned by the agent on both counts",
+        );
+        assert!(store.load_run(run_id).unwrap().is_none());
     }
 }

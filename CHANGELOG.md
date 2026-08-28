@@ -34,6 +34,60 @@ Per-release notes for ALMS, with an emphasis on **operator-facing changes** — 
 
 ### Notable changes
 
+- ⚠️ **A named subagent's session is now filed under the invoked agent, and
+  appears in that agent's own sidebar timeline** (#1278). Previously the
+  session was keyed on `AgentId::deterministic(parent_agent_id, name)` — an id
+  matching no registered agent — and `GET /sessions` excluded subagent rows
+  outright, so an agent invoked as somebody's subagent had its work show up
+  nowhere. It is now keyed on the invoked agent's **registry id** and listed,
+  labelled with the invoking parent (new `parent_agent_id` field on subagent
+  session envelopes). The `context_id` is unchanged, so the `read_subagent_session`
+  parent-ownership check is unaffected: reading a subagent transcript by
+  session id still requires being the agent that *invoked* it, not the one
+  that ran it.
+  - **Breaking, no migration: existing named subagent transcripts are
+    abandoned.** The next `invoke_agent` for a given name resolves the new key
+    and starts a fresh session; the old rows stay in the database, unreachable
+    by name and grouped under no agent. Accepted deliberately — ALMS has no
+    production deployments — rather than shipping migration code for an
+    obligation nobody has.
+  - Unregistered names and ephemeral (unnamed) subagents are unchanged: neither
+    has a registry id to be filed under, so both keep their previous keys.
+    Ephemeral sessions also stay out of the listing — they have no agent whose
+    timeline they could join, and one sidebar row per one-shot call would be
+    noise. They remain reachable by session id via `GET /session/{id}`.
+  - Because a named subagent run now *is* the registered agent, its **runs**
+    are filed under that agent too, and so appear in `GET /runs?agent_id=…`.
+    (Its *episodic summaries* are not: no `session_summaries` row has ever
+    been written for a `subagent_` context, before or after this change.)
+  - **Episodic memory is no longer loaded on any subagent run.** The read
+    side had no session-type gate, so filing the run under the invoked
+    agent's id would have injected that agent's summaries of its own
+    operator chats, Telegram threads, DMs and scheduled jobs into a context
+    whose output goes straight back to the invoking parent as the
+    `invoke_agent` result — a new read path from one agent's private history
+    into another's, with no tool call needed. The gate restores symmetry
+    with the write side, which has always excluded subagent sessions. Also
+    saves `run_summary_budget` (15% of `max_input_tokens`) on every named
+    subagent run.
+  - **Deleting an agent no longer destroys other agents' subagent
+    transcripts.** `delete_agent`'s cascade selected sessions by `agent_id`
+    alone, so once a named subagent session was filed under the invoked
+    agent, deleting that agent would have hard-deleted the *invoking*
+    parent's transcripts, runs and audit events. Ownership for the cascade
+    now reads the parent out of the `context_id` — the same record
+    authorization already reads — so deleting the invoked agent spares them
+    and deleting the parent takes them, wherever they are filed. Unlike the
+    keying break above this was not a one-time upgrade cost:
+    `DELETE /agents/{id_or_name}` is a repeatable operation.
+  - Side effect of the same fix: subagent sessions with no registry agent —
+    ephemeral ones, and named ones whose name was never registered — are now
+    cleaned up when their parent is deleted. Previously no delete path
+    enumerated them at all and they accumulated indefinitely.
+  - Named subagent rows in the sidebar do **not** offer a delete control.
+    They are read-only surfaces whose lifecycle the coordinator owns, and
+    `DELETE /session/{id}` does not check for an active run.
+
 - **The server-default LLM model / provider no longer needs a restart** (#1148).
   Changing `model` / `provider` in the Settings modal (or via `PATCH /settings`)
   now takes effect on the **next run**, matching the `context` / `session` /

@@ -12,9 +12,12 @@ import type { AgentEntity, SessionEntity } from "./state/core-store";
 
 const PARENT_ID = "00000000-0000-4000-8000-000000000001";
 const PEER_ID = "00000000-0000-4000-8000-000000000002";
-// A named subagent session is stored under `AgentId::deterministic(parent, name)`
-// and an ephemeral one under a fresh `AgentId::new()` — neither is a registered
-// agent id, which is the whole reason the owner has to arrive as `agent_name`.
+// #1278 files a named subagent session under the invoked agent's REGISTRY id
+// when it has one, so `sessionOwnerName`'s `agent_id` arm resolves for those.
+// The derived ids below are the two cases it still cannot reach — a name that
+// was never registered, and an ephemeral subagent — which is why the owner
+// keeps arriving as `agent_name`.
+const REGISTERED_REVIEWER_ID = "00000000-0000-4000-8000-000000000003";
 const DERIVED_NAMED_ID = "00000000-0000-4000-8000-0000000000d1";
 const DERIVED_EPHEMERAL_ID = "00000000-0000-4000-8000-0000000000d2";
 const CHAT_SESSION = "00000000-0000-4000-8000-000000000010";
@@ -22,6 +25,8 @@ const NAMED_SUBAGENT_SESSION = "00000000-0000-4000-8000-000000000011";
 const EPHEMERAL_SUBAGENT_SESSION = "00000000-0000-4000-8000-000000000012";
 const UNKNOWN_OWNER_SESSION = "00000000-0000-4000-8000-000000000013";
 const UNFETCHED_SUBAGENT_SESSION = "00000000-0000-4000-8000-000000000014";
+const REGISTERED_SUBAGENT_SESSION = "00000000-0000-4000-8000-000000000015";
+const RENAMED_SUBAGENT_SESSION = "00000000-0000-4000-8000-000000000016";
 const TASK_ID = "00000000-0000-4000-8000-0000000000aa";
 
 /** Mirrors `EPHEMERAL_SUBAGENT_LABEL` in `crates/alms-gateway/src/server/routes.rs`. */
@@ -179,6 +184,62 @@ describe("assistant bubble author label", () => {
     activeSessionId.value = null;
 
     expect(renderLabel()).toBe("atlas $");
+  });
+
+  it("names the subagent when BOTH resolution arms answer (#1278)", () => {
+    // New state as of #1278: the session is filed under the invoked agent's
+    // registry id, so `agent_id` resolves — on top of the `agent_name`
+    // enrichment that was previously the only answer. The two agree by
+    // construction (the registry id was looked up BY that name), so the
+    // label is unchanged; this pins that it stays unchanged rather than
+    // starting to depend on which arm runs first.
+    bridge.replaceAgents([
+      PARENT,
+      { ...PARENT, id: REGISTERED_REVIEWER_ID, name: "reviewer", is_default: false },
+    ]);
+
+    const label = labelFor(
+      subagentSession(
+        REGISTERED_SUBAGENT_SESSION,
+        REGISTERED_REVIEWER_ID,
+        `subagent_${PARENT_ID}_reviewer`,
+        "reviewer",
+      ),
+    );
+
+    expect(label).toBe("reviewer $");
+    expect(label).not.toContain("atlas");
+  });
+
+  it("prefers the context's name over the registry's when the agent was renamed", () => {
+    // The one way the two arms can DISAGREE: the agent has since been
+    // renamed, so its registry record says "critic" while the session's
+    // context still says "reviewer". `agent_name` wins, which names the
+    // session for what it was when it ran — and either way the answer is
+    // the subagent, never the parent, which is #1277's actual rule.
+    //
+    // Not reachable through the API today (Tim N2 on PR #1288): there is
+    // no rename route — `UpdateAgentRequest` has no `name` field and
+    // `PUT /agents/{id_or_name}` is the only update endpoint — so do not
+    // go looking for one. This is future-proofing for the day a rename
+    // lands, which is exactly when the divergence stops being hypothetical
+    // and the wrong arm would start renaming history retroactively.
+    bridge.replaceAgents([
+      PARENT,
+      { ...PARENT, id: REGISTERED_REVIEWER_ID, name: "critic", is_default: false },
+    ]);
+
+    const label = labelFor(
+      subagentSession(
+        RENAMED_SUBAGENT_SESSION,
+        REGISTERED_REVIEWER_ID,
+        `subagent_${PARENT_ID}_reviewer`,
+        "reviewer",
+      ),
+    );
+
+    expect(label).toBe("reviewer $");
+    expect(label).not.toContain("atlas");
   });
 
   it("names the owning agent of a chat session the sidebar is not focused on", () => {

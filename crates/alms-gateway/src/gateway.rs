@@ -666,8 +666,21 @@ impl Gateway {
 
     /// Run the message processing loop until the shutdown token is cancelled.
     ///
-    /// All runs for the same agent are serialized via `agent_queue` (FIFO).
-    /// Different agents process concurrently.
+    /// All **gateway** runs for the same agent are serialized via
+    /// `agent_queue` (FIFO). Different agents process concurrently.
+    ///
+    /// "Gateway" is load-bearing since #1278. Subagent runs have always
+    /// bypassed this queue — the coordinator drives its own `AgentRuntime`
+    /// directly — but they used to be registered under a derived id that
+    /// matched no registered agent, so the per-agent claim stayed literally
+    /// true of everything `GET /runs?agent_id=…` could show. A named
+    /// subagent run is now registered under the *invoked* agent's registry
+    /// id, so that endpoint can legitimately show several concurrent runs
+    /// for one agent, and `agent_has_running_run` (which feeds the
+    /// `queued_behind` count on the run-creation path) can report `true`
+    /// because of a subagent rather than a queued chat turn. Both are
+    /// reporting surfaces; neither weakens the FIFO discipline this queue
+    /// enforces over the runs it actually owns.
     ///
     /// Per-agent Telegram bots each have their own polling loop. Messages from
     /// all bots are merged into a single channel tagged with the owning agent,
