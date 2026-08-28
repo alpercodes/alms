@@ -84,16 +84,34 @@ impl Tool for WorkspaceWriteTool {
             .and_then(|v| v.as_str())
             .unwrap_or("write");
 
-        match mode {
-            "write" => self.workspace.write_file(workspace_file, content)?,
-            "append" => self.workspace.append_file(workspace_file, content)?,
+        let append = match mode {
+            "write" => false,
+            "append" => true,
             other => {
                 return Err(SandboxError::InvalidParameters(format!(
                     "Unknown mode '{}': must be 'write' or 'append'",
                     other
                 )));
             }
-        }
+        };
+
+        // Both writers do blocking file IO, and `append_file` additionally
+        // waits on a cross-process advisory lock with no timeout (#1280).
+        // Awaiting that on a tokio worker would wedge the worker for as long
+        // as some other holder — a second daemon on the same data dir — keeps
+        // the lock. Offloaded to the blocking pool instead, the same
+        // convention `check_sandbox_path_async` follows for far cheaper work.
+        let workspace = self.workspace.clone();
+        let content = content.to_string();
+        tokio::task::spawn_blocking(move || {
+            if append {
+                workspace.append_file(workspace_file, &content)
+            } else {
+                workspace.write_file(workspace_file, &content)
+            }
+        })
+        .await
+        .map_err(|e| SandboxError::Internal(format!("Workspace write task failed: {}", e)))??;
 
         Ok(serde_json::json!({
             "ok": true,

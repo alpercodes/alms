@@ -301,7 +301,7 @@ The workspace files are read at the **start of each run** (not cached across run
 
 **Memory updates:**
 - The agent can update workspace files via the `workspace_write` tool
-- `workspace_write` takes `{file: "memories.md", content: "..."}` or `{file: "memories.md", append: "..."}`
+- `workspace_write` takes `{file: "memories", content: "..."}`, with an optional `mode` of `"write"` (the default) or `"append"`. `file` is the bare name — `"personality"`, `"goals"`, `"memories"`, `"user"` — without the `.md` extension
 - All four workspace files are agent-writable (personality, goals, memories, user) — this is needed for the bootstrap interview to populate `personality.md`
 - Memory writes are audited
 

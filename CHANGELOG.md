@@ -34,6 +34,7 @@ Per-release notes for ALMS, with an emphasis on **operator-facing changes** — 
 
 ### Notable changes
 
+- **An agent's memories survive a concurrent write to its workspace** (#1280). `AgentWorkspace::append_file` was an unlocked read-modify-write (`read_to_string` → `format!` → `fs::write`), and a named subagent resolves to the *same* workspace directory as the agent it was invoked from — a path the coordinator deliberately allows several parents onto at once. Two appends that overlapped therefore left only one of them on disk: no error, no warning, and a still well-formed `memories.md`, so the loss was durable and invisible. The append now runs under an exclusive advisory lock (a sidecar `.{file}.lock`, so nothing ever locks the data file itself and readers are never blocked) and writes through an append-mode handle, so it lands at the file's current end and never rewrites bytes that arrived after the call started. Two runs writing memories at the same time still do so without seeing each other's entries — serialising the *runs* is a separate question, tracked on #1278.
 - ⚠️ **A named subagent's session is now filed under the invoked agent, and
   appears in that agent's own sidebar timeline** (#1278). Previously the
   session was keyed on `AgentId::deterministic(parent_agent_id, name)` — an id

@@ -695,8 +695,10 @@ Per `communication-architecture.md` Section 8.2: **no two instances of the same 
 
 This is a hard constraint, not a suggestion. Running an agent in parallel across sessions would cause:
 - State conflicts (agent making contradictory decisions in two conversations)
-- Memory corruption (two instances writing to the same workspace files)
+- Incoherent memory (two instances appending to the same workspace files without seeing each other's entries)
 - Confusing behavior (agent appearing in two places at once)
+
+The memory bullet used to read *corruption*, and meant it literally: `AgentWorkspace::append_file` was an unlocked read-modify-write, so one of two overlapping appends was silently dropped. That is fixed for the append path (#1280) — `append_file` now runs under an exclusive advisory lock and writes through an append-mode handle, so no append is lost however two appends interleave, and that guarantee holds without any caller-side serialisation. The *replacing* writers — `workspace_write` with `mode: "write"`, and `PUT /agents/{id}/workspace/{file}` — do not take that lock yet (#1294). What the queue is still needed for is the weaker but real problem above: both instances write, neither read the other, and the resulting file is a coherent-looking merge of two conversations that never met.
 
 ### Current state
 
