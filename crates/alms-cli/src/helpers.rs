@@ -72,14 +72,34 @@ pub(crate) fn api_client() -> anyhow::Result<reqwest::Client> {
 }
 
 /// Parse an HTTP error response body into a user-friendly message.
+///
+/// The gateway emits error bodies in **two** shapes and this reads both
+/// (#1289, Tim S3 on #1295):
+///
+/// 1. The house shape from `api_error` — `{"error": {"code", "message"}}`.
+/// 2. A **flat** `{"error_code", "message", ...}` built directly by the
+///    handler. `POST /runs` alone has three: the DM guard (#1156), the
+///    subagent guard (#1289), and the queue-full / shutdown admission
+///    errors. Reading only shape 1 meant those printed as a raw JSON dump
+///    of the whole body instead of the sentence written for the operator
+///    — and for the subagent guard that is the entire audience, since the
+///    web UI never offers the path.
+///
+/// Shape 1 is tried first so a body carrying both is read as the house
+/// shape. Anything that parses as neither falls back to the raw body,
+/// which is still strictly more than nothing.
 pub(crate) fn parse_api_error(status: reqwest::StatusCode, body: &str) -> String {
-    if let Ok(val) = serde_json::from_str::<serde_json::Value>(body)
-        && let Some(msg) = val
+    if let Ok(val) = serde_json::from_str::<serde_json::Value>(body) {
+        if let Some(msg) = val
             .get("error")
             .and_then(|e| e.get("message"))
             .and_then(|m| m.as_str())
-    {
-        return format!("HTTP {status}: {msg}");
+        {
+            return format!("HTTP {status}: {msg}");
+        }
+        if let Some(msg) = val.get("message").and_then(|m| m.as_str()) {
+            return format!("HTTP {status}: {msg}");
+        }
     }
     format!("HTTP {status}: {body}")
 }
@@ -245,6 +265,47 @@ mod tests {
         let msg = parse_api_error(reqwest::StatusCode::NOT_FOUND, body);
         assert!(msg.contains("Agent not found"));
         assert!(msg.contains("404"));
+    }
+
+    /// #1289 / Tim S3: the flat `{"error_code", "message", ...}` shape.
+    /// This is the body the subagent guard emits, byte-shaped like the
+    /// handler builds it — and `alms run create --session <subagent id>`
+    /// is the only client that can reach that guard, so a raw JSON dump
+    /// here means the message reaches nobody.
+    #[test]
+    fn test_parse_api_error_flat_handler_shape() {
+        let body = r#"{"error_code":"SUBAGENT_SESSION_NOT_DIRECTLY_RUNNABLE","message":"Subagent sessions are coordinator-driven; turns are triggered via invoke_agent, not POST /runs.","session_id":"11111111-1111-1111-1111-111111111111","context_id":"subagent_22222222-2222-2222-2222-222222222222_reviewer"}"#;
+        let msg = parse_api_error(reqwest::StatusCode::BAD_REQUEST, body);
+
+        assert!(msg.contains("400"));
+        assert!(
+            msg.contains("turns are triggered via invoke_agent"),
+            "the operator must get the sentence, not the envelope; got {msg:?}"
+        );
+        assert!(
+            !msg.contains("error_code"),
+            "a flat body must not be dumped raw; got {msg:?}"
+        );
+    }
+
+    /// The house shape wins when a body somehow carries both, so adding
+    /// the flat arm cannot change how any existing error renders.
+    #[test]
+    fn test_parse_api_error_prefers_the_nested_shape() {
+        let body =
+            r#"{"error":{"code":"NOT_FOUND","message":"nested wins"},"message":"flat loses"}"#;
+        let msg = parse_api_error(reqwest::StatusCode::NOT_FOUND, body);
+        assert!(msg.contains("nested wins"), "got {msg:?}");
+        assert!(!msg.contains("flat loses"), "got {msg:?}");
+    }
+
+    /// A JSON body with neither shape still falls back to the raw body
+    /// rather than to an empty message.
+    #[test]
+    fn test_parse_api_error_json_without_either_shape_falls_back_to_the_body() {
+        let body = r#"{"unexpected":"payload"}"#;
+        let msg = parse_api_error(reqwest::StatusCode::BAD_GATEWAY, body);
+        assert!(msg.contains("unexpected"), "got {msg:?}");
     }
 
     #[test]

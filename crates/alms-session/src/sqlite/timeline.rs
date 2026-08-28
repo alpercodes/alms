@@ -57,6 +57,45 @@ impl SqliteStore {
     /// through the `runs` table to find sessions where this agent has
     /// executed at least one run.
     ///
+    /// **Subagent sessions** (decision recorded for #1289, no code
+    /// change): a **named** subagent's work **does** appear in the
+    /// invoked agent's timeline, and deliberately so — that is the whole
+    /// of #1278/#1288 ("the invoked agent's work is not in its own
+    /// timeline"). It follows without a filter here: `Run::for_subagent`
+    /// files the run under the *invoked* agent's registry id, so branches
+    /// 1a/1b/2 (`WHERE r.agent_id = ?1`) match it, and #1278 files the
+    /// session under the same id, so branch 3 matches its messages. The
+    /// events arrive tagged `session_type: "subagent"` and carry the
+    /// `subagent_{parent}_{name}` `context_id`, which is what a client
+    /// needs to render them as somebody else's errand rather than as an
+    /// operator chat.
+    ///
+    /// Two consequences of that, both intended:
+    ///
+    /// - The **invoking parent** does *not* get the subagent's events in
+    ///   its own timeline. Its breadcrumb is the `invoke_agent` tool call
+    ///   on its own session; the transcript itself is reachable only
+    ///   through `read_subagent_session`, which authorizes on the parent
+    ///   embedded in the `context_id`. Keeping the timeline out of that
+    ///   means it never becomes a second, unauthorized read path.
+    /// - An **ephemeral** subagent's work appears in nobody's timeline,
+    ///   matching its exclusion from `GET /sessions`: it is filed under a
+    ///   fresh `AgentId::new()` that resolves against no registered
+    ///   agent, so there is no agent whose timeline it could join. Same
+    ///   for a named-but-unregistered subagent, which keeps the derived
+    ///   `AgentId::deterministic` key.
+    ///
+    /// Two boundaries on that, neither a defect but both worth stating
+    /// (Tim on #1295). The subagent `runs` row exists at all only when a
+    /// `RunRegistrar` is wired into the coordinator — `run_subagent_loop`
+    /// guards on `if let Some(ref registrar) = run_registrar`, so an
+    /// unregistered deployment gets the messages branch and no run
+    /// events. And the tests below construct rows with `Run::new` inside
+    /// this crate: they pin what this **query** does given a row filed
+    /// under an agent, not that the coordinator produces rows in that
+    /// shape. The latter is `derive_subagent_identity`'s contract and is
+    /// pinned in `alms-coordinator`.
+    ///
     /// **Pagination**: Uses a `(timestamp, sort_key)` cursor to avoid
     /// skipping events that share the same timestamp at a page boundary.
     /// Fetches `limit + 1` rows internally so `has_more` is accurate.
@@ -837,5 +876,133 @@ mod tests {
             "should have run_completed"
         );
         assert!(types.contains(&"marker"), "should have marker");
+    }
+
+    // -----------------------------------------------------------------
+    // #1289 item 2: subagent work in `GET /agents/{id}/timeline`
+    // -----------------------------------------------------------------
+
+    /// The decision recorded on `load_timeline_events`, in the direction
+    /// that IS the feature: a named subagent's run is filed under the
+    /// invoked agent's registry id, so it lands in that agent's timeline.
+    /// #1278's stated complaint was "the invoked agent's work is not in
+    /// its own timeline"; this is the assertion that it now is.
+    ///
+    /// Also pins the tag the client renders it by — an event that arrived
+    /// with no way to tell it from an operator chat would satisfy the
+    /// literal complaint and none of its point.
+    #[test]
+    fn test_timeline_includes_a_named_subagents_run_under_the_invoked_agent() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let invoked = AgentId::new();
+        let parent = AgentId::new();
+
+        // #1278 keying: session AND run filed under the invoked agent's
+        // registry id, context naming the invoking parent.
+        let context_id = format!("subagent_{}_reviewer", parent.0);
+        let session = Session::new(invoked, &context_id);
+        store.save_session(&session).unwrap();
+
+        let mut run = Run::new(session.id, invoked, "review the diff".to_string());
+        run.mark_running();
+        store.save_run(&run).unwrap();
+        insert_user_message(&store, session.id, "review the diff");
+
+        let page = store.load_timeline_events(invoked, None, 50).unwrap();
+
+        assert!(
+            page.events
+                .iter()
+                .any(|e| e.event_type == "run_started" && e.session_id == session.id.0.to_string()),
+            "the invoked agent's timeline must carry its subagent run; got {:?}",
+            page.events
+        );
+        assert!(
+            page.events
+                .iter()
+                .any(|e| e.event_type == "message_received"
+                    && e.session_id == session.id.0.to_string()),
+            "and the subagent session's messages; got {:?}",
+            page.events
+        );
+        assert!(
+            page.events
+                .iter()
+                .filter(|e| e.session_id == session.id.0.to_string())
+                .all(|e| e.session_type == "subagent" && e.context_id == context_id),
+            "every subagent event must be tagged as one and carry the context \
+             that names the parent; got {:?}",
+            page.events
+        );
+    }
+
+    /// The other direction, and the one with a security edge: the
+    /// **invoking** parent does not get the subagent's transcript in its
+    /// timeline. `read_subagent_session` authorizes on the parent embedded
+    /// in the `context_id`; if the timeline also served those events it
+    /// would be a second read path with no such check. The parent's
+    /// breadcrumb is its own `invoke_agent` tool call, on its own session.
+    ///
+    /// Covers both subagent shapes parented by this agent — the named one
+    /// (filed under the invoked agent) and the ephemeral one (filed under
+    /// a fresh `AgentId` that is nobody's, so it reaches no timeline at
+    /// all).
+    #[test]
+    fn test_timeline_excludes_subagent_work_from_the_invoking_parents_timeline() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let invoked = AgentId::new();
+        let parent = AgentId::new();
+
+        let named = Session::new(invoked, format!("subagent_{}_reviewer", parent.0));
+        store.save_session(&named).unwrap();
+        let mut named_run = Run::new(named.id, invoked, "review".to_string());
+        named_run.mark_running();
+        store.save_run(&named_run).unwrap();
+        insert_user_message(&store, named.id, "review");
+
+        let ephemeral_agent = AgentId::new();
+        let ephemeral = Session::new(
+            ephemeral_agent,
+            format!("subagent_{}_{}", parent.0, uuid::Uuid::new_v4()),
+        );
+        store.save_session(&ephemeral).unwrap();
+        let mut ephemeral_run = Run::new(ephemeral.id, ephemeral_agent, "one-shot".to_string());
+        ephemeral_run.mark_running();
+        store.save_run(&ephemeral_run).unwrap();
+        insert_user_message(&store, ephemeral.id, "one-shot");
+
+        // Positive control: the parent's own session, so an empty page
+        // cannot pass this test by accident.
+        let own = Session::new(parent, "web-chat");
+        store.save_session(&own).unwrap();
+        let mut own_run = Run::new(own.id, parent, "delegate this".to_string());
+        own_run.mark_running();
+        store.save_run(&own_run).unwrap();
+
+        let page = store.load_timeline_events(parent, None, 50).unwrap();
+
+        assert!(
+            page.events
+                .iter()
+                .any(|e| e.session_id == own.id.0.to_string()),
+            "the parent's own run must be in its timeline (control); got {:?}",
+            page.events
+        );
+        assert!(
+            page.events
+                .iter()
+                .all(|e| e.session_id != named.id.0.to_string()),
+            "a named subagent's transcript belongs to the invoked agent's \
+             timeline, not the invoker's; got {:?}",
+            page.events
+        );
+        assert!(
+            page.events
+                .iter()
+                .all(|e| e.session_id != ephemeral.id.0.to_string()),
+            "an ephemeral subagent is filed under nobody's registry id and \
+             must reach no timeline; got {:?}",
+            page.events
+        );
     }
 }

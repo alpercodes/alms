@@ -12285,6 +12285,154 @@ async fn create_run_rejects_dm_session_with_structured_400() {
     shutdown_token.cancel();
 }
 
+/// #1289 item 3: `POST /runs` on a subagent session is rejected on
+/// principle, not incidentally.
+///
+/// Subagent turns come from `invoke_agent` -> `SubagentDispatcher` ->
+/// `run_subagent_loop`, which alone records the `parent_run_id` linkage
+/// and returns the result to the awaiting parent. A run created here
+/// would write into a coordinator-owned transcript and deliver to nobody.
+///
+/// The request deliberately carries **no** `agent_id`. That is the case
+/// the old incidental `AGENT_SESSION_MISMATCH` never covered — with
+/// `agent_id` omitted the handler took the session's own id and proceeded,
+/// before #1278 as well as after — so a guard that only fired on a
+/// supplied-and-differing `agent_id` would leave this test red.
+#[tokio::test]
+async fn create_run_rejects_subagent_session_with_structured_400() {
+    use alms_core::{CreateRunRequest, RunInput};
+    use axum::Json;
+    use axum::extract::State;
+
+    let (state, shutdown_token, _cr, _tr, _dr) = test_app_state();
+
+    // #1278 keying: filed under the INVOKED agent's registry id, context
+    // naming the invoking parent.
+    let invoked = AgentId::new();
+    let parent = AgentId::new();
+    let context_id = format!("subagent_{}_reviewer", parent.0);
+    let session = state.session_manager.get_or_create(invoked, &context_id);
+
+    let req = CreateRunRequest {
+        session_id: session.id,
+        agent_id: None,
+        input: RunInput::Text { text: "hi".into() },
+    };
+
+    let Err((status, body)) = super::lifecycle::create_run(State(state.clone()), Json(req)).await
+    else {
+        panic!("create_run must reject operator runs on subagent sessions (#1289)");
+    };
+    assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+    assert_eq!(
+        body.0["error_code"], "SUBAGENT_SESSION_NOT_DIRECTLY_RUNNABLE",
+        "rejection must carry the structured error code; got {:?}",
+        body.0
+    );
+    assert_eq!(body.0["context_id"], context_id);
+
+    // The rejection must fire BEFORE any side effect, exactly like the DM
+    // guard it sits next to: no run recorded, no user input pre-persisted
+    // into a transcript a live coordinator loop may be writing.
+    assert!(
+        state.run_manager.list_by_session(session.id, 10).is_empty(),
+        "no run may be created on the rejected path"
+    );
+    assert!(
+        state
+            .session_manager
+            .get_history(session.id)
+            .unwrap()
+            .is_empty(),
+        "no input may be persisted on the rejected path"
+    );
+
+    shutdown_token.cancel();
+}
+
+/// The guard keys on the `subagent_` prefix, not on a successful parse,
+/// so every shape the coordinator has ever minted is covered: the
+/// ephemeral `subagent_{parent}_{task_id}`, and the legacy pre-#1185
+/// `subagent_{task_id}` that carries no parent segment and which
+/// `parse_subagent_context` returns `None` for. A guard written on the
+/// parse would let the legacy shape through.
+#[tokio::test]
+async fn create_run_rejects_every_subagent_context_shape() {
+    use alms_core::{CreateRunRequest, RunInput};
+    use axum::Json;
+    use axum::extract::State;
+
+    let (state, shutdown_token, _cr, _tr, _dr) = test_app_state();
+    let parent = AgentId::new();
+
+    for context_id in [
+        format!("subagent_{}_{}", parent.0, uuid::Uuid::new_v4()),
+        format!("subagent_{}", uuid::Uuid::new_v4()),
+    ] {
+        let session = state
+            .session_manager
+            .get_or_create(AgentId::new(), &context_id);
+        let req = CreateRunRequest {
+            session_id: session.id,
+            agent_id: None,
+            input: RunInput::Text { text: "hi".into() },
+        };
+        let Err((status, body)) =
+            super::lifecycle::create_run(State(state.clone()), Json(req)).await
+        else {
+            panic!("create_run must reject the subagent context {context_id}");
+        };
+        assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+        assert_eq!(
+            body.0["error_code"], "SUBAGENT_SESSION_NOT_DIRECTLY_RUNNABLE",
+            "{context_id} must be rejected by the subagent guard; got {:?}",
+            body.0
+        );
+    }
+
+    shutdown_token.cancel();
+}
+
+/// Positive control on the guard's width. `subagent_` is a prefix test,
+/// not a substring one: an ordinary chat whose `context_id` merely
+/// contains the word must still be runnable, or the guard has rotted into
+/// "reject anything that mentions subagents".
+///
+/// `classify_session_type` already draws this line — the assertion is
+/// here so that relaxing the guard to `contains` is a red test rather
+/// than a silent outage of every session with an unlucky name.
+#[tokio::test]
+async fn create_run_admits_a_chat_session_whose_context_merely_mentions_subagents() {
+    use alms_core::{CreateRunRequest, RunInput};
+    use axum::Json;
+    use axum::extract::State;
+
+    let (state, shutdown_token, _cr, _tr, _dr) = test_app_state();
+
+    let agent_id = AgentId::new();
+    let session = state
+        .session_manager
+        .get_or_create(agent_id, "notes-about-subagent_design");
+
+    let req = CreateRunRequest {
+        session_id: session.id,
+        agent_id: Some(agent_id),
+        input: RunInput::Text { text: "hi".into() },
+    };
+    let result = super::lifecycle::create_run(State(state.clone()), Json(req)).await;
+
+    match result {
+        Ok((status, _)) => assert_eq!(status, axum::http::StatusCode::CREATED),
+        Err((status, body)) => panic!(
+            "an ordinary chat session must not hit the subagent guard; \
+             got {status:?} {:?}",
+            body.0
+        ),
+    }
+
+    shutdown_token.cancel();
+}
+
 /// Companion to `create_run_rejects_dm_session_with_structured_400`: the
 /// peer-trigger path (`MessageBus` -> `RunTrigger` -> `run_trigger_loop`,
 /// which enqueues with `is_peer_message: true`) must be UNAFFECTED by the

@@ -88,6 +88,48 @@ Per-release notes for ALMS, with an emphasis on **operator-facing changes** — 
   - Named subagent rows in the sidebar do **not** offer a delete control.
     They are read-only surfaces whose lifecycle the coordinator owns, and
     `DELETE /session/{id}` does not check for an active run.
+  - **`alms session list` gained a `TYPE` column** (#1289). The `--agent`
+    path shows the agent's named subagent transcripts since #1278, and
+    nothing in the table distinguished one from a chat. The listing is
+    otherwise **deliberately uncurated**, and does not adopt
+    `GET /sessions`' exclusions: on the `--agent` path the two surfaces
+    already return the *same* subagent rows (named in, ephemeral out) by
+    different mechanisms, and that path never curated anything to begin
+    with — `load_sessions_by_agent` has no type filter, so episodic,
+    notification and job rows have always listed there. `--json` gained
+    the matching `session_type` field, plus `parent_agent_id` on subagent
+    rows (same names as the HTTP envelope), and `alms session show` now
+    prints `Invoked By` for a subagent session — and, routing through the
+    same enrichment, carries the two new fields on `session show --json`
+    as well.
+  - ⚠️ **New rejection: `POST /runs` against a subagent session is now
+    refused with `400 SUBAGENT_SESSION_NOT_DIRECTLY_RUNNABLE`** (#1289) —
+    the same treatment DM sessions got in #1156, for the same reason.
+    Subagent turns are produced by `invoke_agent` → the coordinator, which
+    alone records the parent linkage and returns the result to the awaiting
+    parent; a run created through `POST /runs` writes into a
+    coordinator-owned transcript and is delivered to nobody. Deliberately
+    new rather than restored: before #1278 the request was already accepted
+    whenever `agent_id` was omitted. The web UI never offered this path
+    (subagent sessions render read-only), but `alms run create --session`
+    did, on a session id `alms session list --agent` now surfaces.
+  - **CLI error messages from `POST /runs` now render instead of
+    dumping raw JSON** (#1289). `parse_api_error` read only the nested
+    `{"error": {"message"}}` envelope, so the handlers that build a
+    **flat** `{"error_code", "message", ...}` body directly — the DM
+    guard (#1156), the new subagent guard, and the queue-full /
+    shutdown admission errors — printed the whole envelope at the
+    operator instead of the sentence written for them. Pre-existing;
+    fixed here because the subagent guard's only reachable client is
+    the CLI.
+  - **Subagent work in `GET /agents/{id}/timeline` is confirmed intended,
+    no behaviour change** (#1289). A named subagent's runs and messages
+    appear in the *invoked* agent's timeline — that is the feature #1278
+    delivered — and not in the invoking parent's, which keeps the timeline
+    from becoming a read path around `read_subagent_session`'s
+    parent-ownership check. Ephemeral subagents appear in no timeline,
+    matching their exclusion from `GET /sessions`. Recorded in
+    `docs/api.md` § 12.1 and on `load_timeline_events`.
 
 - **The server-default LLM model / provider no longer needs a restart** (#1148).
   Changing `model` / `provider` in the Settings modal (or via `PATCH /settings`)

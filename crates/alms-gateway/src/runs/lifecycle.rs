@@ -9,7 +9,7 @@ use crate::session_queue::AdmissionError;
 use crate::sse::SseEventData;
 use alms_core::{
     AgentId, AlmsError, CreateRunRequest, CreateRunResponse, Run, RunId, RunInput, RunStatus,
-    SessionId, sanitize_error_for_session,
+    SessionId, classify_session_type, sanitize_error_for_session,
 };
 use alms_runtime::RuntimeEvent;
 use alms_tools::message_sender::ConversationEndReason;
@@ -693,6 +693,59 @@ pub async fn create_run(
                 "error_code": "DM_SESSION_NOT_DIRECTLY_RUNNABLE",
                 "message": "DM sessions are agent-to-agent only; turns are \
                             triggered via send_message, not POST /runs.",
+                "session_id": session_id.0.to_string(),
+                "context_id": context_id.as_str(),
+            }))
+            .into(),
+        ));
+    }
+
+    // #1289 item 3: subagent sessions are coordinator-driven only —
+    // reject the operator path, same shape and same reasoning as the DM
+    // guard above.
+    //
+    // A subagent turn is produced by `invoke_agent` ->
+    // `SubagentDispatcher::dispatch` -> `run_subagent_loop`, which builds
+    // its own `AgentRuntime`, records `Run::for_subagent` with the
+    // parent's `parent_run_id`, and on completion returns the result to
+    // the awaiting parent and emits `subagent_completed`. A `POST /runs`
+    // reproduces none of that: no parent linkage, and no delivery — the
+    // output lands in the transcript and nowhere else, while the parent
+    // blocked in `invoke_agent` never sees it. It can also race a live
+    // coordinator loop writing the same session, which is why #1288
+    // withdrew the sidebar's delete control from these rows.
+    //
+    // This is a NEW guard, not a restored one. Before #1278 the id check
+    // above rejected this incidentally, but only when the caller supplied
+    // an `agent_id` that differed; with `agent_id` omitted the handler
+    // already accepted the request and ran under the derived id. #1278
+    // filed named subagent sessions under the invoked agent's registry
+    // id, which made the supplied-`agent_id` case pass too — so the
+    // question #1289 asks is not "put the accident back" but "should this
+    // be rejected on principle". It should: the UI already treats these
+    // sessions as read-only (`isInternalSession` includes `'subagent'`),
+    // so permitting it would make the API contradict its only client,
+    // and #1278's listing change now hands an operator the session id
+    // (`alms session list --agent`) that `alms run create --session`
+    // takes.
+    //
+    // Keyed on the `subagent_` prefix rather than on a successful parse,
+    // so a context this binary cannot decompose (the legacy pre-#1185
+    // `subagent_{task_id}` shape) is rejected too rather than falling
+    // through the gap.
+    if classify_session_type(&context_id) == "subagent" {
+        warn!(
+            session_id = %session_id.0,
+            context_id = %context_id,
+            "Rejecting POST /runs on a subagent session with \
+             SUBAGENT_SESSION_NOT_DIRECTLY_RUNNABLE (#1289)"
+        );
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error_code": "SUBAGENT_SESSION_NOT_DIRECTLY_RUNNABLE",
+                "message": "Subagent sessions are coordinator-driven; turns are \
+                            triggered via invoke_agent, not POST /runs.",
                 "session_id": session_id.0.to_string(),
                 "context_id": context_id.as_str(),
             }))

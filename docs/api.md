@@ -482,6 +482,22 @@ worker can no longer accept dispatch. No run-side effects are created.
 
 DM sessions (`context_id` starting with `dm:`) are agent-to-agent only. Peer DM turns are triggered exclusively by the `send_message` tool through the internal MessageBus (`RunTrigger` → trigger loop, which enqueues with `is_peer_message: true`) — never by `POST /runs`, which always enqueues non-peer runs. A non-peer run on a DM session would arm the implicit-reply machinery from #1154 (the DM recipient prompt and the `send_message` peer-fold) while the DM completion gate refuses delivery, guaranteeing a silent drop — so the gateway rejects the request up front.
 
+**Response 400** (subagent session, #1289):
+```json
+{
+  "error_code": "SUBAGENT_SESSION_NOT_DIRECTLY_RUNNABLE",
+  "message": "Subagent sessions are coordinator-driven; turns are triggered via invoke_agent, not POST /runs.",
+  "session_id": "<uuid>",
+  "context_id": "subagent_<parent_agent_id>_reviewer"
+}
+```
+
+Returned when the request would **otherwise have been admitted**. A request that supplies an `agent_id` differing from the session's is still rejected earlier, with `AGENT_SESSION_MISMATCH` — that check runs ~50 lines before this guard. The same ordering applies to the DM guard above.
+
+Subagent sessions (`context_id` starting with `subagent_`) are coordinator-driven only. A subagent turn is produced by `invoke_agent` → `SubagentDispatcher::dispatch` → `run_subagent_loop`, which records the run with its parent's `parent_run_id`, returns the result to the awaiting parent, and emits `subagent_completed`. A `POST /runs` reproduces none of that: the output lands in the transcript and is delivered to nobody, and it can race a live coordinator loop writing the same session. The rejection is keyed on the `subagent_` prefix, so the named, ephemeral and legacy pre-#1185 context shapes are all covered.
+
+Deliberately new in #1289 rather than restored: before #1278 the `AGENT_SESSION_MISMATCH` check rejected this only when the caller supplied an `agent_id` that differed from the session's; with `agent_id` omitted the request was already accepted. #1278 filed named subagent sessions under the invoked agent's registry id, which made the supplied-`agent_id` case pass too. The web UI never offered this path — `isInternalSession` includes `subagent`, so the composer renders read-only — but `alms session list --agent` now surfaces the session id and `alms run create --session` accepts it.
+
 **Response 400** (resolved per-agent + server budget overshoots provider cap, #919):
 ```json
 {
@@ -2123,6 +2139,13 @@ The launcher process is fire-and-forget — the response returns as soon as the 
 Returns a unified, reverse-chronological stream of events across all sessions for an agent. Aggregates runs, tool calls, and significant messages into a single timeline.
 
 Path parameter `{id_or_name}` accepts either a UUID or a name slug (same as other `/agents/{id_or_name}` endpoints).
+
+**Subagent work is included** (decision recorded for #1289; no behaviour change). When an agent runs as somebody's **named** subagent, those runs, tool calls and messages appear in *its own* timeline, tagged `session_type: "subagent"` with the `subagent_{parent_agent_id}_{name}` `context_id`. That is the point of #1278 — the run and the session are both filed under the invoked agent's registry id, so the aggregation picks them up without a special case.
+
+Two consequences, both intended:
+
+- The **invoking parent** does not see the subagent's events in its own timeline. Its breadcrumb is the `invoke_agent` tool call on its own session; the transcript is reachable only through `read_subagent_session`, which authorizes on the parent embedded in the `context_id`. Keeping the timeline out of that means it is not a second read path with no such check.
+- An **ephemeral** subagent's work appears in no timeline at all, matching its exclusion from `GET /sessions` (§ 4.1): it is filed under a fresh UUID that resolves against no registered agent, so there is no timeline for it to join. The same holds for a named subagent whose name was never registered.
 
 **Query parameters:**
 
