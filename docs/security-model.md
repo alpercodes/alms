@@ -798,17 +798,36 @@ Job safety:
 ### Subagent session readback (#1181 / PR #1185)
 - The `subagent_` session `context_id` prefix is **coordinator-reserved**: only
   `derive_subagent_identity` (alms-coordinator) may mint contexts with this
-  prefix, and `read_subagent_session`'s access check treats the shape as a
-  trusted ownership record. Both shapes embed the spawning parent's agent id —
+  prefix, and the access rule treats the shape as a trusted ownership record.
+  Both shapes embed the spawning parent's agent id —
   `subagent_{parent_agent_id}_{name}` (named, #1051) and
   `subagent_{parent_agent_id}_{task_id}` (ephemeral, #1181/#1185).
+  - Reserved **by convention, not by enforcement**: `POST /sessions` and
+    `GET /sessions/{agent_id}/{context_id}` `get_or_create` on a client-supplied
+    `context_id` with no prefix validation, so a context like `subagent_notes`
+    is creatable today. Since #1298 such a context is `UnrecognizedShape` and
+    therefore denied to its own agent, where it previously read back via
+    `read_session`'s `agent_id` match. That is fail-closed and consistent with
+    the rest of the product — `classify_session_type` already calls any
+    `subagent_` prefix a subagent, so the session is already internal, excluded
+    from `list_sessions` and read-only in the UI. Stated here because this is
+    the bullet that asserts "reserved": the prefix is now also *denied*, which
+    is the enforcement the mint side still lacks.
 - The reserved shape now has a **second consumer**: `parse_subagent_context`
   (alms-core, #1277) recovers the session's display owner from it for the
   `agent_name` field on session envelopes. A change to the context format must
-  visit both it and `read_subagent_session`'s access check — one decides who
-  may read the transcript, the other decides whose name is rendered on it. The
-  parser's named arm is `validate_agent_name`-gated, which also bounds the
-  model-supplied name before it reaches the UI as a label.
+  visit both it and the access rule — one decides who may read the transcript,
+  the other decides whose name is rendered on it. The parser's named arm is
+  `validate_agent_name`-gated, which also bounds the model-supplied name before
+  it reaches the UI as a label.
+- **The access rule is stated once**, in `alms_core::subagent_session_access`
+  (#1298): *a subagent session belongs to the parent named in its `context_id`,
+  never to the agent whose id it happens to be filed under.* Both
+  `read_subagent_session` and `read_session` call it, and `delete_agent`'s
+  cascade reads the same ownership out of `parse_subagent_parent`. Before
+  #1298 the two tools each carried their own copy of the belief and had
+  drifted into opposite answers about the same bytes (see the #1278 bullet
+  below); a new consumer must call the shared rule rather than re-derive it.
 - Ephemeral subagent transcript reads by `session_id` are **ownership-checked
   by parent id, not bearer-capability**: knowing the session UUID is NOT
   sufficient. The UUID intentionally leaks beyond the spawning parent (it
@@ -820,14 +839,39 @@ Job safety:
   parent id (`subagent_{task_id}`, pre-v0.2.4 hardening) are denied outright.
 - Since #1278 a **named** subagent session's `agent_id` is the *invoked*
   agent's registry id, not the invoking parent's. It is deliberately **not**
-  an authorization input: `check_subagent_session_access` reads ownership only
-  out of the `context_id`, which still embeds the spawning parent. Authorizing
-  on `session.agent_id` would grant the transcript to the agent the work was
-  delegated *to* rather than *by*. Note the consequence in the other
-  direction: because the row is now filed under the invoked agent,
-  `read_session`'s `session.agent_id == self.agent_id` check admits that agent
-  to its own subagent transcripts — reachable only with the session UUID,
-  since `list_my_sessions` still filters `subagent` contexts out.
+  an authorization input: ownership is read only out of the `context_id`,
+  which still embeds the spawning parent. Authorizing on `session.agent_id`
+  would grant the transcript to the agent the work was delegated *to* rather
+  than *by* — and, since every parent invoking the same **registered** named
+  subagent files under that one registry id, it would grant that agent *every*
+  parent's delegations, not only its own. The grant is to the delegate; other
+  parents are reached only if the delegate relays. The embedded parent is the
+  only field that separates two parents' delegations to the same agent.
+  - On the other two arms `session.agent_id` names nobody at all — an
+    unregistered name files under `AgentId::deterministic(parent, name)` and an
+    ephemeral subagent under a fresh `AgentId::new()`, ids no agent holds — so
+    an `agent_id` check grants no one there, the parent included. The
+    pre-#1298 over-grant therefore existed on the **registered-name arm only**,
+    which bounds what was exposed.
+  - `read_session` authorized on `session.agent_id` and so did admit the
+    invoked agent to its own subagent transcripts. Latent rather than open, on
+    two counts: `list_my_sessions` filters `subagent` contexts out, so there
+    was no supported way to learn the id; and the delegate holds `read_session`
+    only while running a **gateway** run — the coordinator's subagent runtime
+    registers none of the agent tools (`alms-coordinator`'s only
+    `register_tool` call is inside `mod tests`), so a subagent run could never
+    read anything back. It needed the delegate to *also* be an agent someone
+    chats with, crons, or DMs. #1298 routes `read_session` through
+    `subagent_session_access` instead, so both tools now grant the spawning
+    parent and refuse everyone else.
+  - One consequence for operators: the two tools are now a single access
+    surface under two names. `ToolRegistry`'s `enabled_filter` applies to every
+    registration, dynamic ones included, and the two names are separately
+    listable in `tools.enabled` — so an allowlist naming `read_session` but not
+    `read_subagent_session` used to leave the parent with no door onto a
+    subagent transcript and now provides one. The check is identical either
+    way; only reachability changed. The default (`tools.enabled` empty = all
+    enabled) is unaffected.
 - The same move puts the invoked agent's registry id on the subagent run's
   **context build**, which is a different question from tool authorization
   because the context builder has no per-agent boundary at all. Episodic

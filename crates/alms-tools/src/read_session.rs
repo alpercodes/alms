@@ -7,10 +7,12 @@
 //! Security: the tool verifies that the requested session belongs to the
 //! calling agent (`session.agent_id == self.agent_id`). For shared DM sessions
 //! (where `agent_id` is the nil UUID sentinel), access is granted if the
-//! agent's name appears in the session's `context_id`.
+//! agent's name appears in the session's `context_id`. Subagent sessions are
+//! the one class where `session.agent_id` is not the owner and are decided by
+//! [`alms_core::subagent_session_access`] instead — see [`ReadSessionTool::check_access`].
 
 use crate::dm_filter;
-use alms_core::{AgentId, SessionId};
+use alms_core::{AgentId, SessionId, SubagentSessionAccess};
 use alms_sandbox::{SandboxError, Tool, error::SandboxResult};
 use alms_session::SessionManager;
 use serde_json::Value;
@@ -44,7 +46,24 @@ impl ReadSessionTool {
     /// Check whether this agent is allowed to read the given session.
     ///
     /// Returns `Ok(())` if access is allowed, or an error message string.
+    ///
+    /// Case 0 runs first and is not a special case of the others: for a
+    /// subagent session `session.agent_id` is the **invoked** agent since
+    /// #1288, so Case 1 would answer the ownership question with the id of
+    /// whoever the work was delegated *to*. The rule that supersedes it is
+    /// stated once in [`alms_core::subagent_session_access`] — this tool and
+    /// `read_subagent_session` both call it so they cannot drift into
+    /// opposite answers about the same bytes again (#1298).
     fn check_access(&self, session: &alms_session::Session) -> Result<(), String> {
+        // Case 0: subagent session — owned by the parent named in the
+        // context_id, whoever the row is filed under.
+        match alms_core::subagent_session_access(&session.context_id, self.agent_id) {
+            SubagentSessionAccess::Owner { .. } => return Ok(()),
+            SubagentSessionAccess::Denied(denial) => return Err(denial.message(session.id)),
+            // Every other session class falls through to the cases below.
+            SubagentSessionAccess::NotSubagent => {}
+        }
+
         // Case 1: session belongs to this agent directly.
         if session.agent_id == self.agent_id {
             return Ok(());
@@ -772,5 +791,184 @@ mod tests {
         assert_eq!(result["summary"], "Explored architecture decisions");
         assert_eq!(result["message_count"], 1);
         assert!(result["messages"].as_array().is_some());
+    }
+
+    // -- #1298: subagent transcripts are owned by the spawning parent -------
+
+    /// Reproduce the post-#1288 row exactly: `agent_id` is the *invoked*
+    /// agent's registry id, `context_id` still names the parent.
+    fn named_subagent_session(
+        mgr: &Arc<SessionManager>,
+        parent: AgentId,
+        invoked: AgentId,
+        name: &str,
+    ) -> alms_session::Session {
+        let session =
+            mgr.get_or_create(invoked, alms_core::named_subagent_context_id(parent, name));
+        assert_eq!(
+            session.agent_id, invoked,
+            "test setup: the row must be filed under the invoked agent"
+        );
+        mgr.append_message(session.id, make_msg(Role::Assistant, "reviewed it"))
+            .unwrap();
+        session
+    }
+
+    async fn read(tool: &ReadSessionTool, session: &alms_session::Session) -> Value {
+        tool.execute(serde_json::json!({ "session_id": session.id.0.to_string() }))
+            .await
+            .unwrap()
+    }
+
+    /// The bug #1298 was filed for, at the tool's own entry point. The
+    /// invoked agent owns the *row* since #1288, so `session.agent_id ==
+    /// self.agent_id` admits it — and that is the wrong question. Delete the
+    /// subagent branch from `check_access` and this row goes green-to-red.
+    #[tokio::test]
+    async fn read_session_refuses_the_invoked_agent_its_own_subagent_transcript() {
+        let mgr = make_session_manager();
+        let parent = AgentId::new();
+        let invoked = AgentId::new();
+        let session = named_subagent_session(&mgr, parent, invoked, "reviewer");
+
+        let tool = ReadSessionTool::new(mgr.clone(), invoked, Some("reviewer".to_string()));
+        let result = read(&tool, &session).await;
+
+        assert!(
+            result["error"]
+                .as_str()
+                .unwrap_or("")
+                .contains("belongs to another agent's subagent"),
+            "the agent the work was delegated TO must not read it back: {result}"
+        );
+        assert!(result.get("messages").is_none());
+    }
+
+    /// The other half of the same rule: the invoking parent is the owner and
+    /// gets the transcript, even though the row is filed elsewhere. Without
+    /// the subagent branch this falls to "does not belong to you".
+    #[tokio::test]
+    async fn read_session_admits_the_invoking_parent_of_a_subagent_transcript() {
+        let mgr = make_session_manager();
+        let parent = AgentId::new();
+        let invoked = AgentId::new();
+        let session = named_subagent_session(&mgr, parent, invoked, "reviewer");
+
+        let tool = ReadSessionTool::new(mgr.clone(), parent, Some("alice".to_string()));
+        let result = read(&tool, &session).await;
+
+        assert!(result.get("error").is_none(), "parent denied: {result}");
+        assert_eq!(result["messages"][0]["content"], "reviewed it");
+    }
+
+    /// A third agent that merely learned the UUID is refused. The id is not a
+    /// bearer capability (#1185) and this tool must not make it one.
+    #[tokio::test]
+    async fn read_session_refuses_a_bystander_holding_the_subagent_session_id() {
+        let mgr = make_session_manager();
+        let parent = AgentId::new();
+        let invoked = AgentId::new();
+        let session = named_subagent_session(&mgr, parent, invoked, "reviewer");
+
+        let tool = ReadSessionTool::new(mgr.clone(), AgentId::new(), Some("mallory".to_string()));
+        let result = read(&tool, &session).await;
+
+        assert!(
+            result["error"]
+                .as_str()
+                .unwrap_or("")
+                .contains("belongs to another agent's subagent"),
+            "{result}"
+        );
+    }
+
+    /// Two parents, one named subagent: post-#1288 both rows carry the same
+    /// `agent_id`, so only the context separates them. Alice must not read
+    /// Bob's delegation to the shared reviewer.
+    #[tokio::test]
+    async fn read_session_separates_two_parents_of_the_same_named_subagent() {
+        let mgr = make_session_manager();
+        let alice = AgentId::new();
+        let bob = AgentId::new();
+        let reviewer = AgentId::new();
+        let alices = named_subagent_session(&mgr, alice, reviewer, "reviewer");
+        let bobs = named_subagent_session(&mgr, bob, reviewer, "reviewer");
+        assert_eq!(
+            alices.agent_id, bobs.agent_id,
+            "test setup: the two rows must be indistinguishable by agent_id"
+        );
+
+        let tool = ReadSessionTool::new(mgr.clone(), alice, Some("alice".to_string()));
+        assert_eq!(
+            read(&tool, &alices).await["messages"][0]["content"],
+            "reviewed it"
+        );
+        assert!(
+            read(&tool, &bobs).await["error"]
+                .as_str()
+                .unwrap_or("")
+                .contains("belongs to another agent's subagent"),
+        );
+    }
+
+    /// The #1185 legacy shape records no parent, so it is denied to everyone
+    /// — including the agent whose id the row is filed under, which is the
+    /// only reader `check_access` would otherwise have admitted.
+    #[tokio::test]
+    async fn read_session_refuses_a_legacy_subagent_context_even_to_the_filed_owner() {
+        let mgr = make_session_manager();
+        let agent_id = AgentId::new();
+        let session = mgr.get_or_create(agent_id, format!("subagent_{}", uuid::Uuid::new_v4()));
+        mgr.append_message(session.id, make_msg(Role::Assistant, "legacy"))
+            .unwrap();
+
+        let tool = ReadSessionTool::new(mgr.clone(), agent_id, Some("alice".to_string()));
+        let result = read(&tool, &session).await;
+
+        assert!(
+            result["error"]
+                .as_str()
+                .unwrap_or("")
+                .contains("legacy ephemeral subagent session"),
+            "{result}"
+        );
+    }
+
+    /// An ephemeral subagent is the same rule with a task id in place of a
+    /// name: parent in, everyone else out.
+    #[tokio::test]
+    async fn read_session_applies_the_rule_to_ephemeral_subagent_sessions() {
+        let mgr = make_session_manager();
+        let parent = AgentId::new();
+        let context_id = format!("subagent_{}_{}", parent.0, uuid::Uuid::new_v4());
+        let session = mgr.get_or_create(AgentId::new(), &context_id);
+        mgr.append_message(session.id, make_msg(Role::Assistant, "did the thing"))
+            .unwrap();
+
+        let parent_tool = ReadSessionTool::new(mgr.clone(), parent, None);
+        assert_eq!(
+            read(&parent_tool, &session).await["messages"][0]["content"],
+            "did the thing"
+        );
+
+        let other_tool = ReadSessionTool::new(mgr.clone(), AgentId::new(), None);
+        assert!(read(&other_tool, &session).await["error"].is_string());
+    }
+
+    /// The subagent branch must not swallow the session classes it has no
+    /// opinion about: an ordinary chat the agent owns still reads back.
+    #[tokio::test]
+    async fn read_session_still_serves_a_context_that_merely_looks_subagent_ish() {
+        let mgr = make_session_manager();
+        let agent_id = AgentId::new();
+        let session = mgr.get_or_create(agent_id, "subagentish-notes");
+        mgr.append_message(session.id, make_msg(Role::User, "hello"))
+            .unwrap();
+
+        let tool = ReadSessionTool::new(mgr.clone(), agent_id, None);
+        let result = read(&tool, &session).await;
+
+        assert!(result.get("error").is_none(), "{result}");
+        assert_eq!(result["messages"][0]["content"], "hello");
     }
 }

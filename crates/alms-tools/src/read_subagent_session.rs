@@ -11,7 +11,7 @@
 //! result, `subagent_started` event, and completion notification already
 //! surfaces to the parent.
 
-use alms_core::{AgentId, SessionId};
+use alms_core::{AgentId, SessionId, SubagentSessionAccess};
 use alms_sandbox::{SandboxError, Tool, error::SandboxResult};
 use alms_session::SessionManager;
 use serde_json::Value;
@@ -60,36 +60,25 @@ impl ReadSubagentSessionTool {
     /// Authorize a by-`session_id` readback target (#1181, hardened per the
     /// Tim / Codex access-control review on PR #1185).
     ///
-    /// The by-id path must not turn this tool into "read any session by
-    /// UUID" — `read_session` already exists for the agent's OWN sessions
-    /// and enforces its own ownership model. Only subagent sessions are in
-    /// scope here, and BOTH `context_id` shapes the coordinator's
-    /// `derive_subagent_identity` produces embed the spawning parent's id,
-    /// which must match this tool's `parent_agent_id`:
+    /// The rule itself is **not stated here** — it lives once, in
+    /// [`alms_core::subagent_session_access`], because `read_session` decides
+    /// the same question about the same bytes and the two answers drifted
+    /// apart when each tool held its own copy of the belief (#1298). This is
+    /// the tool-shaped adapter around it: the ownership decision comes from
+    /// core, and all that is added is the name label and the one message core
+    /// cannot phrase (a non-subagent session, which is `read_session`'s
+    /// business, not a denial).
     ///
-    /// - `subagent_{parent_agent_id}_{name}` — named subagent (#1051).
-    /// - `subagent_{parent_agent_id}_{task_id}` — ephemeral / unnamed
-    ///   subagent. The parent id was added to this shape by the PR #1185
-    ///   hardening: the session UUID must NOT act as a bearer capability,
-    ///   because it leaks beyond the spawning parent — it appears in
-    ///   parent-visible `invoke_agent` result / completion text and, for
-    ///   DM-triggered invocations, is persisted onto the SHARED DM parent
-    ///   session where the DM peer can see it. This tool is registered for
-    ///   every agent and is auto-approved, so without the ownership check
-    ///   any agent that learned the UUID could read the full transcript.
+    /// What the adapter must preserve, from the #1185 hardening:
     ///
-    /// Legacy ephemeral sessions created before the hardening
-    /// (`subagent_{task_id}`, no parent linkage) are DENIED: their ownership
-    /// cannot be verified, and denying them is strictly no worse than
-    /// pre-#1181 behaviour (ephemeral readback never worked at all).
-    ///
-    /// **The check reads the `context_id` and nothing else.** That is why
-    /// #1278 — which moved a named subagent session's `agent_id` onto the
-    /// invoked agent's registry id — could not weaken it: the parent is
-    /// embedded in the context, the context was left byte-for-byte
-    /// unchanged, and `session.agent_id` was never an input here. A future
-    /// change that starts deriving ownership from `session.agent_id` would
-    /// be authorizing on the INVOKED agent instead of the invoking one.
+    /// - The by-id path must not become "read any session by UUID". Only
+    ///   subagent sessions are in scope; anything else is bounced to
+    ///   `read_session`.
+    /// - Ownership is the parent embedded in the `context_id`, never the
+    ///   session UUID (which leaks beyond the spawning parent) and never
+    ///   `session.agent_id` (which since #1278 is the *invoked* agent).
+    /// - Legacy `subagent_{task_id}` sessions predate the parent embedding
+    ///   and stay denied to everyone, the parent included.
     ///
     /// Returns the subagent's name for an owned named session, `None` for an
     /// owned ephemeral one, or a caller-facing error message.
@@ -97,51 +86,24 @@ impl ReadSubagentSessionTool {
         &self,
         session: &alms_session::Session,
     ) -> Result<Option<String>, String> {
-        let Some(rest) = session.context_id.strip_prefix("subagent_") else {
-            return Err(format!(
+        match alms_core::subagent_session_access(&session.context_id, self.parent_agent_id) {
+            SubagentSessionAccess::NotSubagent => Err(format!(
                 "Session {} is not a subagent session. Use read_session to read your own sessions.",
                 session.id.0
-            ));
-        };
-
-        // Legacy pre-hardening ephemeral shape: `subagent_{task_id}` with no
-        // parent linkage — ownership cannot be verified, so deny.
-        if uuid::Uuid::parse_str(rest).is_ok() {
-            return Err(format!(
-                "Session {} is a legacy ephemeral subagent session without parent \
-                 ownership metadata and cannot be read back.",
-                session.id.0
-            ));
-        }
-
-        // Both current shapes are `{parent_uuid}_{remainder}` — a UUID never
-        // contains '_', so the first '_' is the separator regardless of the
-        // remainder's own characters.
-        if let Some((parent, remainder)) = rest.split_once('_')
-            && let Ok(parent_uuid) = uuid::Uuid::parse_str(parent)
-        {
-            if AgentId(parent_uuid) != self.parent_agent_id {
-                return Err(format!(
-                    "Session {} belongs to another agent's subagent. You can only read \
-                     sessions of subagents you invoked.",
-                    session.id.0
-                ));
-            }
-            // Ephemeral remainder is the task UUID → no name label. (A named
-            // subagent whose registered name happens to parse as a UUID would
-            // get a null label too — cosmetic only; the ownership check above
+            )),
+            // Ephemeral trailing segment is the task UUID → no name label. (A
+            // named subagent whose registered name happens to parse as a UUID
+            // would get a null label too — cosmetic only; the ownership check
             // is identical either way.)
-            return if uuid::Uuid::parse_str(remainder).is_ok() {
-                Ok(None)
-            } else {
-                Ok(Some(remainder.to_string()))
-            };
+            SubagentSessionAccess::Owner { trailing } => {
+                if uuid::Uuid::parse_str(trailing).is_ok() {
+                    Ok(None)
+                } else {
+                    Ok(Some(trailing.to_string()))
+                }
+            }
+            SubagentSessionAccess::Denied(denial) => Err(denial.message(session.id)),
         }
-
-        Err(format!(
-            "Session {} has an unrecognized subagent session format.",
-            session.id.0
-        ))
     }
 }
 

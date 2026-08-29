@@ -379,7 +379,7 @@ At the start of each run (in `build_context`), when `run_summary_mode != off`:
 Two built-in tools let agents actively query their own session history (rather than passively receiving injected summaries):
 
 - **`list_my_sessions`** — Lists the agent's sessions across all channels (web, Telegram, DM, job). Returns session ID, context type, context ID, source label, message count, last activity, and episodic summary. Excludes internal sessions (subagent, episodic). Current session excluded by default.
-- **`read_session`** — Reads conversation history from a specific session by UUID. Returns last N messages and the episodic/context summary. Security: verifies session ownership (`agent_id` match or DM participant check with exact segment matching to prevent substring bypass).
+- **`read_session`** — Reads conversation history from a specific session by UUID. Returns last N messages and the episodic/context summary. Security: verifies session ownership (`agent_id` match, or DM participant check with exact segment matching to prevent substring bypass). Subagent sessions are the exception — their owner is the parent embedded in the `context_id`, not the `agent_id` the row is filed under, and the check defers to `alms_core::subagent_session_access` so it cannot disagree with `read_subagent_session` (#1298).
 
 **Storage schema:**
 

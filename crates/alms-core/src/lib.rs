@@ -190,6 +190,139 @@ fn split_subagent_context(context_id: &str) -> Option<(AgentId, &str)> {
     Some((AgentId(parent), trailing))
 }
 
+/// The outcome of [`subagent_session_access`] — who may read the transcript
+/// behind a session's `context_id`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubagentSessionAccess<'a> {
+    /// Not a subagent context at all, so this rule has nothing to say about
+    /// it. Callers fall through to whatever model owns the session class
+    /// they are looking at (`read_session`'s own-session / DM-participant
+    /// checks, say).
+    NotSubagent,
+    /// The reader IS the spawning parent named in the context: granted.
+    ///
+    /// Carries the context's trailing segment — a subagent name, or an
+    /// ephemeral task id — purely as a convenience for labelling the result.
+    /// Labelling is a *separate* question from access and has its own,
+    /// stricter parse: see [`parse_subagent_context`].
+    Owner { trailing: &'a str },
+    /// A subagent session this reader does not own.
+    Denied(SubagentAccessDenial),
+}
+
+/// Why [`subagent_session_access`] refused a read.
+///
+/// Each arm owns its caller-facing text, so every tool enforcing the rule
+/// denies in the same words for the same bytes — the divergence #1298 was
+/// filed for began as two tools writing their own messages for their own
+/// privately held beliefs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubagentAccessDenial {
+    /// A well-formed subagent context parented by a *different* agent. This
+    /// is the arm that refuses the **invoked** agent its own transcript.
+    OtherParent,
+    /// Legacy pre-#1185 `subagent_{task_id}`: no parent is recorded, so
+    /// nobody can be shown to own it. Denied to everyone, parent included.
+    LegacyNoParent,
+    /// `subagent_`-prefixed, but not a shape a parent can be read out of.
+    UnrecognizedShape,
+}
+
+impl SubagentAccessDenial {
+    /// The refusal text handed back to the calling agent.
+    pub fn message(self, session_id: SessionId) -> String {
+        match self {
+            Self::OtherParent => format!(
+                "Session {} belongs to another agent's subagent. You can only read \
+                 sessions of subagents you invoked.",
+                session_id.0
+            ),
+            Self::LegacyNoParent => format!(
+                "Session {} is a legacy ephemeral subagent session without parent \
+                 ownership metadata and cannot be read back.",
+                session_id.0
+            ),
+            Self::UnrecognizedShape => format!(
+                "Session {} has an unrecognized subagent session format.",
+                session_id.0
+            ),
+        }
+    }
+}
+
+/// **A subagent session belongs to the parent named in its `context_id`,
+/// never to the agent whose id it happens to be filed under.**
+///
+/// The single statement of that rule (#1298). Every tool that decides
+/// whether an agent may read a subagent transcript calls *this* — the bug
+/// it was filed for was two tools independently implementing the same
+/// belief and reaching opposite answers about the same bytes.
+///
+/// # Why the `context_id` and not `session.agent_id`
+///
+/// #1278/#1288 moved the `agent_id` half of a named subagent session's key
+/// onto the **invoked** agent's registry id, so the row lands in that
+/// agent's own timeline. That move was for *placement*; the `context_id`
+/// deliberately did not change ([`named_subagent_context_id`]), and it is
+/// the thing that carries ownership.
+///
+/// `session.agent_id` cannot carry it, and not merely by convention — it is
+/// never *simultaneously* a real principal and a per-delegation
+/// discriminator, on any of the three arms it can take:
+///
+/// - A **registered** name files under the invoked agent's registry id: a
+///   real principal, but the same id for every parent that invoked it.
+///   Authorizing on it would hand the DELEGATE every parent's delegations,
+///   not only the one it is running for.
+/// - An **unregistered** name files under
+///   `AgentId::deterministic(parent, name)`, and an **ephemeral** subagent
+///   under a fresh `AgentId::new()`. Both separate parents perfectly and
+///   name no agent at all — "ids no agent holds", as `delete_agent`'s
+///   cascade puts it — so authorizing on them would grant nobody, the
+///   parent included.
+///
+/// So the pre-#1298 over-grant lived on the registered arm alone, and on
+/// that arm the grant is to the *delegate*: another parent is reached only
+/// if the delegate relays what it read, never by the check itself. The
+/// parent embedded in the `context_id` is the one field that both names a
+/// principal and distinguishes one delegation from another, on all three
+/// arms.
+///
+/// This is the same rule `delete_agent`'s cascade reads out of
+/// [`parse_subagent_parent`], and the access-shaped form of the invariant
+/// the tool descriptions state: *a subagent's work belongs to its caller's
+/// graph; an agent's work belongs to itself.*
+///
+/// # The session UUID is not a bearer capability (#1181 / #1185)
+///
+/// The id leaks beyond the spawning parent — it appears in parent-visible
+/// `invoke_agent` results and completion notifications, and for
+/// DM-triggered invocations it is persisted onto the *shared* DM session
+/// where the peer can read it. The tools enforcing this rule are registered
+/// for every agent and auto-approved, so possession of the id is never
+/// sufficient: the parent embedded in the context must match the reader.
+pub fn subagent_session_access(context_id: &str, reader: AgentId) -> SubagentSessionAccess<'_> {
+    let Some(rest) = context_id.strip_prefix("subagent_") else {
+        return SubagentSessionAccess::NotSubagent;
+    };
+
+    // The legacy shape is tested BEFORE the split: a bare task UUID has no
+    // '_' at all, so it would otherwise fall into the unrecognized arm and
+    // deny with the wrong reason. Only the reason — the two tests are
+    // disjoint, because no input format `Uuid::parse_str` accepts contains
+    // '_', so nothing that parses here can also split below. Reordering
+    // cannot turn a denial into a grant.
+    if Uuid::parse_str(rest).is_ok() {
+        return SubagentSessionAccess::Denied(SubagentAccessDenial::LegacyNoParent);
+    }
+
+    match split_subagent_context(context_id) {
+        Some((parent, trailing)) if parent == reader => SubagentSessionAccess::Owner { trailing },
+        Some(_) => SubagentSessionAccess::Denied(SubagentAccessDenial::OtherParent),
+        None => SubagentSessionAccess::Denied(SubagentAccessDenial::UnrecognizedShape),
+    }
+}
+
 /// Error message returned to the LLM when both `send_message` and
 /// `ignore_message` appear in the same tool-call batch (DM conflict).
 ///
@@ -829,5 +962,137 @@ mod tests {
             parse_subagent_context(&ctx),
             Some(SubagentOwner::Named("reviewer"))
         );
+    }
+
+    // -- subagent_session_access: the one statement of transcript ownership --
+
+    /// The rule in one row: the spawning parent gets in, and the agent the
+    /// row is *filed under* since #1288 does not. Flip the function to read
+    /// `session.agent_id` and the second half fails.
+    #[test]
+    fn subagent_session_access_admits_the_parent_and_refuses_the_invoked_agent() {
+        let parent = AgentId::new();
+        let invoked = AgentId::new();
+        let ctx = named_context(parent, "reviewer");
+
+        assert_eq!(
+            subagent_session_access(&ctx, parent),
+            SubagentSessionAccess::Owner {
+                trailing: "reviewer"
+            }
+        );
+        assert_eq!(
+            subagent_session_access(&ctx, invoked),
+            SubagentSessionAccess::Denied(SubagentAccessDenial::OtherParent)
+        );
+    }
+
+    /// Two parents delegating to the *same* named agent is precisely the case
+    /// `session.agent_id` can no longer separate: post-#1288 both rows are
+    /// filed under the one registry id, and only the context tells them
+    /// apart. Alice must not read Bob's delegation.
+    #[test]
+    fn subagent_session_access_separates_two_parents_of_the_same_subagent() {
+        let alice = AgentId::new();
+        let bob = AgentId::new();
+        let alices = named_context(alice, "reviewer");
+        let bobs = named_context(bob, "reviewer");
+
+        assert!(matches!(
+            subagent_session_access(&alices, alice),
+            SubagentSessionAccess::Owner { .. }
+        ));
+        assert_eq!(
+            subagent_session_access(&bobs, alice),
+            SubagentSessionAccess::Denied(SubagentAccessDenial::OtherParent)
+        );
+    }
+
+    /// An ephemeral subagent is owned the same way — the trailing segment is
+    /// a task id rather than a name, which is a labelling difference, not an
+    /// access one.
+    #[test]
+    fn subagent_session_access_treats_ephemeral_sessions_identically() {
+        let parent = AgentId::new();
+        let task_id = Uuid::new_v4().to_string();
+        let ctx = format!("subagent_{}_{}", parent.0, task_id);
+
+        assert_eq!(
+            subagent_session_access(&ctx, parent),
+            SubagentSessionAccess::Owner { trailing: &task_id }
+        );
+        assert_eq!(
+            subagent_session_access(&ctx, AgentId::new()),
+            SubagentSessionAccess::Denied(SubagentAccessDenial::OtherParent)
+        );
+    }
+
+    /// The #1185 hardening: a legacy `subagent_{task_id}` records no parent,
+    /// so it is denied to *everyone*. There is no reader that gets in — the
+    /// loop below is the whole population.
+    #[test]
+    fn subagent_session_access_denies_a_legacy_context_to_everyone() {
+        let ctx = format!("subagent_{}", Uuid::new_v4());
+        for reader in [AgentId::new(), AgentId::new()] {
+            assert_eq!(
+                subagent_session_access(&ctx, reader),
+                SubagentSessionAccess::Denied(SubagentAccessDenial::LegacyNoParent),
+            );
+        }
+    }
+
+    /// A `subagent_`-prefixed context with no readable parent segment is
+    /// denied rather than falling through to some other ownership model.
+    #[test]
+    fn subagent_session_access_denies_an_unreadable_subagent_context() {
+        for ctx in ["subagent_notauuid_reviewer", "subagent_", "subagent_x"] {
+            assert_eq!(
+                subagent_session_access(ctx, AgentId::new()),
+                SubagentSessionAccess::Denied(SubagentAccessDenial::UnrecognizedShape),
+                "ctx {ctx}"
+            );
+        }
+    }
+
+    /// Non-subagent contexts are none of this rule's business: the caller
+    /// must be free to apply its own model. If this returned a denial,
+    /// `read_session` would stop serving ordinary chats.
+    #[test]
+    fn subagent_session_access_stays_out_of_every_other_session_class() {
+        for ctx in [
+            "web-chat-1",
+            "dm:alice:bob",
+            "notifications:alice",
+            "job_abc",
+            "episodic:main",
+            "telegram_123",
+            // Prefix-adjacent, but not the reserved shape.
+            "subagentish",
+        ] {
+            assert_eq!(
+                subagent_session_access(ctx, AgentId::new()),
+                SubagentSessionAccess::NotSubagent,
+                "ctx {ctx}"
+            );
+        }
+    }
+
+    /// Every denial arm speaks, and names the session it refused. Both tools
+    /// hand these strings straight to the model, so an empty or id-less
+    /// message would be a dead end for the agent that hit it.
+    #[test]
+    fn every_denial_arm_has_a_message_naming_the_session() {
+        let session_id = SessionId::new();
+        for denial in [
+            SubagentAccessDenial::OtherParent,
+            SubagentAccessDenial::LegacyNoParent,
+            SubagentAccessDenial::UnrecognizedShape,
+        ] {
+            let msg = denial.message(session_id);
+            assert!(
+                msg.contains(&session_id.0.to_string()),
+                "{denial:?} message must name the session: {msg}"
+            );
+        }
     }
 }

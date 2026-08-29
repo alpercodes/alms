@@ -368,11 +368,10 @@ impl SqliteStore {
         //
         // So ownership here reads out of the same place *authorization*
         // reads out of: the `context_id`'s embedded parent
-        // (`parse_subagent_parent`, the same parse
-        // `ReadSubagentSessionTool::check_subagent_session_access` uses).
-        // The rule is one sentence — **a subagent session belongs to the
-        // parent named in its `context_id`, never to the agent whose id it
-        // happens to be filed under** — and it cuts both ways:
+        // (`parse_subagent_parent`). The rule itself is stated once, in
+        // `alms_core::subagent_session_access` — the read tools are its
+        // access-shaped consumers (#1298) and this cascade is its
+        // deletion-shaped one. It cuts both ways:
         //
         //   - 1a skips a subagent row filed under this agent but parented by
         //     someone else, and
