@@ -79,6 +79,24 @@ struct RunParams {
     /// page reload even when the run is still queued (a reload during the
     /// queued-wait would otherwise find the session history empty).
     input_pre_persisted: bool,
+    /// The peer whose DM conversation with this run's agent just ended, when
+    /// this run is that end's post-end turn (a `ConversationEnded` trigger).
+    /// `None` for every other run.
+    ///
+    /// `MAX_DM_DEPTH` bounds one conversation; nothing bounds conversations
+    /// between a pair, because `end_conversation` clears the depth counters.
+    /// The post-end turn is the one place where re-opening is *immediate* and
+    /// unattended: the agent has just been handed the transcript and is one
+    /// `send_message` away from starting the same conversation at depth 1,
+    /// forever. So `send_message` is registered folded toward this peer —
+    /// the same treatment `is_peer_message` runs get, which these runs were
+    /// missing even though `notifications.rs` already withholds the DM
+    /// addendum from them on the same "not a peer message" reasoning (#1299).
+    ///
+    /// The fold removes exactly one recipient for exactly one turn. Every
+    /// other capability of the post-end turn (#556, #1215) is untouched, and
+    /// nothing stops the pair re-opening later by ordinary means.
+    dm_ended_peer: Option<String>,
 }
 
 /// Prefixes that identify internal (non-user-facing) sessions.

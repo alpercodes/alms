@@ -36,6 +36,15 @@ pub use read_subagent_session::ReadSubagentSessionTool;
 pub use send_message::SendMessageTool;
 
 // Re-export traits and supporting types.
+// `Tool` comes from alms-sandbox and is re-exported so a caller holding one
+// of this crate's tools can actually invoke it. This is necessary, not just
+// convenient: alms-gateway registers every tool in this crate but has NO
+// direct alms-sandbox dependency (its Cargo.toml lists core, session,
+// runtime, tools, coordinator, channel), so without this line a gateway test
+// cannot bring `Tool` into scope to call `execute()` on a tool it built —
+// which is how the #1299 send_message fold is pinned. Re-export only; the
+// dependency graph in CLAUDE.md is unchanged.
+pub use alms_sandbox::Tool;
 pub use event_forwarder::{EventForwarder, SubagentRunOutcome, subagent_activity_kind};
 pub use message_sender::{ConversationEndReason, DeliveryReceipt, MessageSender, SendError};
 pub use subagent::SubagentDispatcher;

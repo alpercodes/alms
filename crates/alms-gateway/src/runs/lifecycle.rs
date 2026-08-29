@@ -925,6 +925,7 @@ pub async fn create_run(
                 is_peer_message: false,
                 is_system_triggered: false,
                 input_pre_persisted,
+                dm_ended_peer: None,
             },
         )
         .await;
@@ -1030,6 +1031,61 @@ pub(super) fn resolve_posture_for_run(
 /// does not match the expected format or neither name matches `agent_name`.
 pub(super) fn extract_peer_from_dm_context(context_id: &str, agent_name: &str) -> Option<String> {
     alms_core::dm_peer(context_id, agent_name).map(|s| s.to_string())
+}
+
+/// Configure the one `send_message` recipient this run may not address.
+///
+/// Called once per run at the tool-registration site in [`execute_run`]. At
+/// most one recipient is ever folded, and the two runs that fold one do so
+/// for opposite reasons:
+///
+/// - **A peer-triggered DM turn** (`is_peer_message`) folds its current peer,
+///   read off the `dm:{a}:{b}` context id — #1154 design default #2. The
+///   agent's final assistant text IS the reply, delivered by the DM
+///   completion gate, so a `send_message` at the peer would double-deliver.
+///   Gated on `is_peer_message` (#1156 defense-in-depth) because the fold is
+///   only correct when the gate actually delivers, and the gate is armed
+///   exclusively for peer-triggered DM runs. Option C already rejects
+///   non-peer runs on `dm:` sessions at `create_run`, so a `dm:` context
+///   cannot reach the other arm today — the gate keeps that explicit should
+///   a new non-peer `dm:` path ever appear (folding without delivery would
+///   silently drop the message).
+///
+/// - **A `ConversationEnded` post-end turn** (#1299) folds the peer whose
+///   conversation just ended, carried on the trigger. Here there is no
+///   completion gate to double-deliver past: the send would simply re-open
+///   the conversation the agent was just told had ended, at depth 1.
+///   `MAX_DM_DEPTH` bounds one conversation and `end_conversation` resets it,
+///   so nothing else stops a pair looping cap → end → re-open → cap forever.
+///   These runs already had half this treatment — `notifications.rs`
+///   withholds the DM addendum from them on exactly the "not a peer message"
+///   reasoning — and the fold is the other half.
+///
+/// The ended-peer arm is keyed on the trigger, NOT on `context_id`, because
+/// the post-end turn runs on the agent's web-chat, its `notifications:`
+/// session, or — when the end resolved an open job episode (#1198 / #1205) —
+/// a `job_*` session. None of those name the peer, and the job arm is both
+/// the one that survives the #1258 interrupted-end suppression and the one
+/// that re-opens with nobody watching.
+///
+/// The two arms are mutually exclusive by construction: `dm_ended_peer` is
+/// set only by `run_trigger_loop`'s `ConversationEnded` arm, which enqueues
+/// with `is_peer_message: false`.
+///
+/// Every other run folds nothing, and no run loses `send_message` for any
+/// recipient other than the single folded name.
+pub(super) fn apply_send_message_fold(
+    tool: alms_tools::SendMessageTool,
+    is_peer_message: bool,
+    context_id: &str,
+    agent_name: &str,
+    dm_ended_peer: Option<&str>,
+) -> alms_tools::SendMessageTool {
+    if is_peer_message {
+        tool.with_dm_peer(extract_peer_from_dm_context(context_id, agent_name))
+    } else {
+        tool.with_ended_dm_peer(dm_ended_peer.map(str::to_string))
+    }
 }
 
 /// RAII guard that calls [`RunManager::untrack_in_flight`] on drop.
@@ -1279,6 +1335,7 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
         is_peer_message,
         is_system_triggered,
         input_pre_persisted,
+        dm_ended_peer,
     } = params;
     // Track this run for graceful shutdown drain.  The guard ensures the
     // counter is decremented even if this function panics.
@@ -2403,31 +2460,19 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
     // Register peer messaging tools (Layer 2) when agent name is known.
     if let Some(ref name) = agent_name {
         let sender: std::sync::Arc<dyn alms_tools::MessageSender> = state.message_bus.clone();
-        // During a DM run, `send_message` is valid only for a NON-peer
-        // recipient (#1154 design default #2): a send aimed at the current
-        // peer is folded by the tool (no delivery) because the agent's
-        // final reply text is delivered implicitly by the completion gate.
-        //
-        // Gated on `is_peer_message` (#1156 defense-in-depth): the fold is
-        // only correct when the completion gate actually delivers, and the
-        // gate is armed exclusively for peer-triggered DM runs. Option C
-        // already rejects non-peer runs on `dm:` sessions at `create_run`,
-        // so this branch is unreachable for them today — the gate makes the
-        // invariant explicit if a new non-peer `dm:` path is ever introduced
-        // (folding without delivery would silently drop the message).
-        let dm_peer_for_send_tool = if is_peer_message {
-            extract_peer_from_dm_context(&context_id, name)
-        } else {
-            None
-        };
-        let send_tool = alms_tools::SendMessageTool::new(
-            sender,
-            agent_id,
-            name.clone(),
-            state.session_manager.clone(),
-            session_id,
-        )
-        .with_dm_peer(dm_peer_for_send_tool);
+        let send_tool = apply_send_message_fold(
+            alms_tools::SendMessageTool::new(
+                sender,
+                agent_id,
+                name.clone(),
+                state.session_manager.clone(),
+                session_id,
+            ),
+            is_peer_message,
+            &context_id,
+            name,
+            dm_ended_peer.as_deref(),
+        );
         let list_tool =
             alms_tools::ListAgentsTool::new(state.session_manager.clone(), name.clone());
         let read_tool =

@@ -181,6 +181,7 @@ pub(super) async fn fire_job_run(state: AppState, job_id: JobId) -> alms_core::A
             is_peer_message: false,
             is_system_triggered: true,
             input_pre_persisted: false,
+            dm_ended_peer: None,
         },
     )
     .await;
@@ -1179,6 +1180,7 @@ pub(crate) async fn completion_notification_loop(
             "subagent".to_string(),
             false, // subagent completion — not a peer message
             episode_route.as_ref().map(|r| r.job_id),
+            None, // no conversation ended here — nothing to fold (#1299)
         )
         .await
         else {
@@ -1245,6 +1247,11 @@ pub(super) async fn enqueue_triggered_run(
     // stamped with the job id so `cancel_runs_for_job` covers it and the
     // episode hook inside `execute_run` engages at every exit.
     job_id: Option<JobId>,
+    // #1299: for a `ConversationEnded` post-end turn, the peer whose
+    // conversation just ended. `execute_run` registers `send_message` folded
+    // toward that peer so the turn cannot immediately re-open the
+    // conversation it was notified about. `None` for every other trigger.
+    dm_ended_peer: Option<String>,
 ) -> Option<RunId> {
     // Wait before taking the cancellation gate or creating any run state.
     // Internal triggers are durable work and must not be silently dropped
@@ -1426,6 +1433,7 @@ pub(super) async fn enqueue_triggered_run(
                 is_peer_message,
                 is_system_triggered: true,
                 input_pre_persisted: false,
+                dm_ended_peer,
             },
         )
         .await;
@@ -1713,6 +1721,190 @@ pub(super) fn format_dm_conversation_history(messages: &[alms_session::Message])
 // RunTrigger loop (peer messaging)
 // ---------------------------------------------------------------------------
 
+/// The peer whose DM with the trigger's recipient just ended, if any (#1299).
+///
+/// Used by [`plan_triggered_runs`] to stamp every run a trigger produces with
+/// the one recipient it may not `send_message`. `MAX_DM_DEPTH` bounds one
+/// conversation and `end_conversation` resets it, so this is the only thing
+/// standing between a pair and an unbounded cap → end → re-open cycle.
+///
+/// **`from_name` is the right name for both `ConversationEnded` triggers the
+/// bus emits, and it means opposite things in them.** On the peer
+/// notification `from_name` is the ENDER and the recipient is the peer; on
+/// the ender's own #556 / #1215 self-notification the recipient is the ender
+/// and `from_name` is the PEER. Either way it names the agent that is *not*
+/// `trigger.agent_id` — exactly the one a `send_message` from this turn
+/// would re-open with.
+///
+/// Three things hold that invariant up. Both production emitters live in
+/// `end_conversation_locked` (`bus.rs`) and say so in comments; the bus tests
+/// pin both shapes (`test_initiator_gets_self_notification_when_ending_dm`
+/// and its depth-exceeded / ignore siblings); and the #1198 episode lookup in
+/// `run_trigger_loop` already depends on it — `SessionId::deterministic_dm(
+/// from_name, peer_name_resolved)` resolves the right DM session on both
+/// shapes only because `from_name` is always the other party.
+///
+/// The signature carries a fourth: taking only the source, this function
+/// *cannot* see the recipient, so the "read `from_name` as the ender in both
+/// shapes" mis-implementation is not expressible here. Keep the parameter
+/// list narrow — it is doing as much work as the tests are.
+///
+/// The two non-DM sources fold nothing: a live peer DM turn folds on its own
+/// `is_peer_message` arm, keyed on the `dm:` context id, and a subagent
+/// completion has no ended conversation. The match is exhaustive so a new
+/// source has to state its answer.
+fn dm_ended_peer_for_source(
+    source: &alms_coordinator::message_bus::MessageSource,
+) -> Option<String> {
+    use alms_coordinator::message_bus::MessageSource;
+    match source {
+        MessageSource::ConversationEnded { from_name, .. } => Some(from_name.clone()),
+        MessageSource::Agent { .. } | MessageSource::SubagentCompletion => None,
+    }
+}
+
+/// One run a [`RunTrigger`](alms_coordinator::message_bus::RunTrigger) should
+/// produce, and the fold it carries.
+///
+/// The fold rides ON the target rather than beside it (#1299): a trigger can
+/// fan out to several runs on different sessions, and every one of them is a
+/// turn in which the ended peer must not be addressable. Making it a field
+/// removes the possibility of a caller applying it to some targets and not
+/// others.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct TriggeredRunTarget {
+    pub(super) session_id: SessionId,
+    pub(super) context_id: String,
+    /// Set when this run continues a job episode (#1198 / #1205).
+    pub(super) job_id: Option<JobId>,
+    /// The peer this run may not `send_message` — see
+    /// [`dm_ended_peer_for_source`] and `lifecycle::apply_send_message_fold`.
+    pub(super) dm_ended_peer: Option<String>,
+}
+
+/// Decide which runs a trigger produces, and what each of them may not
+/// message.
+///
+/// Pure given its four decision inputs (`source`, the trigger's own target,
+/// and `episode_routes`); `agent_id` and `source_label` are log context only.
+/// `episode_routes` is computed by the caller because resolving it *reserves*
+/// the continuations — the side effect stays outside, the decision inside.
+///
+/// # Routing precedence
+///
+/// 1. **A resolved episode wins** (#1198 / #1205). Each route pins its
+///    continuation to the JOB session, superseding the `source_sessions`-
+///    derived target — see design doc § D3 for why the tracker, not the bus,
+///    is the primary router. One run per resolved episode: when two episodes
+///    of the same agent were pending on the ended DM session, BOTH get their
+///    continuation, each on its own job session with its own job id.
+/// 2. **Otherwise an INTERRUPTED end produces nothing** (#1258). An operator
+///    cancel, or a run that died mid-turn, has no outcome to relay, so it
+///    must not put an unrequested run on the operator's session; the
+///    persisted marker is the delivery. An end whose run *completed* —
+///    including `errored` with an unusable result — still gets its run, so
+///    its transcript reaches the operator's chat.
+/// 3. **Otherwise the trigger's own target**, byte-for-byte as pre-#1198.
+///
+/// The episode override deliberately beats the suppression: a job
+/// continuation resumes the JOB, not the DM, and dropping it would stall the
+/// job until its deadline. So the suppression applies only to the trigger's
+/// own target, exactly where the operator sits.
+///
+/// # Why the fold is decided here
+///
+/// That precedence is also what makes the #1299 fold subtle. The arm that
+/// survives the interrupted-end suppression is the job arm — so a job
+/// continuation can be the ONLY run an end produces, it lands on a `job_*`
+/// session that names no peer, and it re-opens with nobody watching. Deriving
+/// the fold from `context_id` at the registration site would miss exactly
+/// that arm. Deriving it here, from the source, and stamping it on every
+/// target makes "every run of an ended DM is folded" one statement instead of
+/// a coincidence between two files.
+///
+/// # What is and is not covered by tests
+///
+/// This function is pinned (routing precedence, and the peer on every target
+/// including the job continuations), and so is the fold itself
+/// (`lifecycle::apply_send_message_fold`). What remains uncovered is the
+/// stretch between them, where the peer is a plain value being passed along:
+/// `enqueue_triggered_run`'s parameter, `RunParams::dm_ended_peer`, and
+/// `execute_run`'s call to `apply_send_message_fold`. Substituting `None` at
+/// any of the three disarms the fold with every test still green.
+///
+/// The reasons differ, and only the third is structural: a test cannot reach
+/// `execute_run`'s call because tool registration needs an LLM-backed runtime
+/// the gateway tests do not have. The first two are merely *unpinned* — they
+/// are reachable, and a future harness could cover them. Do not read the
+/// runtime argument as covering all three.
+///
+/// What the plan shape buys is not uniformity — the old code had that too, by
+/// having exactly one call site — but uniformity at the TYPE level: the peer
+/// is a field of `TriggeredRunTarget`, so a new routing arm has to state it
+/// rather than inherit it by luck, and the plan is a value tests can inspect,
+/// which is what makes a per-arm mistake killable at all. (The arms that
+/// exist are pinned; a new arm stating `None` is a one-token disarm no
+/// current row catches.) Keep the peer on the target.
+pub(super) fn plan_triggered_runs(
+    source: &alms_coordinator::message_bus::MessageSource,
+    trigger_session_id: SessionId,
+    trigger_context_id: &str,
+    episode_routes: Vec<super::job_episode::ContinuationRoute>,
+    agent_id: alms_core::AgentId,
+    source_label: &str,
+) -> Vec<TriggeredRunTarget> {
+    use alms_coordinator::message_bus::MessageSource;
+
+    let dm_ended_peer = dm_ended_peer_for_source(source);
+
+    // Computed from the source directly rather than assigned inside a match
+    // arm, so a future arm cannot silently inherit the `false` default.
+    let end_was_interrupted = matches!(
+        source,
+        MessageSource::ConversationEnded { reason, .. } if reason.is_interrupted()
+    );
+
+    if !episode_routes.is_empty() {
+        return episode_routes
+            .into_iter()
+            .map(|route| {
+                info!(
+                    job_id = %route.job_id,
+                    dm_target = %trigger_session_id.0,
+                    job_session = %route.job_session_id.0,
+                    "ConversationEnded resolved to open job episode — routing \
+                     continuation onto the job session (#1198)"
+                );
+                TriggeredRunTarget {
+                    session_id: route.job_session_id,
+                    context_id: route.context_id,
+                    job_id: Some(route.job_id),
+                    dm_ended_peer: dm_ended_peer.clone(),
+                }
+            })
+            .collect();
+    }
+
+    if end_was_interrupted {
+        info!(
+            session_id = %trigger_session_id.0,
+            agent_id = %agent_id.0,
+            source = %source_label,
+            "DM end was interrupted (cancelled, or the run died mid-turn) \
+             — delivering the notification as a marker, starting no run \
+             (#1258)"
+        );
+        return Vec::new();
+    }
+
+    vec![TriggeredRunTarget {
+        session_id: trigger_session_id,
+        context_id: trigger_context_id.to_string(),
+        job_id: None,
+        dm_ended_peer,
+    }]
+}
+
 /// Processes `RunTrigger` events from the `MessageBus`.
 ///
 /// Each trigger creates a run on the target agent's session, reusing the
@@ -1822,16 +2014,10 @@ pub(crate) async fn run_trigger_loop(
         // below the match).
         let mut dm_ended_webchat: Option<(String, String, Option<String>, String)> = None;
 
-        // #1258: was this end *interrupted* (a run cut short) rather than a
-        // run that completed? Such an end has no outcome to relay, so it must
-        // not put an unrequested run on the operator's session — the persisted
-        // marker below is the delivery. Computed from the source directly
-        // rather than assigned inside the match arm, so a future arm cannot
-        // silently inherit the `false` default.
-        let end_was_interrupted = matches!(
-            &trigger.source,
-            MessageSource::ConversationEnded { reason, .. } if reason.is_interrupted()
-        );
+        // #1258 (was this end interrupted?) and #1299 (which peer the runs
+        // may not message) are both read off the source, and both belong to
+        // the routing decision rather than to any one target — so they live
+        // inside `plan_triggered_runs` below, which owns both.
 
         // Build a source label for SSE `run_created` events and determine
         // whether this is a peer DM run (which needs the DM addendum) or
@@ -2013,53 +2199,17 @@ pub(crate) async fn run_trigger_loop(
             }
         };
 
-        // #1198 routing override: a resolved episode DM pins its
-        // continuation run to the JOB session (superseding the
-        // `source_sessions`-derived target — see design doc § D3 for why
-        // the tracker, not the bus, is the primary router). On a miss the
-        // pre-#1198 routing applies byte-for-byte.
-        //
-        // #1205: one run target per resolved episode — when two episodes
-        // of the same agent were pending on the ended DM session, BOTH get
-        // their continuation (each on its own job session, stamped with its
-        // own job id). The trigger's original target receives a run only
-        // when no episode resolved.
-        //
-        // #1258: an INTERRUPTED end (operator cancel, or a run that died
-        // mid-turn) yields NO trigger-target run. An end whose run *completed*
-        // — including `errored` with an unusable result — still gets one, so
-        // its transcript reaches the operator's chat. The episode override
-        // still wins over the suppression — a job continuation resumes the
-        // job, not the DM, and dropping it would stall the job until its
-        // deadline — so the suppression applies only to the trigger's own
-        // target, exactly where the operator sits.
-        let run_targets: Vec<(SessionId, String, Option<JobId>)> = if !episode_routes.is_empty() {
-            episode_routes
-                .into_iter()
-                .map(|route| {
-                    info!(
-                        job_id = %route.job_id,
-                        dm_target = %session_id.0,
-                        job_session = %route.job_session_id.0,
-                        "ConversationEnded resolved to open job episode — routing \
-                         continuation onto the job session (#1198)"
-                    );
-                    (route.job_session_id, route.context_id, Some(route.job_id))
-                })
-                .collect()
-        } else if end_was_interrupted {
-            info!(
-                session_id = %session_id.0,
-                agent_id = %agent_id.0,
-                source = %source_label,
-                "DM end was interrupted (cancelled, or the run died mid-turn) \
-                 — delivering the notification as a marker, starting no run \
-                 (#1258)"
-            );
-            Vec::new()
-        } else {
-            vec![(session_id, context_id.clone(), None)]
-        };
+        // #1299 / #1258 / #1198: which runs this trigger produces, and what
+        // each of them may not message. One plan, so the routing precedence
+        // and the fold cannot drift apart — see `plan_triggered_runs`.
+        let run_targets = plan_triggered_runs(
+            &trigger.source,
+            session_id,
+            &context_id,
+            episode_routes,
+            agent_id,
+            &source_label,
+        );
 
         // #1218 P2 (#3): forward the DM-ended signal to the agent's web-chat
         // now that the FINAL run routing is known. The `dm_conversation_ended`
@@ -2072,8 +2222,7 @@ pub(crate) async fn run_trigger_loop(
         // the run to a job session, the web-chat is not a run target, so the
         // marker persists.
         if let Some((from_name, reason_str, detail, dm_context)) = dm_ended_webchat {
-            let run_target_ids: Vec<SessionId> =
-                run_targets.iter().map(|(sid, _, _)| *sid).collect();
+            let run_target_ids: Vec<SessionId> = run_targets.iter().map(|t| t.session_id).collect();
             notify_dm_ended_to_webchat(
                 &state,
                 agent_id,
@@ -2086,9 +2235,9 @@ pub(crate) async fn run_trigger_loop(
             .await;
         }
 
-        for (session_id, run_context_id, episode_job_id) in run_targets {
+        for target in run_targets {
             info!(
-                session_id = %session_id.0,
+                session_id = %target.session_id.0,
                 agent_id = %agent_id.0,
                 source = %source_label,
                 "RunTrigger -> creating run"
@@ -2096,15 +2245,21 @@ pub(crate) async fn run_trigger_loop(
 
             // The #1207 episode `note_run` stamp happens inside
             // `enqueue_triggered_run`, right after the run is inserted.
+            //
+            // #1299: the fold travels ON the target, not beside it. Every run
+            // the plan produces carries the peer it may not message, so the
+            // trigger's own target and each job-episode continuation cannot
+            // diverge here — there is no separate variable to forget.
             enqueue_triggered_run(
                 &state,
                 agent_id,
-                session_id,
+                target.session_id,
                 input.clone(),
-                run_context_id,
+                target.context_id,
                 source_label.clone(),
                 is_peer,
-                episode_job_id,
+                target.job_id,
+                target.dm_ended_peer,
             )
             .await;
         }
@@ -2170,6 +2325,233 @@ mod tests {
     use alms_coordinator::message_bus::{MessageSource, RunTrigger};
     use alms_core::AgentId;
     use alms_tools::message_sender::ConversationEndReason;
+
+    // -- #1299: which peer the post-end turn may not message -------------
+    //
+    // `from_name` names the ENDER on the peer notification and the PEER on
+    // the ender's own self-notification. Reading it as "the ender" in both
+    // would fold the wrong agent on the #556 / #1215 path: the recipient's
+    // own name (a no-op fold, leaving the loop open) instead of the peer's.
+    // These two rows pin the pair of readings against each other.
+
+    /// A `ConversationEnded` source with the given interruption.
+    fn ended(from_name: &str, interrupted: bool) -> MessageSource {
+        MessageSource::ConversationEnded {
+            from_agent: AgentId::new(),
+            from_name: from_name.to_string(),
+            reason: if interrupted {
+                ConversationEndReason::UserCancelled
+            } else {
+                ConversationEndReason::Ignored
+            },
+            self_notification: false,
+            source_session_id: None,
+        }
+    }
+
+    fn job_route(job_id: JobId) -> super::super::job_episode::ContinuationRoute {
+        super::super::job_episode::ContinuationRoute {
+            job_id,
+            job_session_id: SessionId::new(),
+            context_id: format!("job_{}", job_id.0),
+        }
+    }
+
+    #[test]
+    fn dm_ended_peer_is_the_ender_on_the_peer_notification() {
+        let peer_notification = MessageSource::ConversationEnded {
+            from_agent: AgentId::new(),
+            from_name: "alice".to_string(),
+            reason: ConversationEndReason::Ignored,
+            // alice ended it; the recipient of this trigger is bob.
+            self_notification: false,
+            source_session_id: None,
+        };
+        assert_eq!(
+            dm_ended_peer_for_source(&peer_notification).as_deref(),
+            Some("alice"),
+            "bob's post-end turn must not be able to message alice back"
+        );
+    }
+
+    #[test]
+    fn dm_ended_peer_is_the_peer_on_the_ender_self_notification() {
+        let self_notification = MessageSource::ConversationEnded {
+            from_agent: AgentId::new(),
+            from_name: "bob".to_string(),
+            // alice ended it and is the RECIPIENT here; from_name is the peer.
+            self_notification: true,
+            reason: ConversationEndReason::Ignored,
+            source_session_id: None,
+        };
+        assert_eq!(
+            dm_ended_peer_for_source(&self_notification).as_deref(),
+            Some("bob"),
+            "the ender's own turn must not be able to re-open with the peer \
+             it just stopped talking to (#556 / #1215)"
+        );
+    }
+
+    #[test]
+    fn non_dm_end_triggers_fold_nothing() {
+        assert_eq!(
+            dm_ended_peer_for_source(&MessageSource::Agent {
+                from_agent: AgentId::new(),
+                from_name: "alice".to_string(),
+            }),
+            None,
+            "a live DM turn folds on its own `is_peer_message` arm"
+        );
+        assert_eq!(
+            dm_ended_peer_for_source(&MessageSource::SubagentCompletion),
+            None
+        );
+    }
+
+    // -- #1299 / #1258 / #1198: the run plan ------------------------------
+    //
+    // These rows pin what `run_trigger_loop` actually hands to
+    // `enqueue_triggered_run`: the routing precedence AND the fold that
+    // rides on each target. Before the plan function existed, the peer was
+    // a separate local applied at the call site, and substituting `None`
+    // there disarmed the fold with every test still green.
+
+    #[test]
+    fn plan_stamps_the_ended_peer_on_the_triggers_own_target() {
+        let session_id = SessionId::new();
+        let plan = plan_triggered_runs(
+            &ended("alice", false),
+            session_id,
+            "notifications:bob",
+            Vec::new(),
+            AgentId::new(),
+            "notification:dm_ended:alice",
+        );
+        assert_eq!(plan.len(), 1);
+        assert_eq!(plan[0].session_id, session_id);
+        assert_eq!(plan[0].context_id, "notifications:bob");
+        assert_eq!(plan[0].job_id, None);
+        assert_eq!(
+            plan[0].dm_ended_peer.as_deref(),
+            Some("alice"),
+            "the post-end turn must be handed the peer it may not message"
+        );
+    }
+
+    /// The arm that made #1299 worth fixing.
+    ///
+    /// A resolved job episode reroutes the continuation onto the `job_*`
+    /// session — a context that names no peer — and this row proves the plan
+    /// *delivers* the peer there, not merely that the fold would honour one
+    /// if given it. Without this the job arm's coverage stopped at
+    /// necessity: the gateway fold test hands `Some("alice")` in directly.
+    #[test]
+    fn plan_carries_the_ended_peer_onto_every_job_episode_continuation() {
+        let routes = vec![job_route(JobId::new()), job_route(JobId::new())];
+        let job_sessions: Vec<SessionId> = routes.iter().map(|r| r.job_session_id).collect();
+
+        let plan = plan_triggered_runs(
+            &ended("alice", false),
+            SessionId::new(),
+            "notifications:bob",
+            routes,
+            AgentId::new(),
+            "notification:dm_ended:alice",
+        );
+
+        assert_eq!(
+            plan.len(),
+            2,
+            "#1205: one continuation per resolved episode"
+        );
+        for (target, job_session) in plan.iter().zip(job_sessions) {
+            assert_eq!(
+                target.session_id, job_session,
+                "#1198: the continuation is pinned to its own job session"
+            );
+            assert!(target.job_id.is_some());
+            assert_eq!(
+                target.dm_ended_peer.as_deref(),
+                Some("alice"),
+                "a job continuation of an ended DM re-opens with nobody \
+                 watching — it must be folded like any other post-end turn"
+            );
+        }
+    }
+
+    /// The precedence, and the reason the job arm needs the fold most: an
+    /// interrupted end suppresses the trigger's own target but NOT a job
+    /// continuation, so the folded job run can be the only run an end
+    /// produces.
+    #[test]
+    fn plan_suppresses_only_the_triggers_own_target_when_the_end_was_interrupted() {
+        let interrupted = ended("alice", true);
+
+        assert!(
+            plan_triggered_runs(
+                &interrupted,
+                SessionId::new(),
+                "web-chat-bob",
+                Vec::new(),
+                AgentId::new(),
+                "notification:dm_ended:alice",
+            )
+            .is_empty(),
+            "#1258: an interrupted end puts no unrequested run on the \
+             operator's session"
+        );
+
+        let surviving = plan_triggered_runs(
+            &interrupted,
+            SessionId::new(),
+            "web-chat-bob",
+            vec![job_route(JobId::new())],
+            AgentId::new(),
+            "notification:dm_ended:alice",
+        );
+        assert_eq!(
+            surviving.len(),
+            1,
+            "the episode override still wins — dropping it would stall the \
+             job until its deadline"
+        );
+        assert_eq!(
+            surviving[0].dm_ended_peer.as_deref(),
+            Some("alice"),
+            "the one run an interrupted end still produces must be folded"
+        );
+    }
+
+    #[test]
+    fn plan_folds_nothing_for_non_dm_end_sources() {
+        let peer_dm = plan_triggered_runs(
+            &MessageSource::Agent {
+                from_agent: AgentId::new(),
+                from_name: "alice".to_string(),
+            },
+            SessionId::new(),
+            "dm:alice:bob",
+            Vec::new(),
+            AgentId::new(),
+            "peer:alice",
+        );
+        assert_eq!(peer_dm.len(), 1);
+        assert_eq!(
+            peer_dm[0].dm_ended_peer, None,
+            "a live DM turn folds on its own `is_peer_message` arm"
+        );
+
+        let subagent = plan_triggered_runs(
+            &MessageSource::SubagentCompletion,
+            SessionId::new(),
+            "web-chat-bob",
+            Vec::new(),
+            AgentId::new(),
+            "subagent",
+        );
+        assert_eq!(subagent.len(), 1);
+        assert_eq!(subagent[0].dm_ended_peer, None);
+    }
 
     /// Regression test for #513: when a `ConversationEnded` trigger has
     /// `source_session_id: None` (the agent was a pure DM recipient),

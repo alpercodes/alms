@@ -341,6 +341,40 @@ fn seed_alice_bob(state: &AppState) -> (AgentId, AgentId) {
     (alice.id, bob.id)
 }
 
+/// Seed one more agent into the SQLite-backed registry.
+///
+/// [`seed_alice_bob`] covers the pair; the #1299 fold tests also need a
+/// third party to show the fold removes exactly one recipient.
+fn seed_agent(state: &AppState, name: &str) -> AgentId {
+    use alms_core::registry::AgentRecord;
+    use chrono::Utc;
+    let store = state
+        .session_manager
+        .store()
+        .expect("test_app_state_with_sqlite must provide a SQLite store");
+    let record = AgentRecord {
+        id: AgentId::new(),
+        name: name.into(),
+        description: String::new(),
+        model: None,
+        posture: None,
+        provider: None,
+        telegram_token: None,
+        thinking_budget_tokens: None,
+        reasoning_effort: None,
+        gemini_thinking_budget: None,
+        summary_provider: None,
+        summary_model: None,
+        worktree_mode: alms_core::WorktreeMode::Off,
+        debug_mode: false,
+        is_default: false,
+        created_at: Utc::now(),
+        last_active: Utc::now(),
+    };
+    store.create_agent(&record).unwrap();
+    record.id
+}
+
 /// Subscribe to SSE events on a session and return the receiver.
 ///
 /// Events sent via `run_manager.send_session_event()` will be received
@@ -428,6 +462,7 @@ async fn cancelled_before_execution_emits_cancelled_event() {
             is_peer_message: false,
             is_system_triggered: false,
             input_pre_persisted: true,
+            dm_ended_peer: None,
         },
     )
     .await;
@@ -536,6 +571,7 @@ async fn cancellation_between_precheck_and_start_transition_cleans_up_without_st
                 is_peer_message: false,
                 is_system_triggered: false,
                 input_pre_persisted: false,
+                dm_ended_peer: None,
             },
         )
         .await;
@@ -619,6 +655,7 @@ async fn pre_persisted_input_survives_start_persistence_failure() {
             is_peer_message: false,
             is_system_triggered: false,
             input_pre_persisted: true,
+            dm_ended_peer: None,
         },
     )
     .await;
@@ -698,6 +735,7 @@ async fn terminal_persistence_failure_is_reported_and_quarantined() {
                 is_peer_message: false,
                 is_system_triggered: false,
                 input_pre_persisted: false,
+                dm_ended_peer: None,
             },
         )
         .await;
@@ -1202,6 +1240,7 @@ async fn deleted_session_cannot_gain_an_orphan_triggered_run() {
             "test".to_string(),
             false,
             None,
+            None,
         )
         .await
     });
@@ -1255,6 +1294,7 @@ async fn deleted_episode_target_releases_reserved_continuation() {
         "subagent".to_string(),
         false,
         Some(route.job_id),
+        None,
     )
     .await;
 
@@ -1306,6 +1346,7 @@ async fn cancelled_during_shutdown_emits_cancelled_event() {
             is_peer_message: false,
             is_system_triggered: false,
             input_pre_persisted: false,
+            dm_ended_peer: None,
         },
     )
     .await;
@@ -1463,6 +1504,7 @@ async fn deny_cancels_queued_runs_in_same_session() {
             is_peer_message: false,
             is_system_triggered: false,
             input_pre_persisted: false,
+            dm_ended_peer: None,
         },
     )
     .await;
@@ -5186,6 +5228,7 @@ async fn execute_run_failure_arm_marks_run_failed_with_structured_error_on_provi
             is_peer_message: false,
             is_system_triggered: false,
             input_pre_persisted: false,
+            dm_ended_peer: None,
         },
     )
     .await;
@@ -5334,6 +5377,7 @@ async fn run_panic_is_reconciled_to_failed_and_cleans_activity_state() {
             is_peer_message: false,
             is_system_triggered: false,
             input_pre_persisted: false,
+            dm_ended_peer: None,
         },
         async { panic!("synthetic queued work panic") },
     )
@@ -5386,6 +5430,7 @@ async fn late_cleanup_panic_does_not_reclassify_a_completed_run_as_failed() {
             is_peer_message: false,
             is_system_triggered: false,
             input_pre_persisted: false,
+            dm_ended_peer: None,
         },
         async { panic!("synthetic late cleanup panic") },
     )
@@ -6457,6 +6502,7 @@ async fn drive_activity_run(
             is_peer_message: false,
             is_system_triggered: false,
             input_pre_persisted: false,
+            dm_ended_peer: None,
         },
     )
     .await;
@@ -6675,6 +6721,7 @@ async fn pre_cancelled_run_emits_session_activity_ended() {
             is_peer_message: false,
             is_system_triggered: false,
             input_pre_persisted: false,
+            dm_ended_peer: None,
         },
     )
     .await;
@@ -6786,6 +6833,7 @@ async fn pre_cancelled_run_flips_state_before_broadcasting() {
                 is_peer_message: false,
                 is_system_triggered: false,
                 input_pre_persisted: false,
+                dm_ended_peer: None,
             },
         )
         .await
@@ -6912,6 +6960,7 @@ async fn happy_path_start_flips_state_before_broadcasting() {
                 is_peer_message: false,
                 is_system_triggered: false,
                 input_pre_persisted: false,
+                dm_ended_peer: None,
             },
         )
         .await
@@ -7193,6 +7242,7 @@ async fn failed_with_tool_calls_arm_flips_state_before_broadcasting() {
                 is_peer_message: false,
                 is_system_triggered: false,
                 input_pre_persisted: false,
+                dm_ended_peer: None,
             },
         )
         .await
@@ -7542,6 +7592,7 @@ async fn execute_run_failed_arm_persists_no_lifecycle_error_marker() {
             is_peer_message: false,
             is_system_triggered: false,
             input_pre_persisted: false,
+            dm_ended_peer: None,
         },
     )
     .await;
@@ -7901,6 +7952,7 @@ async fn execute_run_terminal_broadcasts_decremented_positions_to_remaining_queu
             is_peer_message: false,
             is_system_triggered: false,
             input_pre_persisted: false,
+            dm_ended_peer: None,
         },
     )
     .await;
@@ -8029,6 +8081,7 @@ async fn broadcast_queue_advance_is_noop_when_no_queued_runs_remain() {
             is_peer_message: false,
             is_system_triggered: false,
             input_pre_persisted: false,
+            dm_ended_peer: None,
         },
     )
     .await;
@@ -8617,6 +8670,7 @@ async fn execute_run_rejects_overbudget_resolved_config_on_non_http_path() {
             is_peer_message: false,
             is_system_triggered: true,
             input_pre_persisted: false,
+            dm_ended_peer: None,
         },
     )
     .await;
@@ -8807,6 +8861,7 @@ async fn execute_run_mock_mode_skips_budget_validation_on_non_http_path() {
             is_peer_message: false,
             is_system_triggered: true,
             input_pre_persisted: false,
+            dm_ended_peer: None,
         },
     )
     .await;
@@ -8948,6 +9003,7 @@ async fn drive_notification_run_with_debug_mode(
             is_peer_message: false,
             is_system_triggered: true,
             input_pre_persisted: false,
+            dm_ended_peer: None,
         },
     )
     .await;
@@ -9258,6 +9314,7 @@ async fn http_cancel_emits_terminal_sse_even_when_the_terminal_arm_skips() {
                 is_peer_message: false,
                 is_system_triggered: false,
                 input_pre_persisted: false,
+                dm_ended_peer: None,
             },
         )
         .await;
@@ -9360,6 +9417,7 @@ async fn http_cancel_and_execute_run_emit_single_event() {
                 is_peer_message: false,
                 is_system_triggered: false,
                 input_pre_persisted: false,
+                dm_ended_peer: None,
             },
         )
         .await
@@ -11361,6 +11419,7 @@ async fn notification_input_persistence_failure_fails_closed_before_llm() {
             is_peer_message: false,
             is_system_triggered: true,
             input_pre_persisted: false,
+            dm_ended_peer: None,
         },
     )
     .await;
@@ -12675,6 +12734,7 @@ async fn queued_then_cancelled_dm_run_notifies_peer() {
             is_peer_message: true,
             is_system_triggered: true,
             input_pre_persisted: false,
+            dm_ended_peer: None,
         },
     )
     .await;
@@ -12766,6 +12826,7 @@ async fn queued_then_cancelled_non_peer_run_does_not_notify() {
             is_peer_message: false,
             is_system_triggered: false,
             input_pre_persisted: false,
+            dm_ended_peer: None,
         },
     )
     .await;
@@ -13317,6 +13378,7 @@ async fn episode_precancelled_turn_releases_reservation_and_closes() {
             is_peer_message: false,
             is_system_triggered: true,
             input_pre_persisted: false,
+            dm_ended_peer: None,
         },
     )
     .await;
@@ -13638,6 +13700,7 @@ async fn triggered_run_id_noted_on_episode_before_enqueue_returns() {
         "notification:dm_ended:test".to_string(),
         false,
         Some(job_id),
+        None,
     )
     .await
     .expect("run must be created (job is not cancelled)");
@@ -14839,5 +14902,248 @@ async fn operational_metrics_route_exposes_live_snapshot() {
     }
 
     drop(subscription);
+    shutdown_token.cancel();
+}
+
+// ---------------------------------------------------------------------------
+// #1299: the post-end turn cannot re-open the conversation that just ended
+// ---------------------------------------------------------------------------
+//
+// `MAX_DM_DEPTH` bounds ONE conversation, and `end_conversation_locked`
+// clears `depths` and `expired_pairs` — so the next `send_message` between
+// the same two agents restarts at depth 1. The post-end turn is where that
+// re-entry is immediate and unattended: the agent has just been handed the
+// transcript of the conversation that ended and is one `send_message` away
+// from starting it again.
+//
+// `ConversationEnded` runs are `is_peer_message = false`, so before #1299
+// `SendMessageTool` was registered with no fold at all. The fix gives them a
+// fold of their own, keyed on the ended peer.
+//
+// These rows pin `apply_send_message_fold` — the whole registration decision
+// as `execute_run` makes it — by *executing* the tool it hands to the runtime
+// against the real `MessageBus`. "Not delivered" is therefore observed twice:
+// in the tool's own result, and in the absence of the `RunTrigger` that would
+// have invoked the peer and re-opened the pair.
+
+/// Build the `send_message` tool exactly as `execute_run` would for a run
+/// with the given `(is_peer_message, context_id, dm_ended_peer)`.
+fn send_tool_for_run(
+    state: &AppState,
+    agent_id: AgentId,
+    agent_name: &str,
+    session_id: SessionId,
+    is_peer_message: bool,
+    context_id: &str,
+    dm_ended_peer: Option<&str>,
+) -> alms_tools::SendMessageTool {
+    let sender: Arc<dyn MessageSender> = state.message_bus.clone();
+    super::lifecycle::apply_send_message_fold(
+        alms_tools::SendMessageTool::new(
+            sender,
+            agent_id,
+            agent_name.to_string(),
+            state.session_manager.clone(),
+            session_id,
+        ),
+        is_peer_message,
+        context_id,
+        agent_name,
+        dm_ended_peer,
+    )
+}
+
+/// The acceptance criterion: a `ConversationEnded` run cannot `send_message`
+/// the peer whose conversation just ended.
+///
+/// The mutation this fails on is restoring the unfolded registration — the
+/// pre-#1299 `else { None }` arm in `apply_send_message_fold`. Its exact
+/// effect is the control row below.
+#[tokio::test]
+async fn conversation_ended_run_cannot_send_message_to_the_ended_peer() {
+    use alms_tools::Tool;
+    let (state, shutdown_token, _cr, mut trigger_rx, _dr) = test_app_state_with_sqlite();
+    let (_alice_id, bob_id) = seed_alice_bob(&state);
+    // Bob's post-end turn lands on his notifications session (the
+    // source-less routing) and his conversation with alice has just ended.
+    let session = state
+        .session_manager
+        .get_or_create(bob_id, "notifications:bob");
+
+    let tool = send_tool_for_run(
+        &state,
+        bob_id,
+        "bob",
+        session.id,
+        false, // ConversationEnded runs are NOT peer messages
+        "notifications:bob",
+        Some("alice"),
+    );
+
+    let result = tool
+        .execute(serde_json::json!({ "to": "alice", "message": "one more thing" }))
+        .await
+        .expect("the fold is a non-error result — the agent must not retry");
+
+    assert_eq!(result["folded"], true);
+    assert_eq!(result["delivered"], false);
+    assert!(
+        trigger_rx.try_recv().is_err(),
+        "no RunTrigger may be emitted: a delivered send invokes alice and \
+         re-opens the pair at depth 1, which is the unbounded loop #1299 closes"
+    );
+
+    shutdown_token.cancel();
+}
+
+/// Control row for the one above: with no ended peer the same send DOES
+/// deliver and DOES re-open the conversation.
+///
+/// This is what the post-end turn did before #1299 — asserted here so the
+/// fold row above cannot pass for the wrong reason (a `MessageBus` that
+/// silently refused to deliver in this harness would make it vacuous).
+#[tokio::test]
+async fn run_with_no_ended_peer_still_delivers_to_that_agent() {
+    use alms_tools::Tool;
+    let (state, shutdown_token, _cr, mut trigger_rx, _dr) = test_app_state_with_sqlite();
+    let (alice_id, bob_id) = seed_alice_bob(&state);
+    let session = state
+        .session_manager
+        .get_or_create(bob_id, "notifications:bob");
+
+    let tool = send_tool_for_run(
+        &state,
+        bob_id,
+        "bob",
+        session.id,
+        false,
+        "notifications:bob",
+        None, // no conversation ended — nothing to fold
+    );
+
+    let result = tool
+        .execute(serde_json::json!({ "to": "alice", "message": "one more thing" }))
+        .await
+        .expect("an ordinary send must succeed");
+
+    assert_eq!(result["delivered"], true);
+    assert!(result.get("folded").is_none());
+    let trigger = trigger_rx
+        .try_recv()
+        .expect("an unfolded send invokes the recipient — this is the re-open");
+    assert_eq!(trigger.agent_id, alice_id);
+
+    shutdown_token.cancel();
+}
+
+/// The post-end turn keeps every other capability it has today: the fold
+/// removes exactly one recipient, not `send_message` itself. Reporting the
+/// outcome to a third agent is one of the things the turn exists for.
+#[tokio::test]
+async fn conversation_ended_run_keeps_send_message_for_third_parties() {
+    use alms_tools::Tool;
+    let (state, shutdown_token, _cr, mut trigger_rx, _dr) = test_app_state_with_sqlite();
+    let (_alice_id, bob_id) = seed_alice_bob(&state);
+    let carol_id = seed_agent(&state, "carol");
+    let session = state
+        .session_manager
+        .get_or_create(bob_id, "notifications:bob");
+
+    let tool = send_tool_for_run(
+        &state,
+        bob_id,
+        "bob",
+        session.id,
+        false,
+        "notifications:bob",
+        Some("alice"),
+    );
+
+    let result = tool
+        .execute(serde_json::json!({ "to": "carol", "message": "alice and I are done" }))
+        .await
+        .expect("a send to a third agent must succeed");
+
+    assert_eq!(
+        result["delivered"], true,
+        "only the ended peer is folded — the turn can still report elsewhere"
+    );
+    let trigger = trigger_rx
+        .try_recv()
+        .expect("the third party must actually be invoked");
+    assert_eq!(trigger.agent_id, carol_id);
+
+    shutdown_token.cancel();
+}
+
+/// The #1198 / #1205 job-episode arm.
+///
+/// When the end resolves an open job episode, `run_trigger_loop` reroutes the
+/// continuation onto the agent's `job_*` session — and that arm is also the
+/// one that survives the #1258 interrupted-end suppression, so it can be the
+/// ONLY run an end produces. The fold is keyed on the ended peer carried by
+/// the trigger, not on `context_id`, precisely so it still applies there: a
+/// `job_*` context names no peer, and this is the arm that re-opens with
+/// nobody watching.
+#[tokio::test]
+async fn job_episode_continuation_after_a_dm_end_still_folds_the_ended_peer() {
+    use alms_tools::Tool;
+    let (state, shutdown_token, _cr, mut trigger_rx, _dr) = test_app_state_with_sqlite();
+    let (_alice_id, bob_id) = seed_alice_bob(&state);
+    let job_context = format!("job_{}", uuid::Uuid::new_v4());
+    let session = state.session_manager.get_or_create(bob_id, &job_context);
+
+    let tool = send_tool_for_run(
+        &state,
+        bob_id,
+        "bob",
+        session.id,
+        false,
+        &job_context,
+        Some("alice"),
+    );
+
+    let result = tool
+        .execute(serde_json::json!({ "to": "alice", "message": "resuming — one more ask" }))
+        .await
+        .expect("the fold is a non-error result");
+
+    assert_eq!(
+        result["folded"], true,
+        "a job-episode continuation of an ended DM must not re-open it either"
+    );
+    assert!(trigger_rx.try_recv().is_err());
+
+    shutdown_token.cancel();
+}
+
+/// The #1154 arm is unchanged: a live peer-triggered DM turn still folds its
+/// current peer, read off the `dm:` context id, with `dm_ended_peer` unset.
+#[tokio::test]
+async fn peer_dm_turn_still_folds_its_current_peer() {
+    use alms_tools::Tool;
+    let (state, shutdown_token, _cr, mut trigger_rx, _dr) = test_app_state_with_sqlite();
+    let (_alice_id, bob_id) = seed_alice_bob(&state);
+    let dm_context = alms_core::dm_context_id("alice", "bob");
+    let session = state.session_manager.get_or_create(bob_id, &dm_context);
+
+    let tool = send_tool_for_run(
+        &state,
+        bob_id,
+        "bob",
+        session.id,
+        true, // peer-triggered DM turn
+        &dm_context,
+        None,
+    );
+
+    let result = tool
+        .execute(serde_json::json!({ "to": "alice", "message": "replying" }))
+        .await
+        .expect("the fold is a non-error result");
+
+    assert_eq!(result["folded"], true);
+    assert!(trigger_rx.try_recv().is_err());
+
     shutdown_token.cancel();
 }

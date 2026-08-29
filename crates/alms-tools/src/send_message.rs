@@ -104,16 +104,35 @@ pub struct SendMessageTool {
     /// Passed to `MessageSender::send()` so the MessageBus can track it
     /// as the "source session" for notification routing.
     sender_session_id: SessionId,
-    /// The current DM peer, when this tool is registered inside a DM run
-    /// (#1154 implicit replies).
+    /// The one peer this run may not `send_message`, and why.
     ///
-    /// Under implicit DM replies the agent's final assistant text IS the
-    /// reply to its DM peer — `send_message` aimed at the current peer is
-    /// misuse. To avoid double-delivery, such calls are folded: the tool
-    /// returns a non-error result explaining the implicit-reply contract
-    /// and does NOT deliver anything. `send_message` remains valid for
-    /// any *other* (non-peer) recipient during a DM run.
-    dm_peer: Option<String>,
+    /// A call whose recipient matches is *folded*: the tool returns a
+    /// non-error result explaining that nothing was sent, and delivers
+    /// nothing. `send_message` stays valid for every *other* recipient —
+    /// the fold removes exactly one target, never the tool.
+    ///
+    /// Two run kinds set it (see [`DmFoldReason`]); every other run leaves
+    /// it `None` and gets no fold.
+    dm_peer: Option<(String, DmFoldReason)>,
+}
+
+/// Why `send_message` toward [`SendMessageTool::dm_peer`] is folded.
+///
+/// The variants differ only in what the agent is told, but they must differ:
+/// the implicit-reply note promises the text reaches the peer anyway, which
+/// is true of a live DM turn and false once the conversation has ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DmFoldReason {
+    /// #1154: this run is a peer-triggered DM turn. The agent's final
+    /// assistant text IS the reply, delivered by the DM completion gate, so
+    /// a `send_message` at the peer would double-deliver.
+    ImplicitReply,
+    /// #1299: this run is the post-end turn for a conversation that just
+    /// ended with this peer (a `ConversationEnded` notification run). There
+    /// is no completion gate here — a send at the peer would simply re-open
+    /// the conversation at depth 1, which is how a pair converses without
+    /// bound despite `MAX_DM_DEPTH`.
+    ConversationEnded,
 }
 
 impl SendMessageTool {
@@ -134,25 +153,49 @@ impl SendMessageTool {
         }
     }
 
-    /// Set the current DM peer so `send_message` calls aimed at the peer
-    /// are folded instead of delivered (see [`Self::dm_peer`]).
+    /// Set the current DM peer so `send_message` calls aimed at the peer are
+    /// folded as an implicit reply instead of delivered
+    /// ([`DmFoldReason::ImplicitReply`]).
     pub fn with_dm_peer(mut self, peer: Option<String>) -> Self {
-        self.dm_peer = peer;
+        self.dm_peer = peer.map(|peer| (peer, DmFoldReason::ImplicitReply));
+        self
+    }
+
+    /// Set the peer whose DM conversation has just ended, so this run's
+    /// `send_message` calls aimed at that peer are folded
+    /// ([`DmFoldReason::ConversationEnded`], #1299).
+    ///
+    /// Mutually exclusive with [`Self::with_dm_peer`] — they write the same
+    /// field, so the last call wins. A run is either a live DM turn or the
+    /// post-end turn, never both.
+    pub fn with_ended_dm_peer(mut self, peer: Option<String>) -> Self {
+        self.dm_peer = peer.map(|peer| (peer, DmFoldReason::ConversationEnded));
         self
     }
 
     /// Build the folded (not-delivered) result for a `send_message` call
-    /// aimed at the current DM peer.
-    fn folded_peer_result(peer: &str) -> Value {
-        serde_json::json!({
-            "delivered": false,
-            "folded": true,
-            "note": format!(
+    /// aimed at the folded peer.
+    fn folded_peer_result(peer: &str, reason: DmFoldReason) -> Value {
+        let note = match reason {
+            DmFoldReason::ImplicitReply => format!(
                 "You are already in a direct conversation with '{peer}'. Your \
                  final reply text is delivered to them automatically — do NOT \
                  use send_message for this. The message was NOT sent; include \
                  the content in your final reply text instead."
             ),
+            DmFoldReason::ConversationEnded => format!(
+                "Your conversation with '{peer}' has just ended — this turn is \
+                 for acting on that outcome, not for continuing it. The message \
+                 was NOT sent and nothing you write reaches '{peer}' this turn; \
+                 messaging them again here would only re-open the conversation \
+                 you were notified about. Record what you learned, update your \
+                 goals or memories, or report to someone else instead."
+            ),
+        };
+        serde_json::json!({
+            "delivered": false,
+            "folded": true,
+            "note": note,
         })
     }
 }
@@ -217,18 +260,21 @@ impl Tool for SendMessageTool {
                 )
             })?;
 
-        // Fold sends aimed at the current DM peer (#1154 design default #2):
-        // the agent's final reply text is delivered implicitly, so a
-        // `send_message` to the peer would double-deliver. Checked before
-        // registry resolution so the fold works even without a SQLite store.
-        if let Some(ref peer) = self.dm_peer
+        // Fold sends aimed at the folded peer — either the current DM peer
+        // (#1154 design default #2: the final reply text is delivered
+        // implicitly, so a send would double-deliver) or the peer whose
+        // conversation just ended (#1299: a send would re-open it at depth
+        // 1). Checked before registry resolution so the fold works even
+        // without a SQLite store.
+        if let Some((ref peer, reason)) = self.dm_peer
             && to.eq_ignore_ascii_case(peer)
         {
             warn!(
                 peer = %peer,
-                "send_message aimed at the current DM peer — folded (implicit reply, #1154)"
+                ?reason,
+                "send_message aimed at the folded DM peer — not delivered"
             );
-            return Ok(Self::folded_peer_result(peer));
+            return Ok(Self::folded_peer_result(peer, reason));
         }
 
         // Resolve recipient agent from registry
@@ -251,17 +297,18 @@ impl Tool for SendMessageTool {
 
         // Defense-in-depth: the registry lookup may resolve an alias /
         // differently-cased name to the canonical record — re-check the
-        // canonical name against the DM peer so a non-exact spelling
-        // cannot sneak a double-delivery past the pre-resolution fold.
-        if let Some(ref peer) = self.dm_peer
+        // canonical name against the folded peer so a non-exact spelling
+        // cannot sneak a delivery past the pre-resolution fold.
+        if let Some((ref peer, reason)) = self.dm_peer
             && recipient.name.eq_ignore_ascii_case(peer)
         {
             warn!(
                 peer = %peer,
                 resolved = %recipient.name,
-                "send_message resolved to the current DM peer — folded (implicit reply, #1154)"
+                ?reason,
+                "send_message resolved to the folded DM peer — not delivered"
             );
-            return Ok(Self::folded_peer_result(peer));
+            return Ok(Self::folded_peer_result(peer, reason));
         }
 
         match self
@@ -433,6 +480,79 @@ mod tests {
             result.is_err(),
             "non-peer send must proceed to resolution/delivery (and fail on \
              the missing store here), not be folded"
+        );
+    }
+
+    // ---- Ended-DM-peer fold tests (#1299 post-end turn) ----
+    //
+    // Same short-circuit proof as above: `Ok(...)` from a store-less tool
+    // whose sender errors can only mean the fold fired first.
+
+    #[tokio::test]
+    async fn test_send_to_ended_dm_peer_is_folded_not_delivered() {
+        let tool = make_tool().with_ended_dm_peer(Some("alice".into()));
+        let result = tool
+            .execute(serde_json::json!({ "to": "alice", "message": "let's keep going" }))
+            .await
+            .expect("fold must be a non-error result");
+        assert_eq!(result["delivered"], false);
+        assert_eq!(
+            result["folded"], true,
+            "the post-end turn must not be able to message the peer whose \
+             conversation just ended — that re-opens it at depth 1 (#1299)"
+        );
+        assert!(
+            result.get("error").is_none(),
+            "fold must NOT be an error result — the agent should not retry"
+        );
+    }
+
+    /// The two fold reasons must not share a note.
+    ///
+    /// The implicit-reply note promises the agent that its final reply text
+    /// reaches the peer anyway. That is true of a live DM turn and false
+    /// after the conversation ended: reusing it post-end would tell the
+    /// agent it had replied when nothing was delivered.
+    #[tokio::test]
+    async fn test_ended_dm_peer_fold_does_not_promise_implicit_delivery() {
+        let ended = make_tool()
+            .with_ended_dm_peer(Some("alice".into()))
+            .execute(serde_json::json!({ "to": "alice", "message": "hi" }))
+            .await
+            .expect("fold must be a non-error result");
+        let live = make_tool()
+            .with_dm_peer(Some("alice".into()))
+            .execute(serde_json::json!({ "to": "alice", "message": "hi" }))
+            .await
+            .expect("fold must be a non-error result");
+
+        let ended_note = ended["note"].as_str().expect("fold must carry a note");
+        let live_note = live["note"].as_str().expect("fold must carry a note");
+
+        assert_ne!(
+            ended_note, live_note,
+            "the post-end fold must not reuse the implicit-reply note"
+        );
+        assert!(
+            !ended_note.contains("automatically"),
+            "the post-end fold must not promise automatic delivery — nothing \
+             reaches the peer this turn; got: {ended_note}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_send_to_other_agent_after_dm_ended_is_not_folded() {
+        // The post-end turn keeps `send_message` for everyone else — the
+        // fold removes exactly one recipient, not the tool. Here the send
+        // proceeds far enough to hit the missing-store error.
+        let tool = make_tool().with_ended_dm_peer(Some("alice".into()));
+        let result = tool
+            .execute(serde_json::json!({ "to": "charlie", "message": "alice and I are done" }))
+            .await;
+        assert!(
+            result.is_err(),
+            "a send to a THIRD agent must proceed to resolution/delivery — \
+             the post-end turn keeps every capability but the one target"
         );
     }
 
