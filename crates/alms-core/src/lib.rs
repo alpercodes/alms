@@ -32,7 +32,7 @@ pub use run::{
     RunStatus, RunStatusResponse, RunTransition, TokenUsage, ToolCallRecord, ToolCallRole,
     deliverable_dm_reply, ran_ignore_message_successfully,
 };
-pub use source_label::{derive_source_label, truncate_to_char_boundary};
+pub use source_label::{derive_source_label, tail_to_char_boundary, truncate_to_char_boundary};
 
 /// Classify a session's type from its `context_id`.
 ///

@@ -9,7 +9,7 @@
 //! These are read at the start of each run and injected into the system prompt.
 //! The agent can update goals.md, memories.md, and user.md via the workspace_write tool.
 
-use alms_core::{AlmsError, AlmsResult, truncate_to_char_boundary};
+use alms_core::{AlmsError, AlmsResult, tail_to_char_boundary};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -84,25 +84,23 @@ impl WorkspaceFile {
     /// reorganising — now appends its rewrite after the old content instead
     /// of replacing it, duplicating entries. What it replaces was an
     /// invisible, unrecoverable loss, so preserving data wins the tie either
-    /// way; but the duplication is only *visible and repairable* under a
-    /// precondition worth stating, because this default is what drives the
-    /// file towards breaking it:
+    /// way; but the duplication is only *visible and repairable* because of
+    /// which end [`memories_injection_window`] cuts, and this default is what
+    /// drives the file towards that cut:
     ///
-    /// > **While `memories.md` stays under the 4000-char injection cap.**
-    /// > [`AgentWorkspace::build_system_prompt_prefix`] injects
-    /// > `truncate_to_char_boundary(&memories, 4000)`, which is
-    /// > **head-anchored** — it returns the *oldest* 4000 chars. Under an
-    /// > append default the file grows at the tail while the read window
-    /// > stays put, so past the cap the duplicate lands in the part that is
-    /// > cut: the agent does not see it next context build, and `mode:
-    /// > "write"` cannot repair it either, because the model holds only the
-    /// > head and resending that is itself a destructive truncation. Past
-    /// > the cap, newly appended memories also stop being injected at all.
-    /// > The bytes are still on disk and still recoverable (UI, `PUT`,
-    /// > `fs_read`, an operator) where a lost update is not, which is why
-    /// > this does not change the decision — but head-anchored truncation is
-    /// > the wrong end to cut for an append-default file, and is tracked
-    /// > separately rather than solved here.
+    /// > **Past [`MEMORIES_INJECTION_CAP`], the agent sees a window, not the
+    /// > file.** Until #1308 that window was head-anchored — the *oldest*
+    /// > 4000 bytes — so under an append default the file grew at the tail
+    /// > while the read window stayed put: a duplicate landed in the cut part
+    /// > and was never seen again, `mode: "write"` could not repair it because
+    /// > the model held only the head and resending that was itself a
+    /// > destructive truncation, and newly appended memories stopped being
+    /// > injected at all. #1308 anchors the window to the **tail**, so the
+    /// > duplicate an omitted `mode` produces is in the injected end and the
+    /// > repair reaches it. The window is still a window: it carries a leading
+    /// > marker saying so, and saying that rewriting it with `mode: "write"`
+    /// > deletes what it omits, because that is the one thing the model cannot
+    /// > work out from the text it was handed.
     ///
     /// The tool's parameter description tells the model both halves of the
     /// trade, and the result echoes the effective mode, so a model that
@@ -121,8 +119,25 @@ impl WorkspaceFile {
     /// is constructed per run one hop from the context build, and no protocol
     /// or schema change is needed. Two things such a fix must get right — the
     /// base has to be what the *context build* read, not what tool
-    /// construction saw, and the returned contents inherit the same 4000-char
-    /// cap described above.
+    /// construction saw, and the payload must not be sent **raw** — a bare
+    /// window that does not say it is a window reproduces #1308 on the retry
+    /// path, which is the one shape that is definitely wrong.
+    ///
+    /// That is the floor, not the design. [`memories_injection_window`] is the
+    /// safe default for the payload — same cap, same anchor, same marker, so
+    /// a retry built on it is no more destructive than the injection it
+    /// replaces — but safe is not sufficient: an agent still cannot produce a
+    /// correct wholesale rewrite of a file it has only ever seen the end of.
+    /// Carrying the **whole** file and accepting the context cost is the option
+    /// under which the retry can actually succeed, and choosing between them is
+    /// #1310's call, not this function's.
+    ///
+    /// Two bounds on reusing it, if #1310 does: the marker names
+    /// `memories.md` literally and the cap is sized for it, and a *tail* anchor
+    /// is only the right end to keep for an append-shaped file. `personality`,
+    /// `goals` and `user` still default to `"write"`, so their whole
+    /// population is explicit whole-file replacement — this function does not
+    /// carry to them as written.
     ///
     /// Independent of [`Self::agent_writable`] (#1303), which answers
     /// *whether* the agent may write a file, not what an omitted `mode` means
@@ -143,6 +158,113 @@ impl WorkspaceFile {
             WorkspaceFile::User,
         ]
     }
+}
+
+/// Maximum bytes of `memories.md` injected into the system prompt.
+///
+/// This is not a display nicety, and despite the comment that used to sit on
+/// it ("will be properly budgeted by ContextBuilder") it is not a provisional
+/// stand-in for a budget applied elsewhere either. `ContextBuilder` never
+/// trims a system prompt: `build_with_perspective` measures it with
+/// `estimate_tokens`, pushes it verbatim, and subtracts the result from the
+/// *history* budget. So an uncapped `memories.md` would not be summarised or
+/// dropped downstream — it would evict the conversation instead, and past
+/// `max_input_tokens` the `saturating_sub` floors the history budget at zero
+/// while the oversized system block still ships. This constant is the only
+/// bound on that text.
+///
+/// It is also the only bound on any workspace text: `personality.md`,
+/// `goals.md` and `user.md` go into the same never-trimmed system block with no
+/// cap at all. Out of scope here — #1308 is about which end of `memories.md`
+/// is cut, not about the three files that are not cut — but it is the reason
+/// this constant should not be read as "workspace files are capped".
+pub const MEMORIES_INJECTION_CAP: usize = 4000;
+
+/// The `memories.md` text to inject into the system prompt: the file verbatim
+/// while it fits [`MEMORIES_INJECTION_CAP`], otherwise the **last**
+/// `MEMORIES_INJECTION_CAP` bytes behind a marker.
+///
+/// **Which end is cut (#1308).** This window used to be head-anchored — a
+/// bare `truncate_to_char_boundary`, keeping the *oldest* bytes. That was
+/// survivable while `workspace_write` defaulted to replacing the file, since a
+/// replacing writer keeps the file near whatever the agent last thought worth
+/// keeping, so the head stays roughly current. #1305 made an omitted `mode`
+/// **append** for `memories.md` (see [`WorkspaceFile::default_write_mode`]),
+/// which is right for the lost update it fixes but makes the file grow at the
+/// tail while the window stayed pinned to the head. Past the cap that turns a
+/// size limit into a correctness bug: newly written memories are never
+/// injected again, and the oldest entries become permanent regardless of
+/// whether they are still true. For a file that only ever grows at the end,
+/// the old end is the right one to lose.
+///
+/// **Why the marker leads, and says what it says.** No tool reads a workspace
+/// file back by name: `settings.rs` registers `workspace_write` and there is
+/// no `workspace_read`, so this injection is the only view of its memories the
+/// tool surface *gives* the agent. The bytes are not unreachable — the
+/// workspace lives at `<project_root>/.alms/agents/<name>/`, inside the
+/// project-root sandbox, so an agent with `fs_read` enabled can read the file
+/// by path, and the UI, `PUT` and an operator all reach it — but nothing
+/// hands the model that path, and nothing makes it re-read before rewriting.
+/// #1305's documented repair for an accidental duplicate is an explicit
+/// `mode: "write"`, and in the moment it composes that payload the model is
+/// working from the text in its system prompt. An unmarked window therefore
+/// makes the repair destructive: the agent rewrites the file from a fragment
+/// and deletes everything the fragment omits. Tail-anchoring alone does not fix
+/// that — it only changes which half is deleted. So the marker goes *first*,
+/// because a truncation that removed the start has to be announced before the
+/// content rather than after it, and it states the consequence rather than only
+/// the size. What the marker buys is that the agent does not overwrite bytes it
+/// never saw while believing it held the whole file.
+///
+/// **A partial leading line is dropped — only when there is one.** A
+/// head-anchored window could only ever end mid-entry, which reads as obviously
+/// cut off. A tail-anchored one begins mid-entry, and half a memory read from
+/// its middle is not a fragment but a different claim — "- Never delete the
+/// staging bucket" cut after "Never " asserts the opposite of the entry it came
+/// from. So the window is advanced to the next line boundary, but **only when
+/// its start did not already land just after a newline**. An aligned window
+/// already opens on a whole entry, and cutting there deletes a complete memory
+/// for nothing; with the guard the cut costs at most one entry that was already
+/// half gone, and without it that claim is simply false for the aligned input.
+///
+/// One declared exception, so the property is not read as universal: the cut is
+/// skipped when nothing follows the first newline, so a file that is one
+/// enormous unbroken line still yields its tail instead of leaving a marker and
+/// nothing else. That case does ship a fragment — a fragment that announces
+/// itself beats an empty window, but it is an exception to the rule above, not
+/// an instance of it.
+pub fn memories_injection_window(memories: &str) -> String {
+    if memories.len() <= MEMORIES_INJECTION_CAP {
+        return memories.to_string();
+    }
+
+    let raw = tail_to_char_boundary(memories, MEMORIES_INJECTION_CAP);
+    // Where the window starts inside the file. Recovered from the two lengths
+    // rather than assumed to be `len - cap`, because the tail walk may have
+    // moved forward off a split codepoint. `start >= 1` here: we are past the
+    // at-or-under-cap return, so `raw` is strictly shorter than `memories`.
+    // Slicing at `start` is valid because it is a char boundary by
+    // construction, and the slice form cannot panic the way an index can.
+    let start = memories.len() - raw.len();
+    let opens_mid_entry = !memories[..start].ends_with('\n');
+
+    let mut window = raw;
+    if opens_mid_entry
+        && let Some(nl) = window.find('\n')
+        && !window[nl + 1..].is_empty()
+    {
+        window = &window[nl + 1..];
+    }
+
+    format!(
+        "[Older memories truncated: showing the most recent {} of {} bytes. \
+         This is the end of memories.md, not the whole file -- writing this \
+         text back with mode \"write\" would delete the older entries above \
+         the cut.]\n...\n{}",
+        window.len(),
+        memories.len(),
+        window
+    )
 }
 
 impl AgentWorkspace {
@@ -548,17 +670,10 @@ impl AgentWorkspace {
         }
 
         if let Some(memories) = self.read_file(WorkspaceFile::Memories) {
-            // Truncate memories if too long (will be properly budgeted by ContextBuilder)
-            let memories = if memories.len() > 4000 {
-                format!(
-                    "{}...\n[memories truncated, {} chars total]",
-                    truncate_to_char_boundary(&memories, 4000),
-                    memories.len()
-                )
-            } else {
-                memories
-            };
-            parts.push(format!("## Memories\n{}", memories));
+            parts.push(format!(
+                "## Memories\n{}",
+                memories_injection_window(&memories)
+            ));
         }
 
         if parts.is_empty() {
@@ -740,6 +855,304 @@ mod tests {
         // user.md should be omitted for non-user-facing sessions
         assert!(!prefix.contains("About the User"));
         assert!(!prefix.contains("Alper"));
+    }
+
+    // — memories injection window (#1308) ----------------------------------
+
+    /// A `memories.md` well past the cap, with the two ends named so which one
+    /// survived the window is readable off the assertion rather than inferred
+    /// from a length.
+    fn oversize_memories() -> String {
+        let mut memories = String::from("- OLDEST: this agent's very first recorded fact\n");
+        let mut n = 0;
+        while memories.len() < MEMORIES_INJECTION_CAP * 2 {
+            memories.push_str(&format!("- filler {n:04}: {}\n", "y".repeat(50)));
+            n += 1;
+        }
+        memories.push_str("- NEWEST: the last thing this agent learned\n");
+        memories
+    }
+
+    /// Split an over-cap window into its marker and its content. Panics if the
+    /// window was not truncated at all, so a test that meant to exercise the
+    /// cap cannot pass by accident on a file that fits.
+    fn split_window(window: &str) -> (&str, &str) {
+        window
+            .split_once("\n...\n")
+            .expect("an over-cap window is marker, then separator, then content")
+    }
+
+    /// The acceptance criterion: past the cap, what reaches the agent is what
+    /// it most recently learned.
+    ///
+    /// Before #1308 this was exactly inverted — `truncate_to_char_boundary`
+    /// kept the oldest bytes, so `OLDEST` was injected forever and `NEWEST`
+    /// never was. Under the #1305 append default that is not a size limit but
+    /// a write-only memory: the agent keeps appending and never reads any of
+    /// it back.
+    #[test]
+    fn over_cap_memories_inject_the_recent_end_not_the_oldest() {
+        let memories = oversize_memories();
+        let window = memories_injection_window(&memories);
+
+        assert!(
+            window.contains("- NEWEST:"),
+            "the most recent memory must be inside the window"
+        );
+        assert!(
+            !window.contains("- OLDEST:"),
+            "and the oldest is the end that gets dropped"
+        );
+    }
+
+    /// The same property through the real read path an agent actually gets,
+    /// not just the helper: file on disk -> `build_system_prompt_prefix`.
+    #[test]
+    fn build_system_prompt_prefix_injects_the_recent_end_of_over_cap_memories() {
+        let (_dir, ws) = test_workspace();
+        ws.ensure_dir().unwrap();
+        let memories = oversize_memories();
+        ws.write_file(WorkspaceFile::Memories, &memories).unwrap();
+
+        let prefix = ws.build_system_prompt_prefix(false);
+        assert!(prefix.starts_with("## Memories\n"), "prefix: {prefix:.40}");
+        assert!(
+            prefix.contains("- NEWEST:"),
+            "the injected prefix must carry the recent end"
+        );
+        assert!(
+            !prefix.contains("- OLDEST:"),
+            "the injected prefix must not be frozen on the oldest end"
+        );
+    }
+
+    /// The cap still binds. It is the only bound on this text — `ContextBuilder`
+    /// measures the system prompt and shrinks *history* to pay for it, it never
+    /// trims the prompt itself — so a window that quietly stopped capping would
+    /// evict the conversation instead of the old memories.
+    #[test]
+    fn the_injected_window_stays_within_the_cap() {
+        let memories = oversize_memories();
+        let window = memories_injection_window(&memories);
+        let (_marker, content) = split_window(&window);
+        assert!(
+            content.len() <= MEMORIES_INJECTION_CAP,
+            "content is {} bytes, cap is {MEMORIES_INJECTION_CAP}",
+            content.len()
+        );
+    }
+
+    /// The marker comes *first*. A truncation that removed the start has to be
+    /// announced before the content: the trailing marker the head-anchored
+    /// version used reads as "and there was more after this", which is the
+    /// wrong claim once the missing part is above the cut.
+    #[test]
+    fn the_truncation_marker_leads_the_window() {
+        let window = memories_injection_window(&oversize_memories());
+        assert!(
+            window.starts_with("[Older memories truncated:"),
+            "marker must precede the content; window starts: {window:.60}"
+        );
+    }
+
+    /// What the marker has to say, and the precondition #1310 inherits.
+    ///
+    /// There is no `workspace_read` tool, so this injection is the agent's only
+    /// view of its memories, and #1305's documented repair for an accidental
+    /// duplicate is to resend the file with an explicit `mode: "write"`. The
+    /// only text the model can resend is the text it was shown. A window that
+    /// does not say it is a window therefore turns that repair into a deletion
+    /// — tail-anchoring alone only changes which half is deleted.
+    #[test]
+    fn the_marker_says_the_window_is_not_the_whole_file_and_that_rewriting_deletes() {
+        let memories = oversize_memories();
+        let window = memories_injection_window(&memories);
+        let (marker, _content) = split_window(&window);
+
+        assert!(marker.contains("not the whole file"), "marker: {marker}");
+        assert!(
+            marker.contains("mode \"write\""),
+            "the marker must name the operation it is warning about; marker: {marker}"
+        );
+        assert!(
+            marker.contains("delete the older entries"),
+            "and say what that operation costs; marker: {marker}"
+        );
+    }
+
+    /// The marker's numbers describe the window that was actually produced,
+    /// not the cap it was asked for — the partial-line drop below can make the
+    /// content shorter than `MEMORIES_INJECTION_CAP`, and reporting the cap
+    /// there would misstate how much is missing.
+    #[test]
+    fn the_marker_reports_the_real_shown_and_total_sizes() {
+        let memories = oversize_memories();
+        let window = memories_injection_window(&memories);
+        let (marker, content) = split_window(&window);
+
+        assert!(
+            marker.contains(&format!(
+                "most recent {} of {} bytes",
+                content.len(),
+                memories.len()
+            )),
+            "marker: {marker}"
+        );
+    }
+
+    /// A 34-byte numbered entry. 34 does **not** divide
+    /// [`MEMORIES_INJECTION_CAP`] (4000 mod 34 = 22), so a whole number of
+    /// these always puts the raw window start mid-entry.
+    fn unaligned_entry(i: usize) -> String {
+        format!("- entry {i:03} {}\n", "x".repeat(21))
+    }
+
+    /// A 40-byte numbered entry. 40 **does** divide
+    /// [`MEMORIES_INJECTION_CAP`], so a whole number of these puts the raw
+    /// window start exactly on an entry boundary.
+    fn aligned_entry(i: usize) -> String {
+        format!("- entry {i:03} {}\n", "z".repeat(27))
+    }
+
+    fn repeat_entries(entry: fn(usize) -> String, count: usize) -> String {
+        (0..count).map(entry).collect()
+    }
+
+    /// A tail window opens mid-entry, and half a memory read from its middle
+    /// is not a visibly-truncated fragment but a different claim: cutting
+    /// "- Never delete the staging bucket" partway through can leave text that
+    /// asserts the opposite of the entry it came from. So the window starts at
+    /// the next line boundary.
+    ///
+    /// The mid-entry cut is a precondition, asserted rather than assumed: a
+    /// boundary-aligned cut would make this test pass without exercising
+    /// anything. Asserting it also *excludes* the aligned case by construction,
+    /// which is why
+    /// [`a_window_already_open_on_an_entry_boundary_keeps_its_first_entry`]
+    /// exists as its own row rather than as a second assertion here.
+    ///
+    /// The entries are **numbered** so the assertion pins which entry the
+    /// window opens on. With identical entries `starts_with` would hold whether
+    /// one line or six had been cut, and "at most one entry" would be unpinned.
+    #[test]
+    fn a_partial_leading_entry_is_dropped() {
+        // 122 entries = 4148 bytes; the raw start is 148, which is 12 bytes
+        // into entry 4 — so entry 4 is the half one and entry 5 is the first
+        // whole one.
+        let memories = repeat_entries(unaligned_entry, MEMORIES_INJECTION_CAP / 34 + 5);
+
+        let raw = tail_to_char_boundary(&memories, MEMORIES_INJECTION_CAP);
+        let start = memories.len() - raw.len();
+        assert!(
+            !memories[..start].ends_with('\n'),
+            "precondition: the raw tail window must open mid-entry, got {raw:.40}"
+        );
+
+        let window = memories_injection_window(&memories);
+        let (_marker, content) = split_window(&window);
+        assert!(
+            content.starts_with(&unaligned_entry(5)),
+            "the window must open on the first *whole* entry — exactly one half \
+             entry dropped, no more; got {content:.40}"
+        );
+    }
+
+    /// The complement, and the branch the precondition above provably cannot
+    /// reach: when the raw window already starts just after a newline it opens
+    /// on a whole entry, and advancing to the next line boundary would delete a
+    /// complete memory for nothing.
+    ///
+    /// Before the `opens_mid_entry` guard the cut was unconditional, so this
+    /// input silently lost its oldest in-window entry and the doc's "costs at
+    /// most one entry that was already half gone" was false for exactly it.
+    #[test]
+    fn a_window_already_open_on_an_entry_boundary_keeps_its_first_entry() {
+        // 105 entries = 4200 bytes; 40 divides 4000, so the raw start is 200 —
+        // exactly the first byte of entry 5.
+        let memories = repeat_entries(aligned_entry, MEMORIES_INJECTION_CAP / 40 + 5);
+
+        let raw = tail_to_char_boundary(&memories, MEMORIES_INJECTION_CAP);
+        let start = memories.len() - raw.len();
+        assert!(
+            memories[..start].ends_with('\n'),
+            "precondition: the raw tail window must open on an entry boundary"
+        );
+
+        let window = memories_injection_window(&memories);
+        let (_marker, content) = split_window(&window);
+        assert!(
+            content.starts_with(&aligned_entry(5)),
+            "an aligned window must keep the entry it opens on; got {content:.40}"
+        );
+        assert_eq!(
+            content, raw,
+            "and must be the raw window untouched — nothing to drop, so nothing dropped"
+        );
+    }
+
+    /// The drop must not be able to swallow the whole window. The case that
+    /// reaches that is a window whose only newline is its very last byte:
+    /// everything after it is empty, so cutting there would leave the agent
+    /// with a marker and nothing else.
+    #[test]
+    fn a_window_whose_only_newline_is_its_last_byte_is_kept_whole() {
+        let memories = format!("{}TAIL-MARKER\n", "z".repeat(MEMORIES_INJECTION_CAP * 2));
+        let window = memories_injection_window(&memories);
+        let (_marker, content) = split_window(&window);
+
+        assert!(content.ends_with("TAIL-MARKER\n"), "content: {content:.40}");
+        assert!(
+            content.len() > 1,
+            "dropping to the trailing newline would leave the window empty"
+        );
+    }
+
+    /// And the case with no newline in the window at all — one enormous
+    /// unbroken line — still yields its tail rather than nothing.
+    #[test]
+    fn a_single_unbroken_line_still_yields_its_tail() {
+        let memories = format!("{}TAIL-MARKER", "z".repeat(MEMORIES_INJECTION_CAP * 2));
+        let window = memories_injection_window(&memories);
+        let (_marker, content) = split_window(&window);
+
+        assert!(content.ends_with("TAIL-MARKER"), "content: {content:.40}");
+    }
+
+    /// Under the cap nothing is added — no marker, no ellipsis, byte-identical
+    /// to the file. The `== cap` row is the one the boundary lives on: a `<`
+    /// there would window a file that fits.
+    #[test]
+    fn memories_at_or_under_the_cap_are_injected_verbatim() {
+        let short = "- one fact\n- another fact\n";
+        assert_eq!(memories_injection_window(short), short);
+
+        let exactly_at_cap = "m".repeat(MEMORIES_INJECTION_CAP);
+        assert_eq!(memories_injection_window(&exactly_at_cap), exactly_at_cap);
+    }
+
+    /// One byte over is where windowing starts.
+    #[test]
+    fn one_byte_over_the_cap_is_windowed() {
+        let over = "m".repeat(MEMORIES_INJECTION_CAP + 1);
+        assert!(
+            memories_injection_window(&over).starts_with("[Older memories truncated:"),
+            "the cap must bind at cap + 1"
+        );
+    }
+
+    /// A multi-byte character straddling the cut must not panic or produce
+    /// invalid UTF-8 — the tail walk moves the start forward off it.
+    #[test]
+    fn a_multibyte_char_on_the_cut_is_handled() {
+        // No newlines, so the partial-line drop is out of the way and the cut
+        // itself is what is under test. 'e-acute' is 2 bytes; an odd-length
+        // filler guarantees the raw start lands inside one of them.
+        let memories = format!("{}TAIL-MARKER", "\u{E9}".repeat(MEMORIES_INJECTION_CAP));
+        let window = memories_injection_window(&memories);
+        let (_marker, content) = split_window(&window);
+
+        assert!(content.ends_with("TAIL-MARKER"));
+        assert!(content.len() <= MEMORIES_INJECTION_CAP);
     }
 
     #[test]

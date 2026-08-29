@@ -473,12 +473,13 @@ mod tests {
         // a model that omitted `mode` while meaning a wholesale rewrite gets
         // duplicated entries instead of a silent loss. The duplication is
         // visible in the next context build and fixable with an explicit
-        // `mode: "write"` *while the file stays under the 4000-char injection
-        // cap* — past it the tail is truncated away and neither holds. See
-        // `WorkspaceFile::default_write_mode` for why that does not change
-        // the decision: unread-but-present is still recoverable, a lost
-        // update is not. This file is far under the cap, which is why the
-        // duplication is observable here at all.
+        // `mode: "write"`. Both halves of that used to lapse past
+        // `MEMORIES_INJECTION_CAP`, where the injected window was the file's
+        // *head*: the duplicate sat in the truncated tail, unseen, and the
+        // repair could only resend the head. #1308 anchors the window to the
+        // tail, so a fresh duplicate is inside it either way. See
+        // `WorkspaceFile::default_write_mode` for why unread-but-present was
+        // still the right side of the trade even before that.
         assert_eq!(
             content.matches("- M1").count(),
             2,

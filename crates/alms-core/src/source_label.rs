@@ -97,6 +97,34 @@ pub fn truncate_to_char_boundary(s: &str, max: usize) -> &str {
     &s[..end]
 }
 
+/// Keep at most the **last** `max` bytes of `s`, respecting UTF-8 char
+/// boundaries.
+///
+/// The tail-anchored counterpart of [`truncate_to_char_boundary`]: that one
+/// keeps the *oldest* `max` bytes, this one keeps the *newest*. Which end to
+/// cut is a property of the data, not of the cap — for a log-shaped file that
+/// only ever grows at the end (an append-only `memories.md`, #1308), a
+/// head-anchored window freezes on the oldest content and never shows anything
+/// written since.
+///
+/// If the string is already `max` bytes or shorter it is returned unchanged.
+/// Otherwise the smallest char boundary at or above `s.len() - max` is used, so
+/// the result is always valid UTF-8 and never *longer* than `max` bytes —
+/// mirroring how [`truncate_to_char_boundary`] walks its end backwards rather
+/// than forwards.
+pub fn tail_to_char_boundary(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
+    }
+    // Find the smallest char boundary >= len - max. `s.len()` is always a
+    // boundary, so this terminates even if the tail is one multi-byte char.
+    let mut start = s.len() - max;
+    while !s.is_char_boundary(start) {
+        start += 1;
+    }
+    &s[start..]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -196,5 +224,55 @@ mod tests {
         let s = "\u{1F600}\u{1F601}\u{1F602}"; // 3 emoji, 12 bytes
         let result = truncate_to_char_boundary(s, 5);
         assert_eq!(result, "\u{1F600}"); // 4 bytes, next boundary is at 8
+    }
+
+    // -- tail_to_char_boundary ----------------------------------------------
+
+    /// The whole point of the function: it keeps the *other* end. Pinned
+    /// against its head-anchored twin in one assertion so a future edit that
+    /// collapses the two is a failing test rather than a silent regression
+    /// in whatever reads the tail (#1308).
+    #[test]
+    fn test_tail_and_truncate_cut_opposite_ends() {
+        let s = "0123456789";
+        assert_eq!(truncate_to_char_boundary(s, 3), "012");
+        assert_eq!(tail_to_char_boundary(s, 3), "789");
+    }
+
+    #[test]
+    fn test_tail_no_op_when_already_short_enough() {
+        // Strictly shorter, and exactly at the cap: the second is the row the
+        // early return exists for at all -- without it `s.len() - max`
+        // underflows for the first.
+        assert_eq!(tail_to_char_boundary("hi", 10), "hi");
+        assert_eq!(tail_to_char_boundary("hi", 2), "hi");
+        assert_eq!(tail_to_char_boundary("", 0), "");
+    }
+
+    #[test]
+    fn test_tail_zero_max_is_empty() {
+        assert_eq!(tail_to_char_boundary("abc", 0), "");
+    }
+
+    /// The start is walked *forward* off a split codepoint, never backward:
+    /// backward would keep the result valid UTF-8 too, but at `max + 1` bytes,
+    /// which quietly breaks every caller that picked `max` as a hard budget.
+    #[test]
+    fn test_tail_multibyte_walks_forward_off_the_split() {
+        let s = "aa\u{E9}b"; // 5 bytes: the 2-byte 'e-acute' sits at 2..4
+        let result = tail_to_char_boundary(s, 2);
+        assert_eq!(result, "b", "byte 3 is mid-char, so the start moves to 4");
+        assert!(
+            result.len() <= 2,
+            "walking backward would return 3 bytes for a 2-byte budget"
+        );
+    }
+
+    #[test]
+    fn test_tail_multibyte_exact_boundary_is_not_moved() {
+        // Each emoji is 4 bytes; len - 8 is already a boundary, so the tail is
+        // the last two emoji exactly.
+        let s = "\u{1F600}\u{1F601}\u{1F602}"; // 3 emoji, 12 bytes
+        assert_eq!(tail_to_char_boundary(s, 8), "\u{1F601}\u{1F602}");
     }
 }
