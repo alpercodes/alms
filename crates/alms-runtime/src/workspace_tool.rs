@@ -95,12 +95,13 @@ impl Tool for WorkspaceWriteTool {
             }
         };
 
-        // Both writers do blocking file IO, and `append_file` additionally
-        // waits on a cross-process advisory lock with no timeout (#1280).
-        // Awaiting that on a tokio worker would wedge the worker for as long
-        // as some other holder — a second daemon on the same data dir — keeps
-        // the lock. Offloaded to the blocking pool instead, the same
-        // convention `check_sandbox_path_async` follows for far cheaper work.
+        // Both writers do blocking file IO, and both wait on the file's
+        // cross-process advisory lock with no timeout (#1280 for the append,
+        // #1294 for the write). Awaiting that on a tokio worker would wedge
+        // the worker for as long as some other holder — a second daemon on
+        // the same data dir — keeps the lock. Offloaded to the blocking pool
+        // instead, the same convention `check_sandbox_path_async` follows for
+        // far cheaper work.
         let workspace = self.workspace.clone();
         let content = content.to_string();
         tokio::task::spawn_blocking(move || {
@@ -230,6 +231,39 @@ mod tests {
 
         let content = tool.workspace.read_file(WorkspaceFile::User).unwrap();
         assert!(content.contains("Alper"));
+    }
+
+    /// `mode` is optional and defaults to `"write"`, so this is the branch
+    /// an LLM takes whenever it does not think to ask for one — which is
+    /// why it, and not just `append`, has to be serialised (#1294). The
+    /// sidecar lock file is the evidence the default landed on the locked
+    /// replacement: nothing else in a workspace creates it.
+    #[tokio::test]
+    async fn the_default_mode_goes_through_the_locked_replacement() {
+        let (_dir, tool) = test_tool();
+        let result = tool
+            .execute(serde_json::json!({
+                "file": "memories",
+                "content": "- learned a thing"
+            }))
+            .await
+            .unwrap();
+        assert_eq!(result["mode"], "write", "the default mode must be 'write'");
+
+        let dir = tool.workspace.dir();
+        assert_eq!(
+            std::fs::read_to_string(dir.join("memories.md")).unwrap(),
+            "- learned a thing"
+        );
+        assert!(
+            dir.join(".memories.md.lock").exists(),
+            "a default-mode workspace_write must take the file's sidecar lock; \
+             files on disk: {:?}",
+            std::fs::read_dir(&dir)
+                .unwrap()
+                .map(|e| e.unwrap().file_name())
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]

@@ -12,6 +12,7 @@
 use alms_core::{AlmsError, AlmsResult, truncate_to_char_boundary};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::{debug, info, warn};
 
 /// Agent workspace — reads and manages persistent agent identity files.
@@ -101,7 +102,12 @@ impl AgentWorkspace {
         }
     }
 
-    /// Write a workspace file. Checks `agent_writable()` before writing.
+    /// Write a workspace file, replacing whatever was there. Checks
+    /// `agent_writable()` before writing.
+    ///
+    /// This is the branch an agent takes *by default*: `workspace_write`
+    /// reads its mode as `.unwrap_or("write")`, so an LLM that omits `mode`
+    /// lands here rather than in [`Self::append_file`] (#1294).
     pub fn write_file(&self, file: WorkspaceFile, content: &str) -> AlmsResult<()> {
         if !file.agent_writable() {
             return Err(AlmsError::InvalidConfig(format!(
@@ -110,16 +116,162 @@ impl AgentWorkspace {
             )));
         }
 
+        self.replace_file(file, content)
+    }
+
+    /// Write a workspace file on the operator's authority, skipping the
+    /// `agent_writable()` check.
+    ///
+    /// `PUT /agents/{id}/workspace/{file}` is allowed to write every
+    /// workspace file, including any the agent itself may not — the operator
+    /// is the authority on their own workspace. That exemption is about
+    /// **permission** and nothing else: the write still takes the same lock
+    /// and lands the same way as [`Self::write_file`]. Which is the point of
+    /// this method existing — before #1294 the handler waived the check by
+    /// going around `AgentWorkspace` entirely, and waived the atomicity with
+    /// it.
+    ///
+    /// Caveat worth knowing before reading too much into the split:
+    /// `agent_writable()` returns `true` for all four files today, so this
+    /// and [`Self::write_file`] are behaviourally identical and no test can
+    /// tell them apart (#1303). The split is structural, and it is the
+    /// conservative direction: if `personality.md` ever does become
+    /// non-agent-writable, an operator route that had been calling
+    /// `write_file` would start returning 500 on every personality edit made
+    /// from the UI.
+    pub fn write_file_as_operator(&self, file: WorkspaceFile, content: &str) -> AlmsResult<()> {
+        self.replace_file(file, content)
+    }
+
+    /// Replace a workspace file's contents: serialised against every other
+    /// writer, and never observable half-done by a reader (#1294).
+    ///
+    /// Two properties, both needed:
+    ///
+    /// 1. The file's sidecar lock is held across the whole call — the same
+    ///    lock [`Self::append_file`] takes, so the two serialise. Without it
+    ///    a replacement landing inside an append's observe-then-write cycle
+    ///    truncates the file under it: the append then lands at offset 0 and
+    ///    the replacement overwrites it, leaving a well-formed file with the
+    ///    memory silently gone. That is the #1280 failure mode, reached
+    ///    through the tool's default branch.
+    /// 2. The new content is staged beside the target and moved into place
+    ///    with a rename, instead of being written into a truncated target.
+    ///    `std::fs::write` opens with `O_TRUNC`, so the file is *empty* for
+    ///    the length of the write, and [`Self::read_file`] maps both a read
+    ///    error and an empty file to "no memories" — an agent's whole
+    ///    memory silently missing from the system prompt of any run that
+    ///    built its context in that window. A rename swaps the directory
+    ///    entry, so a concurrent reader sees the whole old content or the
+    ///    whole new content and never anything in between. This is also why
+    ///    the lock alone would not be enough: readers do not take it, by the
+    ///    same reasoning that put the lock on a sidecar in the first place
+    ///    (see [`Self::lock_path`]).
+    ///
+    /// The rename buys visibility, not crash durability: nothing is fsynced,
+    /// so power loss mid-call can still lose the new content — but it cannot
+    /// leave a torn file, and a crash between the two steps leaves nothing
+    /// behind but a stray staging file.
+    ///
+    /// A lock that cannot be taken **fails** this write, where the same
+    /// failure only warns in [`Self::append_file`]. The asymmetry is the
+    /// point, not an oversight: #1292 could step over a missing lock because
+    /// an append-mode write is non-destructive on its own, so the degraded
+    /// path provably cost at most a misplaced separator. No such proof
+    /// exists here — an unserialised replacement can rename the file out
+    /// from under an append that had already opened its handle (the lock is
+    /// taken, then the handle is opened, then `needs_separator` seeks and
+    /// reads: a real window, several syscalls wide). The old inode is
+    /// unlinked, the appender writes into it, and those bytes are freed when
+    /// the handle closes. **Both calls return `Ok`** — the `write_all`
+    /// succeeded, the rename succeeded, nothing warns — and one of them
+    /// wrote where nobody can ever read. Not overwritten: gone. That is the
+    /// defect this function exists to prevent, so it cannot also be its
+    /// degraded mode. Failing costs a retry and nothing else: the old
+    /// content is untouched and the caller still holds the new content.
+    /// Which is the same trade the paragraph below makes about the rename,
+    /// decided the same way.
+    ///
+    /// One accepted regression, on Windows only: `MoveFileEx` needs delete
+    /// access to the target, which an outside process holding it open
+    /// without `FILE_SHARE_DELETE` denies, so a rename can fail where the
+    /// truncating write would have succeeded. That is returned as an error
+    /// rather than falling back to a truncating write — a visible failure
+    /// the caller can retry beats an invisible torn read.
+    fn replace_file(&self, file: WorkspaceFile, content: &str) -> AlmsResult<()> {
         self.ensure_dir()
             .map_err(|e| AlmsError::Runtime(format!("Cannot create workspace dir: {}", e)))?;
 
-        let path = self.dir().join(file.filename());
-        std::fs::write(&path, content).map_err(|e| {
+        let dir = self.dir();
+        let path = dir.join(file.filename());
+
+        // Held for the rest of the function, and a hard precondition —
+        // deliberately NOT `append_file`'s warn-and-step-over. See the
+        // asymmetry note on this function.
+        let _lock = Self::acquire_lock(&dir, file).map_err(|e| {
+            AlmsError::Runtime(format!(
+                "Refusing to replace {} without its lock: {}",
+                path.display(),
+                e
+            ))
+        })?;
+
+        let staging = Self::staging_path(&dir, file);
+        std::fs::write(&staging, content).map_err(|e| {
+            let _ = std::fs::remove_file(&staging);
+            AlmsError::Runtime(format!(
+                "Failed to stage a replacement for {}: {}",
+                path.display(),
+                e
+            ))
+        })?;
+
+        // Test-only interleaving seam — see `tests::run_replace_interleave_hook`.
+        // The replacement is fully staged and the target has not been touched
+        // yet: the instant at which a truncate-first writer would already
+        // have emptied it.
+        #[cfg(test)]
+        tests::run_replace_interleave_hook();
+
+        std::fs::rename(&staging, &path).map_err(|e| {
+            let _ = std::fs::remove_file(&staging);
             AlmsError::Runtime(format!("Failed to write {}: {}", path.display(), e))
         })?;
 
         info!("Updated workspace file: {}", path.display());
         Ok(())
+    }
+
+    /// Path of the scratch file a replacement is staged in before being
+    /// renamed over the target.
+    ///
+    /// In the same directory, because a rename is only atomic within one
+    /// filesystem. Unique per call rather than a fixed `.{file}.tmp` as a
+    /// second line of defence: a lock that *fails* to be taken now aborts the
+    /// write, but a lock that silently does not work (a filesystem where the
+    /// call succeeds without conflicting, some NFS mounts) leaves two
+    /// replacements staging at once, and on a shared path they would splice
+    /// into one file and rename the splice into place — corruption worse
+    /// than the lost update this is fixing. Pid reuse after a crash can pick
+    /// a name a dead process left behind, which costs nothing: the staging
+    /// write truncates it.
+    ///
+    /// It is only a second line of defence, and a narrow one: on a
+    /// filesystem whose locking silently no-ops, the orphaned-inode append
+    /// loss described on [`Self::replace_file`] is still reachable, and
+    /// unique staging paths do nothing about it — they stop two
+    /// replacements splicing, not a replacement outrunning an append.
+    /// Nothing here should try to close that. No lock discipline fixes a
+    /// lock that lies; #1292's append path carries the same residual for the
+    /// same reason.
+    fn staging_path(dir: &Path, file: WorkspaceFile) -> PathBuf {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        dir.join(format!(
+            ".{}.{}.{}.tmp",
+            file.filename(),
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ))
     }
 
     /// Path of the sidecar advisory lock that guards one workspace file.
@@ -256,12 +408,13 @@ impl AgentWorkspace {
     ///
     /// `len` is a parameter rather than a local so that the gap between
     /// observing the length and reading the tail is visible to the caller —
-    /// and reachable from a test. A concurrent *truncating* writer
-    /// (`write_file`, or `PUT /agents/{id}/workspace/{file}` — neither takes
-    /// the lock yet, #1294) can land in that gap, leaving the seek past the
-    /// new end. A short read there is not an error, it means "the tail we
-    /// were told about is gone": answered with a separator, which costs a
-    /// blank line, rather than with an error, which costs the memory.
+    /// and reachable from a test. Every in-tree writer now takes the sidecar
+    /// lock (#1294), so none of them can land in that gap — but a writer
+    /// that failed to take the lock, or an operator editing the file by hand
+    /// while a run is live, still can, leaving the seek past the new end. A
+    /// short read there is not an error, it means "the tail we were told
+    /// about is gone": answered with a separator, which costs a blank line,
+    /// rather than with an error, which costs the memory.
     fn needs_separator(handle: &mut std::fs::File, len: u64) -> std::io::Result<bool> {
         if len == 0 {
             return Ok(false);
@@ -363,6 +516,30 @@ mod tests {
     /// fires once and the `RefCell` borrow is not held across the callback.
     pub(super) fn run_append_interleave_hook() {
         let hook = APPEND_INTERLEAVE_HOOK.with(|slot| slot.borrow_mut().take());
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    thread_local! {
+        /// The same seam as [`APPEND_INTERLEAVE_HOOK`], for
+        /// [`AgentWorkspace::replace_file`]: fires once, with the lock held
+        /// and the replacement fully staged, immediately before the rename
+        /// puts it in place. Same constraint — a hook must not call back
+        /// into a workspace writer for the same file, because the sidecar
+        /// lock conflicts per open handle, not per process.
+        static REPLACE_INTERLEAVE_HOOK: RefCell<Option<Box<dyn FnOnce()>>> =
+            const { RefCell::new(None) };
+    }
+
+    /// Arm the interleaving seam for this thread's next replacing write.
+    fn on_next_replace(hook: impl FnOnce() + 'static) {
+        REPLACE_INTERLEAVE_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+    }
+
+    /// Called by `replace_file`. See [`run_append_interleave_hook`].
+    pub(super) fn run_replace_interleave_hook() {
+        let hook = REPLACE_INTERLEAVE_HOOK.with(|slot| slot.borrow_mut().take());
         if let Some(hook) = hook {
             hook();
         }
@@ -510,12 +687,12 @@ mod tests {
 
         let competitor_path = ws.dir().join("memories.md");
         on_next_append(move || {
-            // Stands in for a writer that does NOT hold the sidecar lock, so
-            // this pins the append-mode write on its own, independently of
-            // the lock. Another `append_file` blocks on the lock and can
-            // never land in this window; the writers that can are the two
-            // unlocked ones in-tree today — `write_file` and
-            // `PUT /agents/{id}/workspace/{file}` (#1294).
+            // Stands in for a writer that does NOT hold the sidecar lock,
+            // so this pins the append-mode write on its own, independently
+            // of the lock. Every in-tree writer takes the lock as of #1294
+            // and so blocks here instead; what is left is a writer whose own
+            // lock acquisition failed and stepped over it, or something
+            // outside the daemon appending to the same file.
             let mut f = std::fs::OpenOptions::new()
                 .append(true)
                 .open(&competitor_path)
@@ -743,5 +920,349 @@ mod tests {
             std::fs::read_to_string(&path).unwrap(),
             "- one\n- two\n- three"
         );
+    }
+
+    // ---- #1294: the replacing writers are locked and atomic --------------
+
+    /// The replacing write runs under the *same* sidecar lock `append_file`
+    /// takes — the probe resolves the path through `lock_path`, so a write
+    /// that locked nothing, or locked some other file, leaves this free.
+    ///
+    /// Together with `append_holds_the_sidecar_lock_across_the_write` this is
+    /// the mutual exclusion the fix rests on: both writers hold that one lock
+    /// across their whole observe-or-stage-then-write cycle, so neither can
+    /// land inside the other's. Probed from inside the seam, so no thread and
+    /// no sleep is involved — the lock is either held at that instant or
+    /// it is not.
+    #[test]
+    fn a_replacing_write_holds_the_sidecar_lock_across_the_rename() {
+        let (_dir, ws) = test_workspace();
+        ws.write_file(WorkspaceFile::Memories, "- first").unwrap();
+
+        let lock_path = AgentWorkspace::lock_path(&ws.dir(), WorkspaceFile::Memories);
+        let contended = Arc::new(AtomicBool::new(false));
+        let flag = contended.clone();
+        on_next_replace(move || {
+            let probe = std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(false)
+                .open(&lock_path)
+                .unwrap();
+            flag.store(
+                matches!(probe.try_lock(), Err(std::fs::TryLockError::WouldBlock)),
+                Ordering::SeqCst,
+            );
+        });
+
+        ws.write_file(WorkspaceFile::Memories, "- second").unwrap();
+
+        assert!(
+            contended.load(Ordering::SeqCst),
+            "write_file must hold the workspace file's lock while it replaces it"
+        );
+    }
+
+    /// The lock is on the sidecar, never on the data file — same reason as
+    /// for appends: `read_file` maps a read error to `None`, and on Windows a
+    /// held lock makes every other handle's read fail. So a reader must still
+    /// see the *old* content in full while a replacement is in flight, not an
+    /// error and not a truncated file.
+    #[test]
+    fn memories_stay_readable_while_a_replacement_is_in_flight() {
+        let (_dir, ws) = test_workspace();
+        ws.write_file(WorkspaceFile::Memories, "- first").unwrap();
+
+        let reader = ws.clone();
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let sink = seen.clone();
+        on_next_replace(move || {
+            *sink.lock().unwrap() = Some(reader.read_file(WorkspaceFile::Memories));
+        });
+
+        ws.write_file(WorkspaceFile::Memories, "- second").unwrap();
+
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(
+            seen,
+            Some(Some("- first".to_string())),
+            "the old content must still be readable in full until the \
+             replacement is renamed into place"
+        );
+        assert_eq!(
+            ws.read_file(WorkspaceFile::Memories).unwrap(),
+            "- second",
+            "and the new content must be there once the call returns"
+        );
+    }
+
+    /// A replacement swaps the directory entry; it does not rewrite the file
+    /// in place. A handle opened before the write therefore still reads the
+    /// old content afterwards — which is exactly why a concurrent reader
+    /// can never see a half-written file. Under a truncating `fs::write` that
+    /// same handle would see the new content, because it is the same inode.
+    ///
+    /// Portable: an open handle keeps the replaced file alive under both
+    /// `rename` and `MoveFileEx` (Rust opens files with `FILE_SHARE_DELETE`).
+    #[test]
+    fn a_replacement_swaps_the_file_rather_than_rewriting_it_in_place() {
+        let (_dir, ws) = test_workspace();
+        ws.write_file(WorkspaceFile::Memories, "- before").unwrap();
+
+        let mut held = std::fs::File::open(ws.dir().join("memories.md")).unwrap();
+
+        ws.write_file(WorkspaceFile::Memories, "- after").unwrap();
+
+        let mut seen = String::new();
+        held.read_to_string(&mut seen).unwrap();
+        assert_eq!(
+            seen, "- before",
+            "a handle opened before the write must still see the old content: \
+             the replacement is a rename, not an in-place rewrite"
+        );
+        assert_eq!(ws.read_file(WorkspaceFile::Memories).unwrap(), "- after");
+    }
+
+    /// Nothing touches the target until the replacement is whole: at the
+    /// instant the new content is fully staged, the file on disk is still the
+    /// complete old content. Kills a "truncate the target, then stream into
+    /// it" implementation, which is the shape that makes an empty file
+    /// observable.
+    ///
+    /// It does *not* kill a single-call `std::fs::write` — the seam fires
+    /// before that call, so the target is legitimately intact at the instant
+    /// this looks. That one is killed by
+    /// `a_replacement_swaps_the_file_rather_than_rewriting_it_in_place` and
+    /// by `a_concurrent_reader_never_observes_a_partial_replacement`.
+    #[test]
+    fn the_target_is_untouched_until_the_replacement_is_whole() {
+        let (_dir, ws) = test_workspace();
+        ws.write_file(WorkspaceFile::Memories, "- before").unwrap();
+
+        let path = ws.dir().join("memories.md");
+        let observed = Arc::new(std::sync::Mutex::new(None));
+        let sink = observed.clone();
+        on_next_replace(move || {
+            *sink.lock().unwrap() = Some(std::fs::read_to_string(&path).unwrap());
+        });
+
+        ws.write_file(WorkspaceFile::Memories, "- after").unwrap();
+
+        assert_eq!(
+            observed.lock().unwrap().clone(),
+            Some("- before".to_string()),
+            "the target must still hold the whole old content while the \
+             replacement is staged"
+        );
+    }
+
+    /// Acceptance for the torn read (#1294): a reader racing a stream of
+    /// replacements must only ever observe a *whole* document. Under the old
+    /// `std::fs::write` the file is empty for the length of the write, and
+    /// `read_file` reports that as `None` — an agent's memories silently
+    /// gone from the system prompt of whichever run was building context.
+    ///
+    /// The documents are large so that a truncate-and-write window would be
+    /// wide enough to catch; with the rename there is no window to catch at
+    /// all, so this cannot fail spuriously.
+    #[test]
+    fn a_concurrent_reader_never_observes_a_partial_replacement() {
+        const ROUNDS: usize = 60;
+        const LINES: usize = 8000;
+
+        let (_dir, ws) = test_workspace();
+        let doc_a: String = (0..LINES).map(|i| format!("- alpha {i}\n")).collect();
+        let doc_b: String = (0..LINES).map(|i| format!("- bravo {i}\n")).collect();
+        ws.write_file(WorkspaceFile::Memories, &doc_a).unwrap();
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let started = Arc::new(AtomicBool::new(false));
+        let reader_ws = ws.clone();
+        let reader_stop = stop.clone();
+        let reader_started = started.clone();
+        let (want_a, want_b) = (doc_a.clone(), doc_b.clone());
+        let reader = std::thread::spawn(move || {
+            let mut reads = 0usize;
+            // Reads first and checks the flag after, so a reader that only
+            // gets scheduled once still reports a read and this test cannot
+            // go red for having lost a race for the CPU.
+            loop {
+                match reader_ws.read_file(WorkspaceFile::Memories) {
+                    Some(seen) if seen == want_a || seen == want_b => reads += 1,
+                    Some(seen) => panic!(
+                        "torn read: {} bytes, neither whole document ({} bytes)",
+                        seen.len(),
+                        want_a.len()
+                    ),
+                    None => panic!("torn read: memories.md read back empty or missing"),
+                }
+                reader_started.store(true, Ordering::Relaxed);
+                if reader_stop.load(Ordering::Relaxed) {
+                    return reads;
+                }
+            }
+        });
+
+        // Give the reader its first read before the writes start, so the two
+        // actually overlap on a busy box. Bounded, because a test that hangs
+        // is worse than one that covers less than it hoped.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !started.load(Ordering::Relaxed) && std::time::Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+
+        for round in 0..ROUNDS {
+            let doc = if round % 2 == 0 { &doc_b } else { &doc_a };
+            ws.write_file(WorkspaceFile::Memories, doc).unwrap();
+        }
+        stop.store(true, Ordering::Relaxed);
+
+        let reads = reader
+            .join()
+            .expect("the reader must never observe a partial file");
+        assert!(reads > 0, "the reader never actually read the file");
+    }
+
+    /// The operator route writes every workspace file without consulting
+    /// `agent_writable()`, and lands each one through the same locked
+    /// replacement — the sidecar it leaves behind is the evidence it did
+    /// not go around the write path.
+    #[test]
+    fn the_operator_route_writes_every_file_through_the_locked_replacement() {
+        let (_dir, ws) = test_workspace();
+
+        for file in WorkspaceFile::all() {
+            ws.write_file_as_operator(*file, "operator content")
+                .unwrap();
+            assert_eq!(
+                ws.read_file(*file).as_deref(),
+                Some("operator content"),
+                "the operator must be able to write {}",
+                file.filename()
+            );
+            assert!(
+                AgentWorkspace::lock_path(&ws.dir(), *file).exists(),
+                "the operator write of {} must have taken the sidecar lock",
+                file.filename()
+            );
+        }
+    }
+
+    /// The portable half of `memories_stay_readable_while_a_replacement_is_in
+    /// _flight`: whatever else is true, the DATA file must carry no lock while
+    /// a replacement is in flight. A held lock is *observable* on both
+    /// platforms even though only Windows lets it break reads, so unlike the
+    /// test above this one kills "lock the data file instead of the sidecar"
+    /// on ubuntu CI too.
+    #[test]
+    fn the_data_file_itself_is_never_locked_during_a_replacement() {
+        let (_dir, ws) = test_workspace();
+        ws.write_file(WorkspaceFile::Memories, "- first").unwrap();
+
+        let data_path = ws.dir().join("memories.md");
+        let unlocked = Arc::new(AtomicBool::new(false));
+        let flag = unlocked.clone();
+        on_next_replace(move || {
+            let probe = std::fs::File::open(&data_path).unwrap();
+            flag.store(probe.try_lock_shared().is_ok(), Ordering::SeqCst);
+        });
+
+        ws.write_file(WorkspaceFile::Memories, "- second").unwrap();
+
+        assert!(
+            unlocked.load(Ordering::SeqCst),
+            "memories.md must never be locked during a replacement: read_file \
+             maps a read error to None, so a locked data file silently empties \
+             an agent's memories out of the system prompt"
+        );
+    }
+
+    /// A replacement that cannot land reports the failure and takes its
+    /// scratch file with it. Forced by making the target a directory, which
+    /// no rename can replace on either platform.
+    #[test]
+    fn a_replacement_that_cannot_land_leaves_no_scratch_behind() {
+        let (_dir, ws) = test_workspace();
+        ws.ensure_dir().unwrap();
+        std::fs::create_dir(ws.dir().join("memories.md")).unwrap();
+
+        let err = ws
+            .write_file(WorkspaceFile::Memories, "- doomed")
+            .expect_err("a replacement that cannot be renamed into place must fail");
+        assert!(
+            err.to_string().contains("memories.md"),
+            "the error must name the file it could not write: {err}"
+        );
+
+        let strays: Vec<_> = std::fs::read_dir(ws.dir())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".tmp"))
+            .collect();
+        assert!(
+            strays.is_empty(),
+            "a failed replacement left its scratch file behind: {strays:?}"
+        );
+    }
+
+    /// A replacement that cannot take the lock does not happen. Unlike an
+    /// append, which is non-destructive with or without the lock, an
+    /// unserialised replacement can rename the file out from under an append
+    /// that already holds a handle — so the lock is a precondition here,
+    /// not a best effort, and the old content must survive the refusal
+    /// intact for the caller to retry against.
+    ///
+    /// Forced by making the sidecar path a directory, which no
+    /// `OpenOptions::open` can open for writing on either platform.
+    #[test]
+    fn a_replacement_refuses_to_run_without_its_lock() {
+        let (_dir, ws) = test_workspace();
+        ws.ensure_dir().unwrap();
+        // Seeded outside the workspace API so no earlier write creates the
+        // sidecar as a file first.
+        std::fs::write(ws.dir().join("memories.md"), "- before").unwrap();
+        std::fs::create_dir(AgentWorkspace::lock_path(
+            &ws.dir(),
+            WorkspaceFile::Memories,
+        ))
+        .unwrap();
+
+        let err = ws
+            .write_file(WorkspaceFile::Memories, "- after")
+            .expect_err("a replacement that cannot be serialised must not happen");
+        assert!(
+            err.to_string().contains("memories.md"),
+            "the error must name the file it refused to write: {err}"
+        );
+
+        assert_eq!(
+            ws.read_file(WorkspaceFile::Memories).as_deref(),
+            Some("- before"),
+            "a refused replacement must leave the old content intact"
+        );
+        let strays: Vec<_> = std::fs::read_dir(ws.dir())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".tmp"))
+            .collect();
+        assert!(
+            strays.is_empty(),
+            "a refused replacement must not stage anything: {strays:?}"
+        );
+    }
+
+    /// A replacement leaves no scratch file behind.
+    #[test]
+    fn a_replacement_cleans_up_after_itself() {
+        let (_dir, ws) = test_workspace();
+        ws.write_file(WorkspaceFile::Memories, "- one").unwrap();
+        ws.write_file(WorkspaceFile::Memories, "- two").unwrap();
+
+        let strays: Vec<_> = std::fs::read_dir(ws.dir())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".tmp"))
+            .collect();
+        assert!(strays.is_empty(), "staging files left behind: {strays:?}");
     }
 }

@@ -127,19 +127,35 @@ pub async fn update_workspace_file(
 
     let workspace = AgentWorkspace::new(workspace_dir, &agent.name);
 
-    // Write directly using the filesystem path — user API allows all files including personality.
-    if let Err(e) = workspace.ensure_dir() {
-        return api_error(StatusCode::INTERNAL_SERVER_ERROR, "IO_ERROR", e).into_response();
-    }
+    // The operator API may write every workspace file, including any the
+    // agent itself may not. That exemption is about *permission*, so it is
+    // taken by calling the operator entry point — not, as before #1294, by
+    // reaching past `AgentWorkspace` for the path and doing a bare
+    // `std::fs::write`, which also waived the sidecar lock and left the file
+    // truncated for the length of every edit made from the workspace editor.
+    //
+    // On the blocking pool because the write now waits on that lock with no
+    // timeout, the same reasoning `workspace_write` follows (#1280): a second
+    // daemon on the same data dir could otherwise wedge a tokio worker.
+    let content = body.content;
+    let write = tokio::task::spawn_blocking(move || {
+        workspace.write_file_as_operator(workspace_file, &content)
+    })
+    .await;
 
-    let path = workspace.dir().join(workspace_file.filename());
-    match std::fs::write(&path, &body.content) {
-        Ok(()) => Json(serde_json::json!({
+    match write {
+        Ok(Ok(())) => Json(serde_json::json!({
             "ok": true,
             "file": workspace_file.filename(),
         }))
         .into_response(),
-        Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, "IO_ERROR", e).into_response(),
+        Ok(Err(e)) => api_error(StatusCode::INTERNAL_SERVER_ERROR, "IO_ERROR", e).into_response(),
+        Err(e) => api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "IO_ERROR",
+            format!("Workspace write task failed: {}", e),
+        )
+        .into_response(),
     }
 }
 
@@ -353,7 +369,7 @@ mod open_tests {
     /// Build an AppState backed by an in-memory SQLite store and a temp
     /// `workspace_dir`. The TempDir is returned so the caller keeps it alive
     /// for the duration of the test (its Drop removes the directory).
-    fn open_test_app_state() -> (TempDir, crate::server::AppState) {
+    pub(super) fn open_test_app_state() -> (TempDir, crate::server::AppState) {
         let tmp = TempDir::new().expect("tempdir for workspace");
         let gateway_config = crate::gateway::GatewayConfig {
             db_path: Some(":memory:".to_string()),
@@ -378,7 +394,7 @@ mod open_tests {
         (tmp, state)
     }
 
-    fn new_agent(name: &str) -> AgentRecord {
+    pub(super) fn new_agent(name: &str) -> AgentRecord {
         let now = Utc::now();
         AgentRecord {
             id: AgentId::new(),
@@ -522,5 +538,104 @@ mod open_tests {
         let (status, body) = invoke_open(state, "anything").await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(body["error"]["code"], "NOT_CONFIGURED");
+    }
+}
+
+#[cfg(test)]
+mod put_tests {
+    //! Tests for `PUT /agents/{id_or_name}/workspace/{file}` (#1294).
+
+    use super::open_tests::{new_agent, open_test_app_state};
+    use super::*;
+    use axum::body::to_bytes;
+    use axum::http::StatusCode;
+
+    async fn invoke_put(
+        state: crate::server::AppState,
+        id_or_name: &str,
+        file: &str,
+        content: &str,
+    ) -> (StatusCode, serde_json::Value) {
+        let resp = update_workspace_file(
+            axum::extract::State(state),
+            axum::extract::Path((id_or_name.to_string(), file.to_string())),
+            Json(UpdateWorkspaceFileRequest {
+                content: content.to_string(),
+            }),
+        )
+        .await
+        .into_response();
+        let status = resp.status();
+        let body_bytes = to_bytes(resp.into_body(), 1024 * 64).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap_or_default();
+        (status, body)
+    }
+
+    /// The operator write goes through `AgentWorkspace`'s locked replacement
+    /// rather than around it. The sidecar lock file is the evidence: nothing
+    /// else in the workspace creates it, so its absence would mean the
+    /// handler had gone back to writing the path itself — which is what
+    /// left a window in which a run building its context read a truncated or
+    /// empty `memories.md`, silently.
+    #[tokio::test]
+    async fn a_put_writes_through_the_locked_replacement() {
+        let (tmp, state) = open_test_app_state();
+        let store = state.session_manager.store().expect("sqlite store");
+        store.create_agent(&new_agent("scribe")).unwrap();
+
+        let (status, body) = invoke_put(state, "scribe", "memories", "- learned a thing").await;
+        assert_eq!(status, StatusCode::OK, "body = {body}");
+        assert_eq!(body["ok"], serde_json::json!(true));
+
+        let dir = tmp.path().join("scribe");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("memories.md")).unwrap(),
+            "- learned a thing"
+        );
+        assert!(
+            dir.join(".memories.md.lock").exists(),
+            "the PUT must have taken the workspace file's sidecar lock; \
+             files on disk: {:?}",
+            std::fs::read_dir(&dir)
+                .unwrap()
+                .map(|e| e.unwrap().file_name())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// The operator may write `personality.md`, which is the reason this
+    /// handler was allowed to bypass `AgentWorkspace` in the first place.
+    /// Routing it through `write_file_as_operator` keeps the exemption.
+    #[tokio::test]
+    async fn a_put_may_still_write_personality() {
+        let (tmp, state) = open_test_app_state();
+        let store = state.session_manager.store().expect("sqlite store");
+        store.create_agent(&new_agent("stylist")).unwrap();
+
+        let (status, body) = invoke_put(state, "stylist", "personality", "Terse. Precise.").await;
+        assert_eq!(status, StatusCode::OK, "body = {body}");
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("stylist").join("personality.md")).unwrap(),
+            "Terse. Precise."
+        );
+    }
+
+    /// A replacement leaves no staging file behind for the workspace editor
+    /// (or `GET /workspace`) to trip over.
+    #[tokio::test]
+    async fn a_put_leaves_no_staging_file_behind() {
+        let (tmp, state) = open_test_app_state();
+        let store = state.session_manager.store().expect("sqlite store");
+        store.create_agent(&new_agent("tidy")).unwrap();
+
+        let (status, _) = invoke_put(state, "tidy", "goals", "- ship it").await;
+        assert_eq!(status, StatusCode::OK);
+
+        let strays: Vec<_> = std::fs::read_dir(tmp.path().join("tidy"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".tmp"))
+            .collect();
+        assert!(strays.is_empty(), "staging files left behind: {strays:?}");
     }
 }
