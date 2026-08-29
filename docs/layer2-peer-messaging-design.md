@@ -387,7 +387,7 @@ impl Tool for SendMessageTool {
 }
 ```
 
-The tool returns immediately (fire-and-forget from the sender's perspective). The sender does NOT block waiting for a response. If the sender wants to see the response, it reads the DM session later using a new tool or gets notified.
+The tool returns immediately: the sender does NOT block waiting for a response. It does not have to go looking for one either -- the reply (or the conversation-end) triggers a run for the sender, so the sender is invoked to handle it. See § 9.1; the shipped description and result note in `crates/alms-tools/src/send_message.rs` are authoritative and say this out loud (#1111).
 
 **Note:** The `send_message` tool currently only supports natural language (text) messages. Structured message support (Section 3.4, `MessagePayload::Structured`) will be added in a later phase — likely as an optional `structured` JSON parameter on the tool, or as a separate `send_structured_message` tool.
 
@@ -743,17 +743,24 @@ The existing `SessionQueue` already has a two-tier priority system (`enqueue()` 
 
 `invoke_agent` (the hierarchy model) and `send_message` (the peer model) coexist. They serve different purposes:
 
+*Re-audited against shipped behaviour in #1296, when the three tool descriptions were rewritten to match it. Three rows were stale and are corrected below; the rule at the bottom of this section survived unchanged.*
+
 | | `invoke_agent` | `send_message` |
 |---|---|---|
 | **Semantics** | "Do this task and return the result" | "Here is information / a request" |
-| **Blocking** | Yes (foreground) or poll (background) | No -- fire and forget |
-| **Session** | Subagent session (child of parent) | DM session (peer-to-peer) |
-| **Result** | Returned as tool result to caller | Recipient may or may not respond |
+| **Blocking** | Foreground blocks. Background returns immediately and the caller is **notified on completion** -- not polled | Never blocks the sender's run. Delivery is immediate; the sender is **invoked again** when the reply or the conversation-end arrives -- not polled (see **Result** for the one end that starts no run) |
+| **Session** | Subagent session, `context_id = subagent_{parent}_{name}` -- keyed to the invoking parent. (For a **named, registered** subagent, #1288 files the row under the *invoked* agent's registry id so it appears in that agent's timeline; the `context_id`, and therefore ownership, stayed with the parent. An ephemeral subagent, or a name matching no registry record, has no registry id to be filed under and keeps the pre-#1288 derived key -- `named_subagent_key`'s fallback arm. A transient registry read *error* lands on that same arm without being the same answer: an absent agent keys identically on every invocation, whereas an unreadable store forks the named subagent's session across invocations, so it is logged rather than swallowed (#1241/#1246 -- "absent" and "unreadable" must not collapse into one silent `None`)) | Shared DM session `dm:{a}:{b}` -- both peers read and write the same session |
+| **Result** | Returned as the tool result, in the caller's context | The recipient replies, or explicitly ends the conversation. The DM completion gate (#1154) guarantees a run that **completes** exits as reply / ended / errored rather than being silently dropped (the pre-#1154 `DM_TEXT_ONLY_DROPPED` outcome) -- it is the entry point on the `Ok` arm of `execute_run()`, so it classifies completing runs only. A run cut short (cancelled, or died mid-turn) still ends the conversation, but `run_trigger_loop` starts **no run on the trigger's own target** (#1258) -- unless the ended DM resolves an open job episode, whose continuation still fires on the job session, the episode override being evaluated first (#1198/#1205) |
+| **Transcript** | `read_subagent_session` admits only the invoking parent -- it authorizes on the parent embedded in the `context_id` (#1181/#1185). Note this is a statement about *that tool*, not an access boundary: since #1288 the row is also filed under the invoked agent, and `read_session` authorizes on `session.agent_id`, so it admits the invoked agent for the same bytes. Discovery, not authorization, is what keeps that latent (`list_my_sessions` filters `subagent` out) | Readable by both peers (`read_messages`) |
 | **Use case** | Delegation, task decomposition | Collaboration, notification, discussion |
 
 `invoke_agent` is for **vertical** communication (boss to worker). `send_message` is for **horizontal** communication (peer to peer).
 
+The deciding factor is the **relationship**, and its testable form is: *a subagent's work belongs to its caller's graph; an agent's work belongs to itself.*
+
 They should NOT be merged. A developer agent asking a reviewer agent for a review should use `send_message`. A PM agent assigning a task to a developer agent should use `invoke_agent`. The LLM will learn the distinction through system prompts and experience.
+
+**Where the ergonomics genuinely differ.** `invoke_agent` returns inline: the caller carries on in *the same run, in the same session*, with the result in hand. A DM does not. The sender's continuation happens on the **DM session**; the session it sent *from* resumes only when the conversation ends (the `ConversationEnded` trigger routes to the recorded source session). So when an agent needs an answer in order to finish work in its current turn -- a user is waiting on that run's output and the answer is an input to it -- `invoke_agent` is the shape that asks for, even against a nominal peer. The tool descriptions state that difference rather than pretending it away. What they must not do is let it become the *default* tiebreaker: reaching for `invoke_agent` because one call is tidier than being re-invoked is the failure mode that opened #1278.
 
 ### 9.2 SSE Streaming
 
@@ -987,7 +994,7 @@ Agents need to know they can communicate with peers. The staged system prompt (`
 ## Peer Messaging
 
 You can communicate with other agents using these tools:
-- `send_message(to, message)` — send a message to another agent (fire-and-forget)
+- `send_message(to, message)` — send a message to another agent (does not block your run; their reply invokes you again — see § 9.1)
 - `list_agents()` — discover available agents and their roles
 - `read_messages(from, last_n)` — read your DM conversation with another agent
 

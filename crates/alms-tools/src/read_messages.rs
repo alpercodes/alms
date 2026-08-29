@@ -56,13 +56,18 @@ impl Tool for ReadMessagesTool {
     }
 
     fn description(&self) -> &str {
-        "Read the conversation history with another agent. By default returns \
-         all messages from your DM session with the specified agent. Use this \
-         to check for replies after sending a message via send_message. The \
-         response carries `total_count` (real messages in the DM), \
-         `returned_count` (what's in the `messages` array), and `truncated: \
-         bool` -- check these to detect if older messages were omitted. Pass \
-         `last_n` explicitly if you only need a specific count."
+        "Returns the transcript of your DM conversation with another agent. \
+         This is a reader for what was already said -- it is NOT a way to \
+         wait for a reply. If a reply is not here yet, the recipient's run \
+         may still be in progress; you will be invoked again when they reply \
+         (or when they end the conversation), so reading again will not \
+         surface it any sooner. Use this to review past exchanges or confirm \
+         what was already said. By default returns all messages from your DM \
+         session with the specified agent. The response carries `total_count` \
+         (real messages in the DM), `returned_count` (what's in the \
+         `messages` array), and `truncated: bool` -- check these to detect if \
+         older messages were omitted. Pass `last_n` explicitly if you only \
+         need a specific count."
     }
 
     fn parameters(&self) -> Value {

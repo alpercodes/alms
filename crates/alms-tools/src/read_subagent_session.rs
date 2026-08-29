@@ -171,8 +171,9 @@ impl Tool for ReadSubagentSessionTool {
             "properties": {
                 "name": {
                     "type": "string",
-                    "description": "The subagent's persistent name (e.g., 'reviewer', 'researcher'). \
-                                    Use for named subagents. Provide either this or session_id."
+                    "description": "The subagent's persistent name (e.g., 'researcher', \
+                                    'summarizer'). Use for named subagents. Provide either \
+                                    this or session_id."
                 },
                 "session_id": {
                     "type": "string",

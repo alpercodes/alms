@@ -74,9 +74,17 @@ impl Tool for InvokeAgentTool {
     }
 
     fn description(&self) -> &str {
-        "Spawn a subagent to handle a specific task. The subagent runs its own \
-         independent LLM loop and returns its final response. Use this to delegate \
-         specialised work or run subtasks that need their own reasoning loop."
+        "Delegate a task to a subagent: it runs its own independent LLM loop and \
+         returns its final response to you. This creates a SUBORDINATE \
+         relationship -- the work belongs to your run: you set the task, the \
+         result lands in your context, and the subagent's transcript is yours \
+         to read (read_subagent_session admits only the agent that invoked \
+         it). Use it for work you are directing and will report on. When you \
+         are addressing a PEER instead -- asking another agent for a review or \
+         an opinion, or anything where the answer is theirs and the exchange \
+         may go back and forth -- use send_message: that starts a conversation \
+         the other agent owns, and their reply comes back to you as a new run \
+         rather than as this tool's result."
     }
 
     fn parameters(&self) -> Value {
@@ -89,12 +97,15 @@ impl Tool for InvokeAgentTool {
                 },
                 "name": {
                     "type": "string",
-                    "description": "The name of a registered agent to invoke (e.g. 'reviewer', \
-                                    'researcher'). The agent must be pre-created via \
-                                    `alms agent create --name <name>`. Named agents retain \
-                                    conversation history and workspace files across invocations. \
-                                    When omitted, an ephemeral subagent is created (fresh session, \
-                                    no workspace, default config)."
+                    "description": "The name of a registered agent to assign the task to \
+                                    (e.g. 'researcher', 'summarizer'). Pick a name for work \
+                                    you are handing down; to ask a peer for something (a \
+                                    review, an opinion) use send_message instead. The agent \
+                                    must be pre-created via `alms agent create --name <name>`. \
+                                    Named agents retain conversation history and workspace \
+                                    files across invocations. When omitted, an ephemeral \
+                                    subagent is created (fresh session, no workspace, \
+                                    default config)."
                 },
                 "background": {
                     "type": "boolean",
@@ -277,6 +288,32 @@ mod tests {
         let tool = make_tool("ok");
         let err = tool.execute(serde_json::json!({})).await.unwrap_err();
         assert!(matches!(err, SandboxError::InvalidParameters(_)));
+    }
+
+    /// #1296: the `name` example must not be a *review request*.
+    ///
+    /// `docs/layer2-peer-messaging-design.md` § 9.1 uses exactly that case
+    /// as its worked example of when to prefer `send_message` ("a developer
+    /// agent asking a reviewer agent for a review should use
+    /// `send_message`"), so offering `'reviewer'` as the archetypal thing to
+    /// invoke handed the model the doc's own counterexample. Most of this
+    /// rewrite is prose and not pinnable; the presence of that one token is.
+    #[test]
+    fn name_example_is_not_the_design_docs_counterexample() {
+        let tool = make_tool("ok");
+        let name_desc = tool.parameters()["properties"]["name"]["description"]
+            .as_str()
+            .expect("`name` must document itself")
+            .to_ascii_lowercase();
+        assert!(
+            !name_desc.contains("'reviewer'"),
+            "invoke_agent's `name` example must not be 'reviewer' -- § 9.1 says a \
+             review request is the send_message case (#1296). Got: {name_desc}"
+        );
+        assert!(
+            name_desc.contains("send_message"),
+            "the `name` parameter must point at send_message for peer requests (#1296)"
+        );
     }
 
     #[tokio::test]

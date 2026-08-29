@@ -1,7 +1,71 @@
 //! send_message tool -- sends a peer message from one agent to another.
 //!
-//! Fire-and-forget: the tool returns immediately with a delivery confirmation.
-//! The recipient processes the message asynchronously via a triggered run.
+//! The tool returns immediately with a delivery confirmation; the sender's
+//! loop is never blocked on a reply. That is the *only* thing "asynchronous"
+//! means here -- delivery itself is immediate, and the exchange is not a
+//! queue the sender has to drain:
+//!
+//! - `MessageBus::send` persists the message to the shared DM session and
+//!   emits a `RunTrigger` for the recipient, so the recipient is *invoked*
+//!   to process it (`crates/alms-coordinator/src/message_bus/bus.rs`).
+//! - The recipient's reply (its final assistant text, delivered by the DM
+//!   completion gate under #1154) goes back through the same path, so the
+//!   original sender is invoked in turn on the DM session.
+//! - If the recipient ends the conversation instead, `end_conversation`
+//!   emits a `ConversationEnded` trigger for the peer unconditionally --
+//!   and for an end that *completed*, `run_trigger_loop` starts the run, so
+//!   the sender is invoked for that outcome too.
+//!
+//! Nothing in that loop is reached by polling `read_messages`, which is why
+//! the tool description (and the delivered-result note below) say so out
+//! loud. See #1111 / #1296 and `docs/layer2-peer-messaging-design.md` § 9.1.
+//!
+//! ## The exception the agent is deliberately not told about (#1258)
+//!
+//! The bus emits that third trigger unconditionally, but the trigger loop
+//! does not always act on it: `run_trigger_loop` starts **no run on the
+//! trigger's own target** when the end `is_interrupted()` -- `UserCancelled`,
+//! or `Errored { interrupted: true }` (the peer's run was cancelled or died
+//! mid-turn). The unconditional emit is therefore true of the bus and not of
+//! the outcome; the suppression is one crate away, in
+//! `crates/alms-gateway/src/runs/notifications.rs`, under the heading
+//! "Consequence: an interrupted end is invisible to the agent".
+//!
+//! Read that `run_targets` branch in **evaluation order**, because its first
+//! arm is an exception to the suppression rather than a case of it: a
+//! resolved #1198 job episode routes a continuation onto the *job* session
+//! and wins over the interrupted-end check, because "dropping it would stall
+//! the job until its deadline". The silent population is therefore narrower
+//! than "every interrupted end" -- it is an interrupted end that resolves no
+//! open job episode.
+//!
+//! [`SendMessageTool::description`] and [`DELIVERED_NOTE`] state the
+//! notification **without** that qualification. That is a choice, not an
+//! oversight:
+//!
+//! - There is no agent-available remedy. The `dm_ended` bus record is
+//!   empty-text, so `dm_filter`'s `is_synthetic_marker` hides it from
+//!   `read_messages` *and* `read_session`; the `dm_ended_notification`
+//!   marker is `Role::System` + synthetic and is stripped before the
+//!   provider. No observation an agent can make distinguishes "the reply is
+//!   still coming" from "the end was interrupted".
+//! - So the caveat could not change what the agent does -- except in one
+//!   direction. "You will usually be invoked" leaves exactly one lever
+//!   (check), which is the polling instinct #1111 exists to close, and which
+//!   provably cannot detect this case.
+//! - The job-episode exception above cuts the same way. It *adds* a case in
+//!   which the agent is invoked, so the set of ends that reach it silently is
+//!   smaller than this section's premise alone implies -- which makes the
+//!   unqualified strings more accurate than a hedged version would be, not
+//!   less.
+//!
+//! A caveat is worth its tokens only if it changes what the reader can do.
+//! Here it does for the human reader and cannot for the model, so it lives
+//! at this level and not in the strings. **Revisit if that stops being
+//! true**: if an interrupted end ever grows an agent-visible signal (the
+//! machinery would be `persist_error_marker`, #874, which survives the strip
+//! pass), the absolute wording becomes actionably wrong and should be
+//! qualified.
 
 use crate::message_sender::{MessageSender, SendError};
 use alms_core::{AgentId, SessionId};
@@ -10,6 +74,18 @@ use alms_session::SessionManager;
 use serde_json::Value;
 use std::sync::Arc;
 use tracing::warn;
+
+/// Note attached to a successful delivery, re-read by the agent when it
+/// plans its next step.
+///
+/// Carries the same mental model as the tool description: the recipient is
+/// being *invoked*, the sender will be invoked back, and `read_messages` is
+/// not a waiting room (#1111).
+const DELIVERED_NOTE: &str = "Delivered. The recipient is now being invoked in your shared DM \
+     session to process this. Their reply triggers a new run there and you will be invoked to \
+     handle it; if they end the conversation instead, you are notified then. Do NOT poll \
+     read_messages waiting for the reply -- it will not arrive any sooner, and the system \
+     resumes you when it does.";
 
 /// Built-in tool that sends a message to another registered agent.
 ///
@@ -88,13 +164,21 @@ impl Tool for SendMessageTool {
     }
 
     fn description(&self) -> &str {
-        "Send a message to another agent. The target agent will receive it \
-         and may respond. Use this for peer-to-peer communication -- asking \
-         for reviews, sharing updates, requesting help. The message is \
-         delivered asynchronously (fire-and-forget). Use read_messages to \
-         check the conversation later. Do NOT use this to reply to an agent \
-         you are already in a direct conversation with -- your final reply \
-         text is delivered to them automatically."
+        "Send a direct message to another agent. This is the PEER \
+         relationship: they run on their own and their reply is theirs. \
+         Sending triggers an LLM run in your shared DM session -- they \
+         are actively invoked to process your message, and may think, use \
+         tools, or do work before replying. Their reply triggers a run for \
+         you in that same DM session: the system invokes you again to handle \
+         it. If they end the conversation instead of replying, you are \
+         notified then. 'Asynchronous' means your current run is not blocked \
+         waiting for the reply -- it does NOT mean delivery is deferred, and \
+         it does NOT mean you have to poll: calling read_messages will not \
+         make a reply arrive any sooner. Use this for peer work -- asking for \
+         a review, sharing an update, requesting help. For a subordinate task \
+         whose result you need inline, use invoke_agent. Do NOT use this to \
+         reply to an agent you are already in a direct conversation with -- \
+         your final reply text is delivered to them automatically."
     }
 
     fn parameters(&self) -> Value {
@@ -195,7 +279,7 @@ impl Tool for SendMessageTool {
             Ok(receipt) => Ok(serde_json::json!({
                 "delivered": true,
                 "dm_session_id": receipt.session_id.0.to_string(),
-                "note": "Message delivered. The recipient will process it asynchronously."
+                "note": DELIVERED_NOTE,
             })),
             Err(SendError::DepthExceeded) => {
                 warn!("send_message depth exceeded for {to}");
@@ -350,6 +434,95 @@ mod tests {
             "non-peer send must proceed to resolution/delivery (and fail on \
              the missing store here), not be folded"
         );
+    }
+
+    // ---- Delivered-result shape (#1111) ----
+    //
+    // The wording of the note is prose and deliberately not asserted; what
+    // is pinnable is that a successful delivery still *carries* one. The
+    // note is the only place the agent is told, at planning time, not to
+    // poll `read_messages` -- a refactor that dropped the field would
+    // silently take that back, and every other test in this file stops
+    // short of the delivered path (no store, erroring sender).
+
+    /// A sender that always succeeds, so the delivered branch is reachable.
+    #[derive(Debug)]
+    struct OkSender(SessionId);
+
+    #[async_trait::async_trait]
+    impl MessageSender for OkSender {
+        async fn send(
+            &self,
+            _: &str,
+            _: AgentId,
+            _: &str,
+            _: AgentId,
+            _: &str,
+            _: Option<SessionId>,
+        ) -> Result<crate::message_sender::DeliveryReceipt, SendError> {
+            Ok(crate::message_sender::DeliveryReceipt { session_id: self.0 })
+        }
+
+        async fn end_conversation(
+            &self,
+            _: &str,
+            _: AgentId,
+            _: &str,
+            _: AgentId,
+            _: crate::message_sender::ConversationEndReason,
+        ) -> Result<(), SendError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn delivered_result_carries_a_planning_note() {
+        let store = alms_session::SqliteStore::open_in_memory().unwrap();
+        let recipient = alms_core::AgentRecord {
+            id: AgentId::new(),
+            name: "bob".into(),
+            description: String::new(),
+            model: None,
+            posture: None,
+            provider: None,
+            telegram_token: None,
+            thinking_budget_tokens: None,
+            reasoning_effort: None,
+            gemini_thinking_budget: None,
+            summary_provider: None,
+            summary_model: None,
+            worktree_mode: alms_core::WorktreeMode::Off,
+            debug_mode: false,
+            is_default: false,
+            created_at: alms_core::Timestamp::now().0,
+            last_active: alms_core::Timestamp::now().0,
+        };
+        store.create_agent(&recipient).unwrap();
+        let mgr = Arc::new(
+            SessionManager::with_store(alms_session::SessionConfig::default(), store).unwrap(),
+        );
+
+        let dm_session = SessionId::new();
+        let tool = SendMessageTool::new(
+            Arc::new(OkSender(dm_session)),
+            AgentId::new(),
+            "alice".into(),
+            mgr,
+            SessionId::new(),
+        );
+
+        let result = tool
+            .execute(serde_json::json!({ "to": "bob", "message": "hi" }))
+            .await
+            .expect("delivery must succeed");
+
+        assert_eq!(result["delivered"], true);
+        assert_eq!(result["dm_session_id"], dm_session.0.to_string());
+        assert_eq!(
+            result["note"], DELIVERED_NOTE,
+            "a delivered send must still carry the planning note (#1111)"
+        );
+        assert!(!DELIVERED_NOTE.is_empty());
     }
 
     #[tokio::test]
