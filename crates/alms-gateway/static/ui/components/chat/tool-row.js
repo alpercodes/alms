@@ -325,13 +325,23 @@ export function renderParams(tool, params) {
             }
             break;
         case 'workspace_write': {
-            const mode = params.mode === 'append' ? 'append' : 'write';
+            // Render only a mode the caller actually sent. An omitted `mode`
+            // is resolved server-side and *per file*
+            // (`WorkspaceFile::default_write_mode`, #1305: `append` for
+            // memories, `write` for the other three), so fabricating 'write'
+            // here labelled the request row "write" next to a Result row
+            // reading "append" for the same call. Mirroring the backend
+            // default in JS would be a second source of truth that goes stale
+            // the next time the default moves; the Result pill already renders
+            // the effective `result.mode` (`renderFsWriteEditOutput`) and is
+            // the single answer to which branch ran.
+            const mode = typeof params.mode === 'string' ? params.mode : null;
             return html`
                 <div class="tc-detail-section">
                     <div class="tc-detail-label">Workspace</div>
                     <div class="tc-status-row">
                         <span class="tc-kv-badge">${params.file || ''}</span>
-                        <span class="tc-kv-meta">${mode}</span>
+                        ${mode && html`<span class="tc-kv-meta">${mode}</span>`}
                     </div>
                 </div>
                 ${params.content && html`

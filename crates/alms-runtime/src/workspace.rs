@@ -51,6 +51,90 @@ impl WorkspaceFile {
         }
     }
 
+    /// What `workspace_write` does when the model omits `mode` — the
+    /// recorded answer to #1305, in place of a bare `.unwrap_or("write")`.
+    ///
+    /// Returns one of exactly the two strings the tool accepts, so it can be
+    /// the `unwrap_or` for the parameter and be echoed back as the
+    /// *effective* mode.
+    ///
+    /// **The decision.** `memories.md` defaults to `"append"`; the other
+    /// three default to `"write"`.
+    ///
+    /// Why the split, and why it is not more locking: an agent's read of its
+    /// memories is the context build, which `AgentRuntime` runs **once per
+    /// run**, before `agent_loop` — the assembled system prompt is then
+    /// carried through every tool iteration. So the snapshot a
+    /// `workspace_write` replaces is a *run-start* snapshot, not a turn-old
+    /// one, and the window is the whole run. Anything appended inside it — by
+    /// another live instance of the same named agent, which the coordinator's
+    /// `active_named` guard deliberately permits, **or by this very run's own
+    /// earlier `workspace_write` calls** — is not in the snapshot the model is
+    /// editing, so a whole-file replacement silently erases it. No lock can
+    /// bracket that; there is no critical section, only a stale snapshot
+    /// (#1305, the residual #1280/#1294 structurally could not reach). What
+    /// *can* be changed is where an omitted `mode` lands. The three identity
+    /// files each describe one settled thing and are meant to be restated;
+    /// `memories.md` is a list of learned facts that accumulates, so an
+    /// omitted `mode` there almost always means "add this", and the
+    /// destructive reading is the wrong one to guess.
+    ///
+    /// **The cost, accepted deliberately.** A model that omits `mode` while
+    /// genuinely intending to rewrite `memories.md` wholesale — pruning or
+    /// reorganising — now appends its rewrite after the old content instead
+    /// of replacing it, duplicating entries. What it replaces was an
+    /// invisible, unrecoverable loss, so preserving data wins the tie either
+    /// way; but the duplication is only *visible and repairable* under a
+    /// precondition worth stating, because this default is what drives the
+    /// file towards breaking it:
+    ///
+    /// > **While `memories.md` stays under the 4000-char injection cap.**
+    /// > [`AgentWorkspace::build_system_prompt_prefix`] injects
+    /// > `truncate_to_char_boundary(&memories, 4000)`, which is
+    /// > **head-anchored** — it returns the *oldest* 4000 chars. Under an
+    /// > append default the file grows at the tail while the read window
+    /// > stays put, so past the cap the duplicate lands in the part that is
+    /// > cut: the agent does not see it next context build, and `mode:
+    /// > "write"` cannot repair it either, because the model holds only the
+    /// > head and resending that is itself a destructive truncation. Past
+    /// > the cap, newly appended memories also stop being injected at all.
+    /// > The bytes are still on disk and still recoverable (UI, `PUT`,
+    /// > `fs_read`, an operator) where a lost update is not, which is why
+    /// > this does not change the decision — but head-anchored truncation is
+    /// > the wrong end to cut for an append-default file, and is tracked
+    /// > separately rather than solved here.
+    ///
+    /// The tool's parameter description tells the model both halves of the
+    /// trade, and the result echoes the effective mode, so a model that
+    /// guessed wrong can find out in the same turn.
+    ///
+    /// Rejecting the stale replacement instead — a compare-and-swap against
+    /// the file's state at context-build time — was considered and not done,
+    /// as the cheaper fix rather than the impossible one. A **bare** rejection
+    /// would be unusable: the agent would see it (a failed tool call is
+    /// persisted as its own `Error: ...` tool result and the loop continues,
+    /// so it is answerable in-turn) but has no way to re-read its workspace —
+    /// there is no `workspace_read` tool, only the system-prompt injection it
+    /// has already consumed. A rejection **carrying the current file
+    /// contents** would be usable, and is the shape any future fix should
+    /// take: that payload travels on the channel above, `WorkspaceWriteTool`
+    /// is constructed per run one hop from the context build, and no protocol
+    /// or schema change is needed. Two things such a fix must get right — the
+    /// base has to be what the *context build* read, not what tool
+    /// construction saw, and the returned contents inherit the same 4000-char
+    /// cap described above.
+    ///
+    /// Independent of [`Self::agent_writable`] (#1303), which answers
+    /// *whether* the agent may write a file, not what an omitted `mode` means
+    /// for one it may. A file made non-agent-writable there is rejected
+    /// before this is ever consulted.
+    pub fn default_write_mode(&self) -> &'static str {
+        match self {
+            WorkspaceFile::Memories => "append",
+            WorkspaceFile::Personality | WorkspaceFile::Goals | WorkspaceFile::User => "write",
+        }
+    }
+
     pub fn all() -> &'static [WorkspaceFile] {
         &[
             WorkspaceFile::Personality,
@@ -105,9 +189,17 @@ impl AgentWorkspace {
     /// Write a workspace file, replacing whatever was there. Checks
     /// `agent_writable()` before writing.
     ///
-    /// This is the branch an agent takes *by default*: `workspace_write`
-    /// reads its mode as `.unwrap_or("write")`, so an LLM that omits `mode`
-    /// lands here rather than in [`Self::append_file`] (#1294).
+    /// This is the branch an agent takes by default for `personality.md`,
+    /// `goals.md` and `user.md` — the three files
+    /// [`WorkspaceFile::default_write_mode`] answers `"write"` for, so an LLM
+    /// that omits `mode` on one of them lands here rather than in
+    /// [`Self::append_file`] (#1294). `memories.md` no longer does: it
+    /// defaults to append, because the content an omitted `mode` replaces
+    /// there is the context build's snapshot, which is as old as the run
+    /// (#1305). Reaching this function for `memories.md` now takes an
+    /// explicit `mode: "write"` — which is still the right thing for an
+    /// agent deliberately compacting its memories, and still carries the
+    /// staleness, now knowingly.
     pub fn write_file(&self, file: WorkspaceFile, content: &str) -> AlmsResult<()> {
         if !file.agent_writable() {
             return Err(AlmsError::InvalidConfig(format!(
@@ -154,7 +246,9 @@ impl AgentWorkspace {
     ///    truncates the file under it: the append then lands at offset 0 and
     ///    the replacement overwrites it, leaving a well-formed file with the
     ///    memory silently gone. That is the #1280 failure mode, reached
-    ///    through the tool's default branch.
+    ///    through the tool's replacing branch — which was `memories.md`'s
+    ///    default until #1305 moved it to append, and is still one explicit
+    ///    `mode: "write"` away.
     /// 2. The new content is staged beside the target and moved into place
     ///    with a rename, instead of being written into a truncated target.
     ///    `std::fs::write` opens with `O_TRUNC`, so the file is *empty* for

@@ -1,1 +1,0 @@
-import{o as e,r as t}from"./index-Danwrcvt.js";import"./deps-B6P9tuvi.js";import{t as n}from"./entity-state-Dvifu_4n.js";var r=n.agents,i=e(null),a=t(()=>r.value.find(e=>e.id===i.value)||null);function o(e){n.replaceAgents(e)}export{a as activeAgent,i as activeAgentId,r as agents,o as replaceAgents};
