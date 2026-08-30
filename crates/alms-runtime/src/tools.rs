@@ -106,8 +106,15 @@ impl ToolRegistry {
 
     /// Re-register `fs_read`, `fs_write`, and `fs_edit` with the given cache.
     ///
-    /// Used both during initial construction and after `with_workspace()`
-    /// re-creates tools sandboxed to the workspace directory.
+    /// Called once, from the two `with_builtins*` constructors, to
+    /// replace the cache-less `fs_read` / `fs_write` / `fs_edit` that
+    /// `register_builtin_tools_sandboxed` just registered. This is the
+    /// pass that puts those three names one registration above
+    /// `fs_list` / `fs_grep` / `fs_glob` for the rest of the run.
+    ///
+    /// It used to say this also ran "after `with_workspace()` re-creates
+    /// tools sandboxed to the workspace directory". #945 collapsed the
+    /// two-root model and `with_workspace` re-creates no fs_* tools.
     ///
     /// `fs_edit_fuzzy_match` is baked into the `FsEditTool` at construction
     /// time (config-file-only per issue #755).

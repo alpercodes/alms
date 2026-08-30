@@ -2178,9 +2178,19 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
         }
     }
 
-    // Wire the shell-output spill policy (issue #756) before `with_workspace`
-    // so the per-run spill directory is included in the agent's
-    // `fs_read`/`fs_list`/`fs_grep`/`fs_glob` extra_read_roots at run start.
+    // Wire the shell-output spill policy (issue #756) before
+    // `with_project_root` so the per-run spill directory is included in
+    // the agent's `fs_read`/`fs_list`/`fs_grep`/`fs_glob`
+    // extra_read_roots at run start.
+    //
+    // This said "before `with_workspace`" until #1260. That is a strictly
+    // weaker rule than the real one and obeying it is not sufficient:
+    // `with_project_root` runs earlier, it is the registration that
+    // composes the accumulated extras, and `with_workspace` has
+    // registered no fs_* tool since #945 — so a reordering that satisfied
+    // the old comment could drop every extra read root silently. The
+    // `with_tool_output_truncate` block below always stated the
+    // constraint correctly; the two are meant to be identical.
     // The directory itself is created lazily on first spill. Reads use the
     // live `tools_config.shell_spill` so operators can tweak the TOML and
     // restart, but values are NOT PATCH-mutable (consistent with
@@ -4068,5 +4078,446 @@ mod tests {
         let summary = build_summary_client(&llm, None, None, &secrets, AgentId::new());
         assert_eq!(summary.provider(), "anthropic");
         assert_eq!(summary.default_model(), "claude-sonnet-4-20250514");
+    }
+
+    /// #1260 — what a run's tool-registry churn is allowed to log.
+    ///
+    /// These live here, rather than next to the registry in
+    /// `alms-sandbox`, because the claim is about the *builder chain
+    /// `execute_run` runs above*, and because this crate is the one with
+    /// the interest-cache-safe `tracing` capture harness (#1221). Putting
+    /// a third copy of that harness in `alms-sandbox` is exactly what
+    /// #1282 exists to prevent.
+    ///
+    /// # What the "a normal run logs no re-registration warning" claim
+    /// ranges over
+    ///
+    /// Every write into a run's tool map goes through one of two checked
+    /// entry points — `ToolRegistry::register` and
+    /// `ToolRegistry::register_as`. (#1260 also routed the one raw
+    /// `DashMap::insert` that bypassed both, the `shell_exec` alias in
+    /// `register_builtin_tools_sandboxed`, through `register_as`.) The
+    /// callers that reach them during a run are:
+    ///
+    /// | caller | what it replaces |
+    /// |---|---|
+    /// | `register_builtin_tools_sandboxed` | nothing — first write of 11 builtins + the `shell_exec` alias |
+    /// | `runtime::ToolRegistry::attach_fs_cache_to_registry` | `fs_read`, `fs_write`, `fs_edit` |
+    /// | `apply_shell_permissions`, from `AgentRuntime::new` | `shell`, `shell_exec` |
+    /// | `with_shell_default_env` | `shell`, `shell_exec` |
+    /// | `with_shell_spill` | `shell`, `shell_exec`, six read-family `fs_*` |
+    /// | `with_tool_output_truncate` | six read-family `fs_*` — **no shell** |
+    /// | `with_extra_fs_read_root` | six read-family `fs_*` |
+    /// | `with_project_root` / `with_unrestricted_filesystem` | six `fs_*`, `shell`, `shell_exec` |
+    /// | `with_workspace` | nothing — first write of `workspace_read` / `workspace_write` |
+    /// | `AgentRuntime::register_tool`, from `runs::tools` | nothing — first write of each of the 8 agent tools |
+    ///
+    /// The third and sixth rows are a correction (#1317 review). The table
+    /// first credited the shell pair to `with_tool_output_truncate` and
+    /// omitted `apply_shell_permissions` — two errors that cancel, so
+    /// `shell`'s total of five was right for the wrong reasons and the
+    /// assertions below still passed. Worth stating rather than silently
+    /// swapping: a total that survives a wrong decomposition is exactly
+    /// the failure the counts are supposed to catch, and it survived
+    /// because the count and its explanation were derived together.
+    ///
+    /// The default path replaces 29 names per run, which is the shape of
+    /// the issue's histogram: four apiece for `fs_read` / `fs_write` /
+    /// `fs_edit` (they carry the extra `attach_fs_cache_to_registry`
+    /// pass), three apiece for `fs_list` / `fs_grep` / `fs_glob`, four
+    /// apiece for `shell` and `shell_exec` — the 76:57 ratio the issue
+    /// counted, over 19 runs. The table is not merely consistent with
+    /// that histogram, it is the only model consistent with it: the
+    /// rival — in which `with_workspace` re-registers the fs_* tools as
+    /// well, which the doc on `refresh_fs_tools_for_extras` asserted
+    /// until #1260 corrected it — predicts 5:4, and 76 is not divisible
+    /// by 5. `expected_registrations` below turns the table into
+    /// assertions so it cannot drift back into prose.
+    ///
+    /// The last two rows are the only ones these tests do not build,
+    /// because they need an `AppState`. They cannot contribute to the
+    /// claim: each of those ten tools is the sole writer of its name, so
+    /// they hit `register` with no existing entry to compare against.
+    /// `alms-coordinator`'s subagent chain is a strict subset of the
+    /// builders below and adds no shape of its own.
+    ///
+    /// # How these rows were graded
+    ///
+    /// **A row is only pinned by a mutation it is the sole killer of.**
+    /// "Every mutant was killed" grades the suite; it says nothing about
+    /// any individual row, because a row that never kills alone is
+    /// carried by its neighbours and can be deleted without the table
+    /// noticing. Adding a row to a suite whose mutants already all die
+    /// is therefore not evidence the row works — it is the shape a
+    /// redundant row takes.
+    ///
+    /// #1260 ran into that twice. The `impl_type_id` guard in
+    /// `alms-sandbox` could not fail at all, and the reason it looked
+    /// fine was that every discriminator mutation was killed by the
+    /// impostor rows instead — a negative result that reads as a pass.
+    /// The `shell` composition below was wrong in two ways that
+    /// cancelled, and the reason it survived was that the assertion and
+    /// its justification were derived together, so agreement between
+    /// them was agreement between two copies of one derivation.
+    ///
+    /// The check is free once per-row killers are printed: does each row
+    /// appear *alone* in some kill set? The two that do not are declared
+    /// in the PR rather than left to look like coverage.
+    mod tool_registration_logging {
+        use super::*;
+        use crate::test_log_capture::capture_logs;
+
+        /// The sandbox branch `execute_run` picks between. All three are
+        /// exercised: they register different tools and the middle one
+        /// adds an extra `with_extra_fs_read_root` pass.
+        #[derive(Clone, Copy)]
+        enum SandboxBranch {
+            /// The default — `with_project_root(state.project_root)`.
+            ProjectRoot,
+            /// `worktree_mode = "git"` (#946).
+            Worktree,
+            /// `[security].allow_full_os_access` (#947).
+            Unrestricted,
+        }
+
+        /// The registration sequence `execute_run` performs, in its
+        /// order. Mirrors the builder chain above; when a builder is
+        /// added there it belongs here too, or these tests quietly stop
+        /// covering it.
+        fn build_runtime_like_a_run(branch: SandboxBranch, root: &std::path::Path) {
+            let project_root = root.join("project");
+            let data_dir = root.join("data");
+            let workspace_dir = root.join("workspace");
+            std::fs::create_dir_all(&project_root).unwrap();
+            std::fs::create_dir_all(&data_dir).unwrap();
+            std::fs::create_dir_all(&workspace_dir).unwrap();
+
+            let llm = test_llm();
+            let run_id = RunId::new();
+            let config = alms_runtime::AgentConfig {
+                sandbox_root: project_root.display().to_string(),
+                ..Default::default()
+            };
+
+            let (runtime_tx, _rx) = mpsc::unbounded_channel::<RuntimeEvent>();
+            let mut runtime = alms_runtime::AgentRuntime::new(AgentId::new(), config, llm)
+                .expect("runtime construction must succeed")
+                .with_event_sender(runtime_tx)
+                .with_run_id(run_id)
+                .with_cancel_token(CancellationToken::new())
+                .with_agent_name("registry-noise-probe".to_string());
+
+            let shell_env =
+                alms_core::build_shell_default_env(Some(&data_dir), Some(&workspace_dir));
+            runtime = runtime.with_shell_default_env(shell_env);
+            runtime = runtime.with_shell_spill(
+                data_dir
+                    .join(alms_runtime::spill::SPILL_DIR_NAME)
+                    .join(run_id.0.to_string()),
+                true,
+            );
+            runtime = runtime.with_tool_output_truncate(
+                data_dir
+                    .join(alms_runtime::tool_output_truncate::TOOL_OUTPUT_DIR_NAME)
+                    .join(run_id.0.to_string()),
+                true,
+                8_000,
+                200,
+            );
+
+            runtime = match branch {
+                SandboxBranch::ProjectRoot => runtime.with_project_root(project_root.clone()),
+                SandboxBranch::Worktree => {
+                    let worktree = project_root
+                        .join(".alms")
+                        .join("worktrees")
+                        .join("registry-noise-probe");
+                    std::fs::create_dir_all(&worktree).unwrap();
+                    runtime
+                        .with_extra_fs_read_root(project_root.join(".alms").join("agents"))
+                        .with_project_root(worktree)
+                }
+                SandboxBranch::Unrestricted => runtime.with_unrestricted_filesystem(),
+            };
+
+            let workspace =
+                alms_runtime::AgentWorkspace::new(&workspace_dir, "registry-noise-probe");
+            let _runtime = runtime.with_workspace(workspace);
+        }
+
+        /// A minimal LLM client — deliberately *not*
+        /// `summary_test_fixtures`, whose `SecretsStore` emits three
+        /// unrelated WARNs of its own and would put the volume row
+        /// below over budget for reasons that have nothing to do with
+        /// tool registration.
+        fn test_llm() -> alms_runtime::LlmClient {
+            alms_runtime::LlmClient::new(alms_runtime::LlmConfig {
+                provider: "anthropic".into(),
+                api_key: "sk-ant-test".into(),
+                base_url: "https://api.anthropic.com/v1".into(),
+                default_model: "claude-sonnet-4-20250514".into(),
+                ..Default::default()
+            })
+            .expect("test LLM client must build")
+        }
+
+        /// Counts the lines of a capture, ignoring the trailing newline.
+        fn line_count(captured: &str) -> usize {
+            captured.lines().filter(|l| !l.trim().is_empty()).count()
+        }
+
+        /// How many times the chain registered `name` under its primary
+        /// name. Matched to end-of-line so `shell` cannot absorb a
+        /// hypothetical `shell_*`; the alias uses a different message and
+        /// is counted by [`alias_registrations`].
+        fn registrations(captured: &str, name: &str) -> usize {
+            captured
+                .matches(&format!("Registering tool: {name}\n"))
+                .count()
+        }
+
+        /// How many times the chain pointed `shell_exec` at a tool.
+        fn alias_registrations(captured: &str) -> usize {
+            captured
+                .matches("Registering tool alias: 'shell_exec'")
+                .count()
+        }
+
+        /// The registration count each name should reach, derived from
+        /// the caller table in the module doc rather than read off a run.
+        /// Registrations, not replacements — the first one is the insert,
+        /// so the issue's histogram numbers are these minus one.
+        ///
+        /// `fs_read` / `fs_write` / `fs_edit` sit one above the other
+        /// three because `attach_fs_cache_to_registry` covers exactly the
+        /// cache-aware family while `register_fs_tools` covers all six.
+        /// That asymmetry is the whole of the 4:3 ratio, and it is why
+        /// the stale doc on `refresh_fs_tools_for_extras` mattered: the
+        /// model it described — `with_workspace` re-registering the fs_*
+        /// tools as well — predicts 5:4, and 76 is not divisible by 5.
+        fn expected_registrations(branch: SandboxBranch) -> Vec<(&'static str, usize)> {
+            // The worktree branch pushes a sibling-read root, and
+            // `with_extra_fs_read_root` refreshes the read-family tools —
+            // so it costs the six fs_* one extra pass and leaves `shell`
+            // alone.
+            let extra = match branch {
+                SandboxBranch::Worktree => 1,
+                SandboxBranch::ProjectRoot | SandboxBranch::Unrestricted => 0,
+            };
+            vec![
+                // builtins + attach_fs_cache + spill + tool-output + root
+                ("fs_read", 5 + extra),
+                ("fs_write", 5 + extra),
+                ("fs_edit", 5 + extra),
+                // builtins + spill + tool-output + root
+                ("fs_list", 4 + extra),
+                ("fs_grep", 4 + extra),
+                ("fs_glob", 4 + extra),
+                // builtins + apply_shell_permissions + default_env
+                // + spill + root. NOT `with_tool_output_truncate`, whose
+                // only registration effect is `refresh_fs_tools_for_extras`
+                // — which is also why `extra` above does not apply here.
+                ("shell", 5),
+            ]
+        }
+
+        /// The load-bearing row, run over each sandbox branch.
+        ///
+        /// The capture is taken at DEBUG so one buffer carries both
+        /// halves: a "no warnings" assertion over a chain that registered
+        /// nothing would be satisfied vacuously, and the counts are what
+        /// rule that out.
+        ///
+        /// The counts are also the enumeration itself. The claim this
+        /// module rests on — that the caller table in its doc comment is
+        /// complete rather than sampled — was prose, checked against the
+        /// issue's histogram by hand. Asserting the per-name numbers
+        /// makes the 4:3 ratio an artifact of the build rather than a
+        /// claim about it, and turns "a builder was added to
+        /// `execute_run` and nobody mirrored it here" from silent drift
+        /// into a failing test.
+        #[test]
+        fn a_runs_builder_chain_reregisters_tools_without_warning() {
+            for (label, branch) in [
+                ("project_root", SandboxBranch::ProjectRoot),
+                ("worktree", SandboxBranch::Worktree),
+                ("unrestricted", SandboxBranch::Unrestricted),
+            ] {
+                let dir = tempfile::tempdir().unwrap();
+                let captured = capture_logs(tracing::Level::DEBUG, || {
+                    build_runtime_like_a_run(branch, dir.path());
+                });
+
+                // Collected rather than asserted one at a time: which
+                // names moved *together* is the diagnostic. A builder that
+                // registers only fs_* shifts six counts and leaves `shell`
+                // alone, and that contrast is what distinguishes the real
+                // contributors from the plausible ones — the distinction
+                // the caller table got wrong for `with_tool_output_truncate`
+                // until the #1317 review. Failing on the first mismatch
+                // hides exactly that shape.
+                let mismatches: Vec<String> = expected_registrations(branch)
+                    .into_iter()
+                    .filter_map(|(name, expected)| {
+                        let actual = registrations(&captured, name);
+                        (actual != expected)
+                            .then(|| format!("{name}: expected {expected}, saw {actual}"))
+                    })
+                    .collect();
+                assert!(
+                    mismatches.is_empty(),
+                    "[{label}] registration counts moved: {}. The builder \
+                     sequence changed and the caller table in this module's \
+                     doc comment no longer enumerates it — check which names \
+                     moved together before editing the numbers.",
+                    mismatches.join("; ")
+                );
+                assert_eq!(
+                    alias_registrations(&captured),
+                    5,
+                    "[{label}] every site that registers `shell` registers \
+                     the alias in the same breath, so the two counts move \
+                     together — a divergence means one of the five sites \
+                     grew or lost its `register_arc_as` call"
+                );
+
+                assert!(
+                    !captured.contains(alms_runtime::TOOL_COLLISION_WARNING),
+                    "[{label}] re-registering the same tool for a new run is \
+                     the normal lifecycle and must not warn. Captured:\n{captured}"
+                );
+            }
+        }
+
+        /// The complement. Without it, deleting both warnings outright
+        /// would satisfy the row above just as well — and a
+        /// discriminator that never fires re-hides the class of bug the
+        /// noise was concealing in the first place.
+        ///
+        /// Also the reason the negative assertion above cannot go stale:
+        /// both rows look for `TOOL_COLLISION_WARNING`, which is the
+        /// registry's own constant rather than a copy of its text, and
+        /// this row fails the moment it stops being emitted.
+        #[test]
+        fn a_different_implementation_taking_an_established_name_still_warns() {
+            let dir = tempfile::tempdir().unwrap();
+            let project_root = dir.path().join("project");
+            std::fs::create_dir_all(&project_root).unwrap();
+
+            let llm = test_llm();
+            let config = alms_runtime::AgentConfig {
+                sandbox_root: project_root.display().to_string(),
+                ..Default::default()
+            };
+            let runtime = alms_runtime::AgentRuntime::new(AgentId::new(), config, llm).unwrap();
+
+            let captured = capture_logs(tracing::Level::WARN, || {
+                runtime.register_tool(std::sync::Arc::new(ImpostorFsRead));
+            });
+
+            assert!(
+                captured.contains(alms_runtime::TOOL_COLLISION_WARNING),
+                "a foreign implementation claiming the `fs_read` name is the \
+                 one case worth a WARN. Captured:\n{captured}"
+            );
+            assert!(
+                captured.contains("fs_read"),
+                "the warning must name the tool that was displaced. \
+                 Captured:\n{captured}"
+            );
+        }
+
+        /// `register_as` has its own warning and its own branch, so it
+        /// needs its own complement — the builder-chain row above pins
+        /// only that the alias's *benign* re-registration is silent, and
+        /// silence is equally satisfied by an alias path that can never
+        /// speak.
+        ///
+        /// Re-pointing `shell_exec` at a tool that calls itself
+        /// something else is the case the alias check exists for: the
+        /// map key stays put while the thing it resolves to changes
+        /// underneath it.
+        #[test]
+        fn an_alias_repointed_at_a_different_tool_still_warns() {
+            let registry = alms_runtime::tools::ToolRegistry::with_builtins();
+
+            let captured = capture_logs(tracing::Level::WARN, || {
+                registry.register_arc_as("shell_exec", std::sync::Arc::new(ImpostorFsRead));
+            });
+
+            assert!(
+                captured.contains(alms_runtime::TOOL_COLLISION_WARNING),
+                "an alias now resolving to a different tool is worth saying \
+                 out loud. Captured:\n{captured}"
+            );
+            assert!(
+                captured.contains("shell_exec"),
+                "the warning must name the alias. Captured:\n{captured}"
+            );
+        }
+
+        /// Total log volume over a run's registration churn, at WARN and
+        /// at INFO. The issue's third acceptance criterion is about
+        /// volume rather than about any particular message, so this row
+        /// is phrased the same way and survives rewording of either
+        /// warning.
+        ///
+        /// Budgets, not measurements. Today the chain emits **1** WARN
+        /// (the non-Linux shell-sandbox notice; on Linux that one is an
+        /// INFO and the count is 0) and **5** lines at INFO — the two
+        /// LLM-client lines, "Filesystem sandbox active", the
+        /// shell-sandbox notice and one "Registered built-in tools"
+        /// summary. The slack above those is there so an ordinary new
+        /// log line does not fail the build, while the regressions this
+        /// row exists for stay far outside it: putting the
+        /// per-registration `warn!` back on the happy path takes WARN to
+        /// ~30, and putting the per-registration `info!` back takes INFO
+        /// to ~40.
+        #[test]
+        fn a_runs_registration_churn_is_quiet_at_warn_and_info() {
+            let dir = tempfile::tempdir().unwrap();
+            let warns = capture_logs(tracing::Level::WARN, || {
+                build_runtime_like_a_run(SandboxBranch::ProjectRoot, dir.path());
+            });
+            assert!(
+                line_count(&warns) <= 3,
+                "a run's tool-registry churn must not produce \
+                 readable-log-destroying WARN volume; got {} line(s):\n{warns}",
+                line_count(&warns)
+            );
+
+            let dir = tempfile::tempdir().unwrap();
+            let infos = capture_logs(tracing::Level::INFO, || {
+                build_runtime_like_a_run(SandboxBranch::ProjectRoot, dir.path());
+            });
+            assert!(
+                line_count(&infos) <= 10,
+                "the same applies one level down — INFO carried a line per \
+                 registration, which is the same non-event the `debug!` \
+                 immediately above it already reports; got {} line(s):\n{infos}",
+                line_count(&infos)
+            );
+        }
+
+        /// A `Tool` that is not `FsReadTool` but claims the `fs_read`
+        /// name — the collision the registry should still surface.
+        #[derive(Debug)]
+        struct ImpostorFsRead;
+
+        #[async_trait::async_trait]
+        impl alms_tools::Tool for ImpostorFsRead {
+            fn name(&self) -> &str {
+                "fs_read"
+            }
+            fn description(&self) -> &str {
+                "not the real fs_read"
+            }
+            async fn execute(
+                &self,
+                _params: serde_json::Value,
+            ) -> alms_tools::SandboxResult<serde_json::Value> {
+                Ok(serde_json::Value::Null)
+            }
+        }
     }
 }

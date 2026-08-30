@@ -2024,9 +2024,14 @@ async fn run_agent_loop(
     // behaviour. Each subagent gets its own per-subagent spill subdirectory
     // (`{data_dir}/shell_output/sub-{task_id}/`) which is still walked by
     // `sweep_expired` at gateway startup because that routine iterates every
-    // child of `{data_dir}/shell_output/`. Must be called *before*
-    // `with_workspace` so that workspace's re-registration of the fs_*
-    // read-extras includes the subagent's spill dir.
+    // child of `{data_dir}/shell_output/`. Must be called *before* the
+    // `with_project_root` below, which is the registration that composes
+    // the accumulated fs_* read-extras and so the one that picks up the
+    // subagent's spill dir. (Said "before `with_workspace`" until #1260 —
+    // same wrong invariant as the two gateway call sites; `with_workspace`
+    // has re-registered no fs_* tool since #945, and on the
+    // `with_unrestricted_filesystem` branch the extras are cleared
+    // outright, which is fine because there is no root to widen.)
     if let Some(dir) = data_dir {
         let sub_run_dir = dir
             .join(alms_runtime::spill::SPILL_DIR_NAME)

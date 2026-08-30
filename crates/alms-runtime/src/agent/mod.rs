@@ -44,13 +44,20 @@ pub struct AgentRuntime {
     pub(crate) run_id: Option<alms_core::RunId>,
     /// Per-run cancellation token for cooperative cancellation.
     pub(crate) cancel_token: Option<CancellationToken>,
-    /// Resolved sandbox root (canonicalized). Retained so `with_workspace()` can
-    /// re-register the shell tool with the workspace dir as default cwd.
+    /// Resolved sandbox root (canonicalized). Retained because the
+    /// *sandboxed* shell and fs_* re-registrations read it — the shell
+    /// builders, and `refresh_fs_tools_for_extras`, which is a no-op
+    /// while this is `None`. `with_unrestricted_filesystem` is the
+    /// exception on both counts: it sets this to `None` and then
+    /// registers unsandboxed tools that never consult it.
     pub(crate) resolved_sandbox_root: Option<std::path::PathBuf>,
     /// Whether shell commands bypass sandbox cwd restriction.
     pub(crate) shell_unrestricted: bool,
     /// Default env vars injected into shell processes (e.g. ALMS_DATA_DIR).
-    /// Retained so `with_workspace()` can pass them to the re-registered shell tool.
+    /// Retained so the shell re-registrations that follow
+    /// `with_shell_default_env` — `with_shell_spill`, `with_project_root`,
+    /// `with_unrestricted_filesystem` — carry them onto the replacement
+    /// tool instead of dropping them.
     pub(crate) shell_default_env: std::collections::HashMap<String, String>,
     /// Permission-based allow/deny patterns for shell commands.
     /// Retained so re-registrations of the shell tool preserve the policy.
@@ -61,9 +68,9 @@ pub struct AgentRuntime {
     /// Large-output spill-to-disk policy for the shell tool (issue #756).
     /// Defaults to disabled; the gateway wires in an active policy once the
     /// per-run spill directory (`{data_dir}/shell_output/{run_id}/`) is
-    /// known, via [`Self::with_shell_spill`]. Retained so re-registrations
-    /// of the shell tool (from `with_workspace`, `with_shell_default_env`,
-    /// etc.) preserve the policy.
+    /// known, via [`Self::with_shell_spill`]. Retained so the shell
+    /// re-registrations that follow (`with_project_root`,
+    /// `with_unrestricted_filesystem`) preserve the policy.
     pub(crate) shell_spill_policy: alms_sandbox::shell::spill::ShellSpillPolicy,
     /// Shared in-loop tool-output truncation policy (issue #851).
     ///
@@ -87,14 +94,31 @@ pub struct AgentRuntime {
     /// - [`Self::with_shell_spill`] appends `{data_dir}/shell_output/{run_id}/`.
     /// - [`Self::with_tool_output_truncate`] appends `{data_dir}/tool-output/{run_id}/`.
     ///
-    /// [`Self::with_workspace`] reads the full accumulated list when it
-    /// re-registers the read-family fs tools, so the workspace registration
-    /// (which is the *last* fs_* registration in the gateway lifecycle order)
-    /// preserves every per-run spill dir as a read root. Without this single
-    /// source of truth, the spill-builder methods would have to re-register
-    /// fs_* tools themselves AND `with_workspace` would silently overwrite
-    /// those extras — the dead-code / footgun pattern Tim flagged on #921
-    /// review.
+    /// Every *sandboxed* read-family fs_* registration reads the full
+    /// accumulated list via [`Self::compose_fs_extra_read_roots`], so the
+    /// one that runs last in the gateway's builder order —
+    /// [`Self::with_project_root`] — preserves every per-run spill dir as
+    /// a read root.
+    ///
+    /// [`Self::with_unrestricted_filesystem`] is the other tail of that
+    /// branch and works the opposite way: it **clears** this accumulator
+    /// and registers `FsReadTool::new()` and friends directly, never
+    /// composing extras at all. Same outcome — with no primary root there
+    /// is nothing to widen — by the inverse mechanism. (An earlier
+    /// version of this doc listed it alongside `with_project_root` as a
+    /// preserver, which is wrong twice over; the inline comment in that
+    /// builder says so correctly.) That is what makes the accumulator a
+    /// single source of truth rather than a per-builder detail: without it
+    /// each spill builder would re-register fs_* tools from its own local
+    /// view and the last writer would silently drop the others' roots —
+    /// the footgun flagged on #921 review.
+    ///
+    /// This used to name [`Self::with_workspace`] as the last fs_*
+    /// registration. It has performed none since #945, which is why the
+    /// correction matters here specifically: the claim is the stated
+    /// reason this field exists, so a reader checking it against
+    /// `with_workspace` would find nothing and conclude the field was
+    /// vestigial. It is not — the builders above are the consumers.
     pub(crate) extra_fs_read_roots: Vec<std::path::PathBuf>,
     /// Agent name for perspective mapping in DM sessions.
     /// When set and the context_id starts with "dm:", the context builder

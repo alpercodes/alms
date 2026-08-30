@@ -830,8 +830,34 @@ impl Gateway {
                     // agent's dedicated worktree under
                     // `<project>/.alms/worktrees/<name>/`. Mirror the HTTP
                     // path so Telegram-triggered runs see the same model.
-                    // Must precede `with_workspace` so the re-registration
-                    // of fs_* / shell happens before workspace attachment.
+                    //
+                    // The live ordering constraint here is
+                    // `with_shell_default_env` above: this block
+                    // re-registers the shell tool, and the replacement
+                    // reads `self.shell_default_env`, so running it first
+                    // would drop ALMS_DATA_DIR / ALMS_WORKSPACE_DIR from
+                    // every Telegram-triggered shell call. That is the
+                    // invariant `with_unrestricted_filesystem`'s doc
+                    // states for all three call sites.
+                    //
+                    // The extra-read-roots ordering that governs the same
+                    // pin in `runs::lifecycle` does NOT apply on this
+                    // path: Telegram wires no `with_shell_spill` and no
+                    // `with_tool_output_truncate`, so `extra_fs_read_roots`
+                    // is empty here and this registration has nothing to
+                    // preserve. Position relative to `with_workspace` is
+                    // likewise unconstrained — that builder has registered
+                    // no fs_* or shell tool since #945.
+                    //
+                    // Both halves are corrections (#1260). The comment
+                    // first gave the `with_workspace` ordering as the
+                    // reason, vacuous since #945; the fix for that
+                    // replaced it with the spill-builder rule from the
+                    // HTTP path, vacuous here for a different reason —
+                    // those builders are not on this chain at all. A rule
+                    // that cannot be violated reads like one that must be
+                    // obeyed, and sends the next reader hunting for
+                    // builders that are not there.
                     //
                     // Precedence: `[security].allow_full_os_access` wins
                     // over both worktree mode and project-root mode. The

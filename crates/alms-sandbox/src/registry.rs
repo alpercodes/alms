@@ -1,10 +1,64 @@
 #[cfg(test)]
 use crate::NativeTool;
-use crate::{SandboxError, Tool, ToolContext, error::SandboxResult};
+use crate::{SandboxError, Tool, ToolContext, ToolIdentity, error::SandboxResult};
 use dashmap::DashMap;
 use serde_json::Value;
 use std::sync::Arc;
 use tracing::{debug, error, info, warn};
+
+/// The phrase both name-collision warnings share (#1260).
+///
+/// Exported so that log-asserting tests in other crates pin the string
+/// the registry actually emits instead of a copy of it. The negative
+/// assertion ("a normal run logs no re-registration warning") is only
+/// worth anything while some positive assertion proves the same string
+/// is still live, and both need to be looking for the same text.
+pub const TOOL_COLLISION_WARNING: &str = "already registered by a different implementation";
+
+/// Whether `existing` and `incoming` are the same tool implementation.
+///
+/// This is the discriminator behind [`TOOL_COLLISION_WARNING`] (#1260).
+/// Two tools are "the same" when they are the same concrete type **and**
+/// report the same canonical [`Tool::name`]:
+///
+/// * **Same type** is what makes the per-run lifecycle silent. Every
+///   re-registration a run performs is the same type rebuilt with
+///   different constructor arguments — `FsReadTool::new()` replaced by
+///   `FsReadTool::sandboxed(root).with_cache(..)`, `ShellTool` replaced
+///   by a `ShellTool` that also knows the run's spill directory. Those
+///   are configuration changes, not collisions, and each one used to
+///   cost a WARN.
+/// * **Same canonical name** only ever differs on the alias path, where
+///   the map key is not `tool.name()`. Re-registering `ShellTool` under
+///   `"shell_exec"` is benign precisely because the alias still resolves
+///   to a tool that calls itself `"shell"`; pointing `"shell_exec"` at
+///   something else is not.
+///
+/// # What this deliberately does not claim
+///
+/// It is an approximation of "a different tool", not a proof of one, and
+/// the approximation is exact in one direction only: a type change is
+/// always reported, a same-type change never is. The blind spot is a
+/// type that can carry more than one identity, and there are exactly two
+/// in the tree. 21 of the 22 non-`cfg(test)` `impl Tool` blocks return a
+/// hard-coded `&'static str` from `name()`, so across the shipped set
+/// the type → name mapping is a bijection and "same type" and "same
+/// tool" coincide. The exceptions are [`crate::NativeTool`], which takes
+/// its name as a constructor argument, and `BlockingTestTool` in
+/// `alms-runtime`, which is `#[cfg(test)]`.
+///
+/// **`NativeTool`'s exemption is a call-graph invariant, not a
+/// structural one.** Its only caller in this tree is the `#[cfg(test)]`
+/// `register_native` helper below — but `NativeTool::new` is `pub` and
+/// un-gated, so nothing stops a future in-tree caller, or a downstream
+/// crate, from registering two differently-named `NativeTool`s and
+/// landing in the blind spot without any compiler complaint. The name
+/// comparison is what bounds the damage when that happens: it catches
+/// the sub-case where the two disagree on their canonical name, which is
+/// the whole of the alias path and part of the primary one.
+pub fn same_implementation(existing: &dyn Tool, incoming: &dyn Tool) -> bool {
+    existing.impl_type_id() == incoming.impl_type_id() && existing.name() == incoming.name()
+}
 
 /// Tool registry for managing available tools
 #[derive(Debug, Clone)]
@@ -47,13 +101,40 @@ impl ToolRegistry {
             return Ok(());
         }
 
-        if self.tools.contains_key(&name) {
-            warn!("Tool '{}' already registered, replacing", name);
+        // Re-registration is the normal per-run lifecycle, not an
+        // anomaly: a single run rebuilds the registry once and then
+        // replaces `shell` and the `fs_*` family several times over as
+        // the runtime's builder chain narrows the sandbox root, wires
+        // the file-state cache and adds the run's spill directories.
+        // Warning on that fired ~29 times per run and trained everyone
+        // to skip WARN entirely (#1260). Only a change of implementation
+        // behind an existing name is worth saying anything about.
+        //
+        // The `Ref` guard `get()` hands back is confined to this block:
+        // it read-locks the shard `insert()` below needs to write-lock,
+        // so it must be dropped before the insert, not merely before the
+        // end of the function.
+        let collision = {
+            self.tools.get(&name).and_then(|existing| {
+                let existing = existing.value();
+                (!same_implementation(existing.as_ref(), tool.as_ref()))
+                    .then(|| (existing.impl_type_name(), existing.name().to_string()))
+            })
+        };
+        if let Some((previous_impl, previous_name)) = collision {
+            warn!(
+                tool = %name,
+                previous_impl,
+                previous_name,
+                new_impl = tool.impl_type_name(),
+                "Tool '{}' is {} — replacing",
+                name,
+                TOOL_COLLISION_WARNING,
+            );
         }
 
         debug!("Registering tool: {}", name);
         self.tools.insert(name.clone(), tool);
-        info!("Successfully registered tool: {}", name);
 
         Ok(())
     }
@@ -82,8 +163,31 @@ impl ToolRegistry {
             return Ok(());
         }
 
-        if self.tools.contains_key(alias) {
-            warn!("Tool alias '{}' already registered, replacing", alias);
+        // Same rule as `register()` (#1260), and on this path the
+        // canonical-name half of `same_implementation` is the half that
+        // does the work: re-pointing `"shell_exec"` at another
+        // `ShellTool` is the per-run lifecycle, while re-pointing it at
+        // a tool that calls itself something else silently changes what
+        // an established alias means. See the `collision` block in
+        // `register()` for why the `Ref` guard is scoped.
+        let collision = {
+            self.tools.get(alias).and_then(|existing| {
+                let existing = existing.value();
+                (!same_implementation(existing.as_ref(), tool.as_ref()))
+                    .then(|| (existing.impl_type_name(), existing.name().to_string()))
+            })
+        };
+        if let Some((previous_impl, previous_name)) = collision {
+            warn!(
+                alias = %alias,
+                previous_impl,
+                previous_name,
+                new_impl = tool.impl_type_name(),
+                new_name = tool.name(),
+                "Tool alias '{}' is {} — repointing",
+                alias,
+                TOOL_COLLISION_WARNING,
+            );
         }
 
         debug!("Registering tool alias: '{}' -> '{}'", alias, tool.name());
@@ -152,7 +256,7 @@ impl ToolRegistry {
             DatetimeTool, EchoTool, FsEditTool, FsGlobTool, FsGrepTool, FsListTool, FsReadTool,
             FsWriteTool, HttpGetTool, MathTool,
         };
-        use crate::shell::{SHELL_TOOL_ALIAS, SHELL_TOOL_NAME, ShellTool};
+        use crate::shell::{SHELL_TOOL_ALIAS, ShellTool};
 
         // Build all tools, then filter by the enabled list.
         let shell_tool: Arc<dyn Tool> = Arc::new(ShellTool::with_policy(
@@ -203,19 +307,17 @@ impl ToolRegistry {
         }
 
         // Register the shell tool under the legacy alias "shell_exec" for
-        // backward compatibility. The enabled_filter accepts either "shell"
-        // or "shell_exec" for the alias registration.
-        let shell_alias_allowed = self.enabled_filter.is_empty()
-            || self
-                .enabled_filter
-                .iter()
-                .any(|e| e == SHELL_TOOL_NAME || e == SHELL_TOOL_ALIAS);
-        if shell_alias_allowed {
-            self.tools.insert(SHELL_TOOL_ALIAS.to_string(), shell_tool);
-            debug!(
-                "Registered shell tool alias '{}' -> '{}'",
-                SHELL_TOOL_ALIAS, SHELL_TOOL_NAME
-            );
+        // backward compatibility.
+        //
+        // This used to `insert()` straight into the map behind an
+        // open-coded copy of the filter check. `register_as` applies the
+        // identical rule — it accepts the alias when the filter is empty,
+        // names the alias, or names `tool.name()`, which here is
+        // `SHELL_TOOL_NAME` — so routing through it is behaviour-preserving
+        // and closes the one insert path that had no collision check at
+        // all (#1260).
+        if let Err(e) = self.register_as(SHELL_TOOL_ALIAS, shell_tool) {
+            error!("Failed to register shell tool alias: {}", e);
         }
 
         // Warn about enabled entries that don't match any builtin tool name,
@@ -491,5 +593,205 @@ mod tests {
             !shell.is_auto_approved(),
             "shell should NOT be auto-approved"
         );
+    }
+
+    /// #1260 — the discriminator that decides whether a replacement is
+    /// worth a WARN.
+    ///
+    /// These rows pin [`same_implementation`] itself. That the registry
+    /// *emits* the warning from the branch this function selects is
+    /// pinned end to end, over the real per-run builder chain and with a
+    /// `tracing` capture, in `alms-gateway`'s
+    /// `runs::lifecycle::tests::tool_registration_logging` — `alms-sandbox`
+    /// has no log-capture harness and adding a third copy of the #1221 one
+    /// is exactly what #1282 exists to stop.
+    mod collision_detection {
+        use super::*;
+        use crate::{FileStateCache, ShellTool};
+
+        /// The two call shapes `ToolIdentity`'s doc comment warns about,
+        /// side by side.
+        ///
+        /// This row does **not** guard the discriminator, though an
+        /// earlier version of it claimed to. Through a `&dyn Tool` the
+        /// resolution is forced: `&'a dyn Tool` is not `'static`, so the
+        /// blanket impl cannot apply and probing can only match
+        /// `Self = dyn Tool` by value. A row phrased over `&dyn Tool`
+        /// therefore restates its own signature and cannot fail. What
+        /// actually pins the type half of `same_implementation` is the
+        /// pair of impostor rows below, whose fake tools share the
+        /// incumbent's *name*: collapse the type comparison and both go
+        /// green-to-red.
+        ///
+        /// What is worth pinning here is the trap itself, because it is
+        /// silent and the wrong shape compiles. Through the `Arc` the
+        /// blanket impl *does* apply — `Arc<dyn Tool>` is sized and
+        /// `'static`, autoref matches it at the first probe step, and
+        /// every tool in the process reports one shared id. Asserting
+        /// that equality is a real claim about method resolution, and it
+        /// is the claim that makes the `&dyn Tool` argument types on
+        /// `same_implementation` load-bearing rather than stylistic.
+        #[test]
+        fn impl_type_id_reads_the_pointer_unless_reborrowed_as_dyn_tool() {
+            let echo: Arc<dyn Tool> = Arc::new(crate::EchoTool::new());
+            let echo_again: Arc<dyn Tool> = Arc::new(crate::EchoTool::new());
+            let math: Arc<dyn Tool> = Arc::new(crate::MathTool::new());
+
+            fn id_of(tool: &dyn Tool) -> std::any::TypeId {
+                tool.impl_type_id()
+            }
+
+            assert_eq!(
+                id_of(echo.as_ref()),
+                id_of(echo_again.as_ref()),
+                "two instances of one tool type must share an impl_type_id"
+            );
+            assert_ne!(
+                id_of(echo.as_ref()),
+                id_of(math.as_ref()),
+                "through a &dyn Tool the vtable entry is reached and \
+                 distinct types report distinct ids"
+            );
+
+            // The trap: same expressions, no reborrow. Both answer
+            // `TypeId::of::<Arc<dyn Tool>>()`, so a `same_implementation`
+            // written over `Arc<dyn Tool>` would call every pair of tools
+            // in the process the same implementation and never warn.
+            #[allow(clippy::needless_borrow)]
+            let via_arc_echo = (&echo).impl_type_id();
+            #[allow(clippy::needless_borrow)]
+            let via_arc_math = (&math).impl_type_id();
+            assert_eq!(
+                via_arc_echo, via_arc_math,
+                "called on the Arc rather than on a &dyn Tool, \
+                 impl_type_id reports the pointer's type — this is why \
+                 same_implementation takes &dyn Tool arguments"
+            );
+            assert_eq!(
+                via_arc_echo,
+                std::any::TypeId::of::<Arc<dyn Tool>>(),
+                "and the shared id is specifically the Arc's"
+            );
+        }
+
+        /// The exact shape `ToolRegistry::attach_fs_cache_to_registry`
+        /// and `AgentRuntime::register_fs_tools` produce: one `FsReadTool`
+        /// replaced by another that is sandboxed and cache-aware. Four
+        /// times per run, per read-family tool.
+        #[test]
+        fn a_reconfigured_fs_tool_is_the_same_implementation() {
+            let plain: Arc<dyn Tool> = Arc::new(crate::FsReadTool::new());
+            let sandboxed: Arc<dyn Tool> = Arc::new(
+                crate::FsReadTool::sandboxed(std::path::PathBuf::from("."))
+                    .with_cache(Arc::new(FileStateCache::default())),
+            );
+
+            assert!(
+                same_implementation(plain.as_ref(), sandboxed.as_ref()),
+                "re-registering fs_read with a sandbox root and a file-state \
+                 cache is a configuration change, not a collision"
+            );
+        }
+
+        /// The other half of the per-run churn: `with_shell_default_env`,
+        /// `with_shell_spill`, `with_tool_output_truncate` and
+        /// `with_project_root` each rebuild `ShellTool` with a different
+        /// policy and re-register it under both `shell` and `shell_exec`.
+        #[test]
+        fn a_repolicied_shell_tool_is_the_same_implementation() {
+            let unrestricted: Arc<dyn Tool> = Arc::new(ShellTool::with_policy(None, true));
+            let sandboxed: Arc<dyn Tool> = Arc::new(ShellTool::with_policy(
+                Some(std::path::PathBuf::from(".")),
+                false,
+            ));
+
+            assert!(same_implementation(
+                unrestricted.as_ref(),
+                sandboxed.as_ref()
+            ));
+        }
+
+        /// The complement, and the reason the check is not just "always
+        /// silent": a different implementation arriving under an
+        /// established name is still a collision.
+        #[test]
+        fn a_different_implementation_is_not_the_same_implementation() {
+            let echo: Arc<dyn Tool> = Arc::new(crate::EchoTool::new());
+            let math: Arc<dyn Tool> = Arc::new(crate::MathTool::new());
+
+            assert!(!same_implementation(echo.as_ref(), math.as_ref()));
+        }
+
+        /// The type half of the discriminator, isolated. Two tools that
+        /// agree on the name are still a collision when the code behind
+        /// the name changed — this is the shape a real name clash takes
+        /// (`register` keys on `tool.name()`, so a genuine clash always
+        /// has matching names and differing types) and the row that
+        /// fails if the type comparison is ever dropped.
+        #[test]
+        fn a_foreign_type_claiming_an_existing_name_is_a_collision() {
+            let real: Arc<dyn Tool> = Arc::new(crate::EchoTool::new());
+            let impostor: Arc<dyn Tool> = Arc::new(NativeTool::new("echo", |_| Ok(Value::Null)));
+
+            assert_eq!(real.name(), impostor.name());
+            assert!(!same_implementation(real.as_ref(), impostor.as_ref()));
+        }
+
+        /// The canonical-name half of the discriminator, which is what
+        /// does the work on the alias path: re-pointing `shell_exec` at
+        /// something that calls itself a different name changes what an
+        /// established alias means, even when nothing about the type
+        /// changed.
+        #[test]
+        fn same_type_under_a_different_canonical_name_is_a_collision() {
+            let shell: Arc<dyn Tool> = Arc::new(NativeTool::new("shell", |_| Ok(Value::Null)));
+            let shell_again: Arc<dyn Tool> =
+                Arc::new(NativeTool::new("shell", |_| Ok(Value::Null)));
+            let impostor: Arc<dyn Tool> =
+                Arc::new(NativeTool::new("not_shell", |_| Ok(Value::Null)));
+
+            assert!(!same_implementation(shell.as_ref(), impostor.as_ref()));
+            assert!(
+                same_implementation(shell.as_ref(), shell_again.as_ref()),
+                "the name check must not make every re-registration a \
+                 collision — same type and same canonical name is still \
+                 the benign case"
+            );
+        }
+
+        /// `register_builtin_tools_sandboxed` used to open-code the
+        /// alias's `enabled_filter` check next to a raw map `insert`.
+        /// #1260 routed it through `register_as` so the alias insert is
+        /// collision-checked like every other one; these two rows pin
+        /// that the filter semantics came along unchanged — the alias is
+        /// accepted when the operator names *either* spelling, and the
+        /// primary name is still filtered on its own.
+        #[test]
+        fn alias_is_registered_when_the_filter_names_only_the_alias() {
+            let enabled = vec!["shell_exec".to_string()];
+            let registry = ToolRegistry::with_builtin_tools_sandboxed(None, false, &enabled);
+
+            assert!(registry.contains("shell_exec"));
+            assert!(
+                !registry.contains("shell"),
+                "the primary name is filtered on its own name, which the \
+                 operator did not list"
+            );
+            assert_eq!(registry.len(), 1);
+        }
+
+        #[test]
+        fn alias_is_registered_when_the_filter_names_only_the_primary() {
+            let enabled = vec!["shell".to_string()];
+            let registry = ToolRegistry::with_builtin_tools_sandboxed(None, false, &enabled);
+
+            assert!(registry.contains("shell"));
+            assert!(
+                registry.contains("shell_exec"),
+                "register_as accepts the tool's canonical name in the \
+                 filter, which is what the open-coded check did"
+            );
+            assert_eq!(registry.len(), 2);
+        }
     }
 }

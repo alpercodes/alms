@@ -45,3 +45,9 @@ pub use alms_sandbox::shell::spill;
 // same reason: the gateway installs the `[tools].shell_path` override and
 // logs the resolved shell at startup without a direct `alms-sandbox` edge.
 pub use alms_sandbox::shell::init_shell_resolution;
+
+// Re-export the tool-name-collision warning phrase (#1260). The warning
+// is emitted while *this* crate's builder chain assembles a run's tool
+// registry, and the gateway's log-asserting tests are what pin it, so it
+// travels the same no-direct-`alms-sandbox`-edge route as the two above.
+pub use alms_sandbox::TOOL_COLLISION_WARNING;

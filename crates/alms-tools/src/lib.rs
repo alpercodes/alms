@@ -44,7 +44,12 @@ pub use send_message::SendMessageTool;
 // cannot bring `Tool` into scope to call `execute()` on a tool it built —
 // which is how the #1299 send_message fold is pinned. Re-export only; the
 // dependency graph in CLAUDE.md is unchanged.
-pub use alms_sandbox::Tool;
+//
+// `SandboxResult` / `SandboxError` ride along for the same reason one step
+// further: a gateway test that *implements* `Tool` (rather than calling one)
+// has to name the error type in `execute`'s signature. #1260's
+// collision-warning complement is the first such test.
+pub use alms_sandbox::{SandboxError, SandboxResult, Tool};
 pub use event_forwarder::{EventForwarder, SubagentRunOutcome, subagent_activity_kind};
 pub use message_sender::{ConversationEndReason, DeliveryReceipt, MessageSender, SendError};
 pub use subagent::SubagentDispatcher;

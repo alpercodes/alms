@@ -85,9 +85,13 @@ impl AgentRuntime {
         };
 
         // Apply shell permissions / classification to the initially registered
-        // shell tool. The shell tool is re-registered whenever
-        // with_workspace() or with_shell_default_env() is called, but we also
-        // need it on the initial tool so unnamed agents get the policy.
+        // shell tool. The shell tool is re-registered by
+        // with_shell_default_env(), with_shell_spill(), with_project_root()
+        // and with_unrestricted_filesystem(), but we also need it on the
+        // initial tool so agents that call none of those get the policy.
+        // (This used to name with_workspace() as one of the re-registering
+        // builders. It has not registered a shell tool since #945 — see
+        // refresh_fs_tools_for_extras for the same correction.)
         //
         // Always re-register so that a non-default classification mode
         // (e.g. Strict) takes effect even when no permission patterns are set.
@@ -197,11 +201,11 @@ impl AgentRuntime {
     /// Must be called *after* `AgentRuntime::new` (which installs the
     /// initial sandboxed tools from `config.sandbox_root`) and BEFORE
     /// `with_workspace` so the unrestricted fs_*/shell tools are what
-    /// `with_workspace` sees when it (post-#945) re-registers
-    /// `workspace_write` only — `with_workspace` no longer touches
-    /// fs_*/shell registration, but the ordering invariant still holds
-    /// for forward-compatibility. `with_shell_default_env` is the
-    /// exception: it is called BEFORE `with_unrestricted_filesystem`
+    /// `with_workspace` sees when it (post-#945) registers
+    /// `workspace_write` / `workspace_read` only — `with_workspace` no
+    /// longer touches fs_*/shell registration, but the ordering invariant
+    /// still holds for forward-compatibility. `with_shell_default_env` is
+    /// the exception: it is called BEFORE `with_unrestricted_filesystem`
     /// at every call site (gateway HTTP path, Telegram path, coordinator
     /// subagent path) and the unrestricted shell registration reads
     /// `self.shell_default_env` directly, so the env vars are
@@ -224,8 +228,11 @@ impl AgentRuntime {
         // read, but with no primary root to enforce against `extras` is
         // a no-op — the unsandboxed fs_* tools accept absolute paths
         // anywhere. Clear the accumulator so later builders that consult
-        // it (e.g. a re-call into `register_fs_tools` from
-        // `with_workspace`) do not re-introduce a sandboxed registration.
+        // it (`with_extra_fs_read_root`, or a `with_shell_spill` /
+        // `with_tool_output_truncate` that has not run yet, all of which
+        // reach `register_fs_tools` via `refresh_fs_tools_for_extras`) do
+        // not re-introduce a sandboxed registration. `with_workspace` is
+        // NOT one of them — it has registered no fs_* tool since #945.
         self.extra_fs_read_roots.clear();
 
         let cache = self.tools.file_state_cache().clone();
@@ -347,9 +354,13 @@ impl AgentRuntime {
     /// fs_* tools at registration time.
     ///
     /// Combines, in order:
-    /// 1. The caller-supplied prefix (typically the workspace parent dir for
-    ///    sibling-workspace reads — #242 — when `with_workspace` is the
-    ///    caller; empty otherwise).
+    /// 1. The caller-supplied prefix. Always empty today: its one
+    ///    caller was `with_workspace`, passing the workspace parent dir
+    ///    for sibling-workspace reads (#242), and #945 removed both that
+    ///    shim and `with_workspace`'s fs_* registration — the agent's
+    ///    metadata now lives under the project root, so a sibling read
+    ///    resolves against the primary root directly. The parameter is
+    ///    kept because `register_fs_tools` still threads it.
     /// 2. The accumulated [`Self::extra_fs_read_roots`] entries pushed by
     ///    builder methods like [`Self::with_shell_spill`] and
     ///    [`Self::with_tool_output_truncate`].
@@ -432,17 +443,30 @@ impl AgentRuntime {
         }
     }
 
-    /// Re-register read-family fs_* tools when no workspace is attached.
+    /// Re-register the read-family fs_* tools against the current
+    /// primary sandbox root.
     ///
-    /// Used by [`Self::with_shell_spill`] and
-    /// [`Self::with_tool_output_truncate`] to widen the agent's read roots
-    /// to include the per-run spill directory at the moment the policy
-    /// becomes active. When `with_workspace` is *also* called later, it
-    /// re-registers the fs_* tools again with the workspace as the primary
-    /// root, picking up the same accumulated extras via
-    /// [`Self::compose_fs_extra_read_roots`] — so the call order does not
-    /// matter, and the workspace registration cannot silently drop the
-    /// spill-dir extras (#921 review).
+    /// Used by [`Self::with_shell_spill`],
+    /// [`Self::with_tool_output_truncate`] and
+    /// [`Self::with_extra_fs_read_root`] to widen the agent's read roots
+    /// the moment a new per-run directory becomes relevant, rather than
+    /// waiting for a later builder to do it.
+    ///
+    /// A no-op until a primary root exists. [`Self::with_project_root`]
+    /// consults the same accumulator via
+    /// [`Self::compose_fs_extra_read_roots`] when it runs, so an extra
+    /// pushed before the root is pinned is picked up then — the call
+    /// order does not matter either way (#921 review).
+    ///
+    /// **Corrected in #1260.** This used to say that `with_workspace`
+    /// re-registers the fs_* tools again "with the workspace as the
+    /// primary root". True pre-#945, and not since: #945 collapsed the
+    /// two-root model and `with_workspace` now registers only
+    /// `workspace_write` / `workspace_read`, touching no sandbox path
+    /// (its own doc comment says so). Worth naming rather than quietly
+    /// deleting — the stale claim predicts one extra fs_* pass per run,
+    /// and that is exactly the rival model the registration-count
+    /// enumeration in #1260 had to rule out.
     fn refresh_fs_tools_for_extras(&mut self) {
         if let Some(root) = self.resolved_sandbox_root.clone() {
             let extras = self.compose_fs_extra_read_roots(&[]);
@@ -635,10 +659,13 @@ impl AgentRuntime {
         }
 
         // Push the per-run shell-spill dir onto the accumulated
-        // `extra_fs_read_roots` so `with_workspace`'s later fs_* registration
-        // also picks it up, and re-register the read-family fs_* tools now
-        // for the unnamed-agent path (where `with_workspace` is never
-        // called). See [`Self::extra_fs_read_roots`] for the rationale.
+        // `extra_fs_read_roots` so a later fs_* registration —
+        // `with_project_root`, or another builder's
+        // `refresh_fs_tools_for_extras` — picks it up, and re-register the
+        // read-family fs_* tools now so the root is live even if no such
+        // builder follows. (This used to say `with_workspace` performs
+        // that later registration; it has not since #945.) See
+        // [`Self::extra_fs_read_roots`] for the rationale.
         if enabled {
             self.extra_fs_read_roots.push(run_dir);
             self.refresh_fs_tools_for_extras();
@@ -684,11 +711,17 @@ impl AgentRuntime {
         self.tool_output_truncate_policy = policy;
 
         // Push the per-run tool-output spill dir onto the accumulated
-        // `extra_fs_read_roots` so `with_workspace`'s later fs_*
-        // re-registration also picks it up, and re-register the read-family
-        // fs_* tools now for the unnamed-agent path. The accumulator is the
-        // single source of truth for all per-run spill dirs — see
-        // [`Self::extra_fs_read_roots`] for the rationale (#921 review fix).
+        // `extra_fs_read_roots` so a later fs_* registration picks it up,
+        // and re-register the read-family fs_* tools now so the root is
+        // live even if none follows. (Same correction as `with_shell_spill`
+        // above: the later registration is `with_project_root` or another
+        // `refresh_fs_tools_for_extras`, never `with_workspace`.) The
+        // accumulator is the single source of truth for all per-run spill
+        // dirs — see [`Self::extra_fs_read_roots`] (#921 review fix).
+        //
+        // Note this builder registers no shell tool, unlike
+        // `with_shell_spill` above — its only registration effect is the
+        // `refresh_fs_tools_for_extras` below.
         if enabled {
             self.extra_fs_read_roots.push(run_dir);
             self.refresh_fs_tools_for_extras();
@@ -699,9 +732,14 @@ impl AgentRuntime {
 
     /// Re-register the shell tool with the current `shell_permissions`.
     ///
-    /// Used at construction time to apply permissions to the initial shell
-    /// tool registration. Later registrations (via `with_workspace()`,
-    /// `with_shell_default_env()`) also apply permissions explicitly.
+    /// Used at construction time to apply permissions to the initial
+    /// shell tool registration — it is the second of the five shell
+    /// registrations a normal run performs, and the only one that is not
+    /// a `with_*` builder. The others (`with_shell_default_env`,
+    /// `with_shell_spill`, and whichever of `with_project_root` /
+    /// `with_unrestricted_filesystem` the run takes) apply permissions
+    /// explicitly too. `with_workspace` is not among them: it has
+    /// registered no shell tool since #945.
     fn apply_shell_permissions(&mut self) {
         let enabled = &self.config.enabled_tools;
         let shell_enabled =

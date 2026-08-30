@@ -14,7 +14,7 @@ pub use builtin::{
 };
 pub use error::{SandboxError, SandboxResult};
 pub use file_state_cache::FileStateCache;
-pub use registry::ToolRegistry;
+pub use registry::{TOOL_COLLISION_WARNING, ToolRegistry};
 pub use shell::ShellTool;
 
 /// Type alias for backward compatibility. Use [`ShellTool`] instead.
@@ -49,9 +49,52 @@ impl ToolContext {
     }
 }
 
+/// Concrete-type identity for `dyn Tool` trait objects (#1260).
+///
+/// [`ToolRegistry`] uses this to tell "the same tool re-registered for a
+/// new run" (the normal per-run lifecycle) apart from "a different
+/// implementation taking over a name that is already in use" (a genuine
+/// collision, and the only one of the two worth a WARN).
+///
+/// Blanket-implemented for every sized `'static` type, so no [`Tool`]
+/// implementation has to write anything. [`Tool`] takes it as a
+/// supertrait, which puts both methods in `dyn Tool`'s vtable and makes
+/// them dispatch to the **concrete** type behind the trait object.
+///
+/// # Call it through a `&dyn Tool`, never through a smart pointer
+///
+/// The blanket impl also covers `Arc<dyn Tool>`, `Box<dyn Tool>` and
+/// `&dyn Tool` themselves — those are sized `'static` types too. Calling
+/// `arc.impl_type_id()` therefore reports the *pointer's* type, which is
+/// the same footgun as `Box<dyn Any>::type_id()`. Always reborrow to a
+/// `&dyn Tool` first (`&*arc`, or hand it to a function taking
+/// `&dyn Tool`) so method resolution picks the vtable entry.
+/// [`registry::same_implementation`] takes `&dyn Tool` arguments partly
+/// to make that reborrow the only way the registry can ask the question.
+pub trait ToolIdentity {
+    /// `TypeId` of the concrete type behind this trait object.
+    fn impl_type_id(&self) -> std::any::TypeId;
+
+    /// [`std::any::type_name`] of the concrete type behind this trait
+    /// object. Used only to make the collision WARN actionable —
+    /// `type_name` output is explicitly not a stable identity, so it is
+    /// never compared, only logged.
+    fn impl_type_name(&self) -> &'static str;
+}
+
+impl<T: 'static> ToolIdentity for T {
+    fn impl_type_id(&self) -> std::any::TypeId {
+        std::any::TypeId::of::<T>()
+    }
+
+    fn impl_type_name(&self) -> &'static str {
+        std::any::type_name::<T>()
+    }
+}
+
 /// Tool trait — implemented by native tools registered with the runtime.
 #[async_trait::async_trait]
-pub trait Tool: Send + Sync + std::fmt::Debug {
+pub trait Tool: ToolIdentity + Send + Sync + std::fmt::Debug {
     /// Get the tool name
     fn name(&self) -> &str;
 
