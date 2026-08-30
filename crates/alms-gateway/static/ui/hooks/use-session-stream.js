@@ -41,7 +41,6 @@ import { trackSubagentStart, trackSubagentEnd, trackSubagentActivity, findSubage
 import { agentPhase, setAgentPhase, clearAgentPhase, setDmContext, revertPhase, dmPeer } from '../state/agent-status.js';
 import { messageQueue } from '../state/queue.js';
 import { activeSessionId, activeSession, dmParticipants } from '../state/sessions.js';
-import { activeAgent } from '../state/agents.js';
 import { normalizeApproval } from '../utils/approvals.js';
 import { selectGeneration } from '../state/select-generation.js';
 import { confirmOptimisticMessage } from '../state/pending-messages.js';
@@ -111,9 +110,18 @@ export const dmThinkingBuffers = signal(new Map());
 const dmPendingReplyBuffers = new Map();
 
 /**
- * Run-ids known to be DM / peer-triggered runs, recorded from a `run_created`
- * whose `source` starts with `peer:`. Read by `isDmEvent` as a third proof a
- * run is a DM run.
+ * DM / peer-triggered runs, keyed by run-id, valued by the `peer:<name>`
+ * `source` their `run_created` carried. Membership is read by `isDmEvent` as a
+ * third proof a run is a DM run; the recorded source is read by `run_started`
+ * to label the run's `dm_reasoning` block.
+ *
+ * Why the source is retained and not just the id (#1166): `run_started` used to
+ * recover the source by scanning `chatMessages` for a queued `thinking` row.
+ * That row is swept run-id-blind by `sealLastAgent` (which every run end and
+ * every `dm_message` calls), so a run queued behind a busy agent routinely lost
+ * its source before it started — and the block was then labelled with the
+ * UI-selected `activeAgent`. Render state is the wrong place to keep wire
+ * facts; this map is the same per-stream lifetime as the id set it replaces.
  *
  * Why this is needed (#1162 sym-2 / sym-1 attach race): `isDmEvent` otherwise
  * relies on `activeSession.session_type === 'dm'` OR an existing live
@@ -127,7 +135,7 @@ const dmPendingReplyBuffers = new Map();
  * `run_created` is an unambiguous, attach-timing-independent signal that the run
  * is a DM run, so recording it closes the gap. Cleared per stream teardown.
  */
-const peerRunIds = new Set();
+const peerRunSources = new Map();
 
 /**
  * Derive the correct agent name for a DM reasoning block from the
@@ -152,9 +160,29 @@ const peerRunIds = new Set();
  * which — combined with the old habit of streaming the reply into the
  * collapsible — is exactly the "reply shows first as an Alice message" report.
  * So for `peer:` sources we return `null` (the block renders the neutral
- * "Agent reasoning" label) rather than risk a wrong name; the `activeAgent`
- * fallback is reserved for NON-peer sources (user-initiated runs), where the
- * active agent genuinely is the one reasoning.
+ * "Agent reasoning" label) rather than risk a wrong name.
+ *
+ * ## Why there is no `activeAgent` fallback at all (#1166)
+ *
+ * #1164 left an `activeAgent` fallback here for "NON-peer sources
+ * (user-initiated runs), where the active agent genuinely is the one
+ * reasoning". Both halves of that premise are false on a DM session:
+ *
+ *   1. There are no user-initiated DM runs. `POST /runs` on any `dm:` session
+ *      is unconditionally rejected with `DM_SESSION_NOT_DIRECTLY_RUNNABLE`
+ *      (runs/lifecycle.rs), so every run this function is asked about was
+ *      peer-triggered. A source that is not `peer:`-shaped here means the
+ *      source was LOST, not that it was user-initiated.
+ *   2. The active agent need not be a participant. `navigateToSession`
+ *      deliberately does NOT `switchAgent` for DM rows ("the operator might
+ *      be reading alice's chat and quickly peeking at a DM-from-bob"), so
+ *      `activeAgent` while a DM is open is whatever the operator last
+ *      selected — frequently a third agent that is not in the conversation.
+ *
+ * So the fallback could not just pick the wrong side, it could label the
+ * block with an agent that is not in the DM at all. Every caller is inside a
+ * DM branch, so an unrecognised source now yields the same neutral label the
+ * unresolved-participants case already used.
  *
  * @param {string|null} source - the run's source field (e.g. "peer:Alice")
  * @returns {string|null} the name of the agent doing the reasoning, or null
@@ -164,15 +192,24 @@ function dmReasoningAgentName(source) {
     if (source && source.startsWith('peer:')) {
         const peerName = source.slice(5);
         const participants = dmParticipants.value;
-        if (participants.length >= 2) {
-            // The peer triggered the run — the OTHER participant is reasoning.
+        // The peer triggered the run — the OTHER participant is reasoning.
+        //
+        // The membership test is load-bearing, not defensive: without it a
+        // `peerName` matching NEITHER participant still satisfied the ternary
+        // and returned `participants[0]` — a name borrowed from an arbitrary
+        // index, with no detector. That was the one path by which this
+        // function could still name a non-owner, which the "never a guess"
+        // rule below does not permit; it also SHADOWED the strictly better
+        // `agentName` term that `run_started` ranks after this one.
+        if (participants.length >= 2 && participants.includes(peerName)) {
             return participants[0] === peerName ? participants[1] : participants[0];
         }
-        // Participants unresolved: prefer the neutral label over a wrong name.
+        // Participants unresolved, or the peer is not one of them: prefer the
+        // neutral label over a wrong name.
         return null;
     }
-    // Non-peer source (user-initiated): the active agent is the one reasoning.
-    return activeAgent.value?.name || null;
+    // Missing / unrecognised source: neutral label, never a guess (#1166).
+    return null;
 }
 
 /**
@@ -211,7 +248,7 @@ function isDmEvent(runId) {
         // This closes the attach-race window where a DM run's deltas (incl. the
         // buffered-fallback re-emit) would otherwise fall through to the non-DM
         // path and double-render against the `dm_message` bubble.
-        if (peerRunIds.has(runId)) return true;
+        if (peerRunSources.has(runId)) return true;
         // Event-driven fallback: a live DM reasoning block for this run is proof
         // the run is a DM run even when activeSession hasn't resolved yet.
         return chatMessages.value.some(
@@ -495,17 +532,19 @@ export function openSessionStream(sessionId, opts) {
         ? new Map(dmPendingReplyBuffers)
         : null;
 
-    // Carry the DM/peer run-id set across a same-session reconnect for the same
-    // reason (#1162): the set drives `isDmEvent`, and `run_created` (which
+    // Carry the DM/peer run-source map across a same-session reconnect for the
+    // same reason (#1162): it drives `isDmEvent`, and `run_created` (which
     // populates it from the `peer:` source) is non-ephemeral but may sit at or
-    // before the reconnect cursor, so it would NOT replay. Losing the set on a
+    // before the reconnect cursor, so it would NOT replay. Losing it on a
     // reconnect that lands mid-run would re-expose the attach-race fall-through
-    // for the run's remaining deltas (incl. the buffered-fallback re-emit).
+    // for the run's remaining deltas (incl. the buffered-fallback re-emit) and,
+    // since #1166, would also cost a still-queued run the source `run_started`
+    // labels its collapsible with.
     // Same gating as the pending-reply carry-over: same-session, no fresh load
     // (a fresh `loadSession` replays `run_created` from history, repopulating it).
-    const carriedPeerRunIds = (sessionId && sessionId === activeStreamSessionId
+    const carriedPeerRunSources = (sessionId && sessionId === activeStreamSessionId
         && (!opts || !(opts.sealedReasoningRunIds instanceof Set)))
-        ? new Set(peerRunIds)
+        ? new Map(peerRunSources)
         : null;
 
     closeSessionStream();
@@ -571,11 +610,13 @@ export function openSessionStream(sessionId, opts) {
             dmPendingReplyBuffers.set(runId, text);
         }
     }
-    // Re-install the carried DM/peer run-id set (mirrors the pending-reply
+    // Re-install the carried DM/peer run-source map (mirrors the pending-reply
     // re-seed above) so `isDmEvent` keeps classifying the run's deltas as DM
     // across the reconnect (#1162).
-    if (carriedPeerRunIds instanceof Set) {
-        for (const runId of carriedPeerRunIds) peerRunIds.add(runId);
+    if (carriedPeerRunSources instanceof Map) {
+        for (const [runId, source] of carriedPeerRunSources) {
+            peerRunSources.set(runId, source);
+        }
     }
     // Defer clearing the dead-state flag until the connection
     // actually opens — see the `'open'` listener below. Constructing
@@ -755,7 +796,10 @@ export function openSessionStream(sessionId, opts) {
             // Record the run as a DM run so `isDmEvent` classifies its deltas
             // correctly even before `activeSession` resolves or a `dm_reasoning`
             // block exists (#1162 attach race). The contracted run_id is its stable key.
-            peerRunIds.add(data.run_id);
+            // The source is retained (not just the id) so a run that is still
+            // QUEUED here can be attributed when `run_started` fires later,
+            // without depending on its thinking row having survived (#1166).
+            peerRunSources.set(data.run_id, data.source);
         }
 
         // Take the DM block-creation path whenever this run is known to be a DM
@@ -769,7 +813,7 @@ export function openSessionStream(sessionId, opts) {
         // indicator branch below while routing genuine DM runs here. Without
         // this, an attach-race peer run fell to the `is_notification` branch and
         // got a bare `thinking` (queuedBehind:0) row instead of a `dm_reasoning`
-        // block: live `reasoning_delta` (bucketed by `isDmEvent` via `peerRunIds`)
+        // block: live `reasoning_delta` (bucketed by `isDmEvent` via `peerRunSources`)
         // then had no block to render into, and `run_finished` had no block to
         // seal — so the run's reasoning was dropped live until a reload rebuilt
         // it from history.
@@ -880,26 +924,82 @@ export function openSessionStream(sessionId, opts) {
         // Gate via `isDmEvent` (run_id-aware) rather than a bare `activeSession`
         // read, mirroring the delta / run_finished handlers (#1162 attach race).
         // `run_started` carries no `source`, so it cannot re-detect `peer:` on
-        // its own — but `run_created` already recorded this run in `peerRunIds`,
-        // which `isDmEvent` ORs in. Without this, a QUEUED peer DM run whose
-        // `activeSession` is still unresolved at run_started time would fall to
-        // the non-DM `else` branch and never get its `dm_reasoning` block (the
+        // its own — but `run_created` already recorded this run in
+        // `peerRunSources`, which `isDmEvent` ORs in. Without this, a QUEUED
+        // peer DM run whose `activeSession` is still unresolved at run_started
+        // time would fall to the non-DM `else` branch and never get its
+        // `dm_reasoning` block (the
         // queued-run analogue of the non-queued `run_created` drop fixed above).
         const isDm = isDmEvent(data.run_id);
 
         if (isDm) {
             // DM session: replace the queued thinking indicator with a
-            // live reasoning block now that the run is actually executing.
-            // Extract the source from the queued thinking indicator (set
-            // by run_created) so we can derive the correct agent name.
+            // live reasoning block now that the run is actually executing,
+            // labelled with the agent doing the reasoning.
             // Fixes #692 — was using activeAgent which is always the
             // UI-selected agent, not necessarily the one reasoning.
+            //
+            // #1166 — three inputs, every one of them keyed to THIS run:
+            //
+            //  1. `peerRunSources`: the `peer:<name>` source THIS run's
+            //     `run_created` carried, held off-render so no sweep can
+            //     reach it. Absent only when `run_created` predates the
+            //     stream (the operator opened the DM mid-conversation) or
+            //     was dropped by a reconnect cursor.
+            //  2. `thinkingMsg.agentName`: the run's OWNING AGENT, taken by
+            //     `loadSession` step 3 straight off the run record's
+            //     `agent_id`. This is the stronger input of the two — a wire
+            //     fact with no derivation, where term 1 is a `peer:` name put
+            //     through `dmParticipants`. It is ranked SECOND anyway because
+            //     it exists only on the reload path, so leading with term 1
+            //     keeps the ordinary live turn resolving on one term instead
+            //     of falling through every time. In a two-participant DM they
+            //     cannot disagree, and term 1's one failure mode (a `peer:`
+            //     name that is not a participant) now returns null rather
+            //     than a wrong name, so it can no longer shadow this term.
+            //  3. `thinkingMsg.source`: legacy shape, kept so a row stamped by
+            //     an older frontend build still attributes.
+            //
+            // The previous code had only (3), and read it off "the FIRST
+            // queued thinking row" rather than this run's. That failed two ways:
+            // a second concurrently-queued run derived its name from the first
+            // run's source, and `sealLastAgent` (called by every run end and
+            // every `dm_message`) sweeps queued rows run-id-blind, so a run
+            // queued behind a busy agent reached `run_started` with no row at
+            // all. Both fell through to the UI-selected `activeAgent`.
+            //
+            // The sweep below is likewise keyed on this run's `run_id` so
+            // starting one run no longer deletes another's queue chip (which
+            // also left `run_queue_position` (#831) nothing to decrement).
+            // Both producers of a queued DM thinking row stamp `runId` (the
+            // `run_created` handler above and `loadSession` step 3), so
+            // routing by run_id has no un-stamped rows to strand.
+            //
+            // DECLARED RESIDUAL — this closes the ATTRIBUTION consequence, not
+            // the whole chip loss. `sealLastAgent` (and `flushDeltaBuffer`)
+            // still drop EVERY `thinking` row unconditionally, on every
+            // `dm_message` and every run end, so a run that is still
+            // legitimately queued keeps losing its position chip and
+            // `run_queue_position` still finds nothing to update. Attribution
+            // no longer depends on that row surviving — that is what
+            // `peerRunSources` above is for — but the #831 chip itself is
+            // still swept. Fixing it means scoping two shared, non-DM helpers
+            // and adding a run-id-scoped removal at run end so a
+            // cancelled-before-dispatch run does not strand a chip; that is a
+            // #831 change with non-DM blast radius, deliberately not smuggled
+            // into a DM attribution fix. Tracked separately (see #1321).
             const thinkingMsg = chatMessages.value.find(
                 m => m.type === 'thinking' && m.queuedBehind > 0
+                    && m.runId === data.run_id
             );
-            const agentName = dmReasoningAgentName(thinkingMsg?.source);
+            const agentName = dmReasoningAgentName(peerRunSources.get(data.run_id))
+                || thinkingMsg?.agentName
+                || dmReasoningAgentName(thinkingMsg?.source);
             transformMessages(msgs => {
-                const filtered = msgs.filter(m => !(m.type === 'thinking' && m.queuedBehind > 0));
+                const filtered = msgs.filter(m => !(
+                    m.type === 'thinking' && m.queuedBehind > 0
+                    && m.runId === data.run_id
+                ));
                 // Only add reasoning block if one does not already exist
                 // for this run (it may already exist if run was not queued).
                 if (!filtered.some(m => m.type === 'dm_reasoning' && m.runId === data.run_id)) {
@@ -1279,7 +1379,23 @@ export function openSessionStream(sessionId, opts) {
                 });
                 // DM tool starts do NOT update the header bar (#688).
                 // "Chatting with {peer}..." is sticky during DMs.
-            } else if (data.tool === 'invoke_agent') {
+            } else if (data.tool === 'invoke_agent' && !data.source_agent) {
+                // The `!data.source_agent` clause is what keeps ARM ORDER from
+                // being load-bearing (#1167 investigation). This arm sits ABOVE
+                // the `data.source_agent` drop below, so without it a
+                // subagent-tagged `invoke_agent` — alone among tagged tools —
+                // reached `appendMessage` and rendered as a PARENT tool row,
+                // contradicting the drop arm's own contract ("they must never
+                // render as parent tool rows"). In a DM that is a top-level tool
+                // row escaping the collapsible with `isDmEvent` TRUE — exactly
+                // the #1167 shape, and not covered by the `isDmEvent === false`
+                // reasoning that closes every other route to that fallback.
+                //
+                // Unreachable today: it needs a subagent to call `invoke_agent`,
+                // and recursive spawning is not shipped. This clause is a
+                // no-op on every path that exists now (an untagged invoke_agent
+                // is unaffected; a tagged one now takes the drop arm like its
+                // siblings) and closes the route before it can open.
                 sealLastAgent();
                 const name = data.params?.name || data.params?.subagent_name || 'subagent';
                 const task = data.params?.task || '';
@@ -2153,10 +2269,10 @@ export function closeSessionStream() {
     // collapsible, so it must not leak into a different session's run on
     // reopen. (#1157/#1162)
     dmPendingReplyBuffers.clear();
-    // Drop the DM/peer run-id set for the same reason — a different session's
+    // Drop the DM/peer run-source map for the same reason — a different session's
     // runs must not inherit this session's DM classification. A same-session
     // reconnect re-installs it via the carry-over in `openSessionStream`. (#1162)
-    peerRunIds.clear();
+    peerRunSources.clear();
     clearAgentPhase();
     // Drop the per-session reasoning-dedupe suppress-set (#1135) for the
     // stream being torn down so the store does not accumulate entries across

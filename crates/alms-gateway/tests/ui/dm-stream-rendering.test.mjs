@@ -1294,3 +1294,224 @@ test('malformed numeric session SSE reconciles before resuming past the frame', 
 
     reset();
 });
+
+// ---------------------------------------------------------------------------
+// #1166 — a DM run's collapsible must never be labelled with the UI-selected
+// agent.
+//
+// `run_started` turns a queued run's thinking indicator into that run's
+// `dm_reasoning` block and has to name the agent doing the reasoning. It used
+// to recover that name from "the first queued thinking row in chatMessages",
+// then fall back to `activeAgent` — the sidebar selection, which
+// `navigateToSession` deliberately does NOT change when a DM is opened, so it
+// is frequently the peer, and sometimes an agent that is not in the DM at all.
+//
+// Three inputs could send it down that fallback:
+//   a) `loadSession` step 3 reconstructs the indicator for an already-queued
+//      run and never had a `source` to stamp (opening a DM mid-conversation);
+//   b) a second concurrently-queued run read the FIRST row's source;
+//   c) `sealLastAgent` — called by every `dm_message` and every run end —
+//      sweeps queued rows run-id-blind, so a run queued behind a busy agent
+//      reached `run_started` with no row at all.
+//
+// PARTICIPANTS is alphabetical, as the backend sorts a `dm:{a}:{b}` context id,
+// and `replier()` derives the expected name from the `peer:` source the way
+// the product rule reads: the peer sent, so the OTHER participant reasons.
+// ---------------------------------------------------------------------------
+
+const PARTICIPANTS = ['alice', 'bob'];
+
+/** The participant that is NOT `peerName` — i.e. the one doing the reasoning. */
+function replier(peerName) {
+    const other = PARTICIPANTS.filter(p => p !== peerName);
+    assert.equal(other.length, 1, `fixture error: ${peerName} must be a participant`);
+    return other[0];
+}
+
+/** Put the harness in "viewing a DM, sidebar parked on `selected`" state. */
+function openDmViewedAs(selected) {
+    T.activeSession.value = { session_type: 'dm', participants: PARTICIPANTS };
+    T.dmParticipants.value = PARTICIPANTS;
+    T.activeAgent.value = { name: selected };
+    return openStream('dm-sess');
+}
+
+test('#1166: a DM run with no recoverable source is labelled neutrally, never with the UI-selected agent', () => {
+    reset();
+    // `carol` is not in this DM at all — opening a DM does not switch the
+    // active agent, so the sidebar can be parked on any agent in the tenant.
+    const es = openDmViewedAs('carol');
+    // A queued indicator carrying neither a source nor an owning agent: the
+    // pre-#1166 `loadSession` step-3 shape, and the only shape left once every
+    // richer input is absent.
+    T.chatMessages.value = [
+        { id: 'seed', type: 'thinking', queuedBehind: 1, runId: 'R' },
+    ];
+
+    es.emit('run_started', { run_id: 'R' });
+
+    const block = reasoningBlock('R');
+    assert.ok(block, 'the queued run still becomes a dm_reasoning block');
+    assert.equal(block.agentName, null,
+        'an unattributable DM run renders the neutral "Agent reasoning" label '
+        + 'rather than borrowing the UI-selected agent');
+});
+
+test('#1166: a queued DM run takes its source from ITS OWN indicator, not the first queued one', () => {
+    reset();
+    // Sidebar on `bob` so the expected answer (`replier('bob')` === 'alice')
+    // is NOT what an `activeAgent` fallback would produce either — the row
+    // reads as a genuine attribution, not one the confound could satisfy.
+    const es = openDmViewedAs('bob');
+    // Two runs queued at once, indicators seeded directly so `peerRunSources`
+    // is empty and the row is the ONLY available input. R2 is listed second so
+    // a run-id-blind `find` would read R1's source.
+    T.chatMessages.value = [
+        { id: 's1', type: 'thinking', queuedBehind: 1, runId: 'R1', source: 'peer:alice' },
+        { id: 's2', type: 'thinking', queuedBehind: 2, runId: 'R2', source: 'peer:bob' },
+    ];
+
+    es.emit('run_started', { run_id: 'R2' });
+
+    assert.equal(reasoningBlock('R2').agentName, replier('bob'),
+        'R2 is attributed from its own peer:bob source, not R1\'s peer:alice');
+});
+
+test('#1166: starting one queued DM run leaves the other queued run\'s indicator alone', () => {
+    reset();
+    const es = openDmViewedAs('alice');
+    es.emit('run_created', { run_id: 'R1', source: 'peer:alice', is_notification: true, queued_behind: 1 });
+    es.emit('run_created', { run_id: 'R2', source: 'peer:bob', is_notification: true, queued_behind: 2 });
+
+    es.emit('run_started', { run_id: 'R1' });
+
+    const survivor = thinkingRow('R2');
+    assert.ok(survivor, 'R2 keeps its queued indicator when an unrelated run starts');
+    assert.equal(survivor.queuedBehind, 2, 'and keeps its queue position');
+    // The position chip is what `run_queue_position` (#831) decrements; a
+    // blanket sweep left that handler with nothing to update.
+    es.emit('run_queue_position', { run_id: 'R2', position: 1 });
+    assert.equal(thinkingRow('R2').queuedBehind, 1,
+        'the surviving indicator is still reachable by run_queue_position');
+});
+
+test('#1166: a DM run whose indicator was swept by dm_message is still attributed from its recorded source', () => {
+    reset();
+    const es = openDmViewedAs('alice');
+    // R is queued behind a busy agent while the peer's turn completes. The
+    // delivered bubble runs `sealLastAgent`, which drops every thinking row.
+    es.emit('run_created', { run_id: 'R', source: 'peer:alice', is_notification: true, queued_behind: 1 });
+    es.emit('dm_message', { message: 'over to you', from_agent: 'alice', from_agent_id: 'a' });
+    assert.equal(thinkingRow('R'), undefined,
+        'precondition: the queued indicator really is gone by run_started');
+
+    es.emit('run_started', { run_id: 'R' });
+
+    assert.equal(reasoningBlock('R').agentName, replier('alice'),
+        'the run_created source, retained per run, survives the render-state sweep');
+});
+
+test('#1166: the reconstructed indicator\'s owning agent attributes a run whose run_created predates the stream', () => {
+    reset();
+    const es = openDmViewedAs('alice');
+    // Opening a DM mid-conversation: `run_created` sits at or before the
+    // history cursor and never replays, so `peerRunSources` has nothing. What
+    // `loadSession` step 3 CAN supply is the run's owning agent, read from
+    // `GET /runs/{id}`.
+    const seed = { id: 'seed', type: 'thinking', queuedBehind: 1, runId: 'R', agentName: 'bob' };
+    T.chatMessages.value = [seed];
+
+    es.emit('run_started', { run_id: 'R' });
+
+    assert.equal(reasoningBlock('R').agentName, seed.agentName,
+        'the block is labelled with the run\'s owning agent, not the sidebar selection');
+});
+
+test('#1166: the owning-agent stamp — not the sidebar agreeing by luck — supplies the name', () => {
+    reset();
+    // Same shape as the previous row with the confound removed: the sidebar is
+    // parked on the reasoning agent, so a fallback to `activeAgent` would
+    // produce the right answer for the wrong reason. The stamp must still be
+    // what carries it, or the previous row is passing on a coincidence.
+    const es = openDmViewedAs('bob');
+    const seed = { id: 'seed', type: 'thinking', queuedBehind: 1, runId: 'R', agentName: 'bob' };
+    T.chatMessages.value = [seed];
+
+    es.emit('run_started', { run_id: 'R' });
+
+    assert.equal(reasoningBlock('R').agentName, seed.agentName);
+});
+
+test('#1166: the per-run source survives a same-session reconnect', () => {
+    reset();
+    const es = openDmViewedAs('alice');
+    es.emit('run_created', { run_id: 'R', source: 'peer:alice', is_notification: true, queued_behind: 1 });
+    es.emit('dm_message', { message: 'over to you', from_agent: 'alice', from_agent_id: 'a' });
+
+    // Backoff reopen mid-queue: the cursor is past run_created, so it does not
+    // replay, and chatMessages (already swept) carries no fallback.
+    const es2 = reconnectStream('dm-sess');
+    es2.emit('run_started', { run_id: 'R' });
+
+    assert.equal(reasoningBlock('R').agentName, replier('alice'),
+        'the carried per-run source still attributes the block after a reconnect');
+});
+
+test('#1166: a peer: source naming a non-participant yields the neutral label, not participants[0]', () => {
+    reset();
+    const es = openDmViewedAs('alice');
+    // A `peer:` source whose name is in neither participant slot. The ternary
+    // that resolves `peer:<name>` has no correct answer here, and the index it
+    // would otherwise return is arbitrary — so there must be no name at all.
+    const stranger = 'carol';
+    assert.ok(!PARTICIPANTS.includes(stranger), 'fixture: must not be a participant');
+    es.emit('run_created', {
+        run_id: 'R', source: `peer:${stranger}`, is_notification: true, queued_behind: 0,
+    });
+
+    assert.strictEqual(reasoningBlock('R').agentName, null,
+        'an unresolvable peer yields no name rather than a borrowed index');
+});
+
+test('#1167 latent: a subagent-tagged invoke_agent must not escape the collapsible', () => {
+    reset();
+    const es = openDmViewedAs('alice');
+    es.emit('run_created', { run_id: 'R', source: 'peer:alice', is_notification: true, queued_behind: 0 });
+    // Every OTHER subagent-tagged tool is dropped by the `data.source_agent`
+    // arm ("they must never render as parent tool rows"). `invoke_agent` was
+    // matched one arm ABOVE that drop, so it alone reached `appendMessage` —
+    // a top-level tool row in a DM with `isDmEvent` TRUE, which is the one
+    // route to the standalone-ToolRow fallback that the `isDmEvent === false`
+    // argument does not cover. Unreachable until recursive subagent spawning
+    // ships; pinned so arm order stops being load-bearing.
+    es.emit('tool_start', {
+        run_id: 'R', tool: 'invoke_agent', params: { name: 'nested' },
+        tool_invocation_id: 'inv-nested', source_agent: 'researcher',
+    });
+
+    assert.deepEqual(
+        T.chatMessages.value.filter(m => m.type === 'tool'), [],
+        'a tagged invoke_agent must not render as a parent tool row',
+    );
+    assert.deepEqual(reasoningBlock('R').tools, [],
+        'nor be smuggled into the peer collapsible — it belongs to no run here');
+});
+
+test('#1166 control: a normal non-queued DM turn is unaffected and reads its name from run_created', () => {
+    reset();
+    // Same run, same events, sidebar parked on each side in turn: the label
+    // must not move with the selection.
+    for (const selected of PARTICIPANTS) {
+        reset();
+        const es = openDmViewedAs(selected);
+        es.emit('run_created', { run_id: 'R', source: 'peer:alice', is_notification: true, queued_behind: 0 });
+        es.emit('tool_start', { run_id: 'R', tool: 'fs_read', params: {}, tool_invocation_id: 'inv-1' });
+        es.emit('tool_end', { run_id: 'R', tool_invocation_id: 'inv-1', ok: true, result: {} });
+
+        const block = reasoningBlock('R');
+        assert.equal(block.agentName, replier('alice'),
+            `sidebar parked on ${selected} must not change the attribution`);
+        assert.equal(block.tools.length, 1,
+            'and the turn\'s tool call still groups inside that block');
+    }
+});

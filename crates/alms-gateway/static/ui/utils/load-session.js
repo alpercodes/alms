@@ -29,7 +29,7 @@ import { activeRunId, runs, replaceRuns, setRunStatus, upsertRun } from '../stat
 import { openSessionStream, registerSessionContractReconciler } from '../hooks/use-session-stream.js';
 import { setAgentPhase, clearAgentPhase, setDmContext } from '../state/agent-status.js';
 import { sessions, crossAgentSessions, activeSessionId, upsertSession } from '../state/sessions.js';
-import { activeAgent } from '../state/agents.js';
+import { activeAgent, agents } from '../state/agents.js';
 import { getPendingMessages, confirmOptimisticMessage } from '../state/pending-messages.js';
 import { rehydrateSubagentsFromHistory, parentSessionId } from '../state/subagents.js';
 
@@ -420,11 +420,38 @@ export async function loadSession(sessionId, opts) {
                     if (opts.requireAuthoritativeSnapshot) throw err;
                 }
             }
+            // Stamp the run's OWNING AGENT name (#1166).
+            //
+            // On a DM session `run_started` turns this indicator into the
+            // run's `dm_reasoning` block and has to label that block with the
+            // agent doing the reasoning. Its only input was the indicator's
+            // `source` — which the live `run_created` handler stamps but this
+            // reconstruction never had, so the block fell through to the
+            // UI-selected `activeAgent`: a coin flip when the operator is
+            // viewing the peer's side, and not even a participant when the
+            // operator is viewing a third agent (opening a DM deliberately
+            // does not switch the active agent, see `navigateToSession`).
+            //
+            // `agent_id` is the authoritative answer and is already on the
+            // wire: `sessionRunSchema` marks it REQUIRED and backs both
+            // `GET /runs?session_id` (the step-1 fetch behind `activeRun`) and
+            // `GET /runs/{id}`, and a DM run's owning agent IS the agent doing
+            // the reasoning. Reading it off the step-1 record is therefore
+            // enough — the queued-only `getRun` probe above could never refine
+            // it — and it means the live block is labelled CORRECTLY rather
+            // than merely not-wrongly. When the agent roster has not resolved
+            // (or the owner is not in it) this stays null and
+            // `dmReasoningAgentName` renders the neutral "Agent reasoning".
+            const runAgentId = activeRun?.agent_id || null;
+            const runAgentName = runAgentId
+                ? (agents.value.find(a => a.id === runAgentId)?.name || null)
+                : null;
             // Stamp runId so the live `run_queue_position` SSE handler can
             // locate this indicator and decrement it in place.
             appendMessage({
                 id: nextMsgId(), type: 'thinking',
                 queuedBehind, runId: activeRunId.value,
+                agentName: runAgentName,
             });
         }
 

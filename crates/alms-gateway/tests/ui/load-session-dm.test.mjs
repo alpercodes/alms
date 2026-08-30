@@ -158,6 +158,11 @@ const sessions = signal([]);
 const crossAgentSessions = signal([]);
 const activeSessionId = signal(null);
 const activeAgent = signal(null);
+// The tenant agent roster. Step 3 resolves a run's owning agent id to a name
+// through this list so a DM run's collapsible can be labelled correctly
+// (#1166); it is NOT filtered to the active agent, which is the point — a DM's
+// participants are frequently not the sidebar selection.
+const agents = signal([]);
 
 // ---- inert helpers ----
 function getPendingMessages() { return []; }
@@ -178,7 +183,7 @@ function normalizeApproval(a) {
 // Test hooks — exported so the harness can reach the live signals + recordings.
 export const __test = {
     chatMessages, activeRunId, runs, sessions, crossAgentSessions,
-    activeSessionId, activeAgent, parentSessionId, __calls,
+    activeSessionId, activeAgent, agents, parentSessionId, __calls,
 };
 `;
 
@@ -314,6 +319,7 @@ function reset() {
     T.crossAgentSessions.value = [];
     T.activeSessionId.value = null;
     T.activeAgent.value = null;
+    T.agents.value = [];
     T.parentSessionId.value = null;
     T.__calls.getRunReasoning.length = 0;
     T.__calls.getRunText.length = 0;
@@ -583,6 +589,120 @@ test('terminal probe failure preserves a queued sibling run', async () => {
     assert.equal(T.activeRunId.value, SIBLING,
         'terminal-probe fallback must preserve queued sibling activity');
 });
+
+// ---------------------------------------------------------------------------
+// #1166 — the reconstructed queued indicator must carry the run's owning agent.
+//
+// Opening a DM while a run is queued is the everyday way a DM run reaches
+// `run_started` with no `peer:` source on the wire: `run_created` already fired
+// before this stream opened and sits at or before the history cursor, so it
+// never replays. The indicator this step appends is then the ONLY thing
+// `run_started` has to name the run's collapsible with — and it carried no
+// attribution at all, so the block fell through to the UI-selected
+// `activeAgent`. That selection is not changed by opening a DM
+// (`navigateToSession` skips `switchAgent` for DM rows), so it is the peer's
+// name about half the time and a non-participant's the rest.
+//
+// `agent_id` is on the wire already (`sessionRunSchema` covers both
+// `GET /runs?session_id` and `GET /runs/{id}`), and for a DM run the owning
+// agent IS the agent doing the reasoning.
+// ---------------------------------------------------------------------------
+
+const AGENT_ROSTER = [
+    { id: 'agent-alice', name: 'alice' },
+    { id: 'agent-bob', name: 'bob' },
+    { id: 'agent-carol', name: 'carol' },
+];
+
+/** Fixture: a DM load landing on a queued run owned by `ownerId`. */
+function queuedDmApi(runId, ownerId) {
+    return makeApi({
+        getSession: async () => ({ ...DM_ENVELOPE, has_active_run: true }),
+        listRuns: async () => ({
+            runs: [{ run_id: runId, status: 'queued', agent_id: ownerId }],
+        }),
+        // Deliberately a DIFFERENT owner from the step-1 list record. The
+        // queued-only `getRun` probe must not feed attribution: `agent_id` is
+        // REQUIRED on `sessionRunSchema`, which backs `GET /runs?session_id`
+        // too, so step 1 always already holds it. If the deleted refinement
+        // is ever reintroduced this fixture makes it fail loudly instead of
+        // agreeing by construction.
+        getRun: async () => ({
+            run_id: runId, agent_id: 'agent-carol', queue_position: 2,
+        }),
+    });
+}
+
+test('#1166: a queued DM run\'s reconstructed indicator carries the run\'s owning agent', async () => {
+    reset();
+    T.crossAgentSessions.value = [DM_ENVELOPE];
+    T.agents.value = AGENT_ROSTER;
+    // The sidebar is parked on a THIRD agent — not a participant. This is the
+    // input that used to be borrowed as the label.
+    T.activeAgent.value = AGENT_ROSTER.find(a => a.name === 'carol');
+    const RUN = 'run-queued-dm';
+    const owner = AGENT_ROSTER.find(a => a.name === 'bob');
+    globalThis.__lsApi = queuedDmApi(RUN, owner.id);
+
+    await runLoadSession();
+
+    const indicator = T.chatMessages.value.find(
+        m => m.type === 'thinking' && m.runId === RUN,
+    );
+    assert.ok(indicator, 'a queued run still gets its indicator');
+    assert.equal(indicator.queuedBehind, 2, 'and its live queue position');
+    assert.equal(indicator.agentName, owner.name,
+        'the indicator names the run\'s OWNING agent, resolved from agent_id — '
+        + 'this is what run_started labels the collapsible with');
+    assert.notEqual(indicator.agentName, T.activeAgent.value.name,
+        'and it is not the sidebar selection');
+});
+
+test('#1166: the owner is stamped even when the sidebar happens to be on that same agent', async () => {
+    reset();
+    T.crossAgentSessions.value = [DM_ENVELOPE];
+    T.agents.value = AGENT_ROSTER;
+    const owner = AGENT_ROSTER.find(a => a.name === 'bob');
+    // Confound removed: with the sidebar parked ON the owner, resolving the
+    // name from the sidebar instead of `agent_id` would look correct. Only
+    // dropping the stamp entirely is visible here, which is what separates
+    // "stamps the wrong thing" from "stamps nothing".
+    T.activeAgent.value = owner;
+    const RUN = 'run-queued-dm';
+    globalThis.__lsApi = queuedDmApi(RUN, owner.id);
+
+    await runLoadSession();
+
+    const indicator = T.chatMessages.value.find(
+        m => m.type === 'thinking' && m.runId === RUN,
+    );
+    assert.equal(indicator.agentName, owner.name);
+});
+
+test('#1166: an unresolvable owning agent leaves the indicator unattributed rather than guessing', async () => {
+    reset();
+    T.crossAgentSessions.value = [DM_ENVELOPE];
+    // Roster has not loaded (or the owner is not in it): there is no name to
+    // resolve, and the downstream `dmReasoningAgentName` renders neutral.
+    T.agents.value = [];
+    T.activeAgent.value = { id: 'agent-carol', name: 'carol' };
+    const RUN = 'run-queued-dm';
+    globalThis.__lsApi = queuedDmApi(RUN, 'agent-bob');
+
+    await runLoadSession();
+
+    const indicator = T.chatMessages.value.find(
+        m => m.type === 'thinking' && m.runId === RUN,
+    );
+    // `strictEqual`, deliberately: the row has to distinguish "stamped, with
+    // no name to give" from "never stamped at all". Under `assert.equal`'s
+    // `==`, `undefined == null` passes and the absent-key case would slip
+    // through — which is also what keeps the M9-is-a-subset-of-M8 claim in the
+    // PR's mutation table true rather than an artefact of the import line.
+    assert.strictEqual(indicator.agentName, null,
+        'an unresolvable owner yields no name, never the sidebar selection');
+});
+
 test('control: mid-run NON-DM load still seeds the in-flight text (skip is DM-scoped)', async () => {
     reset();
     const CHAT_ENVELOPE = {
