@@ -5,6 +5,7 @@
 //! sorted name pair) rather than by `(agent_id, context_id)`.
 
 use crate::dm_filter;
+use crate::session_read;
 use alms_core::SessionId;
 use alms_sandbox::{SandboxError, Tool, error::SandboxResult};
 use alms_session::{Message, SessionManager};
@@ -12,22 +13,17 @@ use serde_json::Value;
 use std::sync::Arc;
 
 /// Hard byte cap on the summed *serialized JSON* size of the per-message
-/// entries returned in a single `read_messages` call (~15K tokens). Sized
-/// to stay well below typical context windows so the response can't
-/// single-handedly blow the agent's budget when an LLM forgets to page
-/// through long history.
+/// entries returned in a single `read_messages` call (~15K tokens).
 ///
-/// The unit is JSON bytes -- specifically the `serde_json` rendering of
-/// each `{"from": "...", "content": "..."}` object -- so content with many
-/// escapable characters (`"`, `\`, newlines, control bytes) is measured at
-/// its post-escape size, not its raw UTF-8 size. This is what the LLM
-/// actually consumes.
-pub const READ_MESSAGES_SERIALIZED_BYTE_CAP: usize = 60_000;
+/// Kept as a named alias of the shared [`session_read::SERIALIZED_BYTE_CAP`]
+/// (#1032): the cap itself is now one value for all three session-reading
+/// tools, and this name stays because it is the one #1028's tests and review
+/// thread refer to.
+pub const READ_MESSAGES_SERIALIZED_BYTE_CAP: usize = session_read::SERIALIZED_BYTE_CAP;
 
 /// Soft backstop on the message count returned in a single `read_messages`
-/// call. Guards against pathological inputs (very chatty DMs where each
-/// message is a few bytes and the byte cap would never fire).
-pub const READ_MESSAGES_MESSAGE_CAP: usize = 200;
+/// call. Alias of the shared [`session_read::MESSAGE_CAP`] (#1032).
+pub const READ_MESSAGES_MESSAGE_CAP: usize = session_read::MESSAGE_CAP;
 
 /// Built-in tool that reads the DM conversation history with another agent.
 ///
@@ -102,41 +98,10 @@ impl Tool for ReadMessagesTool {
                 SandboxError::InvalidParameters("'from' is required and must be non-empty".into())
             })?;
 
-        // `last_n` is optional. When the caller passes it explicitly we honor
-        // it verbatim (agents can still page deterministically). When omitted
-        // (or explicitly `null`) we return everything bounded only by the byte
-        // / message-count caps below.
-        //
-        // Malformed values -- negative numbers, non-integer floats like 3.5,
-        // strings, booleans, arrays, objects -- are rejected with a clear
-        // `InvalidParameters` error instead of silently falling back to the
-        // default-all path. The schema also pins `last_n` to a non-negative
-        // integer, but we validate here too because JSON-schema enforcement
-        // in the tool-call path is best-effort at the LLM layer and the
-        // runtime is the only place we can guarantee deterministic paging.
-        // See PR #1028 (Codex P2) for the regression this guards against:
-        // pre-fix `params.get("last_n").and_then(|v| v.as_u64()).unwrap_or(20)`
-        // routed `{ "last_n": -1 }` to a hard fallback of 20; the byte-cap
-        // refactor turned the same `None` into "return everything up to the
-        // byte / message caps", silently inflating returned context.
-        let explicit_last_n = match params.get("last_n") {
-            None | Some(Value::Null) => None,
-            Some(Value::Number(n)) => {
-                if let Some(u) = n.as_u64() {
-                    // Genuine non-negative integer in u64 range.
-                    Some(u as usize)
-                } else {
-                    return Err(SandboxError::InvalidParameters(format!(
-                        "'last_n' must be a non-negative integer; got {n}"
-                    )));
-                }
-            }
-            Some(other) => {
-                return Err(SandboxError::InvalidParameters(format!(
-                    "'last_n' must be a non-negative integer; got {other}"
-                )));
-            }
-        };
+        // `last_n` is optional, and malformed values are rejected rather than
+        // silently defaulting -- see `session_read::parse_last_n` for the
+        // #1028 regression that shape guards against.
+        let explicit_last_n = session_read::parse_last_n(&params)?;
 
         // Look up the shared DM session by its deterministic SessionId.
         let session_id = SessionId::deterministic_dm(&self.agent_name, from);
@@ -162,12 +127,10 @@ impl Tool for ReadMessagesTool {
             .filter(|m| !dm_filter::is_synthetic_marker(m))
             .collect();
 
-        let total_count = real_messages.len();
-
         // Helper: project a `Message` into its wire-shape JSON value (the
         // exact `{"from": "...", "content": "..."}` object that ends up in
         // the response `messages` array).
-        let project = |m: &Message| -> Value {
+        let project = |m: &&Message| -> Value {
             let from_agent = m
                 .metadata
                 .as_ref()
@@ -189,90 +152,18 @@ impl Tool for ReadMessagesTool {
             })
         };
 
-        // Decide which trailing slice to return.
-        //
-        // Order of precedence:
-        //   1. Explicit `last_n` from the caller -- honored verbatim. If the
-        //      DM actually has more messages than `last_n` we still flag
-        //      `truncated: true` with reason `explicit_last_n` so the agent
-        //      knows older messages exist.
-        //   2. Otherwise, walk backwards from the newest message and keep
-        //      messages as long as neither the byte cap nor the message-count
-        //      cap is exceeded. Whichever cap fires first wins.
-        //
-        // Both branches build the trailing slice in reverse order, then
-        // reverse once at the end. The default branch walks the history
-        // backwards and breaks as soon as a cap fires, so the work is
-        // O(returned_count) rather than O(total_count) -- the 10k-message-DM
-        // worst case never materializes a full projection (see #1028 / P2).
-        let (mut recent_rev, truncation_reason): (Vec<Value>, Option<&'static str>) =
-            match explicit_last_n {
-                Some(n) => {
-                    let start = total_count.saturating_sub(n);
-                    let reason = if start > 0 {
-                        Some("explicit_last_n")
-                    } else {
-                        None
-                    };
-
-                    // Project only the trailing `n` messages and reverse so
-                    // we can share the post-loop `reverse()` with the default
-                    // branch below.
-                    let mut acc: Vec<Value> =
-                        real_messages[start..].iter().map(|m| project(m)).collect();
-                    acc.reverse();
-                    (acc, reason)
-                }
-                None => {
-                    let mut acc: Vec<Value> = Vec::new();
-                    let mut byte_sum: usize = 0;
-                    let mut reason: Option<&'static str> = None;
-
-                    // Iterate newest -> oldest. Measure each projected entry
-                    // at its *serialized JSON* size (not raw UTF-8) so the
-                    // cap stays accurate even when content contains lots of
-                    // escapable characters like `"`, `\`, or newlines.
-                    //
-                    // As soon as adding the next message would breach either
-                    // cap, stop and record the reason. We break BEFORE
-                    // serializing+projecting the remaining tail, so the work
-                    // is bounded by what we actually return.
-                    for m in real_messages.iter().rev() {
-                        if acc.len() >= READ_MESSAGES_MESSAGE_CAP {
-                            reason = Some("message_cap");
-                            break;
-                        }
-                        let entry = project(m);
-                        // Serialize this entry to measure its exact wire-bytes
-                        // -- post-escape, with key wrappers -- which is what
-                        // the LLM consumes from the tool result. The serialized
-                        // string is dropped here (we only keep its length);
-                        // the response builder below re-encodes each admitted
-                        // entry once when constructing the final JSON array.
-                        // The win is still O(returned_count) measurements
-                        // instead of O(total_count) projection -- we break
-                        // before serializing the rejected tail.
-                        let entry_bytes = serde_json::to_string(&entry)
-                            .map(|s| s.len())
-                            .unwrap_or(usize::MAX);
-                        let next_bytes = byte_sum.saturating_add(entry_bytes);
-                        if next_bytes > READ_MESSAGES_SERIALIZED_BYTE_CAP {
-                            reason = Some("byte_cap");
-                            break;
-                        }
-                        byte_sum = next_bytes;
-                        acc.push(entry);
-                    }
-                    (acc, reason)
-                }
-            };
-
-        // Restore chronological order: we appended newest-first above.
-        recent_rev.reverse();
-        let recent = recent_rev;
-
-        let returned_count = recent.len();
-        let truncated = truncation_reason.is_some();
+        // Decide which trailing slice to return. The precedence (explicit
+        // `last_n` honoured verbatim but flagged, otherwise a byte- and
+        // count-capped walk from the newest message backwards) is shared with
+        // `read_session` and `read_subagent_session` -- see `session_read`.
+        let selection = session_read::select_recent(
+            &real_messages,
+            explicit_last_n,
+            READ_MESSAGES_SERIALIZED_BYTE_CAP,
+            READ_MESSAGES_MESSAGE_CAP,
+            project,
+        );
+        let total_count = selection.total_count;
 
         // Get summary if available
         let summary = self
@@ -282,20 +173,19 @@ impl Tool for ReadMessagesTool {
             .filter(|s| !s.text.is_empty())
             .map(|s| s.text);
 
-        Ok(serde_json::json!({
+        let mut result = serde_json::json!({
             "peer": from,
             // Legacy fields kept for back-compat with any consumers that
-            // grew up on the old shape; new contract is the explicit
-            // `total_count` / `returned_count` / `truncated` triple.
+            // grew up on the old shape; the contract is the explicit
+            // `total_count` / `returned_count` / `truncated` /
+            // `truncation_reason` quartet stamped below.
             "message_count": total_count,
-            "showing": returned_count,
-            "total_count": total_count,
-            "returned_count": returned_count,
-            "truncated": truncated,
-            "truncation_reason": truncation_reason,
-            "messages": recent,
+            "showing": selection.returned_count(),
+            "messages": selection.entries,
             "summary": summary.as_deref().unwrap_or(""),
-        }))
+        });
+        selection.write_contract_fields(&mut result);
+        Ok(result)
     }
 
     fn is_builtin(&self) -> bool {

@@ -11,11 +11,25 @@
 //! result, `subagent_started` event, and completion notification already
 //! surfaces to the parent.
 
+use crate::session_read;
 use alms_core::{AgentId, SessionId, SubagentSessionAccess};
 use alms_sandbox::{SandboxError, Tool, error::SandboxResult};
 use alms_session::SessionManager;
 use serde_json::Value;
 use std::sync::Arc;
+
+/// Project a persisted message into this tool's wire shape.
+///
+/// Shared by the normal read and the `summary_only` fallback so the two paths
+/// cannot render the same message differently -- they were separate inline
+/// closures before #1032, which is exactly the kind of duplicate a later edit
+/// updates on one side only.
+fn project_msg(m: &alms_session::Message) -> Value {
+    serde_json::json!({
+        "role": format!("{:?}", m.role).to_lowercase(),
+        "content": m.content.to_display_string(),
+    })
+}
 
 /// Built-in tool that reads conversation history from a subagent's session.
 ///
@@ -118,8 +132,12 @@ impl Tool for ReadSubagentSessionTool {
          (created via invoke_agent with a name), pass 'name'. For an ephemeral / \
          unnamed subagent (e.g. a background invoke_agent without a name), pass \
          'session_id' — the subagent session UUID from the invoke_agent result or \
-         the completion notification. Returns the last N messages (default 20) \
-         and the session summary if available."
+         the completion notification. By default returns the whole transcript and \
+         the session summary if available. The response carries `total_count` \
+         (messages in the session), `returned_count` (what's in the `messages` \
+         array), and `truncated: bool` -- check these to detect whether older \
+         messages were omitted. Pass `last_n` explicitly if you only need a \
+         specific count."
     }
 
     fn parameters(&self) -> Value {
@@ -146,14 +164,21 @@ impl Tool for ReadSubagentSessionTool {
                 },
                 "last_n": {
                     "type": "integer",
-                    "description": "Number of most recent messages to return. Default: 20."
+                    "minimum": 0,
+                    "description": "Optional: number of most-recent messages to return. \
+                                    Must be a non-negative integer. Omit to return all messages \
+                                    (subject to response-size limits indicated by the `truncated` \
+                                    flag). Malformed values (negative, non-integer, non-numeric) \
+                                    are rejected with InvalidParameters rather than silently \
+                                    falling back."
                 },
                 "summary_only": {
                     "type": "boolean",
                     "description": "If true, return the rolling context summary when available. \
-                                    When no summary exists, falls back to returning recent messages \
-                                    (capped at last_n or 10, whichever is smaller) with distinct \
-                                    fallback_messages/fallback_message_count keys. Default: false."
+                                    When no summary exists, falls back to returning a few recent \
+                                    messages with distinct fallback_messages/fallback_message_count \
+                                    keys, alongside the same truncated/truncation_reason fields as \
+                                    a normal read. Default: false."
                 }
             },
             "required": []
@@ -171,7 +196,9 @@ impl Tool for ReadSubagentSessionTool {
             .and_then(|v| v.as_str())
             .filter(|s| !s.is_empty());
 
-        let last_n = params.get("last_n").and_then(|v| v.as_u64()).unwrap_or(20) as usize;
+        // #1032: no silent default. Omitted means "everything, bounded by the
+        // caps"; malformed is an error rather than a quiet fallback to 20.
+        let explicit_last_n = session_read::parse_last_n(&params)?;
 
         let summary_only = params
             .get("summary_only")
@@ -282,31 +309,45 @@ impl Tool for ReadSubagentSessionTool {
                 }));
             }
 
-            // No summary available — fall back to the last N messages so the
+            // No summary available — fall back to a few recent messages so the
             // caller still gets useful context instead of an empty response.
+            //
+            // This path keeps its own, much smaller message cap: it is a
+            // consolation prize for a missing summary, not a transcript read
+            // (that is this same tool without `summary_only`). So the shared
+            // walk runs with `FALLBACK_COUNT` as its message cap.
+            //
+            // An explicit `last_n` ABOVE that cap is deliberately not passed
+            // through as an explicit bound: the caller's number is not what
+            // limits the result, the fallback cap is, and reporting
+            // `explicit_last_n` would credit a number this path never
+            // honoured. Passing `None` lets the walk report `message_cap`,
+            // which is what actually fired.
             const FALLBACK_COUNT: usize = 10;
-            let effective_count = last_n.min(FALLBACK_COUNT);
-            let start = total.saturating_sub(effective_count);
-            let recent: Vec<Value> = messages[start..]
-                .iter()
-                .map(|m| {
-                    serde_json::json!({
-                        "role": format!("{:?}", m.role).to_lowercase(),
-                        "content": m.content.to_display_string()
-                    })
-                })
-                .collect();
+            let fallback_explicit = explicit_last_n.filter(|n| *n <= FALLBACK_COUNT);
+            let selection = session_read::select_recent(
+                &messages,
+                fallback_explicit,
+                session_read::SERIALIZED_BYTE_CAP,
+                FALLBACK_COUNT,
+                project_msg,
+            );
 
-            return Ok(serde_json::json!({
+            let mut result = serde_json::json!({
                 "subagent": subagent_label,
                 "session_id": session_id_str,
                 "summary": Value::Null,
                 "has_summary": false,
-                "fallback_messages": recent,
-                "fallback_message_count": total,
-                "fallback_showing": recent.len(),
+                "fallback_messages": selection.entries,
+                // Legacy keys kept for back-compat; the contract quartet is
+                // stamped below and uses the canonical names, so a caller
+                // reading `truncated` does not have to know which path it is on.
+                "fallback_message_count": selection.total_count,
+                "fallback_showing": selection.returned_count(),
                 "note": "No summary available. Showing the last messages as a fallback.",
-            }));
+            });
+            selection.write_contract_fields(&mut result);
+            return Ok(result);
         }
 
         // Read message history
@@ -315,28 +356,26 @@ impl Tool for ReadSubagentSessionTool {
             .get_history(session.id)
             .map_err(|e| SandboxError::Io(format!("Failed to read session history: {e}")))?;
 
-        let total = messages.len();
+        let selection = session_read::select_recent(
+            &messages,
+            explicit_last_n,
+            session_read::SERIALIZED_BYTE_CAP,
+            session_read::MESSAGE_CAP,
+            project_msg,
+        );
 
-        // Take last_n messages
-        let start = total.saturating_sub(last_n);
-        let recent: Vec<Value> = messages[start..]
-            .iter()
-            .map(|m| {
-                serde_json::json!({
-                    "role": format!("{:?}", m.role).to_lowercase(),
-                    "content": m.content.to_display_string()
-                })
-            })
-            .collect();
-
-        Ok(serde_json::json!({
+        let mut result = serde_json::json!({
             "subagent": subagent_label,
             "session_id": session_id_str,
-            "message_count": total,
-            "showing": recent.len(),
-            "messages": recent,
+            // Legacy keys kept for back-compat; the contract is the quartet
+            // stamped just below.
+            "message_count": selection.total_count,
+            "showing": selection.returned_count(),
+            "messages": selection.entries,
             "summary": summary.as_deref().map(Value::from).unwrap_or(Value::Null),
-        }))
+        });
+        selection.write_contract_fields(&mut result);
+        Ok(result)
     }
 
     fn is_builtin(&self) -> bool {
@@ -385,6 +424,199 @@ mod tests {
         for msg in messages {
             mgr.append_message(session.id, msg).unwrap();
         }
+    }
+
+    // -- #1032: the truncation contract ---------------------------------
+    //
+    // Same four `truncation_reason` values as `read_session`, and the same
+    // derivation: the set comes from `session_read::reason` plus the
+    // untruncated case. The extra axis here is that this tool has TWO
+    // response shapes -- the normal read and the `summary_only` fallback --
+    // and the contract has to hold on both, which the last rows cover.
+
+    /// A named subagent session holding `count` messages of `body`.
+    fn subagent_with(count: usize, body: &str) -> (ReadSubagentSessionTool, Arc<SessionManager>) {
+        let (tool, mgr) = make_tool();
+        let msgs: Vec<Message> = (0..count)
+            .map(|i| make_msg(Role::Assistant, &format!("{body}{i}")))
+            .collect();
+        populate_subagent(&tool, &mgr, "researcher", msgs);
+        (tool, mgr)
+    }
+
+    async fn read_named(tool: &ReadSubagentSessionTool, extra: Value) -> Value {
+        let mut params = serde_json::json!({ "name": "researcher" });
+        if let Some(obj) = extra.as_object() {
+            for (k, v) in obj {
+                params[k] = v.clone();
+            }
+        }
+        tool.execute(params).await.unwrap()
+    }
+
+    /// `null` — everything fits, and the default returns ALL of it rather
+    /// than the pre-#1032 silent 20.
+    #[tokio::test]
+    async fn contract_untruncated_default_returns_everything() {
+        let (tool, _mgr) = subagent_with(35, "m");
+        let result = read_named(&tool, serde_json::json!({})).await;
+
+        assert_eq!(result["total_count"], 35);
+        assert_eq!(
+            result["returned_count"], 35,
+            "the silent last_n=20 default is gone"
+        );
+        assert_eq!(result["truncated"], false);
+        assert!(result["truncation_reason"].is_null());
+        assert_eq!(result["message_count"], 35, "legacy key still agrees");
+        assert_eq!(result["showing"], 35);
+    }
+
+    /// `explicit_last_n`, and its complement.
+    #[tokio::test]
+    async fn contract_explicit_last_n_is_flagged_only_when_older_exist() {
+        let (tool, _mgr) = subagent_with(10, "m");
+
+        let cut = read_named(&tool, serde_json::json!({ "last_n": 4 })).await;
+        assert_eq!(cut["returned_count"], 4);
+        assert_eq!(cut["truncated"], true);
+        assert_eq!(cut["truncation_reason"], "explicit_last_n");
+
+        let whole = read_named(&tool, serde_json::json!({ "last_n": 10 })).await;
+        assert_eq!(whole["returned_count"], 10);
+        assert_eq!(whole["truncated"], false);
+        assert!(whole["truncation_reason"].is_null());
+    }
+
+    /// `byte_cap`.
+    #[tokio::test]
+    async fn contract_byte_cap_truncates_to_the_trailing_slice() {
+        let (tool, mgr) = make_tool();
+        let msgs: Vec<Message> = (0..10)
+            .map(|i| make_msg(Role::Assistant, &format!("{i}{}", "x".repeat(10_000))))
+            .collect();
+        populate_subagent(&tool, &mgr, "researcher", msgs);
+
+        let result = read_named(&tool, serde_json::json!({})).await;
+        assert_eq!(result["total_count"], 10);
+        assert_eq!(result["truncated"], true);
+        assert_eq!(result["truncation_reason"], "byte_cap");
+        let returned = result["returned_count"].as_u64().unwrap();
+        assert!(returned > 0 && returned < 10, "{returned}");
+        let msgs = result["messages"].as_array().unwrap();
+        assert!(
+            msgs.last().unwrap()["content"]
+                .as_str()
+                .unwrap()
+                .starts_with('9'),
+            "the newest message must survive"
+        );
+    }
+
+    /// `message_cap`.
+    #[tokio::test]
+    async fn contract_message_cap_backstops_a_chatty_subagent() {
+        let (tool, _mgr) = subagent_with(session_read::MESSAGE_CAP + 25, "m");
+        let result = read_named(&tool, serde_json::json!({})).await;
+
+        assert_eq!(result["total_count"], session_read::MESSAGE_CAP + 25);
+        assert_eq!(result["returned_count"], session_read::MESSAGE_CAP);
+        assert_eq!(result["truncated"], true);
+        assert_eq!(result["truncation_reason"], "message_cap");
+    }
+
+    /// Malformed `last_n` is an error, not a quiet 20.
+    #[tokio::test]
+    async fn contract_malformed_last_n_is_rejected_not_defaulted() {
+        let (tool, _mgr) = subagent_with(30, "m");
+        for bad in [
+            serde_json::json!(-1),
+            serde_json::json!(3.5),
+            serde_json::json!("20"),
+            serde_json::json!(true),
+        ] {
+            let err = tool
+                .execute(serde_json::json!({ "name": "researcher", "last_n": bad }))
+                .await
+                .expect_err(&format!("{bad} must be rejected"));
+            assert!(matches!(err, SandboxError::InvalidParameters(_)), "{bad}");
+        }
+    }
+
+    // -- the summary_only fallback shape --------------------------------
+
+    /// The fallback path keeps its own, much smaller cap and now reports it.
+    ///
+    /// Pre-#1032 it silently returned `min(last_n, 10)` with no way to tell
+    /// that anything was left out. It is a consolation prize for a missing
+    /// summary, not a transcript read, so the small cap stays — but it is
+    /// now *stated*, and as `message_cap`, which is what actually fired.
+    #[tokio::test]
+    async fn contract_summary_only_fallback_reports_its_own_cap() {
+        let (tool, _mgr) = subagent_with(30, "m");
+        let result = read_named(&tool, serde_json::json!({ "summary_only": true })).await;
+
+        assert_eq!(result["has_summary"], false);
+        assert_eq!(result["fallback_message_count"], 30, "legacy key");
+        assert_eq!(result["fallback_showing"], 10, "legacy key");
+        // The contract quartet uses the canonical names on BOTH shapes, so a
+        // caller reading `truncated` does not have to know which path it got.
+        assert_eq!(result["total_count"], 30);
+        assert_eq!(result["returned_count"], 10);
+        assert_eq!(result["truncated"], true);
+        assert_eq!(result["truncation_reason"], "message_cap");
+    }
+
+    /// An explicit `last_n` BELOW the fallback cap is the caller's bound, so
+    /// the reason names the caller.
+    #[tokio::test]
+    async fn contract_summary_only_fallback_credits_a_small_explicit_last_n() {
+        let (tool, _mgr) = subagent_with(30, "m");
+        let result = read_named(
+            &tool,
+            serde_json::json!({ "summary_only": true, "last_n": 3 }),
+        )
+        .await;
+
+        assert_eq!(result["returned_count"], 3);
+        assert_eq!(result["truncation_reason"], "explicit_last_n");
+    }
+
+    /// An explicit `last_n` ABOVE the fallback cap is NOT what limited the
+    /// result, so it must not be credited: the cap fired, and that is what
+    /// the reason says. This is the row that separates "reported honestly"
+    /// from "reported plausibly".
+    #[tokio::test]
+    async fn contract_summary_only_fallback_does_not_credit_an_unhonoured_last_n() {
+        let (tool, _mgr) = subagent_with(30, "m");
+        let result = read_named(
+            &tool,
+            serde_json::json!({ "summary_only": true, "last_n": 25 }),
+        )
+        .await;
+
+        assert_eq!(
+            result["returned_count"], 10,
+            "the fallback cap still bounds it"
+        );
+        assert_eq!(
+            result["truncation_reason"], "message_cap",
+            "the caller asked for 25 and got 10 — crediting `explicit_last_n` \
+             would name a bound that was never honoured"
+        );
+    }
+
+    /// The complement for the fallback shape: when the session is smaller
+    /// than the fallback cap, nothing is omitted and nothing is flagged.
+    #[tokio::test]
+    async fn contract_summary_only_fallback_is_untruncated_when_it_all_fits() {
+        let (tool, _mgr) = subagent_with(4, "m");
+        let result = read_named(&tool, serde_json::json!({ "summary_only": true })).await;
+
+        assert_eq!(result["total_count"], 4);
+        assert_eq!(result["returned_count"], 4);
+        assert_eq!(result["truncated"], false);
+        assert!(result["truncation_reason"].is_null());
     }
 
     #[tokio::test]

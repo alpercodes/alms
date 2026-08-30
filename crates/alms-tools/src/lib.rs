@@ -22,6 +22,7 @@ pub mod read_messages;
 pub mod read_session;
 pub mod read_subagent_session;
 pub mod send_message;
+pub mod session_read;
 pub mod subagent;
 pub mod subagent_self_sink;
 

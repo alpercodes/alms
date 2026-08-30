@@ -12,6 +12,7 @@
 //! [`alms_core::subagent_session_access`] instead — see [`ReadSessionTool::check_access`].
 
 use crate::dm_filter;
+use crate::session_read;
 use alms_core::{AgentId, SessionId, SubagentSessionAccess};
 use alms_sandbox::{SandboxError, Tool, error::SandboxResult};
 use alms_session::SessionManager;
@@ -107,8 +108,11 @@ impl Tool for ReadSessionTool {
 
     fn description(&self) -> &str {
         "Read the conversation history of one of your sessions. Use list_my_sessions \
-         first to find the session ID, then read_session to get the detail. Returns \
-         the last N messages and the session summary."
+         first to find the session ID, then read_session to get the detail. By default \
+         returns the whole transcript and the session summary. The response carries \
+         `total_count` (messages in the session), `returned_count` (what's in the \
+         `messages` array), and `truncated: bool` -- check these to detect whether older \
+         messages were omitted. Pass `last_n` explicitly if you only need a specific count."
     }
 
     fn parameters(&self) -> Value {
@@ -121,7 +125,13 @@ impl Tool for ReadSessionTool {
                 },
                 "last_n": {
                     "type": "integer",
-                    "description": "Number of most recent messages to return. Default: 20."
+                    "minimum": 0,
+                    "description": "Optional: number of most-recent messages to return. \
+                                    Must be a non-negative integer. Omit to return all messages \
+                                    (subject to response-size limits indicated by the `truncated` \
+                                    flag). Malformed values (negative, non-integer, non-numeric) \
+                                    are rejected with InvalidParameters rather than silently \
+                                    falling back."
                 },
                 "summary_only": {
                     "type": "boolean",
@@ -151,7 +161,9 @@ impl Tool for ReadSessionTool {
         })?;
         let session_id = SessionId(uuid);
 
-        let last_n = params.get("last_n").and_then(|v| v.as_u64()).unwrap_or(20) as usize;
+        // #1032: no silent default. Omitted means "everything, bounded by the
+        // caps"; malformed is an error rather than a quiet fallback to 20.
+        let explicit_last_n = session_read::parse_last_n(&params)?;
 
         let summary_only = params
             .get("summary_only")
@@ -202,6 +214,12 @@ impl Tool for ReadSessionTool {
         let summary = episodic_summary.or(context_summary);
 
         if summary_only {
+            // No contract fields here, deliberately: this branch returns no
+            // `messages` array at all, so `returned_count` / `truncated` would
+            // describe something that is not in the response. That differs
+            // from `read_subagent_session`'s `summary_only`, which DOES carry
+            // them — because when no summary exists it falls back to
+            // returning messages, and those can be truncated (#1032).
             return Ok(serde_json::json!({
                 "session_id": session_id_str,
                 "context_id": session.context_id,
@@ -239,30 +257,43 @@ impl Tool for ReadSessionTool {
             entry
         };
 
-        let (total, recent): (usize, Vec<Value>) = if is_dm {
+        // The cap walk runs on the POST-filter list, so `total_count` counts
+        // real conversational messages and matches `read_messages` semantics
+        // -- a DM whose history is mostly markers must not report a total the
+        // agent can never page to.
+        let selection = if is_dm {
             let real: Vec<&alms_session::Message> = messages
                 .iter()
                 .filter(|m| !dm_filter::is_synthetic_marker(m))
                 .collect();
-            let count = real.len();
-            let start = count.saturating_sub(last_n);
-            let items = real[start..].iter().map(|m| format_msg(m)).collect();
-            (count, items)
+            session_read::select_recent(
+                &real,
+                explicit_last_n,
+                session_read::SERIALIZED_BYTE_CAP,
+                session_read::MESSAGE_CAP,
+                |m: &&alms_session::Message| format_msg(m),
+            )
         } else {
-            let count = messages.len();
-            let start = count.saturating_sub(last_n);
-            let items = messages[start..].iter().map(format_msg).collect();
-            (count, items)
+            session_read::select_recent(
+                &messages,
+                explicit_last_n,
+                session_read::SERIALIZED_BYTE_CAP,
+                session_read::MESSAGE_CAP,
+                format_msg,
+            )
         };
 
         let mut result = serde_json::json!({
             "session_id": session_id_str,
             "context_id": session.context_id,
-            "message_count": total,
-            "showing": recent.len(),
-            "messages": recent,
+            // Legacy keys kept for back-compat; the contract is the quartet
+            // stamped just below.
+            "message_count": selection.total_count,
+            "showing": selection.returned_count(),
+            "messages": selection.entries,
             "summary": summary.as_deref().unwrap_or(""),
         });
+        selection.write_contract_fields(&mut result);
 
         // Add a hint for DM sessions directing agents to read_messages
         // for proper perspective mapping ("you" vs peer name).
@@ -412,6 +443,209 @@ mod tests {
                 .unwrap()
                 .contains("does not belong to you")
         );
+    }
+
+    // -- #1032: the truncation contract ---------------------------------
+    //
+    // `truncation_reason` has exactly four values, so the rows below cover
+    // exactly four: `null`, `explicit_last_n`, `byte_cap`, `message_cap`.
+    // Derived from `session_read::reason` plus the untruncated case, not from
+    // the situations that happened to come to mind.
+
+    /// Build a session owned by `agent_id` holding `count` messages of
+    /// `body`, and return the tool plus the session id.
+    fn session_with(count: usize, body: &str) -> (ReadSessionTool, String) {
+        let mgr = make_session_manager();
+        let agent_id = AgentId::new();
+        let tool = ReadSessionTool::new(mgr.clone(), agent_id, None);
+        let session = mgr.get_or_create(agent_id, "ctx-contract");
+        for i in 0..count {
+            mgr.append_message(session.id, make_msg(Role::User, &format!("{body}{i}")))
+                .unwrap();
+        }
+        (tool, session.id.0.to_string())
+    }
+
+    async fn read_with(tool: &ReadSessionTool, session_id: &str, params: Value) -> Value {
+        let mut p = serde_json::json!({ "session_id": session_id });
+        if let Some(obj) = params.as_object() {
+            for (k, v) in obj {
+                p[k] = v.clone();
+            }
+        }
+        tool.execute(p).await.unwrap()
+    }
+
+    /// `null` — the whole transcript fits, and the default path returns ALL
+    /// of it rather than the pre-#1032 silent 20.
+    #[tokio::test]
+    async fn contract_untruncated_default_returns_everything() {
+        let (tool, sid) = session_with(35, "m");
+        let result = read_with(&tool, &sid, serde_json::json!({})).await;
+
+        assert_eq!(result["total_count"], 35);
+        assert_eq!(
+            result["returned_count"], 35,
+            "the silent last_n=20 default is gone"
+        );
+        assert_eq!(result["truncated"], false);
+        assert!(result["truncation_reason"].is_null());
+        // Legacy keys still agree with the new ones.
+        assert_eq!(result["message_count"], 35);
+        assert_eq!(result["showing"], 35);
+    }
+
+    /// `explicit_last_n` — honoured verbatim, and flagged because older
+    /// messages exist.
+    #[tokio::test]
+    async fn contract_explicit_last_n_is_flagged_when_older_exist() {
+        let (tool, sid) = session_with(10, "m");
+        let result = read_with(&tool, &sid, serde_json::json!({ "last_n": 3 })).await;
+
+        assert_eq!(result["total_count"], 10);
+        assert_eq!(result["returned_count"], 3);
+        assert_eq!(result["truncated"], true);
+        assert_eq!(result["truncation_reason"], "explicit_last_n");
+    }
+
+    /// The complement that keeps the row above honest: an explicit `last_n`
+    /// covering the whole session omits nothing, so it must NOT be flagged.
+    #[tokio::test]
+    async fn contract_explicit_last_n_covering_all_is_not_flagged() {
+        let (tool, sid) = session_with(3, "m");
+        let result = read_with(&tool, &sid, serde_json::json!({ "last_n": 3 })).await;
+
+        assert_eq!(result["returned_count"], 3);
+        assert_eq!(result["truncated"], false);
+        assert!(result["truncation_reason"].is_null());
+    }
+
+    /// `byte_cap` — a few very large messages trip the serialized-byte cap.
+    #[tokio::test]
+    async fn contract_byte_cap_truncates_to_the_trailing_slice() {
+        let mgr = make_session_manager();
+        let agent_id = AgentId::new();
+        let tool = ReadSessionTool::new(mgr.clone(), agent_id, None);
+        let session = mgr.get_or_create(agent_id, "ctx-big");
+        // 10 x ~10 KB comfortably exceeds the 60 KB cap.
+        for i in 0..10 {
+            let body = format!("{i}{}", "x".repeat(10_000));
+            mgr.append_message(session.id, make_msg(Role::User, &body))
+                .unwrap();
+        }
+
+        let result = read_with(&tool, &session.id.0.to_string(), serde_json::json!({})).await;
+
+        assert_eq!(result["total_count"], 10);
+        assert_eq!(result["truncated"], true);
+        assert_eq!(result["truncation_reason"], "byte_cap");
+        let returned = result["returned_count"].as_u64().unwrap();
+        assert!(
+            returned > 0 && returned < 10,
+            "a trailing slice, not all or nothing: {returned}"
+        );
+        // The NEWEST messages are the ones kept.
+        let msgs = result["messages"].as_array().unwrap();
+        assert!(
+            msgs.last().unwrap()["content"]
+                .as_str()
+                .unwrap()
+                .starts_with('9'),
+            "the newest message must survive"
+        );
+    }
+
+    /// `message_cap` — a chatty session where each message is a few bytes,
+    /// so the byte cap can never fire but the count backstop must.
+    #[tokio::test]
+    async fn contract_message_cap_backstops_a_chatty_session() {
+        let (tool, sid) = session_with(session_read::MESSAGE_CAP + 25, "m");
+        let result = read_with(&tool, &sid, serde_json::json!({})).await;
+
+        assert_eq!(result["total_count"], session_read::MESSAGE_CAP + 25);
+        assert_eq!(result["returned_count"], session_read::MESSAGE_CAP);
+        assert_eq!(result["truncated"], true);
+        assert_eq!(result["truncation_reason"], "message_cap");
+    }
+
+    /// The #1028 P1 lesson on this sibling: the cap is charged on the
+    /// SERIALIZED entry, so escape-heavy content costs its post-escape size.
+    /// Measuring raw UTF-8 would admit roughly twice as much.
+    #[tokio::test]
+    async fn contract_byte_cap_accounts_for_json_escape_expansion() {
+        async fn returned_for(body: char) -> u64 {
+            let mgr = make_session_manager();
+            let agent_id = AgentId::new();
+            let tool = ReadSessionTool::new(mgr.clone(), agent_id, None);
+            let session = mgr.get_or_create(agent_id, "ctx-escape");
+            for _ in 0..40 {
+                let text: String = std::iter::repeat_n(body, 4_000).collect();
+                mgr.append_message(session.id, make_msg(Role::User, &text))
+                    .unwrap();
+            }
+            let result = tool
+                .execute(serde_json::json!({ "session_id": session.id.0.to_string() }))
+                .await
+                .unwrap();
+            assert_eq!(result["truncation_reason"], "byte_cap");
+            result["returned_count"].as_u64().unwrap()
+        }
+
+        // `"` serializes to `\"`: one raw byte, two wire bytes.
+        let escaped = returned_for('"').await;
+        let plain = returned_for('x').await;
+        assert!(
+            escaped < plain,
+            "escape-heavy content must be charged post-escape: \
+             escaped={escaped} plain={plain}"
+        );
+    }
+
+    /// The silent-fallback class #1028 closed for `read_messages`, now closed
+    /// here: a malformed `last_n` is an error, not a quiet 20.
+    #[tokio::test]
+    async fn contract_malformed_last_n_is_rejected_not_defaulted() {
+        let (tool, sid) = session_with(30, "m");
+        for bad in [
+            serde_json::json!(-1),
+            serde_json::json!(3.5),
+            serde_json::json!("20"),
+            serde_json::json!(true),
+        ] {
+            let err = tool
+                .execute(serde_json::json!({ "session_id": sid, "last_n": bad }))
+                .await
+                .expect_err(&format!("{bad} must be rejected"));
+            assert!(matches!(err, SandboxError::InvalidParameters(_)), "{bad}");
+        }
+    }
+
+    /// The DM branch filters synthetic markers, and the cap walk runs on the
+    /// POST-filter list — so `total_count` counts messages an agent can
+    /// actually page to, matching `read_messages` semantics.
+    #[tokio::test]
+    async fn contract_total_count_excludes_filtered_dm_markers() {
+        let mgr = make_session_manager();
+        let agent_id = AgentId::new();
+        let tool = ReadSessionTool::new(mgr.clone(), agent_id, Some("alice".to_string()));
+        let session = mgr.get_or_create(agent_id, "dm:alice:bob");
+
+        let mut real = make_msg(Role::User, "hello");
+        real.metadata = Some(serde_json::json!({ "from_agent": "bob" }));
+        mgr.append_message(session.id, real).unwrap();
+
+        // A synthetic marker of the shape `dm_filter` hides.
+        let mut marker = make_msg(Role::System, "");
+        marker.metadata = Some(serde_json::json!({ "synthetic": true, "type": "dm_ended" }));
+        mgr.append_message(session.id, marker).unwrap();
+
+        let result = read_with(&tool, &session.id.0.to_string(), serde_json::json!({})).await;
+        assert_eq!(
+            result["total_count"], 1,
+            "the marker must not inflate a total the agent can never reach"
+        );
+        assert_eq!(result["returned_count"], 1);
+        assert!(result["truncation_reason"].is_null());
     }
 
     #[tokio::test]
