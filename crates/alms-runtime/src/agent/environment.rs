@@ -3,7 +3,7 @@ use crate::events::RuntimeEventSender;
 use crate::llm_client::LlmClient;
 use crate::tools::ToolRegistry;
 use crate::workspace::AgentWorkspace;
-use crate::workspace_tool::WorkspaceWriteTool;
+use crate::workspace_tool::{WorkspaceReadTool, WorkspaceWriteTool};
 use alms_core::{AgentId, AlmsError, AlmsResult};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
@@ -289,9 +289,10 @@ impl AgentRuntime {
 
     /// Attach an agent workspace for persistent identity files.
     ///
-    /// Registers the `workspace_write` tool so the agent can update its
-    /// `personality.md` / `goals.md` / `memories.md` / `user.md` during
-    /// runs. Ensures the workspace directory exists.
+    /// Registers the `workspace_write` and `workspace_read` tools so the
+    /// agent can update and re-read its `personality.md` / `goals.md` /
+    /// `memories.md` / `user.md` during runs. Ensures the workspace directory
+    /// exists.
     ///
     /// Pre-#945 this method also re-targeted the filesystem sandbox at
     /// the workspace dir; v2 collapses the two-root model so the
@@ -304,15 +305,28 @@ impl AgentRuntime {
     /// `fs_read('.alms/agents/<sibling>/personality.md')` resolves
     /// directly under the primary root.
     ///
-    /// **Note**: `workspace_write` registration goes through `ToolRegistry::register()`,
+    /// **Note**: both registrations go through `ToolRegistry::register()`,
     /// which checks the `enabled_filter`. If the operator has set `tools.enabled`
-    /// and `workspace_write` is not in the list, it will be silently skipped.
+    /// and a tool is not in the list, it will be silently skipped.
     /// This is intentional — the operator's allowlist should be the single
     /// source of truth for which tools are available.
+    ///
+    /// The two are registered together but filtered separately, so an
+    /// allowlist naming `workspace_write` and not `workspace_read` is
+    /// possible. `workspace_write`'s refusal message (#1310) is written for
+    /// that case: its first recovery is `mode: "append"`, which is the same
+    /// tool the agent already has, and `workspace_read` is only needed for a
+    /// deliberate whole-file rewrite.
     pub fn with_workspace(mut self, workspace: AgentWorkspace) -> Self {
-        let tool = WorkspaceWriteTool::new(workspace.clone());
         // Subject to enabled_filter — see doc comment above.
-        self.tools.register(std::sync::Arc::new(tool));
+        self.tools
+            .register(std::sync::Arc::new(WorkspaceWriteTool::new(
+                workspace.clone(),
+            )));
+        self.tools
+            .register(std::sync::Arc::new(WorkspaceReadTool::new(
+                workspace.clone(),
+            )));
 
         // Ensure the workspace directory exists so `workspace_write` and
         // `read_file` calls don't trip on a missing directory. Failure is

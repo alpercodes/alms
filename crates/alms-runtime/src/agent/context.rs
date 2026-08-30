@@ -77,6 +77,20 @@ impl AgentRuntime {
         input: &str,
     ) -> AlmsResult<Vec<LlmMessage>> {
         let include_user = Self::is_user_facing_context(context_id);
+
+        // Start the run with no record of what the agent has been shown of
+        // its workspace (#1310). The `assemble_system_prompt` call below
+        // immediately refills it for every file it injects, so the effect is
+        // to scope the record to this run: a view recorded by a previous run
+        // must not authorise a whole-file `workspace_write` in this one,
+        // where that run's context is gone. `user.md` is the case that makes
+        // this observable — it is injected only for user-facing contexts, so
+        // without the reset a webchat run could license a DM run's blind
+        // replacement of it.
+        if let Some(ref ws) = self.workspace {
+            ws.forget_shown_files();
+        }
+
         let mut system_prompt =
             self.assemble_system_prompt(&self.config.system_prompt, include_user);
 

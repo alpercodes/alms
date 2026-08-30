@@ -5,7 +5,7 @@
 //! - Tool registry and execution
 //! - Agent loop orchestration
 //!
-//! Tool implementations (except `workspace_write`) have been extracted to the
+//! Tool implementations (except the workspace tools) have been extracted to the
 //! `alms-tools` crate. The `SubagentDispatcher`, `MessageSender`, and
 //! `EventForwarder` traits also live in `alms-tools`.
 

@@ -228,6 +228,7 @@ impl ToolRegistry {
             "read_subagent_session",
             "send_message",
             "workspace_write",
+            "workspace_read",
             "list_agents",
             "list_my_sessions",
             "read_messages",

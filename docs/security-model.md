@@ -471,6 +471,21 @@ syntactically possible but only ever via the agent's own sandboxed
 write path — and `workspace_write` itself is hard-pinned to the agent's
 own metadata directory by the tool, not by the sandbox.
 
+`workspace_read` (#1310) is pinned the same way, and the argument that
+matters is the parity with its own sibling rather than the contrast with
+`fs_read`: `workspace_write` was **already** tool-pinned to that one
+metadata directory, and the read half is pinned by the same mechanism, so
+adding it widened nothing. That form of the claim survives a deployment
+where `fs_read` is disabled entirely, which the contrast does not.
+
+The mechanism is that there is no caller-controlled component in the
+path at all: the `file` parameter accepts only the four literals
+`personality` / `goals` / `memories` / `user`, and the read joins a
+construction-time workspace `dir` with a `&'static str` filename. So
+`workspace_read` cannot reach a sibling's metadata even though `fs_read`
+can — a tool addressed *by name* is strictly narrower than one addressed
+by path.
+
 In [worktree mode](#opt-in-worktree-mode) the primary root narrows to
 the worktree path; the gateway widens the read-family fs_* tools'
 extras list with `<project_root>/.alms/agents/` so cross-agent reads

@@ -58,6 +58,7 @@ pub async fn get_settings(State(state): State<AppState>) -> impl IntoResponse {
     );
     if state.workspace_dir.is_some() {
         tools.push("workspace_write".to_string());
+        tools.push("workspace_read".to_string());
     }
 
     let agent_id = state.default_agent_id.read().0.to_string();

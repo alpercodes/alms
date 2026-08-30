@@ -10,8 +10,10 @@
 //! The agent can update goals.md, memories.md, and user.md via the workspace_write tool.
 
 use alms_core::{AlmsError, AlmsResult, tail_to_char_boundary};
+use dashmap::DashMap;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::{debug, info, warn};
 
@@ -20,10 +22,123 @@ use tracing::{debug, info, warn};
 pub struct AgentWorkspace {
     /// Resolved workspace directory for this agent.
     dir: PathBuf,
+    /// What this workspace has handed to the agent, per file — the base of
+    /// the compare-and-swap in [`Self::write_file_checked`] (#1310).
+    ///
+    /// Shared across clones on purpose. `AgentRuntime` holds one
+    /// `AgentWorkspace` and gives a clone to each workspace tool, so the
+    /// prompt build that *shows* a file and the tool call that replaces it
+    /// consult the same record. Two `AgentWorkspace` values built
+    /// independently for the same directory (the gateway's `PUT` handler,
+    /// two concurrent runs of the same named agent) do **not** share one,
+    /// which is correct: they are different contexts and neither has seen
+    /// what the other was shown. What keeps *those* honest is the on-disk
+    /// half of the check, which compares against the file itself.
+    shown: Arc<DashMap<WorkspaceFile, ShownView>>,
+}
+
+/// What the agent has been shown of one workspace file, and whether it was
+/// shown whole.
+///
+/// `content` is the file exactly as it was read at the moment it was handed
+/// over — the raw bytes, *not* the windowed form the model received — so a
+/// later replacement can be compared against the file byte for byte.
+///
+/// `whole` says whether what the model actually received was that content in
+/// full. It is false when the injection was a tail window
+/// ([`memories_injection_window`]) and when a `workspace_read` was capped at
+/// [`WORKSPACE_READ_CAP`]. The two fields answer different questions and both
+/// are needed: `content` catches a file that moved under the agent, `whole`
+/// catches a file the agent only ever saw the end of. Neither implies the
+/// other.
+#[derive(Debug, Clone)]
+struct ShownView {
+    content: String,
+    whole: bool,
+}
+
+/// Whether a replacement must clear the shown-view check before it lands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShownGuard {
+    /// Operator authority, or a caller that is not the agent. The file is
+    /// replaced unconditionally.
+    Skip,
+    /// The agent's own `workspace_write` with `mode: "write"`. The
+    /// replacement is refused unless the agent has been shown the file's
+    /// current contents in full (#1310).
+    Enforce,
+}
+
+/// Why [`AgentWorkspace::write_file_checked`] refused a whole-file
+/// replacement.
+///
+/// All three mean the same thing to the file — the replacement would have
+/// deleted bytes the agent was never shown — but they are separate variants
+/// because they say different things to the *agent*, and the agent is the one
+/// that has to recover.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefusedWrite {
+    /// Nothing has shown this file to the agent. The everyday instance is
+    /// `user.md` in a non-user-facing run: `build_system_prompt_prefix`
+    /// omits it for `dm:` / `subagent_` / `job_` / `notifications:`
+    /// contexts, so an agent in one of those runs has never seen it — and
+    /// `user.md` defaults to `"write"`, so the *default* call there was a
+    /// silent whole-file erasure.
+    NeverShown,
+    /// The agent was shown a window, not the file. Reachable for
+    /// `memories.md` past [`MEMORIES_INJECTION_CAP`], and for any file past
+    /// [`WORKSPACE_READ_CAP`] on the `workspace_read` path. This one needs no
+    /// concurrency and no second writer: it is the steady state of any
+    /// memories file that has grown past the cap.
+    ShownPartially,
+    /// The file has changed since the agent was shown it — by another live
+    /// instance of the same named agent, by an operator edit, or by this very
+    /// run's own earlier `workspace_write` calls in the same tool batch.
+    ChangedSinceShown,
+}
+
+impl RefusedWrite {
+    /// Stable machine-readable token for the tool result, so a caller (or a
+    /// test, or the UI) can branch on the reason without parsing prose.
+    pub fn code(&self) -> &'static str {
+        match self {
+            RefusedWrite::NeverShown => "never_shown",
+            RefusedWrite::ShownPartially => "shown_partially",
+            RefusedWrite::ChangedSinceShown => "changed_since_shown",
+        }
+    }
+}
+
+/// Outcome of [`AgentWorkspace::write_file_checked`].
+///
+/// A refusal is deliberately **not** an `Err`: nothing failed, and the
+/// distinction matters at the call site, which has to turn one of these into
+/// an answer the model can act on and the other into a genuine error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckedWrite {
+    Written,
+    Refused(RefusedWrite),
+}
+
+/// One workspace file as handed to the agent by
+/// [`AgentWorkspace::read_for_agent`].
+#[derive(Debug, Clone)]
+pub struct AgentRead {
+    /// What to give the agent: the file verbatim, or its tail when the file
+    /// is over [`WORKSPACE_READ_CAP`].
+    pub content: String,
+    /// Size of the whole file on disk, so a capped read can say what it left
+    /// out rather than only that it left something out.
+    pub total_bytes: usize,
+    /// Whether `content` is the whole file. False makes a subsequent
+    /// `mode: "write"` refuse with [`RefusedWrite::ShownPartially`]: a capped
+    /// read must not launder a partial view into permission to replace the
+    /// file, which is the exact trap the injection window already sets.
+    pub complete: bool,
 }
 
 /// Files that can be read/written in the workspace
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum WorkspaceFile {
     Personality,
     Goals,
@@ -62,11 +177,14 @@ impl WorkspaceFile {
     /// three default to `"write"`.
     ///
     /// Why the split, and why it is not more locking: an agent's read of its
-    /// memories is the context build, which `AgentRuntime` runs **once per
-    /// run**, before `agent_loop` — the assembled system prompt is then
-    /// carried through every tool iteration. So the snapshot a
-    /// `workspace_write` replaces is a *run-start* snapshot, not a turn-old
-    /// one, and the window is the whole run. Anything appended inside it — by
+    /// memories is the context build, which `AgentRuntime` runs before
+    /// `agent_loop`. The assembled prompt is *not* carried unchanged through
+    /// every tool iteration, as this comment used to say — `agent_loop` calls
+    /// `rebuild_system_prompt_for_tool_loop` after each tool batch, which
+    /// re-reads the workspace and replaces `messages[0]` — but it is carried
+    /// through the first one, and a whole tool batch executes between two
+    /// rebuilds. So the snapshot a `workspace_write` replaces is at best a
+    /// batch old and at worst a run old. Anything appended inside that — by
     /// another live instance of the same named agent, which the coordinator's
     /// `active_named` guard deliberately permits, **or by this very run's own
     /// earlier `workspace_write` calls** — is not in the snapshot the model is
@@ -106,38 +224,32 @@ impl WorkspaceFile {
     /// trade, and the result echoes the effective mode, so a model that
     /// guessed wrong can find out in the same turn.
     ///
-    /// Rejecting the stale replacement instead — a compare-and-swap against
-    /// the file's state at context-build time — was considered and not done,
-    /// as the cheaper fix rather than the impossible one. A **bare** rejection
-    /// would be unusable: the agent would see it (a failed tool call is
-    /// persisted as its own `Error: ...` tool result and the loop continues,
-    /// so it is answerable in-turn) but has no way to re-read its workspace —
-    /// there is no `workspace_read` tool, only the system-prompt injection it
-    /// has already consumed. A rejection **carrying the current file
-    /// contents** would be usable, and is the shape any future fix should
-    /// take: that payload travels on the channel above, `WorkspaceWriteTool`
-    /// is constructed per run one hop from the context build, and no protocol
-    /// or schema change is needed. Two things such a fix must get right — the
-    /// base has to be what the *context build* read, not what tool
-    /// construction saw, and the payload must not be sent **raw** — a bare
-    /// window that does not say it is a window reproduces #1308 on the retry
-    /// path, which is the one shape that is definitely wrong.
+    /// **The explicit branch is no longer unguarded (#1310).** This function
+    /// only chooses what an *omitted* `mode` means; an explicit
+    /// `mode: "write"` now goes through [`AgentWorkspace::write_file_checked`],
+    /// which refuses a replacement that would delete text the agent has not
+    /// been shown. That guard reaches three things this default cannot: a
+    /// `memories.md` past [`MEMORIES_INJECTION_CAP`], where the agent has only
+    /// ever seen the tail; `user.md` in a non-user-facing run, where it has
+    /// seen nothing at all; and a file that moved between the last prompt
+    /// build and the call.
     ///
-    /// That is the floor, not the design. [`memories_injection_window`] is the
-    /// safe default for the payload — same cap, same anchor, same marker, so
-    /// a retry built on it is no more destructive than the injection it
+    /// The two remain independent and both are needed. The guard is not a
+    /// substitute for this default — a refusal costs the agent a turn and a
+    /// decision, where an append-by-default costs nothing — and this default
+    /// is not a substitute for the guard, because it says nothing about the
+    /// branch the agent asked for explicitly.
+    ///
+    /// #1310 chose a refusal that names its recovery over a refusal carrying
+    /// the file's contents as a payload. [`memories_injection_window`] would
+    /// have been the safe payload — same cap, same anchor, same marker, so a
+    /// retry built on it is no more destructive than the injection it
     /// replaces — but safe is not sufficient: an agent still cannot produce a
     /// correct wholesale rewrite of a file it has only ever seen the end of.
-    /// Carrying the **whole** file and accepting the context cost is the option
-    /// under which the retry can actually succeed, and choosing between them is
-    /// #1310's call, not this function's.
-    ///
-    /// Two bounds on reusing it, if #1310 does: the marker names
-    /// `memories.md` literally and the cap is sized for it, and a *tail* anchor
-    /// is only the right end to keep for an append-shaped file. `personality`,
-    /// `goals` and `user` still default to `"write"`, so their whole
-    /// population is explicit whole-file replacement — this function does not
-    /// carry to them as written.
+    /// The whole file is what makes the retry able to succeed, and
+    /// `workspace_read` delivers it on request rather than on every refusal,
+    /// so the context cost is paid only by the agent that is actually going
+    /// to rewrite the file.
     ///
     /// Independent of [`Self::agent_writable`] (#1303), which answers
     /// *whether* the agent may write a file, not what an omitted `mode` means
@@ -197,24 +309,24 @@ pub const MEMORIES_INJECTION_CAP: usize = 4000;
 /// whether they are still true. For a file that only ever grows at the end,
 /// the old end is the right one to lose.
 ///
-/// **Why the marker leads, and says what it says.** No tool reads a workspace
-/// file back by name: `settings.rs` registers `workspace_write` and there is
-/// no `workspace_read`, so this injection is the only view of its memories the
-/// tool surface *gives* the agent. The bytes are not unreachable — the
-/// workspace lives at `<project_root>/.alms/agents/<name>/`, inside the
-/// project-root sandbox, so an agent with `fs_read` enabled can read the file
-/// by path, and the UI, `PUT` and an operator all reach it — but nothing
-/// hands the model that path, and nothing makes it re-read before rewriting.
-/// #1305's documented repair for an accidental duplicate is an explicit
-/// `mode: "write"`, and in the moment it composes that payload the model is
-/// working from the text in its system prompt. An unmarked window therefore
-/// makes the repair destructive: the agent rewrites the file from a fragment
-/// and deletes everything the fragment omits. Tail-anchoring alone does not fix
-/// that — it only changes which half is deleted. So the marker goes *first*,
-/// because a truncation that removed the start has to be announced before the
-/// content rather than after it, and it states the consequence rather than only
-/// the size. What the marker buys is that the agent does not overwrite bytes it
-/// never saw while believing it held the whole file.
+/// **Why the marker leads, and says what it says.** This injection is the
+/// view of its memories the agent gets whether it asked or not, and #1305's
+/// documented repair for an accidental duplicate is an explicit
+/// `mode: "write"` — composed, in the moment, from the text in the system
+/// prompt. An unmarked window therefore makes the repair destructive: the
+/// agent rewrites the file from a fragment and deletes everything the
+/// fragment omits. Tail-anchoring alone does not fix that — it only changes
+/// which half is deleted. So the marker goes *first*, because a truncation
+/// that removed the start has to be announced before the content rather than
+/// after it, and it states the consequence rather than only the size.
+///
+/// Since #1310 the marker is no longer the only thing standing between the
+/// model and that deletion: a `mode: "write"` built on a windowed view is
+/// refused outright by [`AgentWorkspace::write_file_checked`], and
+/// `workspace_read` gives the agent the whole file when it means to rewrite
+/// one. The marker still earns its place — it is what lets a model avoid the
+/// refusal instead of discovering it — but it is now the polite half of a
+/// guarantee rather than the whole of it.
 ///
 /// **A partial leading line is dropped — only when there is one.** A
 /// head-anchored window could only ever end mid-entry, which reads as obviously
@@ -238,23 +350,7 @@ pub fn memories_injection_window(memories: &str) -> String {
         return memories.to_string();
     }
 
-    let raw = tail_to_char_boundary(memories, MEMORIES_INJECTION_CAP);
-    // Where the window starts inside the file. Recovered from the two lengths
-    // rather than assumed to be `len - cap`, because the tail walk may have
-    // moved forward off a split codepoint. `start >= 1` here: we are past the
-    // at-or-under-cap return, so `raw` is strictly shorter than `memories`.
-    // Slicing at `start` is valid because it is a char boundary by
-    // construction, and the slice form cannot panic the way an index can.
-    let start = memories.len() - raw.len();
-    let opens_mid_entry = !memories[..start].ends_with('\n');
-
-    let mut window = raw;
-    if opens_mid_entry
-        && let Some(nl) = window.find('\n')
-        && !window[nl + 1..].is_empty()
-    {
-        window = &window[nl + 1..];
-    }
+    let window = tail_window_from_line_start(memories, MEMORIES_INJECTION_CAP);
 
     format!(
         "[Older memories truncated: showing the most recent {} of {} bytes. \
@@ -267,6 +363,142 @@ pub fn memories_injection_window(memories: &str) -> String {
     )
 }
 
+/// Maximum bytes of one workspace file returned by the `workspace_read` tool.
+///
+/// Four times [`MEMORIES_INJECTION_CAP`], because this is the *deliberate*
+/// read — the agent asked for the file, usually because it is about to
+/// replace it, and a rewrite composed from a 4000-byte window is the problem
+/// rather than the fix. Two ceilings bound it from above:
+///
+/// - `tool_output_truncate`'s default byte cap is 32 KB
+///   (`DEFAULT_MAX_BYTES`), applied to the tool result *after* this function
+///   has returned. Staying well under it keeps a second, invisible truncation
+///   from landing on top of this one. Its 2000-line cap cannot fire at all:
+///   the result is serialised as compact JSON, so the whole payload is one
+///   line however many lines the file has.
+/// - The context builder never trims a tool result it has already accepted,
+///   and the result is persisted, so every byte here is paid again on every
+///   later context build of the same session.
+///
+/// The bound this constant does **not** carry: an operator who lowers
+/// `tool_output_truncate.max_bytes` gets a spilled preview where the agent
+/// asked for the file, while [`AgentWorkspace::read_for_agent`] has already
+/// recorded the whole file as shown — so a following `mode: "write"` would be
+/// allowed on the strength of a preview. The policy is off by default, but it
+/// is real and the truncation outcome is not visible from inside a tool.
+pub const WORKSPACE_READ_CAP: usize = 12_000;
+
+/// Worst-case growth from JSON-escaping a `workspace_read` payload, for the
+/// bound below.
+///
+/// The truncator measures the **serialised** result — `loop_impl.rs` does
+/// `value.to_string()` — not the bytes this module hands back, so a limit
+/// stated against the raw payload does not bound what the truncator sees.
+/// `serde_json` escapes `"`, `\`, `\n`, `\r`, `\t`, `\u{8}` and `\u{c}` to two
+/// bytes each and leaves everything else, including all non-ASCII, verbatim.
+/// Two is therefore the factor for every byte a text file can contain, applied
+/// pessimistically to *every* byte — a file no real `memories.md` approaches.
+///
+/// **One declared exception**, so this is not read as a proof it is not: the
+/// other control characters below `0x20` serialise as `\u00XX`, six bytes
+/// each, and a file of those exceeds this bound. Nothing an agent writes
+/// contains them, but `fs_write` and the operator `PUT` both reach
+/// `memories.md` and neither validates content. The consequence is exactly the
+/// residual recorded above — a spilled preview against a recorded whole view —
+/// and it belongs with whatever closes that one, not here.
+///
+/// **Checked against `serde_json`, not asserted here.** This is a claim about
+/// a third-party crate, which is exactly the kind a doc comment cannot hold
+/// across a dependency bump — and the `const` block below cannot hold it
+/// either, because an `assert!` is one-sided: shrinking a term inside it only
+/// makes it easier to satisfy, so no build failure can catch a factor that is
+/// too small for reality. `the_json_escape_factor_matches_what_serde_json_actually_emits`
+/// is what holds it, one character at a time and in both directions.
+const WORKSPACE_READ_JSON_ESCAPE_FACTOR: usize = 2;
+
+/// Slack for the rest of the `workspace_read` result — the keys, the file
+/// name, and the `note` a capped read carries. Roughly three times what the
+/// longest of those actually costs.
+const WORKSPACE_READ_JSON_ENVELOPE: usize = 1024;
+
+/// The two relationships that make [`WORKSPACE_READ_CAP`]'s value correct,
+/// checked at compile time rather than in a test.
+///
+/// Neither is visible from the constant's own definition, and neither is
+/// something a test could pin usefully: every test that exercises the cap
+/// derives its sizes *from* the constant, so they all move with it and none
+/// of them would notice it changing. These would.
+///
+/// A const block rather than a `#[test]` because both operands are constants
+/// — clippy rejects a runtime `assert!` on them, and correctly: a fact known
+/// at compile time should fail the build, not a test run.
+const _: () = {
+    assert!(
+        WORKSPACE_READ_CAP > MEMORIES_INJECTION_CAP,
+        "a deliberate read must return more than the prompt injection already did, \
+         or `workspace_read` cannot be the recovery from a windowed view"
+    );
+    assert!(
+        WORKSPACE_READ_CAP * WORKSPACE_READ_JSON_ESCAPE_FACTOR + WORKSPACE_READ_JSON_ENVELOPE
+            <= crate::tool_output_truncate::DEFAULT_MAX_BYTES,
+        "the *serialised* read result must fit inside the in-loop truncator's default byte \
+         cap -- the truncator measures `value.to_string()`, so comparing the raw payload \
+         against that cap would not establish this. Otherwise the truncator spills the \
+         result *after* `read_for_agent` has recorded the whole file as shown, leaving the \
+         agent holding a preview while the guard believes it holds the file, which is this \
+         fix inverted"
+    );
+};
+
+/// The last `cap` bytes of `text`, advanced to the next line boundary when
+/// the cut landed mid-line.
+///
+/// Extracted from [`memories_injection_window`] (#1308/#1311) so the
+/// `workspace_read` cap can reuse the walk rather than re-derive it. What is
+/// *not* shared is the marker: that one names `memories.md` literally and
+/// states a consequence specific to the system-prompt injection, so it stays
+/// with its caller.
+///
+/// **A partial leading line is dropped — only when there is one.** A
+/// tail-anchored window begins mid-entry, and half a memory read from its
+/// middle is not a fragment but a different claim: "- Never delete the
+/// staging bucket" cut after "Never " asserts the opposite of the entry it
+/// came from. So the window is advanced to the next line boundary, but only
+/// when its start did not already land just after a newline — an aligned
+/// window already opens on a whole entry, and cutting there would delete a
+/// complete one for nothing.
+///
+/// One declared exception, so the property is not read as universal: the cut
+/// is skipped when nothing follows the first newline, so a file that is one
+/// enormous unbroken line still yields its tail instead of an empty window. A
+/// fragment that announces itself beats nothing at all, but it is an
+/// exception to the rule above, not an instance of it.
+///
+/// Total for any input: when `text` is at or under `cap` the window is the
+/// whole text and `start == 0`, which is a real line start, so the mid-line
+/// guard is false and nothing is cut. Both callers return early in that case
+/// anyway; the `start > 0` term is what makes that a property of this
+/// function rather than a precondition on them.
+fn tail_window_from_line_start(text: &str, cap: usize) -> &str {
+    let raw = tail_to_char_boundary(text, cap);
+    // Where the window starts inside the text. Recovered from the two lengths
+    // rather than assumed to be `len - cap`, because the tail walk may have
+    // moved forward off a split codepoint. Slicing at `start` is valid
+    // because it is a char boundary by construction, and the slice form
+    // cannot panic the way an index can.
+    let start = text.len() - raw.len();
+    let opens_mid_entry = start > 0 && !text[..start].ends_with('\n');
+
+    let mut window = raw;
+    if opens_mid_entry
+        && let Some(nl) = window.find('\n')
+        && !window[nl + 1..].is_empty()
+    {
+        window = &window[nl + 1..];
+    }
+    window
+}
+
 impl AgentWorkspace {
     /// Create a workspace at `{base_dir}/{agent_name}/`.
     ///
@@ -275,6 +507,7 @@ impl AgentWorkspace {
     pub fn new(base_dir: impl Into<PathBuf>, agent_name: &str) -> Self {
         Self {
             dir: base_dir.into().join(agent_name),
+            shown: Arc::new(DashMap::new()),
         }
     }
 
@@ -282,7 +515,10 @@ impl AgentWorkspace {
     ///
     /// Used for subagents whose workspace path is already fully resolved.
     pub fn with_dir(dir: impl Into<PathBuf>) -> Self {
-        Self { dir: dir.into() }
+        Self {
+            dir: dir.into(),
+            shown: Arc::new(DashMap::new()),
+        }
     }
 
     /// Get the workspace directory for this agent.
@@ -293,6 +529,78 @@ impl AgentWorkspace {
     /// Ensure the workspace directory exists
     pub fn ensure_dir(&self) -> std::io::Result<()> {
         std::fs::create_dir_all(self.dir())
+    }
+
+    /// Record that the agent has been handed `content` as its view of
+    /// `file`, and whether that was the whole of it.
+    ///
+    /// Every call site is a place where bytes actually reach the model: the
+    /// system-prompt injection, the `workspace_read` tool, and the agent's
+    /// own successful whole-file replacement. Deliberately *not* called from
+    /// [`Self::append_file`] — an append tells the agent nothing about the
+    /// bytes it did not write, and refreshing the base there would hand a
+    /// following `mode: "write"` permission to delete exactly the entries the
+    /// append had just added. That single omission is what makes the
+    /// append-then-replace sequence in #1310 refusable.
+    ///
+    /// Also not called from [`Self::write_file_as_operator`]: an operator
+    /// editing the file from the UI is not the agent reading it, and the
+    /// resulting mismatch refusing the agent's next replacement is the
+    /// correct outcome, not collateral.
+    fn record_shown(&self, file: WorkspaceFile, content: String, whole: bool) {
+        self.shown.insert(file, ShownView { content, whole });
+    }
+
+    /// Drop every recorded view, so the next thing to show the agent a file
+    /// starts the record over.
+    ///
+    /// Called once per run, from `build_context`, immediately before the
+    /// system prompt is assembled. Without it the record would outlive the
+    /// context it describes: a runtime reused across two runs would let a
+    /// file shown in the first run authorise a replacement in the second,
+    /// where the agent's context does not contain it. The gateway and the
+    /// coordinator both build a fresh `AgentWorkspace` per run today, so this
+    /// is belt-and-braces — but it makes "the base is what *this run* has
+    /// seen" a property of the runtime rather than of its callers' habits.
+    pub fn forget_shown_files(&self) {
+        self.shown.clear();
+    }
+
+    /// Read a workspace file for the agent and record what was handed over.
+    ///
+    /// This is the `workspace_read` tool's whole implementation, and the
+    /// deliberate counterpart to the system-prompt injection: the injection
+    /// is what the agent gets whether it wanted it or not, capped small
+    /// enough to share the prompt with everything else; this is what it gets
+    /// when it asks, capped at [`WORKSPACE_READ_CAP`].
+    ///
+    /// The recorded base is the **whole file**, not the returned window, so
+    /// the comparison in [`Self::write_file_checked`] stays a comparison
+    /// against the file. What a capped read gives up is `complete`, and that
+    /// is the flag that refuses the following replacement.
+    pub fn read_for_agent(&self, file: WorkspaceFile) -> AgentRead {
+        let full = self.read_file(file).unwrap_or_default();
+        let total_bytes = full.len();
+
+        // One branch decides both the payload and the claim about it, so
+        // they cannot disagree — the failure mode this fix exists to stop is
+        // exactly a partial view described as a whole one.
+        let (content, complete) = if total_bytes <= WORKSPACE_READ_CAP {
+            (full.clone(), true)
+        } else {
+            (
+                tail_window_from_line_start(&full, WORKSPACE_READ_CAP).to_string(),
+                false,
+            )
+        };
+
+        self.record_shown(file, full, complete);
+
+        AgentRead {
+            content,
+            total_bytes,
+            complete,
+        }
     }
 
     /// Read a workspace file. Returns None if file doesn't exist or is empty.
@@ -322,6 +630,12 @@ impl AgentWorkspace {
     /// explicit `mode: "write"` — which is still the right thing for an
     /// agent deliberately compacting its memories, and still carries the
     /// staleness, now knowingly.
+    ///
+    /// **Not the agent's path any more (#1310).** `workspace_write` now goes
+    /// through [`Self::write_file_checked`], which is this plus the
+    /// shown-view guard. This function survives as the unguarded replacement
+    /// — the one the #1294 lock/staging tests exercise directly, and the one
+    /// to call when the guard is not wanted and the caller knows why.
     pub fn write_file(&self, file: WorkspaceFile, content: &str) -> AlmsResult<()> {
         if !file.agent_writable() {
             return Err(AlmsError::InvalidConfig(format!(
@@ -331,6 +645,110 @@ impl AgentWorkspace {
         }
 
         self.replace_file(file, content)
+    }
+
+    /// Replace a workspace file on the agent's behalf, refusing the write
+    /// when it would delete bytes the agent has never been shown (#1310).
+    ///
+    /// **The defect.** `mode: "write"` sends a whole file, and the only file
+    /// the model has to send is the one in its context. Three ways that
+    /// differs from the file on disk, none of which the model can detect:
+    ///
+    /// 1. It is a **window**. Past [`MEMORIES_INJECTION_CAP`] the injection
+    ///    is the tail of `memories.md`, so a replacement built from it
+    ///    deletes everything above the cut. This needs no concurrency, no
+    ///    second agent and no unusual sequence — it is the steady state of
+    ///    every memories file that has grown past 4000 bytes. #1311 put a
+    ///    marker on the window saying so, which is the best a string can do;
+    ///    this is the part that does not depend on the model reading it.
+    /// 2. It was **never shown**. `build_system_prompt_prefix` omits
+    ///    `user.md` from `dm:` / `subagent_` / `job_` / `notifications:`
+    ///    runs, and `user.md` defaults to `"write"` — so in those runs the
+    ///    *default* `workspace_write` on `user` replaced a file the agent had
+    ///    no copy of.
+    /// 3. It has **changed since**. Another live instance of the same named
+    ///    agent (the coordinator's `active_named` guard permits several), an
+    ///    operator editing from the UI, or this very run's own earlier
+    ///    `workspace_write` calls in the same tool batch.
+    ///
+    /// **What the check is.** The compare half of a compare-and-swap, taken
+    /// under the file's sidecar lock and against the file itself rather than
+    /// any snapshot the caller is holding — so nothing can land between the
+    /// decision and the rename. The base is [`Self::record_shown`]'s record:
+    /// bytes that actually reached the model, from the prompt injection, from
+    /// `workspace_read`, or from the agent's own previous replacement.
+    ///
+    /// **Why a non-empty target is the trigger.** A file that is missing,
+    /// empty or blank has nothing to lose, so it is written unconditionally.
+    /// That is not a convenience: it keeps the refusal exactly co-extensive
+    /// with "this would have destroyed something", which is what makes it
+    /// safe to leave on by default. A fresh agent bootstrapping its
+    /// `personality.md` never meets the guard.
+    ///
+    /// **Why this is not `mode: "append"`'s problem.** An append never
+    /// deletes, so it is not checked, and it stays the recovery any agent can
+    /// reach with no other tool enabled — which matters, because
+    /// `workspace_read` is subject to the same `tools.enabled` allowlist as
+    /// everything else and cannot be assumed present.
+    ///
+    /// Independent of [`WorkspaceFile::agent_writable`] (#1303), checked
+    /// first here as it is in [`Self::write_file`]: that answers whether the
+    /// agent may write the file at all, this answers whether *this*
+    /// replacement is safe. A file made non-agent-writable is rejected before
+    /// the guard is consulted.
+    pub fn write_file_checked(
+        &self,
+        file: WorkspaceFile,
+        content: &str,
+    ) -> AlmsResult<CheckedWrite> {
+        if !file.agent_writable() {
+            return Err(AlmsError::InvalidConfig(format!(
+                "{} is not agent-writable (edit it manually)",
+                file.filename()
+            )));
+        }
+
+        self.replace_file_guarded(file, content, ShownGuard::Enforce)
+    }
+
+    /// The shown-view decision for one replacement, read off the file at
+    /// `path` and the recorded view.
+    ///
+    /// Called with the file's sidecar lock already held; takes no lock of its
+    /// own and must not, since [`Self::acquire_lock`] conflicts per open
+    /// handle rather than per process.
+    ///
+    /// An unreadable file is treated as empty, which allows the write. That
+    /// is the same direction [`Self::read_file`] already takes for a read
+    /// error, and the conservative one here: refusing on an IO error would
+    /// convert a transient failure into an agent that cannot write its own
+    /// workspace, and the replacement is about to overwrite whatever is there
+    /// regardless.
+    ///
+    /// **This is the opposite answer to the one the caller gives ten lines
+    /// up**, where a lock that cannot be taken *fails* the write, and the two
+    /// are decided differently on purpose. A missing lock means the write may
+    /// land unserialised, which #1294 showed can destroy an append that
+    /// already succeeded — a new harm, created by proceeding. An unreadable
+    /// target means only that this check cannot tell whether the replacement
+    /// destroys anything; proceeding is exactly what the same call did before
+    /// this guard existed, so failing open adds no harm that was not already
+    /// there. Refusing here would take a read error on a file the agent is
+    /// entitled to write and turn it into a permanent refusal, which is a
+    /// worse trade than the one it avoids.
+    fn refusal_for(&self, file: WorkspaceFile, path: &Path) -> Option<RefusedWrite> {
+        let current = std::fs::read_to_string(path).unwrap_or_default();
+        if current.trim().is_empty() {
+            return None;
+        }
+
+        let view = self.shown.get(&file).map(|v| v.value().clone());
+        match view {
+            None => Some(RefusedWrite::NeverShown),
+            Some(view) if !view.whole => Some(RefusedWrite::ShownPartially),
+            Some(view) if view.content != current => Some(RefusedWrite::ChangedSinceShown),
+            Some(_) => None,
+        }
     }
 
     /// Write a workspace file on the operator's authority, skipping the
@@ -415,6 +833,26 @@ impl AgentWorkspace {
     /// rather than falling back to a truncating write — a visible failure
     /// the caller can retry beats an invisible torn read.
     fn replace_file(&self, file: WorkspaceFile, content: &str) -> AlmsResult<()> {
+        // `ShownGuard::Skip` has no refusing branch, so the outcome carries
+        // nothing this caller can act on.
+        self.replace_file_guarded(file, content, ShownGuard::Skip)
+            .map(|_| ())
+    }
+
+    /// [`Self::replace_file`], with the #1310 shown-view guard optionally
+    /// enforced between taking the lock and staging the replacement.
+    ///
+    /// The guard sits **inside** the lock deliberately. Reading the file to
+    /// compare it before taking the lock would leave a window in which an
+    /// append lands after the comparison and is renamed away by the write
+    /// that the comparison had just approved — the same lost update, moved
+    /// somewhere harder to see.
+    fn replace_file_guarded(
+        &self,
+        file: WorkspaceFile,
+        content: &str,
+        guard: ShownGuard,
+    ) -> AlmsResult<CheckedWrite> {
         self.ensure_dir()
             .map_err(|e| AlmsError::Runtime(format!("Cannot create workspace dir: {}", e)))?;
 
@@ -431,6 +869,17 @@ impl AgentWorkspace {
                 e
             ))
         })?;
+
+        if guard == ShownGuard::Enforce
+            && let Some(refusal) = self.refusal_for(file, &path)
+        {
+            warn!(
+                "Refusing to replace {} from the agent: {} (#1310)",
+                path.display(),
+                refusal.code()
+            );
+            return Ok(CheckedWrite::Refused(refusal));
+        }
 
         let staging = Self::staging_path(&dir, file);
         std::fs::write(&staging, content).map_err(|e| {
@@ -454,8 +903,16 @@ impl AgentWorkspace {
             AlmsError::Runtime(format!("Failed to write {}: {}", path.display(), e))
         })?;
 
+        if guard == ShownGuard::Enforce {
+            // The agent authored these bytes, so it has now seen the whole
+            // file. Without this, its own second `mode: "write"` in the same
+            // run would be refused as `ChangedSinceShown` against the file it
+            // had just written itself.
+            self.record_shown(file, content.to_string(), true);
+        }
+
         info!("Updated workspace file: {}", path.display());
-        Ok(())
+        Ok(CheckedWrite::Written)
     }
 
     /// Path of the scratch file a replacement is staged in before being
@@ -654,26 +1111,107 @@ impl AgentWorkspace {
     /// When `include_user` is false, `user.md` is omitted from the prefix.
     /// This saves tokens and avoids confusion in non-user-facing contexts
     /// (DM sessions, subagent runs, scheduled jobs).
+    ///
+    /// This is also the moment the agent is *shown* its workspace, so each
+    /// read is recorded as the base for [`Self::write_file_checked`] (#1310).
+    /// Two details carry the whole guard:
+    ///
+    /// - A file that is missing or blank is recorded as an empty view rather
+    ///   than skipped. There is nothing to show and nothing to lose, and
+    ///   recording it keeps a fresh agent's first `personality.md` write off
+    ///   the guard for a reason the record states, instead of relying on the
+    ///   empty-target valve alone.
+    /// - `user.md` under `include_user == false` is **not read and not
+    ///   recorded**. It is the one file that can be absent from the prompt
+    ///   while present on disk, and recording it here — "we looked, so call
+    ///   it seen" — would hand a DM-run `workspace_write` permission to
+    ///   delete a file the agent has no copy of. Not looking is what makes
+    ///   that case [`RefusedWrite::NeverShown`].
+    ///
+    /// Called again by `rebuild_system_prompt_for_tool_loop` after every tool
+    /// batch, which is what refreshes the base mid-run: an agent that appends
+    /// in one batch and replaces in the next has been re-shown the file in
+    /// between, and its replacement is judged against what it can actually
+    /// see.
     pub fn build_system_prompt_prefix(&self, include_user: bool) -> String {
         let mut parts = Vec::new();
 
-        if let Some(personality) = self.read_file(WorkspaceFile::Personality) {
+        let personality = self
+            .read_file(WorkspaceFile::Personality)
+            .unwrap_or_default();
+        self.record_shown(WorkspaceFile::Personality, personality.clone(), true);
+        if !personality.is_empty() {
             parts.push(personality);
         }
 
-        if let Some(goals) = self.read_file(WorkspaceFile::Goals) {
+        let goals = self.read_file(WorkspaceFile::Goals).unwrap_or_default();
+        self.record_shown(WorkspaceFile::Goals, goals.clone(), true);
+        if !goals.is_empty() {
             parts.push(format!("## Current Goals\n{}", goals));
         }
 
-        if include_user && let Some(user) = self.read_file(WorkspaceFile::User) {
-            parts.push(format!("## About the User\n{}", user));
+        if include_user {
+            let user = self.read_file(WorkspaceFile::User).unwrap_or_default();
+            self.record_shown(WorkspaceFile::User, user.clone(), true);
+            if !user.is_empty() {
+                parts.push(format!("## About the User\n{}", user));
+            }
         }
 
-        if let Some(memories) = self.read_file(WorkspaceFile::Memories) {
-            parts.push(format!(
-                "## Memories\n{}",
-                memories_injection_window(&memories)
-            ));
+        let memories = self.read_file(WorkspaceFile::Memories).unwrap_or_default();
+        let window = memories_injection_window(&memories);
+        // `memories_injection_window` returns the file verbatim while it fits
+        // the cap and a marked tail window past it, so this equality *is* the
+        // "was the agent shown the whole file?" question, in that polarity:
+        // it is *true* when the file fit and was injected verbatim. Read off
+        // the value rather than recomputing the cap comparison, which would
+        // be a second copy of the predicate free to drift from the first.
+        let shown_whole_here = window == memories;
+
+        // **Re-showing a window must not un-show a whole copy the model is
+        // still holding.** This function runs again after every tool batch,
+        // and for an over-cap `memories.md` it computes `whole = false` every
+        // time — so an unconditional record would overwrite the `whole: true`
+        // that `read_for_agent` had just written, on the one rebuild that is
+        // guaranteed to land between the two. A `workspace_read` and the
+        // `mode: "write"` it exists to enable **cannot** be the same tool
+        // batch, because the model needs the read result to compose the
+        // replacement. So the recovery this guard advertises would refuse
+        // forever, for the whole 4001..=WORKSPACE_READ_CAP band — which is
+        // `ShownPartially`'s entire recoverable population. (Found in review
+        // of #1310; every read-then-write test missed it by omitting the
+        // rebuild, which is exactly the production step that changes the
+        // answer.)
+        //
+        // Views *accumulate* in the model's context rather than replacing one
+        // another: `agent_loop` only appends to `messages` and swaps
+        // `messages[0]`, so a `workspace_read` result stays in context for the
+        // rest of the run. Last-writer-wins is the wrong join for that.
+        //
+        // **Content equality is what keeps it safe**, and it is the whole
+        // condition: the carry-over only applies while the recorded bytes are
+        // still the bytes on disk. If the file moved, the contents differ, the
+        // fresh record lands, and the refusal fires as `ChangedSinceShown` or
+        // `ShownPartially` exactly as it would have.
+        //
+        // Deliberately local to `memories`, not a rule on
+        // [`Self::record_shown`]. The other three files are injected in full,
+        // so they never downgrade and would gain nothing; and a general rule
+        // would have to carve out [`Self::read_for_agent`], whose own capped
+        // path *must* keep downgrading — a rule whose only exception is the
+        // caller that needs it most is not a rule.
+        let already_shown_whole = self
+            .shown
+            .get(&WorkspaceFile::Memories)
+            .is_some_and(|v| v.whole && v.content == memories);
+
+        self.record_shown(
+            WorkspaceFile::Memories,
+            memories,
+            shown_whole_here || already_shown_whole,
+        );
+        if !window.is_empty() {
+            parts.push(format!("## Memories\n{}", window));
         }
 
         if parts.is_empty() {
@@ -957,12 +1495,19 @@ mod tests {
 
     /// What the marker has to say, and the precondition #1310 inherits.
     ///
-    /// There is no `workspace_read` tool, so this injection is the agent's only
-    /// view of its memories, and #1305's documented repair for an accidental
-    /// duplicate is to resend the file with an explicit `mode: "write"`. The
-    /// only text the model can resend is the text it was shown. A window that
-    /// does not say it is a window therefore turns that repair into a deletion
-    /// — tail-anchoring alone only changes which half is deleted.
+    /// This injection is the view of its memories the agent gets whether it
+    /// asked or not, and #1305's documented repair for an accidental duplicate
+    /// is to resend the file with an explicit `mode: "write"`. The only text
+    /// the model can resend is the text it was shown. A window that does not
+    /// say it is a window therefore turns that repair into a deletion —
+    /// tail-anchoring alone only changes which half is deleted.
+    ///
+    /// (This comment used to open "there is no `workspace_read` tool, so this
+    /// injection is the agent's only view of its memories". #1310 added one,
+    /// and refuses a replacement built from a window outright. The marker is
+    /// now what lets a model *avoid* that refusal rather than the only thing
+    /// standing between it and the deletion — which is why the assertions
+    /// below are unchanged.)
     #[test]
     fn the_marker_says_the_window_is_not_the_whole_file_and_that_rewriting_deletes() {
         let memories = oversize_memories();
@@ -1771,5 +2316,667 @@ mod tests {
             .filter(|name| name.ends_with(".tmp"))
             .collect();
         assert!(strays.is_empty(), "staging files left behind: {strays:?}");
+    }
+
+    // ── #1310: the shown-view guard on a whole-file replacement ────────────
+
+    /// Numbered entries totalling at least `bytes`, so a test can say "the
+    /// entry at the top" and "the entry at the bottom" without counting
+    /// characters.
+    fn memories_of_at_least(bytes: usize) -> String {
+        let mut out = String::new();
+        let mut n = 0;
+        while out.len() < bytes {
+            out.push_str(&format!("- entry {n}\n"));
+            n += 1;
+        }
+        out
+    }
+
+    /// Nothing has shown the agent the file, so a replacement is refused.
+    ///
+    /// Not a contrived state. It is every `dm:` / `subagent_` / `job_` /
+    /// `notifications:` run's relationship with `user.md`, which
+    /// `build_system_prompt_prefix` leaves out of the prompt — and `user.md`
+    /// defaults to `"write"`, so before this the *default* call in those runs
+    /// replaced a file the agent had no copy of.
+    ///
+    /// The file being untouched afterwards is half the assertion: a refusal
+    /// that had already renamed the staging file into place would satisfy the
+    /// return value and lose the data anyway.
+    #[test]
+    fn a_replacement_is_refused_when_nothing_has_shown_the_agent_the_file() {
+        let (_dir, ws) = test_workspace();
+        ws.write_file_as_operator(WorkspaceFile::Goals, "- ship the thing")
+            .unwrap();
+
+        assert_eq!(
+            ws.write_file_checked(WorkspaceFile::Goals, "- something else")
+                .unwrap(),
+            CheckedWrite::Refused(RefusedWrite::NeverShown)
+        );
+        assert_eq!(
+            ws.read_file(WorkspaceFile::Goals).unwrap(),
+            "- ship the thing",
+            "a refused replacement must not touch the file"
+        );
+    }
+
+    /// The false branch of every refusal above, and the reason none of them
+    /// is satisfied by a guard that simply always says no: a replacement of a
+    /// file the prompt build showed the agent, unchanged since, is written.
+    #[test]
+    fn a_replacement_matching_what_the_agent_was_shown_is_written() {
+        let (_dir, ws) = test_workspace();
+        ws.write_file_as_operator(WorkspaceFile::Goals, "- ship the thing")
+            .unwrap();
+        let prefix = ws.build_system_prompt_prefix(true);
+        assert!(
+            prefix.contains("- ship the thing"),
+            "precondition: the prompt build is what shows the agent the file"
+        );
+
+        assert_eq!(
+            ws.write_file_checked(WorkspaceFile::Goals, "- ship the thing, then rest")
+                .unwrap(),
+            CheckedWrite::Written
+        );
+        assert_eq!(
+            ws.read_file(WorkspaceFile::Goals).unwrap(),
+            "- ship the thing, then rest"
+        );
+    }
+
+    /// The file moved after it was shown, so a replacement is refused.
+    ///
+    /// Both rows are the same edit at different sizes. The same-length row is
+    /// the one that matters: a guard that compared lengths, or file
+    /// modification times at one-second resolution, would pass the first row
+    /// and fail the second.
+    #[test]
+    fn a_replacement_is_refused_when_the_file_moved_after_it_was_shown() {
+        for (label, moved_to) in [
+            ("a longer file", "- ship the thing\n- and another"),
+            // Exactly as many bytes as "- ship the thing".
+            ("a same-length file", "- ship the thinh"),
+        ] {
+            let (_dir, ws) = test_workspace();
+            ws.write_file_as_operator(WorkspaceFile::Goals, "- ship the thing")
+                .unwrap();
+            let _ = ws.build_system_prompt_prefix(true);
+
+            ws.write_file_as_operator(WorkspaceFile::Goals, moved_to)
+                .unwrap();
+
+            assert_eq!(
+                ws.write_file_checked(WorkspaceFile::Goals, "- something else")
+                    .unwrap(),
+                CheckedWrite::Refused(RefusedWrite::ChangedSinceShown),
+                "{label}"
+            );
+            assert_eq!(
+                ws.read_file(WorkspaceFile::Goals).unwrap(),
+                moved_to,
+                "{label}: the refusal must leave the newer content in place"
+            );
+        }
+    }
+
+    /// A file with nothing in it is replaced without any view being recorded,
+    /// for all four files and for both ways of being empty.
+    ///
+    /// This is what keeps the refusal exactly co-extensive with "this would
+    /// have destroyed something". A fresh agent bootstrapping its
+    /// `personality.md` has been shown nothing, and must not be refused for
+    /// it.
+    ///
+    /// Enumerated over [`WorkspaceFile::all`] rather than spot-checked,
+    /// because the guard has no per-file branch and a claim about "the
+    /// workspace files" should be a claim about all of them.
+    #[test]
+    fn an_empty_or_missing_target_is_written_without_the_agent_having_seen_it() {
+        for file in WorkspaceFile::all() {
+            let (_dir, ws) = test_workspace();
+            assert_eq!(
+                ws.write_file_checked(*file, "first content").unwrap(),
+                CheckedWrite::Written,
+                "a missing {} must be writable",
+                file.filename()
+            );
+
+            let (_dir, ws) = test_workspace();
+            ws.ensure_dir().unwrap();
+            std::fs::write(ws.dir().join(file.filename()), "   \n\t\n").unwrap();
+            assert_eq!(
+                ws.write_file_checked(*file, "first content").unwrap(),
+                CheckedWrite::Written,
+                "a blank {} must be writable",
+                file.filename()
+            );
+        }
+    }
+
+    /// The always-on case, and the one that needs no concurrency, no second
+    /// writer and no unusual sequence: past [`MEMORIES_INJECTION_CAP`] the
+    /// agent is shown the *end* of `memories.md`, so any whole-file
+    /// replacement it can compose deletes everything above the cut.
+    ///
+    /// The agent modelled here is the best-case one — it sends back exactly
+    /// the window it was given, unedited, and nothing has touched the file in
+    /// between. The refusal is about the **view**, not about a race, which is
+    /// why this test arms nothing and races nothing.
+    #[test]
+    fn an_over_cap_memories_file_refuses_a_replacement_even_when_nothing_changed() {
+        let (_dir, ws) = test_workspace();
+        let memories = memories_of_at_least(MEMORIES_INJECTION_CAP + 500);
+        ws.write_file_as_operator(WorkspaceFile::Memories, &memories)
+            .unwrap();
+
+        let prefix = ws.build_system_prompt_prefix(false);
+        assert!(
+            prefix.contains("Older memories truncated"),
+            "precondition: over the cap the injection is a window, not the file"
+        );
+        assert!(
+            !prefix.contains("- entry 0\n"),
+            "precondition: the oldest entry is the part the agent cannot see"
+        );
+
+        let window = memories_injection_window(&memories);
+        assert_eq!(
+            ws.write_file_checked(WorkspaceFile::Memories, &window)
+                .unwrap(),
+            CheckedWrite::Refused(RefusedWrite::ShownPartially)
+        );
+        assert_eq!(
+            ws.read_file(WorkspaceFile::Memories).unwrap(),
+            memories,
+            "the entries above the cut must survive"
+        );
+    }
+
+    /// The boundary of the row above, both sides of it.
+    ///
+    /// `ShownPartially` is decided by whether the injection windowed the
+    /// file, so the guard turns on at exactly one byte. Pinning both sides
+    /// makes the constant load-bearing: a suite that only tested "much larger
+    /// than the cap" would pass with the comparison off by one, or with the
+    /// cap changed underneath it.
+    #[test]
+    fn the_partial_view_guard_turns_on_one_byte_past_the_injection_cap() {
+        for (label, size, expected) in [
+            ("at the cap", MEMORIES_INJECTION_CAP, CheckedWrite::Written),
+            (
+                "one byte over",
+                MEMORIES_INJECTION_CAP + 1,
+                CheckedWrite::Refused(RefusedWrite::ShownPartially),
+            ),
+        ] {
+            let (_dir, ws) = test_workspace();
+            // One unbroken line, so the size is exactly `size` and the
+            // line-boundary walk has nothing to move.
+            let memories = "a".repeat(size);
+            ws.write_file_as_operator(WorkspaceFile::Memories, &memories)
+                .unwrap();
+            let _ = ws.build_system_prompt_prefix(false);
+
+            assert_eq!(
+                ws.write_file_checked(WorkspaceFile::Memories, "- compacted")
+                    .unwrap(),
+                expected,
+                "{label}"
+            );
+        }
+    }
+
+    /// A file that is both windowed and stale reports `ShownPartially`.
+    ///
+    /// Recorded as a decision rather than left to whichever arm happens to be
+    /// first: partiality is a property of the view that a re-read fixes
+    /// outright, and staleness is a special case of the same remedy, so the
+    /// message that describes the larger problem wins.
+    #[test]
+    fn a_view_that_is_both_partial_and_stale_reports_the_partial_view() {
+        let (_dir, ws) = test_workspace();
+        let memories = memories_of_at_least(MEMORIES_INJECTION_CAP + 500);
+        ws.write_file_as_operator(WorkspaceFile::Memories, &memories)
+            .unwrap();
+        let _ = ws.build_system_prompt_prefix(false);
+        ws.append_file(WorkspaceFile::Memories, "- entry added later")
+            .unwrap();
+
+        assert_eq!(
+            ws.write_file_checked(WorkspaceFile::Memories, "- compacted")
+                .unwrap(),
+            CheckedWrite::Refused(RefusedWrite::ShownPartially)
+        );
+    }
+
+    /// `user.md` is the one file that can be absent from the prompt while
+    /// present on disk, and the guard follows the prompt rather than the
+    /// disk.
+    ///
+    /// Both branches are here because the `include_user == false` row is only
+    /// meaningful against the `true` one: a workspace that never recorded
+    /// `user.md` at all would pass the refusing row and break every DM
+    /// agent's ability to write the file even after `workspace_read`.
+    #[test]
+    fn user_md_is_shown_only_to_a_user_facing_run_and_the_guard_follows() {
+        for (include_user, expected) in [
+            (true, CheckedWrite::Written),
+            (false, CheckedWrite::Refused(RefusedWrite::NeverShown)),
+        ] {
+            let (_dir, ws) = test_workspace();
+            ws.write_file_as_operator(WorkspaceFile::User, "Name: Alper")
+                .unwrap();
+
+            let prefix = ws.build_system_prompt_prefix(include_user);
+            assert_eq!(
+                prefix.contains("Name: Alper"),
+                include_user,
+                "precondition: include_user={include_user} decides whether the agent sees it"
+            );
+
+            assert_eq!(
+                ws.write_file_checked(WorkspaceFile::User, "Name: Someone Else")
+                    .unwrap(),
+                expected,
+                "include_user={include_user}"
+            );
+        }
+    }
+
+    /// An append does **not** refresh the base, so the replacement that
+    /// follows it is refused.
+    ///
+    /// This is #1310's headline sequence with the concurrency removed, which
+    /// is how it actually reaches production: one agent, one run, one tool
+    /// batch. It appends three memories and then tidies up by sending back
+    /// the snapshot it was given — which does not contain them.
+    ///
+    /// The single line that makes it refusable is the absence of a
+    /// `record_shown` call in `append_file`. Refreshing the base there would
+    /// look reasonable (the agent knows what it appended) and would hand this
+    /// exact replacement permission to delete all three.
+    #[test]
+    fn an_append_does_not_refresh_the_base_so_the_replacement_after_it_is_refused() {
+        let (_dir, ws) = test_workspace();
+        ws.write_file_as_operator(WorkspaceFile::Memories, "- M1\n- M2")
+            .unwrap();
+
+        let snapshot = ws
+            .build_system_prompt_prefix(false)
+            .strip_prefix("## Memories\n")
+            .expect("only memories.md is seeded, so it is the whole prefix")
+            .to_string();
+
+        for entry in ["- M3", "- M4", "- M5"] {
+            ws.append_file(WorkspaceFile::Memories, entry).unwrap();
+        }
+
+        assert_eq!(
+            ws.write_file_checked(
+                WorkspaceFile::Memories,
+                &snapshot.replace("- M1", "- M1 (fixed)")
+            )
+            .unwrap(),
+            CheckedWrite::Refused(RefusedWrite::ChangedSinceShown)
+        );
+        let on_disk = ws.read_file(WorkspaceFile::Memories).unwrap();
+        for entry in ["- M3", "- M4", "- M5"] {
+            assert!(
+                on_disk.contains(entry),
+                "{entry} was appended during the run and must survive; memories.md is now:\n{on_disk}"
+            );
+        }
+    }
+
+    /// The agent's own successful replacement becomes the new base.
+    ///
+    /// Without it the guard would be self-defeating: an agent that replaced a
+    /// file once would be refused the second time, against content it had
+    /// written itself one call earlier.
+    #[test]
+    fn a_successful_replacement_becomes_the_new_base() {
+        let (_dir, ws) = test_workspace();
+        ws.write_file_as_operator(WorkspaceFile::Goals, "- old")
+            .unwrap();
+        let _ = ws.build_system_prompt_prefix(true);
+
+        assert_eq!(
+            ws.write_file_checked(WorkspaceFile::Goals, "- new")
+                .unwrap(),
+            CheckedWrite::Written
+        );
+        assert_eq!(
+            ws.write_file_checked(WorkspaceFile::Goals, "- newer")
+                .unwrap(),
+            CheckedWrite::Written,
+            "a second replacement must not be refused against the agent's own first one"
+        );
+        assert_eq!(ws.read_file(WorkspaceFile::Goals).unwrap(), "- newer");
+    }
+
+    /// An operator's write does **not** become the agent's base.
+    ///
+    /// `write_file_as_operator` is the `PUT /agents/{id}/workspace/{file}`
+    /// route: a human editing the file from the UI, which the agent has no
+    /// way to observe. Recording it as shown would let the agent's next
+    /// replacement delete the human's edit, which is the same defect with a
+    /// different author.
+    #[test]
+    fn an_operator_write_does_not_become_the_agents_base() {
+        let (_dir, ws) = test_workspace();
+        ws.write_file_as_operator(WorkspaceFile::Goals, "- old")
+            .unwrap();
+        let _ = ws.build_system_prompt_prefix(true);
+
+        ws.write_file_as_operator(WorkspaceFile::Goals, "- edited by hand")
+            .unwrap();
+
+        assert_eq!(
+            ws.write_file_checked(WorkspaceFile::Goals, "- old, rewritten")
+                .unwrap(),
+            CheckedWrite::Refused(RefusedWrite::ChangedSinceShown)
+        );
+        assert_eq!(
+            ws.read_file(WorkspaceFile::Goals).unwrap(),
+            "- edited by hand"
+        );
+    }
+
+    /// [`AgentWorkspace::forget_shown_files`] drops the record, so a view
+    /// from one run cannot authorise a replacement in the next.
+    #[test]
+    fn forgetting_the_shown_files_refuses_the_next_replacement() {
+        let (_dir, ws) = test_workspace();
+        ws.write_file_as_operator(WorkspaceFile::Goals, "- old")
+            .unwrap();
+        let _ = ws.build_system_prompt_prefix(true);
+
+        ws.forget_shown_files();
+
+        assert_eq!(
+            ws.write_file_checked(WorkspaceFile::Goals, "- new")
+                .unwrap(),
+            CheckedWrite::Refused(RefusedWrite::NeverShown)
+        );
+    }
+
+    /// The recovery, end to end: a deliberate read replaces a partial view
+    /// with a whole one and the refused replacement goes through.
+    ///
+    /// A refusal with no reachable way out is a worse bug than the silent
+    /// loss it replaces, so this is the row that makes the guard shippable
+    /// rather than merely correct.
+    #[test]
+    fn a_deliberate_read_replaces_a_partial_view_and_unblocks_the_replacement() {
+        let (_dir, ws) = test_workspace();
+        let memories = memories_of_at_least(MEMORIES_INJECTION_CAP + 500);
+        ws.write_file_as_operator(WorkspaceFile::Memories, &memories)
+            .unwrap();
+        let _ = ws.build_system_prompt_prefix(false);
+
+        assert_eq!(
+            ws.write_file_checked(WorkspaceFile::Memories, "- compacted")
+                .unwrap(),
+            CheckedWrite::Refused(RefusedWrite::ShownPartially),
+            "precondition: the injection windowed the file"
+        );
+
+        let read = ws.read_for_agent(WorkspaceFile::Memories);
+        assert!(read.complete, "the file is under WORKSPACE_READ_CAP");
+        assert_eq!(
+            read.content, memories,
+            "a complete read is the file verbatim"
+        );
+        assert_eq!(read.total_bytes, memories.len());
+
+        // The prompt rebuild `agent_loop` runs after every tool batch, and it
+        // is not optional here: the read and the write cannot be one batch,
+        // because the model needs the read result to compose the replacement.
+        // An unconditional re-record downgrades the read's `whole` view back
+        // to a window on this line, and the write below is then refused
+        // forever.
+        let _ = ws.build_system_prompt_prefix(false);
+
+        assert_eq!(
+            ws.write_file_checked(WorkspaceFile::Memories, "- compacted")
+                .unwrap(),
+            CheckedWrite::Written
+        );
+        assert_eq!(
+            ws.read_file(WorkspaceFile::Memories).unwrap(),
+            "- compacted"
+        );
+    }
+
+    /// The carry-over is gated on the bytes, not on the flag: a rebuild after
+    /// a read still downgrades the view when the file has *moved*.
+    ///
+    /// The complement of the row above, and the reason it is safe. Carrying a
+    /// stale `whole` forward unconditionally would rebuild the original defect
+    /// out of the fix for it — the agent read M, something appended, and a
+    /// replacement composed from M erases the append while the record claims
+    /// it has seen the whole file.
+    ///
+    /// Over-cap on purpose, so `window == memories` is false and the
+    /// carry-over is the only thing that could authorise the write.
+    #[test]
+    fn a_rebuild_after_a_read_still_downgrades_the_view_when_the_file_moved() {
+        let (_dir, ws) = test_workspace();
+        let memories = memories_of_at_least(MEMORIES_INJECTION_CAP + 500);
+        ws.write_file_as_operator(WorkspaceFile::Memories, &memories)
+            .unwrap();
+
+        let read = ws.read_for_agent(WorkspaceFile::Memories);
+        assert!(read.complete, "precondition: the read was not capped");
+
+        // Another live instance of the same named agent appends after the
+        // read and before the rebuild.
+        ws.append_file(WorkspaceFile::Memories, "- learned by someone else")
+            .unwrap();
+        let _ = ws.build_system_prompt_prefix(false);
+
+        assert_eq!(
+            ws.write_file_checked(WorkspaceFile::Memories, &read.content)
+                .unwrap(),
+            CheckedWrite::Refused(RefusedWrite::ShownPartially),
+            "a whole view of *older* bytes must not authorise replacing the newer ones"
+        );
+        assert!(
+            ws.read_file(WorkspaceFile::Memories)
+                .unwrap()
+                .contains("- learned by someone else"),
+            "and the append must survive"
+        );
+    }
+
+    /// A read that hits its own cap does not unblock anything.
+    ///
+    /// The composition that matters: `workspace_read` is the recovery, so the
+    /// tempting shape is "a read always makes the next write legal". It must
+    /// not, or the recovery becomes a laundering step that turns a
+    /// `WORKSPACE_READ_CAP`-sized window into permission to delete a much
+    /// larger file.
+    ///
+    /// Both sides of `WORKSPACE_READ_CAP` are here for the same reason as the
+    /// injection-cap boundary above.
+    #[test]
+    fn a_capped_read_reports_a_partial_view_and_leaves_the_replacement_refused() {
+        for (label, size, complete, expected) in [
+            (
+                "at the cap",
+                WORKSPACE_READ_CAP,
+                true,
+                CheckedWrite::Written,
+            ),
+            (
+                "one byte over",
+                WORKSPACE_READ_CAP + 1,
+                false,
+                CheckedWrite::Refused(RefusedWrite::ShownPartially),
+            ),
+        ] {
+            let (_dir, ws) = test_workspace();
+            let memories = "a".repeat(size);
+            ws.write_file_as_operator(WorkspaceFile::Memories, &memories)
+                .unwrap();
+
+            let read = ws.read_for_agent(WorkspaceFile::Memories);
+            assert_eq!(read.complete, complete, "{label}");
+            assert_eq!(
+                read.total_bytes,
+                memories.len(),
+                "{label}: total_bytes is the file, not the window"
+            );
+            assert!(
+                read.content.len() <= WORKSPACE_READ_CAP,
+                "{label}: the payload never exceeds the cap"
+            );
+
+            assert_eq!(
+                ws.write_file_checked(WorkspaceFile::Memories, "- compacted")
+                    .unwrap(),
+                expected,
+                "{label}"
+            );
+        }
+    }
+
+    /// A read of a file that is not there is a complete read of nothing.
+    ///
+    /// The alternative — reporting it incomplete, or erroring — would refuse
+    /// the following write on a file with nothing in it, which is the one
+    /// case the guard is supposed to stay out of.
+    #[test]
+    fn a_read_of_a_missing_file_is_complete_and_empty() {
+        for file in WorkspaceFile::all() {
+            let (_dir, ws) = test_workspace();
+            let read = ws.read_for_agent(*file);
+            assert_eq!(read.content, "", "{}", file.filename());
+            assert_eq!(read.total_bytes, 0, "{}", file.filename());
+            assert!(read.complete, "{}", file.filename());
+        }
+    }
+
+    /// A capped read is tail-anchored and opens on a whole line, and says how
+    /// big the file really was.
+    ///
+    /// Same reasoning as the injection window (#1308/#1311), which is why the
+    /// walk is shared: for an append-shaped file the old end is the right one
+    /// to lose, and a window opening mid-entry is not a fragment but a
+    /// different claim.
+    #[test]
+    fn a_capped_read_keeps_the_end_and_opens_on_a_line_boundary() {
+        let (_dir, ws) = test_workspace();
+        let memories = memories_of_at_least(WORKSPACE_READ_CAP + 500);
+        ws.write_file_as_operator(WorkspaceFile::Memories, &memories)
+            .unwrap();
+
+        let read = ws.read_for_agent(WorkspaceFile::Memories);
+        assert!(!read.complete);
+        assert!(
+            memories.ends_with(&read.content),
+            "the window must be the file's tail"
+        );
+        assert!(
+            read.content.starts_with("- entry "),
+            "the window must open on a whole entry, not halfway through one; it opens:\n{}",
+            &read.content[..40.min(read.content.len())]
+        );
+        assert!(
+            !read.content.contains("- entry 0\n"),
+            "the oldest entries are the ones dropped"
+        );
+    }
+
+    /// The declared exception to the line-boundary rule, so it is not read as
+    /// universal: a file that is one enormous unbroken line still yields its
+    /// tail rather than an empty window.
+    #[test]
+    fn a_capped_read_of_one_unbroken_line_still_yields_its_tail() {
+        let (_dir, ws) = test_workspace();
+        let memories = "a".repeat(WORKSPACE_READ_CAP * 2);
+        ws.write_file_as_operator(WorkspaceFile::Memories, &memories)
+            .unwrap();
+
+        let read = ws.read_for_agent(WorkspaceFile::Memories);
+        assert!(!read.complete);
+        assert_eq!(read.content.len(), WORKSPACE_READ_CAP);
+    }
+
+    /// [`WORKSPACE_READ_JSON_ESCAPE_FACTOR`] is a claim about `serde_json`, so
+    /// it is checked against `serde_json` rather than asserted in prose.
+    ///
+    /// The `const` block at the definition is one-sided by construction —
+    /// weakening a term inside an `assert!` can only make it easier to
+    /// satisfy, so no build failure can catch a factor that is too small for
+    /// reality. That is the right shape for the arithmetic and the wrong
+    /// shape for the premise, and the premise is the half that a dependency
+    /// bump can invalidate with nobody reading the doc comment above it.
+    ///
+    /// Every byte that escapes at all is asserted to escape to **exactly**
+    /// two, one character at a time, so a `serde_json` that started emitting
+    /// (say) `\u000a` for a newline fails here rather than silently spilling
+    /// a `workspace_read` result past the in-loop truncator.
+    ///
+    /// **Scope, stated so this is not read as more than it is.** This pins
+    /// the factor for the escapes a text file can contain. It deliberately
+    /// does *not* cover the other control characters below `0x20`, which
+    /// serialise as six-byte `\u00XX` — that is the declared exception on
+    /// [`WORKSPACE_READ_JSON_ESCAPE_FACTOR`], and it is routed to the
+    /// truncator residual rather than to this constant.
+    #[test]
+    fn the_json_escape_factor_matches_what_serde_json_actually_emits() {
+        for (label, ch) in [
+            ("quote", '"'),
+            ("backslash", '\\'),
+            ("newline", '\n'),
+            ("carriage return", '\r'),
+            ("tab", '\t'),
+            ("backspace", '\u{8}'),
+            ("form feed", '\u{c}'),
+        ] {
+            // `to_string()` on a JSON string wraps it in two quotes; the rest
+            // is the escaped byte.
+            let serialised = serde_json::Value::String(ch.to_string()).to_string();
+            assert_eq!(
+                serialised.len() - 2,
+                WORKSPACE_READ_JSON_ESCAPE_FACTOR,
+                "{label} serialises as {serialised}, which is not \
+                 {WORKSPACE_READ_JSON_ESCAPE_FACTOR} bytes -- the cap arithmetic at \
+                 WORKSPACE_READ_CAP assumes it is"
+            );
+        }
+
+        // And the complement: ordinary text, including non-ASCII, does not
+        // escape at all. Without this row the factor could be "correct" for a
+        // serialiser that escaped every byte, which would blow the bound the
+        // moment a real file went through it.
+        let plain = "- a memory about caf\u{e9}s\n";
+        let serialised = serde_json::Value::String(plain.to_string()).to_string();
+        assert_eq!(
+            serialised.len() - 2,
+            plain.len() + 1,
+            "only the newline may grow; got {serialised}"
+        );
+    }
+
+    /// The shared tail walk is total: handed a `cap` at or above the text's
+    /// length it returns the whole text, rather than treating position 0 as a
+    /// mid-line cut and eating the first line.
+    ///
+    /// Both real callers return early before reaching that input, so this
+    /// tests a property of the function rather than of the system. It is here
+    /// because the `start > 0` term that provides it is invisible from either
+    /// call site, and a future third caller without an early return would
+    /// silently lose a line.
+    #[test]
+    fn the_tail_walk_returns_the_whole_text_when_the_cap_does_not_bite() {
+        assert_eq!(
+            tail_window_from_line_start("first line\nsecond line", 1000),
+            "first line\nsecond line"
+        );
     }
 }
