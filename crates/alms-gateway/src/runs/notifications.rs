@@ -805,14 +805,19 @@ async fn notify_job_completion(
 /// LLM turn explaining itself — the banner is where the operator learns *why*
 /// (#1258).
 ///
-/// Known gap (#1258): an agent with no user-facing session at all — a purely
-/// background or channel-driven one — gets `None` from
-/// `find_user_facing_session` and this function early-returns. Pre-#1258 an
-/// interrupted end at least landed a run on `notifications:{agent}`, so the
-/// end was in that agent's history; now it is recorded only as the bus's
-/// (reader-invisible) `dm_ended` row on the DM session. A fallback that
-/// persists the marker on the trigger's own target when no user-facing
-/// session exists would close it.
+/// Closed gap (#1258 → #1300): an agent with no user-facing session at all — a
+/// purely background or channel-driven one — gets `None` from
+/// `find_user_facing_session`, and this function early-returns, so the
+/// OPERATOR-facing marker is still not written for it. That used to mean an
+/// interrupted end existed only as the bus's (reader-invisible) `dm_ended`
+/// row, where pre-#1258 it had at least landed a run on
+/// `notifications:{agent}`. #1300 writes the agent's own record on the
+/// trigger's own target instead — including creating the deterministic
+/// `notifications:` session when the trigger is that agent's first, which is
+/// exactly the case this paragraph described. See
+/// `persist_interrupted_end_marker`. What remains open is narrower and
+/// operator-facing only: such an agent has no chat for a banner to appear in,
+/// which is what having no user-facing session means.
 pub(super) async fn notify_dm_ended_to_webchat(
     state: &AppState,
     agent_id: alms_core::AgentId,
@@ -1782,8 +1787,57 @@ pub(super) struct TriggeredRunTarget {
     pub(super) dm_ended_peer: Option<String>,
 }
 
-/// Decide which runs a trigger produces, and what each of them may not
-/// message.
+/// The record an interrupted DM end leaves in place of the run it did not
+/// get (#1300).
+///
+/// Produced only by the #1258 suppression arm of [`plan_triggered_runs`], and
+/// mutually exclusive with [`TriggerPlan::targets`] by construction: an
+/// interrupted end that still produces a run is told about the interruption
+/// BY that run's input — [`format_dm_ended_notification`] states it in prose
+/// on both the `user_cancelled` and `errored` arms — so a marker there would
+/// be a second copy of the same sentence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct InterruptedEndRecord {
+    /// The session whose run was suppressed — i.e. exactly where the
+    /// notification would have landed. Deliberately not
+    /// `find_user_facing_session`: that is the OPERATOR's copy, which
+    /// `notify_dm_ended_to_webchat` already writes as a display-only marker.
+    /// This is the AGENT's copy and belongs on the thread that lost its turn,
+    /// which is also the only choice that still has a target when the agent
+    /// has no user-facing session at all.
+    pub(super) session_id: SessionId,
+    /// The other party — the trigger's `from_name`, which names the agent
+    /// that is *not* the recipient on BOTH shapes of `ConversationEnded`
+    /// (see [`dm_ended_peer_for_source`]).
+    pub(super) peer_name: String,
+    /// Carried rather than pre-formatted, so the marker text stays a pure
+    /// function of it that is testable without building a plan.
+    pub(super) reason: ConversationEndReason,
+    /// The trigger's context id, carried for the same reason
+    /// [`TriggeredRunTarget`] carries one: the target session may not exist
+    /// yet, and creating it needs the context id. See
+    /// [`persist_interrupted_end_marker`].
+    pub(super) context_id: String,
+}
+
+/// The complete routing decision for one trigger: the runs it produces, and
+/// — when it produces none — the record that stands in for the run it did
+/// not get.
+///
+/// One value rather than two returns because the two halves are a partition,
+/// not a pair: a `ConversationEnded` trigger yields runs XOR a marker. A test
+/// can assert the partition on the returned value instead of asserting each
+/// half separately and hoping they line up.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct TriggerPlan {
+    pub(super) targets: Vec<TriggeredRunTarget>,
+    /// Set exactly when `targets` is empty because the end was interrupted
+    /// (#1300).
+    pub(super) interrupted_end: Option<InterruptedEndRecord>,
+}
+
+/// Decide which runs a trigger produces, what each of them may not message,
+/// and — when it produces none — where the end gets recorded instead.
 ///
 /// Pure given its four decision inputs (`source`, the trigger's own target,
 /// and `episode_routes`); `agent_id` and `source_label` are log context only.
@@ -1798,12 +1852,23 @@ pub(super) struct TriggeredRunTarget {
 ///    is the primary router. One run per resolved episode: when two episodes
 ///    of the same agent were pending on the ended DM session, BOTH get their
 ///    continuation, each on its own job session with its own job id.
-/// 2. **Otherwise an INTERRUPTED end produces nothing** (#1258). An operator
+/// 2. **Otherwise an INTERRUPTED end produces no run** (#1258). An operator
 ///    cancel, or a run that died mid-turn, has no outcome to relay, so it
 ///    must not put an unrequested run on the operator's session; the
-///    persisted marker is the delivery. An end whose run *completed* —
+///    persisted marker is the operator's delivery. An end whose run
+///    *completed* —
 ///    including `errored` with an unusable result — still gets its run, so
 ///    its transcript reaches the operator's chat.
+///
+///    That arm returns an [`InterruptedEndRecord`] naming the same session
+///    (#1300). Before it, the end was delivered only to the OPERATOR — both
+///    of the records it leaves behind are hidden from the agent, the
+///    `dm_ended_notification` marker by the pre-provider system strip and the
+///    bus's empty-bodied `dm_ended` row by `is_synthetic_marker`. The record
+///    is written with `persist_error_marker`, whose `kind: "error"` shape the
+///    runtime rewrites into a surviving `[Error] …` user message, so it is
+///    the one thing here that reaches the model. Still no run: #1258 is about
+///    not *starting a turn*, not about staying silent.
 /// 3. **Otherwise the trigger's own target**, byte-for-byte as pre-#1198.
 ///
 /// The episode override deliberately beats the suppression: a job
@@ -1852,7 +1917,7 @@ pub(super) fn plan_triggered_runs(
     episode_routes: Vec<super::job_episode::ContinuationRoute>,
     agent_id: alms_core::AgentId,
     source_label: &str,
-) -> Vec<TriggeredRunTarget> {
+) -> TriggerPlan {
     use alms_coordinator::message_bus::MessageSource;
 
     let dm_ended_peer = dm_ended_peer_for_source(source);
@@ -1865,7 +1930,7 @@ pub(super) fn plan_triggered_runs(
     );
 
     if !episode_routes.is_empty() {
-        return episode_routes
+        let targets = episode_routes
             .into_iter()
             .map(|route| {
                 info!(
@@ -1883,6 +1948,13 @@ pub(super) fn plan_triggered_runs(
                 }
             })
             .collect();
+        // No `interrupted_end` even when `end_was_interrupted`: these runs
+        // carry `format_dm_ended_notification`'s prose, which already states
+        // the cancellation / failure to the agent (#1300).
+        return TriggerPlan {
+            targets,
+            interrupted_end: None,
+        };
     }
 
     if end_was_interrupted {
@@ -1892,17 +1964,208 @@ pub(super) fn plan_triggered_runs(
             source = %source_label,
             "DM end was interrupted (cancelled, or the run died mid-turn) \
              — delivering the notification as a marker, starting no run \
-             (#1258)"
+             (#1258/#1300)"
         );
-        return Vec::new();
+        // `end_was_interrupted` is `true` only for `ConversationEnded`, so
+        // `dm_ended_peer` and the reason are both present here. Destructured
+        // rather than unwrapped so a source that ever lies about that yields
+        // no record instead of a panic in the trigger loop.
+        let interrupted_end = match source {
+            MessageSource::ConversationEnded {
+                from_name, reason, ..
+            } => Some(InterruptedEndRecord {
+                session_id: trigger_session_id,
+                peer_name: from_name.clone(),
+                reason: reason.clone(),
+                context_id: trigger_context_id.to_string(),
+            }),
+            MessageSource::Agent { .. } | MessageSource::SubagentCompletion => None,
+        };
+        return TriggerPlan {
+            targets: Vec::new(),
+            interrupted_end,
+        };
     }
 
-    vec![TriggeredRunTarget {
-        session_id: trigger_session_id,
-        context_id: trigger_context_id.to_string(),
-        job_id: None,
-        dm_ended_peer,
-    }]
+    TriggerPlan {
+        targets: vec![TriggeredRunTarget {
+            session_id: trigger_session_id,
+            context_id: trigger_context_id.to_string(),
+            job_id: None,
+            dm_ended_peer,
+        }],
+        interrupted_end: None,
+    }
+}
+
+/// Marker `type` for the record an interrupted DM end leaves behind (#1300).
+///
+/// Deliberately not `"run_boundary"`, the other `kind: "error"` type: the UI
+/// renders that one as a run divider, and
+/// `alms_runtime::context::error_markers`'s #912 legacy-duplicate filter
+/// drops `kind: "error"` markers whose type IS `run_boundary` when a
+/// runtime-layer `[Run failed: …]` bubble sits next to them. A distinct type
+/// keeps this record out of both. It falls through to the UI's generic
+/// `kind == "error"` branch, which renders it with `ErrorMessage`.
+pub(super) const INTERRUPTED_END_MARKER_TYPE: &str = "dm_end_interrupted";
+
+/// The text of the record an interrupted DM end leaves in place of the run it
+/// did not get (#1300).
+///
+/// `peer_name` is the trigger's `from_name`, which names the OTHER party on
+/// both shapes of `ConversationEnded` (see [`dm_ended_peer_for_source`]), so
+/// the second-person phrasing is correct for the peer notification and for
+/// the ender's own #556 / #1215 self-notification alike — neither attributes
+/// the interruption to anybody.
+///
+/// **The whole payload has to live in this string.** `session_msg_to_llm`
+/// rewrites an error marker as `[Error] {content}` and reads `msg.content`
+/// only; nothing in the marker's metadata reaches the model.
+///
+/// The transcript is deliberately NOT inlined the way
+/// `dm_ended_with_history.md` inlines it into a run input. This text is
+/// re-injected on every later turn of the session rather than being consumed
+/// once, so it points at `read_messages` — which does return the DM's real
+/// messages, `is_synthetic_marker` hides only the empty-bodied `dm_ended`
+/// row — instead of carrying up to `DM_HISTORY_MAX_CHARS` of transcript
+/// forever.
+pub(super) fn format_interrupted_end_marker(
+    peer_name: &str,
+    reason: &ConversationEndReason,
+) -> String {
+    let cause = match reason {
+        ConversationEndReason::UserCancelled => "the run was cancelled by the user".to_string(),
+        ConversationEndReason::Errored { message, .. } => format!("the run failed: {message}"),
+        // Unreachable: `plan_triggered_runs` asks for this record only on
+        // `is_interrupted()` reasons. Stated rather than `unreachable!` so a
+        // future interrupted variant degrades to a truthful sentence instead
+        // of panicking the trigger loop.
+        ConversationEndReason::Ignored | ConversationEndReason::DepthExceeded => {
+            "the run did not finish".to_string()
+        }
+    };
+    format!(
+        "Your DM conversation with agent \"{peer_name}\" was cut short before it finished \
+         ({cause}). No reply is coming, and no notification turn was run for this end, so \
+         this record is its only trace. Use read_messages(from: \"{peer_name}\") to review \
+         what was said."
+    )
+}
+
+/// Persist the [`InterruptedEndRecord`] the plan asked for (#1300).
+///
+/// `persist_error_marker`, not the `persist_lifecycle_marker` its web-chat
+/// sibling uses: only the `kind: "error"` shape survives
+/// `strip_mid_history_system_markers` (the runtime rewrites it into an
+/// `[Error] …` user message) and only it is exempt from
+/// `is_stripped_display_marker`, which would otherwise have the
+/// token-budgeted history strategies skip it during selection. Downgrading
+/// this one call to `persist_lifecycle_marker` restores the exact
+/// invisibility #1300 exists to remove.
+///
+/// # Why this mirrors `enqueue_triggered_run`'s session handling
+///
+/// The record stands in for the run that function would have created, so it
+/// has to land — and refuse — in exactly the same places. It cannot simply
+/// write: `SessionManager::append_message` returns `SessionNotFound` when the
+/// session has no history entry, and `persist_error_marker` swallows that
+/// into a `warn!`. That method's doc says "all callers create sessions via
+/// `get_or_create` first"; this was the first call site for which that was
+/// false, because the run it replaces never needed the session to exist —
+/// `enqueue_triggered_run` creates it.
+///
+/// The population that hits it is the one the site choice exists to serve: a
+/// source-less peer, or a #1215 receiver-ends self-notification, routed to a
+/// `notifications:{name}` session that has never been created. Those agents
+/// are exactly the pure recipients `find_user_facing_session` would also have
+/// missed, so dropping them here would give up the whole reason for writing
+/// to the trigger's own target.
+///
+/// The creation is therefore **guarded the same way**: a deterministic
+/// `notifications:` fallback is created (those "intentionally begin life at
+/// the first trigger"), and every other missing target is refused.
+///
+/// Matching the run path is the weak reason to draw the line there —
+/// consistency is equally satisfied by moving the other side. The reasons
+/// that settle it are about what each branch does:
+///
+/// - **A refused target has no reader.** By the time an end is processed,
+///   `remove_source_sessions_for_dm` has cleared the pair's mapping, so
+///   nothing will ever route another trigger at that dead source-session id;
+///   a record there could only be write-only. The deterministic
+///   `notifications:{name}` case is the exact inverse — every later
+///   source-less trigger for that agent resolves to the SAME id, so a record
+///   there is guaranteed a reader. The guard is a "will be read" test.
+/// - **Resurrection has consequences past the stray session.**
+///   `get_or_create_with_id` stamps `last_activity = now`, and
+///   `find_user_facing_session` returns the most recent non-internal session
+///   — so creating a chat the operator DELETED would silently make it the
+///   destination for that agent's future DM-ended banners.
+///
+/// Both conjuncts are load-bearing, and the second is the one with teeth: a
+/// `notifications:` context paired with a NON-canonical id is reachable —
+/// `end_conversation` produces exactly that when the peer's source session
+/// was deleted mid-DM (it keeps the stale id and falls the context back to
+/// `notifications:{peer}`). Creating it would register the stale id under the
+/// canonical `(agent_id, context_id)` key, after which `get_or_create_with_id`
+/// answers "already resolves to …" and `enqueue_triggered_run` suppresses
+/// EVERY later notification run for that agent.
+///
+/// `get()` is a sound probe for the `history` entry `append_message` needs:
+/// `SessionManager::delete` removes `sessions`, `session_by_id` and `history`
+/// together.
+fn persist_interrupted_end_marker(
+    state: &AppState,
+    agent_id: alms_core::AgentId,
+    record: &InterruptedEndRecord,
+) {
+    if state.session_manager.get(record.session_id).is_err() {
+        let is_notification_fallback = record.context_id.starts_with("notifications:")
+            && record.session_id == SessionId::deterministic(&record.context_id);
+        if !is_notification_fallback {
+            warn!(
+                session_id = %record.session_id.0,
+                context_id = %record.context_id,
+                "Dropping interrupted-end record: its target session no longer exists \
+                 and is not a deterministic notification fallback — the run path \
+                 would have refused this target too (#1300)"
+            );
+            return;
+        }
+        if let Err(error) = state.session_manager.get_or_create_with_id(
+            record.session_id,
+            agent_id,
+            record.context_id.clone(),
+        ) {
+            warn!(
+                session_id = %record.session_id.0,
+                context_id = %record.context_id,
+                %error,
+                "Dropping interrupted-end record: its deterministic notification \
+                 session could not be created (#1300)"
+            );
+            return;
+        }
+    }
+
+    info!(
+        session_id = %record.session_id.0,
+        peer = %record.peer_name,
+        reason = %record.reason,
+        "Interrupted DM end got no run — recording it in the session the run \
+         would have used (#1300)"
+    );
+    super::markers::persist_error_marker(
+        &state.session_manager,
+        record.session_id,
+        INTERRUPTED_END_MARKER_TYPE,
+        format_interrupted_end_marker(&record.peer_name, &record.reason),
+        serde_json::json!({
+            "peer": record.peer_name,
+            "reason": record.reason.to_string(),
+            "error_kind": INTERRUPTED_END_MARKER_TYPE,
+        }),
+    );
 }
 
 /// Processes `RunTrigger` events from the `MessageBus`.
@@ -1975,10 +2238,11 @@ pub(super) fn plan_triggered_runs(
 /// an open episode still fires them (otherwise the job stalls until its
 /// deadline).
 ///
-/// # Consequence: an interrupted end is invisible to the agent
+/// # The agent is told without being woken (#1300)
 ///
-/// Recorded because it is invisible from the diff. After an interrupted end
-/// there is no agent-visible signal anywhere:
+/// Suppressing the run used to suppress the *news*. Everything else an
+/// interrupted end leaves behind is hidden from the agent by a different
+/// mechanism, which is why the gap was invisible from the diff:
 ///
 /// - the `dm_ended_notification` marker is `Role::System` + `synthetic`, so
 ///   `strip_mid_history_system_markers` removes it before the provider (and
@@ -1987,14 +2251,21 @@ pub(super) fn plan_triggered_runs(
 /// - the bus's `dm_ended` record is empty-text, so `dm_filter`'s
 ///   `is_synthetic_marker` hides it from `read_messages` / `read_session`.
 ///
-/// So the bus state is consistent — depth reset, tombstone written, neither
+/// The bus state was consistent — depth reset, tombstone written, neither
 /// side can keep sending — but ask the agent "what did the peer say?" and it
-/// does not know the conversation ended. The operator is told; the agent is
-/// not. That is the accepted trade for #1258: the operator is the one who
-/// cancelled, is watching, and can open the DM view. If the agent ever needs
-/// telling without spending a turn, the machinery is `persist_error_marker`
-/// (#874), which survives the strip pass and is rewritten into an `[Error] …`
-/// user message on the next turn.
+/// did not know the conversation had ended. So `plan_triggered_runs` now also
+/// returns an [`InterruptedEndRecord`], which this loop persists via
+/// `persist_error_marker` (#874) onto the session whose run was suppressed.
+/// That marker is `kind: "error"`, the one marker shape the runtime rewrites
+/// into a surviving `[Error] …` user message, so the agent reads the end on
+/// that session's next turn.
+///
+/// The #1258 fix is untouched by that: no run is created, nothing is woken,
+/// and there is no post-end turn to guard. The operator's delivery is also
+/// untouched — `notify_dm_ended_to_webchat` still writes its display-only
+/// marker and banner, and the two do not collide because they are different
+/// records for different readers (and, when the trigger routed to a
+/// `notifications:` session, different sessions).
 pub(crate) async fn run_trigger_loop(
     mut rx: mpsc::Receiver<alms_coordinator::message_bus::RunTrigger>,
     state: AppState,
@@ -2199,10 +2470,15 @@ pub(crate) async fn run_trigger_loop(
             }
         };
 
-        // #1299 / #1258 / #1198: which runs this trigger produces, and what
-        // each of them may not message. One plan, so the routing precedence
-        // and the fold cannot drift apart — see `plan_triggered_runs`.
-        let run_targets = plan_triggered_runs(
+        // #1299 / #1258 / #1198 / #1300: which runs this trigger produces,
+        // what each of them may not message, and — when it produces none —
+        // where the end is recorded instead. One plan, so the routing
+        // precedence, the fold, and the marker cannot drift apart. See
+        // `plan_triggered_runs`.
+        let TriggerPlan {
+            targets: run_targets,
+            interrupted_end,
+        } = plan_triggered_runs(
             &trigger.source,
             session_id,
             &context_id,
@@ -2233,6 +2509,15 @@ pub(crate) async fn run_trigger_loop(
                 &run_target_ids,
             )
             .await;
+        }
+
+        // #1300: an interrupted end that produced no run leaves the AGENT's
+        // copy on the session the run would have used. Written after the
+        // web-chat forward above so that, on the routings where both land in
+        // the same chat, the operator's banner reads first and this record
+        // reads as its follow-up rather than the other way round.
+        if let Some(record) = interrupted_end {
+            persist_interrupted_end_marker(&state, agent_id, &record);
         }
 
         for target in run_targets {
@@ -2349,6 +2634,59 @@ mod tests {
         }
     }
 
+    /// A `ConversationEnded` source carrying an explicit reason.
+    fn ended_because(from_name: &str, reason: ConversationEndReason) -> MessageSource {
+        MessageSource::ConversationEnded {
+            from_agent: AgentId::new(),
+            from_name: from_name.to_string(),
+            reason,
+            self_notification: false,
+            source_session_id: None,
+        }
+    }
+
+    /// **Every** `ConversationEndReason`, with `Errored` at both settings of
+    /// `interrupted` — the set the #1300 claim ranges over.
+    ///
+    /// Derived rather than picked: the `match` is exhaustive and returns
+    /// nothing, so it exists only to fail compilation when a variant is added
+    /// to the enum, which is the signal to extend the list above it. The two
+    /// polarity assertions then keep the list from degenerating into an
+    /// all-interrupted or all-completed set, which would let a row that
+    /// asserts "every X" pass while covering only one answer.
+    fn all_end_reasons() -> Vec<ConversationEndReason> {
+        let all = vec![
+            ConversationEndReason::Ignored,
+            ConversationEndReason::DepthExceeded,
+            ConversationEndReason::UserCancelled,
+            ConversationEndReason::Errored {
+                message: "429 rate limited".to_string(),
+                interrupted: true,
+            },
+            ConversationEndReason::Errored {
+                message: "no deliverable reply".to_string(),
+                interrupted: false,
+            },
+        ];
+        for reason in &all {
+            match reason {
+                ConversationEndReason::Ignored
+                | ConversationEndReason::DepthExceeded
+                | ConversationEndReason::UserCancelled
+                | ConversationEndReason::Errored { .. } => {}
+            }
+        }
+        assert!(
+            all.iter().any(ConversationEndReason::is_interrupted),
+            "the set must contain interrupted ends"
+        );
+        assert!(
+            all.iter().any(|r| !r.is_interrupted()),
+            "and completed ends, or the complement rows below are vacuous"
+        );
+        all
+    }
+
     fn job_route(job_id: JobId) -> super::super::job_episode::ContinuationRoute {
         super::super::job_episode::ContinuationRoute {
             job_id,
@@ -2427,14 +2765,18 @@ mod tests {
             AgentId::new(),
             "notification:dm_ended:alice",
         );
-        assert_eq!(plan.len(), 1);
-        assert_eq!(plan[0].session_id, session_id);
-        assert_eq!(plan[0].context_id, "notifications:bob");
-        assert_eq!(plan[0].job_id, None);
+        assert_eq!(plan.targets.len(), 1);
+        assert_eq!(plan.targets[0].session_id, session_id);
+        assert_eq!(plan.targets[0].context_id, "notifications:bob");
+        assert_eq!(plan.targets[0].job_id, None);
         assert_eq!(
-            plan[0].dm_ended_peer.as_deref(),
+            plan.targets[0].dm_ended_peer.as_deref(),
             Some("alice"),
             "the post-end turn must be handed the peer it may not message"
+        );
+        assert_eq!(
+            plan.interrupted_end, None,
+            "#1300: an end that gets its run is told by the run's input"
         );
     }
 
@@ -2460,11 +2802,11 @@ mod tests {
         );
 
         assert_eq!(
-            plan.len(),
+            plan.targets.len(),
             2,
             "#1205: one continuation per resolved episode"
         );
-        for (target, job_session) in plan.iter().zip(job_sessions) {
+        for (target, job_session) in plan.targets.iter().zip(job_sessions) {
             assert_eq!(
                 target.session_id, job_session,
                 "#1198: the continuation is pinned to its own job session"
@@ -2496,6 +2838,7 @@ mod tests {
                 AgentId::new(),
                 "notification:dm_ended:alice",
             )
+            .targets
             .is_empty(),
             "#1258: an interrupted end puts no unrequested run on the \
              operator's session"
@@ -2510,13 +2853,13 @@ mod tests {
             "notification:dm_ended:alice",
         );
         assert_eq!(
-            surviving.len(),
+            surviving.targets.len(),
             1,
             "the episode override still wins — dropping it would stall the \
              job until its deadline"
         );
         assert_eq!(
-            surviving[0].dm_ended_peer.as_deref(),
+            surviving.targets[0].dm_ended_peer.as_deref(),
             Some("alice"),
             "the one run an interrupted end still produces must be folded"
         );
@@ -2535,9 +2878,9 @@ mod tests {
             AgentId::new(),
             "peer:alice",
         );
-        assert_eq!(peer_dm.len(), 1);
+        assert_eq!(peer_dm.targets.len(), 1);
         assert_eq!(
-            peer_dm[0].dm_ended_peer, None,
+            peer_dm.targets[0].dm_ended_peer, None,
             "a live DM turn folds on its own `is_peer_message` arm"
         );
 
@@ -2549,8 +2892,603 @@ mod tests {
             AgentId::new(),
             "subagent",
         );
-        assert_eq!(subagent.len(), 1);
-        assert_eq!(subagent[0].dm_ended_peer, None);
+        assert_eq!(subagent.targets.len(), 1);
+        assert_eq!(subagent.targets[0].dm_ended_peer, None);
+
+        // #1300 complement over the OTHER axis the plan matches on. Both
+        // non-end sources produce a run, so neither may also produce the
+        // record that stands in for a missing one.
+        assert_eq!(peer_dm.interrupted_end, None);
+        assert_eq!(subagent.interrupted_end, None);
+    }
+
+    // -- #1300: the record an interrupted end leaves instead of a run ----
+
+    /// The claim is "every interrupted end that starts no run leaves a
+    /// record, and nothing else does" — so this ranges over every
+    /// `ConversationEndReason`, not over the two the #1299 rows happened to
+    /// need, and it carries its own complement: the completed reasons in the
+    /// same loop must produce a run and no record.
+    ///
+    /// The expectation is computed from `reason.is_interrupted()` rather than
+    /// listed, so flipping the plan's predicate flips the expected answer for
+    /// every row at once and cannot be absorbed by one hard-coded entry.
+    #[test]
+    fn plan_records_exactly_the_interrupted_ends_and_nothing_else() {
+        for reason in all_end_reasons() {
+            let trigger_session = SessionId::new();
+            let plan = plan_triggered_runs(
+                &ended_because("alice", reason.clone()),
+                trigger_session,
+                "web-chat-bob",
+                Vec::new(),
+                AgentId::new(),
+                "notification:dm_ended:alice",
+            );
+
+            if reason.is_interrupted() {
+                let record = plan
+                    .interrupted_end
+                    .as_ref()
+                    .unwrap_or_else(|| panic!("{reason:?} starts no run — it must leave a record"));
+                assert_eq!(
+                    record.session_id, trigger_session,
+                    "the record belongs on the session whose run was suppressed, \
+                     not on some separately-resolved chat"
+                );
+                assert_eq!(
+                    record.peer_name, "alice",
+                    "`from_name` names the other party on both trigger shapes"
+                );
+                assert_eq!(record.reason, reason, "the cause travels with the record");
+                assert_eq!(
+                    record.context_id, "web-chat-bob",
+                    "the context id travels too — without it the record cannot \
+                     create a target session that does not exist yet (#1300 C1)"
+                );
+                assert!(
+                    plan.targets.is_empty(),
+                    "#1258 stays fixed: {reason:?} still starts no run"
+                );
+            } else {
+                assert_eq!(
+                    plan.interrupted_end, None,
+                    "{reason:?} completed — its run's input already states the outcome, \
+                     so a record would be a second copy"
+                );
+                assert_eq!(plan.targets.len(), 1, "{reason:?} still gets its run");
+            }
+        }
+    }
+
+    /// The job-episode arm, over the same full set.
+    ///
+    /// An end can be interrupted AND still produce a run: the #1198 / #1205
+    /// override is evaluated first, so a resolved episode continues on the
+    /// job session. Those runs are handed
+    /// `format_dm_ended_notification`'s prose, which states the cancellation
+    /// or the failure, so the record must NOT also fire — this is the row
+    /// that fails if #1300 is implemented as "interrupted ⇒ marker" instead
+    /// of "no run ⇒ marker".
+    #[test]
+    fn plan_records_nothing_when_a_job_episode_still_produces_a_run() {
+        for reason in all_end_reasons() {
+            let plan = plan_triggered_runs(
+                &ended_because("alice", reason.clone()),
+                SessionId::new(),
+                "web-chat-bob",
+                vec![job_route(JobId::new())],
+                AgentId::new(),
+                "notification:dm_ended:alice",
+            );
+            assert_eq!(plan.targets.len(), 1, "{reason:?}: the episode still runs");
+            assert_eq!(
+                plan.interrupted_end, None,
+                "{reason:?}: the continuation's input already carries the reason"
+            );
+        }
+    }
+
+    /// The partition the [`TriggerPlan`] type exists to make assertable:
+    /// runs XOR record, for every reason and both episode states.
+    #[test]
+    fn plan_never_produces_both_a_run_and_a_record_nor_neither() {
+        for reason in all_end_reasons() {
+            for routes in [Vec::new(), vec![job_route(JobId::new())]] {
+                let plan = plan_triggered_runs(
+                    &ended_because("alice", reason.clone()),
+                    SessionId::new(),
+                    "web-chat-bob",
+                    routes,
+                    AgentId::new(),
+                    "notification:dm_ended:alice",
+                );
+                assert_ne!(
+                    plan.targets.is_empty(),
+                    plan.interrupted_end.is_none(),
+                    "{reason:?}: an end must yield runs XOR a record, got {plan:?}"
+                );
+            }
+        }
+    }
+
+    /// The marker text is the entire payload — `session_msg_to_llm` rewrites
+    /// an error marker as `[Error] {content}` and never reads its metadata —
+    /// so each thing the agent needs is pinned here.
+    #[test]
+    fn interrupted_end_marker_text_names_the_peer_the_cause_and_the_remedy() {
+        let cancelled =
+            format_interrupted_end_marker("alice", &ConversationEndReason::UserCancelled);
+        // The naming is asserted at the sentence that OPENS the record, not
+        // by a bare `contains("alice")` — that one is satisfied by the
+        // `read_messages` pointer alone, so hard-coding the opening clause to
+        // a fixed word would slip through it.
+        assert!(
+            cancelled.contains("conversation with agent \"alice\""),
+            "{cancelled}"
+        );
+        assert!(cancelled.contains("cancelled by the user"), "{cancelled}");
+        assert!(
+            cancelled.contains("No reply is coming"),
+            "the agent must not be left waiting for a reply that cannot arrive: {cancelled}"
+        );
+        assert!(
+            cancelled.contains("read_messages(from: \"alice\")"),
+            "the transcript is not inlined, so the pointer to it has to be exact: {cancelled}"
+        );
+
+        let failed = format_interrupted_end_marker(
+            "alice",
+            &ConversationEndReason::Errored {
+                message: "LLM authentication error".to_string(),
+                interrupted: true,
+            },
+        );
+        assert!(
+            failed.contains("LLM authentication error"),
+            "the sanitised, bounded detail is the only clue to WHY: {failed}"
+        );
+
+        // Complement: the two texts differ, so a row asserting one of them is
+        // not silently satisfied by a constant string.
+        assert_ne!(cancelled, failed);
+    }
+
+    /// Three separate mechanisms hide every other record of an interrupted
+    /// end; this walks the real persisted marker through the real
+    /// `ContextBuilder` and asserts it comes out the other side.
+    ///
+    /// The leading user message is load-bearing for the POSITIVE assertion:
+    /// `strip_mid_history_system_markers` carves out a LEADING system prefix,
+    /// so a record at index 0 would survive for a reason unrelated to
+    /// `kind: "error"`.
+    ///
+    /// It is not what makes the negative control meaningful, and an earlier
+    /// version of this comment claimed it was. The control never reaches the
+    /// strip at all: `is_stripped_display_marker` excludes display markers at
+    /// *selection* time (`strategies.rs`, #1201), so they never enter the
+    /// assembled window. The control therefore cannot pass vacuously — it
+    /// would fail loudly — and what it pins is the selection filter rather
+    /// than the strip.
+    #[tokio::test]
+    async fn interrupted_end_marker_survives_into_the_llm_context() {
+        use alms_core::config::ContextConfig;
+        use alms_runtime::context::ContextBuilder;
+
+        let (state, _token) = build_notification_state();
+        let agent_id = AgentId::new();
+        let session = state
+            .session_manager
+            .get_or_create(agent_id, "web-chat-bob");
+
+        state
+            .session_manager
+            .append_message(
+                session.id,
+                alms_session::Message {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    role: alms_session::Role::User,
+                    content: alms_session::Content::Text("go talk to alice".into()),
+                    timestamp: alms_core::Timestamp::now(),
+                    metadata: None,
+                },
+            )
+            .unwrap();
+
+        persist_interrupted_end_marker(
+            &state,
+            agent_id,
+            &InterruptedEndRecord {
+                session_id: session.id,
+                peer_name: "alice".to_string(),
+                reason: ConversationEndReason::UserCancelled,
+                context_id: "web-chat-bob".to_string(),
+            },
+        );
+
+        // The operator's copy of the same event, written exactly as
+        // `notify_dm_ended_to_webchat` writes it. It is the negative control:
+        // if BOTH shapes reached the LLM, the row below would prove nothing
+        // about `persist_error_marker`.
+        crate::runs::markers::persist_lifecycle_marker(
+            &state.session_manager,
+            session.id,
+            "dm_ended_notification",
+            "[DM conversation ended] Conversation with alice ended (cancelled by user)."
+                .to_string(),
+            serde_json::json!({"peer": "alice", "reason": "user_cancelled"}),
+        );
+
+        let history = state.session_manager.get_history(session.id).unwrap();
+        assert_eq!(
+            history.len(),
+            3,
+            "one input plus both markers are persisted"
+        );
+
+        // Filter 3 (`dm_filter::is_synthetic_marker`, which hides the bus's
+        // `dm_ended` row from `read_messages` / `read_session`): the record
+        // does NOT beat this one, deliberately — it is not DM content and
+        // must not leak into a peer's transcript. Its route to the agent is
+        // the context build below, not the read tools.
+        let marker = &history[1];
+        assert!(alms_tools::dm_filter::is_synthetic_marker(marker));
+
+        let messages = ContextBuilder::new(ContextConfig {
+            strategy: "truncate".into(),
+            max_input_tokens: 32000,
+            summary_model: None,
+            ..Default::default()
+        })
+        .build("You are bob.", &history, "what happened with alice?", None);
+
+        // Filters 1 and 2 (`strip_mid_history_system_markers`, and the
+        // history strategies' `is_stripped_display_marker` skip): the record
+        // arrives as a `user` message carrying its full text.
+        let carrying: Vec<&alms_runtime::LlmMessage> = messages
+            .iter()
+            .filter(|m| {
+                m.content
+                    .as_deref()
+                    .is_some_and(|c| c.contains("was cut short before it finished"))
+            })
+            .collect();
+        assert_eq!(
+            carrying.len(),
+            1,
+            "the interrupted-end record must reach the LLM, exactly once"
+        );
+        let surfaced = carrying[0];
+        assert_eq!(
+            surfaced.role, "user",
+            "error markers are rewritten to `user` — a `system` here would be \
+             stripped before the provider"
+        );
+        let text = surfaced.content.as_deref().unwrap();
+        // `contains`, not `starts_with`: the canonical-shape pass merges
+        // adjacent same-role messages, so the rewritten marker arrives glued
+        // to the operator's own turns. The prefix is still what marks it as a
+        // failure rather than as something the operator typed.
+        assert!(text.contains("[Error] Your DM conversation"), "{text}");
+        assert!(text.contains("read_messages(from: \"alice\")"), "{text}");
+
+        // The negative control: same session, same event, same build — the
+        // display-only marker does not reach the model. Swapping the call
+        // above to `persist_lifecycle_marker` therefore fails the row above
+        // rather than silently keeping the agent blind.
+        assert!(
+            !messages.iter().any(|m| m
+                .content
+                .as_deref()
+                .is_some_and(|c| c.contains("[DM conversation ended]"))),
+            "the display-only DM-ended marker must still be stripped pre-provider"
+        );
+    }
+
+    /// Drive `run_trigger_loop` itself, so the wiring between the plan and
+    /// `persist_error_marker` is covered and not just the two ends of it.
+    ///
+    /// Asserts both halves of #1300 at once, plus that #1258 is untouched:
+    /// the interrupted end starts **no run** on the trigger's target, and
+    /// leaves the record there instead. It also pins the split between the
+    /// two copies — the operator's display-only `dm_ended_notification`
+    /// lands on the user-facing chat, the agent's error marker on the
+    /// notification session — which is why neither duplicates the other.
+    #[tokio::test]
+    async fn interrupted_end_leaves_its_record_where_the_run_would_have_gone() {
+        let (state, shutdown_token) = build_notification_state();
+        let agent_id = AgentId::new();
+
+        // Deliberately NOT pre-created. `end_conversation` routes a
+        // source-less peer (and a #1215 receiver-ends self-notification) to
+        // exactly this deterministic id, and for an agent whose first DM this
+        // is, no such session exists yet. `enqueue_triggered_run` creates it
+        // on the run path; the record path has to do the same or it is
+        // dropped by `append_message`'s `SessionNotFound` — silently, because
+        // `persist_error_marker` swallows the error (#1300 C1).
+        let notif_context = "notifications:bob".to_string();
+        let notif_session_id = SessionId::deterministic(&notif_context);
+        let web_session = state.session_manager.get_or_create(agent_id, "web");
+
+        let (test_tx, test_rx) = mpsc::channel(8);
+        test_tx
+            .send(RunTrigger {
+                agent_id,
+                session_id: notif_session_id,
+                input: "DM ended marker".to_string(),
+                source: MessageSource::ConversationEnded {
+                    from_agent: AgentId::new(),
+                    from_name: "alice".to_string(),
+                    reason: ConversationEndReason::UserCancelled,
+                    self_notification: false,
+                    source_session_id: None,
+                },
+                context_id: notif_context.clone(),
+            })
+            .await
+            .unwrap();
+        drop(test_tx);
+        run_trigger_loop(test_rx, state.clone()).await;
+
+        assert!(
+            state
+                .run_manager
+                .list_by_session(notif_session_id, 10)
+                .is_empty(),
+            "#1258: an interrupted end must still start no run"
+        );
+
+        let history = state.session_manager.get_history(notif_session_id).unwrap();
+        assert_eq!(
+            history.len(),
+            1,
+            "the record is the ONLY thing an interrupted end leaves on this \
+             session: {history:?}"
+        );
+        let meta = history[0].metadata.as_ref().expect("marker has metadata");
+        assert_eq!(
+            meta["kind"], "error",
+            "or it is stripped before the provider"
+        );
+        // The literal, not the constant: `assert_eq!(meta["type"],
+        // INTERRUPTED_END_MARKER_TYPE)` compares the constant to itself and
+        // moves with any redefinition of it.
+        assert_eq!(meta["type"], "dm_end_interrupted");
+        assert_ne!(
+            meta["type"], "run_boundary",
+            "sharing that type would put this record under the UI's run-divider \
+             branch and inside #912's legacy-duplicate filter — pinned for real \
+             by `interrupted_end_record_survives_the_legacy_run_boundary_sweep`"
+        );
+        assert_eq!(meta["peer"], "alice");
+        assert_eq!(meta["reason"], "user_cancelled");
+        assert!(
+            history[0]
+                .content
+                .to_display_string()
+                .contains("was cut short before it finished"),
+            "{:?}",
+            history[0].content
+        );
+
+        // The operator's copy went somewhere else, and stayed display-only.
+        let web_history = state.session_manager.get_history(web_session.id).unwrap();
+        let web_types: Vec<String> = web_history
+            .iter()
+            .filter_map(|m| m.metadata.as_ref()?.get("type")?.as_str().map(String::from))
+            .collect();
+        assert!(
+            web_types.iter().any(|t| t == "dm_ended_notification"),
+            "the web-chat still gets its banner marker: {web_types:?}"
+        );
+        assert!(
+            !web_types.iter().any(|t| t == INTERRUPTED_END_MARKER_TYPE),
+            "and not a second copy of the agent's record: {web_types:?}"
+        );
+
+        shutdown_token.cancel();
+    }
+
+    /// The `run_boundary` argument, pinned by its consequence rather than by
+    /// a string comparison.
+    ///
+    /// `error_markers::filter_legacy_duplicate_run_boundary_markers` (#912)
+    /// drops a `kind: "error"` marker whose `type` IS `run_boundary` when a
+    /// runtime-layer `[Run failed: …]` / `[Run cancelled by user]` bubble sits
+    /// next to it — and an interrupted end is *exactly* the situation that
+    /// produces such a bubble, so the adjacency here is the realistic case,
+    /// not a contrived one. Redefining `INTERRUPTED_END_MARKER_TYPE` to
+    /// `"run_boundary"` makes this row fail; the metadata assertion elsewhere
+    /// only compares the constant to itself and would not notice.
+    #[tokio::test]
+    async fn interrupted_end_record_survives_the_legacy_run_boundary_sweep() {
+        use alms_core::config::ContextConfig;
+        use alms_runtime::context::ContextBuilder;
+
+        let (state, _token) = build_notification_state();
+        let session = state
+            .session_manager
+            .get_or_create(AgentId::new(), "web-chat-bob");
+
+        // The cancelled run's own bubble, written by the runtime layer.
+        state
+            .session_manager
+            .append_message(
+                session.id,
+                alms_session::Message {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    role: alms_session::Role::Assistant,
+                    content: alms_session::Content::Text("[Run cancelled by user]".into()),
+                    timestamp: alms_core::Timestamp::now(),
+                    metadata: None,
+                },
+            )
+            .unwrap();
+
+        persist_interrupted_end_marker(
+            &state,
+            AgentId::new(),
+            &InterruptedEndRecord {
+                session_id: session.id,
+                peer_name: "alice".to_string(),
+                reason: ConversationEndReason::UserCancelled,
+                context_id: "web-chat-bob".to_string(),
+            },
+        );
+
+        let history = state.session_manager.get_history(session.id).unwrap();
+        let messages = ContextBuilder::new(ContextConfig {
+            strategy: "truncate".into(),
+            max_input_tokens: 32000,
+            summary_model: None,
+            ..Default::default()
+        })
+        .build("You are bob.", &history, "what happened?", None);
+
+        assert!(
+            messages.iter().any(|m| m
+                .content
+                .as_deref()
+                .is_some_and(|c| c.contains("was cut short before it finished"))),
+            "the record must not be swept as a duplicate run boundary: {messages:?}"
+        );
+    }
+
+    /// Drive a `ConversationEnded` whose target session does not exist, and
+    /// report whether writing the record created it.
+    ///
+    /// The two rows below differ only in the pair they pass, which is the
+    /// point. The create-a-missing-target guard is a two-conjunct AND, and
+    /// the single row this helper replaced falsified BOTH conjuncts at once
+    /// (a random id with a `"web"` context) — so it kept passing when either
+    /// conjunct was deleted. One row per conjunct, each falsifying exactly
+    /// that one.
+    async fn record_resurrected_target(context_id: &str, session_id: SessionId) -> bool {
+        let (state, shutdown_token) = build_notification_state();
+        let (test_tx, test_rx) = mpsc::channel(8);
+        test_tx
+            .send(RunTrigger {
+                agent_id: AgentId::new(),
+                session_id,
+                input: "DM ended marker".to_string(),
+                source: MessageSource::ConversationEnded {
+                    from_agent: AgentId::new(),
+                    from_name: "alice".to_string(),
+                    reason: ConversationEndReason::UserCancelled,
+                    self_notification: false,
+                    source_session_id: None,
+                },
+                context_id: context_id.to_string(),
+            })
+            .await
+            .unwrap();
+        drop(test_tx);
+        run_trigger_loop(test_rx, state.clone()).await;
+        let created = state.session_manager.get(session_id).is_ok();
+        shutdown_token.cancel();
+        created
+    }
+
+    /// Conjunct 1 — the context is not a notification fallback.
+    ///
+    /// The id IS canonical for its context here, so `starts_with(
+    /// "notifications:")` is the only thing separating this from a create.
+    /// A deleted web-chat has to stay deleted: `get_or_create_with_id` stamps
+    /// `last_activity = now` and `find_user_facing_session` takes the most
+    /// recent non-internal session, so resurrecting one would silently make
+    /// it the destination for that agent's future DM-ended banners.
+    #[tokio::test]
+    async fn a_deleted_web_chat_target_is_not_resurrected_by_the_record() {
+        assert!(
+            !record_resurrected_target("web", SessionId::deterministic("web")).await,
+            "a record must not resurrect a session the run path would have \
+             declined to write to"
+        );
+    }
+
+    /// Conjunct 2 — a notification context paired with a NON-canonical id.
+    ///
+    /// Reachable rather than theoretical: when the peer's source session was
+    /// deleted mid-DM, `end_conversation` keeps the stale `source_sid` as the
+    /// target and falls the context back to `notifications:{peer}` — this
+    /// exact pair. Creating it would register the stale id under the
+    /// canonical `(agent_id, "notifications:alice")` key and shadow the
+    /// deterministic session; from then on `get_or_create_with_id` answers
+    /// "already resolves to …" and `enqueue_triggered_run` suppresses EVERY
+    /// later notification run for that agent. The first conjunct is true
+    /// here, so this row is the only thing between that and a one-token edit.
+    #[tokio::test]
+    async fn a_notification_context_with_a_stale_id_is_not_resurrected() {
+        let stale = SessionId::new();
+        assert_ne!(
+            stale,
+            SessionId::deterministic("notifications:alice"),
+            "the row is about a NON-canonical id"
+        );
+        assert!(
+            !record_resurrected_target("notifications:alice", stale).await,
+            "creating a stale id under the canonical notification context \
+             shadows the deterministic session and suppresses every later \
+             notification run for this agent"
+        );
+    }
+
+    /// The complement of the row above, through the same loop: an end whose
+    /// run COMPLETED gets its run and no record. Without it, the row above is
+    /// equally satisfied by a mechanism that marks every `ConversationEnded`.
+    #[tokio::test]
+    async fn a_completed_end_still_gets_its_run_and_no_record() {
+        let (state, shutdown_token) = build_notification_state();
+        let agent_id = AgentId::new();
+
+        let notif_context = "notifications:bob".to_string();
+        let notif_session_id = SessionId::deterministic(&notif_context);
+
+        let (test_tx, test_rx) = mpsc::channel(8);
+        test_tx
+            .send(RunTrigger {
+                agent_id,
+                session_id: notif_session_id,
+                input: "DM ended marker".to_string(),
+                source: MessageSource::ConversationEnded {
+                    from_agent: AgentId::new(),
+                    from_name: "alice".to_string(),
+                    reason: ConversationEndReason::Ignored,
+                    self_notification: false,
+                    source_session_id: None,
+                },
+                context_id: notif_context.clone(),
+            })
+            .await
+            .unwrap();
+        drop(test_tx);
+        run_trigger_loop(test_rx, state.clone()).await;
+
+        assert!(
+            !state
+                .run_manager
+                .list_by_session(notif_session_id, 10)
+                .is_empty(),
+            "a completed end keeps its notification run"
+        );
+        let recorded = state
+            .session_manager
+            .get_history(notif_session_id)
+            .unwrap()
+            .iter()
+            .any(|m| {
+                m.metadata
+                    .as_ref()
+                    .and_then(|meta| meta.get("type"))
+                    .and_then(|v| v.as_str())
+                    == Some(INTERRUPTED_END_MARKER_TYPE)
+            });
+        assert!(
+            !recorded,
+            "the run's own input states the outcome — a record would double it"
+        );
+
+        shutdown_token.cancel();
     }
 
     /// Regression test for #513: when a `ConversationEnded` trigger has

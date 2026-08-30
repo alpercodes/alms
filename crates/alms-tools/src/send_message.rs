@@ -20,52 +20,57 @@
 //! the tool description (and the delivered-result note below) say so out
 //! loud. See #1111 / #1296 and `docs/layer2-peer-messaging-design.md` § 9.1.
 //!
-//! ## The exception the agent is deliberately not told about (#1258)
+//! ## The one end that arrives without a run (#1258 / #1300)
 //!
 //! The bus emits that third trigger unconditionally, but the trigger loop
-//! does not always act on it: `run_trigger_loop` starts **no run on the
-//! trigger's own target** when the end `is_interrupted()` -- `UserCancelled`,
-//! or `Errored { interrupted: true }` (the peer's run was cancelled or died
-//! mid-turn). The unconditional emit is therefore true of the bus and not of
-//! the outcome; the suppression is one crate away, in
-//! `crates/alms-gateway/src/runs/notifications.rs`, under the heading
-//! "Consequence: an interrupted end is invisible to the agent".
+//! does not always start a run from it: `plan_triggered_runs` starts **no run
+//! on the trigger's own target** when the end `is_interrupted()` --
+//! `UserCancelled`, or `Errored { interrupted: true }` (the peer's run was
+//! cancelled or died mid-turn). The unconditional emit is therefore true of
+//! the bus and not of the run; the suppression is one crate away, in
+//! `crates/alms-gateway/src/runs/notifications.rs`.
 //!
-//! Read that `run_targets` branch in **evaluation order**, because its first
-//! arm is an exception to the suppression rather than a case of it: a
-//! resolved #1198 job episode routes a continuation onto the *job* session
-//! and wins over the interrupted-end check, because "dropping it would stall
-//! the job until its deadline". The silent population is therefore narrower
-//! than "every interrupted end" -- it is an interrupted end that resolves no
-//! open job episode.
+//! Read that plan in **evaluation order**, because its first arm is an
+//! exception to the suppression rather than a case of it: a resolved #1198
+//! job episode routes a continuation onto the *job* session and wins over
+//! the interrupted-end check, because "dropping it would stall the job until
+//! its deadline". The run-less population is therefore narrower than "every
+//! interrupted end" -- it is an interrupted end that resolves no open job
+//! episode.
 //!
-//! [`SendMessageTool::description`] and [`DELIVERED_NOTE`] state the
-//! notification **without** that qualification. That is a choice, not an
-//! oversight:
+//! #1300 gives that population a delivery instead of silence. In place of
+//! the run, the plan returns an `InterruptedEndRecord` and the loop persists
+//! it with `persist_error_marker` (#874) onto the same session.
 //!
-//! - There is no agent-available remedy. The `dm_ended` bus record is
-//!   empty-text, so `dm_filter`'s `is_synthetic_marker` hides it from
-//!   `read_messages` *and* `read_session`; the `dm_ended_notification`
-//!   marker is `Role::System` + synthetic and is stripped before the
-//!   provider. No observation an agent can make distinguishes "the reply is
-//!   still coming" from "the end was interrupted".
-//! - So the caveat could not change what the agent does -- except in one
-//!   direction. "You will usually be invoked" leaves exactly one lever
-//!   (check), which is the polling instinct #1111 exists to close, and which
-//!   provably cannot detect this case.
-//! - The job-episode exception above cuts the same way. It *adds* a case in
-//!   which the agent is invoked, so the set of ends that reach it silently is
-//!   smaller than this section's premise alone implies -- which makes the
-//!   unqualified strings more accurate than a hedged version would be, not
-//!   less.
+//! **Which session that is, is not "the one you called this from".** The bus
+//! routes an end notification to the recorded *source session* for the pair,
+//! and two rules make that diverge from `sender_session_id`: the entry is
+//! stored with `or_insert`, so the FIRST session an agent messaged this peer
+//! from wins and later sends from elsewhere do not move it; and
+//! `is_valid_source` rejects internal contexts (`notification` / `subagent` /
+//! `episodic`, and the DM session itself), so a send made from one of those
+//! records no source at all and the end routes to `notifications:{name}`.
+//! The agent-facing strings therefore say "a later turn" and name no session
+//! -- a locative would be wrong at both of those edges.
 //!
-//! A caveat is worth its tokens only if it changes what the reader can do.
-//! Here it does for the human reader and cannot for the model, so it lives
-//! at this level and not in the strings. **Revisit if that stops being
-//! true**: if an interrupted end ever grows an agent-visible signal (the
-//! machinery would be `persist_error_marker`, #874, which survives the strip
-//! pass), the absolute wording becomes actionably wrong and should be
-//! qualified.
+//! `kind: "error"` is the one marker
+//! shape `session_msg_to_llm` rewrites into a surviving `[Error] ...` user
+//! message, so it reaches the model on that session's next turn. It has to
+//! be that shape: the `dm_ended` bus record is empty-text, so `dm_filter`'s
+//! `is_synthetic_marker` hides it from `read_messages` *and* `read_session`,
+//! and the `dm_ended_notification` marker is `Role::System` + synthetic and
+//! is stripped before the provider.
+//!
+//! [`SendMessageTool::description`] and [`DELIVERED_NOTE`] therefore keep
+//! saying "you are notified" without hedging it, and name the two deliveries
+//! it can arrive by. Before #1300 they named only the first, deliberately:
+//! there was no agent-visible signal at all, so the only caveat available
+//! was "you will *usually* be invoked", which leaves exactly one lever
+//! (check) -- the polling instinct #1111 exists to close, and one that
+//! provably could not detect this case. A caveat is worth its tokens only if
+//! it changes what the reader can do; naming a delivery that arrives by
+//! itself adds a fact and no lever, which is what makes the second clause
+//! worth stating now and not before.
 
 use crate::message_sender::{MessageSender, SendError};
 use alms_core::{AgentId, SessionId};
@@ -83,9 +88,10 @@ use tracing::warn;
 /// not a waiting room (#1111).
 const DELIVERED_NOTE: &str = "Delivered. The recipient is now being invoked in your shared DM \
      session to process this. Their reply triggers a new run there and you will be invoked to \
-     handle it; if they end the conversation instead, you are notified then. Do NOT poll \
-     read_messages waiting for the reply -- it will not arrive any sooner, and the system \
-     resumes you when it does.";
+     handle it; if they end the conversation instead, you are notified then -- by a run, or, \
+     when that end was itself cut short, by a note in a later turn rather than a run of \
+     its own. Do NOT poll read_messages waiting for the reply -- it will not arrive any \
+     sooner, and the system resumes you when it does.";
 
 /// Built-in tool that sends a message to another registered agent.
 ///
@@ -214,7 +220,9 @@ impl Tool for SendMessageTool {
          tools, or do work before replying. Their reply triggers a run for \
          you in that same DM session: the system invokes you again to handle \
          it. If they end the conversation instead of replying, you are \
-         notified then. 'Asynchronous' means your current run is not blocked \
+         notified then -- by a run, or, when that end was itself cut short, \
+         by a note in a later turn rather than a run of its own. \
+         'Asynchronous' means your current run is not blocked \
          waiting for the reply -- it does NOT mean delivery is deferred, and \
          it does NOT mean you have to poll: calling read_messages will not \
          make a reply arrive any sooner. Use this for peer work -- asking for \
