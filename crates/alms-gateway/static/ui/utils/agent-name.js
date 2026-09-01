@@ -162,6 +162,15 @@ export function agentNamesEqual(a, b) {
  * The returned spelling is the one stored in the context_id — canonical,
  * because context_ids are minted from registry records.
  *
+ * **The one place this mirror is not literal.** `dm_peer` strips a `"dm:"`
+ * prefix and then does a single `split_once(':')`, so on a malformed
+ * `dm:a:b:c` the Rust peer for `a` is `b:c`; this splits on every `:` and
+ * reads the first three fields, so it yields `b`. Unreachable —
+ * `validate_agent_name` admits no `:`, so no minted context_id has a fourth
+ * field, and the shape this replaces had the same property. Recorded because
+ * the value of a shared helper is that there is one rule rather than two that
+ * can drift, and the honest version of that claim names its own exception.
+ *
  * @param {unknown} contextId
  * @param {unknown} agentName
  * @returns {string|null}
@@ -180,14 +189,30 @@ export function dmPeerName(contextId, agentName) {
  * Pick the DM peer out of a `participants` array (the envelope-carried
  * counterpart to {@link dmPeerName}, which parses a `context_id`).
  *
- * Same case-folding rule, same explicit-null contract: `null` when
- * `agentName` is not among the participants, rather than the
- * `.find(p => p !== agentName)` shape that returns the active agent's own
- * name the moment the comparison misses.
+ * Same case-folding rule, same explicit-null contract.
  *
- * When `agentName` is absent (boot hasn't resolved the active agent yet) the
- * first participant is returned — this preserves the pre-existing fallback,
- * which is a display-only best guess and not an identity decision.
+ * **`agentName` present but not a participant → `null`.** This is the return
+ * that carries a behaviour change, so it is the one worth being explicit
+ * about. It is a *reachable, supported* state rather than a defensive branch:
+ * an operator can open a DM between two other agents while a third is active,
+ * because `navigate-session.js` deliberately does not switch agents for `dm`
+ * rows (peeking at a DM shouldn't yank you out of the chat you are reading)
+ * and `sortCrossAgentRows` sorts non-owned DM rows to the bottom rather than
+ * hiding them. The `.find(p => p !== agentName)` shape this replaces answered
+ * that case with `participants[0]`, so a third-party peek rendered
+ * "Chatting with alice..." into the status bar of an agent who is not in the
+ * conversation — the #1166 class of header naming someone on a guess. Callers
+ * are expected to render a neutral phase instead; see the `else` at the
+ * `restoreSessionPhase` call site in `load-session.js`.
+ *
+ * A genuine mismatch returns `null` too, so the caller cannot distinguish the
+ * two — deliberately. Both mean "this is not the active agent's conversation",
+ * and neither is a licence to name somebody.
+ *
+ * **`agentName` absent → `participants[0]`.** Boot has not resolved the active
+ * agent yet. Reproduces the old `agentName ? find(...) : participants[0]`
+ * branch exactly: a display-only best guess on a transient state, not an
+ * identity decision.
  *
  * @param {unknown} participants
  * @param {unknown} agentName

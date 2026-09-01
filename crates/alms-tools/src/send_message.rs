@@ -817,6 +817,14 @@ mod tests {
     /// pins the property the two legs jointly produce: whatever spelling the
     /// model types for `to`, the `dm_context_id` built from the recorded pair
     /// is the canonical one, identical every time.
+    ///
+    /// **Scope, so the gap is not mistaken for closed:** this pins
+    /// *composition*, not *provenance*. The sender name is constructed here by
+    /// hand, so what it proves is "given a canonical sender leg, every `to`
+    /// spelling yields one context". What makes that leg canonical in
+    /// production — `resolved.agent_name` flowing into `SendMessageTool::new`
+    /// in the gateway's run lifecycle — is a wiring fact this crate cannot
+    /// reach, and is still held by a doc line rather than a test.
     #[tokio::test]
     async fn dm_context_id_is_canonical_on_both_legs() {
         let store = alms_session::SqliteStore::open_in_memory().unwrap();

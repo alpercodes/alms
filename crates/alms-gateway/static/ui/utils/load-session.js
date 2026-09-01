@@ -813,6 +813,23 @@ export async function loadSession(sessionId, opts) {
                 if (peer) {
                     setDmContext(peer);
                 } else {
+                    // DELIBERATE, and a behaviour change from before #2: when
+                    // the active agent is not a participant, we show the
+                    // neutral phase rather than naming somebody.
+                    //
+                    // This is the third-party DM peek, and it is a supported
+                    // click, not an error path — `navigate-session.js` skips
+                    // the agent switch for `dm` rows on purpose, so opening a
+                    // DM between two other agents leaves the third agent
+                    // active. The old `.find(p => p !== agentName)` answered
+                    // that with `participants[0]`, which put "Chatting with
+                    // alice..." in the status bar of an agent who is not in
+                    // the conversation. The status bar belongs to the active
+                    // agent, so naming a stranger's peer there is the #1166
+                    // failure in miniature; a generic phase is the honest
+                    // answer. Restore the guess with `?? participants[0]`
+                    // HERE if it is ever wanted — never inside the helper,
+                    // whose whole value is refusing to guess.
                     setAgentPhase('calling_llm', null);
                 }
             } else {

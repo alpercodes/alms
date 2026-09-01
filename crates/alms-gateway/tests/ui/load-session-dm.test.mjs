@@ -789,6 +789,42 @@ test('#2: phase restore folds case and never names the operator as their own pee
         'the peer must be the OTHER participant, not the active agent itself');
 });
 
+test('#2: a third-party DM peek shows a neutral phase, not a guessed peer', async () => {
+    // S6 -- a DELIBERATE behaviour change, pinned so it cannot regress by
+    // accident in either direction.
+    //
+    // The operator is on `carol` and opens a DM between alice and bob. That
+    // is a supported click: `navigate-session.js` skips the agent switch for
+    // `dm` rows on purpose (peeking shouldn't yank you out of the chat you're
+    // reading) and `sortCrossAgentRows` sorts non-owned DM rows to the bottom
+    // rather than hiding them, so the active agent genuinely is not a
+    // participant here.
+    //
+    // Before #2, `.find(p => p !== 'carol')` returned 'alice' and the status
+    // bar read "Chatting with alice..." -- on carol's status bar, naming a
+    // conversation carol is not in. That is the #1166 class of header naming
+    // someone on a guess, so the peer derivation now declines and the caller
+    // falls through to the generic phase.
+    reset();
+    T.crossAgentSessions.value = [DM_ENVELOPE];
+    T.activeAgent.value = { id: 'agent-carol', name: 'carol' };
+    globalThis.__lsApi = makeApi({
+        getSession: async () => ({ ...DM_ENVELOPE, has_active_run: true }),
+        listRuns: async () => ({ runs: [{ run_id: 'run-live-5', status: 'running' }] }),
+    });
+
+    await runLoadSession();
+
+    const dmContextCalls = T.__calls.phase.filter(c => c[0] === 'setDmContext');
+    assert.equal(dmContextCalls.length, 0,
+        'the status bar must not name a peer of a conversation the active agent is not in');
+
+    const phaseCalls = T.__calls.phase.filter(c => c[0] === 'setAgentPhase');
+    assert.equal(phaseCalls.length, 1, 'exactly one generic phase is set');
+    assert.equal(phaseCalls[0][1], 'calling_llm',
+        'a third-party DM peek falls through to the neutral running phase');
+});
+
 // ---------------------------------------------------------------------------
 // Strict malformed-frame reconciliation must never reopen from partial state.
 // ---------------------------------------------------------------------------
