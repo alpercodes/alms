@@ -569,14 +569,19 @@ impl SessionManager {
 
         // Also include shared DM sessions where this agent is a participant.
         // DM context_ids have the format "dm:{name1}:{name2}" (alphabetical).
+        //
+        // Participation is decided by `dm_peer` rather than by an inline
+        // comparison so there is exactly ONE participant-matching rule in the
+        // codebase — case-insensitive since #2, matching how agent names
+        // resolve everywhere else. A second inline rule here is how a sidebar
+        // silently loses a DM the tool layer can still see.
         let sentinel = AgentId(uuid::Uuid::nil());
         let dm_sessions: Vec<Session> = self
             .sessions
             .iter()
             .filter(|e| {
                 e.key().0 == sentinel
-                    && alms_core::dm_participants(&e.value().context_id)
-                        .is_some_and(|(a, b)| a == agent_name || b == agent_name)
+                    && alms_core::dm_peer(&e.value().context_id, agent_name).is_some()
             })
             .map(|e| e.value().clone())
             .collect();

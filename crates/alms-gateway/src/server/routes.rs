@@ -1691,7 +1691,7 @@ mod tests {
         let parent = AgentId::new();
         let ephemeral = format!("subagent_{}_{}", parent.0, uuid::Uuid::new_v4());
         let legacy = format!("subagent_{}", uuid::Uuid::new_v4());
-        let unreadable = format!("subagent_{}_NotAName", parent.0);
+        let unreadable = format!("subagent_{}_Not_A_Name", parent.0);
         for ctx in [&ephemeral, &legacy, &unreadable] {
             state.session_manager.get_or_create(agent_id, ctx);
         }

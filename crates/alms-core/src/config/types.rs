@@ -1815,10 +1815,17 @@ impl SecurityConfig {
     /// Returns `true` when the named agent is on the
     /// [`Self::allow_full_os_access`] list.
     ///
-    /// Comparison is exact-match on the registry name (the same string an
-    /// operator types for `alms agent create --name <name>`). Empty input
-    /// (an unnamed/ephemeral agent) never matches because empty entries
-    /// in the list itself would be a configuration error caught by
+    /// Comparison is against the registry name (the same string an operator
+    /// types for `alms agent create --name <name>`), matched
+    /// **case-insensitively** (#2). This does not widen the grant: agent
+    /// names are unique case-insensitively, so a case-folded entry still
+    /// names at most one agent. Matching exactly instead would mean an
+    /// operator who wrote `atlas` in `alms.toml` and created the agent as
+    /// `Atlas` silently gets no grant — a confusing near-miss rather than a
+    /// meaningful safety boundary.
+    ///
+    /// Empty input (an unnamed/ephemeral agent) never matches because empty
+    /// entries in the list itself would be a configuration error caught by
     /// [`Self::validate`]. The check is O(n) — the list is short by
     /// design (a handful of operator-blessed agents), so a `HashSet` is
     /// not worth the allocation cost.
@@ -1826,7 +1833,9 @@ impl SecurityConfig {
         if agent_name.is_empty() {
             return false;
         }
-        self.allow_full_os_access.iter().any(|n| n == agent_name)
+        self.allow_full_os_access
+            .iter()
+            .any(|n| n.eq_ignore_ascii_case(agent_name))
     }
 }
 

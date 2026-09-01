@@ -1,8 +1,9 @@
 //! Agent registry types — persistent named agents.
 //!
 //! An `AgentRecord` represents a named, persistent agent registered in the system.
-//! Each agent has a unique slug name, optional per-agent config overrides, and
-//! its own workspace/sessions/jobs.
+//! Each agent has a name (unique case-insensitively, stored case-preserving —
+//! see [`validate_agent_name`]), optional per-agent config overrides, and its
+//! own workspace/sessions/jobs.
 
 use crate::{AgentId, AlmsError, AlmsResult};
 use chrono::{DateTime, Utc};
@@ -388,10 +389,43 @@ pub struct UpdateAgentRequest {
     pub debug_mode: Option<bool>,
 }
 
-/// Validate an agent name slug.
+/// Agent names that collide with API sub-route segments or internal
+/// `context_id` prefixes, and are therefore refused by
+/// [`validate_agent_name`]. Matched case-insensitively.
 ///
-/// Rules: 1–64 chars, lowercase alphanumeric + hyphens, no leading/trailing hyphens.
-/// Must not be a valid UUID (would collide with UUID-first resolve_agent lookup).
+/// Mirrored client-side by `RESERVED_NAMES` in
+/// `crates/alms-gateway/static/ui/utils/agent-name.js` — keep the two lists
+/// in lock-step.
+pub const RESERVED_AGENT_NAMES: &[&str] = &["default", "dm", "workspace"];
+
+/// Validate an agent name.
+///
+/// Rules: 1–64 chars, ASCII alphanumeric + hyphens, no leading/trailing
+/// hyphens. Must not be a reserved name, and must not be a valid UUID (would
+/// collide with UUID-first `resolve_agent` lookup).
+///
+/// # Case
+///
+/// Both cases are admissible (`Atlas` is as valid as `atlas`), and the
+/// operator's casing is preserved verbatim for display and storage. What is
+/// *not* admissible is two agents whose names differ only in case: agent
+/// workspaces are directories at `{workspace_dir}/{name}/`, and Windows /
+/// macOS filesystems are case-insensitive while Linux is not, so `Atlas` and
+/// `atlas` would share one directory on two platforms and split across two on
+/// the third. Uniqueness is therefore enforced **case-insensitively**, by a
+/// `UNIQUE INDEX ... (name COLLATE NOCASE)` in the agents schema, and every
+/// name lookup (`load_agent_by_name`, and so the HTTP routes, the CLI,
+/// `invoke_agent` and `send_message` that funnel through it) matches
+/// case-insensitively too. This function is per-name only — it cannot see the
+/// registry — so it does not and cannot enforce that part.
+///
+/// # This is also an output constraint
+///
+/// The character class is deliberately narrow because this validator gates
+/// LLM-supplied names on their way to the DOM — see the "output constraint"
+/// section on [`crate::parse_subagent_context`]. `[A-Za-z0-9-]` still admits
+/// no `<`, `&`, quotes, whitespace, or path separators. Widen the class only
+/// with that property in mind.
 pub fn validate_agent_name(name: &str) -> AlmsResult<()> {
     if name.is_empty() || name.len() > 64 {
         return Err(AlmsError::InvalidConfig(format!(
@@ -409,18 +443,24 @@ pub fn validate_agent_name(name: &str) -> AlmsResult<()> {
         )));
     }
 
-    // Only lowercase alphanumeric + hyphens
+    // Only ASCII alphanumeric + hyphens. Uppercase is admissible; anything
+    // outside the class is not (see the output-constraint note above).
     for ch in name.chars() {
-        if !ch.is_ascii_lowercase() && !ch.is_ascii_digit() && ch != '-' {
+        if !ch.is_ascii_alphanumeric() && ch != '-' {
             return Err(AlmsError::InvalidConfig(format!(
-                "agent name must contain only lowercase letters, digits, and hyphens, got '{ch}' in '{name}'"
+                "agent name must contain only ASCII letters, digits, and hyphens, got '{ch}' in '{name}'"
             )));
         }
     }
 
-    // Reserved names that collide with API sub-route segments or internal prefixes
-    const RESERVED_NAMES: &[&str] = &["default", "dm", "workspace"];
-    if RESERVED_NAMES.contains(&name) {
+    // Reserved names that collide with API sub-route segments or internal
+    // prefixes. Matched case-insensitively: those route segments and prefixes
+    // are matched case-insensitively downstream, so an exact-match guard here
+    // would let `DM` walk straight through it.
+    if RESERVED_AGENT_NAMES
+        .iter()
+        .any(|reserved| reserved.eq_ignore_ascii_case(name))
+    {
         return Err(AlmsError::InvalidConfig(format!(
             "agent name '{name}' is reserved"
         )));
@@ -504,6 +544,18 @@ mod tests {
         assert!(validate_agent_name("a1b2c3").is_ok());
     }
 
+    /// Uppercase is admissible (#2). The operator's casing is preserved
+    /// verbatim — this validator never rewrites the name it is handed.
+    #[test]
+    fn uppercase_names_are_accepted() {
+        for name in ["Atlas", "ATLAS", "ResearchBot", "Agent-V2", "A"] {
+            assert!(
+                validate_agent_name(name).is_ok(),
+                "expected {name} to be accepted"
+            );
+        }
+    }
+
     #[test]
     fn test_reserved_names() {
         let err = validate_agent_name("default").unwrap_err();
@@ -512,6 +564,29 @@ mod tests {
         assert!(err.to_string().contains("reserved"));
         let err = validate_agent_name("workspace").unwrap_err();
         assert!(err.to_string().contains("reserved"));
+    }
+
+    /// #2: once uppercase is admissible, an exact-match reserved-name guard
+    /// is a bypass — `DM` would sail through it and land on the very
+    /// `dm:`-prefixed context space the guard exists to protect.
+    #[test]
+    fn reserved_names_are_matched_case_insensitively() {
+        for name in [
+            "DM",
+            "Dm",
+            "dM",
+            "Default",
+            "DEFAULT",
+            "Workspace",
+            "WorkSpace",
+            "WORKSPACE",
+        ] {
+            let err = validate_agent_name(name).unwrap_err().to_string();
+            assert!(
+                err.contains("reserved"),
+                "expected {name} to be rejected as reserved, got: {err}"
+            );
+        }
     }
 
     #[test]
@@ -525,9 +600,15 @@ mod tests {
         assert!(validate_agent_name(&name).is_err());
     }
 
+    /// The class widened to `[A-Za-z0-9-]` (#2), not to "anything". Non-ASCII
+    /// letters stay out: this validator is also the gate on LLM-supplied
+    /// `invoke_agent` names before they are rendered as UI labels, and on the
+    /// name used as a workspace directory component.
     #[test]
-    fn test_invalid_uppercase() {
-        assert!(validate_agent_name("MyAgent").is_err());
+    fn test_invalid_non_ascii_letters() {
+        assert!(validate_agent_name("café").is_err());
+        assert!(validate_agent_name("Ünicode").is_err());
+        assert!(validate_agent_name("αβγ").is_err());
     }
 
     #[test]
@@ -568,6 +649,22 @@ mod tests {
         // re-review item; the client-side mirror missed this case).
         let err = validate_agent_name("a1b2c3d4e5f67890abcdef1234567890").unwrap_err();
         assert!(err.to_string().contains("UUID"));
+    }
+
+    /// #2: `Uuid::parse_str` is itself case-insensitive over the hex digits,
+    /// so admitting uppercase letters does not open a UUID-shaped hole in the
+    /// name space. Pins that the widened class did not shift the boundary the
+    /// named/ephemeral subagent discriminator leans on.
+    #[test]
+    fn uppercase_uuid_shaped_names_are_still_rejected() {
+        for name in [
+            "A1B2C3D4-E5F6-7890-ABCD-EF1234567890",
+            "550E8400-E29B-41D4-A716-446655440000",
+            "A1B2C3D4E5F67890ABCDEF1234567890",
+        ] {
+            let err = validate_agent_name(name).unwrap_err().to_string();
+            assert!(err.contains("UUID"), "expected {name} rejected, got: {err}");
+        }
     }
 
     #[test]

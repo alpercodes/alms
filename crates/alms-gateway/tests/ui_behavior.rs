@@ -151,12 +151,17 @@ fn composer_storage_js_behaviour() {
 }
 
 /// Pinned regression for issue #978: the agent-create form normalizes the
-/// operator's input to a slug-safe shape before POSTing to the backend so
-/// "ResearchBot" / "Research Bot" / etc. never surface a 400 from
-/// `validate_agent_name`. The JS-side test exercises the pure-function
-/// normalizer in `static/ui/utils/agent-name.js` against every rule it
-/// applies plus the empty-string boundary the caller relies on for the
-/// "name required" inline error.
+/// operator's input to a name-safe shape before POSTing to the backend so
+/// "Research Bot" / etc. never surface a 400 from `validate_agent_name`.
+/// The JS-side test exercises the pure-function normalizer in
+/// `static/ui/utils/agent-name.js` against every rule it applies plus the
+/// empty-string boundary the caller relies on for the "name required"
+/// inline error.
+///
+/// Extended for #2: the normalizer no longer lowercases (an operator who
+/// types `Atlas` must get `Atlas`), so the reserved-name and UUID-shape
+/// mirrors can no longer lean on normalization having folded case and are
+/// pinned as case-insensitive in their own right.
 #[test]
 fn agent_name_js_behaviour() {
     run_node_test("agent-name.test.mjs");

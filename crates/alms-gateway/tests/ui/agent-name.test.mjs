@@ -9,10 +9,13 @@
 // on Preact + signals, which aren't vendored into the Node test runtime.
 // The normalizer is the load-bearing piece, and the rules it enforces
 // must stay in lock-step with `crates/alms-core/src/registry.rs ::
-// validate_agent_name` (lowercase alphanumeric + hyphens, no leading or
+// validate_agent_name` (ASCII alphanumeric + hyphens, no leading or
 // trailing hyphens). The cases below were chosen to pin every rule the
 // normalizer applies plus the empty-string boundary the caller relies on
 // to surface the "name required" inline error.
+//
+// Issue #2 widened the backend class to admit uppercase, so the normalizer
+// no longer lowercases: the operator's capitalization IS part of the name.
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -41,18 +44,21 @@ test('#978: lowercase + alphanumeric input passes through unchanged', () => {
     assert.equal(normalizeAgentName('agent-42'), 'agent-42');
 });
 
-test('#978: uppercase input is lowercased (the headline case)', () => {
-    // "ResearchBot" is the example in the issue body — operators type
-    // CamelCase out of habit and the backend used to surface a 400.
-    assert.equal(normalizeAgentName('ResearchBot'), 'researchbot');
-    assert.equal(normalizeAgentName('FOO'), 'foo');
-    assert.equal(normalizeAgentName('FooBar42'), 'foobar42');
+test('#2: uppercase input survives normalization untouched', () => {
+    // The headline case for issue #2: an operator who types "Atlas" must
+    // get an agent named "Atlas". Lowercasing here would silently rewrite
+    // their choice, and they would never see it happen — the preview line
+    // only renders when normalization actually changed something.
+    assert.equal(normalizeAgentName('Atlas'), 'Atlas');
+    assert.equal(normalizeAgentName('ResearchBot'), 'ResearchBot');
+    assert.equal(normalizeAgentName('FOO'), 'FOO');
+    assert.equal(normalizeAgentName('FooBar42'), 'FooBar42');
 });
 
 test('#978: whitespace runs collapse to a single hyphen', () => {
     // "Research Bot" is the second example in the issue — pick the
     // simplest rule that preserves word boundaries.
-    assert.equal(normalizeAgentName('Research Bot'), 'research-bot');
+    assert.equal(normalizeAgentName('Research Bot'), 'Research-Bot');
     assert.equal(normalizeAgentName('a   b'), 'a-b');
     assert.equal(normalizeAgentName('a\tb'), 'a-b');
     assert.equal(normalizeAgentName('a\nb'), 'a-b');
@@ -63,7 +69,7 @@ test('#978: leading and trailing whitespace is trimmed', () => {
     // we trim leading/trailing hyphens so the result satisfies the
     // backend's "no leading/trailing hyphen" rule.
     assert.equal(normalizeAgentName('  foo  '), 'foo');
-    assert.equal(normalizeAgentName(' Research Bot '), 'research-bot');
+    assert.equal(normalizeAgentName(' Research Bot '), 'Research-Bot');
 });
 
 test('#978: non-slug characters are stripped (not converted)', () => {
@@ -74,10 +80,12 @@ test('#978: non-slug characters are stripped (not converted)', () => {
     assert.equal(normalizeAgentName('foo.bar'), 'foobar');
     assert.equal(normalizeAgentName('foo/bar'), 'foobar');
     assert.equal(normalizeAgentName('foo!bar?'), 'foobar');
-    // Unicode letters are out of scope for the backend slug grammar.
-    // The normalizer strips them (consistent with the "non-slug chars
-    // are stripped" rule above) rather than transliterating.
+    // Unicode letters are out of scope for the backend name grammar — #2
+    // widened it to `[A-Za-z0-9-]`, not to "any letter". The normalizer
+    // strips them (consistent with the "non-name chars are stripped" rule
+    // above) rather than transliterating.
     assert.equal(normalizeAgentName('café'), 'caf');
+    assert.equal(normalizeAgentName('Ünicode'), 'nicode');
 });
 
 test('#978: consecutive hyphens collapse to one', () => {
@@ -130,13 +138,24 @@ test('#978: digit-only input survives normalization', () => {
     // The backend slug grammar permits digits — "42" is a legal agent
     // name, even if unusual. Don't strip it.
     assert.equal(normalizeAgentName('42'), '42');
-    assert.equal(normalizeAgentName('Agent42'), 'agent42');
+    assert.equal(normalizeAgentName('Agent42'), 'Agent42');
+});
+
+test('#2: normalization is a no-op for names an operator would actually type', () => {
+    // The component hides the preview line when normalize(raw) === raw. If
+    // any of these changed, an operator typing a perfectly legal name would
+    // see a "will be created as..." nag for no reason — and, worse, would
+    // get an agent named something they didn't choose.
+    for (const name of ['Atlas', 'ResearchBot', 'Agent-V2', 'ATLAS', 'a1B2c3']) {
+        assert.equal(normalizeAgentName(name), name);
+        assert.equal(validateNormalizedAgentName(name), null);
+    }
 });
 
 test('#978: realistic user inputs from the issue body', () => {
     // The two cases the issue body explicitly calls out. Lock them in.
-    assert.equal(normalizeAgentName('ResearchBot'), 'researchbot');
-    assert.equal(normalizeAgentName('Research Bot'), 'research-bot');
+    assert.equal(normalizeAgentName('ResearchBot'), 'ResearchBot');
+    assert.equal(normalizeAgentName('Research Bot'), 'Research-Bot');
 });
 
 // Below: post-normalization validation tests. These mirror the rules in
@@ -149,10 +168,11 @@ test('#999: validateNormalizedAgentName is exported as a function', () => {
     assert.equal(typeof validateNormalizedAgentName, 'function');
 });
 
-test('#999: validator returns null for valid slugs', () => {
+test('#999: validator returns null for valid names', () => {
     // Sanity — the happy path that the existing tests already exercise
     // through the normalizer. The validator must not flag any of them.
     assert.equal(validateNormalizedAgentName('researchbot'), null);
+    assert.equal(validateNormalizedAgentName('ResearchBot'), null);
     assert.equal(validateNormalizedAgentName('research-bot'), null);
     assert.equal(validateNormalizedAgentName('agent-42'), null);
     assert.equal(validateNormalizedAgentName('a'), null);
@@ -169,7 +189,7 @@ test('#999: validator returns null for empty input (caller handles)', () => {
     assert.equal(validateNormalizedAgentName(''), null);
 });
 
-test('#999: validator flags slugs longer than 64 chars', () => {
+test('#999: validator flags names longer than 64 chars', () => {
     // Mirrors `test_invalid_too_long` in registry.rs — a 65-char slug
     // is the boundary case the backend rejects with InvalidConfig.
     const slug65 = 'a'.repeat(65);
@@ -200,31 +220,32 @@ test('#999: validator flags reserved names (post-normalization)', () => {
     }
 });
 
-test('#999: reserved-name check applies after normalization', () => {
-    // The headline UX reason for the post-normalization check: an
-    // operator types `Default` or `DM` or `Workspace` (plausible —
-    // `workspace` is in our public docs) and expects a polished inline
-    // error, not a raw backend 400. Compose normalize + validate to
-    // pin the contract.
+test('#2: reserved-name check is case-insensitive, not normalization-dependent', () => {
+    // Before #2, `DM` was caught only because normalization lowercased it
+    // into the reserved list. Normalization no longer lowercases, so the
+    // check itself has to fold case — otherwise `DM` sails past the client
+    // mirror and the operator gets a raw backend 400 instead of the
+    // polished inline error this check exists to give them.
     const cases = [
-        ['Default', 'default'],
-        ['DEFAULT', 'default'],
-        ['DM', 'dm'],
-        ['Dm', 'dm'],
-        ['Workspace', 'workspace'],
-        ['WorkSpace', 'workspace'],
+        ['Default', 'Default'],
+        ['DEFAULT', 'DEFAULT'],
+        ['DM', 'DM'],
+        ['Dm', 'Dm'],
+        ['dM', 'dM'],
+        ['Workspace', 'Workspace'],
+        ['WorkSpace', 'WorkSpace'],
         ['  workspace  ', 'workspace'],
     ];
-    for (const [input, expectedSlug] of cases) {
-        const slug = normalizeAgentName(input);
-        assert.equal(slug, expectedSlug, `normalize(${input})`);
-        const result = validateNormalizedAgentName(slug);
-        assert.notEqual(result, null, `expected ${input} to be flagged after normalization`);
+    for (const [input, expectedName] of cases) {
+        const name = normalizeAgentName(input);
+        assert.equal(name, expectedName, `normalize(${input})`);
+        const result = validateNormalizedAgentName(name);
+        assert.notEqual(result, null, `expected ${input} to be flagged`);
         assert.equal(result.code, 'AGENT_NAME_RESERVED');
     }
 });
 
-test('#999: validator flags UUID-shaped slugs', () => {
+test('#999: validator flags UUID-shaped names', () => {
     // Mirrors `test_uuid_shaped_name_rejected` in registry.rs — the
     // backend resolves agents by UUID first, so a UUID-shaped name
     // would be unreachable by name. Vanishingly unlikely to type by
@@ -262,25 +283,31 @@ test('#999: validator flags simple-form (32-char hex) UUIDs', () => {
     }
 });
 
-test('#999: UUID-shaped names with uppercase normalize then flag', () => {
-    // An uppercase-hex UUID typed by the operator lowercases through
-    // normalization and is then flagged by the validator. Compose the
-    // pipeline to pin the end-to-end contract. Cover both the
-    // hyphenated and the simple 32-char forms.
-    const hyphenSlug = normalizeAgentName('A1B2C3D4-E5F6-7890-ABCD-EF1234567890');
-    assert.equal(hyphenSlug, 'a1b2c3d4-e5f6-7890-abcd-ef1234567890');
-    const hyphenResult = validateNormalizedAgentName(hyphenSlug);
+test('#2: uppercase-hex UUIDs reach the validator with their case intact', () => {
+    // Before #2 an uppercase-hex UUID was lowercased by normalization into
+    // the lowercase-only regex. It now survives untouched, so the regex
+    // itself has to be case-insensitive — `uuid::Uuid::parse_str` is, and
+    // the backend rejects every casing. Pin that normalization is now the
+    // identity here, for both the hyphenated and simple 32-char forms.
+    const hyphenName = normalizeAgentName('A1B2C3D4-E5F6-7890-ABCD-EF1234567890');
+    assert.equal(hyphenName, 'A1B2C3D4-E5F6-7890-ABCD-EF1234567890');
+    const hyphenResult = validateNormalizedAgentName(hyphenName);
     assert.notEqual(hyphenResult, null);
     assert.equal(hyphenResult.code, 'AGENT_NAME_LOOKS_LIKE_UUID');
 
-    const simpleSlug = normalizeAgentName('A1B2C3D4E5F67890ABCDEF1234567890');
-    assert.equal(simpleSlug, 'a1b2c3d4e5f67890abcdef1234567890');
-    const simpleResult = validateNormalizedAgentName(simpleSlug);
+    const simpleName = normalizeAgentName('A1B2C3D4E5F67890ABCDEF1234567890');
+    assert.equal(simpleName, 'A1B2C3D4E5F67890ABCDEF1234567890');
+    const simpleResult = validateNormalizedAgentName(simpleName);
     assert.notEqual(simpleResult, null);
     assert.equal(simpleResult.code, 'AGENT_NAME_LOOKS_LIKE_UUID');
+
+    // Mixed case too — the regex must not be anchored to a single casing.
+    const mixed = validateNormalizedAgentName('a1B2c3D4-e5F6-7890-AbCd-eF1234567890');
+    assert.notEqual(mixed, null);
+    assert.equal(mixed.code, 'AGENT_NAME_LOOKS_LIKE_UUID');
 });
 
-test('#999: hex-but-not-UUID-shaped slugs are not flagged', () => {
+test('#999: hex-but-not-UUID-shaped names are not flagged', () => {
     // Hex strings that don't match either the 8-4-4-4-12 grouping or
     // the 32-char simple form are fine. Cover the wrong-length cases
     // (31, 33), a non-hex char inside a 32-char string, and partial

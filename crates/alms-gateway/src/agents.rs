@@ -2200,6 +2200,143 @@ mod tests {
             .expect("error response missing error.code field")
     }
 
+    /// Helper: a minimal `CreateAgentRequest` carrying only a name.
+    fn create_req(name: &str) -> alms_core::CreateAgentRequest {
+        alms_core::CreateAgentRequest {
+            name: name.into(),
+            description: None,
+            model: None,
+            posture: None,
+            provider: None,
+            telegram_token: None,
+            thinking_budget_tokens: None,
+            reasoning_effort: None,
+            gemini_thinking_budget: None,
+            summary_provider: None,
+            summary_model: None,
+            worktree_mode: None,
+            debug_mode: None,
+            is_default: None,
+        }
+    }
+
+    /// #2: `POST /agents` accepts uppercase and stores the operator's
+    /// casing verbatim.
+    #[tokio::test]
+    async fn post_agents_accepts_uppercase_and_preserves_the_operators_casing() {
+        let state = agents_test_app_state_with_sqlite();
+
+        let (status, body) = create_agent(
+            axum::extract::State(state.clone()),
+            Json(create_req("Atlas")),
+        )
+        .await
+        .expect("uppercase names are valid since #2");
+        assert_eq!(status, axum::http::StatusCode::CREATED);
+        assert_eq!(body.0["name"], serde_json::json!("Atlas"));
+
+        let store = state.session_manager.store().expect("sqlite store");
+        assert_eq!(
+            store.load_agent_by_name("Atlas").unwrap().unwrap().name,
+            "Atlas"
+        );
+    }
+
+    /// #2: `Atlas` and `atlas` cannot coexist.
+    ///
+    /// The workspace directory is `{workspace_dir}/{name}/`, so two such
+    /// records would share one directory on Windows/macOS and split into two
+    /// on Linux. This is the collision that would otherwise ship as a silent,
+    /// platform-dependent bug, so pin the wire shape the operator sees:
+    /// `409 DUPLICATE_NAME`, same as an exact-name clash.
+    #[tokio::test]
+    async fn post_agents_rejects_a_name_that_differs_only_in_case() {
+        let state = agents_test_app_state_with_sqlite();
+        let _ = create_agent(
+            axum::extract::State(state.clone()),
+            Json(create_req("Atlas")),
+        )
+        .await
+        .expect("first create must succeed");
+
+        for collision in ["atlas", "ATLAS", "aTlAs"] {
+            let (status, body) = create_agent_err(state.clone(), create_req(collision)).await;
+            assert_eq!(
+                status,
+                axum::http::StatusCode::CONFLICT,
+                "{collision} must conflict with 'Atlas'"
+            );
+            assert_eq!(err_code(&body), "DUPLICATE_NAME");
+        }
+
+        // Exactly one record, still spelled the operator's way.
+        let store = state.session_manager.store().expect("sqlite store");
+        let agents = store.list_agents().unwrap();
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agents[0].name, "Atlas");
+    }
+
+    /// #2: `DM` / `Default` / `Workspace` are reserved in any casing.
+    ///
+    /// The reserved list exists because these names collide with API
+    /// sub-route segments and internal `context_id` prefixes. An exact-match
+    /// guard would have let `DM` through the moment uppercase became legal —
+    /// the other silent-bug candidate in this change.
+    #[tokio::test]
+    async fn post_agents_rejects_reserved_names_in_any_casing() {
+        let state = agents_test_app_state_with_sqlite();
+        for name in ["DM", "Dm", "Default", "DEFAULT", "Workspace", "WORKSPACE"] {
+            let (status, body) = create_agent_err(state.clone(), create_req(name)).await;
+            assert_eq!(
+                status,
+                axum::http::StatusCode::BAD_REQUEST,
+                "{name} must be refused as reserved"
+            );
+            assert_eq!(err_code(&body), "INVALID_NAME");
+        }
+        let store = state.session_manager.store().expect("sqlite store");
+        assert!(store.list_agents().unwrap().is_empty());
+    }
+
+    /// #2: `GET /agents/{name}` resolves case-insensitively and answers with
+    /// the stored casing.
+    ///
+    /// Chosen semantics: case-insensitive lookup, case-preserving storage.
+    /// The alternative (exact-match lookup) would make an agent that the
+    /// registry says is unique reachable under only one of its spellings,
+    /// while `send_message` and `invoke_agent` — both of which funnel through
+    /// the same `load_agent_by_name` — happily resolved either.
+    #[tokio::test]
+    async fn get_agent_by_name_resolves_case_insensitively() {
+        let state = agents_test_app_state_with_sqlite();
+        let _ = create_agent(
+            axum::extract::State(state.clone()),
+            Json(create_req("Atlas")),
+        )
+        .await
+        .expect("create must succeed");
+
+        for spelling in ["Atlas", "atlas", "ATLAS"] {
+            let body = get_agent(
+                axum::extract::State(state.clone()),
+                axum::extract::Path(spelling.to_string()),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("GET /agents/{spelling} must resolve: {e:?}"));
+            assert_eq!(body.0["name"], serde_json::json!("Atlas"));
+        }
+
+        // Not a prefix match — resolution is still whole-name.
+        assert!(
+            get_agent(
+                axum::extract::State(state.clone()),
+                axum::extract::Path("atl".to_string()),
+            )
+            .await
+            .is_err()
+        );
+    }
+
     #[tokio::test]
     async fn post_agents_rejects_unknown_summary_provider() {
         // No `[llm.providers.nonexistent]` entry exists, so the validator

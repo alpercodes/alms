@@ -42,6 +42,7 @@ fn fresh_install_reaches_current_schema() {
             (1, "normalize_legacy_schema".to_string()),
             (2, "add_lifecycle_metadata".to_string()),
             (3, "normalize_job_terminal_states".to_string()),
+            (4, "case_insensitive_agent_names".to_string()),
         ],
     );
     for (table, column) in [
@@ -220,7 +221,10 @@ fn repeated_startup_is_idempotent() {
     }
 
     let conn = Connection::open(path).unwrap();
-    assert_eq!(migration_history(&conn).len(), 3);
+    assert_eq!(
+        migration_history(&conn).len(),
+        CURRENT_SCHEMA_VERSION as usize
+    );
 }
 
 #[test]
@@ -231,7 +235,11 @@ fn legacy_spent_one_shot_is_normalized_to_completed() {
     drop(store);
 
     let conn = Connection::open(&path).unwrap();
-    conn.execute("DELETE FROM schema_migrations WHERE version = 3", [])
+    // Roll the bookkeeping back to version 2 so migration 3 re-runs. Delete
+    // every version at or above it, not just the one: the history has to stay
+    // contiguous, and `read_schema_version` refuses to open a database with a
+    // hole in it.
+    conn.execute("DELETE FROM schema_migrations WHERE version >= 3", [])
         .unwrap();
     conn.execute(
         "INSERT INTO jobs (
@@ -289,7 +297,10 @@ fn concurrent_startup_applies_each_version_once() {
         }
 
         let conn = Connection::open(path).unwrap();
-        assert_eq!(migration_history(&conn).len(), 3);
+        assert_eq!(
+            migration_history(&conn).len(),
+            CURRENT_SCHEMA_VERSION as usize
+        );
     }
 }
 
@@ -435,4 +446,81 @@ fn migration_history_records_are_queryable_for_operators() {
     assert!(rows.iter().all(|(_, _, applied_at)| !applied_at.is_empty()));
     assert_eq!(rows[2].0, 3);
     assert_eq!(rows[2].1, "normalize_job_terminal_states");
+    assert_eq!(rows[3].0, 4);
+    assert_eq!(rows[3].1, "case_insensitive_agent_names");
+}
+
+/// #2: a database created before agent names could contain uppercase must
+/// come out of migration 4 with case-insensitive uniqueness actually
+/// enforced, not merely with the version row bumped.
+///
+/// The pre-#2 checkpoint schema declares `name TEXT NOT NULL UNIQUE`, which
+/// SQLite compares with BINARY collation — so on an un-migrated database
+/// `Atlas` and `atlas` both INSERT successfully and then share one workspace
+/// directory on Windows/macOS. Asserted against the constraint's *behaviour*
+/// rather than against `sqlite_master`, so a future table rebuild that keeps
+/// the semantics but drops this index name still passes.
+#[test]
+fn migrated_legacy_database_enforces_case_insensitive_agent_names() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("legacy-names.db");
+    let conn = Connection::open(&path).unwrap();
+    conn.execute_batch(CHECKPOINT_SCHEMA).unwrap();
+    conn.execute(
+        "INSERT INTO agents
+         (id, name, description, is_default, created_at, last_active, worktree_mode, debug_mode)
+         VALUES (
+             '11111111-1111-4111-8111-111111111111',
+             'atlas',
+             '',
+             1,
+             ?1,
+             ?1,
+             'off',
+             0
+         )",
+        ["2026-07-10T00:00:00Z"],
+    )
+    .unwrap();
+    drop(conn);
+
+    let store = SqliteStore::open(&path).unwrap();
+    assert_eq!(store.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
+    drop(store);
+
+    let conn = Connection::open(&path).unwrap();
+    let collision = conn.execute(
+        "INSERT INTO agents
+         (id, name, description, is_default, created_at, last_active, worktree_mode, debug_mode)
+         VALUES (
+             '22222222-2222-4222-8222-222222222222',
+             'Atlas',
+             '',
+             0,
+             ?1,
+             ?1,
+             'off',
+             0
+         )",
+        ["2026-07-10T00:00:00Z"],
+    );
+    let error = collision.expect_err("'Atlas' must collide with the existing 'atlas' row");
+    assert!(
+        matches!(
+            error,
+            rusqlite::Error::SqliteFailure(inner, _)
+                if inner.code == rusqlite::ErrorCode::ConstraintViolation
+        ),
+        "expected a constraint violation, got {error:?}"
+    );
+
+    // The pre-existing row is untouched, casing and all.
+    let name: String = conn
+        .query_row(
+            "SELECT name FROM agents WHERE id = '11111111-1111-4111-8111-111111111111'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(name, "atlas");
 }

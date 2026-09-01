@@ -1735,13 +1735,13 @@ Named agents are persistent entities stored in SQLite. Each agent has a unique s
 Side effects: creates the agent's workspace directory at `{workspace_dir}/{name}/` with empty identity files (personality.md, goals.md, memories.md, user.md).
 
 Errors:
-- `400 INVALID_NAME` — name fails validation (1–64 chars, lowercase alphanumeric + hyphens, no leading/trailing hyphens)
-- `409 DUPLICATE_NAME` — name already exists
+- `400 INVALID_NAME` — name fails validation (1–64 chars, ASCII alphanumeric + hyphens, no leading/trailing hyphens, not a reserved name, not UUID-shaped). Uppercase is allowed and preserved verbatim.
+- `409 DUPLICATE_NAME` — name already exists. **Uniqueness is case-insensitive**: `Atlas` and `atlas` are the same name, because an agent's workspace is a directory at `{workspace_dir}/{name}/` and Windows/macOS filesystems are case-insensitive while Linux is not.
 
 ### 9.3 Get agent
 `GET /agents/{id_or_name}`
 
-Path parameter accepts either a UUID or a name slug. UUID is tried first.
+Path parameter accepts either a UUID or a name. UUID is tried first. **Name lookup is case-insensitive** — `GET /agents/atlas` resolves an agent named `Atlas` — and the response carries the stored casing. The same rule applies to every by-name path parameter in this section, to the CLI, and to the `invoke_agent` / `send_message` agent tools.
 
 **Response 200** — `AgentRecord`
 **Response 404** — agent not found
@@ -2107,7 +2107,7 @@ Updates a single workspace file. `{file}` is one of: `personality.md`, `goals.md
 
 Spawns the host's native file explorer at the agent's workspace directory (Windows Explorer / Finder / `xdg-open`). Operator-trust: the gateway is expected to run on the same host as the operator's browser, so the existing bearer-auth gate is the only privilege check. Bearer auth applies as on other write endpoints.
 
-The endpoint takes no client-supplied path — the workspace path is resolved server-side from the agent registry record and the configured `ALMS_WORKSPACE_DIR`. Path-traversal is closed-by-construction by `validate_agent_name`, which restricts agent names to ASCII lowercase + digits + hyphens.
+The endpoint takes no client-supplied path — the workspace path is resolved server-side from the agent registry record and the configured `ALMS_WORKSPACE_DIR`. Path-traversal is closed-by-construction by `validate_agent_name`, which restricts agent names to ASCII letters + digits + hyphens (no separators, no `.`, no `..`).
 
 The launcher process is fire-and-forget — the response returns as soon as the OS accepts the spawn. The launcher itself is expected to outlive the request (the file explorer window should stay open until the user closes it).
 

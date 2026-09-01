@@ -495,6 +495,16 @@ impl Coordinator {
         is_background: bool,
         parent_cancel_token: Option<CancellationToken>,
     ) -> AlmsResult<(TaskId, SessionId)> {
+        // Canonicalize the LLM-supplied name to the registry's spelling
+        // BEFORE anything keys off it (#2). Everything downstream — the
+        // `active_named` concurrency guard, the subagent `context_id`, the
+        // workspace directory, the UI label — treats the name as an identity,
+        // and agent names resolve case-insensitively, so `invoke_agent
+        // {"name": "Reviewer"}` and `{"name": "reviewer"}` must not fork into
+        // two identities for one registered agent.
+        let mut request = request;
+        canonicalize_subagent_name(&self.session_manager, &mut request);
+
         // Reject concurrent invocations of the same named subagent to prevent
         // session corruption from parallel writes to the same session history.
         //
@@ -1774,6 +1784,50 @@ fn derive_subagent_identity(
             AgentId::new(),
             format!("subagent_{}_{}", request.parent_agent_id.0, task_id.0),
         )
+    }
+}
+
+/// Rewrite a named subagent request's name to the registry's canonical
+/// spelling, in place (#2).
+///
+/// The name on a [`SubagentRequest`] originates in an LLM-supplied
+/// `invoke_agent` parameter. `validate_agent_name` has already established
+/// that it is a *well-formed* name; this establishes that it is the *same
+/// string* the registry stores, so every identity derived from it downstream
+/// agrees:
+///
+/// - `derive_subagent_identity` → the `subagent_{parent}_{name}` `context_id`,
+///   which is the durable session key AND the carrier of the subagent's
+///   display identity (see [`alms_core::parse_subagent_context`]).
+/// - the `active_named` `(parent_agent_id, name)` concurrency guard, which
+///   exists to stop two concurrent invocations from interleaving writes into
+///   one session history — a case variant would slip straight past it.
+/// - `AgentWorkspace` directory selection, `{workspace_dir}/{name}/`.
+///
+/// A name with no registry row is left exactly as the model spelled it: there
+/// is no canonical spelling to adopt, and the unregistered-name path is
+/// already keyed on the literal name by `AgentId::deterministic`. Ditto when
+/// no store is attached or the lookup errors — canonicalization is a
+/// normalization, never a gate.
+fn canonicalize_subagent_name(session_manager: &SessionManager, request: &mut SubagentRequest) {
+    let Some(name) = request.subagent_name.as_deref() else {
+        return;
+    };
+    let Some(canonical) = session_manager
+        .store()
+        .and_then(|store| store.load_agent_by_name(name).ok())
+        .flatten()
+        .map(|record| record.name)
+    else {
+        return;
+    };
+    if canonical != name {
+        debug!(
+            requested = %name,
+            canonical = %canonical,
+            "Canonicalized invoke_agent subagent name to its registry spelling"
+        );
+        request.subagent_name = Some(canonical);
     }
 }
 
@@ -5495,6 +5549,89 @@ mod tests {
             "the context must stay byte-identical — the parent-ownership \
              check in read_subagent_session reads it"
         );
+    }
+
+    /// #2: an `invoke_agent` call that spells a registered name in a
+    /// different case must collapse onto the ONE registered identity.
+    ///
+    /// The name is model-supplied and everything downstream treats it as an
+    /// identity: the `context_id` (the durable session key *and* the carrier
+    /// of the subagent's display name), the `active_named` concurrency guard,
+    /// the workspace directory. Uncanonicalized, `{"name": "Reviewer"}` and
+    /// `{"name": "reviewer"}` would file the same registered agent's work
+    /// under two `context_id`s — two sidebar rows, two histories, and an
+    /// `active_named` guard that no longer serializes concurrent invocations
+    /// of what is really one subagent.
+    #[test]
+    fn canonicalize_subagent_name_collapses_case_variants_onto_the_registry() {
+        let store = alms_session::SqliteStore::open_in_memory().unwrap();
+        let manager =
+            SessionManager::with_store(alms_session::SessionConfig::default(), store).unwrap();
+        let parent_agent_id = AgentId::new();
+        let reviewer = register_agent(&manager, "Reviewer");
+
+        let mk = |name: &str| SubagentRequest {
+            task: "t".into(),
+            parent_session: SessionId::new(),
+            parent_agent_id,
+            parent_run_id: None,
+            subagent_name: Some(name.into()),
+            parent_tool_invocation_id: None,
+        };
+
+        for spelling in ["Reviewer", "reviewer", "REVIEWER"] {
+            let mut request = mk(spelling);
+            canonicalize_subagent_name(&manager, &mut request);
+            assert_eq!(request.subagent_name.as_deref(), Some("Reviewer"));
+
+            let (agent_id, context_id) =
+                derive_subagent_identity(&manager, TaskId::new(), &request);
+            assert_eq!(agent_id, reviewer);
+            assert_eq!(
+                context_id,
+                format!("subagent_{}_Reviewer", parent_agent_id.0),
+                "{spelling} must land on the one canonical context"
+            );
+        }
+    }
+
+    /// #2: canonicalization is a normalization, never a gate. A name with no
+    /// registry row has no canonical spelling to adopt, and the
+    /// unregistered-name path is already keyed on the literal name by
+    /// `AgentId::deterministic` — so it must survive byte-for-byte.
+    #[test]
+    fn canonicalize_subagent_name_leaves_unregistered_names_alone() {
+        let store = alms_session::SqliteStore::open_in_memory().unwrap();
+        let manager =
+            SessionManager::with_store(alms_session::SessionConfig::default(), store).unwrap();
+
+        let mut request = SubagentRequest {
+            task: "t".into(),
+            parent_session: SessionId::new(),
+            parent_agent_id: AgentId::new(),
+            parent_run_id: None,
+            subagent_name: Some("NeverRegistered".into()),
+            parent_tool_invocation_id: None,
+        };
+        canonicalize_subagent_name(&manager, &mut request);
+        assert_eq!(request.subagent_name.as_deref(), Some("NeverRegistered"));
+
+        // Ephemeral requests carry no name at all.
+        let mut ephemeral = SubagentRequest {
+            subagent_name: None,
+            ..request
+        };
+        canonicalize_subagent_name(&manager, &mut ephemeral);
+        assert_eq!(ephemeral.subagent_name, None);
+
+        // No store attached at all is the same story.
+        let registryless = registryless_session_manager();
+        let mut request = SubagentRequest {
+            subagent_name: Some("Reviewer".into()),
+            ..ephemeral
+        };
+        canonicalize_subagent_name(&registryless, &mut request);
+        assert_eq!(request.subagent_name.as_deref(), Some("Reviewer"));
     }
 
     /// Ephemeral subagents have no registry agent to be filed under, so

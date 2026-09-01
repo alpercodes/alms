@@ -168,7 +168,19 @@ impl SqliteStore {
         }
     }
 
-    /// Load an agent by its unique name slug.
+    /// Load an agent by its unique name.
+    ///
+    /// **Case-insensitive, case-preserving (#2).** `Atlas` and `atlas` name the
+    /// same agent — the `idx_agents_name_nocase` unique index guarantees at
+    /// most one row can match — and the returned record carries the casing the
+    /// operator chose at create time. Callers that need a canonical spelling
+    /// (DM `context_id`s, named-subagent `context_id`s, workspace directory
+    /// names) must use `record.name`, never the string they looked up with,
+    /// or a `GET /agents/atlas` and a `GET /agents/Atlas` will fork state.
+    ///
+    /// This is the single choke point every by-name lookup funnels through:
+    /// the HTTP routes, the CLI's `resolve_agent`, `invoke_agent` and
+    /// `send_message` all inherit these semantics from here.
     pub fn load_agent_by_name(&self, name: &str) -> AlmsResult<Option<AgentRecord>> {
         let conn = self.conn.lock();
         let result = conn.query_row(
@@ -176,7 +188,7 @@ impl SqliteStore {
              is_default, created_at, last_active, thinking_budget_tokens, reasoning_effort, \
              gemini_thinking_budget, summary_provider, summary_model, worktree_mode, \
              debug_mode \
-             FROM agents WHERE name = ?1",
+             FROM agents WHERE name = ?1 COLLATE NOCASE",
             params![name],
             parse_agent_row,
         );
@@ -710,8 +722,17 @@ impl SqliteStore {
                     continue;
                 };
 
+                // `COLLATE NOCASE` to match `load_agent_by_name` (#2): the
+                // probe reads "no row" as proof the peer is gone and purges
+                // the DM session on that basis, so a case mismatch between
+                // the name embedded in the `context_id` and the name in the
+                // row would be read as a proof of absence and destroy a live
+                // peer's history. BLOB-vs-TEXT is unaffected — SQLite orders
+                // by storage class before collation, so an unreadable name
+                // still fails to match and still takes the keep-the-session
+                // branch below.
                 let probe = tx.query_row(
-                    "SELECT 1 FROM agents WHERE name = ?1",
+                    "SELECT 1 FROM agents WHERE name = ?1 COLLATE NOCASE",
                     params![peer],
                     |_| Ok(true),
                 );
@@ -1019,6 +1040,63 @@ mod tests {
 
         // Non-existent name returns None
         assert!(store.load_agent_by_name("nonexistent").unwrap().is_none());
+    }
+
+    /// #2: two agents whose names differ only in case are ONE agent.
+    ///
+    /// Without this, `Atlas` and `atlas` are two registry rows that share a
+    /// single workspace directory on Windows/macOS (case-insensitive
+    /// filesystems) and split into two on Linux — a data-mixing bug whose
+    /// symptom depends on the operator's OS. The `idx_agents_name_nocase`
+    /// unique index is what makes the second INSERT impossible; this pins it,
+    /// and pins that the collision surfaces as `DuplicateName` (which the
+    /// gateway maps to `409 DUPLICATE_NAME`) rather than a raw SQLite error.
+    #[test]
+    fn agent_names_are_unique_case_insensitively() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        store.create_agent(&new_agent("Atlas")).unwrap();
+
+        for collision in ["atlas", "ATLAS", "aTlAs", "Atlas"] {
+            let err = store
+                .create_agent(&new_agent(collision))
+                .expect_err(&format!("{collision} must collide with 'Atlas'"));
+            assert!(
+                matches!(err, AlmsError::DuplicateName(ref n) if n == collision),
+                "expected DuplicateName({collision}), got {err:?}"
+            );
+        }
+
+        // A name that differs by more than case is still free.
+        store.create_agent(&new_agent("atlas-2")).unwrap();
+        assert_eq!(store.list_agents().unwrap().len(), 2);
+    }
+
+    /// #2: lookup is case-insensitive, storage is case-preserving.
+    ///
+    /// The returned `name` must be the operator's chosen casing, because
+    /// callers derive durable identity from it — DM `context_id`s, subagent
+    /// `context_id`s, the workspace directory name. If lookup echoed back the
+    /// *queried* spelling instead, `GET /agents/atlas` and `GET /agents/Atlas`
+    /// would mint two different context_ids for one agent.
+    #[test]
+    fn agent_lookup_by_name_is_case_insensitive_and_case_preserving() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let agent = new_agent("Atlas");
+        store.create_agent(&agent).unwrap();
+
+        for spelling in ["Atlas", "atlas", "ATLAS", "aTLAs"] {
+            let loaded = store
+                .load_agent_by_name(spelling)
+                .unwrap()
+                .unwrap_or_else(|| panic!("{spelling} must resolve to the 'Atlas' record"));
+            assert_eq!(loaded.id, agent.id);
+            assert_eq!(
+                loaded.name, "Atlas",
+                "lookup must return the stored casing, not the queried one"
+            );
+        }
+
+        assert!(store.load_agent_by_name("atl").unwrap().is_none());
     }
 
     #[test]

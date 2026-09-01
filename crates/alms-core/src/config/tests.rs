@@ -2463,22 +2463,45 @@ fn security_config_default_is_empty() {
     assert!(!security.is_full_os_access_agent("alice"));
 }
 
-/// `is_full_os_access_agent` is exact-match on the agent's registry name.
+/// `is_full_os_access_agent` matches the whole registry name, never a
+/// prefix or a substring.
 #[test]
-fn security_config_match_is_exact() {
+fn security_config_match_is_whole_name_only() {
     let security = SecurityConfig {
         allow_full_os_access: vec!["alice".into(), "bob".into()],
     };
     assert!(security.is_full_os_access_agent("alice"));
     assert!(security.is_full_os_access_agent("bob"));
     assert!(!security.is_full_os_access_agent("carol"));
-    // No prefix / case-insensitivity / substring matches.
+    // No prefix / substring matches.
     assert!(!security.is_full_os_access_agent("ali"));
-    assert!(!security.is_full_os_access_agent("Alice"));
     assert!(!security.is_full_os_access_agent("alicebot"));
     // Empty input never matches even when the list is non-empty —
     // unnamed/ephemeral agents cannot be on the list by construction.
     assert!(!security.is_full_os_access_agent(""));
+}
+
+/// #2: the list is matched case-insensitively, because agent names are
+/// unique case-insensitively.
+///
+/// This does not widen the grant — a case-folded entry still names at most
+/// one agent. It closes the near-miss where an operator writes `atlas` in
+/// `alms.toml`, creates the agent as `Atlas`, and silently gets no grant at
+/// all.
+#[test]
+fn security_config_match_is_case_insensitive() {
+    let security = SecurityConfig {
+        allow_full_os_access: vec!["Atlas".into()],
+    };
+    for spelling in ["Atlas", "atlas", "ATLAS", "aTlAs"] {
+        assert!(
+            security.is_full_os_access_agent(spelling),
+            "{spelling} must match the 'Atlas' entry"
+        );
+    }
+    // Still a whole-name match, not a case-insensitive substring one.
+    assert!(!security.is_full_os_access_agent("ATL"));
+    assert!(!security.is_full_os_access_agent("AtlasBot"));
 }
 
 /// `[security]` parses cleanly from TOML and survives a full `AlmsConfig`
