@@ -1083,14 +1083,29 @@ export function rehydrateSubagentsFromHistory(messages) {
         // that the subagent is still in flight.
         if (m.status === 'running') {
             candidateRows.push({ msg: m, paired: false });
-        } else if (result && m.id) {
+        } else if (m.result != null && m.id) {
             // Terminal foreground row WITH a persisted result: the
             // invocation is provably over. Nothing to create — but a chip
             // for it may still be sitting at `running`, which is the repair
-            // case below. Gated on `result` and not on `status` alone
-            // because `mapHistoryMessages` defaults a result-less row to
-            // 'done' whenever no run is active, and that default says
-            // nothing about whether the subagent finished.
+            // case below.
+            //
+            // Gated on a persisted result rather than on `status` alone
+            // because `mapHistoryMessages` defaults a result-LESS row to
+            // 'done' whenever no run is active, and that default is a
+            // statement about the run list, not about the subagent.
+            //
+            // Gated on the RAW `m.result`, not on the object-typed `result`
+            // above (Tim, PR #3 F1): `persist_one_tool_result` stores an
+            // `Err` arm as a JSON **string** (`"Error: …"`), so a foreground
+            // invoke_agent that failed outright — dispatch error, unknown
+            // agent, depth exceeded — carries a string result. Requiring an
+            // object would leave exactly those chips unrepaired, and a
+            // failed invocation is if anything the likelier one to have lost
+            // its `tool_end`. `mapHistoryMessages` leaves `result` null on
+            // both result-less paths, so the raw check still excludes the
+            // defaulted rows this restriction exists for. `sessionId` keeps
+            // reading the object-typed `result` — a string result has none,
+            // and the sweep falls back to the chip's own `sessionId`.
             terminalRows.set(m.id, {
                 status: m.status === 'fail' ? 'fail' : 'done',
                 sessionId: subagentSessionId,
@@ -1116,11 +1131,33 @@ export function rehydrateSubagentsFromHistory(messages) {
     // subagent's EARLIER invocation must never terminate the chip of a later
     // one, and those share a key and a session id but never an invocation id.
     //
+    // "On the next load" is usually the SAME turn: the mechanism that loses a
+    // `tool_end` (replay gap / stream-epoch change) is itself what drives
+    // `reconcileFromSnapshot` -> `loadSession` -> this function. The one
+    // window where it genuinely defers is a snapshot taken between the
+    // `tool_end` SSE (emitted in-loop) and `persist_one_tool_result` (run
+    // after the batch) — there the row is still `running` and the chip waits
+    // for the following load.
+    //
     // FOREGROUND only, deliberately. A background row goes terminal the
     // instant the dispatch returns its `task_id` while the subagent keeps
     // running, so its row status proves nothing — that class is already
     // handled by the `subagent_completed` FIFO pairing above, which decides
     // whether to re-create the chip at all.
+    //
+    // GUARD-RAIL for a future refactor: this sweep sits BELOW
+    // `rearmTerminalRemoveTimers()` and deliberately does not need a second
+    // rearm pass, because it terminates through `trackSubagentEnd`, which
+    // arms `scheduleSubagentRemoval` itself. Inlining the status write here
+    // instead would satisfy every test above and still strand the chip at
+    // `done` forever — the reported symptom wearing a different label.
+    //
+    // DESIGN NOTE (Tim, PR #3). The chip's terminal status now has TWO
+    // mechanisms and no acknowledgement between them: the live event, and
+    // this reconciliation against history. Any future terminal route —
+    // recursive subagents, cancel-from-the-child, a background/foreground
+    // unification — has to say which of the two carries it, or it silently
+    // inherits "correct until an event is lost".
     if (terminalRows.size > 0) {
         for (const [key, info] of Object.entries(activeSubagents.value)) {
             if (info.status !== 'running' || !info.toolInvocationId) continue;

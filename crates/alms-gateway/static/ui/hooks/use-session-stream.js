@@ -1579,19 +1579,32 @@ export function openSessionStream(sessionId, opts) {
             // always carry the id — `Sse::tool_end` takes a non-`Option`
             // `ToolInvocationId` — so this only excludes legacy replays).
             //
-            // Scope, so the next reader is not misled (Tim, PR #3 C1/S1):
+            // Scope, so the next reader is not misled (Tim, PR #3 C1/S1/F2):
             // this gate is correlator-plus-row only — `trackSubagentEnd`'s
             // tiers 2 (session id) and 3 (name) are reachable from here ONLY
-            // once one of those two has already resolved. It is a DEFENSIVE
-            // widening, not the fix for the reported #1 symptom: on every live
-            // path the row and the event share the invocation id (the row is
-            // built from `session_messages`, whose `tool_call` metadata
-            // carries `tool_invocation_id`; the provider-keyed rows in
-            // `mapHistoryMessages`' `run_tool_calls` merge path cannot exist
-            // for an in-flight call, because those records are written only at
-            // run end — `runs/lifecycle.rs` `persist_tool_calls`). What it
-            // does buy is that a chip whose stored correlator is right still
-            // terminates when the ROW's identity is wrong for any reason.
+            // once one of those two has already resolved.
+            //
+            // It is a DEFENSIVE widening rather than the fix for the reported
+            // #1 symptom, because a MIS-KEYED row cannot arise while a chip is
+            // live: the row is built from `session_messages`, whose
+            // `tool_call` metadata carries `tool_invocation_id`, and the
+            // provider-keyed rows in `mapHistoryMessages`' `run_tool_calls`
+            // merge path cannot exist for an in-flight call — the only
+            // production writer of those records is `persist_tool_calls` in
+            // `runs/lifecycle.rs`, a closure defined after the agent loop
+            // returns and called from its three terminal arms.
+            //
+            // But "mis-keyed" is not "absent", and this gate is the ONLY
+            // thing covering the absent case. `persist_assistant_tool_calls`
+            // is fire-and-forget: if that write is dropped, a mid-run
+            // reconcile installs a history with no `invoke_agent` row at all,
+            // the surviving live chip still holds the right correlator, and
+            // `tool_end` finds nothing by id. The rehydrate repair sweep
+            // cannot reach that corner either — there is no history row to be
+            // terminal. So: this gate terminates a chip whose stored
+            // correlator is right when the ROW's identity is wrong OR the row
+            // is missing; the sweep handles the case where the EVENT is
+            // missing. Neither subsumes the other.
             const subagentKey = findSubagentByToolInvocationId(matchId);
             const invokeMsg = matchId
                 ? chatMessages.value.find(m => m.type === 'tool' && m.id === matchId)

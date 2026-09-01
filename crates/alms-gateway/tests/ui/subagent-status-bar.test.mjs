@@ -1314,3 +1314,52 @@ test('#1: a legacy tool_end with no invocation id must not end a chip by name', 
         'the live second invocation must survive an id-less tool_end that '
         + 'happens to land next to turn 1\'s stale invoke_agent row');
 });
+
+test('#1/F2: when the invoke_agent ROW is missing entirely, only the correlator can end the chip', () => {
+    // Tim's F2 on PR #3. The run-end argument rules out a MIS-KEYED row while
+    // a chip is live; it says nothing about an ABSENT one.
+    //
+    // `persist_assistant_tool_calls` is fire-and-forget (`loop_impl.rs`,
+    // warn-on-failure by design). If that write is dropped, then mid-run
+    // there is no `session_messages` `tool_call` row AND no `run_tool_calls`
+    // record yet — so a contract reconcile installs a history with no
+    // `invoke_agent` row at all. The live chip survives (the reconciler is
+    // the one load path that does not clear the map) and still holds the
+    // right correlator.
+    //
+    // The repair sweep cannot reach this: there is no history row to BE
+    // terminal. The correlator gate is the only thing that closes it, which
+    // is why this branch is not redundant with the sweep and must not be
+    // "simplified" back into a row lookup.
+    reset();
+    const es = openStream('sess-1');
+
+    es.emit('tool_start', {
+        run_id: 'run-1', tool_invocation_id: 'inv-1', tool: 'invoke_agent',
+        params: { name: 'researcher', task: 'review the diff' },
+    });
+    assert.equal(T.activeSubagents.value.researcher.status, 'running');
+
+    // Reconcile: authoritative history has the parent's text and an
+    // unrelated running tool, but the invoke_agent row never persisted.
+    const history = [
+        { id: 'msg-1', type: 'agent', text: 'delegating…' },
+        { id: 'inv-other', type: 'tool', tool: 'shell', status: 'running', params: {} },
+    ];
+    T.chatMessages.value = history;
+    T.rehydrateSubagentsFromHistory(history);
+    assert.equal(T.activeSubagents.value.researcher.status, 'running',
+        'the sweep has nothing to work with — no invoke_agent row exists');
+
+    // The subagent finishes.
+    es.emit('tool_end', {
+        run_id: 'run-1', tool_invocation_id: 'inv-1', ok: true,
+        result: { response: 'looks good', session_id: 'sub-sess-1' },
+    });
+
+    const entry = T.activeSubagents.value.researcher;
+    assert.equal(entry.status, 'done',
+        'the chip resolves through its stored tool_invocation_id even with '
+        + 'no chat row to identify the event by');
+    assert.equal(entry.sessionId, 'sub-sess-1');
+});

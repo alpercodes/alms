@@ -1108,7 +1108,9 @@ test('#1: a running chip is repaired when its invoke_agent row is terminal in hi
         'the repaired chip keeps its drill-down session link');
 });
 
-test('#1: repair maps a failed row to `fail`', () => {
+test('#1: repair maps a failed row to `fail` (in-band failure, object result)', () => {
+    // `tool_result_ok` classifies a structured error payload as a failure;
+    // the tool itself returned `Ok`, so the persisted result is an object.
     mod.trackSubagentStart('reviewer', 'review the diff', 'inv-1');
     mod.rehydrateSubagentsFromHistory([
         {
@@ -1119,6 +1121,31 @@ test('#1: repair maps a failed row to `fail`', () => {
         },
     ]);
     assert.equal(mod.activeSubagents.value.reviewer.status, 'fail');
+});
+
+test('#1: repair also fires for an outright dispatch failure (STRING result)', () => {
+    // Tim's F1 on PR #3. The sibling case above gave false assurance: it uses
+    // an object result, so a predicate that (wrongly) required
+    // `typeof result === 'object'` still passed it.
+    //
+    // `persist_one_tool_result` stores an `Err` arm as `format!("Error: {e}")`
+    // and history.js keeps it as a bare string when it does not parse as
+    // JSON. So an invoke_agent that failed OUTRIGHT — unknown agent, depth
+    // exceeded, dispatch error — reaches the rehydrator as `status: 'fail'`
+    // with a string result. That is the same lost-`tool_end` class the sweep
+    // exists for, and arguably the likelier one to have lost its event.
+    mod.trackSubagentStart('reviewer', 'review the diff', 'inv-1');
+    mod.rehydrateSubagentsFromHistory([
+        {
+            id: 'inv-1', type: 'tool', tool: 'invoke_agent',
+            params: { name: 'reviewer' }, status: 'fail',
+            result: 'Error: unknown agent reviewer',
+            ts: '2026-05-12T09:00:00Z',
+        },
+    ]);
+    assert.equal(mod.activeSubagents.value.reviewer.status, 'fail',
+        'a string result is still a PERSISTED result — the gate is about '
+        + 'whether the invocation finished, not about the payload shape');
 });
 
 test('#1: repair is identity-exact — an EARLIER invocation never ends a later chip', () => {
