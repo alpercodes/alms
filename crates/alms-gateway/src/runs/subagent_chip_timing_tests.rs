@@ -2,11 +2,13 @@
 //!
 //! The reported symptom was that the chip above the message composer only
 //! cleared once the PARENT run — the run that called `invoke_agent` — ended,
-//! rather than when the subagent's own session finished. The frontend half of
-//! that bug is fixed in `static/ui/hooks/use-session-stream.js`; these tests
-//! pin the wire-level contract the frontend depends on, so a backend change
-//! can never reintroduce the symptom by deferring the terminal signal to the
-//! parent's run end.
+//! rather than when the subagent's own session finished. Two backend
+//! explanations were proposed in the issue (a late `tool_end`, and a missing
+//! foreground `subagent_completed`); these tests exist because BOTH were
+//! refuted by measurement, and pinning the refutation is the only way it stays
+//! refuted. They fix the wire-level contract the frontend's chip lifecycle
+//! depends on, so a backend change can never (re)introduce the symptom by
+//! deferring the terminal signal to the parent's run end.
 //!
 //! Two facts are pinned, one per subagent class, both by driving a REAL
 //! `execute_run` against a scripted streaming LLM whose post-`invoke_agent`
@@ -295,6 +297,30 @@ fn first_at(observed: &[Observed], event_type: &str) -> Option<u128> {
         .map(|e| e.at_ms)
 }
 
+/// The first `tool_end` whose result is a FOREGROUND `invoke_agent` return —
+/// selected on the payload the assertions are actually about (a subagent
+/// `session_id`, and no `task_id`), not on "the first tool_end of any tool".
+///
+/// The parent's only tool is `invoke_agent` today, so the two coincide; if the
+/// script ever gains a second parent tool, position-based selection would
+/// silently retarget the pin while its failure message still claimed to be
+/// about the subagent (Tim, PR #3 S4).
+fn first_foreground_invoke_tool_end(observed: &[Observed]) -> Option<&Observed> {
+    observed.iter().find(|e| {
+        e.event_type == "tool_end"
+            && e.data["result"].get("session_id").is_some()
+            && e.data["result"].get("task_id").is_none()
+    })
+}
+
+/// The first `tool_end` whose result is a BACKGROUND `invoke_agent` dispatch
+/// (identified by the `task_id` the frontend keys its background skip on).
+fn first_background_invoke_tool_end(observed: &[Observed]) -> Option<&Observed> {
+    observed
+        .iter()
+        .find(|e| e.event_type == "tool_end" && e.data["result"].get("task_id").is_some())
+}
+
 fn summarize(observed: &[Observed]) -> Vec<(String, u128)> {
     observed
         .iter()
@@ -312,13 +338,17 @@ fn summarize(observed: &[Observed]) -> Vec<(String, u128)> {
 async fn foreground_subagent_tool_end_leads_the_parent_run_terminal() {
     let observed = observe_parent_session_stream(false).await;
 
-    let tool_end_at = first_at(&observed, "tool_end").unwrap_or_else(|| {
+    let tool_end = first_foreground_invoke_tool_end(&observed).unwrap_or_else(|| {
         panic!(
             "a foreground invoke_agent must produce a tool_end on the parent \
-             session stream; got: {:?}",
+             session stream whose result carries the subagent `session_id` \
+             (the chip's drill-down link) and NO `task_id` (the frontend keys \
+             its background skip on that field, and a stray one would make it \
+             wait for a `subagent_completed` that never comes); got: {:?}",
             summarize(&observed)
         )
     });
+    let tool_end_at = tool_end.at_ms;
     let finished_at = first_at(&observed, "run_finished").unwrap_or_else(|| {
         panic!(
             "the parent run must finish; got: {:?}",
@@ -336,27 +366,41 @@ async fn foreground_subagent_tool_end_leads_the_parent_run_terminal() {
         summarize(&observed)
     );
 
-    let tool_end = observed
-        .iter()
-        .find(|e| e.event_type == "tool_end")
-        .expect("checked above");
     assert_eq!(
         tool_end.data.get("ok").and_then(|v| v.as_bool()),
         Some(true),
         "the foreground tool_end must report success"
     );
     assert!(
-        tool_end.data["result"].get("task_id").is_none(),
-        "a FOREGROUND invoke_agent result must carry no `task_id` — the \
-         frontend keys its background skip on that field, and a stray one \
-         would make it wait for a `subagent_completed` that never comes: {:?}",
-        tool_end.data["result"]
+        tool_end.data.get("tool_invocation_id").is_some(),
+        "the foreground tool_end must carry the invocation id — it is the \
+         correlator the frontend resolves the chip by, and the only thing \
+         that distinguishes concurrent unnamed subagents: {:?}",
+        tool_end.data
     );
-    assert!(
-        tool_end.data["result"].get("session_id").is_some(),
-        "the foreground tool_end result must carry the subagent session id so \
-         the chip keeps its drill-down link when it goes terminal: {:?}",
-        tool_end.data["result"]
+
+    // The live chip is created by `tool_start` and terminated by `tool_end`;
+    // both the chip's stored correlator and the terminating event's come from
+    // the same `invocation_ids[i]` in `agent/loop_impl.rs`. Pinning the
+    // equality here is what makes the frontend's primary (id) match the
+    // normal path on a live session — if it ever broke, every foreground chip
+    // would fall to the row/name fallbacks silently (issue #1, Tim's C1).
+    let tool_start = observed
+        .iter()
+        .find(|e| e.event_type == "tool_start" && e.data.get("tool") == Some(&"invoke_agent".into()))
+        .unwrap_or_else(|| {
+            panic!(
+                "invoke_agent must produce a tool_start on the parent session \
+                 stream — it is what creates the chip; got: {:?}",
+                summarize(&observed)
+            )
+        });
+    assert_eq!(
+        tool_start.data.get("tool_invocation_id"),
+        tool_end.data.get("tool_invocation_id"),
+        "tool_start and tool_end for the same invoke_agent must carry the \
+         SAME tool_invocation_id — the chip stores the first and is resolved \
+         by the second"
     );
 
     // Pins the asymmetry the fix depends on: there is no second route.
@@ -379,23 +423,16 @@ async fn foreground_subagent_tool_end_leads_the_parent_run_terminal() {
 async fn background_subagent_completed_leads_the_parent_run_terminal() {
     let observed = observe_parent_session_stream(true).await;
 
-    let tool_end = observed
-        .iter()
-        .find(|e| e.event_type == "tool_end")
-        .unwrap_or_else(|| {
-            panic!(
-                "a background invoke_agent must still produce a tool_end; \
-                 got: {:?}",
-                summarize(&observed)
-            )
-        });
-    assert!(
-        tool_end.data["result"].get("task_id").is_some(),
-        "the background tool_end result must carry a `task_id` — that field is \
-         what tells the frontend to keep the chip running and wait for \
-         `subagent_completed`: {:?}",
-        tool_end.data["result"]
-    );
+    // Selected on the `task_id` this test is about (S4), not on position:
+    // that field is what tells the frontend to keep the chip running and wait
+    // for `subagent_completed`.
+    first_background_invoke_tool_end(&observed).unwrap_or_else(|| {
+        panic!(
+            "a background invoke_agent must still produce a tool_end, and its \
+             result must carry a `task_id`; got: {:?}",
+            summarize(&observed)
+        )
+    });
 
     let completed_at = first_at(&observed, "subagent_completed").unwrap_or_else(|| {
         panic!(

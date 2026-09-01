@@ -1091,12 +1091,28 @@ test('status flow: Starting -> Reasoning -> Using shell -> Writing -> Done', () 
 // no-op in this handler is directly visible as "the chip lingers until the
 // parent run ends".
 //
-// The failure mode pinned here: the handler closes the parent's tool ROW by
-// `tool_invocation_id` and, when that misses, by a documented "last running
-// tool message" fallback — but it then used to re-find the row STRICTLY by
-// `tool_invocation_id` to decide whether to end the chip. On the fallback
-// path that lookup is empty, so `trackSubagentEnd` was never called and the
-// chip stayed `running` for the rest of the parent run.
+// Two independent properties are pinned below.
+//
+// 1. CHIP RESOLUTION IS ROW-INDEPENDENT (defensive). The handler closes the
+//    parent's tool ROW by `tool_invocation_id` and, when that misses, by a
+//    documented "last running tool message" fallback — and it used to re-find
+//    the row STRICTLY by `tool_invocation_id` to decide whether to end the
+//    chip, which is empty on exactly that fallback path. Resolving the chip
+//    through the tracked entry's correlator instead removes the coupling.
+//
+//    Honest scope (Tim's C1 on PR #3): this divergence is NOT reachable while
+//    a foreground chip is live. The provider-keyed rows it guards against come
+//    from `mapHistoryMessages`' `run_tool_calls` merge path, and those records
+//    are written only at run END (`runs/lifecycle.rs`, `persist_tool_calls`),
+//    so no in-flight invocation can have one; the row a live chip is compared
+//    against always comes from `session_messages`, whose `tool_call` metadata
+//    carries the invocation id. These cases pin the invariant, not a repro.
+//
+// 2. THE CHIP SELF-HEALS WHEN `tool_end` NEVER ARRIVES (the reachable half).
+//    A dropped or gapped `tool_end` has no second delivery, so it strands the
+//    chip at `running`. The repair sweep in `rehydrateSubagentsFromHistory`
+//    reconciles it against history on the next load — see the `#1:` cases in
+//    `subagents-rehydrate.test.mjs` for the unit-level coverage.
 // ===========================================================================
 
 test('#1: a foreground chip goes terminal on tool_end even when the row id does not match', () => {
@@ -1110,12 +1126,11 @@ test('#1: a foreground chip goes terminal on tool_end even when the row id does 
     });
     assert.equal(T.activeSubagents.value.researcher.status, 'running');
 
-    // Mid-run the chat rows are rebuilt (reload / snapshot reconcile / a
-    // session switch back into the parent). `mapHistoryMessages` keys a row
-    // recovered from the `run_tool_calls` records by the PROVIDER call id,
-    // not the invocation id, so the row id no longer matches the live SSE
-    // correlator. The chip is untouched — `rehydrateSubagentsFromHistory`
-    // skips keys that already exist — so it still carries `inv-1`.
+    // Force the divergence directly: a chat row whose id is NOT the live
+    // correlator, with the chip still carrying `inv-1`. Assigning the rows
+    // rather than routing through a load path is deliberate — see property 1
+    // above; no production load path produces this pairing today, so this is
+    // an invariant pin and the assignment is what makes that legible.
     T.chatMessages.value = [{
         id: 'call_provider_1', type: 'tool', tool: 'invoke_agent',
         params: { name: 'researcher', task: 'review the diff' },
@@ -1224,4 +1239,78 @@ test('#1: a BACKGROUND tool_end still leaves the chip running (it waits for suba
         tool_invocation_id: 'inv-9',
     });
     assert.equal(T.activeSubagents.value.researcher.status, 'done');
+});
+
+test('#1: a chip stranded by a MISSED tool_end is repaired by the next history load', () => {
+    // The reachable half of #1. `tool_end` is the only terminal route a
+    // foreground chip has, and it is delivered exactly once — a replay gap or
+    // a stream-epoch change (both of which trigger the contract reconciler,
+    // `use-session-stream.js` `stream_state` -> `load-session.js`
+    // `registerSessionContractReconciler`) can lose it. That path installs a
+    // fresh history WITHOUT clearing the chip map, so before the repair sweep
+    // the chip stayed `running` for the rest of the session.
+    reset();
+    const es = openStream('sess-1');
+
+    es.emit('tool_start', {
+        run_id: 'run-1', tool_invocation_id: 'inv-1', tool: 'invoke_agent',
+        params: { name: 'researcher', task: 'review the diff' },
+    });
+    es.emit('subagent_started', {
+        session_id: 'sess-1', tool_invocation_id: 'inv-1',
+        subagent_name: 'researcher', subagent_session_id: 'sub-sess-1',
+    });
+    assert.equal(T.activeSubagents.value.researcher.status, 'running');
+
+    // ...the subagent finishes, but its `tool_end` never reaches the browser.
+
+    // Contract reconcile: `loadSession` replaces the messages and rehydrates.
+    // Note it does NOT call `clearAllSubagents()` — unlike every switch/boot
+    // path — so the live chip is still here to be repaired.
+    const history = [{
+        id: 'inv-1', type: 'tool', tool: 'invoke_agent',
+        params: { name: 'researcher', task: 'review the diff' },
+        status: 'done', result: { session_id: 'sub-sess-1', response: 'looks good' },
+        ts: '2026-09-01T10:00:00Z',
+    }];
+    T.chatMessages.value = history;
+    T.rehydrateSubagentsFromHistory(history);
+
+    assert.equal(T.activeSubagents.value.researcher.status, 'done',
+        'history is authoritative: a chip whose invocation is terminal there '
+        + 'must not stay running just because its tool_end was lost');
+});
+
+test('#1: a legacy tool_end with no invocation id must not end a chip by name', () => {
+    // N1 on PR #3. `Sse::tool_end` takes a non-`Option` `ToolInvocationId`, so
+    // live events always carry one; only a legacy/replayed payload can omit
+    // it. Without an id there is no correlator, and the row fallback ("the
+    // last row now in this status") can name a STALE row from an earlier turn
+    // — so the handler must not identify a chip from the row at all.
+    reset();
+    const es = openStream('sess-1');
+
+    // Turn 1: a completed invoke_agent row is left behind in the transcript.
+    es.emit('tool_start', {
+        run_id: 'run-1', tool_invocation_id: 'inv-old', tool: 'invoke_agent',
+        params: { name: 'researcher', task: 'first pass' },
+    });
+    es.emit('tool_end', {
+        run_id: 'run-1', tool_invocation_id: 'inv-old', ok: true,
+        result: { response: 'ok', session_id: 'sub-sess-1' },
+    });
+
+    // Turn 2: the same named subagent is running again.
+    es.emit('tool_start', {
+        run_id: 'run-1', tool_invocation_id: 'inv-new', tool: 'invoke_agent',
+        params: { name: 'researcher', task: 'second pass' },
+    });
+    assert.equal(T.activeSubagents.value.researcher.status, 'running');
+
+    // An id-less tool_end for some OTHER tool arrives.
+    es.emit('tool_end', { run_id: 'run-1', ok: true, result: 'shell output' });
+
+    assert.equal(T.activeSubagents.value.researcher.status, 'running',
+        'the live second invocation must survive an id-less tool_end that '
+        + 'happens to land next to turn 1\'s stale invoke_agent row');
 });

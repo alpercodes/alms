@@ -243,7 +243,7 @@ HTTP/SSE control plane. Handles top-level user interactions and exposes coordina
 
 **Other:** `GET /settings`, `GET /audit`, `POST /jobs`, `GET /jobs/{id}`, `GET /sessions`, `GET /health`
 
-**SSE event propagation:** The parent stream receives `subagent_started`, `subagent_completed`, and transient coarse `subagent_activity` status. Raw child token, reasoning, tool-parameter, and tool-result events stay on the child session's own SSE stream, where the fullscreen subagent view can stream and replay them.
+**SSE event propagation:** The parent stream receives `subagent_started`, `subagent_completed` (**background subagents only** — the completion channel is fired behind `handle.is_background`, so a foreground subagent's only terminal signal on the parent stream is the `tool_end` of its `invoke_agent` call; see [`api.md`](api.md) and the pins in `crates/alms-gateway/src/runs/subagent_chip_timing_tests.rs`), and transient coarse `subagent_activity` status. Raw child token, reasoning, tool-parameter, and tool-result events stay on the child session's own SSE stream, where the fullscreen subagent view can stream and replay them.
 
 ### Channel Adapters (`alms-channel`)
 

@@ -1526,11 +1526,35 @@ export function openSessionStream(sessionId, opts) {
                 m => m.type === 'tool' && m.id === matchId,
                 applyToolEnd,
             );
+            let closedByFallback = false;
             if (!found) {
                 found = updateMessage(
                     m => m.type === 'tool' && m.status === 'running',
                     applyToolEnd,
                 );
+                closedByFallback = Boolean(found && matchId);
+            }
+            if (closedByFallback) {
+                // The id correlation missed and we closed "the last running
+                // tool row" instead — a guess. Say so: every historical bug in
+                // this handler has been an identity mismatch (#1125, #1149,
+                // #1190, #1045/#1049), and until this line existed the only
+                // one that logged anything was the TOTAL miss below — this
+                // path succeeds, so it stayed silent and needed a user to
+                // notice it (issue #1).
+                //
+                // The running-chip census is the diagnostic payload: a chip
+                // listed here whose `inv` is not `matchId` is a chip that this
+                // event cannot terminate, and a foreground chip has no second
+                // terminal route. Read before the chip block below so it
+                // reflects the state at the time of the divergence.
+                console.warn('[tool_end] no row matched tool_invocation_id',
+                    matchId, '- closed the last running tool row instead;',
+                    'row/event identity has diverged. Running subagent chips:',
+                    Object.entries(activeSubagents.value)
+                        .filter(([, i]) => i.status === 'running')
+                        .map(([k, i]) => `${k}(inv=${i.toolInvocationId})`)
+                        .join(', ') || '(none)');
             }
             // -- Subagent status-bar chip termination --
             //
@@ -1542,22 +1566,36 @@ export function openSessionStream(sessionId, opts) {
             // by a session switch — i.e. it visibly outlives the subagent for
             // the rest of the parent run.
             //
-            // Which is why the chip is resolved by the `tool_invocation_id`
-            // correlator against the TRACKED ENTRY, not by re-finding the
-            // chat row: the row match above deliberately falls back to "the
-            // last running tool message" when the id correlation misses (a
-            // row rebuilt from the `run_tool_calls` records is keyed by the
-            // PROVIDER call id, not the invocation id — see
-            // `mapHistoryMessages`), and looking the row back up STRICTLY by
-            // `matchId` then returns `undefined` on exactly that path. Entries
-            // are only ever created for `invoke_agent` calls, so a correlator
-            // hit is itself proof that this event closes one — no chat row
-            // required. Reading `chatMessages` again is a best-effort source
-            // of the `name`/`subagent_name` params only.
+            // The chip is therefore resolved by the `tool_invocation_id`
+            // correlator against the TRACKED ENTRY, not by re-finding the chat
+            // row. Entries are only ever created for `invoke_agent` calls
+            // (`trackSubagentStart` / `rehydrateSubagentsFromHistory`), so a
+            // correlator hit is itself proof that this event closes one — no
+            // chat row required. The row is consulted only as a best-effort
+            // source of the `name` / `subagent_name` params, and only when
+            // this event carries an id to match it by (N1: without `matchId`
+            // the "last row with this status" guess can name a STALE terminal
+            // row from an earlier turn and end the wrong chip; live events
+            // always carry the id — `Sse::tool_end` takes a non-`Option`
+            // `ToolInvocationId` — so this only excludes legacy replays).
+            //
+            // Scope, so the next reader is not misled (Tim, PR #3 C1/S1):
+            // this gate is correlator-plus-row only — `trackSubagentEnd`'s
+            // tiers 2 (session id) and 3 (name) are reachable from here ONLY
+            // once one of those two has already resolved. It is a DEFENSIVE
+            // widening, not the fix for the reported #1 symptom: on every live
+            // path the row and the event share the invocation id (the row is
+            // built from `session_messages`, whose `tool_call` metadata
+            // carries `tool_invocation_id`; the provider-keyed rows in
+            // `mapHistoryMessages`' `run_tool_calls` merge path cannot exist
+            // for an in-flight call, because those records are written only at
+            // run end — `runs/lifecycle.rs` `persist_tool_calls`). What it
+            // does buy is that a chip whose stored correlator is right still
+            // terminates when the ROW's identity is wrong for any reason.
             const subagentKey = findSubagentByToolInvocationId(matchId);
             const invokeMsg = matchId
                 ? chatMessages.value.find(m => m.type === 'tool' && m.id === matchId)
-                : chatMessages.value.findLast(m => m.type === 'tool' && m.status === status);
+                : undefined;
             if (subagentKey || invokeMsg?.tool === 'invoke_agent') {
                 const resultObj = typeof data.result === 'object' ? data.result : null;
                 // Background subagents return a `task_id` immediately and keep
@@ -1580,19 +1618,20 @@ export function openSessionStream(sessionId, opts) {
                         if (subagentSessionId) {
                             setSubagentSessionId(name, subagentSessionId, matchId);
                         }
-                        // Pass both correlators so the entry resolves
-                        // identity-exactly (tool_invocation_id -> session id ->
-                        // name), the same order the `subagent_completed`
-                        // handler uses.
+                        // Pass both correlators so `trackSubagentEnd` resolves
+                        // the entry identity-exactly (its own tier order is
+                        // tool_invocation_id -> session id -> name, the same
+                        // one the `subagent_completed` handler uses).
                         trackSubagentEnd(name, status, matchId, subagentSessionId);
                     }
                 }
             }
-            if (!found && !data.source_agent) {
-                // tool_end arrived for a non-subagent tool, but no matching
-                // tool message was found in chatMessages. This means the
-                // tool_start message was lost or never arrived. Log for
-                // diagnosis. (Relates to #501 Bug 4 investigation)
+            if (!found) {
+                // tool_end arrived but no tool row matched at all — not even
+                // the last-running fallback. The tool_start message was lost
+                // or never arrived. (Relates to #501 Bug 4 investigation.)
+                // N2: the old `&& !data.source_agent` conjunct was dead —
+                // the handler already returned at the top for tagged events.
                 console.warn('[tool_end] no matching tool message found for',
                     matchId, '- tool messages in chat:',
                     chatMessages.value.filter(m => m.type === 'tool').length);

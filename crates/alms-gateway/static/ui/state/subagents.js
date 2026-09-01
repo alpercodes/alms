@@ -982,6 +982,11 @@ export function rehydrateSubagentsFromHistory(messages) {
     // live `subagent_started` SSE path uses, and attach it to the pending
     // foreground chip below.
     const startedSessionByInvocation = new Map(); // tool_invocation_id -> subagent_session_id
+    // Terminal FOREGROUND invoke_agent rows (those that carry a persisted
+    // result), keyed by tool_invocation_id. Feeds the repair sweep below: a
+    // chip still at `running` whose invocation appears here lost its
+    // `tool_end` and must be reconciled to the history's verdict.
+    const terminalRows = new Map(); // tool_invocation_id -> {status, sessionId}
     let lastSeenTsMs = -Infinity;
     let orderingWarned = false;
 
@@ -1075,10 +1080,67 @@ export function rehydrateSubagentsFromHistory(messages) {
 
         // Foreground subagent: the parent blocks until the subagent
         // finishes, so an unfinished row literally is the indicator
-        // that the subagent is still in flight. Done/fail means the
-        // tool_result is already in history — nothing to track.
+        // that the subagent is still in flight.
         if (m.status === 'running') {
             candidateRows.push({ msg: m, paired: false });
+        } else if (result && m.id) {
+            // Terminal foreground row WITH a persisted result: the
+            // invocation is provably over. Nothing to create — but a chip
+            // for it may still be sitting at `running`, which is the repair
+            // case below. Gated on `result` and not on `status` alone
+            // because `mapHistoryMessages` defaults a result-less row to
+            // 'done' whenever no run is active, and that default says
+            // nothing about whether the subagent finished.
+            terminalRows.set(m.id, {
+                status: m.status === 'fail' ? 'fail' : 'done',
+                sessionId: subagentSessionId,
+            });
+        }
+    }
+
+    // -- Repair sweep: a running chip whose invocation is provably over --
+    //
+    // `tool_end` for `invoke_agent` is the ONLY route a foreground chip has
+    // to a terminal status (`subagent_completed` is background-only), so a
+    // single dropped/gapped `tool_end` strands the chip at `running` for the
+    // rest of the session — it is not re-delivered, and every load path other
+    // than a full session switch leaves existing entries alone. That is
+    // exactly the reported #1 symptom: a chip that outlives its subagent and
+    // only disappears when something else wipes the map.
+    //
+    // Rehydrate is the single load chokepoint (reload, session switch back,
+    // contract reconcile), so this is where the live map gets reconciled
+    // against the authoritative history — the same self-healing contract
+    // `rearmTerminalRemoveTimers` above establishes for terminal-without-timer
+    // entries. Matching is identity-exact on `tool_invocation_id`: a named
+    // subagent's EARLIER invocation must never terminate the chip of a later
+    // one, and those share a key and a session id but never an invocation id.
+    //
+    // FOREGROUND only, deliberately. A background row goes terminal the
+    // instant the dispatch returns its `task_id` while the subagent keeps
+    // running, so its row status proves nothing — that class is already
+    // handled by the `subagent_completed` FIFO pairing above, which decides
+    // whether to re-create the chip at all.
+    if (terminalRows.size > 0) {
+        for (const [key, info] of Object.entries(activeSubagents.value)) {
+            if (info.status !== 'running' || !info.toolInvocationId) continue;
+            const terminal = terminalRows.get(info.toolInvocationId);
+            if (!terminal) continue;
+            console.warn(
+                '[rehydrateSubagentsFromHistory] chip', key, 'was still running',
+                'but its invoke_agent row is terminal in history — the live',
+                'tool_end never arrived (dropped or gapped). Repairing to',
+                terminal.status, '(issue #1).'
+            );
+            // Recover the drill-down session link the missed `tool_end`
+            // would have attached, so the repaired chip stays clickable for
+            // its auto-remove window (mirrors the tool_end handler's order:
+            // attach the session id, then terminate).
+            const sessionId = terminal.sessionId || info.sessionId || null;
+            if (sessionId && !info.sessionId) {
+                setSubagentSessionId(key, sessionId, info.toolInvocationId);
+            }
+            trackSubagentEnd(key, terminal.status, info.toolInvocationId, sessionId);
         }
     }
 
