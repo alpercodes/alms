@@ -55,6 +55,17 @@ const LOAD_SESSION_JS_PATH = path.resolve(
 // it at module-eval time).
 globalThis.__realHistory = { mapHistoryMessages, groupDmReasoningBlocks };
 
+// Likewise inject the REAL peer-derivation helpers (#2). These are pure and
+// dependency-free, and they decide the very thing the phase-restore test
+// below asserts — which participant becomes "Chatting with {peer}". Stubbing
+// them would mean asserting against a copy of the rule rather than the rule.
+const { dmPeerName, dmPeerFromParticipants } = await import(
+    url.pathToFileURL(
+        path.resolve(__dirname, '../../static/ui/utils/agent-name.js')
+    ).href
+);
+globalThis.__realAgentName = { dmPeerName, dmPeerFromParticipants };
+
 // ---------------------------------------------------------------------------
 // Stub block injected in place of the module's top-level imports. Minimal
 // signals, recording stubs for the side-effect surfaces we assert on
@@ -66,6 +77,9 @@ function signal(initial) { return { value: initial }; }
 
 // ---- REAL history.js pipeline (injected by the test harness) ----
 const { mapHistoryMessages, groupDmReasoningBlocks } = globalThis.__realHistory;
+
+// ---- REAL agent-name.js peer helpers (injected by the test harness, #2) ----
+const { dmPeerName, dmPeerFromParticipants } = globalThis.__realAgentName;
 
 // ---- API stubs: delegate to the per-test config in globalThis.__lsApi ----
 async function getSession(id) { return globalThis.__lsApi.getSession(id); }
@@ -751,6 +765,28 @@ test('phase restore: running DM run restores setDmContext(peer) instead of gener
         'a running DM must restore the DM phase via setDmContext');
     assert.equal(dmContextCalls[0][1], 'bob',
         'the peer is the participant that is not the active agent');
+});
+
+test('#2: phase restore folds case and never names the operator as their own peer', async () => {
+    reset();
+    T.crossAgentSessions.value = [DM_ENVELOPE];
+    // The envelope's participants are ['alice', 'bob']; the active agent
+    // carries a differently-cased spelling of the same name. Pre-#2 the
+    // `.find(p => p !== agentName)` shape returned 'alice' here — the
+    // operator told they were "Chatting with" themselves.
+    T.activeAgent.value = { id: 'agent-alice', name: 'Alice' };
+    globalThis.__lsApi = makeApi({
+        getSession: async () => ({ ...DM_ENVELOPE, has_active_run: true }),
+        listRuns: async () => ({ runs: [{ run_id: 'run-live-4', status: 'running' }] }),
+    });
+
+    await runLoadSession();
+
+    const dmContextCalls = T.__calls.phase.filter(c => c[0] === 'setDmContext');
+    assert.equal(dmContextCalls.length, 1,
+        'a case-varying active agent is still a participant of its own DM');
+    assert.equal(dmContextCalls[0][1], 'bob',
+        'the peer must be the OTHER participant, not the active agent itself');
 });
 
 // ---------------------------------------------------------------------------

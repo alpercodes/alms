@@ -417,7 +417,7 @@ impl SessionId {
 
     /// Derive a deterministic SessionId for a DM conversation between two agents.
     ///
-    /// Names are sorted alphabetically so both sides resolve to the same
+    /// Names are sorted byte-wise so both sides resolve to the same
     /// SessionId regardless of who initiated the conversation (UUID v5).
     ///
     /// This is a convenience wrapper around [`deterministic`](Self::deterministic)
@@ -441,8 +441,11 @@ impl std::fmt::Display for SessionId {
 
 /// Derive the DM context_id for a pair of agents.
 ///
-/// Names are sorted alphabetically so both sides resolve to the same
-/// context_id regardless of who initiated the conversation.
+/// Names are sorted byte-wise so both sides resolve to the same context_id
+/// regardless of who initiated the conversation. (Byte-wise, not
+/// alphabetically: with mixed case the two differ — `dm_context_id("atlas",
+/// "Bob")` is `dm:Bob:atlas`, because `B` sorts below `a`. Deterministic and
+/// harmless, since the ordering is only ever used as a stable key.)
 ///
 /// **Callers must pass the registry's canonical spelling** of both names —
 /// `AgentRecord::name`, not a string a caller or an LLM supplied. Agent names
@@ -465,7 +468,7 @@ pub fn dm_context_id(a: &str, b: &str) -> String {
 
 /// Parse a DM `context_id` into its two participant names.
 ///
-/// DM context IDs have the form `"dm:{name1}:{name2}"` (alphabetically sorted).
+/// DM context IDs have the form `"dm:{name1}:{name2}"` (byte-wise sorted).
 /// Returns `None` if the string does not match the expected format.
 ///
 /// ```
@@ -481,7 +484,7 @@ pub fn dm_participants(context_id: &str) -> Option<(&str, &str)> {
 
 /// Extract the peer agent name from a DM `context_id`.
 ///
-/// DM context IDs have the form `"dm:{name1}:{name2}"` (alphabetically sorted).
+/// DM context IDs have the form `"dm:{name1}:{name2}"` (byte-wise sorted).
 /// The peer is whichever name is NOT `agent_name`.  Returns `None` if the
 /// context ID does not match the expected format or neither name matches
 /// `agent_name`.

@@ -29,9 +29,13 @@ const NAME_UTIL_PATH = path.resolve(
     '../../static/ui/utils/agent-name.js'
 );
 
-const { normalizeAgentName, validateNormalizedAgentName } = await import(
-    url.pathToFileURL(NAME_UTIL_PATH).href
-);
+const {
+    normalizeAgentName,
+    validateNormalizedAgentName,
+    agentNamesEqual,
+    dmPeerName,
+    dmPeerFromParticipants,
+} = await import(url.pathToFileURL(NAME_UTIL_PATH).href);
 
 test('#978: normalizer is exported as a function', () => {
     assert.equal(typeof normalizeAgentName, 'function');
@@ -316,4 +320,73 @@ test('#999: hex-but-not-UUID-shaped names are not flagged', () => {
     assert.equal(validateNormalizedAgentName('a1b2c3d4e5f67890abcdef12345678901'), null); // 33 chars
     assert.equal(validateNormalizedAgentName('a1b2-c3d4-e5f6-7890'), null);
     assert.equal(validateNormalizedAgentName('agent-v2'), null);
+});
+
+// ---------------------------------------------------------------------------
+// #2: the JS mirrors of the Rust participant-matching rules.
+//
+// `dm_peer` was made the single participant-matching rule on the Rust side
+// precisely so a second copy could not drift. These are the JS copies of the
+// same rule; they exist because the UI derives the "Chatting with {peer}"
+// label without a round trip, and they are pinned here so the drift the Rust
+// consolidation prevents can't reappear on this side of the wire.
+// ---------------------------------------------------------------------------
+
+test('#2: agentNamesEqual folds case and rejects non-strings', () => {
+    assert.equal(agentNamesEqual('Atlas', 'atlas'), true);
+    assert.equal(agentNamesEqual('ATLAS', 'aTlAs'), true);
+    assert.equal(agentNamesEqual('Atlas', 'Atlas'), true);
+    assert.equal(agentNamesEqual('atlas', 'atlas-2'), false);
+    assert.equal(agentNamesEqual('atlas', 'bob'), false);
+
+    // Callers pass `activeAgent.value?.name`, undefined before boot resolves.
+    assert.equal(agentNamesEqual(undefined, 'atlas'), false);
+    assert.equal(agentNamesEqual('atlas', null), false);
+    assert.equal(agentNamesEqual(undefined, undefined), false);
+});
+
+test('#2: dmPeerName folds case, mirroring alms_core::dm_peer', () => {
+    // Same cases as the Rust doctest on `dm_peer`.
+    assert.equal(dmPeerName('dm:alice:bob', 'alice'), 'bob');
+    assert.equal(dmPeerName('dm:alice:bob', 'bob'), 'alice');
+    assert.equal(dmPeerName('dm:Atlas:bob', 'atlas'), 'bob');
+    assert.equal(dmPeerName('dm:atlas:Bob', 'BOB'), 'atlas');
+
+    // The returned spelling is the context_id's (canonical), not the query's.
+    assert.equal(dmPeerName('dm:Atlas:Bob', 'atlas'), 'Bob');
+});
+
+test('#2: dmPeerName returns null rather than guessing a peer', () => {
+    // THE regression this helper exists for. The ternary it replaced --
+    //     parts[1] === agentName ? parts[2] : parts[1]
+    // -- read "did not match" as "therefore it is the peer", so a
+    // non-participant yielded the FIRST participant. With case-varying names
+    // that misfires into telling Atlas they are "Chatting with Atlas".
+    assert.equal(dmPeerName('dm:alice:bob', 'charlie'), null);
+    assert.equal(dmPeerName('dm:Atlas:bob', 'carol'), null);
+
+    // Non-DM / malformed contexts.
+    assert.equal(dmPeerName('web-chat-123', 'alice'), null);
+    assert.equal(dmPeerName('dm:alice', 'alice'), null);
+    assert.equal(dmPeerName('', 'alice'), null);
+    assert.equal(dmPeerName(null, 'alice'), null);
+    assert.equal(dmPeerName('dm:alice:bob', undefined), null);
+});
+
+test('#2: dmPeerFromParticipants folds case and never returns the self name', () => {
+    assert.equal(dmPeerFromParticipants(['Atlas', 'bob'], 'atlas'), 'bob');
+    assert.equal(dmPeerFromParticipants(['atlas', 'Bob'], 'BOB'), 'atlas');
+    assert.equal(dmPeerFromParticipants(['alice', 'bob'], 'alice'), 'bob');
+
+    // Not a participant -> null, NOT participants[0]. This is the
+    // `.find(p => p !== agentName)` misfire, which returned the active
+    // agent's own name whenever the comparison missed.
+    assert.equal(dmPeerFromParticipants(['alice', 'bob'], 'charlie'), null);
+
+    // No active agent yet: the pre-existing display-only fallback is kept.
+    assert.equal(dmPeerFromParticipants(['alice', 'bob'], undefined), 'alice');
+    assert.equal(dmPeerFromParticipants(['alice', 'bob'], ''), 'alice');
+
+    assert.equal(dmPeerFromParticipants(null, 'alice'), null);
+    assert.equal(dmPeerFromParticipants(undefined, 'alice'), null);
 });

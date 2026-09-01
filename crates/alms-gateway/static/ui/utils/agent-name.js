@@ -117,3 +117,87 @@ export function validateNormalizedAgentName(slug) {
     }
     return null;
 }
+
+/**
+ * Case-insensitive agent-name equality — the JS mirror of the
+ * `eq_ignore_ascii_case` comparisons the Rust side uses on agent names.
+ *
+ * Agent names resolve case-insensitively (#2), so `Atlas` and `atlas` are the
+ * same agent, and any UI comparison deciding *identity* has to fold case.
+ * Names are `[A-Za-z0-9-]`, so `toLowerCase()` is exact here — no locale or
+ * Unicode-folding subtlety applies.
+ *
+ * Non-string inputs are `false` rather than a throw: callers pass
+ * `activeAgent.value?.name`, which is legitimately undefined before boot
+ * resolves.
+ *
+ * @param {unknown} a
+ * @param {unknown} b
+ * @returns {boolean}
+ */
+export function agentNamesEqual(a, b) {
+    if (typeof a !== 'string' || typeof b !== 'string') return false;
+    return a.toLowerCase() === b.toLowerCase();
+}
+
+/**
+ * Extract the peer agent name from a DM `context_id` — the JS mirror of
+ * `alms_core::dm_peer`.
+ *
+ * DM context IDs have the form `dm:{name1}:{name2}`. The peer is whichever
+ * participant is NOT `agentName`, compared case-insensitively.
+ *
+ * Returns `null` when the string isn't a DM context_id **or when neither
+ * participant is `agentName`**. That second case is why this is a function
+ * rather than a ternary at the call site. The shape it replaces —
+ *
+ *     const peer = parts[1] === agentName ? parts[2] : parts[1];
+ *
+ * — treats "did not match" as "therefore it is the peer", so a name that is
+ * not a participant at all silently yields the *first* participant. Once
+ * names can differ by case that misfire becomes reachable, and it renders as
+ * "Chatting with Atlas" shown to the operator who is themselves Atlas.
+ * Returning `null` forces the caller to handle "not my DM" explicitly.
+ *
+ * The returned spelling is the one stored in the context_id — canonical,
+ * because context_ids are minted from registry records.
+ *
+ * @param {unknown} contextId
+ * @param {unknown} agentName
+ * @returns {string|null}
+ */
+export function dmPeerName(contextId, agentName) {
+    if (typeof contextId !== 'string' || typeof agentName !== 'string') return null;
+    const parts = contextId.split(':');
+    if (parts.length < 3 || parts[0] !== 'dm') return null;
+    const [, first, second] = parts;
+    if (agentNamesEqual(first, agentName)) return second || null;
+    if (agentNamesEqual(second, agentName)) return first || null;
+    return null;
+}
+
+/**
+ * Pick the DM peer out of a `participants` array (the envelope-carried
+ * counterpart to {@link dmPeerName}, which parses a `context_id`).
+ *
+ * Same case-folding rule, same explicit-null contract: `null` when
+ * `agentName` is not among the participants, rather than the
+ * `.find(p => p !== agentName)` shape that returns the active agent's own
+ * name the moment the comparison misses.
+ *
+ * When `agentName` is absent (boot hasn't resolved the active agent yet) the
+ * first participant is returned — this preserves the pre-existing fallback,
+ * which is a display-only best guess and not an identity decision.
+ *
+ * @param {unknown} participants
+ * @param {unknown} agentName
+ * @returns {string|null}
+ */
+export function dmPeerFromParticipants(participants, agentName) {
+    if (!Array.isArray(participants)) return null;
+    if (typeof agentName !== 'string' || agentName === '') {
+        return participants[0] || null;
+    }
+    if (!participants.some(p => agentNamesEqual(p, agentName))) return null;
+    return participants.find(p => !agentNamesEqual(p, agentName)) || null;
+}

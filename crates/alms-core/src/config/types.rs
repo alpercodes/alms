@@ -1815,14 +1815,34 @@ impl SecurityConfig {
     /// Returns `true` when the named agent is on the
     /// [`Self::allow_full_os_access`] list.
     ///
-    /// Comparison is against the registry name (the same string an operator
-    /// types for `alms agent create --name <name>`), matched
-    /// **case-insensitively** (#2). This does not widen the grant: agent
-    /// names are unique case-insensitively, so a case-folded entry still
-    /// names at most one agent. Matching exactly instead would mean an
-    /// operator who wrote `atlas` in `alms.toml` and created the agent as
-    /// `Atlas` silently gets no grant — a confusing near-miss rather than a
-    /// meaningful safety boundary.
+    /// Matched **case-insensitively** (#2).
+    ///
+    /// **Why this does not widen the grant.** Note first that the argument is
+    /// *not* always a registry name: the caller at
+    /// `alms-coordinator/src/lib.rs` passes `request.subagent_name`, which is
+    /// the LLM-supplied `invoke_agent` name, and that name is left
+    /// byte-for-byte when no registry row matches it. So any argument resting
+    /// on agent names being unique case-insensitively does not cover the one
+    /// path that reaches this function with a model-chosen string.
+    ///
+    /// The grant is unwidened for a different reason: `invoke_agent` names are
+    /// run through [`crate::validate_agent_name`] before reaching here, and
+    /// before #2 that admitted only lowercase — so the list was necessarily
+    /// all-lowercase to be matchable at all, and a model that wanted a listed
+    /// name could always type that exact spelling. Folding case adds spellings
+    /// that reach a given entry; it adds no entry the model could not already
+    /// reach. Capability is set by whether *some* matching string is
+    /// producible, not by how many are.
+    ///
+    /// What does change: an entry an operator wrote with capitals was dead
+    /// before #2 (no name could match it) and is live now. That is
+    /// operator-authored intent taking effect, and it is the near-miss this
+    /// folding is meant to close — `alms.toml` saying `atlas` while the agent
+    /// is `Atlas` silently granting nothing.
+    ///
+    /// Separately, and pre-existing: a *model-chosen, unregistered* subagent
+    /// name that matches a list entry drops the project-root sandbox. Nothing
+    /// here changes that, but it is why this comment has to be exactly right.
     ///
     /// Empty input (an unnamed/ephemeral agent) never matches because empty
     /// entries in the list itself would be a configuration error caught by

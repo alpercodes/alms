@@ -2723,11 +2723,15 @@ mod tests {
     ///
     /// If the **peer's** own `agents.name` cell is a BLOB — the exact
     /// corruption `delete_agent_counts_an_unreadable_name_and_strands_the_dm_session`
-    /// builds, one row over — then `SELECT 1 FROM agents WHERE name = ?1`
-    /// with a TEXT parameter matches nothing: SQLite never compares a BLOB
-    /// equal to a TEXT value, and TEXT column affinity does not convert an
-    /// already-stored BLOB. The probe therefore reports `QueryReturnedNoRows`
-    /// for a peer that is alive and still using the session.
+    /// builds, one row over — then
+    /// `SELECT 1 FROM agents WHERE name = ?1 COLLATE NOCASE` with a TEXT
+    /// parameter matches nothing: SQLite never compares a BLOB equal to a
+    /// TEXT value, and TEXT column affinity does not convert an
+    /// already-stored BLOB. The collation is irrelevant to that — storage
+    /// class is compared before any collation is consulted — so the #2
+    /// `COLLATE NOCASE` neither helps nor harms here. The probe still
+    /// reports `QueryReturnedNoRows` for a peer that is alive and still
+    /// using the session.
     ///
     /// Before #1246's follow-up that purged the DM session and every message
     /// in it. The session must survive.

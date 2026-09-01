@@ -454,9 +454,19 @@ pub fn validate_agent_name(name: &str) -> AlmsResult<()> {
     }
 
     // Reserved names that collide with API sub-route segments or internal
-    // prefixes. Matched case-insensitively: those route segments and prefixes
-    // are matched case-insensitively downstream, so an exact-match guard here
-    // would let `DM` walk straight through it.
+    // prefixes. Matched case-insensitively (#2) for coherence with the
+    // uniqueness rule: `DM` and `dm` are one name as far as the registry's
+    // `COLLATE NOCASE` index is concerned, so reserving one spelling while
+    // accepting the other would treat a single name as two names in two
+    // different places.
+    //
+    // Note this is NOT because an uppercase spelling would reach the space
+    // being reserved. It would not: `dm_participants` strips a case-sensitive
+    // `"dm:"`, `INTERNAL_SESSION_PREFIXES` are matched with case-sensitive
+    // `starts_with`, and none of those prefixes is derived from an agent name
+    // — a DM context is `dm:{a}:{b}` whatever the agents are called, so an
+    // agent named `DM` never mints one. The guard is about one name having
+    // one answer, not about closing a bypass.
     if RESERVED_AGENT_NAMES
         .iter()
         .any(|reserved| reserved.eq_ignore_ascii_case(name))
@@ -566,9 +576,15 @@ mod tests {
         assert!(err.to_string().contains("reserved"));
     }
 
-    /// #2: once uppercase is admissible, an exact-match reserved-name guard
-    /// is a bypass — `DM` would sail through it and land on the very
-    /// `dm:`-prefixed context space the guard exists to protect.
+    /// #2: reserved names fold case, for coherence with case-insensitive
+    /// uniqueness — `DM` and `dm` are one name to the registry's index, so
+    /// accepting one while reserving the other would make a single name
+    /// reserved and not-reserved at once.
+    ///
+    /// Deliberately not claimed here: that an agent named `DM` could reach
+    /// the `dm:` context space. It could not — every consumer of those
+    /// prefixes matches them case-sensitively and none derives a prefix from
+    /// an agent name.
     #[test]
     fn reserved_names_are_matched_case_insensitively() {
         for name in [

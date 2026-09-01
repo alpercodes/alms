@@ -54,7 +54,9 @@ pub(crate) enum AgentCommands {
     List,
     /// Create a new agent
     Create {
-        /// Agent name slug (lowercase, hyphens, 1-64 chars)
+        /// Agent name (ASCII letters, digits and hyphens, 1-64 chars).
+        /// Case is preserved but names resolve case-insensitively, so
+        /// `Atlas` and `atlas` are the same agent.
         name: String,
         /// Agent description
         #[arg(long)]

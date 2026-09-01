@@ -18,6 +18,8 @@
 // "at most one expanded at a time" contract or the default-expansion
 // rule.
 
+import { agentNamesEqual } from './agent-name.js';
+
 /**
  * Compute the next expanded-agent state given a click on an agent
  * header. Pure function — no DOM, no side effects.
@@ -138,6 +140,11 @@ export function groupSessionsByAgent(sessionList) {
  * - Other session types are not cross-agent surfaces; this helper
  *   conservatively returns false for them.
  *
+ * Both comparisons go through `agentNamesEqual` (#2): agent names resolve
+ * case-insensitively, so an exact match here would drop the emphasis on the
+ * operator's own rows whenever a stored name and the active agent's name
+ * differ only in case.
+ *
  * @param {object} session
  * @param {string|null|undefined} activeAgentName
  * @returns {boolean}
@@ -147,11 +154,11 @@ export function isOwnedByActiveAgent(session, activeAgentName) {
         return false;
     }
     if (session.session_type === 'notification') {
-        return session.agent_name === activeAgentName;
+        return agentNamesEqual(session.agent_name, activeAgentName);
     }
     if (session.session_type === 'dm') {
         const parts = session.participants;
-        return Array.isArray(parts) && parts.includes(activeAgentName);
+        return Array.isArray(parts) && parts.some(p => agentNamesEqual(p, activeAgentName));
     }
     return false;
 }

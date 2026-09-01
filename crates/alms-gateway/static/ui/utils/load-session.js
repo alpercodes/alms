@@ -32,6 +32,7 @@ import { sessions, crossAgentSessions, activeSessionId, upsertSession } from '..
 import { activeAgent, agents } from '../state/agents.js';
 import { getPendingMessages, confirmOptimisticMessage } from '../state/pending-messages.js';
 import { rehydrateSubagentsFromHistory, parentSessionId } from '../state/subagents.js';
+import { dmPeerName, dmPeerFromParticipants } from './agent-name.js';
 
 /** Internal session types that `/sessions` (list) deliberately filters out
  *  via `is_internal_context_id`. When the resolver-led boot path lands on
@@ -801,10 +802,14 @@ export async function loadSession(sessionId, opts) {
                 // DM session: derive the peer name by finding the participant
                 // that is NOT the active agent, then set the DM context so
                 // the status bar shows "Chatting with {peer}...".
+                //
+                // Via `dmPeerFromParticipants` so the participant-matching
+                // rule lives in exactly one place on this side of the wire
+                // too (#2) — it folds case, and it returns null instead of
+                // handing back the active agent's own name when the match
+                // misses.
                 const agentName = activeAgent.value?.name;
-                const peer = agentName
-                    ? session.participants.find(p => p !== agentName)
-                    : session.participants[0];
+                const peer = dmPeerFromParticipants(session.participants, agentName);
                 if (peer) {
                     setDmContext(peer);
                 } else {
@@ -863,15 +868,19 @@ async function restoreGlobalAgentPhase(agentId, sessionId, isStale, logPrefix) {
         if (activeDmRun && activeDmRun.context_id) {
             // context_id is "dm:<name1>:<name2>" -- derive the peer name
             // by finding the participant that is NOT the active agent.
+            //
+            // `dmPeerName` is the JS mirror of `alms_core::dm_peer` (#2). The
+            // inline ternary this replaces read "did not match" as "therefore
+            // it is the peer", so a case mismatch rendered "Chatting with
+            // Atlas" to the operator who *is* Atlas. The helper returns null
+            // on no-match and we fall through to the generic running-run
+            // branch below.
             const agentName = activeAgent.value?.name;
-            const parts = activeDmRun.context_id.split(':');
-            if (parts.length >= 3 && parts[0] === 'dm' && agentName) {
-                const peer = parts[1] === agentName ? parts[2] : parts[1];
-                if (peer) {
-                    setDmContext(peer);
-                    console.debug(`[${logPrefix}] restored cross-session DM status: Chatting with ${peer}`);
-                    return;
-                }
+            const peer = dmPeerName(activeDmRun.context_id, agentName);
+            if (peer) {
+                setDmContext(peer);
+                console.debug(`[${logPrefix}] restored cross-session DM status: Chatting with ${peer}`);
+                return;
             }
         }
 

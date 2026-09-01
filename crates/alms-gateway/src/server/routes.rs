@@ -466,9 +466,10 @@ async fn list_sessions(
 ///
 /// An ephemeral subagent has no name — only a task id, which must never be
 /// rendered as if it were one. The parentheses are load-bearing: agent names
-/// are restricted to lowercase alphanumerics and hyphens
-/// (`validate_agent_name`), so this string cannot be confused for a real
-/// agent, and no agent can ever be registered under it.
+/// are restricted to ASCII alphanumerics and hyphens (`validate_agent_name`),
+/// so this string cannot be confused for a real agent, and no agent can ever
+/// be registered under it. Uppercase becoming admissible in #2 left that
+/// untouched — parentheses are still outside the class.
 const EPHEMERAL_SUBAGENT_LABEL: &str = "(subagent)";
 
 /// Build the enriched JSON object for a single session, used both by the
