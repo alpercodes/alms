@@ -387,7 +387,9 @@ async fn foreground_subagent_tool_end_leads_the_parent_run_terminal() {
     // would fall to the row/name fallbacks silently (issue #1, Tim's C1).
     let tool_start = observed
         .iter()
-        .find(|e| e.event_type == "tool_start" && e.data.get("tool") == Some(&"invoke_agent".into()))
+        .find(|e| {
+            e.event_type == "tool_start" && e.data.get("tool") == Some(&"invoke_agent".into())
+        })
         .unwrap_or_else(|| {
             panic!(
                 "invoke_agent must produce a tool_start on the parent session \
