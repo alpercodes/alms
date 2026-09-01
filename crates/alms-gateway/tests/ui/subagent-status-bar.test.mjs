@@ -1077,3 +1077,151 @@ test('status flow: Starting -> Reasoning -> Using shell -> Writing -> Done', () 
     });
     assert.equal(label(), 'Done');
 });
+
+// ===========================================================================
+// Issue #1 — a FOREGROUND subagent chip must reach terminal on its own
+// `tool_end`, independently of the parent run's remaining work.
+//
+// `subagent_completed` is emitted ONLY for background subagents
+// (`run_subagent` fires the completion channel behind `handle.is_background`),
+// so `tool_end` for `invoke_agent` is the one and only route a foreground
+// chip has to a terminal status. The backend delivers it the moment the
+// subagent finishes (pinned wire-side in
+// `crates/alms-gateway/src/runs/subagent_chip_timing_tests.rs`), so any
+// no-op in this handler is directly visible as "the chip lingers until the
+// parent run ends".
+//
+// The failure mode pinned here: the handler closes the parent's tool ROW by
+// `tool_invocation_id` and, when that misses, by a documented "last running
+// tool message" fallback — but it then used to re-find the row STRICTLY by
+// `tool_invocation_id` to decide whether to end the chip. On the fallback
+// path that lookup is empty, so `trackSubagentEnd` was never called and the
+// chip stayed `running` for the rest of the parent run.
+// ===========================================================================
+
+test('#1: a foreground chip goes terminal on tool_end even when the row id does not match', () => {
+    reset();
+    const es = openStream('sess-1');
+
+    // Live tool_start: chip + row, both keyed by the invocation id.
+    es.emit('tool_start', {
+        run_id: 'run-1', tool_invocation_id: 'inv-1', tool: 'invoke_agent',
+        params: { name: 'researcher', task: 'review the diff' },
+    });
+    assert.equal(T.activeSubagents.value.researcher.status, 'running');
+
+    // Mid-run the chat rows are rebuilt (reload / snapshot reconcile / a
+    // session switch back into the parent). `mapHistoryMessages` keys a row
+    // recovered from the `run_tool_calls` records by the PROVIDER call id,
+    // not the invocation id, so the row id no longer matches the live SSE
+    // correlator. The chip is untouched — `rehydrateSubagentsFromHistory`
+    // skips keys that already exist — so it still carries `inv-1`.
+    T.chatMessages.value = [{
+        id: 'call_provider_1', type: 'tool', tool: 'invoke_agent',
+        params: { name: 'researcher', task: 'review the diff' },
+        status: 'running', runId: 'run-1',
+    }];
+
+    // The subagent finishes and the parent's invoke_agent call returns.
+    es.emit('tool_end', {
+        run_id: 'run-1', tool_invocation_id: 'inv-1', ok: true,
+        result: { response: 'looks good', session_id: 'sub-sess-1' },
+    });
+
+    const entry = T.activeSubagents.value.researcher;
+    assert.equal(entry.status, 'done',
+        'the chip must be terminal the moment tool_end lands — it is a '
+        + 'foreground subagent, so nothing else will ever end it');
+    assert.equal(entry.sessionId, 'sub-sess-1',
+        'the terminal chip must keep its drill-down session link');
+});
+
+test('#1: the chip is terminal before the parent run ends, and run end is not what ends it', () => {
+    reset();
+    const es = openStream('sess-1');
+
+    es.emit('tool_start', {
+        run_id: 'run-1', tool_invocation_id: 'inv-1', tool: 'invoke_agent',
+        params: { name: 'researcher', task: 'review the diff' },
+    });
+
+    // Control: the parent's own lifecycle must NOT be a terminal route for
+    // the chip. A "fix" that simply swept chips at run end would satisfy the
+    // assertion above and still be the reported bug.
+    es.emit('token_delta', { run_id: 'run-1', delta: 'still working…' });
+    es.emit('run_finished', { run_id: 'run-1', ok: true, ts: '2026-09-01T10:00:00Z' });
+    assert.equal(T.activeSubagents.value.researcher.status, 'running',
+        'a parent run ending must never be what flips a subagent chip');
+
+    // A second parent run (the follow-up / notification turn) ending with the
+    // subagent still in flight: same invariant.
+    es.emit('run_finished', { run_id: 'run-2', ok: true, ts: '2026-09-01T10:00:01Z' });
+    assert.equal(T.activeSubagents.value.researcher.status, 'running');
+
+    // Only the subagent's own tool_end flips it — the parent's remaining work
+    // is irrelevant either way.
+    es.emit('tool_end', {
+        run_id: 'run-1', tool_invocation_id: 'inv-1', ok: true,
+        result: { response: 'looks good', session_id: 'sub-sess-1' },
+    });
+    assert.equal(T.activeSubagents.value.researcher.status, 'done');
+});
+
+test('#1: an UNNAMED foreground chip goes terminal via the invocation-id correlator', () => {
+    reset();
+    const es = openStream('sess-1');
+
+    es.emit('tool_start', {
+        run_id: 'run-1', tool_invocation_id: 'inv-77', tool: 'invoke_agent',
+        params: { task: 'investigate the flake' },
+    });
+    // A forwarded activity signal migrates the entry to the backend label, so
+    // the chip key no longer resembles anything on the tool row.
+    es.emit('subagent_activity', {
+        source_agent: 'subagent-cafebabe', kind: 'writing',
+        parent_tool_invocation_id: 'inv-77',
+    });
+    assert.equal(T.activeSubagents.value['subagent-cafebabe'].status, 'running');
+
+    // Same row-id mismatch as above, and an unnamed subagent has no `name`
+    // param to fall back on — the invocation-id correlator is all there is.
+    T.chatMessages.value = [{
+        id: 'call_provider_2', type: 'tool', tool: 'invoke_agent',
+        params: { task: 'investigate the flake' },
+        status: 'running', runId: 'run-1',
+    }];
+    es.emit('tool_end', {
+        run_id: 'run-1', tool_invocation_id: 'inv-77', ok: false,
+        result: { error: 'subagent failed' },
+    });
+
+    assert.equal(T.activeSubagents.value['subagent-cafebabe'].status, 'fail',
+        'an unnamed foreground chip must resolve through its stored '
+        + 'tool_invocation_id, not through the parent chat row');
+});
+
+test('#1: a BACKGROUND tool_end still leaves the chip running (it waits for subagent_completed)', () => {
+    reset();
+    const es = openStream('sess-1');
+
+    es.emit('tool_start', {
+        run_id: 'run-1', tool_invocation_id: 'inv-9', tool: 'invoke_agent',
+        params: { name: 'researcher', task: 'long investigation', background: true },
+    });
+    // Background dispatch returns immediately with a task_id. The chip must
+    // stay running — the subagent has barely started.
+    es.emit('tool_end', {
+        run_id: 'run-1', tool_invocation_id: 'inv-9', ok: true,
+        result: { task_id: 'task-1', session_id: 'sub-sess-2' },
+    });
+    assert.equal(T.activeSubagents.value.researcher.status, 'running',
+        'a `task_id` result is the background marker: the chip waits for '
+        + '`subagent_completed`');
+
+    es.emit('subagent_completed', {
+        subagent_name: 'researcher', status: 'done',
+        subagent_session_id: 'sub-sess-2', summary: 'all done',
+        tool_invocation_id: 'inv-9',
+    });
+    assert.equal(T.activeSubagents.value.researcher.status, 'done');
+});

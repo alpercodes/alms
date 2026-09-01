@@ -1532,37 +1532,63 @@ export function openSessionStream(sessionId, opts) {
                     applyToolEnd,
                 );
             }
-            if (found) {
-                // Check if the matched tool was invoke_agent and track subagent end.
-                // Re-read from the signal since updateMessage already wrote it.
-                const updated = chatMessages.value;
-                const updatedMsg = matchId
-                    ? updated.find(m => m.type === 'tool' && m.id === matchId)
-                    : updated.findLast(m => m.type === 'tool' && m.status === status);
-                if (updatedMsg && updatedMsg.tool === 'invoke_agent') {
-                    const resultObj = typeof data.result === 'object' ? data.result : null;
-                    const isBackground = resultObj && resultObj.task_id;
-                    if (!isBackground) {
-                        // Resolve the subagent name: prefer the explicit name
-                        // from params, fall back to looking up the entry by the
-                        // invoke_agent tool_invocation_id (handles unnamed
-                        // subagents whose bar entry may have been migrated to
-                        // the backend-assigned label by a forwarded
-                        // `subagent_activity` signal).
-                        const name = updatedMsg.params?.name
-                            || updatedMsg.params?.subagent_name
-                            || findSubagentByToolInvocationId(matchId);
-                        if (name) {
-                            // Capture session_id from invoke_agent result for
-                            // drill-down navigation before ending the subagent.
-                            if (resultObj && resultObj.session_id) {
-                                setSubagentSessionId(name, resultObj.session_id);
-                            }
-                            trackSubagentEnd(name, status);
+            // -- Subagent status-bar chip termination --
+            //
+            // A FOREGROUND `invoke_agent` has exactly ONE route to a terminal
+            // chip: this event. `subagent_completed` is emitted only for
+            // BACKGROUND subagents (`run_subagent` fires the completion
+            // channel behind `handle.is_background`), so if this branch
+            // no-ops the chip stays `running` until the whole map is cleared
+            // by a session switch — i.e. it visibly outlives the subagent for
+            // the rest of the parent run.
+            //
+            // Which is why the chip is resolved by the `tool_invocation_id`
+            // correlator against the TRACKED ENTRY, not by re-finding the
+            // chat row: the row match above deliberately falls back to "the
+            // last running tool message" when the id correlation misses (a
+            // row rebuilt from the `run_tool_calls` records is keyed by the
+            // PROVIDER call id, not the invocation id — see
+            // `mapHistoryMessages`), and looking the row back up STRICTLY by
+            // `matchId` then returns `undefined` on exactly that path. Entries
+            // are only ever created for `invoke_agent` calls, so a correlator
+            // hit is itself proof that this event closes one — no chat row
+            // required. Reading `chatMessages` again is a best-effort source
+            // of the `name`/`subagent_name` params only.
+            const subagentKey = findSubagentByToolInvocationId(matchId);
+            const invokeMsg = matchId
+                ? chatMessages.value.find(m => m.type === 'tool' && m.id === matchId)
+                : chatMessages.value.findLast(m => m.type === 'tool' && m.status === status);
+            if (subagentKey || invokeMsg?.tool === 'invoke_agent') {
+                const resultObj = typeof data.result === 'object' ? data.result : null;
+                // Background subagents return a `task_id` immediately and keep
+                // running; their chip is terminated by `subagent_completed`.
+                const isBackground = resultObj && resultObj.task_id;
+                if (!isBackground) {
+                    // Resolve the subagent name: prefer the explicit name from
+                    // params, fall back to the entry resolved by the
+                    // invoke_agent tool_invocation_id (handles unnamed
+                    // subagents whose bar entry may have been migrated to the
+                    // backend-assigned label by a forwarded
+                    // `subagent_activity` signal).
+                    const name = invokeMsg?.params?.name
+                        || invokeMsg?.params?.subagent_name
+                        || subagentKey;
+                    if (name) {
+                        const subagentSessionId = (resultObj && resultObj.session_id) || null;
+                        // Capture session_id from invoke_agent result for
+                        // drill-down navigation before ending the subagent.
+                        if (subagentSessionId) {
+                            setSubagentSessionId(name, subagentSessionId, matchId);
                         }
+                        // Pass both correlators so the entry resolves
+                        // identity-exactly (tool_invocation_id -> session id ->
+                        // name), the same order the `subagent_completed`
+                        // handler uses.
+                        trackSubagentEnd(name, status, matchId, subagentSessionId);
                     }
                 }
-            } else if (!data.source_agent) {
+            }
+            if (!found && !data.source_agent) {
                 // tool_end arrived for a non-subagent tool, but no matching
                 // tool message was found in chatMessages. This means the
                 // tool_start message was lost or never arrived. Log for
