@@ -66,9 +66,6 @@ pub const DEFAULT_MAX_BYTES: usize = 32 * 1024;
 /// the LLM's "scan the result" cost bounded.
 pub const DEFAULT_MAX_LINES: usize = 2000;
 
-/// Default retention window in days for spill files.
-pub const DEFAULT_RETENTION_DAYS: u32 = 7;
-
 /// Per-[`AgentRuntime`][crate::AgentRuntime] truncation policy, baked in at
 /// runtime construction.
 ///
