@@ -14,9 +14,9 @@ subagents, message each other directly, and keep working across restarts.
   files (personality, goals, memories), and cross-session episodic memory
 - **Multi-agent coordination** — hierarchical subagents via `invoke_agent`, peer-to-peer
   direct messages via `send_message`, and a message bus underneath both
-- **Sandboxed tools** — shell and filesystem tools gated by path canonicalization, a
-  built-in destructive-command classifier, configurable permission rules, and Landlock on
-  Linux
+- **Sandboxed tools** — filesystem tools pinned to the project root by path
+  canonicalization, a destructive-command classifier and configurable permission rules over
+  shell commands, and Landlock confinement of shell children on Linux
 - **Multi-provider LLM support** — OpenAI-compatible, Anthropic, and Gemini, including
   reasoning/thinking blocks and prompt caching
 - **Gateway + web UI** — REST API with SSE streaming, and a browser UI served from the
@@ -73,13 +73,24 @@ decisions, and you should know them before deploying:
 - **Single-operator trust model.** No multi-user support, no privilege separation between
   agents and the operator. Do not expose the gateway to untrusted users.
 - **Agents can read the secrets store.** The sandbox root is the project root, and
-  `.alms/` lives inside it — so `.alms/secrets.json` is reachable via `fs_read`. Treat any
-  secret an agent can reach as disclosed to your model provider.
-- **Sandboxing is not equal across platforms.** Linux gets OS-level enforcement through
-  Landlock. Windows and macOS get application-layer checks only — path canonicalization,
-  command classification, and permission gates, with no second line of defence.
-- **`[security].allow_full_os_access` disables containment.** It exists for workloads that
-  need it. Setting it makes ALMS a remote code execution service aimed at your own machine.
+  `.alms/` lives inside it — so `.alms/secrets.json` is reachable via `fs_read`. Set
+  `ALMS_MASTER_KEY` to encrypt that file at rest (AES-256-GCM); the daemon's shell children
+  never see that variable, so an agent that reads the file gets ciphertext. Without it,
+  treat any secret an agent can reach as disclosed to your model provider.
+- **Sandboxing is not equal across platforms, and the gap is in `shell`.** The `fs_*` tools
+  enforce the project-root boundary identically everywhere. The `shell` tool does not check
+  paths in the command at all. On **Linux 5.13+** Landlock gives each shell child a
+  kernel-enforced boundary; on **Windows and macOS there is no filesystem boundary on
+  `shell`** — a command can read and write anything the daemon's OS user can. What remains
+  there is the `[tools.shell_permissions]` regex list, the destructive-command classifier,
+  and a working-directory revert that reports an escape *after* the command has already
+  run. On those platforms — and on Linux below 5.13, where Landlock silently degrades to
+  unsandboxed — run the daemon as a low-privilege OS user with filesystem ACLs.
+- **`[security].allow_full_os_access` removes the filesystem sandbox for the agents you
+  list.** It is a list of agent names, not a boolean: a listed agent's `fs_*` and `shell`
+  run against the real root. Shell permissions and the destructive-command classifier still
+  apply. Note that names are matched against the string an `invoke_agent` call supplies, so
+  any agent can claim a listed name.
 - **Prompt injection is not solved.** Tool output enters the model's context; a hostile
   repository or web page can attempt to steer an agent.
 
