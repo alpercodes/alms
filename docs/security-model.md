@@ -641,18 +641,30 @@ place, taking the registry spelling when a row exists and
 `to_ascii_lowercase()` when none does — and the list is then matched
 case-insensitively.
 
-Folding does not narrow the grant, because `validate_agent_name` admits
-only ASCII letters, digits and hyphens: every spelling an agent can
-legally emit folds onto one lowercase form, and every entry an operator
-can legally write is reached by it. So listing `deploy-bot` does not
-scope the grant to a registered agent called `deploy-bot` — **any**
+Folding does not narrow the grant. `validate_agent_name` admits only
+1–64 characters of ASCII letters, digits and interior hyphens, and it
+gates every path that can produce a name reaching the comparison — CLI
+create, `POST /agents`, and the LLM-supplied `invoke_agent` name, which
+is rejected outright when it fails. So every spelling an agent can
+legally emit folds onto one lowercase form, and every entry that could
+name a real agent is reached by it. Listing `deploy-bot` therefore does
+not scope the grant to a registered agent called `deploy-bot` — **any**
 agent that emits `invoke_agent(name: "Deploy-Bot")` gets an unsandboxed
 subagent, registered or not.
 
 Treat every entry on this list as a name any agent in the fleet can
-claim, and pick a name a model is unlikely to guess. Unusual
-capitalisation is not that name: casing is folded on both sides, so it
-buys nothing.
+claim, and pick a name a model is unlikely to guess. Two things will not
+do that for you:
+
+- **Unusual capitalisation.** Casing folds on both sides, so it buys
+  nothing.
+- **Characters outside the agent-name class.** `SecurityConfig::validate`
+  rejects only empty and whitespace-only entries, so `deploy_bot`,
+  `deploy.bot` or `Déploy` load without complaint — and can never match,
+  because every name that reaches the comparison has been through
+  `validate_agent_name`. That is a **dead entry**, not a narrower grant:
+  the operator believes they granted full OS access and granted nothing.
+  Keep entries inside the agent-name class.
 
 #### Shell sandboxing platform asymmetry — be honest about this
 
