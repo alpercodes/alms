@@ -78,8 +78,8 @@ decisions, and you should know them before deploying:
 - **`[security].allow_full_os_access` removes the filesystem sandbox for the agents you
   list.** It is a list of agent names, not a boolean: a listed agent's `fs_*` and `shell`
   run against the real root. Shell permissions and the destructive-command classifier still
-  apply. Note that names are matched against the string an `invoke_agent` call supplies, so
-  any agent can claim a listed name.
+  apply. Note that a listed name is matched — case-folded — against the name an
+  `invoke_agent` call supplies, so any agent can claim it, registered or not.
 - **Prompt injection is not solved.** Tool output enters the model's context; a hostile
   repository or web page can attempt to steer an agent.
 

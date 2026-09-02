@@ -634,14 +634,25 @@ always inherit the parent's effective sandbox root.
 
 **A listed name is reachable by the model, not only by the operator.**
 The subagent call site passes `request.subagent_name` to
-`SecurityConfig::is_full_os_access_agent`, and that name is the string
-the LLM supplied to `invoke_agent`; it is left byte-for-byte when no
-registry row matches it. Matching is case-insensitive. So listing
-`deploy-bot` does not scope the grant to a registered agent called
-`deploy-bot` — **any** agent that emits
-`invoke_agent(name: "Deploy-Bot")` gets an unsandboxed subagent,
-registered or not. Treat every entry on this list as a name any agent
-in the fleet can claim, and pick entries a model is unlikely to guess.
+`SecurityConfig::is_full_os_access_agent`, and that name originates as
+the string the LLM supplied to `invoke_agent`. It is *folded* before it
+gets there — `canonicalize_subagent_name` mutates the request field in
+place, taking the registry spelling when a row exists and
+`to_ascii_lowercase()` when none does — and the list is then matched
+case-insensitively.
+
+Folding does not narrow the grant, because `validate_agent_name` admits
+only ASCII letters, digits and hyphens: every spelling an agent can
+legally emit folds onto one lowercase form, and every entry an operator
+can legally write is reached by it. So listing `deploy-bot` does not
+scope the grant to a registered agent called `deploy-bot` — **any**
+agent that emits `invoke_agent(name: "Deploy-Bot")` gets an unsandboxed
+subagent, registered or not.
+
+Treat every entry on this list as a name any agent in the fleet can
+claim, and pick a name a model is unlikely to guess. Unusual
+capitalisation is not that name: casing is folded on both sides, so it
+buys nothing.
 
 #### Shell sandboxing platform asymmetry — be honest about this
 
