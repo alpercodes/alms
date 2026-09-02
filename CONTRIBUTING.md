@@ -117,6 +117,26 @@ The CI pipeline (`.github/workflows/ci.yml`) runs:
 
 `make ci` runs all of these steps locally for parity.
 
+## Licensing
+
+ALMS is Apache-2.0. The repository-level `LICENSE` is the authority, and the `license`
+field is declared in both the workspace `Cargo.toml` and `package.json`. Between them
+every file in the tree is covered.
+
+Rust sources additionally carry a one-line SPDX header as their first line:
+
+```rust
+// SPDX-License-Identifier: Apache-2.0
+```
+
+Please add it to new `.rs` files. Nothing in CI enforces it.
+
+Frontend sources under `crates/alms-gateway/static/ui/` and `frontend/` deliberately do
+**not** carry the header. That is a convention choice — SPDX headers are a Rust-side habit
+in this repository — and not a licensing gap, since `LICENSE` and the `package.json`
+`license` field already cover them. Marking them too would be a reasonable change; propose
+it as its own PR rather than folding it into an unrelated one.
+
 ## Project Structure
 
 - `crates/alms-core` - Core types and errors
