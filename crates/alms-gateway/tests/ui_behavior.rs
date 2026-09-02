@@ -490,3 +490,147 @@ fn job_summary_js_behaviour() {
 fn jobs_tab_js_behaviour() {
     run_node_test("jobs-tab.test.mjs");
 }
+
+// -- Suites recovered by the #7 drift guard --------------------------------
+//
+// The three below were on disk with no registration here, so `cargo test`
+// never ran them and (before #7) neither did anything else. They are wired up
+// unchanged; the guard at the bottom of this file is what stops the next one
+// going missing.
+
+/// Pinned regression for issue #1211: the sidebar's cross-session active-run
+/// dot must be driven by the GLOBAL cross-agent session-activity feed, not a
+/// per-agent one. Exercises the real `static/ui/hooks/use-agent-events.js`
+/// against the real `state/queue.js`: `openAgentEventsStream` must connect to
+/// `/events/session-activity` (a per-agent URL is the #1211 root cause — a run
+/// on another agent's session never reached the active agent's feed), a
+/// `session_activity_started` for a session owned by ANY agent must write
+/// `bgRuns[sessionId]`, and `session_activity_ended` must clear it.
+///
+/// Added 2026-07-13 (#1228) and unregistered until #7.
+#[test]
+fn agent_events_global_feed_js_behaviour() {
+    run_node_test("agent-events-global-feed.test.mjs");
+}
+
+/// Pinned regression for issue #1003: the per-agent Debug-mode toggle, swept
+/// out in #941. Both surfaces that can set it (AgentEditModal and the Settings
+/// modal's Debug section) compute the `PATCH /agents/{id}` delta the same way
+/// — send `debug_mode` only when the form value differs from the stored one —
+/// and both must treat a pre-#1003 record's absent `debug_mode` as `false`.
+/// Without that, opening the modal on a legacy record and pressing Apply
+/// emits a redundant PATCH on every save.
+///
+/// Added 2026-05-09 (#1015) and unregistered until #7 — the longest-dead of
+/// the three.
+#[test]
+fn debug_mode_patch_js_behaviour() {
+    run_node_test("debug-mode-patch.test.mjs");
+}
+
+/// Pinned regression for issue #1212: a job session owned by agent A showed a
+/// peer's name on its assistant messages, because attribution fell back to
+/// `activeAgent` — and opening a job session from the cross-agent Jobs group
+/// deliberately does not switch the active agent, so `activeAgent` can point
+/// at any other agent the operator had selected. Covers the pure helper
+/// `utils/session-owner.js::sessionOwnerName(session, agents)` that the fix
+/// derives attribution from.
+///
+/// Added 2026-07-09 (#1217) and unregistered until #7.
+#[test]
+fn session_owner_js_behaviour() {
+    run_node_test("session-owner.test.mjs");
+}
+
+/// Guard against the two runners drifting apart (issue #7).
+///
+/// The suites in `tests/ui/` have two entry points, and until #7 they could
+/// silently disagree about which files exist:
+///
+/// * `npm run ui:test:behavior` -> `tests/ui/_run-all.mjs`, which READS THE
+///   DIRECTORY. It cannot miss a suite.
+/// * `cargo test -p alms-gateway` -> the hand-written `#[test]` functions
+///   above, one per suite. Those carry the per-suite regression notes that
+///   make a failure legible, which is why they are a list and not a loop —
+///   but a list is exactly what drifts.
+///
+/// It had already drifted three times when this guard was written:
+/// `debug-mode-patch.test.mjs` (added 2026-05-09), `session-owner.test.mjs`
+/// (2026-07-09) and `agent-events-global-feed.test.mjs` (2026-07-13) sat on
+/// disk with no `run_node_test` call, so they ran under NEITHER runner — 22
+/// tests of coverage that could not fail. Nothing reported it, because
+/// "nobody runs this file" has no failure mode of its own.
+///
+/// So: the directory is the single source of truth, and this test is what
+/// binds the list to it. Every `*.test.mjs` on disk must have a registration,
+/// and every registration must name a file that exists. Adding a suite without
+/// registering it now fails cargo, by name.
+///
+/// Implementation note: the registered set is parsed out of THIS FILE's own
+/// source via `include_str!`, so it cannot go stale relative to the tests it
+/// describes. The parse is a plain substring scan, so a registration call
+/// written inside a comment or a string literal would count as real — which is
+/// why the marker below is assembled rather than written out literally, and
+/// why this doc comment does not spell it out either.
+#[test]
+fn every_ui_test_file_has_a_cargo_test() {
+    const THIS_FILE: &str = include_str!("ui_behavior.rs");
+    // Assembled, not written literally, so this line is not itself a match.
+    let marker = format!("run_node_test{}", "(\"");
+
+    let mut registered: Vec<String> = Vec::new();
+    for (idx, _) in THIS_FILE.match_indices(marker.as_str()) {
+        let rest = &THIS_FILE[idx + marker.len()..];
+        if let Some(end) = rest.find('"') {
+            registered.push(rest[..end].to_string());
+        }
+    }
+    registered.sort();
+    registered.dedup();
+    assert!(
+        !registered.is_empty(),
+        "parsed zero registrations out of this file — the guard would pass \
+         vacuously, so the parse itself must have broken",
+    );
+
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("ui");
+    let mut on_disk: Vec<String> = std::fs::read_dir(&dir)
+        .unwrap_or_else(|e| panic!("cannot read {}: {e}", dir.display()))
+        .filter_map(|entry| {
+            let name = entry.ok()?.file_name().to_string_lossy().into_owned();
+            name.ends_with(".test.mjs").then_some(name)
+        })
+        .collect();
+    on_disk.sort();
+    assert!(
+        !on_disk.is_empty(),
+        "found no *.test.mjs suites in {} — refusing to pass vacuously",
+        dir.display(),
+    );
+
+    let unregistered: Vec<&String> = on_disk
+        .iter()
+        .filter(|name| !registered.contains(name))
+        .collect();
+    assert!(
+        unregistered.is_empty(),
+        "these suites exist in tests/ui/ but nothing in ui_behavior.rs names \
+         them, so `cargo test` never runs them: {unregistered:?}\n\
+         Add a `#[test]` here, with a note on what it pins. \
+         `npm run ui:test:behavior` already runs them — that asymmetry is \
+         issue #7, and this guard exists to stop it recurring.",
+    );
+
+    let missing: Vec<&String> = registered
+        .iter()
+        .filter(|name| !on_disk.contains(name))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "these files are registered in ui_behavior.rs but do not exist in \
+         tests/ui/: {missing:?}\n\
+         A renamed or deleted suite still needs its registration removed.",
+    );
+}

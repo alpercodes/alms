@@ -19,10 +19,20 @@ make ci          # fmt-check + clippy + test + build-release
 make test        # cargo test --all
 make test-golden # SSE golden tests only
 make clippy      # cargo clippy -- -D warnings
-npm run ui:check # TypeScript + ESLint + Prettier + Vitest
+npm run ui:check # TypeScript + ESLint + Prettier + both test runners
 npm run ui:build # Rebuild committed rust-embed assets
 npm run ui:test:e2e
 ```
+
+**Two frontend test runners, two trees.** `npm run ui:test` runs both halves:
+`ui:test:unit` (Vitest over `frontend/`) and `ui:test:behavior` (Node's
+`node:test` over `crates/alms-gateway/tests/ui/*.test.mjs`, which is where the
+tests for `crates/alms-gateway/static/ui/` live). The behaviour suites also run
+under `cargo test -p alms-gateway` via `tests/ui_behavior.rs` — one `#[test]`
+per suite, kept in step with the directory by the
+`every_ui_test_file_has_a_cargo_test` guard, so a suite cannot be picked up by
+one runner and silently missed by the other (issue #7; before it, three suites
+ran under neither).
 
 ## Project Structure
 
