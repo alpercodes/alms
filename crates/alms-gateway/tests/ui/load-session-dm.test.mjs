@@ -71,6 +71,25 @@ globalThis.__realAgentName = { dmPeerName, dmPeerFromParticipants };
 // signals, recording stubs for the side-effect surfaces we assert on
 // (openSessionStream, agent-phase setters, run-scoped GETs), and the REAL
 // history pipeline injected from the harness.
+//
+// THE TRAP (issue #7, seen in PR #4): `loadLoadSessionModule` strips EVERY
+// top-level import from the real module and prepends this block. It throws
+// only when an import SURVIVES the rewrite — never when a stripped binding
+// has no replacement here. So adding an import to `load-session.js` and
+// nothing here yields an undefined binding, i.e. a `ReferenceError` at call
+// time if you are lucky, and a wrong-but-green assertion if you are not.
+//
+// The rule for a newly imported helper:
+//
+//   * If the assertions depend on what the helper DECIDES, inject the REAL
+//     one through a `globalThis.__real*` handle (see `__realHistory` and
+//     `__realAgentName` above) and destructure it below. Stubbing it means
+//     asserting against a copy of the rule instead of the rule.
+//   * Stub it here only when it is a side effect you are recording, or a
+//     dependency you are deliberately cutting.
+//
+// Either way it must appear in this block. Silence is not an option the
+// rewrite gives you.
 // ---------------------------------------------------------------------------
 const STUB_PRELUDE = `
 function signal(initial) { return { value: initial }; }

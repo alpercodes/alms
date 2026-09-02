@@ -30,7 +30,8 @@ fn ui_test_path(name: &str) -> PathBuf {
 }
 
 /// True when `node --version` succeeds. Used to gate the behaviour tests so
-/// the suite still passes on machines without Node installed.
+/// the suite still passes on machines without Node installed — locally. In CI
+/// a missing interpreter is a hard failure; see `run_node_test`.
 fn node_available() -> bool {
     Command::new("node")
         .arg("--version")
@@ -44,6 +45,35 @@ fn node_available() -> bool {
 /// test output.
 fn run_node_test(file: &str) {
     if !node_available() {
+        // Skipping LOCALLY is deliberate (see the module header): a
+        // behavioural test that shells out to an interpreter shouldn't break a
+        // Rust-only contributor's `cargo test`. In CI it is the opposite of
+        // deliberate. A node-less runner turns all 22 suites into a silent
+        // no-op and still reports green — the third and worst route to "cargo
+        // passed having executed zero JS", alongside the two issue #7 closes.
+        // Worst because it takes out every suite at once, and because it
+        // announces itself only on stderr, which nobody reads when the run is
+        // green.
+        //
+        // It is also the one route `every_ui_test_file_has_a_cargo_test`
+        // cannot see: that guard only reads the filesystem, so it passes
+        // happily on a machine with no node at all.
+        //
+        // The npm runner has no equivalent hatch — node is present there by
+        // construction — so leaving this open would preserve the exact
+        // asymmetry this file exists to remove: the runner CI depends on could
+        // degrade to nothing, the runner it doesn't could not.
+        //
+        // `CI` is set by GitHub Actions (and every other provider worth
+        // naming) and by nothing on an ordinary developer machine.
+        assert!(
+            std::env::var_os("CI").is_none(),
+            "`node` is not on PATH in CI, so ui_behavior::{file} would be \
+             SKIPPED rather than run — and so would every other suite in \
+             tests/ui/, silently, with cargo still reporting success. Install \
+             Node.js (see .node-version) on the runner, or retire this harness \
+             deliberately rather than letting it evaporate.",
+        );
         eprintln!(
             "skipping ui_behavior::{}: `node` is not on PATH (install Node.js >= 22)",
             file,
@@ -489,4 +519,201 @@ fn job_summary_js_behaviour() {
 #[test]
 fn jobs_tab_js_behaviour() {
     run_node_test("jobs-tab.test.mjs");
+}
+
+// -- Suites recovered by the #7 drift guard --------------------------------
+//
+// The three below were on disk with no registration here, so `cargo test`
+// never ran them and (before #7) neither did anything else. They are wired up
+// unchanged; the guard at the bottom of this file is what stops the next one
+// going missing.
+
+/// Pinned regression for issue #1211: the sidebar's cross-session active-run
+/// dot must be driven by the GLOBAL cross-agent session-activity feed, not a
+/// per-agent one. Exercises the real `static/ui/hooks/use-agent-events.js`
+/// against the real `state/queue.js`: `openAgentEventsStream` must connect to
+/// `/events/session-activity` (a per-agent URL is the #1211 root cause — a run
+/// on another agent's session never reached the active agent's feed), a
+/// `session_activity_started` for a session owned by ANY agent must write
+/// `bgRuns[sessionId]`, and `session_activity_ended` must clear it.
+///
+/// Added 2026-07-13 (#1228) and unregistered until #7.
+#[test]
+fn agent_events_global_feed_js_behaviour() {
+    run_node_test("agent-events-global-feed.test.mjs");
+}
+
+/// Pinned regression for issue #1003: the per-agent Debug-mode toggle, swept
+/// out in #941. Both surfaces that can set it (AgentEditModal and the Settings
+/// modal's Debug section) compute the `PATCH /agents/{id}` delta the same way
+/// — send `debug_mode` only when the form value differs from the stored one —
+/// and both must treat a pre-#1003 record's absent `debug_mode` as `false`.
+/// Without that, opening the modal on a legacy record and pressing Apply
+/// emits a redundant PATCH on every save.
+///
+/// Added 2026-05-09 (#1015) and unregistered until #7 — the longest-dead of
+/// the three.
+#[test]
+fn debug_mode_patch_js_behaviour() {
+    run_node_test("debug-mode-patch.test.mjs");
+}
+
+/// Pinned regression for issue #1212: a job session owned by agent A showed a
+/// peer's name on its assistant messages, because attribution fell back to
+/// `activeAgent` — and opening a job session from the cross-agent Jobs group
+/// deliberately does not switch the active agent, so `activeAgent` can point
+/// at any other agent the operator had selected. Covers the pure helper
+/// `utils/session-owner.js::sessionOwnerName(session, agents)` that the fix
+/// derives attribution from.
+///
+/// Added 2026-07-09 (#1217) and unregistered until #7.
+#[test]
+fn session_owner_js_behaviour() {
+    run_node_test("session-owner.test.mjs");
+}
+
+/// Guard against the two runners drifting apart (issue #7).
+///
+/// The suites in `tests/ui/` have two entry points, and until #7 they could
+/// silently disagree about which files exist:
+///
+/// * `npm run ui:test:behavior` -> `tests/ui/_run-all.mjs`, which READS THE
+///   DIRECTORY. It cannot miss a suite.
+/// * `cargo test -p alms-gateway` -> the hand-written `#[test]` functions
+///   above, one per suite. Those carry the per-suite regression notes that
+///   make a failure legible, which is why they are a list and not a loop —
+///   but a list is exactly what drifts.
+///
+/// It had already drifted three times when this guard was written:
+/// `debug-mode-patch.test.mjs` (added 2026-05-09), `session-owner.test.mjs`
+/// (2026-07-09) and `agent-events-global-feed.test.mjs` (2026-07-13) sat on
+/// disk with no `run_node_test` call, so they ran under NEITHER runner — 22
+/// tests of coverage that could not fail. Nothing reported it, because
+/// "nobody runs this file" has no failure mode of its own.
+///
+/// So: the directory is the single source of truth, and this test is what
+/// binds the list to it. Every `*.test.mjs` on disk must have a registration,
+/// and every registration must name a file that exists. Adding a suite without
+/// registering it now fails cargo, by name.
+///
+/// Implementation note: the registered set is parsed out of THIS FILE's own
+/// source via `include_str!`, so it cannot go stale relative to the tests it
+/// describes.
+///
+/// WHAT THIS GUARD DOES NOT CLAIM (Tim, PR #9 F2). It binds the LIST to the
+/// directory, not the EXECUTION to the list. A registration proves a suite is
+/// named here, not that cargo runs it, and three things satisfy the former
+/// while defeating the latter:
+///
+/// * the whole `#[test] fn` commented out — CLOSED below: registrations on
+///   comment lines are not counted, so the suite reads as unregistered and
+///   this test fails;
+/// * an `ignore` attribute on a registered fn — CLOSED below by a scan;
+/// * a `#[cfg(...)]`-gated fn — NOT closed. Distinguishing a disabled suite
+///   from a legitimate platform gate needs real parsing, and a blanket ban on
+///   `#[cfg` here would be a false positive waiting to happen. There are none
+///   in this file today; if one appears, teach this guard about it.
+///
+/// None of the three is darkness — `_run-all.mjs` still runs the suite off the
+/// directory — but each re-opens issue #7's asymmetry with the runners
+/// swapped, which is precisely the shape worth naming rather than leaving to
+/// be rediscovered.
+///
+/// Parse note: the scan is a plain substring match, so the marker is assembled
+/// rather than written literally (otherwise the guard's own line would be a
+/// registration), and this doc comment deliberately does not spell it out.
+#[test]
+fn every_ui_test_file_has_a_cargo_test() {
+    const THIS_FILE: &str = include_str!("ui_behavior.rs");
+    // Assembled, not written literally, so this line is not itself a match.
+    let marker = format!("run_node_test{}", "(\"");
+
+    // A commented-out `#[test] fn` leaves its registration behind as a comment.
+    // Counting it would let a disabled suite still read as registered (F2), so
+    // comment lines are skipped — which makes disabling a suite that way fail
+    // this test with "exists on disk but nothing names it", the correct
+    // complaint.
+    let mut registered: Vec<String> = Vec::new();
+    for line in THIS_FILE.lines() {
+        if line.trim_start().starts_with("//") {
+            continue;
+        }
+        let Some(idx) = line.find(marker.as_str()) else {
+            continue;
+        };
+        let rest = &line[idx + marker.len()..];
+        if let Some(end) = rest.find('"') {
+            registered.push(rest[..end].to_string());
+        }
+    }
+    registered.sort();
+    registered.dedup();
+    assert!(
+        !registered.is_empty(),
+        "parsed zero registrations out of this file — the guard would pass \
+         vacuously, so the parse itself must have broken",
+    );
+
+    // An ignored suite is a registration that runs nothing: the same "test
+    // that cannot fail" this whole file is about. There are none today.
+    //
+    // The needle is assembled, and no prose above or below writes the
+    // attribute out in full — otherwise this scan matches its own explanation
+    // and the guard fails on a clean tree. (It did, on the first attempt. Same
+    // self-reference hazard as the registration marker: a test that reads its
+    // own source has to keep its evidence and its commentary apart.)
+    let ignore_attr = format!("#[{}]", "ignore");
+    let ignored_line = THIS_FILE
+        .lines()
+        .find(|line| !line.trim_start().starts_with("//") && line.contains(&ignore_attr));
+    assert!(
+        ignored_line.is_none(),
+        "an ignore attribute appeared in ui_behavior.rs ({}). A \
+         registered-but-ignored suite satisfies this guard while running \
+         nothing under cargo, which re-opens issue #7 with the runners \
+         swapped — npm would still run it. Remove the suite properly, or teach \
+         this guard which registration is allowed to be skipped and why.",
+        ignored_line.unwrap_or("").trim(),
+    );
+
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("ui");
+    let mut on_disk: Vec<String> = std::fs::read_dir(&dir)
+        .unwrap_or_else(|e| panic!("cannot read {}: {e}", dir.display()))
+        .filter_map(|entry| {
+            let name = entry.ok()?.file_name().to_string_lossy().into_owned();
+            name.ends_with(".test.mjs").then_some(name)
+        })
+        .collect();
+    on_disk.sort();
+    assert!(
+        !on_disk.is_empty(),
+        "found no *.test.mjs suites in {} — refusing to pass vacuously",
+        dir.display(),
+    );
+
+    let unregistered: Vec<&String> = on_disk
+        .iter()
+        .filter(|name| !registered.contains(name))
+        .collect();
+    assert!(
+        unregistered.is_empty(),
+        "these suites exist in tests/ui/ but nothing in ui_behavior.rs names \
+         them, so `cargo test` never runs them: {unregistered:?}\n\
+         Add a `#[test]` here, with a note on what it pins. \
+         `npm run ui:test:behavior` already runs them — that asymmetry is \
+         issue #7, and this guard exists to stop it recurring.",
+    );
+
+    let missing: Vec<&String> = registered
+        .iter()
+        .filter(|name| !on_disk.contains(name))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "these files are registered in ui_behavior.rs but do not exist in \
+         tests/ui/: {missing:?}\n\
+         A renamed or deleted suite still needs its registration removed.",
+    );
 }

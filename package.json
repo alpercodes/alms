@@ -14,7 +14,9 @@
     "ui:typecheck": "tsc --noEmit && tsc -p tsconfig.boundary.json",
     "ui:lint": "eslint frontend vite.config.ts playwright.config.ts && eslint --no-ignore crates/alms-gateway/static/ui/api/client.js crates/alms-gateway/static/ui/hooks/use-agent-events.js crates/alms-gateway/static/ui/hooks/use-session-stream.js",
     "ui:format:check": "prettier --check frontend vite.config.ts playwright.config.ts eslint.config.js package.json tsconfig.json tsconfig.boundary.json",
-    "ui:test": "vitest run",
+    "ui:test": "npm run ui:test:unit && npm run ui:test:behavior",
+    "ui:test:unit": "vitest run",
+    "ui:test:behavior": "node crates/alms-gateway/tests/ui/_run-all.mjs",
     "ui:test:e2e": "playwright test",
     "ui:audit": "npm audit --audit-level=moderate",
     "ui:check": "npm run ui:typecheck && npm run ui:lint && npm run ui:format:check && npm run ui:test"
