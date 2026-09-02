@@ -54,7 +54,9 @@ pub(crate) enum AgentCommands {
     List,
     /// Create a new agent
     Create {
-        /// Agent name slug (lowercase, hyphens, 1-64 chars)
+        /// Agent name (ASCII letters, digits and hyphens, 1-64 chars).
+        /// Case is preserved but names resolve case-insensitively, so
+        /// `Atlas` and `atlas` are the same agent.
         name: String,
         /// Agent description
         #[arg(long)]
@@ -1013,6 +1015,45 @@ mod tests {
         assert!(err.to_string().contains("already exists"));
     }
 
+    /// #2: `alms agent create --name atlas` must be refused when `Atlas`
+    /// already exists. The two would share one workspace directory on
+    /// Windows/macOS and split into two on Linux.
+    #[test]
+    fn create_rejects_a_name_that_differs_only_in_case() {
+        let store = new_store();
+        let opts = |name: &str| AgentCreateOpts {
+            name: name.into(),
+            description: None,
+            model: None,
+            posture: None,
+            provider: None,
+            thinking_budget_tokens: None,
+            reasoning_effort: None,
+            gemini_thinking_budget: None,
+            summary_provider: None,
+            summary_model: None,
+            worktree_mode: WorktreeMode::Off,
+            project_root: None,
+            default: false,
+            json: false,
+            workspace_dir: None,
+        };
+        agent_create(&store, opts("Atlas")).unwrap();
+
+        let err = agent_create(&store, opts("atlas")).unwrap_err();
+        assert!(
+            err.to_string().contains("already exists"),
+            "unexpected error: {err}"
+        );
+
+        // The operator's casing survives, and `alms agent show atlas`
+        // resolves it.
+        let agents = store.list_agents().unwrap();
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agents[0].name, "Atlas");
+        assert_eq!(resolve_agent(&store, "atlas").unwrap().name, "Atlas");
+    }
+
     #[test]
     fn test_create_invalid_name_fails() {
         let store = new_store();
@@ -1037,7 +1078,10 @@ mod tests {
             },
         )
         .unwrap_err();
-        assert!(err.to_string().contains("lowercase"));
+        assert!(
+            err.to_string().contains("ASCII letters"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

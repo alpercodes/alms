@@ -128,9 +128,14 @@ pub enum SubagentOwner<'a> {
 /// identity label in the web UI. Gating the named arm on
 /// `validate_agent_name` therefore does double duty: it is the
 /// named/ephemeral discriminator, AND it constrains what can reach the DOM
-/// to `[a-z0-9-]`, 1–64 chars. A "just take the trailing segment" parse
+/// to `[A-Za-z0-9-]`, 1–64 chars. A "just take the trailing segment" parse
 /// would have handed arbitrary model-controlled text to a label. Keep the
 /// gate even if the discrimination is ever reworked.
+///
+/// #2 widened the class from `[a-z0-9-]` to `[A-Za-z0-9-]`. Both properties
+/// survive verbatim: uppercase adds no `<`, `&`, quote, whitespace, or path
+/// separator to the label, and `Uuid::parse_str` is case-insensitive over hex
+/// digits, so the UUID arm's disjointness from the name arm is untouched.
 pub fn parse_subagent_context(context_id: &str) -> Option<SubagentOwner<'_>> {
     let (_, trailing) = split_subagent_context(context_id)?;
 
@@ -412,7 +417,7 @@ impl SessionId {
 
     /// Derive a deterministic SessionId for a DM conversation between two agents.
     ///
-    /// Names are sorted alphabetically so both sides resolve to the same
+    /// Names are sorted byte-wise so both sides resolve to the same
     /// SessionId regardless of who initiated the conversation (UUID v5).
     ///
     /// This is a convenience wrapper around [`deterministic`](Self::deterministic)
@@ -436,8 +441,20 @@ impl std::fmt::Display for SessionId {
 
 /// Derive the DM context_id for a pair of agents.
 ///
-/// Names are sorted alphabetically so both sides resolve to the same
-/// context_id regardless of who initiated the conversation.
+/// Names are sorted byte-wise so both sides resolve to the same context_id
+/// regardless of who initiated the conversation. (Byte-wise, not
+/// alphabetically: with mixed case the two differ — `dm_context_id("atlas",
+/// "Bob")` is `dm:Bob:atlas`, because `B` sorts below `a`. Deterministic and
+/// harmless, since the ordering is only ever used as a stable key.)
+///
+/// **Callers must pass the registry's canonical spelling** of both names —
+/// `AgentRecord::name`, not a string a caller or an LLM supplied. Agent names
+/// admit uppercase since #2 and resolve case-insensitively, so `("Atlas",
+/// "bob")` and `("atlas", "bob")` name the same pair but would produce two
+/// different context_ids, and therefore two forked DM sessions. Sorting is
+/// deliberately left byte-wise (not case-folded): the input is already
+/// canonical, so a case-folded sort would only mask the bug above rather than
+/// prevent it.
 ///
 /// ```
 /// # use alms_core::dm_context_id;
@@ -451,7 +468,7 @@ pub fn dm_context_id(a: &str, b: &str) -> String {
 
 /// Parse a DM `context_id` into its two participant names.
 ///
-/// DM context IDs have the form `"dm:{name1}:{name2}"` (alphabetically sorted).
+/// DM context IDs have the form `"dm:{name1}:{name2}"` (byte-wise sorted).
 /// Returns `None` if the string does not match the expected format.
 ///
 /// ```
@@ -467,23 +484,30 @@ pub fn dm_participants(context_id: &str) -> Option<(&str, &str)> {
 
 /// Extract the peer agent name from a DM `context_id`.
 ///
-/// DM context IDs have the form `"dm:{name1}:{name2}"` (alphabetically sorted).
+/// DM context IDs have the form `"dm:{name1}:{name2}"` (byte-wise sorted).
 /// The peer is whichever name is NOT `agent_name`.  Returns `None` if the
 /// context ID does not match the expected format or neither name matches
 /// `agent_name`.
+///
+/// The participant match is **case-insensitive** (#2): agent names resolve
+/// case-insensitively, so `dm:Atlas:bob` is Atlas's DM however the caller
+/// happens to spell the agent. The returned peer is the spelling stored in the
+/// context_id, which is the canonical one when the context_id was minted from
+/// registry records.
 ///
 /// ```
 /// # use alms_core::dm_peer;
 /// assert_eq!(dm_peer("dm:alice:bob", "alice"), Some("bob"));
 /// assert_eq!(dm_peer("dm:alice:bob", "bob"), Some("alice"));
+/// assert_eq!(dm_peer("dm:Atlas:bob", "atlas"), Some("bob"));
 /// assert_eq!(dm_peer("dm:alice:bob", "charlie"), None);
 /// assert_eq!(dm_peer("web-chat-123", "alice"), None);
 /// ```
 pub fn dm_peer<'a>(context_id: &'a str, agent_name: &str) -> Option<&'a str> {
     let (a, b) = dm_participants(context_id)?;
-    if a == agent_name {
+    if a.eq_ignore_ascii_case(agent_name) {
         Some(b)
-    } else if b == agent_name {
+    } else if b.eq_ignore_ascii_case(agent_name) {
         Some(a)
     } else {
         None
@@ -871,13 +895,38 @@ mod tests {
         // Parent segment isn't a UUID — not a coordinator-minted context.
         assert_eq!(parse_subagent_context("subagent_notauuid_reviewer"), None);
         // Trailing segment is neither a UUID nor a name the agent registry
-        // would ever accept (uppercase is rejected by validate_agent_name).
+        // would ever accept (underscores are outside the slug grammar).
         let parent = AgentId::new();
         assert_eq!(
-            parse_subagent_context(&named_context(parent, "Reviewer")),
+            parse_subagent_context(&named_context(parent, "Re_viewer")),
             None
         );
         assert_eq!(parse_subagent_context(&named_context(parent, "")), None);
+    }
+
+    /// #2: an uppercase agent name is now registry-valid, so a subagent
+    /// context that embeds one must round-trip as `Named` rather than falling
+    /// into the "unknown owner, display nothing" hole — and the ephemeral arm
+    /// must be unmoved by the widened class.
+    #[test]
+    fn parse_subagent_context_round_trips_uppercase_names() {
+        let parent = AgentId::new();
+        for name in ["Reviewer", "ATLAS", "Agent-V2"] {
+            assert!(validate_agent_name(name).is_ok(), "fixture {name} invalid");
+            assert_eq!(
+                parse_subagent_context(&named_context(parent, name)),
+                Some(SubagentOwner::Named(name)),
+                "expected {name} to round-trip as Named"
+            );
+        }
+        // The UUID arm is tested FIRST and stays disjoint: an uppercase-hex
+        // task id still classifies as ephemeral, not as a name.
+        let ctx = format!(
+            "subagent_{}_{}",
+            parent.0,
+            Uuid::new_v4().to_string().to_uppercase()
+        );
+        assert_eq!(parse_subagent_context(&ctx), Some(SubagentOwner::Ephemeral));
     }
 
     #[test]
@@ -886,14 +935,21 @@ mod tests {
         // the parse is the only thing standing between a raw context segment
         // and a rendered agent label.
         let parent = AgentId::new();
-        for name in ["reviewer", "a", "agent-1"] {
+        for name in ["reviewer", "a", "agent-1", "Reviewer"] {
             assert!(validate_agent_name(name).is_ok(), "fixture {name} invalid");
             assert_eq!(
                 parse_subagent_context(&named_context(parent, name)),
                 Some(SubagentOwner::Named(name))
             );
         }
-        for name in ["-lead", "lead-", "UPPER", "with space", "default"] {
+        for name in [
+            "-lead",
+            "lead-",
+            "under_score",
+            "with space",
+            "default",
+            "DM",
+        ] {
             assert!(validate_agent_name(name).is_err(), "fixture {name} valid");
             assert_eq!(parse_subagent_context(&named_context(parent, name)), None);
         }
@@ -941,7 +997,7 @@ mod tests {
     #[test]
     fn parse_subagent_parent_ignores_an_unreadable_trailing_segment() {
         let parent = AgentId::new();
-        let ctx = named_context(parent, "Reviewer");
+        let ctx = named_context(parent, "Re_viewer");
         assert_eq!(parse_subagent_context(&ctx), None);
         assert_eq!(parse_subagent_parent(&ctx), Some(parent));
     }

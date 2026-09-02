@@ -55,6 +55,17 @@ const LOAD_SESSION_JS_PATH = path.resolve(
 // it at module-eval time).
 globalThis.__realHistory = { mapHistoryMessages, groupDmReasoningBlocks };
 
+// Likewise inject the REAL peer-derivation helpers (#2). These are pure and
+// dependency-free, and they decide the very thing the phase-restore test
+// below asserts — which participant becomes "Chatting with {peer}". Stubbing
+// them would mean asserting against a copy of the rule rather than the rule.
+const { dmPeerName, dmPeerFromParticipants } = await import(
+    url.pathToFileURL(
+        path.resolve(__dirname, '../../static/ui/utils/agent-name.js')
+    ).href
+);
+globalThis.__realAgentName = { dmPeerName, dmPeerFromParticipants };
+
 // ---------------------------------------------------------------------------
 // Stub block injected in place of the module's top-level imports. Minimal
 // signals, recording stubs for the side-effect surfaces we assert on
@@ -66,6 +77,9 @@ function signal(initial) { return { value: initial }; }
 
 // ---- REAL history.js pipeline (injected by the test harness) ----
 const { mapHistoryMessages, groupDmReasoningBlocks } = globalThis.__realHistory;
+
+// ---- REAL agent-name.js peer helpers (injected by the test harness, #2) ----
+const { dmPeerName, dmPeerFromParticipants } = globalThis.__realAgentName;
 
 // ---- API stubs: delegate to the per-test config in globalThis.__lsApi ----
 async function getSession(id) { return globalThis.__lsApi.getSession(id); }
@@ -751,6 +765,64 @@ test('phase restore: running DM run restores setDmContext(peer) instead of gener
         'a running DM must restore the DM phase via setDmContext');
     assert.equal(dmContextCalls[0][1], 'bob',
         'the peer is the participant that is not the active agent');
+});
+
+test('#2: phase restore folds case and never names the operator as their own peer', async () => {
+    reset();
+    T.crossAgentSessions.value = [DM_ENVELOPE];
+    // The envelope's participants are ['alice', 'bob']; the active agent
+    // carries a differently-cased spelling of the same name. Pre-#2 the
+    // `.find(p => p !== agentName)` shape returned 'alice' here — the
+    // operator told they were "Chatting with" themselves.
+    T.activeAgent.value = { id: 'agent-alice', name: 'Alice' };
+    globalThis.__lsApi = makeApi({
+        getSession: async () => ({ ...DM_ENVELOPE, has_active_run: true }),
+        listRuns: async () => ({ runs: [{ run_id: 'run-live-4', status: 'running' }] }),
+    });
+
+    await runLoadSession();
+
+    const dmContextCalls = T.__calls.phase.filter(c => c[0] === 'setDmContext');
+    assert.equal(dmContextCalls.length, 1,
+        'a case-varying active agent is still a participant of its own DM');
+    assert.equal(dmContextCalls[0][1], 'bob',
+        'the peer must be the OTHER participant, not the active agent itself');
+});
+
+test('#2: a third-party DM peek shows a neutral phase, not a guessed peer', async () => {
+    // S6 -- a DELIBERATE behaviour change, pinned so it cannot regress by
+    // accident in either direction.
+    //
+    // The operator is on `carol` and opens a DM between alice and bob. That
+    // is a supported click: `navigate-session.js` skips the agent switch for
+    // `dm` rows on purpose (peeking shouldn't yank you out of the chat you're
+    // reading) and `sortCrossAgentRows` sorts non-owned DM rows to the bottom
+    // rather than hiding them, so the active agent genuinely is not a
+    // participant here.
+    //
+    // Before #2, `.find(p => p !== 'carol')` returned 'alice' and the status
+    // bar read "Chatting with alice..." -- on carol's status bar, naming a
+    // conversation carol is not in. That is the #1166 class of header naming
+    // someone on a guess, so the peer derivation now declines and the caller
+    // falls through to the generic phase.
+    reset();
+    T.crossAgentSessions.value = [DM_ENVELOPE];
+    T.activeAgent.value = { id: 'agent-carol', name: 'carol' };
+    globalThis.__lsApi = makeApi({
+        getSession: async () => ({ ...DM_ENVELOPE, has_active_run: true }),
+        listRuns: async () => ({ runs: [{ run_id: 'run-live-5', status: 'running' }] }),
+    });
+
+    await runLoadSession();
+
+    const dmContextCalls = T.__calls.phase.filter(c => c[0] === 'setDmContext');
+    assert.equal(dmContextCalls.length, 0,
+        'the status bar must not name a peer of a conversation the active agent is not in');
+
+    const phaseCalls = T.__calls.phase.filter(c => c[0] === 'setAgentPhase');
+    assert.equal(phaseCalls.length, 1, 'exactly one generic phase is set');
+    assert.equal(phaseCalls[0][1], 'calling_llm',
+        'a third-party DM peek falls through to the neutral running phase');
 });
 
 // ---------------------------------------------------------------------------

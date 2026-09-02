@@ -1,15 +1,16 @@
 //! Ordered, transactional SQLite schema migrations.
 //!
 //! Version 1 adopts and normalizes every schema shape accepted by the former
-//! best-effort startup path. Later versions add lifecycle metadata and
-//! normalize durable job terminal/retry state.
+//! best-effort startup path. Later versions add lifecycle metadata, normalize
+//! durable job terminal/retry state, and make agent-name uniqueness
+//! case-insensitive.
 
 use super::{V1_BASELINE_INDEXES, V1_BASELINE_SCHEMA};
 use alms_core::{AlmsError, AlmsResult};
 use rusqlite::{Connection, ErrorCode, Transaction, TransactionBehavior, params};
 use std::time::{Duration, Instant};
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 3;
+pub const CURRENT_SCHEMA_VERSION: u32 = 4;
 
 const CONNECTION_PRAGMAS: &str = "
 PRAGMA foreign_keys=ON;
@@ -47,6 +48,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 3,
         name: "normalize_job_terminal_states",
         apply: normalize_job_terminal_states,
+    },
+    Migration {
+        version: 4,
+        name: "case_insensitive_agent_names",
+        apply: case_insensitive_agent_names,
     },
 ];
 
@@ -265,6 +271,31 @@ fn normalize_job_terminal_states(transaction: &Transaction<'_>) -> rusqlite::Res
     Ok(())
 }
 
+/// Make agent-name uniqueness case-insensitive (#2).
+///
+/// Agent names admit uppercase since #2, and agent workspaces are directories
+/// at `{workspace_dir}/{name}/`. Windows and macOS filesystems are
+/// case-insensitive while Linux is not, so `Atlas` and `atlas` as two registry
+/// rows would share one workspace directory on two platforms and split across
+/// two on the third — a silent, platform-dependent data-mixing bug.
+///
+/// The table's original `name TEXT NOT NULL UNIQUE` (case-sensitive, and
+/// frozen in the v1 baseline) stays; this index is strictly stronger, so it
+/// subsumes it. Adding the constraint as an index rather than rebuilding the
+/// table keeps the migration cheap and non-destructive. It cannot fail on
+/// existing data: every name written before #2 was lowercase-only, so no two
+/// rows can already collide case-insensitively.
+///
+/// `load_agent_by_name` (and therefore the HTTP routes, the CLI,
+/// `invoke_agent` and `send_message`) matches `name = ?1 COLLATE NOCASE`,
+/// which is served by this index.
+fn case_insensitive_agent_names(transaction: &Transaction<'_>) -> rusqlite::Result<()> {
+    transaction.execute_batch(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_agents_name_nocase \
+         ON agents(name COLLATE NOCASE);",
+    )
+}
+
 fn add_column_if_missing(
     conn: &Connection,
     table: &str,
@@ -324,10 +355,30 @@ mod tests {
         transaction.execute_batch("CREATE TABLE phase_three (value TEXT);")
     }
 
+    /// Pad a synthetic migration list out to [`CURRENT_SCHEMA_VERSION`].
+    ///
+    /// `validate_migration_list` requires the list to end exactly at the
+    /// constant, so a fixed-length fixture would have to be re-numbered by
+    /// hand every time a real migration ships. The padding steps are no-ops.
+    fn pad_to_current(head: &[Migration]) -> Vec<Migration> {
+        fn noop(_: &Transaction<'_>) -> rusqlite::Result<()> {
+            Ok(())
+        }
+        let mut list = head.to_vec();
+        for version in (list.len() as u32 + 1)..=CURRENT_SCHEMA_VERSION {
+            list.push(Migration {
+                version,
+                name: "pad_noop",
+                apply: noop,
+            });
+        }
+        list
+    }
+
     #[test]
     fn failed_step_rolls_back_and_can_be_retried() {
         let mut conn = Connection::open_in_memory().unwrap();
-        let failed = [
+        let failed = pad_to_current(&[
             Migration {
                 version: 1,
                 name: "create_marker",
@@ -343,14 +394,14 @@ mod tests {
                 name: "add_phase_three",
                 apply: successful_migration_three,
             },
-        ];
+        ]);
 
         let error = apply_migrations(&mut conn, &failed).unwrap_err();
         assert!(error.to_string().contains("migration 2"));
         assert_eq!(read_schema_version(&conn).unwrap(), 1);
         assert!(!column_exists(&conn, "marker", "phase_two").unwrap());
 
-        let repaired = [
+        let repaired = pad_to_current(&[
             failed[0],
             Migration {
                 version: 2,
@@ -362,9 +413,9 @@ mod tests {
                 name: "add_phase_three",
                 apply: successful_migration_three,
             },
-        ];
+        ]);
         apply_migrations(&mut conn, &repaired).unwrap();
-        assert_eq!(read_schema_version(&conn).unwrap(), 3);
+        assert_eq!(read_schema_version(&conn).unwrap(), CURRENT_SCHEMA_VERSION);
         assert!(column_exists(&conn, "marker", "phase_two").unwrap());
     }
 

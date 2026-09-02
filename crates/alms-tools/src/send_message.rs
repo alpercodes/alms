@@ -319,12 +319,19 @@ impl Tool for SendMessageTool {
             return Ok(Self::folded_peer_result(peer, reason));
         }
 
+        // Deliver under the recipient's CANONICAL registry name, not the `to`
+        // the model typed (#2). `MessageBus::send` derives the DM
+        // `context_id` from this string; agent names admit uppercase and
+        // resolve case-insensitively, so passing the raw `to` would file
+        // `dm:atlas:bob` and `dm:Atlas:bob` as two separate DM sessions for
+        // the same pair of agents, splitting the conversation history down
+        // the middle of the model's spelling habits.
         match self
             .sender
             .send(
                 &self.sender_name,
                 self.sender_agent_id,
-                to,
+                &recipient.name,
                 recipient.id,
                 message,
                 Some(self.sender_session_id),
@@ -662,6 +669,200 @@ mod tests {
         assert!(
             result.is_err(),
             "without a DM peer, sends must proceed normally (missing store here)"
+        );
+    }
+
+    /// A sender that records the recipient name it was handed.
+    #[derive(Debug, Default)]
+    struct RecordingSender(std::sync::Mutex<Vec<String>>);
+
+    #[async_trait::async_trait]
+    impl MessageSender for RecordingSender {
+        async fn send(
+            &self,
+            _: &str,
+            _: AgentId,
+            recipient_name: &str,
+            _: AgentId,
+            _: &str,
+            _: Option<SessionId>,
+        ) -> Result<crate::message_sender::DeliveryReceipt, SendError> {
+            self.0.lock().unwrap().push(recipient_name.to_string());
+            Ok(crate::message_sender::DeliveryReceipt {
+                session_id: SessionId::new(),
+            })
+        }
+
+        async fn end_conversation(
+            &self,
+            _: &str,
+            _: AgentId,
+            _: &str,
+            _: AgentId,
+            _: crate::message_sender::ConversationEndReason,
+        ) -> Result<(), SendError> {
+            Ok(())
+        }
+    }
+
+    /// A sender that records **both** name legs of the DM `context_id`.
+    #[derive(Debug, Default)]
+    struct RecordingBothLegs(std::sync::Mutex<Vec<(String, String)>>);
+
+    #[async_trait::async_trait]
+    impl MessageSender for RecordingBothLegs {
+        async fn send(
+            &self,
+            sender_name: &str,
+            _: AgentId,
+            recipient_name: &str,
+            _: AgentId,
+            _: &str,
+            _: Option<SessionId>,
+        ) -> Result<crate::message_sender::DeliveryReceipt, SendError> {
+            self.0
+                .lock()
+                .unwrap()
+                .push((sender_name.to_string(), recipient_name.to_string()));
+            Ok(crate::message_sender::DeliveryReceipt {
+                session_id: SessionId::new(),
+            })
+        }
+
+        async fn end_conversation(
+            &self,
+            _: &str,
+            _: AgentId,
+            _: &str,
+            _: AgentId,
+            _: crate::message_sender::ConversationEndReason,
+        ) -> Result<(), SendError> {
+            Ok(())
+        }
+    }
+
+    fn agent_record(name: &str) -> alms_core::AgentRecord {
+        alms_core::AgentRecord {
+            id: AgentId::new(),
+            name: name.into(),
+            description: String::new(),
+            model: None,
+            posture: None,
+            provider: None,
+            telegram_token: None,
+            thinking_budget_tokens: None,
+            reasoning_effort: None,
+            gemini_thinking_budget: None,
+            summary_provider: None,
+            summary_model: None,
+            worktree_mode: alms_core::WorktreeMode::Off,
+            debug_mode: false,
+            is_default: false,
+            created_at: alms_core::Timestamp::now().0,
+            last_active: alms_core::Timestamp::now().0,
+        }
+    }
+
+    /// #2: delivery uses the recipient's canonical registry name, not the
+    /// `to` string the model typed.
+    ///
+    /// `MessageBus::send` derives the DM `context_id` from this argument. Now
+    /// that names admit uppercase and resolve case-insensitively, passing the
+    /// raw `to` would file `dm:Atlas:alice` and `dm:atlas:alice` as two
+    /// separate DM sessions between the same pair of agents — the peer's
+    /// history would silently split on the sender's spelling habits.
+    #[tokio::test]
+    async fn delivery_uses_the_recipients_canonical_registry_name() {
+        let store = alms_session::SqliteStore::open_in_memory().unwrap();
+        store.create_agent(&agent_record("Atlas")).unwrap();
+        let mgr = Arc::new(
+            SessionManager::with_store(alms_session::SessionConfig::default(), store).unwrap(),
+        );
+
+        let sender = Arc::new(RecordingSender::default());
+        let tool = SendMessageTool::new(
+            sender.clone(),
+            AgentId::new(),
+            "alice".into(),
+            mgr,
+            SessionId::new(),
+        );
+
+        for spelling in ["Atlas", "atlas", "ATLAS"] {
+            let result = tool
+                .execute(serde_json::json!({ "to": spelling, "message": "hi" }))
+                .await
+                .unwrap_or_else(|e| panic!("send to {spelling} must resolve: {e}"));
+            assert_eq!(result["delivered"], true);
+        }
+
+        assert_eq!(
+            *sender.0.lock().unwrap(),
+            vec![
+                "Atlas".to_string(),
+                "Atlas".to_string(),
+                "Atlas".to_string()
+            ],
+            "every spelling must deliver under the one canonical name"
+        );
+    }
+
+    /// #2: **both** legs of the DM `context_id` are canonical, so the pair
+    /// resolves to one session.
+    ///
+    /// The sibling test above pins the recipient leg, which is the one that
+    /// had the bug. The sender leg (`self.sender_name`) is correct only
+    /// because the runtime constructs this tool from `resolved.agent_name` —
+    /// a registry lookup — and nothing closer than a doc line said so. This
+    /// pins the property the two legs jointly produce: whatever spelling the
+    /// model types for `to`, the `dm_context_id` built from the recorded pair
+    /// is the canonical one, identical every time.
+    ///
+    /// **Scope, so the gap is not mistaken for closed:** this pins
+    /// *composition*, not *provenance*. The sender name is constructed here by
+    /// hand, so what it proves is "given a canonical sender leg, every `to`
+    /// spelling yields one context". What makes that leg canonical in
+    /// production — `resolved.agent_name` flowing into `SendMessageTool::new`
+    /// in the gateway's run lifecycle — is a wiring fact this crate cannot
+    /// reach, and is still held by a doc line rather than a test.
+    #[tokio::test]
+    async fn dm_context_id_is_canonical_on_both_legs() {
+        let store = alms_session::SqliteStore::open_in_memory().unwrap();
+        store.create_agent(&agent_record("Atlas")).unwrap();
+        let mgr = Arc::new(
+            SessionManager::with_store(alms_session::SessionConfig::default(), store).unwrap(),
+        );
+
+        let sender = Arc::new(RecordingBothLegs::default());
+        // The sender name the runtime hands us is already registry-canonical;
+        // a mixed-case one proves the tool passes it through untouched rather
+        // than folding or re-deriving it.
+        let tool = SendMessageTool::new(
+            sender.clone(),
+            AgentId::new(),
+            "Alice".into(),
+            mgr,
+            SessionId::new(),
+        );
+
+        for spelling in ["Atlas", "atlas", "ATLAS", "aTlAs"] {
+            tool.execute(serde_json::json!({ "to": spelling, "message": "hi" }))
+                .await
+                .unwrap_or_else(|e| panic!("send to {spelling} must resolve: {e}"));
+        }
+
+        let contexts: Vec<String> = sender
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(from, to)| alms_core::dm_context_id(from, to))
+            .collect();
+
+        assert_eq!(
+            contexts,
+            vec!["dm:Alice:Atlas".to_string(); 4],
+            "every spelling must land on one DM context, not fork the pair"
         );
     }
 }

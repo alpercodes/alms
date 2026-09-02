@@ -664,14 +664,16 @@ export function AgentsTab() {
 
     // The input is lenient — we accept whatever the operator types and
     // normalize on submit. The preview line below the input shows the
-    // slug shape that will actually be sent to the backend so there are
-    // no surprises after Create is clicked. See `utils/agent-name.js`
-    // for the normalization rules and #978 for the UX motivation.
+    // name that will actually be sent to the backend so there are no
+    // surprises after Create is clicked. See `utils/agent-name.js` for the
+    // normalization rules and #978 for the UX motivation. Since #2 the
+    // operator's capitalization is part of the name and survives — typing
+    // "Atlas" creates "Atlas", so the preview stays hidden for it.
     const normalized = normalizeAgentName(newName.value);
     const rawTrimmed = (newName.value || '').trim();
     // Only show the preview when (a) the operator has typed something
     // and (b) the normalized form actually differs from the raw input
-    // (otherwise it's just visual noise — they already see the slug).
+    // (otherwise it's just visual noise — they already see the name).
     const showPreview = rawTrimmed !== '' && normalized !== rawTrimmed;
 
     const onCreate = async () => {

@@ -13,9 +13,15 @@ export function OnboardingView() {
         const val = name.value.trim();
         if (!val) return;
 
-        // Validate: lowercase, digits, hyphens, 1-64 chars
-        if (!/^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$/.test(val)) {
-            error.value = 'Invalid name: lowercase letters, digits, hyphens only (1-64 chars, no trailing hyphen)';
+        // Validate: ASCII letters (either case), digits, hyphens, 1-64 chars.
+        // Mirrors `validate_agent_name` in crates/alms-core/src/registry.rs,
+        // which admits uppercase since #2 — rejecting it here would have made
+        // the very first agent an operator creates un-capitalizable. The
+        // backend enforces uniqueness case-insensitively, so a name that
+        // differs from an existing one only in case comes back as a 409 and
+        // lands in the catch below.
+        if (!/^[A-Za-z0-9](?:[A-Za-z0-9-]{0,62}[A-Za-z0-9])?$/.test(val)) {
+            error.value = 'Invalid name: letters, digits, hyphens only (1-64 chars, no trailing hyphen)';
             return;
         }
 
@@ -49,7 +55,7 @@ export function OnboardingView() {
                         value=${name.value}
                         onInput=${(e) => { name.value = e.target.value; }}
                         disabled=${loading.value} />
-                    <div class="onboard-hint">lowercase, digits, hyphens (1-64 chars)</div>
+                    <div class="onboard-hint">letters, digits, hyphens (1-64 chars)</div>
                 </div>
                 <button class="onboard-btn" type="submit" disabled=${loading.value || !name.value.trim()}>
                     ${loading.value ? 'Creating...' : 'Create Agent'}

@@ -249,6 +249,22 @@ test('cross-agent: isOwnedByActiveAgent matches DM participant', () => {
     assert.equal(isOwnedByActiveAgent(session, 'charlie'), false);
 });
 
+test('#2: isOwnedByActiveAgent folds case on both surfaces', () => {
+    // Agent names resolve case-insensitively, so an exact match here would
+    // drop the "this row is yours" emphasis whenever the stored name and the
+    // active agent's name differ only in case. Both surfaces, since they are
+    // two separate comparisons.
+    const notification = { session_type: 'notification', agent_name: 'Atlas' };
+    assert.equal(isOwnedByActiveAgent(notification, 'atlas'), true);
+    assert.equal(isOwnedByActiveAgent(notification, 'ATLAS'), true);
+    assert.equal(isOwnedByActiveAgent(notification, 'atlas-2'), false);
+
+    const dm = { session_type: 'dm', participants: ['Atlas', 'bob'] };
+    assert.equal(isOwnedByActiveAgent(dm, 'atlas'), true);
+    assert.equal(isOwnedByActiveAgent(dm, 'BOB'), true);
+    assert.equal(isOwnedByActiveAgent(dm, 'charlie'), false);
+});
+
 test('cross-agent: isOwnedByActiveAgent is false for malformed cross-agent rows', () => {
     // Defensive: notification with no agent_name, DM with no participants.
     assert.equal(
