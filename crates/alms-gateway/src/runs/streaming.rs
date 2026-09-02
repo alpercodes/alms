@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! SSE event streaming — per-run, per-session, and per-agent event streams.
 
 use crate::api_error;

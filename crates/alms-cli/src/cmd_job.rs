@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 use alms_core::CreateJobRequest;
 use alms_core::job::{Job, JobId, JobSchedule, JobStatus, JobTerminalReason};
 use alms_session::SqliteStore;

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! Bearer token authentication middleware and API response headers.
 
 use axum::{

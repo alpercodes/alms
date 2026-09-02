@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! Telegram Bot API types
 
 use serde::{Deserialize, Serialize};

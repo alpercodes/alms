@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! Timeline API — unified chronological view of all agent activity.
 //!
 //! `GET /agents/{id_or_name}/timeline?limit=N&before=TIMESTAMP`

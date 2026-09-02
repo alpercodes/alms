@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! Accounting for durable *columns* a parser could not read and replaced with a
 //! fallback, keeping the row (#1246).
 //!

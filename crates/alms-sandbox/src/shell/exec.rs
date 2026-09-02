@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! Command execution for the shell tool.
 //!
 //! Handles spawning processes, capturing output, enforcing timeouts,

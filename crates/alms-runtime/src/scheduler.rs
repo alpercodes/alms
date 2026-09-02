@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! Minimal async scheduler backed by `tokio::time`.
 //!
 //! Uses `tokio::time::sleep_until` exclusively so tests can freeze/advance the

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! Shared lifecycle transition outcomes.
 
 use serde::{Deserialize, Serialize};

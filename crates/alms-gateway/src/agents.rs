@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! Agent registry HTTP API
 //!
 //! CRUD endpoints for managing persistent named agents.

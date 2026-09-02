@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 use alms_core::{AgentId, AgentRecord, AlmsConfig};
 use alms_session::SqliteStore;
 

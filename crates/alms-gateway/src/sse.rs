@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! Server-Sent Events (SSE) streaming for ALMS
 //!
 //! Provides event streaming per docs/api.md specification.

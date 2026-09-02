@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! Consolidated DM post-run lifecycle handling.
 //!
 //! When a peer-triggered DM run completes, the **DM completion gate**

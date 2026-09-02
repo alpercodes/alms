@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! Background task execution for the shell tool.
 //!
 //! When `run_in_background: true` is specified, the command is spawned as a

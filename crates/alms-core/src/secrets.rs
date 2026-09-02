@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! Secure API key storage with optional encryption at rest.
 //!
 //! Keys are stored in a JSON file (`.alms/secrets.json`). When the

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! SubagentDispatcher trait -- lets tools spawn subagents without a direct
 //! dependency on alms-coordinator.
 //!

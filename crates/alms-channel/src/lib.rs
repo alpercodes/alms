@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! Channel adapters for messaging platforms
 //!
 //! This crate provides adapters for various messaging platforms including:

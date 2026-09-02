@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! Shared in-loop tool-output truncation service (issue #851).
 //!
 //! Every tool's result is routed through [`truncate`] before it lands in the

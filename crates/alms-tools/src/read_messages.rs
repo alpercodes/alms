@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! read_messages tool -- reads DM conversation history with another agent.
 //!
 //! Uses the shared DM session model: both agents read from the same session.

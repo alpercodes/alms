@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! ignore_message tool -- lets an agent decline to respond.
 //!
 //! When called, this tool signals that the current run should end early

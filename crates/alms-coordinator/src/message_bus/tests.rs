@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 use super::*;
 use alms_core::{AgentId, SessionId, dm_context_id};
 use alms_session::SessionConfig;

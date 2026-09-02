@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! Security checks for the shell tool.
 //!
 //! Preserves all existing security features from `ShellExecTool`:

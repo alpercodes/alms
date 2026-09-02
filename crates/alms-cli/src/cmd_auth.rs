@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! CLI commands for managing API key credentials.
 //!
 //! ```text

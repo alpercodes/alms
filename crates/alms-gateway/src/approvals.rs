@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! Approval store and HTTP handlers.
 //!
 //! When the runtime runs in `Guarded` posture, it emits `ApprovalRequired`

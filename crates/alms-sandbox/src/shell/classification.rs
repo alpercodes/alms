@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! Built-in command classification for destructive operation detection.
 //!
 //! Layers **with** the configurable permission system in [`super::permissions`]:

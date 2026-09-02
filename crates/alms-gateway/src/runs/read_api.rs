@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! Read-only run HTTP endpoints and their presentation models.
 
 use crate::api_error;

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! ALMS Tool implementations and supporting traits.
 //!
 //! This crate contains:

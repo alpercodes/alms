@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! Agent-to-agent message bus (Layer 2 -- Phase 1: DM only).
 //!
 //! The `MessageBus` routes messages between agents via shared DM sessions.

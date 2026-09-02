@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! Structured diagnostic formatting for LLM-adapter decode/parse failures
 //! (#1044).
 //!

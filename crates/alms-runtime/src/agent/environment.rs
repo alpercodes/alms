@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 use super::{AgentConfig, AgentRuntime};
 use crate::events::RuntimeEventSender;
 use crate::llm_client::LlmClient;

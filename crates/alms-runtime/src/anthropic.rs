@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! Anthropic Messages API types and conversion functions.
 //!
 //! Converts between ALMS internal types (`CompletionRequest`/`CompletionResponse`)

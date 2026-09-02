@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! Hidden `alms shell-host` subcommand — the self-contained shell engine
 //! (#1143, Phase 2 of #1121).
 //!

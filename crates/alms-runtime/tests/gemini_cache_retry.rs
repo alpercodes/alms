@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! End-to-end wiremock integration tests for the Gemini cache-expired
 //! retry cycle (#795).
 //!

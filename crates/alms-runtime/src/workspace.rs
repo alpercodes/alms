@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! Agent workspace — persistent identity files.
 //!
 //! Each agent has a workspace directory containing:

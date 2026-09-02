@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! Google Gemini `generateContent` / `streamGenerateContent` API types and
 //! conversion functions.
 //!

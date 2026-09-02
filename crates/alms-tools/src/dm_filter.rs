@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! Shared DM message filter — identifies synthetic markers that should be
 //! excluded from DM conversation output.
 //!

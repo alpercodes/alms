@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! Route registration and HTTP handler functions.
 //!
 //! Contains the Axum router setup (`public_router`, `protected_router`) and

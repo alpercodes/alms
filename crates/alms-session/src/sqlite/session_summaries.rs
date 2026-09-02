@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! Per-session episodic summary persistence (cross-session memory).
 
 use super::*;

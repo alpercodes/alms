@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! Per-agent git worktree management (#946).
 //!
 //! Side-effecting helpers for creating / removing the per-agent worktree

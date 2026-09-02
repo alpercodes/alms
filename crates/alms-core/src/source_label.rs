@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! Source label derivation from `context_id` strings.
 //!
 //! A `context_id` encodes the origin of a session (web chat, Telegram, DM,

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! ALMS Gateway - Integrated message router
 //!
 //! Connects channels (Telegram, etc.) to agent runtimes with session management.

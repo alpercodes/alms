@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 use alms_core::{SessionId, classify_session_type, parse_subagent_parent};
 use alms_session::{Session, SqliteStore};
 use clap::Subcommand;

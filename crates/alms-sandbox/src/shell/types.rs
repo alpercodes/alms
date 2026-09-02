@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! Types for the redesigned shell tool.
 //!
 //! This module contains the input/output types, shell state, and background

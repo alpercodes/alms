@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! Per-line allocation cap used by `fs_read` (#902) and `fs_grep` (#913).
 //!
 //! `BufReader::lines()` / `next_line()` allocate per line without any cap, so a

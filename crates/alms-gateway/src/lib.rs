@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! ALMS Gateway - HTTP/SSE API and message routing
 //!
 //! The gateway provides:

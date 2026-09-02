@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! Agent registry -- CRUD, migration, default management.
 
 use super::*;

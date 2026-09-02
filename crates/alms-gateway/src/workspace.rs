@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! Workspace HTTP API
 //!
 //! GET  /agents/{id_or_name}/workspace          — read all workspace files

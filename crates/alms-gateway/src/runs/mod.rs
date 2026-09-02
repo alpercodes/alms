@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! Run management for ALMS Gateway
 //!
 //! Implements POST /runs and GET /runs/{id}/events per docs/api.md

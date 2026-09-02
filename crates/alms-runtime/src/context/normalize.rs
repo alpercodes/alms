@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! Canonical message-shape pipeline for the context builder (issue #586).
 //!
 //! Pure free functions — no `&self`, no shared state. The pipeline runs as

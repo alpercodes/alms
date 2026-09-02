@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! DM-perspective role mapping and reasoning-message filter.
 //!
 //! For shared sessions (DM/group), all messages are stored as `Role::User`

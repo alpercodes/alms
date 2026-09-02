@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! Run types and status for ALMS
 
 use crate::lifecycle::MAX_LIFECYCLE_REVISION;

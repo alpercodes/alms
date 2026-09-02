@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! Session CRUD and WAL flush.
 
 use super::*;

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! Trait for sending peer messages between agents.
 //!
 //! This trait is defined in `alms-tools` so the tools (SendMessageTool, etc.)

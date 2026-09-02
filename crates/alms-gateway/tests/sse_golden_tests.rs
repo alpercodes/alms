@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! Golden tests for SSE event sequencing
 //!
 //! Tests event ordering and field alignment with docs/api.md

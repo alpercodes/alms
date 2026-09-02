@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! Path normalisation for sandbox-root containment checks (#1255).
 //!
 //! The shell engine reports its post-command working directory by running

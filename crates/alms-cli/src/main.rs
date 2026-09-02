@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 mod cmd_agent;
 mod cmd_auth;
 mod cmd_job;

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! Run creation, execution, and completion — the core run lifecycle.
 
 use super::tools::{RoutedBgEvent, RuntimeEventForwarder, forward_runtime_events, route_bg_event};

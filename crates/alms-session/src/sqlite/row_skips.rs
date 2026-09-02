@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! Accounting for durable rows a loader could not parse and therefore dropped
 //! (#1241).
 //!
