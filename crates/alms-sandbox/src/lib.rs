@@ -19,9 +19,6 @@ pub use file_state_cache::FileStateCache;
 pub use registry::{TOOL_COLLISION_WARNING, ToolRegistry};
 pub use shell::ShellTool;
 
-/// Type alias for backward compatibility. Use [`ShellTool`] instead.
-pub type ShellExecTool = ShellTool;
-
 /// Per-call context threaded into [`Tool::execute_with_context`].
 ///
 /// Carries identifiers the runtime knows about a specific tool invocation

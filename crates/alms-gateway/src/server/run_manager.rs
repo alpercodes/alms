@@ -1147,7 +1147,7 @@ impl RunManager {
         // deltas — the chat history is loaded via getSessionMessages instead.
         let session_event = if is_ephemeral {
             // Fast path: no logging, just fan out. Leave event_id as None
-            // so the dedup filter in stream_with_replay passes it through
+            // so the dedup filter in stream_with_replay_source passes it through
             // (dedup only drops Some(id) where id <= max_replay_id).
             event
         } else {
@@ -1186,8 +1186,9 @@ impl RunManager {
     /// Used for high-frequency / moment-in-time signals (the `subagent_activity`
     /// status events from the background-subagent channel) that are worthless
     /// on replay and must not grow the session log. `event_id` is left `None`
-    /// so the replay dedup filter in `stream_with_replay` passes the event
-    /// through — the same contract as `send_event`'s ephemeral fast path.
+    /// so the replay dedup filter in `stream_with_replay_source` passes
+    /// the event through — the same contract as `send_event`'s ephemeral
+    /// fast path.
     /// Synchronous: pure in-memory fan-out, no log I/O to await.
     pub fn send_transient_session_event(&self, session_id: SessionId, event: SseEventData) {
         fan_out_to(&self.session_senders, session_id, &event);

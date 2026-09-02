@@ -145,19 +145,6 @@ pub struct BackgroundTaskResult {
     pub error: Option<String>,
 }
 
-/// A background task being tracked by the shell tool.
-#[derive(Debug)]
-pub struct BackgroundTask {
-    /// Unique task identifier.
-    pub task_id: String,
-
-    /// The command that was submitted.
-    pub command: String,
-
-    /// Tokio join handle for the spawned task.
-    pub handle: tokio::task::JoinHandle<Result<ShellOutput, String>>,
-}
-
 /// Persistent state for a shell tool instance.
 ///
 /// Tracks the current working directory across invocations and any

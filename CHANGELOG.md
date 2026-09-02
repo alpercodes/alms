@@ -108,6 +108,14 @@ Each item below changes behaviour for a deployment that has not set the knob exp
   happens to be showing.
 - The sidebar active-run indicator lights on cross-agent sessions.
 
+### Internal
+
+- Seven provably-unreachable `pub` items removed from the library crates — among them the
+  `ShellExecTool` type alias (the `shell_exec` wire name is unaffected and still
+  registered), a superseded string-based output truncator, and two `RunEventStream`
+  constructors that could build an SSE response without subscriber bookkeeping. No
+  behaviour change.
+
 ## v0.2.3 — released (tag `v0.2.3`)
 
 Stable on `main`, with Linux x86_64 and Windows x86_64 binaries. Headline changes:
