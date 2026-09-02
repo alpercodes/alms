@@ -651,3 +651,198 @@ test('#1196: legacy job marker without run_id yields runId null (graceful)', () 
     assert.equal(e.jobSessionId, null);
     assert.equal(e.jobSessionUuid, null);
 });
+
+// ---------------------------------------------------------------------------
+// #5: reconstructed tool rows must be correlatable with the live event stream.
+// ---------------------------------------------------------------------------
+//
+// `run_tool_calls` records now carry `tool_invocation_id` — ALMS's own
+// correlator, the one `tool_start` / `tool_end` / `subagent_started` carry and
+// the one every frontend identity lookup uses. Before #5 they carried only the
+// provider's `tool_id`, which appears in no event, so a row rebuilt from them
+// could not be matched by id at all.
+
+/** A `run_tool_calls` call/result pair as the session endpoint serves it. */
+function toolCallPair(opts) {
+    const { toolId, invocationId, runId, withResult } = opts;
+    const call = {
+        run_id: runId,
+        seq: 0,
+        role: 'assistant',
+        tool_name: 'invoke_agent',
+        tool_id: toolId,
+        params: JSON.stringify({ name: 'reviewer', task: 'review it' }),
+        timestamp: '2026-05-14T12:00:00Z',
+    };
+    if (invocationId) call.tool_invocation_id = invocationId;
+    if (!withResult) return [call];
+    const result = {
+        run_id: runId,
+        seq: 1,
+        role: 'tool',
+        tool_name: 'invoke_agent',
+        tool_id: toolId,
+        result: JSON.stringify({ session_id: 'sub-session-1' }),
+        timestamp: '2026-05-14T12:00:05Z',
+    };
+    if (invocationId) result.tool_invocation_id = invocationId;
+    return [call, result];
+}
+
+test('#5: a merged tool row is keyed by the invocation id, not the provider id', () => {
+    const mapped = mapHistoryMessages([], {
+        hasActiveRun: false,
+        sessionToolCalls: toolCallPair({
+            toolId: 'call_provider_abc',
+            invocationId: 'inv-1111',
+            runId: 'run-A',
+            withResult: true,
+        }),
+    });
+
+    const tools = mapped.filter(m => m.type === 'tool');
+    assert.equal(tools.length, 1);
+    assert.equal(
+        tools[0].id, 'inv-1111',
+        'the row must be named by the correlator the SSE stream uses',
+    );
+});
+
+test('#5: a pre-#5 record with no correlator still falls back to the provider id', () => {
+    // No `tool_invocation_id` on the records at all — the shape of every row
+    // written before the column existed. Must be no worse than before.
+    const mapped = mapHistoryMessages([], {
+        hasActiveRun: false,
+        sessionToolCalls: toolCallPair({
+            toolId: 'call_provider_abc',
+            invocationId: null,
+            runId: 'run-A',
+            withResult: true,
+        }),
+    });
+
+    const tools = mapped.filter(m => m.type === 'tool');
+    assert.equal(tools.length, 1);
+    assert.equal(tools[0].id, 'call_provider_abc');
+});
+
+test('#5: a row already rendered from message history is not duplicated by the merge', () => {
+    // The message carries ONLY the invocation id (no `tool_call_id`), so a
+    // dedupe keyed on the provider id alone would not recognise it and would
+    // emit the merge-path row as a second copy.
+    const msgs = [
+        {
+            type: 'tool_call',
+            tool: 'invoke_agent',
+            params: { name: 'reviewer' },
+            timestamp: '2026-05-14T12:00:00Z',
+            metadata: { tool_invocation_id: 'inv-1111' },
+        },
+    ];
+    const mapped = mapHistoryMessages(msgs, {
+        hasActiveRun: false,
+        sessionToolCalls: toolCallPair({
+            toolId: 'call_provider_abc',
+            invocationId: 'inv-1111',
+            runId: 'run-A',
+            withResult: true,
+        }),
+    });
+
+    const tools = mapped.filter(m => m.type === 'tool');
+    assert.equal(tools.length, 1, 'one invocation must produce exactly one row');
+    assert.equal(tools[0].id, 'inv-1111');
+});
+
+// ---------------------------------------------------------------------------
+// #5 / phantom chip: a tool row's liveness is a fact about ITS run.
+// ---------------------------------------------------------------------------
+
+test('#5: an unfinished row whose own run is terminal is not running', () => {
+    // The phantom-chip shape from the issue's reachability section: a run
+    // cancelled while a foreground `invoke_agent` was in flight leaves a call
+    // record with no result. Reloading while a LATER run is active used to
+    // render it `running` — and `rehydrateSubagentsFromHistory` then builds a
+    // chip nothing can ever terminate, because the run that would have emitted
+    // `tool_end` is gone and the repair sweep needs a result this row lacks.
+    const mapped = mapHistoryMessages([], {
+        hasActiveRun: true,
+        terminalRunIds: new Set(['run-cancelled']),
+        sessionToolCalls: toolCallPair({
+            toolId: 'call_provider_abc',
+            invocationId: 'inv-1111',
+            runId: 'run-cancelled',
+            withResult: false,
+        }),
+    });
+
+    const tools = mapped.filter(m => m.type === 'tool');
+    assert.equal(tools.length, 1);
+    assert.equal(
+        tools[0].status, 'done',
+        'a row whose own run is terminal cannot still be running',
+    );
+});
+
+test('#5: an unfinished row whose own run is still live stays running', () => {
+    // The other half of the same rule — this must not become a blanket
+    // downgrade of every result-less row.
+    const mapped = mapHistoryMessages([], {
+        hasActiveRun: true,
+        terminalRunIds: new Set(['run-other']),
+        sessionToolCalls: toolCallPair({
+            toolId: 'call_provider_abc',
+            invocationId: 'inv-1111',
+            runId: 'run-live',
+            withResult: false,
+        }),
+    });
+
+    assert.equal(mapped.filter(m => m.type === 'tool')[0].status, 'running');
+});
+
+test('#5: an unknown run is not assumed terminal', () => {
+    // `run-live` is absent from the snapshot (older than the fetch window, or
+    // the runs fetch failed). Unknown must inherit the previous behaviour
+    // rather than being treated as evidence of termination.
+    for (const terminalRunIds of [new Set(), null, undefined]) {
+        const mapped = mapHistoryMessages([], {
+            hasActiveRun: true,
+            terminalRunIds,
+            sessionToolCalls: toolCallPair({
+                toolId: 'call_provider_abc',
+                invocationId: 'inv-1111',
+                runId: 'run-live',
+                withResult: false,
+            }),
+        });
+        assert.equal(
+            mapped.filter(m => m.type === 'tool')[0].status, 'running',
+            'absent evidence is not evidence of absence',
+        );
+    }
+});
+
+test('#5: the terminal-run rule applies to history-message rows too', () => {
+    // The main pass and the merge path are separate emission sites with
+    // separate status expressions; both have to honour the rule or the
+    // phantom just moves to whichever one was missed.
+    const msgs = [
+        {
+            type: 'tool_call',
+            tool: 'invoke_agent',
+            params: { name: 'reviewer' },
+            timestamp: '2026-05-14T12:00:00Z',
+            metadata: { tool_invocation_id: 'inv-2222', run_id: 'run-cancelled' },
+        },
+    ];
+    const mapped = mapHistoryMessages(msgs, {
+        hasActiveRun: true,
+        terminalRunIds: new Set(['run-cancelled']),
+    });
+
+    const tools = mapped.filter(m => m.type === 'tool');
+    assert.equal(tools.length, 1);
+    assert.equal(tools[0].id, 'inv-2222');
+    assert.equal(tools[0].status, 'done');
+});

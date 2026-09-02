@@ -213,8 +213,32 @@ pub struct ToolCallRecord {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_name: Option<String>,
     /// Provider-assigned tool call ID (correlates call to result).
+    ///
+    /// This is the LLM provider's id (`call_abc123`), NOT ALMS's own
+    /// correlator — see [`Self::tool_invocation_id`], which is what the
+    /// event stream and the frontend key on.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_id: Option<String>,
+    /// ALMS's own invocation correlator, as a string-formatted UUID (#5).
+    ///
+    /// This is the id carried by the `tool_start` / `tool_end` /
+    /// `subagent_started` / `subagent_completed` SSE events, written into
+    /// `session_messages` metadata as `tool_invocation_id`, and used as the
+    /// identity key by every frontend lookup. [`Self::tool_id`] is the
+    /// *provider's* id and is not known to any of them.
+    ///
+    /// Without this, a chat row the frontend reconstructs from
+    /// `run_tool_calls` is structurally uncorrelatable with the live event
+    /// stream: a `tool_end` cannot find the row by id and has to guess, a
+    /// rehydrated subagent chip stores the provider id so nothing can
+    /// terminate it, and the `subagent_started` session-id lookup (keyed by
+    /// invocation id) misses, leaving a dead "View session" button.
+    ///
+    /// `None` for rows written before #5. Both persistence paths tolerate
+    /// that; the frontend falls back to [`Self::tool_id`], which is the
+    /// pre-#5 behaviour.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_invocation_id: Option<String>,
     /// JSON-encoded tool parameters (for calls).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub params: Option<String>,
@@ -919,6 +943,7 @@ mod tests {
             role,
             tool_name: Some(tool_name.to_string()),
             tool_id: Some(tool_id.to_string()),
+            tool_invocation_id: None,
             params: None,
             result: result.map(String::from),
             timestamp: Utc::now(),

@@ -1519,9 +1519,31 @@ export function openSessionStream(sessionId, opts) {
             }
 
             // Primary match: by tool_invocation_id (exact ID correlation).
-            // Fallback: if the primary match fails (e.g. tool message was
-            // reconstructed from history with a different ID scheme), fall
-            // back to matching the last running tool message.
+            // Fallback: if the primary match fails, close the last running
+            // tool message instead.
+            //
+            // #5 shrank this fallback's population but did NOT make it
+            // removable, and the distinction matters:
+            //
+            //   - "reconstructed from history with a different ID scheme" was
+            //     the `run_tool_calls` merge path, which used to name rows
+            //     with the LLM provider's `tool_id`. Those rows now carry
+            //     `tool_invocation_id` and match by id, so this arm no longer
+            //     sees them — EXCEPT for records written before that column
+            //     existed, which have no correlator to be named by.
+            //   - The other reason the primary match misses is that the row is
+            //     ABSENT, not mis-keyed: `persist_assistant_tool_calls` is
+            //     fire-and-forget, so a dropped write leaves a reconciled
+            //     history with no row for a call that is genuinely in flight.
+            //     #5 says nothing about that case — there is no row for a
+            //     correlator to be on.
+            //
+            // Since the two are indistinguishable from here, narrowing this
+            // arm needs evidence rather than reasoning, and the warning below
+            // is the instrument: it should get quieter as pre-#5 records age
+            // out. If it does not, the remaining population is the absent-row
+            // case and wants a different fix (see the chip gate further down,
+            // which already covers that case for subagents).
             let found = matchId && updateMessage(
                 m => m.type === 'tool' && m.id === matchId,
                 applyToolEnd,
@@ -1586,13 +1608,23 @@ export function openSessionStream(sessionId, opts) {
             //
             // It is a DEFENSIVE widening rather than the fix for the reported
             // #1 symptom, because a MIS-KEYED row cannot arise while a chip is
-            // live: the row is built from `session_messages`, whose
-            // `tool_call` metadata carries `tool_invocation_id`, and the
-            // provider-keyed rows in `mapHistoryMessages`' `run_tool_calls`
-            // merge path cannot exist for an in-flight call — the only
-            // production writer of those records is `persist_tool_calls` in
-            // `runs/lifecycle.rs`, a closure defined after the agent loop
-            // returns and called from its three terminal arms.
+            // live. That held for two independent reasons, and #5 removed the
+            // second one:
+            //
+            //   1. A row built from `session_messages` is keyed by
+            //      `tool_call` metadata's `tool_invocation_id` — correct by
+            //      construction, then and now.
+            //   2. A row from `mapHistoryMessages`' `run_tool_calls` merge
+            //      path used to be keyed by the LLM provider's `tool_id`, but
+            //      could not exist for an in-flight call anyway: the only
+            //      production writer of those records is `persist_tool_calls`
+            //      in `runs/lifecycle.rs`, a closure defined after the agent
+            //      loop returns and called from its three terminal arms.
+            //      Since #5 those rows are keyed by the correlator too, so
+            //      the timing argument is no longer what is holding this up —
+            //      the rows are simply correct now. Kept because it is what
+            //      makes the claim true for pre-#5 records, which have no
+            //      correlator and are still provider-keyed.
             //
             // But "mis-keyed" is not "absent", and this gate is the ONLY
             // thing covering the absent case. `persist_assistant_tool_calls`

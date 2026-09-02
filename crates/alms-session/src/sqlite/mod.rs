@@ -156,7 +156,8 @@ CREATE TABLE IF NOT EXISTS run_tool_calls (
     params     TEXT,
     result     TEXT,
     timestamp  TEXT NOT NULL,
-    from_agent TEXT
+    from_agent TEXT,
+    tool_invocation_id TEXT
 );
 
 CREATE TABLE IF NOT EXISTS session_summaries (

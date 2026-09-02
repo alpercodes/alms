@@ -21,8 +21,9 @@ impl SqliteStore {
             .lock()
             .execute(
                 "INSERT INTO run_tool_calls \
-                 (run_id, session_id, seq, role, tool_name, tool_id, params, result, timestamp, from_agent) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                 (run_id, session_id, seq, role, tool_name, tool_id, params, result, \
+                  timestamp, from_agent, tool_invocation_id) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
                 params![
                     run_id.0.to_string(),
                     session_id.0.to_string(),
@@ -34,6 +35,7 @@ impl SqliteStore {
                     record.result.as_deref(),
                     record.timestamp.to_rfc3339(),
                     record.from_agent.as_deref(),
+                    record.tool_invocation_id.as_deref(),
                 ],
             )
             .map_err(|e| AlmsError::Runtime(format!("SQLite save_tool_call: {e}")))?;
@@ -59,8 +61,9 @@ impl SqliteStore {
         for record in records {
             tx.execute(
                 "INSERT INTO run_tool_calls \
-                 (run_id, session_id, seq, role, tool_name, tool_id, params, result, timestamp, from_agent) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                 (run_id, session_id, seq, role, tool_name, tool_id, params, result, \
+                  timestamp, from_agent, tool_invocation_id) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
                 params![
                     run_id.0.to_string(),
                     session_id.0.to_string(),
@@ -72,6 +75,7 @@ impl SqliteStore {
                     record.result.as_deref(),
                     record.timestamp.to_rfc3339(),
                     record.from_agent.as_deref(),
+                    record.tool_invocation_id.as_deref(),
                 ],
             )
             .map_err(|e| AlmsError::Runtime(format!("SQLite save_tool_call batch: {e}")))?;
@@ -86,7 +90,8 @@ impl SqliteStore {
         let conn = self.conn.lock();
         let mut stmt = conn
             .prepare(
-                "SELECT seq, role, tool_name, tool_id, params, result, timestamp, from_agent \
+                "SELECT seq, role, tool_name, tool_id, params, result, timestamp, \
+                        from_agent, tool_invocation_id \
                  FROM run_tool_calls WHERE run_id = ?1 ORDER BY seq",
             )
             .map_err(|e| AlmsError::Runtime(format!("SQLite prepare load_tool_calls: {e}")))?;
@@ -102,11 +107,22 @@ impl SqliteStore {
                     row.get::<_, Option<String>>(5)?,
                     row.get::<_, String>(6)?,
                     row.get::<_, Option<String>>(7)?,
+                    row.get::<_, Option<String>>(8)?,
                 ))
             })
             .map_err(|e| AlmsError::Runtime(format!("SQLite query load_tool_calls: {e}")))?
             .filter_map(|r| match r {
-                Ok((seq, role_str, tool_name, tool_id, params, result, ts_str, from_agent)) => {
+                Ok((
+                    seq,
+                    role_str,
+                    tool_name,
+                    tool_id,
+                    params,
+                    result,
+                    ts_str,
+                    from_agent,
+                    tool_invocation_id,
+                )) => {
                     let role: ToolCallRole = role_str
                         .parse()
                         .inspect_err(|e| {
@@ -134,6 +150,7 @@ impl SqliteStore {
                         result,
                         timestamp,
                         from_agent,
+                        tool_invocation_id,
                     })
                 }
                 Err(e) => {
@@ -192,7 +209,8 @@ impl SqliteStore {
         let mut stmt = conn
             .prepare(
                 "SELECT tc.run_id, tc.seq, tc.role, tc.tool_name, tc.tool_id, \
-                        tc.params, tc.result, tc.timestamp, tc.from_agent \
+                        tc.params, tc.result, tc.timestamp, tc.from_agent, \
+                        tc.tool_invocation_id \
                  FROM run_tool_calls tc \
                  LEFT JOIN runs r ON tc.run_id = r.run_id \
                  WHERE tc.session_id = ?1 \
@@ -215,6 +233,7 @@ impl SqliteStore {
                     row.get::<_, Option<String>>(6)?,
                     row.get::<_, String>(7)?,
                     row.get::<_, Option<String>>(8)?,
+                    row.get::<_, Option<String>>(9)?,
                 ))
             })
             .map_err(|e| {
@@ -231,6 +250,7 @@ impl SqliteStore {
                     result,
                     ts_str,
                     from_agent,
+                    tool_invocation_id,
                 )) => {
                     let run_id: RunId = uuid::Uuid::parse_str(&run_id_str)
                         .inspect_err(|e| {
@@ -270,6 +290,7 @@ impl SqliteStore {
                             result,
                             timestamp,
                             from_agent,
+                            tool_invocation_id,
                         },
                     })
                 }
@@ -307,6 +328,7 @@ mod tests {
             role,
             tool_name: Some(name.to_string()),
             tool_id: Some(format!("call_{seq}")),
+            tool_invocation_id: None,
             params: if role == ToolCallRole::Assistant {
                 Some(r#"{"text":"hello"}"#.to_string())
             } else {
@@ -320,6 +342,79 @@ mod tests {
             timestamp: chrono::Utc::now(),
             from_agent: None,
         }
+    }
+
+    /// #5: the correlator survives both write paths and both read paths.
+    ///
+    /// There are two inserters (`save_tool_call`, `save_tool_calls`) and two
+    /// loaders (`load_tool_calls`, `load_tool_calls_for_session`), each with
+    /// its own hand-written column list and its own positional row decoder.
+    /// A column added to three of the four is a silent data-loss bug that no
+    /// type check catches — the tuple indices still line up, they just read
+    /// the wrong thing or nothing. So all four combinations are exercised.
+    #[test]
+    fn tool_invocation_id_survives_both_writers_and_both_loaders() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let session_id = SessionId::new();
+
+        // Writer 1: the singular insert.
+        let single_run = RunId::new();
+        let mut single = new_tool_call_record(0, ToolCallRole::Assistant, "echo");
+        single.tool_invocation_id = Some("inv-single".to_string());
+        store
+            .save_tool_call(single_run, session_id, &single)
+            .unwrap();
+
+        // Writer 2: the batch insert.
+        let batch_run = RunId::new();
+        let mut call = new_tool_call_record(0, ToolCallRole::Assistant, "echo");
+        call.tool_invocation_id = Some("inv-batch-call".to_string());
+        let mut result = new_tool_call_record(1, ToolCallRole::Tool, "echo");
+        result.tool_invocation_id = Some("inv-batch-result".to_string());
+        store
+            .save_tool_calls(batch_run, session_id, &[call, result])
+            .unwrap();
+
+        // Loader 1, over each writer's rows.
+        assert_eq!(
+            store.load_tool_calls(single_run).unwrap()[0]
+                .tool_invocation_id
+                .as_deref(),
+            Some("inv-single"),
+            "save_tool_call -> load_tool_calls",
+        );
+        let batch_loaded = store.load_tool_calls(batch_run).unwrap();
+        assert_eq!(
+            batch_loaded
+                .iter()
+                .map(|r| r.tool_invocation_id.as_deref())
+                .collect::<Vec<_>>(),
+            vec![Some("inv-batch-call"), Some("inv-batch-result")],
+            "save_tool_calls -> load_tool_calls",
+        );
+
+        // Loader 2 spans both runs, since both were written under one session.
+        let by_session = store.load_tool_calls_for_session(session_id).unwrap();
+        let mut correlators: Vec<&str> = by_session
+            .iter()
+            .filter_map(|c| c.record.tool_invocation_id.as_deref())
+            .collect();
+        correlators.sort();
+        assert_eq!(
+            correlators,
+            vec!["inv-batch-call", "inv-batch-result", "inv-single"],
+            "every row must surface its correlator through the session loader",
+        );
+
+        // `None` is a legitimate value (pre-#5 rows), not an error.
+        let null_run = RunId::new();
+        let bare = new_tool_call_record(0, ToolCallRole::Assistant, "echo");
+        assert!(bare.tool_invocation_id.is_none());
+        store.save_tool_call(null_run, session_id, &bare).unwrap();
+        assert_eq!(
+            store.load_tool_calls(null_run).unwrap()[0].tool_invocation_id,
+            None,
+        );
     }
 
     #[test]
@@ -425,6 +520,7 @@ mod tests {
                 role: ToolCallRole::Assistant,
                 tool_name: Some("shell_exec".to_string()),
                 tool_id: Some("call_0".to_string()),
+                tool_invocation_id: None,
                 params: None, // Empty-args tool call
                 result: None,
                 timestamp: chrono::Utc::now(),
@@ -435,6 +531,7 @@ mod tests {
                 role: ToolCallRole::Tool,
                 tool_name: Some("shell_exec".to_string()),
                 tool_id: Some("call_0".to_string()),
+                tool_invocation_id: None,
                 params: None,
                 result: None, // Tool returned nothing
                 timestamp: chrono::Utc::now(),
@@ -565,6 +662,7 @@ mod tests {
             role: ToolCallRole::Assistant,
             tool_name: Some("send_message".to_string()),
             tool_id: Some("call_0".to_string()),
+            tool_invocation_id: None,
             params: Some(r#"{"text":"hi"}"#.to_string()),
             result: None,
             timestamp: chrono::Utc::now(),

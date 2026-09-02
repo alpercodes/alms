@@ -2910,6 +2910,133 @@ fn make_runtime_for_conflict_exec_test(posture: Posture) -> AgentRuntime {
     }
 }
 
+/// #5: the tool-call record persisted for a result carries the SAME
+/// correlator the `ToolEnd` event carries.
+///
+/// This is the property the whole issue turns on. `run_tool_calls` is the
+/// sole persistence site for `Tool`-role rows, and it both emits `ToolEnd`
+/// and pushes the record; before #5 the record stored only the *provider's*
+/// `tool_id`, which no event, no `session_messages` metadata entry and no
+/// frontend lookup ever sees. A row reconstructed from `run_tool_calls` was
+/// therefore uncorrelatable with the live stream by construction.
+///
+/// Asserting the two against each other (rather than each against a literal)
+/// is what makes this a pin on *agreement* rather than on two independent
+/// spellings that could drift apart.
+///
+/// Scope: this covers the `Tool`-role push. The `Assistant`-role push lives
+/// in `agent_loop`, which needs a full LLM round trip to reach; it consumes
+/// the same `invocation_ids` slice, positionally, via `zip` over the very vec
+/// it was built from.
+#[tokio::test]
+async fn tool_call_records_carry_the_streamed_invocation_id() {
+    let tool_calls = vec![
+        ToolCall::new("call_provider_a", "echo", r#"{"message":"a"}"#),
+        ToolCall::new("call_provider_b", "echo", r#"{"message":"b"}"#),
+    ];
+    let invocation_ids: Vec<uuid::Uuid> = (0..2).map(|_| uuid::Uuid::new_v4()).collect();
+
+    // Both execution arms: Guarded runs sequentially, Autonomous in parallel,
+    // and they reach `persist_one_tool_result` by different routes.
+    for posture in [Posture::Guarded, Posture::Autonomous] {
+        let mut runtime = make_runtime_for_conflict_exec_test(posture);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        runtime.event_sender = Some(tx);
+
+        let session_manager = SessionManager::new(SessionConfig::default());
+        let session = session_manager.get_or_create(runtime.agent_id, "test");
+
+        let mut tool_call_records: Vec<alms_core::ToolCallRecord> = Vec::new();
+        let mut tool_seq: u32 = 0;
+        let results = runtime
+            .run_tool_calls(
+                &tool_calls,
+                &invocation_ids,
+                &[],
+                &session_manager,
+                session.id,
+                false,
+                &mut tool_call_records,
+                &mut tool_seq,
+            )
+            .await
+            .expect("echo batch must succeed");
+
+        // `run_tool_calls` emits the `ToolEnd` events and persists records only
+        // on its cancel path; the completed-batch records are collected by
+        // `process_tool_results`, which `agent_loop` calls next. Drive both, in
+        // that order, so the assertion below spans the real pairing.
+        let mut messages: Vec<LlmMessage> = Vec::new();
+        runtime.process_tool_results(
+            &tool_calls,
+            results,
+            &invocation_ids,
+            &mut messages,
+            &mut tool_call_records,
+            &mut tool_seq,
+            &session_manager,
+            session.id,
+            false,
+        );
+
+        drop(runtime);
+
+        let mut streamed: Vec<String> = Vec::new();
+        while let Some(event) = rx.recv().await {
+            if let RuntimeEvent::ToolEnd { invocation_id, .. } = event {
+                streamed.push(invocation_id.to_string());
+            }
+        }
+
+        let persisted: Vec<Option<String>> = tool_call_records
+            .iter()
+            .map(|r| r.tool_invocation_id.clone())
+            .collect();
+
+        assert_eq!(
+            persisted.len(),
+            2,
+            "{posture:?}: one Tool-role record per call"
+        );
+        assert_eq!(streamed.len(), 2, "{posture:?}: one ToolEnd per call");
+
+        // The agreement assertion. Sorted because the parallel arm may emit
+        // and persist in completion order rather than call order — the claim
+        // is that the two SETS are the same, which is what correlation needs.
+        let mut persisted_sorted: Vec<String> = persisted
+            .into_iter()
+            .map(|v| v.expect("every persisted record must carry a correlator"))
+            .collect();
+        let mut streamed_sorted = streamed.clone();
+        persisted_sorted.sort();
+        streamed_sorted.sort();
+        assert_eq!(
+            persisted_sorted, streamed_sorted,
+            "{posture:?}: the persisted correlator must be the streamed one",
+        );
+
+        // And both must be the ids the caller supplied — not, say, freshly
+        // minted ones that merely happen to agree with each other.
+        let mut supplied: Vec<String> = invocation_ids.iter().map(|i| i.to_string()).collect();
+        supplied.sort();
+        assert_eq!(
+            persisted_sorted, supplied,
+            "{posture:?}: correlators must be the caller's invocation ids",
+        );
+
+        // The provider id is still recorded, and is still a different thing.
+        let provider_ids: std::collections::HashSet<&str> = tool_call_records
+            .iter()
+            .filter_map(|r| r.tool_id.as_deref())
+            .collect();
+        assert_eq!(
+            provider_ids,
+            ["call_provider_a", "call_provider_b"].into_iter().collect(),
+            "{posture:?}: tool_id must keep carrying the provider's id",
+        );
+    }
+}
+
 /// #1160 (Codex P2), execution path: drive `run_tool_calls` with the exact
 /// mixed-batch shape — `ignore_message` (0) + peer-directed `send_message`
 /// (1) + third-agent `send_message` (2) — and a `conflicting_indices` of

@@ -872,6 +872,20 @@ async fn get_session_messages(
 /// providing a session-level view.  It is especially important for DM sessions
 /// where tool calls are stored only in `run_tool_calls` (not in
 /// `session_messages`) and would otherwise be lost on page reload.
+///
+/// Each record carries **two** identifiers, and clients must not confuse them
+/// (#5): `tool_id` is the LLM provider's call id, which pairs a call record
+/// with its result record and appears in no SSE event; `tool_invocation_id` is
+/// ALMS's own correlator, which is what `tool_start` / `tool_end` /
+/// `subagent_started` / `subagent_completed` carry and what the frontend keys
+/// row identity on. A row reconstructed from this endpoint must use the
+/// latter, or it cannot be matched against the live stream at all — which is
+/// the bug the field was added to close. It is `Option` because rows written
+/// before #5 have none; the frontend falls back to `tool_id` there, which is
+/// the pre-#5 behaviour.
+///
+/// No serialization work is needed here for either field: `SessionToolCall`
+/// flattens `ToolCallRecord`, so the response shape follows the struct.
 async fn get_session_tool_calls(
     State(state): State<AppState>,
     Path(session_id): Path<SessionId>,

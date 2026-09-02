@@ -1,9 +1,16 @@
+use alms_core::SessionId;
+use alms_core::run::{RunId, ToolCallRecord, ToolCallRole};
 use alms_session::sqlite::{CURRENT_SCHEMA_VERSION, SqliteStore};
-use rusqlite::Connection;
+use rusqlite::{Connection, params};
 use std::sync::{Arc, Barrier};
 use tempfile::tempdir;
 
 const CHECKPOINT_SCHEMA: &str = include_str!("fixtures/v0_2_4_schema.sql");
+
+/// Fixed ids for the #5 migration test so the pre-migration raw INSERT and
+/// the post-migration store reads address the same rows.
+const LEGACY_RUN_ID: &str = "33333333-3333-4333-8333-333333333333";
+const LEGACY_SESSION_ID: &str = "44444444-4444-4444-8444-444444444444";
 
 fn column_exists(conn: &Connection, table: &str, column: &str) -> bool {
     let mut statement = conn
@@ -43,6 +50,7 @@ fn fresh_install_reaches_current_schema() {
             (2, "add_lifecycle_metadata".to_string()),
             (3, "normalize_job_terminal_states".to_string()),
             (4, "case_insensitive_agent_names".to_string()),
+            (5, "add_tool_invocation_id".to_string()),
         ],
     );
     for (table, column) in [
@@ -52,6 +60,7 @@ fn fresh_install_reaches_current_schema() {
         ("jobs", "terminal_reason"),
         ("jobs", "retry_count"),
         ("jobs", "last_error"),
+        ("run_tool_calls", "tool_invocation_id"),
     ] {
         assert!(column_exists(&conn, table, column), "{table}.{column}");
     }
@@ -402,6 +411,7 @@ fn legacy_unversioned_columns_are_normalized() {
         ("runs", "resolved_config"),
         ("run_tool_calls", "session_id"),
         ("run_tool_calls", "from_agent"),
+        ("run_tool_calls", "tool_invocation_id"),
     ] {
         assert!(column_exists(&conn, table, column), "{table}.{column}");
     }
@@ -523,4 +533,99 @@ fn migrated_legacy_database_enforces_case_insensitive_agent_names() {
         )
         .unwrap();
     assert_eq!(name, "atlas");
+}
+
+/// #5: a pre-#5 database gains `run_tool_calls.tool_invocation_id`, its
+/// existing rows read back as `None`, and new rows round-trip the correlator.
+///
+/// Asserted through the store's own load path rather than by checking
+/// `PRAGMA table_info`, for the same reason as the case-insensitive-names
+/// test above: what has to hold is that the column *behaves* — a row written
+/// before the migration is readable and reports no correlator, and a row
+/// written after carries one. A `sqlite_master` assertion would pass on a
+/// migration that added the column but left the SELECT projection behind,
+/// which is exactly the half-done state worth catching.
+#[test]
+fn migrated_legacy_database_round_trips_tool_invocation_id() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("legacy-tool-calls.db");
+    let conn = Connection::open(&path).unwrap();
+    conn.execute_batch(CHECKPOINT_SCHEMA).unwrap();
+
+    // The v0.2.4 checkpoint's `run_tool_calls` has no `tool_invocation_id`,
+    // so this INSERT is only valid pre-migration — it pins that the fixture
+    // really is a pre-#5 shape rather than one that quietly gained the column.
+    assert!(
+        !column_exists(&conn, "run_tool_calls", "tool_invocation_id"),
+        "fixture must be a genuine pre-#5 schema, or this test proves nothing",
+    );
+    conn.execute(
+        "INSERT INTO run_tool_calls
+         (run_id, session_id, seq, role, tool_name, tool_id, params, result, timestamp)
+         VALUES (?1, ?2, 0, 'assistant', 'echo', 'call_legacy', '{}', NULL, ?3)",
+        params![
+            LEGACY_RUN_ID.to_string(),
+            LEGACY_SESSION_ID.to_string(),
+            "2026-07-10T00:00:00Z",
+        ],
+    )
+    .unwrap();
+    drop(conn);
+
+    let store = SqliteStore::open(&path).unwrap();
+    assert_eq!(store.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
+
+    let run_id = RunId(uuid::Uuid::parse_str(LEGACY_RUN_ID).unwrap());
+    let session_id = SessionId(uuid::Uuid::parse_str(LEGACY_SESSION_ID).unwrap());
+
+    // The pre-existing row survives and reports no correlator. `None` rather
+    // than a backfilled value is the whole disposition: the invocation id is
+    // minted per-invocation inside the agent loop and is not recoverable from
+    // anything on the row, so there is nothing to backfill it *to*.
+    let legacy = store.load_tool_calls(run_id).unwrap();
+    assert_eq!(legacy.len(), 1, "the pre-#5 row must survive the migration");
+    assert_eq!(legacy[0].tool_id.as_deref(), Some("call_legacy"));
+    assert_eq!(
+        legacy[0].tool_invocation_id, None,
+        "a row written before #5 has no correlator to report",
+    );
+
+    // A row written after the migration carries one, through both loaders.
+    store
+        .save_tool_call(
+            run_id,
+            session_id,
+            &ToolCallRecord {
+                seq: 1,
+                role: ToolCallRole::Assistant,
+                tool_name: Some("echo".to_string()),
+                tool_id: Some("call_new".to_string()),
+                tool_invocation_id: Some("6f1c9d2e-0000-4000-8000-000000000001".to_string()),
+                params: Some("{}".to_string()),
+                result: None,
+                timestamp: chrono::Utc::now(),
+                from_agent: None,
+            },
+        )
+        .unwrap();
+
+    let by_run = store.load_tool_calls(run_id).unwrap();
+    assert_eq!(by_run.len(), 2);
+    assert_eq!(
+        by_run[1].tool_invocation_id.as_deref(),
+        Some("6f1c9d2e-0000-4000-8000-000000000001"),
+    );
+
+    // `load_tool_calls_for_session` is a separate projection and a separate
+    // decoder, so it gets its own assertion rather than riding on the above.
+    let by_session = store.load_tool_calls_for_session(session_id).unwrap();
+    let correlators: Vec<Option<&str>> = by_session
+        .iter()
+        .map(|c| c.record.tool_invocation_id.as_deref())
+        .collect();
+    assert_eq!(
+        correlators,
+        vec![None, Some("6f1c9d2e-0000-4000-8000-000000000001")],
+        "the session-level loader must surface the correlator too",
+    );
 }
