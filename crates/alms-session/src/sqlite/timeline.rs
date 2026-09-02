@@ -420,6 +420,7 @@ mod tests {
             role: ToolCallRole::Assistant,
             tool_name: Some("shell_exec".to_string()),
             tool_id: Some("call_0".to_string()),
+            tool_invocation_id: None,
             params: Some(r#"{"cmd":"ls"}"#.to_string()),
             result: None,
             timestamp: chrono::Utc::now(),

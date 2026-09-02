@@ -837,6 +837,7 @@ mod tests {
             role,
             tool_name: Some(tool_name.to_string()),
             tool_id: Some(tool_id.to_string()),
+            tool_invocation_id: None,
             params: None,
             result: result.map(String::from),
             timestamp: chrono::Utc::now(),

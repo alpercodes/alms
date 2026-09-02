@@ -476,6 +476,7 @@ mod tests {
             role: ToolCallRole::Tool,
             tool_name: Some(name.to_string()),
             tool_id: Some("call_1".to_string()),
+            tool_invocation_id: None,
             params: None,
             result: Some(result.to_string()),
             timestamp: Utc::now(),

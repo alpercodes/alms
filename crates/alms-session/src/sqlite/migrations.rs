@@ -2,15 +2,16 @@
 //!
 //! Version 1 adopts and normalizes every schema shape accepted by the former
 //! best-effort startup path. Later versions add lifecycle metadata, normalize
-//! durable job terminal/retry state, and make agent-name uniqueness
-//! case-insensitive.
+//! durable job terminal/retry state, make agent-name uniqueness
+//! case-insensitive, and record ALMS's own tool-invocation correlator on
+//! per-run tool call rows.
 
 use super::{V1_BASELINE_INDEXES, V1_BASELINE_SCHEMA};
 use alms_core::{AlmsError, AlmsResult};
 use rusqlite::{Connection, ErrorCode, Transaction, TransactionBehavior, params};
 use std::time::{Duration, Instant};
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 4;
+pub const CURRENT_SCHEMA_VERSION: u32 = 5;
 
 const CONNECTION_PRAGMAS: &str = "
 PRAGMA foreign_keys=ON;
@@ -53,6 +54,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 4,
         name: "case_insensitive_agent_names",
         apply: case_insensitive_agent_names,
+    },
+    Migration {
+        version: 5,
+        name: "add_tool_invocation_id",
+        apply: add_tool_invocation_id,
     },
 ];
 
@@ -296,6 +302,27 @@ fn case_insensitive_agent_names(transaction: &Transaction<'_>) -> rusqlite::Resu
     )
 }
 
+/// #5: record ALMS's own tool-invocation correlator on per-run tool call rows.
+///
+/// `run_tool_calls.tool_id` is the *provider's* call id; the id the SSE
+/// stream, `session_messages` metadata and every frontend lookup key on is
+/// the invocation id, and it was not stored. A chat row reconstructed from
+/// this table was therefore uncorrelatable with the live event stream.
+///
+/// Nullable with no backfill, deliberately. The correlator is generated
+/// per-invocation inside the agent loop and is not recoverable from anything
+/// on the row — there is no value to backfill *to*, so a row written before
+/// this migration reads back as `None` and the frontend falls back to
+/// `tool_id`, which is exactly the pre-#5 behaviour.
+///
+/// `add_column_if_missing` rather than a bare `ALTER TABLE`: the column is
+/// also in the v1 baseline, so a database created fresh already has it and
+/// this must be a no-op there. (Same shape as the `from_agent` /
+/// `session_id` additions in migration 1.)
+fn add_tool_invocation_id(transaction: &Transaction<'_>) -> rusqlite::Result<()> {
+    add_column_if_missing(transaction, "run_tool_calls", "tool_invocation_id", "TEXT")
+}
+
 fn add_column_if_missing(
     conn: &Connection,
     table: &str,
@@ -360,15 +387,26 @@ mod tests {
     /// `validate_migration_list` requires the list to end exactly at the
     /// constant, so a fixed-length fixture would have to be re-numbered by
     /// hand every time a real migration ships. The padding steps are no-ops.
+    ///
+    /// Each pad gets its **own** name. `schema_migrations.name` is `UNIQUE`,
+    /// so a shared name works only while at most one pad is ever appended —
+    /// which was true until #5 took the constant to 5 and a three-step
+    /// fixture started needing two pads. The failure was a `UNIQUE constraint
+    /// failed` from the recording INSERT, i.e. the fixture breaking, not the
+    /// migration runner; the per-version name removes the ceiling entirely
+    /// rather than raising it by one.
     fn pad_to_current(head: &[Migration]) -> Vec<Migration> {
         fn noop(_: &Transaction<'_>) -> rusqlite::Result<()> {
             Ok(())
         }
         let mut list = head.to_vec();
         for version in (list.len() as u32 + 1)..=CURRENT_SCHEMA_VERSION {
+            // `Migration::name` is `&'static str`; leaking here is bounded by
+            // the migration count and confined to the test binary.
+            let name: &'static str = Box::leak(format!("pad_noop_{version}").into_boxed_str());
             list.push(Migration {
                 version,
-                name: "pad_noop",
+                name,
                 apply: noop,
             });
         }

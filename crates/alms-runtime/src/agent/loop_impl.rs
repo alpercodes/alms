@@ -819,12 +819,22 @@ impl AgentRuntime {
                 // frontend fallback merge path can attribute reasoning
                 // blocks to the correct agent when session-level
                 // persistence is missing. (#696)
-                for tc in &tool_calls {
+                //
+                // `tool_invocation_id` carries the SAME correlator that was
+                // just handed to `persist_assistant_tool_calls` and that the
+                // `tool_start` / `tool_end` SSE events will use (#5). Storing
+                // only the provider's `tool_id` is what made a row
+                // reconstructed from this table uncorrelatable with the live
+                // stream. `invocation_ids` is positional over `tool_calls`
+                // (built by mapping over it directly, just above), so `zip`
+                // is the pairing — not an index lookup that could drift.
+                for (tc, invocation_id) in tool_calls.iter().zip(&invocation_ids) {
                     tool_call_records.push(alms_core::ToolCallRecord {
                         seq: tool_seq,
                         role: alms_core::ToolCallRole::Assistant,
                         tool_name: Some(tc.function.name.clone()),
                         tool_id: Some(tc.id.clone()),
+                        tool_invocation_id: Some(invocation_id.to_string()),
                         params: Some(tc.function.arguments.clone()),
                         result: None,
                         timestamp: chrono::Utc::now(),
@@ -1872,11 +1882,16 @@ impl AgentRuntime {
         }
 
         // Collect tool result record for per-run storage (all sessions).
+        //
+        // Same `invocation_id` this function already stamped onto the session
+        // message metadata a few lines above, so the persisted result row and
+        // the `tool_end` event agree on identity (#5).
         tool_call_records.push(alms_core::ToolCallRecord {
             seq: *tool_seq,
             role: alms_core::ToolCallRole::Tool,
             tool_name: Some(tool_call.function.name.clone()),
             tool_id: Some(tool_call.id.clone()),
+            tool_invocation_id: Some(invocation_id.to_string()),
             params: None,
             result: Some(content.clone()),
             timestamp: chrono::Utc::now(),
