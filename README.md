@@ -31,23 +31,29 @@ Requires Rust nightly, installed automatically from `rust-toolchain.toml`.
 ```bash
 cargo build --release
 
-# Start the gateway (defaults to 127.0.0.1:8080)
+# Store a provider key — openai, anthropic, openrouter, or gemini.
+# Do this before starting the gateway: the daemon reads secrets.json once
+# at boot, so a key stored while it is running will not be picked up.
+./target/release/alms auth set openrouter
+```
+
+Then start the gateway. It runs in the foreground:
+
+```bash
+# Defaults to 127.0.0.1:8080
 ./target/release/alms gateway
 ```
 
-A first run needs a provider key and an agent. In a second shell:
+In a second shell, create an agent and open the web UI. Agents are read from SQLite per
+call, so creating one against a running gateway works:
 
 ```bash
-# Store a provider key — openai, anthropic, openrouter, or gemini
-./target/release/alms auth set openrouter
-
-# Create an agent
 ./target/release/alms agent create atlas \
     --description "Coordinator" \
     --posture guarded
 
-# Open the web UI — the shortest path to a first run: it creates the
-# session for you and streams the agent's output live
+# The shortest path to a first run — the dashboard creates the session
+# for you and streams the agent's output live
 ./target/release/alms dashboard
 ```
 
