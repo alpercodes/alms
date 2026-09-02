@@ -8,18 +8,60 @@ the git history.
 
 ### ⚠️ Default changes — read before upgrading
 
+Each item below changes behaviour for a deployment that has not set the knob explicitly.
+
 - **Agent-loop hard caps now default ON, and the run-duration guard is inactivity-based.**
   `[llm].max_iterations` defaults to `500` and bounds a single run of any type — web chat,
   scheduled job, or subagent. A run is terminated when it stops making *progress* rather
   than on flat wall-clock, so a long but productive run is no longer clipped. New `[llm]`
   knobs: `between_iterations_secs` (default `180`) and `tool_phase_ceiling_secs` (default
-  `900`). The absolute backstop `max_run_duration_secs` rose from 4h to 24h. Set any knob
-  to `0` to disable it. All are config-file-only and require a restart.
+  `900`); the absolute backstop `max_run_duration_secs` rose from 4h to 24h.
+
+  **After upgrading**, a previously-unbounded deployment will end any run exceeding 500 LLM
+  calls, stalling past a phase budget, or running 24h as `failed`. A stalled run carries its
+  own session label, **"Agent stopped after stalling (no activity)"**, so it is
+  distinguishable from a crash. Set any knob to `0` to disable that cap. All are
+  config-file-only — not mutable via `PATCH /settings`, no env override, restart required.
+  See `docs/config.md` § "Agent-loop hard caps".
+
+- **`[llm.anthropic].thinking_budget_tokens` default `0` → `2048`.** Anthropic deployments
+  that never set it explicitly start paying ~2048 thinking tokens per turn.
+
+  **To disable it after upgrading**, set the per-agent `thinking_budget_tokens` to `0` (an
+  explicit zero disables), or pin `[llm.anthropic].thinking_budget_tokens = 0` fleet-wide.
+  ⚠️ `clear_thinking_budget_tokens: true` does **not** disable thinking — it clears the
+  per-agent override back to *inherit*, and inheriting now means `2048`, so it re-enables it.
+
+- **`[llm].timeout_secs` `120` → `600`; `[llm].stream_chunk_timeout_secs` `60` → `180`.**
+  The first is the per-call HTTP deadline, raised because heavy reasoning models
+  legitimately reason past 120s; the second is the per-chunk body-silence guard. Both apply
+  to every run type and are inherited verbatim by subagents.
+
+  **After upgrading**, a provider that accepts the connection and then goes quiet hangs for
+  up to 10 minutes instead of 2. A host that is simply unreachable is still bounded by a
+  fixed 30s connect timeout. Pin lower values under `[llm]` if you prefer tighter deadlines.
 
 - **Default model and provider changed.** `[llm].model` now defaults to `z-ai/glm-5.2` on
-  the `openrouter` provider. Conversation summarisation defaults to a separate, cheaper
-  model rather than reusing the main one. Deployments with an explicit model set are
+  the `openrouter` provider. Conversation summarisation no longer reuses the agent's model:
+  `[context].summary_model` / `summary_provider` default to the pair
+  `google/gemma-4-31b-it` @ `openrouter`. Deployments with an explicit model set are
   unaffected.
+
+  ⚠️ **If your agents run on a non-OpenRouter provider** — Anthropic direct, for example —
+  summarisation now needs a resolvable OpenRouter key (`alms auth set openrouter <key>`) or
+  it fails. **To restore the old inherit-the-agent's-model behaviour**, clear *both* fields
+  together: `summary_model = ""` and `summary_provider = ""`. Setting only one is rejected
+  at boot. The empty string is the explicit-clear sentinel on all three surfaces — TOML,
+  `PATCH /settings`, and the persisted `settings.json` — so a clear survives a restart.
+
+- **`workspace_write`'s `mode` now defaults per file: `memories` appends, the other three
+  replace.** Previously every file defaulted to `write`, so a call that omitted `mode`
+  replaced the whole file — the wrong branch to guess for `memories.md`.
+
+  ⚠️ **This changes what an existing tool call does for every agent already calling it.**
+  A `workspace_write` on `memories` with no `mode` now *adds* to the file instead of
+  replacing it. `personality`, `goals` and `user` still default to `write`, and an explicit
+  `mode` is still honoured everywhere.
 
 - **`fs_read` output caps lowered.** Whole-file reads cap at 256 KiB; passing `offset` or
   `limit` falls back to a 64 KiB output budget. Large reads must paginate.
