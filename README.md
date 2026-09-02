@@ -83,8 +83,7 @@ decisions, and you should know them before deploying:
 - **Prompt injection is not solved.** Tool output enters the model's context; a hostile
   repository or web page can attempt to steer an agent.
 
-Full detail in [`docs/security-model.md`](docs/security-model.md) and
-[`SECURITY.md`](SECURITY.md).
+Full detail in [`docs/security-model.md`](docs/security-model.md).
 
 ## Architecture
 
