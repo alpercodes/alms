@@ -1,2 +1,27 @@
+# Line-ending policy (issue #11).
+#
+# `text=auto` makes LF-in-the-index a property of the REPOSITORY rather than of
+# each contributor's `core.autocrlf`. It deliberately does NOT set `eol`, so the
+# working tree keeps whatever the platform's git produces -- CRLF on a default
+# Windows checkout, LF elsewhere. Adding it caused zero churn: every tracked
+# file was already LF in the index (`git ls-files --eol` reports no `i/crlf` and
+# no `i/mixed`), so no renormalise commit was needed.
+#
+# It is the guard for the other half of #11: `endOfLine: "auto"` in
+# .prettierrc.json makes `ui:format:check` accept a native-CRLF working tree --
+# which it must, or `npm run ui:check` is unusable on Windows and never reaches
+# the test suites -- but that also means prettier would no longer object to a
+# CRLF file being committed. This line keeps that from happening at the layer
+# where it actually matters.
+#
+# A repo-wide `eol=lf` would ALSO fix the prettier symptom, by forcing LF into
+# every working tree. Not done: it rewrites every existing checkout, overrides a
+# setting contributors are entitled to choose, and buys nothing the pair above
+# does not already deliver.
+* text=auto
+
+# Generated artefacts whose committed bytes are compared against a fresh build
+# (`npm run ui:build`), so they must be byte-identical on every platform. More
+# specific than the rule above, so they win.
 crates/alms-gateway/static/ui/index.html text eol=lf
 crates/alms-gateway/static/ui-dist/index.html text eol=lf
