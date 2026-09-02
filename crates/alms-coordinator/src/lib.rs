@@ -501,9 +501,10 @@ impl Coordinator {
         // `{"name": "Reviewer"}` and `{"name": "reviewer"}` must not fork into
         // two identities for one subagent.
         //
-        // THE GUARD KEY FOLDS BY CONSTRUCTION, NOT BY REMEMBERING TO. This is
-        // the property that makes the fix safe, so it is worth being explicit
-        // rather than leaving the next reader to re-verify it.
+        // THE GUARD KEY FOLDS BY CONSTRUCTION, GIVEN A STABLE REGISTRY READ.
+        // That is the property making the fix safe, so it is worth stating
+        // exactly — including its one exception — rather than leaving the
+        // next reader to re-derive either half.
         //
         // Collapsing two spellings onto one session WITHOUT collapsing the
         // `active_named` key would admit two concurrent runs against one
@@ -527,6 +528,28 @@ impl Coordinator {
         // `request` is moved into the spawned task, so `run_subagent` and
         // `run_agent_loop` see the mutated value too. There is no path that
         // reads the pre-fold spelling.
+        //
+        // THE ONE WINDOW WHERE IT DOES NOT HOLD. The rule is shared, but the
+        // registry *read* is not: this folds the request field, and
+        // `named_subagent_key` reads the registry again downstream. If those
+        // two reads disagree — a transient store error on one, success on the
+        // other — the field holds `scout` while the session context is built
+        // from `Scout`, so the guard key, workspace dir and label fold one way
+        // and the session the other. With both reads failing, or neither, the
+        // guard still serialises correctly; the bad shape is one of two
+        // concurrent invocations hitting the error, which yields different
+        // guard keys and the same session — the very hazard this fold-together
+        // constraint exists to prevent.
+        //
+        // Not closed here, deliberately. It predates the fold (the #2 version
+        // had the same window), it needs a SQLite failure inside a two-call
+        // window, and it is already the *declared* disposition: see the
+        // accepted-fork note on `SessionManager::named_subagent_key`, which
+        // explains why forking is cheaper than failing the invocation and
+        // requires it to be visible — `lookup_subagent_record` logs it.
+        // Folding once and threading the result would remove the second read,
+        // but the read path has no earlier point to fold at, so it would buy
+        // this at the cost of the property that makes #12 unrepeatable.
         let mut request = request;
         canonicalize_subagent_name(&self.session_manager, &mut request);
 
@@ -1841,8 +1864,16 @@ fn derive_subagent_identity(
 /// Because three of the five things that key on the name never go through
 /// `named_subagent_key`. Mutating the request's own field is what reaches
 /// them — see the call site in [`Coordinator::spawn_subagent`] for the census
-/// and for why the `active_named` guard folds by construction rather than by
-/// anyone remembering to fold it.
+/// and for why the `active_named` guard folds by construction **given a
+/// stable registry read**, rather than by anyone remembering to fold it.
+///
+/// The qualifier is not a hedge. This and `named_subagent_key` share the
+/// *rule* but not the registry *read*, so a transient store error on one of
+/// them and success on the other is the single way they disagree — and the
+/// consequence is the guard key folding one way while the session context
+/// folds the other. See the accepted-fork note on
+/// [`SessionManager::named_subagent_key`] for why that disposition is
+/// deliberate and why it is logged rather than fixed here.
 fn canonicalize_subagent_name(session_manager: &SessionManager, request: &mut SubagentRequest) {
     let Some(name) = request.subagent_name.as_deref() else {
         return;

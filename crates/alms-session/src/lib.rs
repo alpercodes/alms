@@ -803,10 +803,20 @@ impl SessionManager {
     /// `validate_agent_name` already rejects those case-insensitively (#2) —
     /// so `DM` never reaches here to become `dm`.
     ///
-    /// Idempotent, and that is load-bearing: the coordinator folds the
-    /// request's name in place and the key derivation folds again downstream,
-    /// so a non-idempotent rule would desynchronise them on the second
-    /// application.
+    /// Idempotent for a stable registry read, and that is load-bearing: the
+    /// coordinator folds the request's name in place and the key derivation
+    /// folds again downstream, so a rule that moved on the second application
+    /// would desynchronise them.
+    ///
+    /// The one branch-flip that would break it cannot happen. A name
+    /// unregistered at the first application and registered at the second
+    /// would take the fold, then the registry spelling — but the lookup has
+    /// matched case-insensitively since #2, so if a record exists at the
+    /// second call it existed at the first, and the first call already took
+    /// the registry branch. What *can* differ between the two is the read
+    /// itself failing on one of them; see the accepted-fork note on
+    /// [`Self::named_subagent_key`], which is where that disposition is
+    /// declared and logged.
     pub fn canonical_subagent_name(&self, name: &str) -> String {
         Self::fold(self.lookup_subagent_record(name).as_ref(), name)
     }
