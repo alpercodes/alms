@@ -355,11 +355,16 @@ invocations cannot escape it.
 #### Single sandbox root — the project root
 
 Every agent runs with **one** filesystem sandbox root, and that root is
-the project directory by default. Both file tools (`fs_read`,
-`fs_write`, `fs_list`, `fs_edit`, `fs_grep`, `fs_glob`) and the `shell`
-tool enforce against this same root: paths must resolve under it after
-symlink canonicalization, and the shell's persistent cwd defaults to
-it.
+the project directory by default. The file tools (`fs_read`,
+`fs_write`, `fs_list`, `fs_edit`, `fs_grep`, `fs_glob`) *enforce* it:
+a path must resolve under the root after symlink canonicalization or
+the call is refused. The `shell` tool is **pinned** to it — that root
+is its starting cwd, and a cwd that leaves it is reverted after the
+fact — but the shell does not inspect paths inside the command. What
+actually confines a shell child is Landlock on Linux 5.13+, and nothing
+on Windows or macOS. That difference is the most important thing in
+this section; see *Shell sandboxing platform asymmetry* below before
+relying on it.
 
 This is a deliberate change from the pre-#945 layout, where the agent's
 metadata directory under `workspace_dir/<agent>/` was the sandbox root
@@ -627,39 +632,92 @@ TOML file.
 Ephemeral subagents cannot match the list — they have no name — and
 always inherit the parent's effective sandbox root.
 
+**A listed name is reachable by the model, not only by the operator.**
+The subagent call site passes `request.subagent_name` to
+`SecurityConfig::is_full_os_access_agent`, and that name is the string
+the LLM supplied to `invoke_agent`; it is left byte-for-byte when no
+registry row matches it. Matching is case-insensitive. So listing
+`deploy-bot` does not scope the grant to a registered agent called
+`deploy-bot` — **any** agent that emits
+`invoke_agent(name: "Deploy-Bot")` gets an unsandboxed subagent,
+registered or not. Treat every entry on this list as a name any agent
+in the fleet can claim, and pick entries a model is unlikely to guess.
+
 #### Shell sandboxing platform asymmetry — be honest about this
 
-The filesystem prefix check (the application-layer
+The `fs_*` prefix check (the application-layer
 `canonicalize() + starts_with` logic above) runs identically on every
-platform. The `shell` tool's filesystem isolation does **not**.
+platform — `check_sandbox_path` in
+`crates/alms-sandbox/src/builtin/mod.rs` is not `cfg`-gated, so there is
+no Windows/macOS weakening there. That is the boundary that *does* hold
+everywhere.
 
+The `shell` tool is a different story, and the asymmetry is narrower and
+worse than "application-layer instead of kernel-level":
+
+- **The `shell` tool does not check paths in the command, on any
+  platform.** The last check that looked at command *arguments* was a
+  hardcoded denied-filename list, removed in the old tracker's #744 with
+  nothing to replace it. The module docs in
+  `crates/alms-sandbox/src/shell/security.rs` record the removal and the
+  reasoning: a substring scan over a shell command string is bypassed by
+  a symlink, variable expansion, command substitution, an encoded name,
+  or a renamed copy, so it projected a posture it could not deliver.
+  Do not go looking for one — `command_references_denied_file`, cited by
+  earlier revisions of this section, does not exist.
+- **The only shell-side path logic is post-hoc cwd containment**
+  (`crates/alms-sandbox/src/shell/pathnorm.rs`). After a command runs,
+  the shell reports its final working directory; if that directory does
+  not normalise to something under the sandbox root, the persistent cwd
+  is **reverted** and a `[cwd unchanged: …]` notice is appended to
+  stdout. It runs *after* the command. `cd /etc && ls` returns the
+  `/etc` listing to the model and then resets the cwd — the test in
+  `crates/alms-sandbox/src/shell/mod.rs` pins exactly that ("the
+  command's own output must survive intact"). This is cwd-drift
+  correction plus a signal to the agent, not a boundary.
 - **Linux 5.13+** — Landlock LSM applies a kernel-level filesystem
   sandbox to every shell child process (see
   [§ 4.5](#45-isolation-roadmap)). The child cannot open files outside
-  the configured allow-list of paths regardless of what the command
-  string says. This is the only platform where the shell sandbox is an
-  OS-enforced boundary.
-- **Windows and macOS** — there is no equivalent kernel-level shell
-  sandbox. The `shell` tool's path enforcement is **application-layer
-  only**: a substring scanner in `shell_exec` looks at the command
-  string and rejects invocations that reference paths outside the
-  sandbox root, but anything that hides the path (variable
-  substitution, base64 / hex decode, a script that the agent first
-  writes inside the sandbox and then `bash <script>`s, redirection
-  through stdin) bypasses the scanner. Same caveat as the existing
-  `command_references_denied_file` check: it catches the obvious
-  cases, not a motivated attacker.
+  the configured allow-list regardless of what the command string says.
+  This is the only platform where the shell has a filesystem boundary at
+  all.
+- **Windows and macOS** — there is **no filesystem boundary on `shell`**.
+  A command can read and write anything the daemon's OS user can. What
+  remains is the `[tools.shell_permissions]` regex list and the
+  destructive-command classifier
+  ([§ 4.3](#43-configurable-shell-permissions-shell_permissions)) — both
+  operator policy over command *strings* (`rm -rf /`, `mkfs.`, `dd if=`),
+  not path controls. Defeating the classifier is not what gets an agent
+  out of the project root; nothing is holding it in.
 
-For real shell isolation on Windows / macOS, operators should run the
-daemon as a low-privilege OS user with filesystem ACLs that limit
-access to the project root. See
+**Landlock degrades open on an unsupported kernel.**
+`apply_landlock_sandbox` (`crates/alms-sandbox/src/shell/exec.rs`) builds
+its ruleset inside `pre_exec`. If the first step,
+`Ruleset::default().handle_access(...)`, fails — an older kernel, or a
+container/seccomp profile that blocks the Landlock syscalls — it prints
+`[alms] Landlock not supported by kernel, running unsandboxed` and
+returns `Ok(())`, and the command runs with no filesystem restriction.
+Every *later* failure (ruleset creation, adding a rule, `restrict_self`,
+a `NotEnforced` status) is a hard error that refuses to run the command,
+so the degrade-open window is exactly "this kernel cannot do Landlock at
+all". Two consequences an operator needs:
+
+- **The 5.13+ floor is load-bearing.** On an older kernel, or in a
+  container that blocks the syscall, a Linux deployment has
+  Windows-grade shell containment — not a degraded version of the Linux
+  one.
+- **The notice is an `eprintln!` to the child's stderr, not a
+  `tracing::warn!`.** It does not reach structured logs, so a log
+  scanner will never see it. Verify Landlock by hand on an unfamiliar
+  kernel or inside a container.
+
+For real shell isolation on Windows / macOS — and on Linux below 5.13 —
+run the daemon as a **low-privilege OS user with filesystem ACLs** that
+limit it to the project root. That is currently the only containment
+available for `shell` on those platforms. See
 [§ 4.5 Isolation roadmap](#45-isolation-roadmap) for the longer-term
 plan (`bubblewrap`/`nsjail` on Linux, OS-user-based isolation as the
 universal answer).
-
-`fs_*` tools have no equivalent platform asymmetry — they go through
-the same `canonicalize() + starts_with` check on every OS, and
-substring tricks in the path string are pre-empted by canonicalization.
 
 ### 4.5a Tool output handling — truncation + spill files (#756 + #851)
 
