@@ -20,8 +20,35 @@
 # does not already deliver.
 * text=auto
 
-# Generated artefacts whose committed bytes are compared against a fresh build
-# (`npm run ui:build`), so they must be byte-identical on every platform. More
-# specific than the rule above, so they win.
+# ---------------------------------------------------------------------------
+# PRECEDENCE: git resolves .gitattributes by LAST MATCHING LINE, not by most
+# specific pattern (gitattributes(5): "If multiple patterns match the path, a
+# later line overrides an earlier line"). The entries below win over `* text=auto`
+# because they come AFTER it. Anything appended below them overrides THEM --
+# so a new wildcard added at the bottom would silently un-protect the
+# byte-compared assets these lines exist to protect. Append above this block.
+# ---------------------------------------------------------------------------
+
+# Generated frontend bundle. Its committed bytes are compared against a fresh
+# build by CI, and that check is a PAIR (.github/workflows/ci.yml):
+#
+#     npm run ui:build
+#     git diff --exit-code -- crates/alms-gateway/static/ui-dist
+#     test -z "$(git status --porcelain=v1 --untracked-files=all -- ...)"
+#
+# The first condition applies git's clean filter, so a CRLF working tree is
+# invisible to it; the second does not, and reports every generated file whose
+# working-tree line endings differ from what the build just wrote. Under
+# `* text=auto` alone, a Windows checkout materialises the multi-line chunks as
+# CRLF while vite writes LF, so the second condition fails locally and CI --
+# being Linux, and therefore LF -- never sees it. The drift gate was not
+# reproducible off Linux.
+#
+# `eol=lf` here fixes that at the checkout layer. The objections to a repo-wide
+# `eol=lf` do not apply to this directory: nobody hand-edits a minified bundle,
+# and byte-identity with a fresh build is the entire point of committing it.
+crates/alms-gateway/static/ui-dist/** text eol=lf
+
+# Source template for the bundle above; hashed asset names are injected into it
+# at build time, so it is compared the same way and needs the same treatment.
 crates/alms-gateway/static/ui/index.html text eol=lf
-crates/alms-gateway/static/ui-dist/index.html text eol=lf
