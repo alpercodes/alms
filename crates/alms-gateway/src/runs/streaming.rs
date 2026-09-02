@@ -101,7 +101,7 @@ pub async fn stream_run_events(
         // Run is active — register sender BEFORE snapshotting the event
         // log to close the race where events produced between snapshot
         // and registration would be lost. Overlap is deduplicated by
-        // stream_with_replay.
+        // stream_with_replay_source.
         let subscription = state.run_manager.subscribe_run(run_id);
 
         // TOCTOU guard: the run may have completed between the time the
@@ -192,9 +192,9 @@ pub struct SessionEventsQuery {
 /// `subagent_activity` events on the new channel.
 ///
 /// Snapshot events carry no `event_id` (they are live-channel events, never
-/// logged), so they pass the replay dedup filter in `stream_with_replay` and
-/// arrive after any persisted-event replay — the same ordering a genuinely
-/// live signal would have.
+/// logged), so they pass the replay dedup filter in
+/// `stream_with_replay_source` and arrive after any persisted-event
+/// replay — the same ordering a genuinely live signal would have.
 ///
 /// Shared by the `stream_session_events` handler and the reattach regression
 /// test so the test exercises the identical attach path the endpoint runs.

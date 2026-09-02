@@ -11,7 +11,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_stream::StreamExt;
-use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::error;
 use uuid::Uuid;
 
@@ -854,12 +853,6 @@ fn wire_event(data: SseEventData) -> Event {
 pub struct RunEventStream;
 
 impl RunEventStream {
-    pub fn stream(
-        receiver: mpsc::UnboundedReceiver<SseEventData>,
-    ) -> Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>> {
-        Self::stream_with_replay(receiver, Vec::new())
-    }
-
     /// Stream only replayed (historical) events, then close.
     /// Used for terminal runs (Completed/Failed/Cancelled) where no new events will arrive.
     pub fn stream_replay_only(
@@ -872,13 +865,6 @@ impl RunEventStream {
         );
 
         Sse::new(stream)
-    }
-
-    pub fn stream_with_replay(
-        receiver: mpsc::UnboundedReceiver<SseEventData>,
-        replay: Vec<SseEventData>,
-    ) -> Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>> {
-        Self::stream_with_replay_source(UnboundedReceiverStream::new(receiver), replay)
     }
 
     pub fn stream_with_replay_source<S>(
@@ -1369,6 +1355,7 @@ fn classify_error(msg: &str) -> String {
 mod tests {
     use super::*;
     use alms_core::RunId;
+    use tokio_stream::wrappers::UnboundedReceiverStream;
 
     #[test]
     fn frontend_wire_fixtures_match_real_rust_serialization() {
