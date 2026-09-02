@@ -580,6 +580,9 @@ entirely by listing them under `[security].allow_full_os_access` in
 
 ```toml
 [security]
+# Entries must be valid agent names — ASCII letters, digits and interior
+# hyphens. `deploy_bot` or `deploy.bot` load without error and can never
+# match anything; see the dead-entry note below.
 allow_full_os_access = ["operator-shell", "deploy-bot"]
 ```
 

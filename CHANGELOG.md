@@ -110,6 +110,9 @@ Each item below changes behaviour for a deployment that has not set the knob exp
 
 ### Internal
 
+Entries here exist only where an internal change could be mistaken for an operator-facing
+one.
+
 - Seven provably-unreachable `pub` items removed from the library crates — among them the
   `ShellExecTool` type alias (the `shell_exec` wire name is unaffected and still
   registered), a superseded string-based output truncator, and two `RunEventStream`
