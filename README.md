@@ -35,10 +35,27 @@ cargo build --release
 ./target/release/alms gateway
 ```
 
-The dashboard is the shortest path to a first run: it creates the session for you and
-streams the agent's output live.
+A first run needs a provider key and an agent. In a second shell:
 
-To drive it over the API instead — sessions are created against an agent UUID:
+```bash
+# Store a provider key — openai, anthropic, openrouter, or gemini
+./target/release/alms auth set openrouter
+
+# Create an agent
+./target/release/alms agent create atlas \
+    --description "Coordinator" \
+    --posture guarded
+
+# Open the web UI — the shortest path to a first run: it creates the
+# session for you and streams the agent's output live
+./target/release/alms dashboard
+```
+
+Postures are `guarded` (approval required for sensitive tools), `full_control`, and
+`autonomous`.
+
+To drive it over the API instead — sessions are created against an agent UUID, and these
+examples need `jq`:
 
 ```bash
 AGENT=$(./target/release/alms agent show atlas --json | jq -r .id)
@@ -50,9 +67,6 @@ SESSION=$(curl -sX POST http://127.0.0.1:8080/sessions \
 ./target/release/alms run create --session "$SESSION" --input "Summarise this repo"
 ./target/release/alms health
 ```
-
-Agent postures are `guarded` (approval required for sensitive tools), `full_control`, and
-`autonomous`.
 
 ## Before you run this
 
