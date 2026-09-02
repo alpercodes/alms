@@ -5,7 +5,12 @@
 //! window, the parent calls this tool when it needs detail from a specific
 //! subagent's session. Named subagents resolve by `name` through the same
 //! `(parent_agent_id, name)` keying invoke_agent dispatches on (#1051),
-//! via the shared `SessionManager::named_subagent_key` (#1278). Ephemeral
+//! via the shared `SessionManager::named_subagent_key` (#1278). That helper
+//! folds the name to its canonical spelling internally (#12), so a `name`
+//! spelled differently from the registry's still finds the session
+//! `invoke_agent` created — this tool deliberately does NOT pre-canonicalize,
+//! because a second application of the rule here is exactly the drift the
+//! shared helper exists to prevent. Ephemeral
 //! / unnamed subagents have no name to derive from, so
 //! they resolve by `session_id` instead (#1181) — the id every invoke_agent
 //! result, `subagent_started` event, and completion notification already
@@ -230,6 +235,12 @@ impl Tool for ReadSubagentSessionTool {
                 // different rules (the context is a pure format, the agent id
                 // depends on the registry — #1278) and a second spelling of
                 // them here is a silent "no session found" waiting to happen.
+                //
+                // `name` is passed RAW, on purpose. The helper folds it (#12).
+                // Pre-folding here would be a second copy of that rule in the
+                // one place whose whole job is to agree with the writer — and
+                // #12 was precisely the two paths disagreeing about the name
+                // one step above this call, while both "shared" the helper.
                 let key = self
                     .session_manager
                     .named_subagent_key(self.parent_agent_id, name);

@@ -768,6 +768,84 @@ impl SessionManager {
         self.store.as_ref()
     }
 
+    /// The canonical spelling of a subagent name (#6 / #12).
+    ///
+    /// **The one rule.** Every identity a named subagent has is derived from
+    /// its name — the session `context_id`, the fallback `AgentId`, the
+    /// `active_named` concurrency key, the `{workspace_dir}/{name}/`
+    /// directory, the status-bar chip label — and agent names resolve
+    /// case-insensitively (#2). So the name has to be reduced to one spelling
+    /// *before* any of them are computed, and it has to be the same reduction
+    /// everywhere. This function is that reduction; it is deliberately the
+    /// only place the choice is made.
+    ///
+    /// - **A registered name** takes the registry's spelling. There is an
+    ///   authored answer, so nothing is invented.
+    /// - **An unregistered name** is ASCII-lowercased. There is no authored
+    ///   answer — an unregistered name exists only as a string the model
+    ///   emitted this turn, and may be emitted differently next turn, which
+    ///   is precisely the defect. Names are `[A-Za-z0-9-]`
+    ///   ([`alms_core::validate_agent_name`]), so `to_ascii_lowercase` is
+    ///   exact here: no locale, no Unicode folding, no multi-char expansions.
+    ///
+    /// The cost of the second rule is that a chip the model asked for as
+    /// `Scout` renders as `scout`. Accepted deliberately (#6): the
+    /// alternative is that the *same two invocations* fork or do not
+    /// depending on whether someone happened to register the name, and that
+    /// discontinuity is harder to defend than a lowercase label. Note this is
+    /// **not** the "silently rewrite what the operator typed" failure the
+    /// agent-create form avoids — there the operator authored a durable name
+    /// once; here nobody authored anything.
+    ///
+    /// Folding cannot manufacture an invalid name. Lowercasing preserves the
+    /// character class and the no-leading/trailing-hyphen rule, and it cannot
+    /// produce a newly-*reserved* or newly-UUID-shaped name either, because
+    /// `validate_agent_name` already rejects those case-insensitively (#2) —
+    /// so `DM` never reaches here to become `dm`.
+    ///
+    /// Idempotent, and that is load-bearing: the coordinator folds the
+    /// request's name in place and the key derivation folds again downstream,
+    /// so a non-idempotent rule would desynchronise them on the second
+    /// application.
+    pub fn canonical_subagent_name(&self, name: &str) -> String {
+        Self::fold(self.lookup_subagent_record(name).as_ref(), name)
+    }
+
+    /// The fold itself, factored out so the name and the key derivation
+    /// cannot disagree about it while sharing one registry read.
+    fn fold(record: Option<&alms_core::AgentRecord>, name: &str) -> String {
+        match record {
+            Some(record) => record.name.clone(),
+            None => name.to_ascii_lowercase(),
+        }
+    }
+
+    /// One registry read, shared by [`Self::canonical_subagent_name`] and
+    /// [`Self::named_subagent_key`].
+    ///
+    /// `Ok(None)` (no such agent) and `Err` (registry unreadable) both yield
+    /// `None` because they share a *disposition* — the unregistered path —
+    /// but they are not the same event and must not collapse into one silent
+    /// `None` (#1241/#1246), so the failure is logged. See the note on
+    /// [`Self::named_subagent_key`] for why the fork it causes is a cheaper
+    /// disposition than failing the invocation.
+    fn lookup_subagent_record(&self, name: &str) -> Option<alms_core::AgentRecord> {
+        let store = self.store.as_ref()?;
+        match store.load_agent_by_name(name) {
+            Ok(record) => record,
+            Err(e) => {
+                tracing::warn!(
+                    subagent_name = %name,
+                    error = %e,
+                    "Agent registry unreadable while resolving a named subagent; falling back \
+                     to the folded spelling and the derived id, which forks this invocation from \
+                     invocations that resolved the registry record"
+                );
+                None
+            }
+        }
+    }
+
     /// Resolve the `(agent_id, context_id)` key a **named** subagent
     /// session is filed under (#1278).
     ///
@@ -776,10 +854,19 @@ impl SessionManager {
     /// the coordinator's `derive_subagent_identity` (write) and
     /// `ReadSubagentSessionTool`'s by-name lookup (read).
     ///
+    /// Sharing this function is necessary but was not sufficient (#12). The
+    /// key was derived from the caller's `name`, so the two paths could still
+    /// diverge one step *above* here: the write path canonicalized the name
+    /// against the registry before calling in, the read path passed the
+    /// model's spelling straight through, and the shared helper faithfully
+    /// produced two different keys from two different inputs. The fold now
+    /// happens inside this function, on the way in, so agreement no longer
+    /// depends on what callers remember to do first.
+    ///
     /// # Which agent id
     ///
     /// The invoked agent's **registry id**, when a registry record exists
-    /// for `name`. Before #1278 the key was
+    /// for `name` (matched case-insensitively, #2). Before #1278 the key was
     /// `AgentId::deterministic(parent_agent_id, name)`, which resolves
     /// against no registered agent — so a named subagent's transcript was
     /// filed under an id nothing in the product could look up, and the
@@ -797,11 +884,22 @@ impl SessionManager {
     /// of `AgentId::deterministic` for subagent keying, and it is a live
     /// case rather than a legacy accommodation.
     ///
+    /// Both halves key on the **folded** spelling (#6). `AgentId::deterministic`
+    /// hashes the string it is given, so keying it on the raw name forked
+    /// `Scout` and `scout` into two subagents with two sessions, two
+    /// workspace directories and two chips — for a name whose registered
+    /// equivalent would have been one agent. See
+    /// [`Self::canonical_subagent_name`] for why the fold is a lowercase
+    /// rather than a first-spelling-wins rule.
+    ///
     /// # This answer does not depend on what is already stored
     ///
-    /// The key is a pure function of the registry *when the registry can be
-    /// read*, deliberately: it never looks at whether a session already sits
-    /// on either key. So a name invoked before its agent was registered
+    /// The key is a pure function of the registry and the name *when the
+    /// registry can be read*, deliberately: it never looks at whether a
+    /// session already sits on either key. This is also why the #6 fold is a
+    /// lowercase rule and not "whichever spelling was seen first" — that
+    /// would make identity depend on invocation order, which is the property
+    /// this section exists to exclude. So a name invoked before its agent was registered
     /// lands on the derived id, and the invocation after the registration
     /// lands on the registry id and starts a fresh session — the earlier
     /// transcript stays in the database but is no longer reachable by name.
@@ -827,28 +925,30 @@ impl SessionManager {
     /// named subagent depend on invocation order, which is a far worse
     /// thing to carry forward than one lost transcript.
     pub fn named_subagent_key(&self, parent_agent_id: AgentId, name: &str) -> (AgentId, String) {
-        let context_id = alms_core::named_subagent_context_id(parent_agent_id, name);
+        // Fold FIRST, then derive both halves from the folded spelling.
+        //
+        // Order is the whole fix (#12). This used to build the `context_id`
+        // from the caller's `name` while taking the `agent_id` from a lookup
+        // that folds case, so the key was half-folded: `invoke_agent`, which
+        // canonicalized before calling in, and `read_subagent_session`, which
+        // did not, agreed on the id and disagreed on the context. A read then
+        // missed a session the write had just created and reported the
+        // subagent had never been invoked.
+        //
+        // Doing it here rather than asking both callers to canonicalize first
+        // is what makes that unrepeatable: this function is already the single
+        // source of truth both paths funnel through, so a caller cannot forget
+        // a step it does not have to take.
+        let record = self.lookup_subagent_record(name);
+        let canonical = Self::fold(record.as_ref(), name);
+        let context_id = alms_core::named_subagent_context_id(parent_agent_id, &canonical);
 
-        let registry_id = self.store.as_ref().and_then(|store| {
-            match store.load_agent_by_name(name) {
-                Ok(record) => record.map(|r| r.id),
-                Err(e) => {
-                    tracing::warn!(
-                        subagent_name = %name,
-                        parent_agent_id = %parent_agent_id.0,
-                        error = %e,
-                        "Agent registry unreadable while keying a named subagent; filing this \
-                         invocation under the derived fallback id, which forks its session from \
-                         invocations that resolved the registry id"
-                    );
-                    None
-                }
-            }
-        });
-
-        match registry_id {
-            Some(agent_id) => (agent_id, context_id),
-            None => (AgentId::deterministic(parent_agent_id, name), context_id),
+        match record {
+            Some(record) => (record.id, context_id),
+            None => (
+                AgentId::deterministic(parent_agent_id, &canonical),
+                context_id,
+            ),
         }
     }
 
@@ -1401,6 +1501,142 @@ mod tests {
             "the ownership check reads the parent out of these bytes"
         );
         assert_eq!(alms_core::parse_subagent_parent(&ctx_b), Some(parent_b));
+    }
+
+    /// #12, the regression this bug needed and did not have: invoke a
+    /// registered subagent with NON-REGISTRY casing, then read it back with
+    /// **the same casing**, and the session must be found.
+    ///
+    /// That exact sequence is what a self-consistent model produces
+    /// unprompted — it picks a spelling and reuses it. The system used to
+    /// canonicalize the write and not the read, so the model's consistency
+    /// was not enough: `invoke_agent {"name":"Reviewer"}` landed on
+    /// `subagent_{p}_reviewer` while `read_subagent_session {"name":"Reviewer"}`
+    /// looked for `subagent_{p}_Reviewer` and was told the subagent had never
+    /// been invoked. Nobody typed anything wrong.
+    ///
+    /// Driven through the two real entry points rather than through one of
+    /// them twice: the bug was an asymmetry BETWEEN the paths, so a test that
+    /// exercised either alone would have passed throughout.
+    #[test]
+    fn a_case_varied_read_finds_the_session_the_write_created() {
+        let mgr = make_manager();
+        let parent = AgentId::new();
+        register_agent(&mgr, "reviewer");
+
+        // Write path: the coordinator canonicalizes, then derives the key.
+        let written = mgr.named_subagent_key(parent, &mgr.canonical_subagent_name("Reviewer"));
+        let session = mgr.get_or_create(written.0, &written.1);
+
+        // Read path: `read_subagent_session` passes the model's spelling raw.
+        for spelling in ["Reviewer", "reviewer", "REVIEWER"] {
+            let read = mgr.named_subagent_key(parent, spelling);
+            assert!(
+                mgr.has_session(&read),
+                "reading back as {spelling:?} must find the session the write created"
+            );
+            assert_eq!(
+                mgr.get_or_create(read.0, &read.1).id,
+                session.id,
+                "{spelling:?} must resolve to the SAME session, not a fresh one"
+            );
+        }
+    }
+
+    /// #12: the two halves of the key must fold together.
+    ///
+    /// The bug was a HALF-folded key — `agent_id` folded (it comes from a
+    /// case-insensitive registry lookup) while `context_id` interpolated the
+    /// literal name. Asserting only that the ids match would have passed
+    /// before the fix; the context is the half that was wrong.
+    #[test]
+    fn both_halves_of_the_key_fold_together() {
+        let mgr = make_manager();
+        let parent = AgentId::new();
+        register_agent(&mgr, "reviewer");
+
+        let canonical = mgr.named_subagent_key(parent, "reviewer");
+        let varied = mgr.named_subagent_key(parent, "Reviewer");
+
+        assert_eq!(varied.0, canonical.0, "agent id half");
+        assert_eq!(
+            varied.1, canonical.1,
+            "context id half — this is the one that did not fold"
+        );
+        assert_eq!(varied.1, format!("subagent_{}_reviewer", parent.0));
+    }
+
+    /// #6: two spellings of an UNREGISTERED name are one subagent.
+    ///
+    /// Both halves again, and for a sharper reason here: the fallback id is
+    /// `AgentId::deterministic`, which hashes whatever string it is handed,
+    /// so keying it on the raw name forked the identity as well as the
+    /// session.
+    #[test]
+    fn unregistered_spellings_resolve_to_one_subagent() {
+        let mgr = make_manager();
+        let parent = AgentId::new();
+
+        let expected = (
+            AgentId::deterministic(parent, "scout"),
+            format!("subagent_{}_scout", parent.0),
+        );
+
+        for spelling in ["scout", "Scout", "SCOUT", "sCoUt"] {
+            assert_eq!(
+                mgr.named_subagent_key(parent, spelling),
+                expected,
+                "{spelling:?} must key onto the one folded identity"
+            );
+        }
+
+        // A name that differs by more than case is still its own subagent.
+        assert_ne!(mgr.named_subagent_key(parent, "scout-2"), expected);
+    }
+
+    /// #6: the fold is applied, not merely available — and it is idempotent.
+    ///
+    /// `canonical_subagent_name` is called by the coordinator on the request
+    /// and again inside `named_subagent_key`. A non-idempotent rule would
+    /// desynchronise the two on the second application.
+    #[test]
+    fn canonical_subagent_name_is_idempotent_and_registry_first() {
+        let mgr = make_manager();
+        register_agent(&mgr, "ScoutMaster");
+
+        // Registered: the registry's authored spelling wins over the fold.
+        for spelling in ["ScoutMaster", "scoutmaster", "SCOUTMASTER"] {
+            let once = mgr.canonical_subagent_name(spelling);
+            assert_eq!(once, "ScoutMaster");
+            assert_eq!(mgr.canonical_subagent_name(&once), once, "idempotent");
+        }
+
+        // Unregistered: the fold.
+        for spelling in ["Scout", "scout", "SCOUT"] {
+            let once = mgr.canonical_subagent_name(spelling);
+            assert_eq!(once, "scout");
+            assert_eq!(mgr.canonical_subagent_name(&once), once, "idempotent");
+        }
+    }
+
+    /// #6: a store-less manager folds too.
+    ///
+    /// Passing the name through when there is no registry to consult would
+    /// make a subagent's identity depend on whether persistence happens to be
+    /// configured, which is a worse thing to condition identity on than case.
+    #[test]
+    fn the_fold_does_not_depend_on_having_a_store() {
+        let mgr = SessionManager::new(SessionConfig::default());
+        let parent = AgentId::new();
+
+        assert_eq!(mgr.canonical_subagent_name("Reviewer"), "reviewer");
+        assert_eq!(
+            mgr.named_subagent_key(parent, "Reviewer"),
+            (
+                AgentId::deterministic(parent, "reviewer"),
+                format!("subagent_{}_reviewer", parent.0)
+            )
+        );
     }
 
     /// `invoke_agent` validates the SHAPE of a subagent name, not its

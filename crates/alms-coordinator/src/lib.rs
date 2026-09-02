@@ -495,13 +495,38 @@ impl Coordinator {
         is_background: bool,
         parent_cancel_token: Option<CancellationToken>,
     ) -> AlmsResult<(TaskId, SessionId)> {
-        // Canonicalize the LLM-supplied name to the registry's spelling
-        // BEFORE anything keys off it (#2). Everything downstream — the
-        // `active_named` concurrency guard, the subagent `context_id`, the
-        // workspace directory, the UI label — treats the name as an identity,
-        // and agent names resolve case-insensitively, so `invoke_agent
-        // {"name": "Reviewer"}` and `{"name": "reviewer"}` must not fork into
-        // two identities for one registered agent.
+        // Canonicalize the LLM-supplied name BEFORE anything keys off it
+        // (#2 registered, #6 unregistered). Everything downstream treats the
+        // name as an identity, and agent names resolve case-insensitively, so
+        // `{"name": "Reviewer"}` and `{"name": "reviewer"}` must not fork into
+        // two identities for one subagent.
+        //
+        // THE GUARD KEY FOLDS BY CONSTRUCTION, NOT BY REMEMBERING TO. This is
+        // the property that makes the fix safe, so it is worth being explicit
+        // rather than leaving the next reader to re-verify it.
+        //
+        // Collapsing two spellings onto one session WITHOUT collapsing the
+        // `active_named` key would admit two concurrent runs against one
+        // session history — the exact failure that guard exists to prevent.
+        // (Today the guard is bypassed in the literal sense — two spellings
+        // are two keys, both admitted — and is saved only because the
+        // `context_id` forks in the same step, so the two were never
+        // contending for one session.) The two must therefore fold together
+        // or not at all.
+        //
+        // They do, because this mutates `request.subagent_name` and every
+        // derivation reads that one field afterwards:
+        //
+        //   - the `active_named` insert, immediately below;
+        //   - its paired removal in `NamedSubagentGuard`, which reads the same
+        //     field, so insert and remove cannot disagree;
+        //   - `derive_subagent_identity` -> `named_subagent_key`;
+        //   - `{workspace_dir}/{name}/` in `run_agent_loop`;
+        //   - `subagent_label` and `with_agent_name`.
+        //
+        // `request` is moved into the spawned task, so `run_subagent` and
+        // `run_agent_loop` see the mutated value too. There is no path that
+        // reads the pre-fold spelling.
         let mut request = request;
         canonicalize_subagent_name(&self.session_manager, &mut request);
 
@@ -1757,9 +1782,19 @@ fn agent_config_for_subagent(
 /// sessions invoked it. See #1051 for the design decision. The `agent_id`
 /// half of that key is the invoked agent's **registry id** since #1278, so
 /// the work lands in that agent's own timeline; the resolution rules
-/// (including the unregistered-name fallback) live in
+/// (including the name fold and the unregistered-name fallback) live in
 /// [`SessionManager::named_subagent_key`], which the by-name readback in
-/// `ReadSubagentSessionTool` shares so the two cannot drift.
+/// `ReadSubagentSessionTool` shares.
+///
+/// Sharing that helper is what keeps the two paths together — but note what
+/// it does and does not buy, because this comment previously claimed more
+/// than the code delivered and that is why #12 stayed invisible. Sharing a
+/// function only prevents drift in what the function *computes*; it says
+/// nothing about the arguments each caller passes. Until #12 the key was
+/// derived from the caller's raw `name`, this path canonicalized before
+/// calling in, the readback did not, and the shared helper faithfully
+/// returned two different keys. The fold now happens *inside* the helper, so
+/// the guarantee finally matches the claim.
 ///
 /// Ephemeral (unnamed) subagent contexts embed the parent agent id too —
 /// `subagent_{parent_agent_id}_{task_id}` — so `read_subagent_session`'s
@@ -1787,45 +1822,37 @@ fn derive_subagent_identity(
     }
 }
 
-/// Rewrite a named subagent request's name to the registry's canonical
-/// spelling, in place (#2).
+/// Rewrite a named subagent request's name to its canonical spelling, in
+/// place (#2 / #6).
 ///
 /// The name on a [`SubagentRequest`] originates in an LLM-supplied
 /// `invoke_agent` parameter. `validate_agent_name` has already established
-/// that it is a *well-formed* name; this establishes that it is the *same
-/// string* the registry stores, so every identity derived from it downstream
-/// agrees:
+/// that it is a *well-formed* name; this establishes that it is the *one*
+/// spelling, so every identity derived from it downstream agrees.
 ///
-/// - `derive_subagent_identity` → the `subagent_{parent}_{name}` `context_id`,
-///   which is the durable session key AND the carrier of the subagent's
-///   display identity (see [`alms_core::parse_subagent_context`]).
-/// - the `active_named` `(parent_agent_id, name)` concurrency guard, which
-///   exists to stop two concurrent invocations from interleaving writes into
-///   one session history — a case variant would slip straight past it.
-/// - `AgentWorkspace` directory selection, `{workspace_dir}/{name}/`.
+/// **The rule itself lives in [`SessionManager::canonical_subagent_name`]**
+/// and is not restated here. That is the point: `named_subagent_key` applies
+/// the same function on the read path, so the write and read paths cannot
+/// hold different opinions about what a name means (#12 is what happens when
+/// they do).
 ///
-/// A name with no registry row is left exactly as the model spelled it: there
-/// is no canonical spelling to adopt, and the unregistered-name path is
-/// already keyed on the literal name by `AgentId::deterministic`. Ditto when
-/// no store is attached or the lookup errors — canonicalization is a
-/// normalization, never a gate.
+/// # Why this function still exists, given the key derivation folds too
+///
+/// Because three of the five things that key on the name never go through
+/// `named_subagent_key`. Mutating the request's own field is what reaches
+/// them — see the call site in [`Coordinator::spawn_subagent`] for the census
+/// and for why the `active_named` guard folds by construction rather than by
+/// anyone remembering to fold it.
 fn canonicalize_subagent_name(session_manager: &SessionManager, request: &mut SubagentRequest) {
     let Some(name) = request.subagent_name.as_deref() else {
         return;
     };
-    let Some(canonical) = session_manager
-        .store()
-        .and_then(|store| store.load_agent_by_name(name).ok())
-        .flatten()
-        .map(|record| record.name)
-    else {
-        return;
-    };
+    let canonical = session_manager.canonical_subagent_name(name);
     if canonical != name {
         debug!(
             requested = %name,
             canonical = %canonical,
-            "Canonicalized invoke_agent subagent name to its registry spelling"
+            "Canonicalized invoke_agent subagent name"
         );
         request.subagent_name = Some(canonical);
     }
@@ -5595,43 +5622,96 @@ mod tests {
         }
     }
 
-    /// #2: canonicalization is a normalization, never a gate. A name with no
-    /// registry row has no canonical spelling to adopt, and the
-    /// unregistered-name path is already keyed on the literal name by
-    /// `AgentId::deterministic` — so it must survive byte-for-byte.
+    /// #6: an UNREGISTERED name folds to lowercase.
+    ///
+    /// Supersedes the #2-era contract, which left these byte-for-byte on the
+    /// reasoning that there is no canonical spelling to adopt. True, and it
+    /// is why this is a *choice* rather than a lookup — but leaving it alone
+    /// meant `Scout` and `scout` became two subagents with two sessions, two
+    /// workspace directories and two chips, while the same two spellings of a
+    /// *registered* name became one agent. Registering a name should not
+    /// change whether two invocations are the same subagent.
+    ///
+    /// Lowercase rather than first-spelling-wins: the latter needs to consult
+    /// what is already stored, which would make a subagent's identity depend
+    /// on invocation order — the property `named_subagent_key` documents
+    /// itself as excluding.
     #[test]
-    fn canonicalize_subagent_name_leaves_unregistered_names_alone() {
+    fn canonicalize_subagent_name_folds_unregistered_names_to_lowercase() {
         let store = alms_session::SqliteStore::open_in_memory().unwrap();
         let manager =
             SessionManager::with_store(alms_session::SessionConfig::default(), store).unwrap();
 
-        let mut request = SubagentRequest {
+        let mk = |name: &str| SubagentRequest {
             task: "t".into(),
             parent_session: SessionId::new(),
             parent_agent_id: AgentId::new(),
             parent_run_id: None,
-            subagent_name: Some("NeverRegistered".into()),
+            subagent_name: Some(name.into()),
             parent_tool_invocation_id: None,
         };
-        canonicalize_subagent_name(&manager, &mut request);
-        assert_eq!(request.subagent_name.as_deref(), Some("NeverRegistered"));
+
+        for spelling in ["NeverRegistered", "neverregistered", "NEVERREGISTERED"] {
+            let mut request = mk(spelling);
+            canonicalize_subagent_name(&manager, &mut request);
+            assert_eq!(
+                request.subagent_name.as_deref(),
+                Some("neverregistered"),
+                "{spelling} must fold onto the one unregistered identity"
+            );
+        }
+
+        // Idempotent: the coordinator folds here and the key derivation folds
+        // again downstream, so a second application must be a no-op.
+        let mut once = mk("Scout");
+        canonicalize_subagent_name(&manager, &mut once);
+        let after_first = once.subagent_name.clone();
+        canonicalize_subagent_name(&manager, &mut once);
+        assert_eq!(once.subagent_name, after_first);
 
         // Ephemeral requests carry no name at all.
         let mut ephemeral = SubagentRequest {
             subagent_name: None,
-            ..request
+            ..mk("unused")
         };
         canonicalize_subagent_name(&manager, &mut ephemeral);
         assert_eq!(ephemeral.subagent_name, None);
 
-        // No store attached at all is the same story.
+        // No store attached: nothing to look up, so the same fold applies
+        // rather than a passthrough. Passing through here would make identity
+        // depend on whether persistence happens to be configured.
         let registryless = registryless_session_manager();
-        let mut request = SubagentRequest {
-            subagent_name: Some("Reviewer".into()),
-            ..ephemeral
-        };
+        let mut request = mk("Reviewer");
         canonicalize_subagent_name(&registryless, &mut request);
-        assert_eq!(request.subagent_name.as_deref(), Some("Reviewer"));
+        assert_eq!(request.subagent_name.as_deref(), Some("reviewer"));
+    }
+
+    /// #6: a name that IS registered still takes the registry's spelling,
+    /// not the fold. The lowercase rule is the fallback for names with no
+    /// authored spelling — it must not overwrite one that exists.
+    #[test]
+    fn canonicalize_subagent_name_prefers_the_registry_over_the_fold() {
+        let store = alms_session::SqliteStore::open_in_memory().unwrap();
+        let manager =
+            SessionManager::with_store(alms_session::SessionConfig::default(), store).unwrap();
+        register_agent(&manager, "ScoutMaster");
+
+        for spelling in ["ScoutMaster", "scoutmaster", "SCOUTMASTER"] {
+            let mut request = SubagentRequest {
+                task: "t".into(),
+                parent_session: SessionId::new(),
+                parent_agent_id: AgentId::new(),
+                parent_run_id: None,
+                subagent_name: Some(spelling.into()),
+                parent_tool_invocation_id: None,
+            };
+            canonicalize_subagent_name(&manager, &mut request);
+            assert_eq!(
+                request.subagent_name.as_deref(),
+                Some("ScoutMaster"),
+                "a registered name keeps its authored casing, not the fold"
+            );
+        }
     }
 
     /// Ephemeral subagents have no registry agent to be filed under, so
@@ -5887,6 +5967,100 @@ mod tests {
                 .active_named
                 .contains(&(parent_a, "reviewer".to_string())),
             "parent_a's guard slot should still be held"
+        );
+    }
+
+    // -- #6 — the guard key folds together with the identity ------------------
+
+    /// #6's hard constraint: collapsing two spellings onto one session
+    /// WITHOUT collapsing the `active_named` key admits two concurrent runs
+    /// against one session history — the exact failure the guard exists to
+    /// prevent.
+    ///
+    /// Before the fold, the guard was bypassed in the literal sense (two
+    /// spellings, two keys, both admitted) and was saved only because the
+    /// `context_id` forked in the same step, so the two invocations were
+    /// never contending for one session. Folding the identity without folding
+    /// the guard would remove the accident that made the bypass harmless.
+    ///
+    /// This pins the guard half specifically: hold the slot under the FOLDED
+    /// spelling, then dispatch with a different casing and require rejection.
+    /// A test that only asserted the sessions were shared would pass on the
+    /// dangerous half-fix.
+    #[tokio::test]
+    async fn test_active_named_guard_folds_with_the_identity() {
+        let workspace_tmp = tempfile::TempDir::new().unwrap();
+        let coord = test_coordinator().with_workspace_dir(workspace_tmp.path().to_path_buf());
+        let parent = test_parent_agent_id();
+
+        // A run for the folded identity is already in flight.
+        coord.active_named.insert((parent, "scout".to_string()));
+
+        // A differently-cased invocation of the same unregistered subagent
+        // must be refused, not admitted alongside it.
+        let result = coord
+            .dispatch(
+                "second invocation".to_string(),
+                test_session_id(),
+                parent,
+                None,
+                None,
+                Some("Scout".to_string()),
+                None,
+                None,
+            )
+            .await;
+
+        assert!(
+            result.is_err(),
+            "a case variant must hit the guard, or the fold has admitted two \
+             concurrent runs against one session: {result:?}"
+        );
+        let message = result.unwrap_err().to_string();
+        assert!(
+            message.contains("already running"),
+            "must be refused BY THE GUARD, not by some unrelated failure: {message}"
+        );
+    }
+
+    /// #6, the other half of the same contract: two case variants of an
+    /// unregistered name resolve to ONE session.
+    ///
+    /// Sequential rather than concurrent, so the guard (verified above) is
+    /// released between them and the assertion is about identity rather than
+    /// about admission.
+    #[tokio::test]
+    async fn test_unregistered_case_variants_share_one_session() {
+        let workspace_tmp = tempfile::TempDir::new().unwrap();
+        let coord = test_coordinator().with_workspace_dir(workspace_tmp.path().to_path_buf());
+        let parent = test_parent_agent_id();
+
+        let mut sessions = Vec::new();
+        for spelling in ["Scout", "scout", "SCOUT"] {
+            let (_result, sub_session_id) = coord
+                .dispatch(
+                    format!("invoked as {spelling}"),
+                    test_session_id(),
+                    parent,
+                    None,
+                    None,
+                    Some(spelling.to_string()),
+                    None,
+                    None,
+                )
+                .await
+                .unwrap_or_else(|e| panic!("dispatch as {spelling} must succeed: {e:?}"));
+            sessions.push(sub_session_id);
+        }
+
+        assert_eq!(
+            sessions
+                .iter()
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            1,
+            "three spellings of one unregistered subagent must share one session, \
+             got {sessions:?}"
         );
     }
 
