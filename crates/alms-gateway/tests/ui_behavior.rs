@@ -30,7 +30,8 @@ fn ui_test_path(name: &str) -> PathBuf {
 }
 
 /// True when `node --version` succeeds. Used to gate the behaviour tests so
-/// the suite still passes on machines without Node installed.
+/// the suite still passes on machines without Node installed — locally. In CI
+/// a missing interpreter is a hard failure; see `run_node_test`.
 fn node_available() -> bool {
     Command::new("node")
         .arg("--version")
@@ -44,6 +45,35 @@ fn node_available() -> bool {
 /// test output.
 fn run_node_test(file: &str) {
     if !node_available() {
+        // Skipping LOCALLY is deliberate (see the module header): a
+        // behavioural test that shells out to an interpreter shouldn't break a
+        // Rust-only contributor's `cargo test`. In CI it is the opposite of
+        // deliberate. A node-less runner turns all 22 suites into a silent
+        // no-op and still reports green — the third and worst route to "cargo
+        // passed having executed zero JS", alongside the two issue #7 closes.
+        // Worst because it takes out every suite at once, and because it
+        // announces itself only on stderr, which nobody reads when the run is
+        // green.
+        //
+        // It is also the one route `every_ui_test_file_has_a_cargo_test`
+        // cannot see: that guard only reads the filesystem, so it passes
+        // happily on a machine with no node at all.
+        //
+        // The npm runner has no equivalent hatch — node is present there by
+        // construction — so leaving this open would preserve the exact
+        // asymmetry this file exists to remove: the runner CI depends on could
+        // degrade to nothing, the runner it doesn't could not.
+        //
+        // `CI` is set by GitHub Actions (and every other provider worth
+        // naming) and by nothing on an ordinary developer machine.
+        assert!(
+            std::env::var_os("CI").is_none(),
+            "`node` is not on PATH in CI, so ui_behavior::{file} would be \
+             SKIPPED rather than run — and so would every other suite in \
+             tests/ui/, silently, with cargo still reporting success. Install \
+             Node.js (see .node-version) on the runner, or retire this harness \
+             deliberately rather than letting it evaporate.",
+        );
         eprintln!(
             "skipping ui_behavior::{}: `node` is not on PATH (install Node.js >= 22)",
             file,
@@ -568,19 +598,50 @@ fn session_owner_js_behaviour() {
 ///
 /// Implementation note: the registered set is parsed out of THIS FILE's own
 /// source via `include_str!`, so it cannot go stale relative to the tests it
-/// describes. The parse is a plain substring scan, so a registration call
-/// written inside a comment or a string literal would count as real — which is
-/// why the marker below is assembled rather than written out literally, and
-/// why this doc comment does not spell it out either.
+/// describes.
+///
+/// WHAT THIS GUARD DOES NOT CLAIM (Tim, PR #9 F2). It binds the LIST to the
+/// directory, not the EXECUTION to the list. A registration proves a suite is
+/// named here, not that cargo runs it, and three things satisfy the former
+/// while defeating the latter:
+///
+/// * the whole `#[test] fn` commented out — CLOSED below: registrations on
+///   comment lines are not counted, so the suite reads as unregistered and
+///   this test fails;
+/// * an `ignore` attribute on a registered fn — CLOSED below by a scan;
+/// * a `#[cfg(...)]`-gated fn — NOT closed. Distinguishing a disabled suite
+///   from a legitimate platform gate needs real parsing, and a blanket ban on
+///   `#[cfg` here would be a false positive waiting to happen. There are none
+///   in this file today; if one appears, teach this guard about it.
+///
+/// None of the three is darkness — `_run-all.mjs` still runs the suite off the
+/// directory — but each re-opens issue #7's asymmetry with the runners
+/// swapped, which is precisely the shape worth naming rather than leaving to
+/// be rediscovered.
+///
+/// Parse note: the scan is a plain substring match, so the marker is assembled
+/// rather than written literally (otherwise the guard's own line would be a
+/// registration), and this doc comment deliberately does not spell it out.
 #[test]
 fn every_ui_test_file_has_a_cargo_test() {
     const THIS_FILE: &str = include_str!("ui_behavior.rs");
     // Assembled, not written literally, so this line is not itself a match.
     let marker = format!("run_node_test{}", "(\"");
 
+    // A commented-out `#[test] fn` leaves its registration behind as a comment.
+    // Counting it would let a disabled suite still read as registered (F2), so
+    // comment lines are skipped — which makes disabling a suite that way fail
+    // this test with "exists on disk but nothing names it", the correct
+    // complaint.
     let mut registered: Vec<String> = Vec::new();
-    for (idx, _) in THIS_FILE.match_indices(marker.as_str()) {
-        let rest = &THIS_FILE[idx + marker.len()..];
+    for line in THIS_FILE.lines() {
+        if line.trim_start().starts_with("//") {
+            continue;
+        }
+        let Some(idx) = line.find(marker.as_str()) else {
+            continue;
+        };
+        let rest = &line[idx + marker.len()..];
         if let Some(end) = rest.find('"') {
             registered.push(rest[..end].to_string());
         }
@@ -591,6 +652,28 @@ fn every_ui_test_file_has_a_cargo_test() {
         !registered.is_empty(),
         "parsed zero registrations out of this file — the guard would pass \
          vacuously, so the parse itself must have broken",
+    );
+
+    // An ignored suite is a registration that runs nothing: the same "test
+    // that cannot fail" this whole file is about. There are none today.
+    //
+    // The needle is assembled, and no prose above or below writes the
+    // attribute out in full — otherwise this scan matches its own explanation
+    // and the guard fails on a clean tree. (It did, on the first attempt. Same
+    // self-reference hazard as the registration marker: a test that reads its
+    // own source has to keep its evidence and its commentary apart.)
+    let ignore_attr = format!("#[{}]", "ignore");
+    let ignored_line = THIS_FILE
+        .lines()
+        .find(|line| !line.trim_start().starts_with("//") && line.contains(&ignore_attr));
+    assert!(
+        ignored_line.is_none(),
+        "an ignore attribute appeared in ui_behavior.rs ({}). A \
+         registered-but-ignored suite satisfies this guard while running \
+         nothing under cargo, which re-opens issue #7 with the runners \
+         swapped — npm would still run it. Remove the suite properly, or teach \
+         this guard which registration is allowed to be skipped and why.",
+        ignored_line.unwrap_or("").trim(),
     );
 
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))

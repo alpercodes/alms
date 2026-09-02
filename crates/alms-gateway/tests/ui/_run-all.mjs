@@ -11,12 +11,23 @@
 // nothing that reads the tests written against their change. A frontend-only
 // contributor has no other reason to invoke cargo at all.
 //
-// Why a script rather than a glob in `package.json`: `node --test` EXITS 0
-// WHEN ITS GLOB MATCHES NOTHING (verified on v22 and v24). A one-liner like
+// Why a script rather than a glob in `package.json`: `node --test` has TWO
+// different exit-code behaviours for "the files aren't there", and only one of
+// them is safe.
+//
+//   node --test "nothing-here-*.test.mjs"     -> exit 0   (glob, no matches)
+//   node --test ./definitely-missing.test.mjs -> exit 1   (explicit path)
+//
+// Both verified on v22 and v24. So the obvious one-liner
 //   node --test "crates/alms-gateway/tests/ui/*.test.mjs"
-// would therefore go green the moment the path drifted — the same
-// "green means nothing" bug in a new costume. Discovery here is an explicit
-// directory read with a non-empty assertion, so a broken path fails loudly.
+// would go green the moment that path drifted — "green means nothing"
+// reintroduced by the fix for "green means nothing".
+//
+// Passing EXPLICIT PATHS harvested from `readdirSync` is therefore load-
+// bearing, not merely tidy: it puts this runner on the safe side of both
+// behaviours. The directory read cannot silently yield nothing (the assertion
+// below), and a file that disappears between that read and the spawn aborts
+// the run instead of quietly shrinking it. (Tim, PR #9.)
 //
 // Single source of truth: this script does not carry a list of suites. The
 // DIRECTORY is the list. `ui_behavior.rs` keeps one `#[test]` per suite (for
