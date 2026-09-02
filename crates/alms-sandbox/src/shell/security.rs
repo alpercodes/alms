@@ -1,6 +1,6 @@
 //! Security checks for the shell tool.
 //!
-//! Preserves all existing security features from `ShellExecTool`:
+//! Preserves all existing security features from the removed `ShellExecTool`:
 //! - Secret env var filtering
 //! - Platform-critical env var re-injection after `env_clear()`
 //!

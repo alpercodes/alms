@@ -1,6 +1,6 @@
 //! Redesigned shell tool inspired by Claude Code's Bash tool.
 //!
-//! Key improvements over the original `ShellExecTool`:
+//! Key improvements over the original `ShellExecTool` (since removed):
 //! - **Command strings**: Interface is `"command": "ls -la"` via `bash -c`
 //! - **Persistent cwd**: Working directory persists across calls
 //! - **Output truncation**: 30KB max with head+tail line preservation
@@ -72,14 +72,34 @@ fn append_marker_line(stdout: &str, marker: &str) -> String {
 /// The tool name used for registration. Agents call it as `"shell"`.
 pub const SHELL_TOOL_NAME: &str = "shell";
 
-/// Legacy alias for backward compatibility.
+/// The wire name `"shell_exec"`, kept as a registration alias for `"shell"`.
+///
+/// **Live, operator-facing, and not dead code however unreferenced it looks.**
+/// It is reachable from the `tools.enabled` allowlist and from any agent still
+/// emitting the older name, so nothing about it is decided by counting Rust
+/// call sites.
+///
+/// Three lookalike names collect around this module and only two survive:
+///
+/// - `"shell"` — the canonical tool name [`ShellTool`] registers under.
+/// - `"shell_exec"` (this const) — the backward-compatible alias for it.
+/// - `ShellExecTool` — the pre-redesign *implementation*, and afterwards a
+///   `pub type ShellExecTool = ShellTool` alias kept for source compatibility.
+///   Both are gone: the implementation was replaced by [`ShellTool`], and the
+///   alias was removed once nothing in the workspace referenced it. Prose
+///   elsewhere in this module still names it, deliberately, as history.
+///
+/// The two are easy to conflate and the consequences are asymmetric: deleting
+/// the type alias cost nothing, deleting this const would silently break every
+/// config and agent still saying `shell_exec`.
 pub const SHELL_TOOL_ALIAS: &str = "shell_exec";
 
 /// Redesigned shell tool with persistent cwd, command strings, and
 /// background execution support.
 ///
-/// Replaces the original `ShellExecTool`. Registered under the name `"shell"`
-/// with `"shell_exec"` as a backward-compatible alias.
+/// Replaced the original `ShellExecTool` (since removed). Registered under
+/// the name `"shell"` with `"shell_exec"` ([`SHELL_TOOL_ALIAS`]) as a
+/// backward-compatible alias.
 #[derive(Debug)]
 pub struct ShellTool {
     /// When Some, cwd is validated against this root in sandboxed mode.
@@ -175,7 +195,7 @@ impl ShellTool {
         }
     }
 
-    /// Create with explicit policy (matching the old `ShellExecTool::with_policy`).
+    /// Create with explicit policy (matching the removed `ShellExecTool::with_policy`).
     pub fn with_policy(sandbox_root: Option<PathBuf>, unrestricted: bool) -> Self {
         let initial_cwd = sandbox_root
             .clone()

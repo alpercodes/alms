@@ -849,7 +849,27 @@ fn wire_event(data: SseEventData) -> Event {
     })
 }
 
-/// SSE event stream wrapper
+/// SSE event stream wrapper.
+///
+/// Every constructor here takes either a replay `Vec` or a caller-supplied
+/// [`Stream`][tokio_stream::Stream] — deliberately, and it is worth not
+/// undoing.
+///
+/// The live streams handed in come from `RunManager::subscribe_*`, which
+/// return a `ManagedSubscription<K>` whose `Drop` unregisters the sender from
+/// the subscriber map. That is what stops a browser disconnect from leaving a
+/// dead sender behind until the next event happens to be broadcast at it.
+///
+/// Two earlier constructors (`stream`, `stream_with_replay`) took a raw
+/// `mpsc::UnboundedReceiver<SseEventData>` instead, which carried no such
+/// bookkeeping: they were the only way to build an SSE response with no
+/// unregister-on-drop guarantee. They were removed once nothing called them.
+/// **Re-adding a receiver-shaped constructor re-adds that footgun** — take a
+/// `Stream` and let the subscription own its own cleanup.
+///
+/// [`event_channel`] still hands out a raw mpsc pair, but only as a plain
+/// collection sink for the SSE golden tests; nothing turns one into a
+/// response.
 pub struct RunEventStream;
 
 impl RunEventStream {

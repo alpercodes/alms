@@ -105,6 +105,33 @@ mod tests {
     }
 
     #[test]
+    fn test_truncate_output_bytes_at_limit_unchanged() {
+        // Boundary: exactly MAX_OUTPUT_BYTES must pass through untouched.
+        //
+        // Ported from the `&str` twin's `test_within_limit_unchanged`, removed
+        // with the twin itself. `short_unchanged` above uses an 11-byte input,
+        // so on its own it does not pin the `<=` in the length guard --
+        // flipping it to `<` still passes.
+        //
+        // The input has to be multi-line to catch that. A single 30_000-byte
+        // line takes the `byte_truncate_bytes` fallback, which appends its note
+        // only when it actually drops bytes, so a one-line boundary input
+        // survives the off-by-one unchanged and asserts nothing. With 3001
+        // lines the mutant takes the head+tail branch instead and the omission
+        // marker shows up.
+        let mut bytes = vec![b'x'; MAX_OUTPUT_BYTES];
+        for (n, b) in bytes.iter_mut().enumerate() {
+            if n % 10 == 0 {
+                *b = b'\n';
+            }
+        }
+        assert_eq!(bytes.len(), MAX_OUTPUT_BYTES);
+        assert!(bytes.iter().filter(|b| **b == b'\n').count() > HEAD_LINES + TAIL_LINES);
+
+        assert_eq!(truncate_output_bytes(&bytes), bytes);
+    }
+
+    #[test]
     fn test_truncate_output_bytes_preserves_invalid_utf8() {
         // Build a buffer with an invalid UTF-8 byte. The byte-level path must
         // pass it through unchanged — no replacement chars at this stage.
