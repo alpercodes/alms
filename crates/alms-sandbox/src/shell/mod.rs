@@ -77,7 +77,11 @@ pub const SHELL_TOOL_NAME: &str = "shell";
 /// **Live, operator-facing, and not dead code however unreferenced it looks.**
 /// It is reachable from the `tools.enabled` allowlist and from any agent still
 /// emitting the older name, so nothing about it is decided by counting Rust
-/// call sites.
+/// call sites. `registry.rs` says so in code rather than prose: the alias is
+/// registered via `register_as` alongside the canonical name, and the
+/// "unknown tool in `tools.enabled`" warning carries an explicit
+/// `name != SHELL_TOOL_ALIAS` arm — the registry already treats `shell_exec`
+/// as a legitimate operator-supplied value rather than a typo.
 ///
 /// Three lookalike names collect around this module and only two survive:
 ///
