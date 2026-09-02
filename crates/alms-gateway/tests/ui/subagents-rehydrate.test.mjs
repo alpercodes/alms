@@ -1064,3 +1064,170 @@ test('#1041 DM follow-up regression anchor: calling the rehydrator with '
         + 'production fix is to pass `mapped` instead (see '
         + 'utils/load-session.js call site).');
 });
+
+// ---------------------------------------------------------------------------
+// Issue #1 — repair sweep: a chip still at `running` whose invoke_agent row is
+// terminal in history lost its `tool_end`.
+//
+// `tool_end` for `invoke_agent` is the ONLY route a FOREGROUND chip has to a
+// terminal status (`subagent_completed` fires behind `handle.is_background`,
+// so foreground invocations produce none — pinned wire-side in
+// `crates/alms-gateway/src/runs/subagent_chip_timing_tests.rs`). A single
+// dropped or gapped `tool_end` therefore strands the chip at `running` for the
+// rest of the session: it is never re-delivered, and every load path except a
+// full session switch leaves existing entries alone.
+//
+// Rehydrate is the single load chokepoint, so it reconciles the live map
+// against the authoritative history — the same self-healing contract the
+// `rearmTerminalRemoveTimers` sweep already provides for terminal entries that
+// lost their auto-remove timer.
+// ---------------------------------------------------------------------------
+
+test('#1: a running chip is repaired when its invoke_agent row is terminal in history', () => {
+    mod.trackSubagentStart('reviewer', 'review the diff', 'inv-1');
+    assert.equal(mod.activeSubagents.value.reviewer.status, 'running');
+
+    // The reload / reconcile sees the completed row the missing tool_end
+    // would have closed.
+    mod.rehydrateSubagentsFromHistory([
+        {
+            id: 'inv-1',
+            type: 'tool',
+            tool: 'invoke_agent',
+            params: { name: 'reviewer', task: 'review the diff' },
+            status: 'done',
+            result: { session_id: 'subsess-1', response: 'looks good' },
+            ts: '2026-05-12T09:00:00Z',
+        },
+    ]);
+
+    const entry = mod.activeSubagents.value.reviewer;
+    assert.equal(entry.status, 'done',
+        'a chip whose invocation is provably over must not stay running');
+    assert.equal(entry.sessionId, 'subsess-1',
+        'the repaired chip keeps its drill-down session link');
+});
+
+test('#1: repair maps a failed row to `fail` (in-band failure, object result)', () => {
+    // `tool_result_ok` classifies a structured error payload as a failure;
+    // the tool itself returned `Ok`, so the persisted result is an object.
+    mod.trackSubagentStart('reviewer', 'review the diff', 'inv-1');
+    mod.rehydrateSubagentsFromHistory([
+        {
+            id: 'inv-1', type: 'tool', tool: 'invoke_agent',
+            params: { name: 'reviewer' }, status: 'fail',
+            result: { error: 'subagent failed' },
+            ts: '2026-05-12T09:00:00Z',
+        },
+    ]);
+    assert.equal(mod.activeSubagents.value.reviewer.status, 'fail');
+});
+
+test('#1: repair also fires for an outright dispatch failure (STRING result)', () => {
+    // Tim's F1 on PR #3. The sibling case above gave false assurance: it uses
+    // an object result, so a predicate that (wrongly) required
+    // `typeof result === 'object'` still passed it.
+    //
+    // `persist_one_tool_result` stores an `Err` arm as `format!("Error: {e}")`
+    // and history.js keeps it as a bare string when it does not parse as
+    // JSON. So an invoke_agent that failed OUTRIGHT — unknown agent, depth
+    // exceeded, dispatch error — reaches the rehydrator as `status: 'fail'`
+    // with a string result. That is the same lost-`tool_end` class the sweep
+    // exists for, and arguably the likelier one to have lost its event.
+    mod.trackSubagentStart('reviewer', 'review the diff', 'inv-1');
+    mod.rehydrateSubagentsFromHistory([
+        {
+            id: 'inv-1', type: 'tool', tool: 'invoke_agent',
+            params: { name: 'reviewer' }, status: 'fail',
+            result: 'Error: unknown agent reviewer',
+            ts: '2026-05-12T09:00:00Z',
+        },
+    ]);
+    assert.equal(mod.activeSubagents.value.reviewer.status, 'fail',
+        'a string result is still a PERSISTED result — the gate is about '
+        + 'whether the invocation finished, not about the payload shape');
+});
+
+test('#1: repair is identity-exact — an EARLIER invocation never ends a later chip', () => {
+    // Named subagents reuse one map key AND one session id across
+    // invocations, so only the tool_invocation_id can tell them apart. The
+    // second invocation is live; the first one's completed row is still in
+    // history.
+    mod.trackSubagentStart('reviewer', 'second pass', 'inv-2');
+    mod.rehydrateSubagentsFromHistory([
+        {
+            id: 'inv-1', type: 'tool', tool: 'invoke_agent',
+            params: { name: 'reviewer', task: 'first pass' }, status: 'done',
+            result: { session_id: 'subsess-1', response: 'ok' },
+            ts: '2026-05-12T09:00:00Z',
+        },
+    ]);
+    assert.equal(mod.activeSubagents.value.reviewer.status, 'running',
+        'the live second invocation must survive its predecessor\'s row');
+    assert.equal(mod.activeSubagents.value.reviewer.toolInvocationId, 'inv-2');
+});
+
+test('#1: repair ignores a result-less row that only DEFAULTED to done', () => {
+    // `mapHistoryMessages` gives a result-less tool row `status: 'done'`
+    // whenever no run is active at map time — a statement about the run list,
+    // not about the subagent. Repairing on that would terminate chips for
+    // subagents that are still working.
+    mod.trackSubagentStart('reviewer', 'still working', 'inv-1');
+    mod.rehydrateSubagentsFromHistory([
+        {
+            id: 'inv-1', type: 'tool', tool: 'invoke_agent',
+            params: { name: 'reviewer' }, status: 'done', result: null,
+            ts: '2026-05-12T09:00:00Z',
+        },
+    ]);
+    assert.equal(mod.activeSubagents.value.reviewer.status, 'running',
+        'only a persisted RESULT proves the invocation finished');
+});
+
+test('#1: a chip rehydrated from a PROVIDER-keyed row self-heals on the next load', () => {
+    // Tim's C2 on PR #3. `ToolCallRecord` (alms-core/src/run.rs) carries only
+    // the provider `tool_id`, so a row reconstructed from the `run_tool_calls`
+    // merge path is keyed by `call_*` — and a chip rehydrated from such a row
+    // stores that id. The live `tool_end` then carries the REAL invocation id
+    // and can match neither the chip nor the row, so no correlator can close
+    // it while it is live. What CAN close it is history: the row the fallback
+    // did close is terminal on the next load, and it is keyed by exactly the
+    // id the chip stored.
+    //
+    // Drives the real `mapHistoryMessages` merge path rather than a
+    // hand-written row, so this stays honest if that keying ever changes.
+    const mapped = mapHistoryMessages([], {
+        hasActiveRun: true,
+        sessionToolCalls: [
+            {
+                tool_id: 'call_provider_1',
+                role: 'assistant',
+                tool_name: 'invoke_agent',
+                params: JSON.stringify({ name: 'reviewer', task: 'review the diff' }),
+                run_id: 'run-1',
+                timestamp: '2026-05-12T09:00:00Z',
+            },
+        ],
+    });
+    assert.equal(mapped.length, 1);
+    assert.equal(mapped[0].id, 'call_provider_1',
+        'anchor: the merge path really does key the row by the PROVIDER id');
+    assert.equal(mapped[0].status, 'running');
+
+    mod.rehydrateSubagentsFromHistory(mapped);
+    assert.equal(mod.activeSubagents.value.reviewer.toolInvocationId, 'call_provider_1',
+        'the chip inherits the row\'s (provider) id — this is the C2 mismatch');
+
+    // The live tool_end closed the row by the last-running-tool fallback, so
+    // history now has it terminal under the provider id.
+    mod.rehydrateSubagentsFromHistory([
+        {
+            ...mapped[0],
+            status: 'done',
+            result: { session_id: 'subsess-1', response: 'looks good' },
+            ts: '2026-05-12T09:00:01Z',
+        },
+    ]);
+    assert.equal(mod.activeSubagents.value.reviewer.status, 'done',
+        'the mismatch survives the live event but not the next load');
+});

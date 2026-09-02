@@ -19,6 +19,8 @@ pub(crate) mod markers;
 pub(crate) mod notifications;
 pub(crate) mod read_api;
 pub(crate) mod streaming;
+#[cfg(test)]
+mod subagent_chip_timing_tests;
 pub(crate) mod subagent_self_sink;
 // `tools` is `pub` (not `pub(super)`) only so that the integration test in
 // `tests/sse_golden_tests.rs` can reach `route_bg_event` for the #1105 bg-path
