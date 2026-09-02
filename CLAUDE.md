@@ -79,7 +79,7 @@ docs/                # Design docs — api.md, architecture.md, security-model.m
                      #   research/ — competitive analysis and tech-stack decisions
 ```
 
-### Dependency graph (no cycles, 9 crates)
+### Dependency graph
 
 ```
 alms-cli → alms-gateway → alms-runtime      → alms-core

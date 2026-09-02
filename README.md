@@ -31,19 +31,8 @@ Requires Rust nightly, installed automatically from `rust-toolchain.toml`.
 ```bash
 cargo build --release
 
-# Store a provider key (openai, anthropic, openrouter)
-./target/release/alms auth set openrouter
-
-# Create an agent
-./target/release/alms agent create atlas \
-    --description "Coordinator" \
-    --posture guarded
-
 # Start the gateway (defaults to 127.0.0.1:8080)
 ./target/release/alms gateway
-
-# In another shell: open the web UI
-./target/release/alms dashboard
 ```
 
 The dashboard is the shortest path to a first run: it creates the session for you and
