@@ -61,6 +61,19 @@ const INTERNAL_SESSION_TYPES = new Set(['subagent', 'job', 'episodic', 'notifica
 const SESSION_RUNS_RESTORE_LIMIT = 200;
 
 /**
+ * The absorbing run statuses — a run in one of these will never emit another
+ * event (#5). Mirrors `RunStatus::is_terminal` in `crates/alms-core/src/run.rs`;
+ * the non-terminal statuses are `queued` and `running`.
+ *
+ * Used to decide whether a tool row with no result belongs to a run that is
+ * still capable of finishing it. Listing the terminal states rather than
+ * negating the live ones is deliberate: a future status added to the backend
+ * lands outside this set, so it is treated as "not known to be terminal" and
+ * inherits the old behaviour instead of silently marking live rows done.
+ */
+const TERMINAL_RUN_STATUSES = new Set(['completed', 'failed', 'cancelled']);
+
+/**
  * Maximum number of agent-scoped runs to fetch when restoring the global
  * agent phase across sessions (the "Chatting with {peer}..." cross-session
  * status, #688). Same truncation concern as `SESSION_RUNS_RESTORE_LIMIT`,
@@ -252,15 +265,31 @@ export async function loadSession(sessionId, opts) {
     // Use a larger fetch window (SESSION_RUNS_RESTORE_LIMIT) for the
     // active-run restore step so an older still-running run is not hidden
     // behind a newer queued / terminal backlog. (#735)
+    //
+    // The same snapshot answers a second question for step 2 (#5): WHICH runs
+    // are already terminal. `hasActiveRun` below is a fact about the session,
+    // so on its own it renders a dead run's unfinished tool row as `running`
+    // whenever some *later* run happens to be active. Collected here rather
+    // than re-fetched because this is the authoritative snapshot the rest of
+    // the load is reconciled against; a second fetch could disagree with it.
+    const terminalRunIds = new Set();
     try {
         const data = await listRuns(sessionId, SESSION_RUNS_RESTORE_LIMIT);
         if (isStale()) return;
         const loaded = data.runs || [];
         replaceRuns(sessionId, loaded);
+        for (const r of loaded) {
+            if (r && r.run_id && TERMINAL_RUN_STATUSES.has(r.status)) {
+                terminalRunIds.add(r.run_id);
+            }
+        }
     } catch (err) {
         if (isStale()) return;
         if (opts.requireAuthoritativeSnapshot) throw err;
         replaceRuns(sessionId, []);
+        // Leave `terminalRunIds` empty: the fetch failed, so we know nothing
+        // about run terminality and must not act as if we did. An empty set
+        // makes `mapHistoryMessages` fall back to the pre-#5 rule.
     }
 
     // Step 2: Fetch message history and session-level tool calls in
@@ -312,6 +341,7 @@ export async function loadSession(sessionId, opts) {
             hasActiveRun: !!activeRunId.value,
             sessionToolCalls,
             isDm: isDmSession,
+            terminalRunIds,
         });
 
         // Diagnostic: log tool call counts for #501 investigation.

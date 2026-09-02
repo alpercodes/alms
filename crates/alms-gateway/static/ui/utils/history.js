@@ -70,11 +70,18 @@ function parseJobNotification(content, metadata) {
  * cases the merge backfills params/result so the tool rows are not empty
  * after a page reload.
  *
- * The index is keyed by tool_id (the provider-assigned tool_call_id
- * that correlates assistant tool_call messages with their results).
+ * The index stays keyed by tool_id (the provider-assigned tool_call_id),
+ * because pairing a call record with its result record is exactly what the
+ * provider's id is for and the two records share it.
  *
- * Each key maps to { call, result } where call is the assistant-role
- * record and result is the tool-role record.
+ * That is a different question from what the resulting chat row is *named*.
+ * Since #5 each record also carries `tool_invocation_id` — ALMS's own
+ * correlator, the one the SSE stream and every frontend identity lookup use —
+ * and that is what the emitted row keys on. Pair by the provider's id; be
+ * identified by ours.
+ *
+ * Each key maps to { call, result, runId, invocationId } where call is the
+ * assistant-role record and result is the tool-role record.
  *
  * @param {Array} toolCalls - records from GET /sessions/{id}/tool-calls
  * @returns {Map<string, { call: object|null, result: object|null }>}
@@ -84,7 +91,8 @@ function buildToolCallIndex(toolCalls) {
     for (const tc of toolCalls) {
         const key = tc.tool_id;
         if (!key) continue;
-        const entry = index.get(key) || { call: null, result: null, runId: null };
+        const entry = index.get(key)
+            || { call: null, result: null, runId: null, invocationId: null };
         if (tc.role === 'assistant' || tc.role === 'Assistant') {
             entry.call = tc;
             // Preserve run_id from the tool call record for reasoning
@@ -93,6 +101,13 @@ function buildToolCallIndex(toolCalls) {
         } else if (tc.role === 'tool' || tc.role === 'Tool') {
             entry.result = tc;
             if (tc.run_id && !entry.runId) entry.runId = tc.run_id;
+        }
+        // #5: the call and result rows of one invocation carry the same
+        // correlator, so either may supply it. `null` for rows written before
+        // the column existed; the merge path falls back to the provider id
+        // there, which is the pre-#5 behaviour.
+        if (tc.tool_invocation_id && !entry.invocationId) {
+            entry.invocationId = tc.tool_invocation_id;
         }
         index.set(key, entry);
     }
@@ -123,6 +138,40 @@ export function mapHistoryMessages(msgs, opts) {
     const hasActiveRun = opts && opts.hasActiveRun;
     const isDm = opts && opts.isDm;
     const sessionToolCalls = (opts && opts.sessionToolCalls) || [];
+    // #5: run ids KNOWN to be terminal (completed / failed / cancelled), from
+    // the runs snapshot the caller already loaded. Optional — an absent or
+    // empty set restores the pre-#5 behaviour exactly.
+    const terminalRunIds = (opts && opts.terminalRunIds) || null;
+
+    /**
+     * Status for a tool row that has NO result record.
+     *
+     * The old rule was `hasActiveRun ? 'running' : 'done'`, where
+     * `hasActiveRun` is a fact about *the session* — is any run active — not
+     * about the run that issued this tool call. That produces a phantom:
+     * cancel a run while a foreground `invoke_agent` is in flight, then reload
+     * while some later run is active, and the dead invocation's row renders
+     * `running`. `rehydrateSubagentsFromHistory` builds a chip from it, and
+     * nothing can ever terminate that chip — the run that would have emitted
+     * `tool_end` is gone, and the repair sweep needs a persisted result this
+     * row will never have.
+     *
+     * So: if we positively know the row's OWN run is terminal, the row is not
+     * running, whatever else is happening on the session.
+     *
+     * Deliberately one-directional and evidence-gated. It can only move
+     * 'running' -> 'done', never the reverse, and only when the run is present
+     * in the snapshot AND terminal. A row whose run is missing from the
+     * snapshot (older than the fetch window, or the fetch failed) is unknown,
+     * not assumed terminal, and keeps the previous behaviour. 'done' rather
+     * than 'fail' because that is already what this row renders as the moment
+     * no run is active — the change makes the rendering independent of an
+     * unrelated run, it does not introduce a new state.
+     */
+    const statusWithoutResult = (rowRunId) => {
+        if (rowRunId && terminalRunIds && terminalRunIds.has(rowRunId)) return 'done';
+        return hasActiveRun ? 'running' : 'done';
+    };
     const toolCallIndex = sessionToolCalls.length > 0
         ? buildToolCallIndex(sessionToolCalls)
         : new Map();
@@ -498,7 +547,7 @@ export function mapHistoryMessages(msgs, opts) {
                 // update it). Otherwise default to 'done' (the result was
                 // persisted elsewhere or the run completed before reload).
                 status: resultOk != null ? (resultOk ? 'done' : 'fail')
-                    : (hasActiveRun ? 'running' : 'done'),
+                    : statusWithoutResult(enrichedRunId),
                 result: result,
                 runId: enrichedRunId || undefined,
                 isReasoning: isReasoning || undefined,
@@ -552,7 +601,13 @@ export function mapHistoryMessages(msgs, opts) {
         // appending them at the end.
         const newToolEntries = [];
         for (const [toolId, pair] of toolCallIndex) {
+            // Skip anything already rendered from message history. Checked on
+            // BOTH ids (#5): `existingToolIds` collects `tool_call_id` AND
+            // `tool_invocation_id` from the messages, and a message that
+            // carried only the latter would not be recognised by a
+            // provider-id-only check — the row would be emitted a second time.
             if (existingToolIds.has(toolId)) continue;
+            if (pair.invocationId && existingToolIds.has(pair.invocationId)) continue;
             if (!pair.call) continue; // skip orphan results
 
             let params = null;
@@ -576,14 +631,33 @@ export function mapHistoryMessages(msgs, opts) {
                 || (pair.result && pair.result.from_agent)
                 || undefined;
 
+            // #5: name the row by ALMS's correlator, not the provider's id.
+            //
+            // This is the whole point of the issue. `tool_end`,
+            // `subagent_started` and every frontend identity lookup carry the
+            // invocation id and have never seen `tool_id`, so a row named by
+            // the provider id is uncorrelatable with the live stream: the
+            // `tool_end` handler cannot match it and falls back to closing
+            // "the last running tool row" (which can close the WRONG row), a
+            // subagent chip rehydrated from it stores the provider id so
+            // nothing can terminate it, and the `startedSessionByInvocation`
+            // lookup misses so its "View session" button is dead.
+            //
+            // `|| toolId` keeps the pre-#5 behaviour for rows written before
+            // the column existed — no worse than before, and correlatable
+            // whenever the correlator is actually there.
+            //
+            // The main pass already does exactly this
+            // (`invocationId || callId || nextMsgId()`); this brings the merge
+            // path into line with it rather than inventing a scheme.
             newToolEntries.push({
                 entry: {
-                    id: toolId || nextMsgId(),
+                    id: pair.invocationId || toolId || nextMsgId(),
                     type: 'tool',
                     tool: pair.call.tool_name || 'unknown',
                     params: params,
                     status: ok != null ? (ok ? 'done' : 'fail')
-                        : (hasActiveRun ? 'running' : 'done'),
+                        : statusWithoutResult(pair.runId),
                     result: result,
                     runId: pair.runId || undefined,
                     // For DM sessions: mark merged tool entries as reasoning

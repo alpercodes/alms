@@ -1231,3 +1231,111 @@ test('#1: a chip rehydrated from a PROVIDER-keyed row self-heals on the next loa
     assert.equal(mod.activeSubagents.value.reviewer.status, 'done',
         'the mismatch survives the live event but not the next load');
 });
+
+// ---------------------------------------------------------------------------
+// #5 — the seam: rows reconstructed from `run_tool_calls` must reach the
+// repair sweep at all.
+// ---------------------------------------------------------------------------
+//
+// Every test above hands `rehydrateSubagentsFromHistory` a row whose `id` is
+// already the invocation id, which is what a row derived from `session_messages`
+// looks like. The OTHER producer is the `run_tool_calls` merge path in
+// `mapHistoryMessages`, and before #5 those records carried only the LLM
+// provider's `tool_id` — so the row arrived named `call_provider_...` while
+// `info.toolInvocationId` on the live chip is the ALMS correlator, and
+// `terminalRows.get(info.toolInvocationId)` could never match.
+//
+// This is what #5 changes about PR #1's sweep, and it is a change in COVERAGE,
+// not in necessity: the sweep still exists for a dropped or gapped `tool_end`,
+// a cause nothing here touches. What was previously out of its reach is the
+// merge-path row. Driving the real `mapHistoryMessages` rather than a
+// hand-written row is the point — the bug lived exactly in the handoff between
+// the two modules, so a fixture in the shape of the output would have hidden it.
+
+test('#5: a chip is repaired from a run_tool_calls-derived row (real mapping pipeline)', () => {
+    mod.trackSubagentStart('reviewer', 'review the diff', 'inv-abc');
+    assert.equal(mod.activeSubagents.value.reviewer.status, 'running');
+
+    // No session_messages at all — the fire-and-forget write was dropped, so
+    // the invocation exists only in `run_tool_calls`.
+    const mapped = mapHistoryMessages([], {
+        hasActiveRun: false,
+        sessionToolCalls: [
+            {
+                run_id: 'run-A',
+                seq: 0,
+                role: 'assistant',
+                tool_name: 'invoke_agent',
+                tool_id: 'call_provider_abc',
+                tool_invocation_id: 'inv-abc',
+                params: JSON.stringify({ name: 'reviewer', task: 'review the diff' }),
+                timestamp: '2026-05-12T09:00:00Z',
+            },
+            {
+                run_id: 'run-A',
+                seq: 1,
+                role: 'tool',
+                tool_name: 'invoke_agent',
+                tool_id: 'call_provider_abc',
+                tool_invocation_id: 'inv-abc',
+                result: JSON.stringify({ session_id: 'subsess-9', response: 'looks good' }),
+                timestamp: '2026-05-12T09:00:05Z',
+            },
+        ],
+    });
+
+    // Pre-#5 this row would be `id: 'call_provider_abc'`.
+    const toolRow = mapped.find(m => m.type === 'tool');
+    assert.equal(toolRow.id, 'inv-abc',
+        'the merge path must name the row with the correlator, or the sweep below cannot match it');
+
+    mod.rehydrateSubagentsFromHistory(mapped);
+
+    const entry = mod.activeSubagents.value.reviewer;
+    assert.equal(entry.status, 'done',
+        'a chip whose invocation is provably over must not stay running, '
+        + 'even when the only surviving record is the run_tool_calls row');
+    assert.equal(entry.sessionId, 'subsess-9',
+        'the repaired chip recovers its drill-down link from the merged result');
+});
+
+test('#5: a pre-#5 row (no correlator) still cannot be repaired — the honest limit', () => {
+    // Recorded rather than papered over. A record written before the column
+    // existed carries no correlator, so its row is still named by the provider
+    // id and the sweep still cannot match it. Nothing in #5 can fix that: the
+    // correlator was never written down, so there is nothing to recover. This
+    // pins the boundary of the claim so a future reader does not assume the
+    // class is closed for old data.
+    mod.trackSubagentStart('reviewer', 'review the diff', 'inv-abc');
+
+    const mapped = mapHistoryMessages([], {
+        hasActiveRun: false,
+        sessionToolCalls: [
+            {
+                run_id: 'run-A',
+                seq: 0,
+                role: 'assistant',
+                tool_name: 'invoke_agent',
+                tool_id: 'call_provider_abc',
+                params: JSON.stringify({ name: 'reviewer', task: 'review the diff' }),
+                timestamp: '2026-05-12T09:00:00Z',
+            },
+            {
+                run_id: 'run-A',
+                seq: 1,
+                role: 'tool',
+                tool_name: 'invoke_agent',
+                tool_id: 'call_provider_abc',
+                result: JSON.stringify({ session_id: 'subsess-9' }),
+                timestamp: '2026-05-12T09:00:05Z',
+            },
+        ],
+    });
+
+    assert.equal(mapped.find(m => m.type === 'tool').id, 'call_provider_abc');
+
+    mod.rehydrateSubagentsFromHistory(mapped);
+
+    assert.equal(mod.activeSubagents.value.reviewer.status, 'running',
+        'documented limit: a record with no correlator stays uncorrelatable');
+});
