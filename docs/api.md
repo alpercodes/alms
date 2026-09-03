@@ -1727,7 +1727,7 @@ Named agents are persistent entities stored in SQLite. Each agent has a unique s
 }
 ```
 
-`debug_mode` (#1003) is a per-agent toggle that enables a `context_debug` SSE event on each turn so the web UI can render the full assembled LLM context window in a dedicated panel. PATCH-mutable; not a config override of any kind — it never affects what the LLM receives, only what is mirrored to the UI for triage.
+`debug_mode` (#1003) is a per-agent toggle that enables a `context_debug` SSE event on each turn so the web UI can render the full assembled LLM context window in a dedicated panel. Mutable via `PUT /agents/{id_or_name}`; not a config override of any kind — it never affects what the LLM receives, only what is mirrored to the UI for triage.
 
 > **CLI note.** `alms agent create` does not expose a `--debug-mode` flag — agents are always created with `debug_mode = false`. Operators flip the flag after creation via `PUT /agents/{id_or_name}` (or the per-agent edit modal / Settings modal in the web UI), the same way every other per-agent knob is toggled. Debug mode is a triage tool, not a creation-time decision.
 

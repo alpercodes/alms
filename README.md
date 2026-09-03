@@ -41,6 +41,11 @@ collects the review threads it produced.
 
 Requires Rust nightly, installed automatically from `rust-toolchain.toml`.
 
+`./install.sh` runs the build below and then copies the binary into `~/.cargo/bin` —
+usually already on your `PATH` if you installed Rust with rustup, though the script only
+reminds you to check. Run it and every `./target/release/alms` in this README becomes
+just `alms`. It is a bash script; on Windows run it from Git Bash.
+
 ```bash
 cargo build --release
 
@@ -49,10 +54,6 @@ cargo build --release
 # at boot, so a key stored while it is running will not be picked up.
 ./target/release/alms auth set openrouter
 ```
-
-`./install.sh` does the same build and then copies the binary into `~/.cargo/bin`, which
-rustup already puts on your `PATH` — after it, every `./target/release/alms` below is just
-`alms`. It is a bash script; on Windows run it from Git Bash.
 
 Then start the gateway. It runs in the foreground:
 

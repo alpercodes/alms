@@ -97,9 +97,11 @@ ALMS should support multiple security postures.
 three values. `guarded` (default) sends every tool call that is not auto-approved through
 the approval gate — `needs_approval_gate = posture == Guarded && !auto_approved` in the
 agent loop. `full_control` executes tools without approval. `autonomous` also executes
-without approval and is what system-triggered runs (peer DMs, notifications, subagent
-completions, scheduled jobs) are forced to, because nobody is present to approve — see
-§ 8. "Safe" above corresponds to `guarded` and "Developer" to `full_control`;
+without approval, and is what a `guarded` agent's system-triggered runs (peer DMs,
+notifications, subagent completions, scheduled jobs) are promoted to, because nobody is
+present to approve. `resolve_posture_for_run` overrides `Guarded` only, so a
+`full_control` agent keeps its own posture on those runs — see § 8. "Safe" above
+corresponds to `guarded` and "Developer" to `full_control`;
 "Locked-down" has no posture of its own — the nearest lever is the `[tools].enabled`
 allowlist, which keeps a tool out of the registry altogether.
 

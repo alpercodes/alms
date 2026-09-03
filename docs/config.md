@@ -255,7 +255,7 @@ Like Anthropic thinking, reasoning text is **not** replayed back to the model on
 
 Same two-layer chain as `model` / `max_tokens` / `thinking_budget_tokens`:
 
-1. **Per-agent** (highest) — `reasoning_effort` field on the agent registry entry (set via `POST /agents`, `PUT /agents/{id}`, or `alms agent create --reasoning-effort <value>`).
+1. **Per-agent** (highest) — `reasoning_effort` field on the agent registry entry (set via `POST /agents`, `PUT /agents/{id_or_name}`, or `alms agent create --reasoning-effort <value>`).
 2. **Server default** (lowest) — `[llm.openai].reasoning_effort` in `alms.toml`.
 
 Omitting the field at every layer means no `reasoning_effort` is sent — non-reasoning models behave exactly as before. A per-agent override is cleared back to "inherit server default" with the `clear_reasoning_effort: true` flag on `PUT /agents/{id_or_name}` — `thinking_budget_tokens` and `gemini_thinking_budget` have matching `clear_*` flags (see `docs/api.md` § 9.4). The CLI has no equivalent: `alms agent config` can set the value but not clear it.
