@@ -199,7 +199,7 @@ After setup, your project should have this structure:
 
 | File | Purpose | Checked in? |
 |------|---------|-------------|
-| `.claude/agents/*.md` | Agent definitions | Yes |
+| `.claude/agents/*.md` | Agent definitions | Yes — though not in this repo; see below |
 | `.claude/agent-memory/` | Per-agent persistent memory (review patterns, findings) | No (gitignore) |
 | `.claude/settings.json` | Tool permissions | Optional |
 | `.claude/worktrees/` | Agent working copies | No (gitignore) |
@@ -213,6 +213,12 @@ After setup, your project should have this structure:
 .claude/worktrees/
 .claude/scheduled_tasks.lock
 ```
+
+Checking the agent definitions in is the recommendation — they are project configuration,
+and a contributor who clones the repo gets the same team you have. **This repository does
+not follow it**: all of `.claude/` is ignored here, so the definitions described above are
+not in the tree and you will not find them by browsing. The prose in this document is the
+authoritative description of them.
 
 ### Atlas Memory System
 
@@ -283,7 +289,16 @@ This means Tim's reviews get better over time — he remembers what he's seen be
 }
 ```
 
-This auto-approves common tools so agents don't stall waiting for permission. Adjust based on your trust level.
+This auto-approves common tools so agents don't stall waiting for permission.
+
+**Understand what `Bash(*)` means before copying it.** It approves every shell command an
+agent proposes, without asking — including destructive ones, and including commands an
+agent arrived at by misreading the task. It is what makes unattended parallel runs
+practical, and it is only a reasonable trade when the blast radius is bounded: agents in
+throwaway worktrees, a repository you can restore from a remote, and no credentials
+reachable from the working tree. If any of those does not hold, narrow the pattern to the
+specific commands your workflow needs (`Bash(git *)`, `Bash(cargo *)`) and accept the
+occasional prompt.
 
 ## How It Works
 
@@ -343,15 +358,17 @@ Every agent inherits this context, so you don't need to repeat project conventio
 
 ### Launching Agents
 
-Atlas uses the Agent tool with `run_in_background: true` for parallel work:
+Atlas launches agents with the Agent tool. Issuing several in one message runs them
+concurrently:
 
 ```
 // Launch Heph and Larry in parallel
-Agent(subagent_type: "heph-dev", prompt: "...", run_in_background: true)
-Agent(subagent_type: "larry-bug-fix", prompt: "...", run_in_background: true)
+Agent(subagent_type: "heph-dev", prompt: "...")
+Agent(subagent_type: "larry-bug-fix", prompt: "...")
 ```
 
-When an agent completes, Atlas gets a notification with the result.
+Subagents run in the background — the launching session keeps working and is notified when
+each one finishes.
 
 ### Writing Good Agent Prompts
 
@@ -380,9 +397,9 @@ Tim reviews are iterative:
 5. Atlas merges and pulls develop
 ```
 
-**Critical rule**: Tim reviews sequentially — never run two Tim instances in parallel. This prevents duplicate or conflicting reviews.
-
-**Critical rule**: When Tim finds issues, send the SAME agent (Heph or Larry) back to fix them on the same branch. Never launch a new agent targeting an existing branch — the second push will fail.
+Two rules govern this loop, both stated in full under Operational Rules below: reviews run
+one at a time (rule 3), and review feedback goes back to the *same* agent on the same
+branch rather than a fresh one (rule 4).
 
 ## Operational Rules
 
