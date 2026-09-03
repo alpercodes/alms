@@ -2,6 +2,13 @@
 
 A practical guide to running a 4-agent development team inside Claude Code. This setup enables parallel feature development, bug fixing, and code review — all coordinated by a single human operator.
 
+> **On the issue numbers below.** References such as `#467` and `#497` point at this
+> project's pre-migration tracker. The repository moved on 2026-09-01 and issue numbering
+> restarted at 1, so they do not resolve against the current tracker — a low number may now
+> land on an unrelated issue. They are kept because the worked examples reason about
+> specific pieces of work. The same convention is used in
+> [`docs/engineering-reviews/README.md`](engineering-reviews/README.md).
+
 ## Overview
 
 The system uses Claude Code's Agent tool with git worktree isolation to run multiple specialized agents in parallel. Each agent operates in its own copy of the repository, so they never conflict.
@@ -536,15 +543,3 @@ To use this pattern on a different project:
 3. **Start small**: Begin with just Atlas + one dev agent (Heph). Add Tim for reviews once the basic loop works. Add Larry when you need parallel bug fixing.
 
 4. **Tune the prompts**: The more specific your agent prompts, the better the results. Include file paths, line numbers, and clear success criteria.
-
-## Provenance
-
-The issue and PR numbers cited throughout this document (`#497`, `#1045`, and similar)
-point at the project's **pre-migration** tracker. The repository moved on 2026-09-01 and
-issue numbering restarted at 1, so those numbers do not resolve against the current
-tracker — a low number may now resolve to an unrelated issue. They are retained because
-the examples reason about specific pieces of work, and stripping them would leave the
-worked examples without referents.
-
-The same convention is used in
-[`docs/engineering-reviews/README.md`](engineering-reviews/README.md).
