@@ -1,4 +1,4 @@
-import{a as e,c as t,d as n,i as r,l as i,n as a,o,r as s,s as c,u as l}from"./index-BXCJ9BLZ.js";import{n as u,t as d}from"./deps-BhomfQTs.js";import{A as f,C as p,D as m,E as h,M as g,N as _,O as v,P as y,S as b,T as x,_ as S,a as C,b as w,c as T,d as E,f as D,g as ee,h as te,i as ne,j as O,l as re,m as k,o as A,p as j,r as M,s as N,t as P,u as ie,v as F,w as ae,x as oe,y as I}from"./pending-messages-CAf2nDR5.js";import{A as se,C as ce,D as le,E as ue,I as L,M as de,O as fe,P as pe,S as me,T as he,a as ge,b as _e,c as ve,d as ye,g as be,h as xe,j as Se,k as Ce,l as we,n as Te,o as Ee,p as De,r as Oe,s as ke,t as Ae,u as je,x as Me,y as Ne}from"./use-session-stream-CfjrtoNX.js";import{t as R}from"./entity-state-Dvifu_4n.js";import{a as Pe,n as z,r as B,t as Fe}from"./agents-Dfte3Wv0.js";import{activeRunId as V,clearRuns as Ie,replaceRuns as Le,runListGeneration as Re,selectedRunId as ze}from"./runs-CrGl9Nvq.js";import{a as Be,i as Ve,o as He,r as Ue}from"./chat-actions-uXEv39RD.js";import{agentSwitchLoading as We,bootRetryAvailable as Ge,runBoot as Ke,sessionSwitchLoading as qe,setRunBoot as Je}from"./loading-4NYacrVZ.js";import{n as Ye,t as Xe}from"./select-generation-DvILpFQd.js";import{n as Ze,o as Qe,r as $e,t as et}from"./runs-DeqSj5wX.js";import{a as tt,i as nt,r as rt,t as it}from"./load-session-DmK-Qq1a.js";var at=()=>O(`/settings`),ot=e=>g(`/settings`,e),H=o({});async function st(){try{H.value=await at()}catch(e){console.error(`[settings] refresh failed:`,e)}}var U=o(null),W=o(null),G=null,ct=null,lt=0,ut=10,dt=null,K=null,q=null;function ft(e,t){let n=t&&t.streamEpoch!=null?String(t.streamEpoch):null;if(mt(),!e)return;q!==null&&(clearTimeout(q),q=null);let r=localStorage.getItem(`alms_auth_token`),i=new URLSearchParams;r&&i.set(`token`,r),t&&t.lastEventId!=null&&i.set(`last_event_id`,String(t.lastEventId)),n&&i.set(`stream_epoch`,n);let a=i.toString(),o=`/events/session-activity${a?`?`+a:``}`,s=new EventSource(o);G=s,ct=e,lt=0,dt=t&&t.lastEventId!=null?t.lastEventId:null,K=n;let c=!1,l=!1,u=!1,d=null,f=null,p=0,m=!1,h=(e,t,n)=>re(e,t,n,K),g=async(e,t=K)=>{let n=Number.isSafeInteger(e)?e:null,r=t;if(l){u=!0,f===r?n!=null&&(d=d==null?n:Math.max(d,n)):(f=r,d=n);return}if(s!==G)return;l=!0;let i=ie(n,r),a=null;try{a=await L(null,{includeDms:!0})}catch(e){console.error(`[agent-events] activity reconciliation failed:`,e)}if(s!==G){T(i);return}a?D(i,a.sessions||[])?p=0:(u=!0,d=n,f=r):T(i),l=!1;let o=u,c=d,m=f;if(u=!1,d=null,f=null,o&&s===G){g(c,m);return}if(!a&&s===G){p++;let e=Math.min(1e3*2**(p-1),3e4);s._reconciliationRetryTimer=setTimeout(()=>{s._reconciliationRetryTimer=null,s===G&&g(null)},e)}};s.addEventListener(`open`,()=>{if(s!==G)return;let e=c||!!(t&&t.reconcileOnOpen);c=!0,ge(`agent-events`),e&&g(null)});let _=async(t,n)=>{if(!(m||s!==G)){m=!0,s.close(),console.error(`[agent-events] rejected live event; reconciling:`,n);try{let n=await L(null,{includeDms:!0});if(s!==G)return;k(n.sessions||[],t,K),G=null,ft(e,{lastEventId:t,streamEpoch:K,reconcileOnOpen:!0})}catch(e){console.error(`[agent-events] contract reconciliation failed:`,e),ke(`agent-events`)}}},v=(e,t)=>s.addEventListener(e,n=>{if(s!==G)return;let r=n.lastEventId,i=r&&/^\d+$/.test(r)?Number(r):null;try{let a=globalThis.__almsContracts;if(!a)throw Error(`Frontend contract bridge is not installed`);t({data:a.parseSseJsonPayload(e,n.data),lastEventId:n.lastEventId}),i!=null&&(dt=r)}catch(t){i==null?(console.error(`[agent-events]`,e,`handler failed:`,t),s.close(),ke(`agent-events`)):_(i,t)}});v(`session_activity_started`,e=>{let t=e.data,n=/^\d+$/.test(e.lastEventId)?Number(e.lastEventId):null;h(`session_activity_started`,t,n)}),v(`session_activity_ended`,e=>{let t=e.data,n=/^\d+$/.test(e.lastEventId)?Number(e.lastEventId):null;h(`session_activity_ended`,t,n)}),v(`stream_state`,e=>{let t=e.data,n=!!(K&&t.stream_epoch&&K!==t.stream_epoch);if(t.stream_epoch&&(K=t.stream_epoch),t.requires_reconciliation||n){let e=Number.isSafeInteger(t.newest)?t.newest:null;g(e)}}),s.onerror=()=>{if(s.readyState===EventSource.CLOSED){if(lt++,lt>=ut){console.error(`[agent-events] Max retries reached for agent`,e),ke(`agent-events`);return}let t=Math.min(2e3*2**(lt-1),3e4),n=e,r=dt,i=K;q=setTimeout(()=>{q=null,ct===n&&ft(n,{lastEventId:r,streamEpoch:i,reconcileOnOpen:!0})},t)}}}function pt(){lt=0;let e=ct;e?ft(e,{lastEventId:dt,streamEpoch:K,reconcileOnOpen:!0}):ge(`agent-events`)}we(pt);function mt(){G&&=(G._reconciliationRetryTimer!=null&&(clearTimeout(G._reconciliationRetryTimer),G._reconciliationRetryTimer=null),G.close(),null),ct=null,dt=null,K=null,lt=0,q!==null&&(clearTimeout(q),q=null),ge(`agent-events`)}function ht(e,t){return!t||typeof t!=`string`?e??null:t===e?null:t}function gt(e){return!e||typeof e!=`string`?null:e}function _t(e,t){return!t||typeof t!=`string`||!e||typeof e!=`string`?!1:e===t}function vt(e){let t=new Map;if(!Array.isArray(e))return t;for(let n of e){if(!n||typeof n.agent_id!=`string`||!n.agent_id)continue;let e=t.get(n.agent_id);e?e.push(n):t.set(n.agent_id,[n])}return t}function yt(e,t){if(!e||!t||typeof t!=`string`)return!1;if(e.session_type===`notification`)return rt(e.agent_name,t);if(e.session_type===`dm`){let n=e.participants;return Array.isArray(n)&&n.some(e=>rt(e,t))}return!1}function bt(e,t){if(!Array.isArray(e))return[];let n=e.map((e,n)=>({s:e,idx:n,owned:+!yt(e,t)}));return n.sort((e,t)=>e.owned-t.owned||e.idx-t.idx),n.map(e=>e.s)}function xt(e){return Array.isArray(e)?e.filter(e=>e&&e.session_type!==`notification`&&e.session_type!==`job`&&e.session_type!==`subagent`):[]}function St(e){return Array.isArray(e)?e.filter(e=>e&&e.session_type===`job`):[]}function Ct(e){return Array.isArray(e)?e.filter(e=>e&&e.session_type===`subagent`):[]}function wt(e){return!!e&&e.session_type!==`subagent`}var Tt=`alms_active_agent`,J=0;function Et(e){return`alms_active_session_${e}`}function Dt(e,t){e&&t&&localStorage.setItem(Et(e),t)}function Ot(e,t,n){if(n){let e=t.find(e=>e.id===n);if(e)return e}let r=localStorage.getItem(Et(e));if(r){let e=t.find(e=>e.id===r);if(e)return e}return t[0]||null}async function kt(e,t){let n=localStorage.getItem(Et(e));if(!n||t.some(e=>e.id===n))return null;try{return await pe(n),n}catch(t){return t&&t.status===404&&localStorage.removeItem(Et(e)),null}}async function At(){try{let e=await at();H.value=e,Pe(e.agents||[]);let t=localStorage.getItem(Tt),n=B.value.find(e=>e.is_default),r=B.value[0],i=B.value.find(e=>e.id===t)||n||r;i&&(z.value=i.id,oe.value=gt(i.id),localStorage.setItem(Tt,i.id),await Mt(i.id))}catch(e){throw console.error(`[boot] failed:`,e),e}}async function jt(){try{return(await L(null,{includeDms:!0})).sessions||[]}catch(e){return console.error(`[fetchCrossAgentSurfaces] failed:`,e),[]}}async function Mt(e,t){let n=++J;try{let[r,i]=await Promise.all([L(e,{includeDms:!1}),jt()]);if(n!==J)return;let a=xt(r.sessions||[]);h(a,i),k([...a,...i]),ft(e);let o=t?null:await kt(e,a);if(n!==J)return;if(o)S.value=o,Dt(e,o),await it(o,{isStale:()=>n!==J,logPrefix:`loadAgentSessions:hidden`});else if(a.length>0){let r=Ot(e,a,t);S.value=r.id,Dt(e,r.id),await it(r.id,{isStale:()=>n!==J,logPrefix:`loadAgentSessions`})}else{let t=await Se(e,`web-chat-`+Date.now());if(n!==J)return;let[r,i]=await Promise.all([L(e,{includeDms:!1}),jt()]);if(n!==J)return;h(xt(r.sessions||[]),i),S.value=t.session_id,Be([],t.session_id),Le(t.session_id,[]),Oe(t.session_id)}}catch(e){if(n!==J)return;console.error(`[loadAgentSessions] failed:`,e)}}async function Nt(e,t){if(!B.value.find(t=>t.id===e))return;Ae(),mt(),Xe(),z.value=e,oe.value=gt(e),localStorage.setItem(Tt,e),We.value=!0,S.value=null,ze.value=null,m(),Be([]),j.value=[],U.value=null,W.value=null,_e();let n=Mt(e,t&&t.targetSessionId),r=J;try{await n}finally{r===J&&(We.value=!1)}}var Y=o(null),X=o(`agents`);function Pt(e){Y.value===e?Y.value=null:(Y.value=e,X.value=e)}var Ft=`alms_theme`;function It(){return localStorage.getItem(Ft)||`dark`}var Lt=o(It());function Rt(){let e=Lt.value===`dark`?`light`:`dark`;Lt.value=e,localStorage.setItem(Ft,e),document.documentElement.setAttribute(`data-theme`,e)}document.documentElement.setAttribute(`data-theme`,It());var zt=()=>d`<svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><circle cx="10" cy="10" r="8"/><path d="M10 6v4l3 3"/></svg>`,Bt=()=>d`<svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M3 5a2 2 0 012-2h3l2 2h5a2 2 0 012 2v7a2 2 0 01-2 2H5a2 2 0 01-2-2V5z"/></svg>`,Vt=()=>d`<svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M5 5l10 10M15 5L5 15"/></svg>`,Ht=()=>d`<svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 15V5M10 5L5 10M10 5l5 5"/></svg>`,Ut=()=>d`<svg width="20" height="20" viewBox="0 0 20 20" fill="currentColor"><rect x="5" y="5" width="10" height="10" rx="1.5"/></svg>`,Wt=()=>d`<svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M6 4l10 6-10 6V4z"/></svg>`,Gt=()=>d`<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12.22 2h-.44a2 2 0 00-2 2v.18a2 2 0 01-1 1.73l-.43.25a2 2 0 01-2 0l-.15-.08a2 2 0 00-2.73.73l-.22.38a2 2 0 00.73 2.73l.15.1a2 2 0 011 1.72v.51a2 2 0 01-1 1.74l-.15.09a2 2 0 00-.73 2.73l.22.38a2 2 0 002.73.73l.15-.08a2 2 0 012 0l.43.25a2 2 0 011 1.73V20a2 2 0 002 2h.44a2 2 0 002-2v-.18a2 2 0 011-1.73l.43-.25a2 2 0 012 0l.15.08a2 2 0 002.73-.73l.22-.39a2 2 0 00-.73-2.73l-.15-.08a2 2 0 01-1-1.74v-.5a2 2 0 011-1.74l.15-.09a2 2 0 00.73-2.73l-.22-.38a2 2 0 00-2.73-.73l-.15.08a2 2 0 01-2 0l-.43-.25a2 2 0 01-1-1.73V4a2 2 0 00-2-2z"/><circle cx="12" cy="12" r="3"/></svg>`,Kt=()=>d`<svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M3 5h14M3 10h14M3 15h14"/></svg>`,qt=()=>d`<svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><circle cx="10" cy="10" r="4"/><path d="M10 2v2M10 16v2M3.5 10H2M18 10h-1.5M5.05 5.05L3.63 3.63M16.37 16.37l-1.42-1.42M5.05 14.95l-1.42 1.42M16.37 3.63l-1.42 1.42"/></svg>`,Jt=()=>d`<svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M17 12.5A7.5 7.5 0 017.5 3 7.5 7.5 0 1017 12.5z"/></svg>`,Yt=o(!1);function Xt(){Yt.value=!Yt.value}function Zt(){Yt.value=!1}var Qt=[`agents`,`jobs`,`audit`],$t=s(()=>H.value.posture||`guarded`);function en({onOpenSettings:e,status:t}){let n=$t.value,r=t.value===`connected`?`ok`:t.value===`running`?`running`:t.value===`error`||t.value===`offline`?`error`:``;return d`
+import{a as e,c as t,d as n,i as r,l as i,n as a,o,r as s,s as c,u as l}from"./index-B5BgAd2e.js";import{n as u,t as d}from"./deps-jIdsN7wc.js";import{A as f,C as p,D as m,E as h,M as g,N as _,O as v,P as y,S as b,T as x,_ as S,a as C,b as w,c as T,d as E,f as D,g as ee,h as te,i as ne,j as O,l as re,m as k,o as A,p as j,r as M,s as N,t as P,u as ie,v as F,w as ae,x as oe,y as I}from"./pending-messages-Deq_dxp7.js";import{A as se,C as ce,D as le,E as ue,I as L,M as de,O as fe,P as pe,S as me,T as he,a as ge,b as _e,c as ve,d as ye,g as be,h as xe,j as Se,k as Ce,l as we,n as Te,o as Ee,p as De,r as Oe,s as ke,t as Ae,u as je,x as Me,y as Ne}from"./use-session-stream-Ct4YVWVM.js";import{t as R}from"./entity-state-Dvifu_4n.js";import{a as Pe,n as z,r as B,t as Fe}from"./agents-BF6NduAV.js";import{activeRunId as V,clearRuns as Ie,replaceRuns as Le,runListGeneration as Re,selectedRunId as ze}from"./runs-agLaznr5.js";import{a as Be,i as Ve,o as He,r as Ue}from"./chat-actions-uXEv39RD.js";import{agentSwitchLoading as We,bootRetryAvailable as Ge,runBoot as Ke,sessionSwitchLoading as qe,setRunBoot as Je}from"./loading-OxDji-5w.js";import{n as Ye,t as Xe}from"./select-generation-DvILpFQd.js";import{n as Ze,o as Qe,r as $e,t as et}from"./runs-D4N-s9XT.js";import{a as tt,i as nt,r as rt,t as it}from"./load-session-4m4SxDKV.js";var at=()=>O(`/settings`),ot=e=>g(`/settings`,e),H=o({});async function st(){try{H.value=await at()}catch(e){console.error(`[settings] refresh failed:`,e)}}var U=o(null),W=o(null),G=null,ct=null,lt=0,ut=10,dt=null,K=null,q=null;function ft(e,t){let n=t&&t.streamEpoch!=null?String(t.streamEpoch):null;if(mt(),!e)return;q!==null&&(clearTimeout(q),q=null);let r=localStorage.getItem(`alms_auth_token`),i=new URLSearchParams;r&&i.set(`token`,r),t&&t.lastEventId!=null&&i.set(`last_event_id`,String(t.lastEventId)),n&&i.set(`stream_epoch`,n);let a=i.toString(),o=`/events/session-activity${a?`?`+a:``}`,s=new EventSource(o);G=s,ct=e,lt=0,dt=t&&t.lastEventId!=null?t.lastEventId:null,K=n;let c=!1,l=!1,u=!1,d=null,f=null,p=0,m=!1,h=(e,t,n)=>re(e,t,n,K),g=async(e,t=K)=>{let n=Number.isSafeInteger(e)?e:null,r=t;if(l){u=!0,f===r?n!=null&&(d=d==null?n:Math.max(d,n)):(f=r,d=n);return}if(s!==G)return;l=!0;let i=ie(n,r),a=null;try{a=await L(null,{includeDms:!0})}catch(e){console.error(`[agent-events] activity reconciliation failed:`,e)}if(s!==G){T(i);return}a?D(i,a.sessions||[])?p=0:(u=!0,d=n,f=r):T(i),l=!1;let o=u,c=d,m=f;if(u=!1,d=null,f=null,o&&s===G){g(c,m);return}if(!a&&s===G){p++;let e=Math.min(1e3*2**(p-1),3e4);s._reconciliationRetryTimer=setTimeout(()=>{s._reconciliationRetryTimer=null,s===G&&g(null)},e)}};s.addEventListener(`open`,()=>{if(s!==G)return;let e=c||!!(t&&t.reconcileOnOpen);c=!0,ge(`agent-events`),e&&g(null)});let _=async(t,n)=>{if(!(m||s!==G)){m=!0,s.close(),console.error(`[agent-events] rejected live event; reconciling:`,n);try{let n=await L(null,{includeDms:!0});if(s!==G)return;k(n.sessions||[],t,K),G=null,ft(e,{lastEventId:t,streamEpoch:K,reconcileOnOpen:!0})}catch(e){console.error(`[agent-events] contract reconciliation failed:`,e),ke(`agent-events`)}}},v=(e,t)=>s.addEventListener(e,n=>{if(s!==G)return;let r=n.lastEventId,i=r&&/^\d+$/.test(r)?Number(r):null;try{let a=globalThis.__almsContracts;if(!a)throw Error(`Frontend contract bridge is not installed`);t({data:a.parseSseJsonPayload(e,n.data),lastEventId:n.lastEventId}),i!=null&&(dt=r)}catch(t){i==null?(console.error(`[agent-events]`,e,`handler failed:`,t),s.close(),ke(`agent-events`)):_(i,t)}});v(`session_activity_started`,e=>{let t=e.data,n=/^\d+$/.test(e.lastEventId)?Number(e.lastEventId):null;h(`session_activity_started`,t,n)}),v(`session_activity_ended`,e=>{let t=e.data,n=/^\d+$/.test(e.lastEventId)?Number(e.lastEventId):null;h(`session_activity_ended`,t,n)}),v(`stream_state`,e=>{let t=e.data,n=!!(K&&t.stream_epoch&&K!==t.stream_epoch);if(t.stream_epoch&&(K=t.stream_epoch),t.requires_reconciliation||n){let e=Number.isSafeInteger(t.newest)?t.newest:null;g(e)}}),s.onerror=()=>{if(s.readyState===EventSource.CLOSED){if(lt++,lt>=ut){console.error(`[agent-events] Max retries reached for agent`,e),ke(`agent-events`);return}let t=Math.min(2e3*2**(lt-1),3e4),n=e,r=dt,i=K;q=setTimeout(()=>{q=null,ct===n&&ft(n,{lastEventId:r,streamEpoch:i,reconcileOnOpen:!0})},t)}}}function pt(){lt=0;let e=ct;e?ft(e,{lastEventId:dt,streamEpoch:K,reconcileOnOpen:!0}):ge(`agent-events`)}we(pt);function mt(){G&&=(G._reconciliationRetryTimer!=null&&(clearTimeout(G._reconciliationRetryTimer),G._reconciliationRetryTimer=null),G.close(),null),ct=null,dt=null,K=null,lt=0,q!==null&&(clearTimeout(q),q=null),ge(`agent-events`)}function ht(e,t){return!t||typeof t!=`string`?e??null:t===e?null:t}function gt(e){return!e||typeof e!=`string`?null:e}function _t(e,t){return!t||typeof t!=`string`||!e||typeof e!=`string`?!1:e===t}function vt(e){let t=new Map;if(!Array.isArray(e))return t;for(let n of e){if(!n||typeof n.agent_id!=`string`||!n.agent_id)continue;let e=t.get(n.agent_id);e?e.push(n):t.set(n.agent_id,[n])}return t}function yt(e,t){if(!e||!t||typeof t!=`string`)return!1;if(e.session_type===`notification`)return rt(e.agent_name,t);if(e.session_type===`dm`){let n=e.participants;return Array.isArray(n)&&n.some(e=>rt(e,t))}return!1}function bt(e,t){if(!Array.isArray(e))return[];let n=e.map((e,n)=>({s:e,idx:n,owned:+!yt(e,t)}));return n.sort((e,t)=>e.owned-t.owned||e.idx-t.idx),n.map(e=>e.s)}function xt(e){return Array.isArray(e)?e.filter(e=>e&&e.session_type!==`notification`&&e.session_type!==`job`&&e.session_type!==`subagent`):[]}function St(e){return Array.isArray(e)?e.filter(e=>e&&e.session_type===`job`):[]}function Ct(e){return Array.isArray(e)?e.filter(e=>e&&e.session_type===`subagent`):[]}function wt(e){return!!e&&e.session_type!==`subagent`}var Tt=`alms_active_agent`,J=0;function Et(e){return`alms_active_session_${e}`}function Dt(e,t){e&&t&&localStorage.setItem(Et(e),t)}function Ot(e,t,n){if(n){let e=t.find(e=>e.id===n);if(e)return e}let r=localStorage.getItem(Et(e));if(r){let e=t.find(e=>e.id===r);if(e)return e}return t[0]||null}async function kt(e,t){let n=localStorage.getItem(Et(e));if(!n||t.some(e=>e.id===n))return null;try{return await pe(n),n}catch(t){return t&&t.status===404&&localStorage.removeItem(Et(e)),null}}async function At(){try{let e=await at();H.value=e,Pe(e.agents||[]);let t=localStorage.getItem(Tt),n=B.value.find(e=>e.is_default),r=B.value[0],i=B.value.find(e=>e.id===t)||n||r;i&&(z.value=i.id,oe.value=gt(i.id),localStorage.setItem(Tt,i.id),await Mt(i.id))}catch(e){throw console.error(`[boot] failed:`,e),e}}async function jt(){try{return(await L(null,{includeDms:!0})).sessions||[]}catch(e){return console.error(`[fetchCrossAgentSurfaces] failed:`,e),[]}}async function Mt(e,t){let n=++J;try{let[r,i]=await Promise.all([L(e,{includeDms:!1}),jt()]);if(n!==J)return;let a=xt(r.sessions||[]);h(a,i),k([...a,...i]),ft(e);let o=t?null:await kt(e,a);if(n!==J)return;if(o)S.value=o,Dt(e,o),await it(o,{isStale:()=>n!==J,logPrefix:`loadAgentSessions:hidden`});else if(a.length>0){let r=Ot(e,a,t);S.value=r.id,Dt(e,r.id),await it(r.id,{isStale:()=>n!==J,logPrefix:`loadAgentSessions`})}else{let t=await Se(e,`web-chat-`+Date.now());if(n!==J)return;let[r,i]=await Promise.all([L(e,{includeDms:!1}),jt()]);if(n!==J)return;h(xt(r.sessions||[]),i),S.value=t.session_id,Be([],t.session_id),Le(t.session_id,[]),Oe(t.session_id)}}catch(e){if(n!==J)return;console.error(`[loadAgentSessions] failed:`,e)}}async function Nt(e,t){if(!B.value.find(t=>t.id===e))return;Ae(),mt(),Xe(),z.value=e,oe.value=gt(e),localStorage.setItem(Tt,e),We.value=!0,S.value=null,ze.value=null,m(),Be([]),j.value=[],U.value=null,W.value=null,_e();let n=Mt(e,t&&t.targetSessionId),r=J;try{await n}finally{r===J&&(We.value=!1)}}var Y=o(null),X=o(`agents`);function Pt(e){Y.value===e?Y.value=null:(Y.value=e,X.value=e)}var Ft=`alms_theme`;function It(){return localStorage.getItem(Ft)||`dark`}var Lt=o(It());function Rt(){let e=Lt.value===`dark`?`light`:`dark`;Lt.value=e,localStorage.setItem(Ft,e),document.documentElement.setAttribute(`data-theme`,e)}document.documentElement.setAttribute(`data-theme`,It());var zt=()=>d`<svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><circle cx="10" cy="10" r="8"/><path d="M10 6v4l3 3"/></svg>`,Bt=()=>d`<svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M3 5a2 2 0 012-2h3l2 2h5a2 2 0 012 2v7a2 2 0 01-2 2H5a2 2 0 01-2-2V5z"/></svg>`,Vt=()=>d`<svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M5 5l10 10M15 5L5 15"/></svg>`,Ht=()=>d`<svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 15V5M10 5L5 10M10 5l5 5"/></svg>`,Ut=()=>d`<svg width="20" height="20" viewBox="0 0 20 20" fill="currentColor"><rect x="5" y="5" width="10" height="10" rx="1.5"/></svg>`,Wt=()=>d`<svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M6 4l10 6-10 6V4z"/></svg>`,Gt=()=>d`<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12.22 2h-.44a2 2 0 00-2 2v.18a2 2 0 01-1 1.73l-.43.25a2 2 0 01-2 0l-.15-.08a2 2 0 00-2.73.73l-.22.38a2 2 0 00.73 2.73l.15.1a2 2 0 011 1.72v.51a2 2 0 01-1 1.74l-.15.09a2 2 0 00-.73 2.73l.22.38a2 2 0 002.73.73l.15-.08a2 2 0 012 0l.43.25a2 2 0 011 1.73V20a2 2 0 002 2h.44a2 2 0 002-2v-.18a2 2 0 011-1.73l.43-.25a2 2 0 012 0l.15.08a2 2 0 002.73-.73l.22-.39a2 2 0 00-.73-2.73l-.15-.08a2 2 0 01-1-1.74v-.5a2 2 0 011-1.74l.15-.09a2 2 0 00.73-2.73l-.22-.38a2 2 0 00-2.73-.73l-.15.08a2 2 0 01-2 0l-.43-.25a2 2 0 01-1-1.73V4a2 2 0 00-2-2z"/><circle cx="12" cy="12" r="3"/></svg>`,Kt=()=>d`<svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M3 5h14M3 10h14M3 15h14"/></svg>`,qt=()=>d`<svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><circle cx="10" cy="10" r="4"/><path d="M10 2v2M10 16v2M3.5 10H2M18 10h-1.5M5.05 5.05L3.63 3.63M16.37 16.37l-1.42-1.42M5.05 14.95l-1.42 1.42M16.37 3.63l-1.42 1.42"/></svg>`,Jt=()=>d`<svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M17 12.5A7.5 7.5 0 017.5 3 7.5 7.5 0 1017 12.5z"/></svg>`,Yt=o(!1);function Xt(){Yt.value=!Yt.value}function Zt(){Yt.value=!1}var Qt=[`agents`,`jobs`,`audit`],$t=s(()=>H.value.posture||`guarded`);function en({onOpenSettings:e,status:t}){let n=$t.value,r=t.value===`connected`?`ok`:t.value===`running`?`running`:t.value===`error`||t.value===`offline`?`error`:``;return d`
         <header>
             <button class="sidebar-toggle-btn" title="Toggle sessions" aria-label="Toggle sessions"
                     onClick=${Xt}>
@@ -1134,28 +1134,7 @@ Context: `+t.context_id+_}
             <span class="model-default-label">Default</span>
             <${Hi} provider=${i} />
         </span>
-    `:d`<span class="model-display model-display--muted">unknown</span>`}function Gi(e){return e===`Enter`||e===` `}function Ki(e){return!e||typeof e.key!=`string`||e.defaultPrevented?!1:Gi(e.key)}function qi(e){return!(!e||e.defaultPrevented)}function Ji(e,t){let n=!!e,r=!!t;return n===r?{}:{debug_mode:r}}var Yi=[`minimal`,`low`,`medium`,`high`];function Xi(e){return e==null?`inherit`:e===0?`disable`:`custom`}function Zi(e){return e==null||e===``?`inherit`:`custom`}function Qi({label:e,hint:t,agentValue:n,mode:r,draft:i}){return d`
-        <div class="settings-row">
-            <label class="settings-label">${e}</label>
-            <div class="agent-tristate">
-                <select class="settings-select agent-tristate-mode"
-                        value=${r.value}
-                        onChange=${e=>{r.value=e.target.value,r.value!==`custom`&&(i.value=``)}}>
-                    <option value="inherit">Inherit (server default)</option>
-                    <option value="disable">Disable (0)</option>
-                    <option value="custom">Custom</option>
-                </select>
-                ${r.value===`custom`&&d`
-                    <input class="settings-input agent-tristate-value"
-                           type="number" min="0" step="1024"
-                           placeholder="tokens"
-                           value=${i.value}
-                           onInput=${e=>{i.value=e.target.value}} />
-                `}
-            </div>
-            ${t&&d`<span class="settings-hint">${t}</span>`}
-        </div>
-    `}function $i({label:e,hint:t,mode:n,value:r}){return d`
+    `:d`<span class="model-display model-display--muted">unknown</span>`}function Gi(e){return e===`Enter`||e===` `}function Ki(e){return!e||typeof e.key!=`string`||e.defaultPrevented?!1:Gi(e.key)}function qi(e){return!(!e||e.defaultPrevented)}function Ji(e,t){let n=!!e,r=!!t;return n===r?{}:{debug_mode:r}}var Yi=`Emits a snapshot of the context window sent to the LLM on every turn, rendered below the chat. Applies from the next run.`,Xi=`Optional cheaper model for compaction summaries and episodic memory. Set provider and model together, or neither.`,Zi=[`minimal`,`low`,`medium`,`high`];function Qi(e){return e==null?`inherit`:e===0?`disable`:`custom`}function $i(e){return e==null||e===``?`inherit`:`custom`}function ea({label:e,agentValue:t,mode:n,draft:r}){return d`
         <div class="settings-row">
             <label class="settings-label">${e}</label>
             <div class="agent-tristate">
@@ -1163,20 +1142,39 @@ Context: `+t.context_id+_}
                         value=${n.value}
                         onChange=${e=>{n.value=e.target.value,n.value!==`custom`&&(r.value=``)}}>
                     <option value="inherit">Inherit (server default)</option>
+                    <option value="disable">Disable (0)</option>
                     <option value="custom">Custom</option>
                 </select>
                 ${n.value===`custom`&&d`
+                    <input class="settings-input agent-tristate-value"
+                           type="number" min="0" step="1024"
+                           placeholder="tokens"
+                           value=${r.value}
+                           onInput=${e=>{r.value=e.target.value}} />
+                `}
+            </div>
+        </div>
+    `}function ta({label:e,mode:t,value:n}){return d`
+        <div class="settings-row">
+            <label class="settings-label">${e}</label>
+            <div class="agent-tristate">
+                <select class="settings-select agent-tristate-mode"
+                        value=${t.value}
+                        onChange=${e=>{t.value=e.target.value,t.value!==`custom`&&(n.value=``)}}>
+                    <option value="inherit">Inherit (server default)</option>
+                    <option value="custom">Custom</option>
+                </select>
+                ${t.value===`custom`&&d`
                     <select class="settings-select agent-tristate-value"
-                            value=${r.value}
-                            onChange=${e=>{r.value=e.target.value}}>
+                            value=${n.value}
+                            onChange=${e=>{n.value=e.target.value}}>
                         <option value="">choose...</option>
-                        ${Yi.map(e=>d`<option value=${e} key=${e}>${e}</option>`)}
+                        ${Zi.map(e=>d`<option value=${e} key=${e}>${e}</option>`)}
                     </select>
                 `}
             </div>
-            ${t&&d`<span class="settings-hint">${t}</span>`}
         </div>
-    `}async function ea(){try{let e=await ji();Pe(e.agents||e||[])}catch(e){console.error(`[agents] fetch failed:`,e)}}function ta({agent:e,onClose:t}){let n=a(e.description||``),r=a(e.model||``),i=a(e.posture||``),o=a(e.provider||``),s=a(`keep`),c=a(``),l=a(Xi(e.thinking_budget_tokens)),u=a(e.thinking_budget_tokens&&e.thinking_budget_tokens>0?String(e.thinking_budget_tokens):``),f=a(Zi(e.reasoning_effort)),p=a(e.reasoning_effort||``),m=a(Xi(e.gemini_thinking_budget)),h=a(e.gemini_thinking_budget&&e.gemini_thinking_budget>0?String(e.gemini_thinking_budget):``),g=a(e.summary_provider||``),_=a(e.summary_model||``),v=a(!!e.debug_mode),y=a(!1),b=a(``),x=H.value.model||``,S=H.value.provider||``,C=H.value.llm_providers||[],w=()=>{let t={};n.value!==(e.description||``)&&(t.description=n.value),(r.value||``)!==(e.model||``)&&(t.model=r.value||``),(i.value||``)!==(e.posture||``)&&(t.posture=i.value||``),(o.value||``)!==(e.provider||``)&&(t.provider=o.value||``),s.value===`set`&&c.value.trim()?t.telegram_token=c.value.trim():s.value===`remove`&&(t.telegram_token=``);let a=e.thinking_budget_tokens;if(l.value===`inherit`)a!=null&&(t.clear_thinking_budget_tokens=!0);else if(l.value===`disable`)a!==0&&(t.thinking_budget_tokens=0);else if(l.value===`custom`){let e=parseInt(u.value,10);!isNaN(e)&&e>=0&&e!==a&&(t.thinking_budget_tokens=e)}let d=e.reasoning_effort||null;f.value===`inherit`?d!=null&&(t.clear_reasoning_effort=!0):f.value===`custom`&&p.value&&p.value!==d&&(t.reasoning_effort=p.value);let y=e.gemini_thinking_budget;if(m.value===`inherit`)y!=null&&(t.clear_gemini_thinking_budget=!0);else if(m.value===`disable`)y!==0&&(t.gemini_thinking_budget=0);else if(m.value===`custom`){let e=parseInt(h.value,10);!isNaN(e)&&e>=0&&e!==y&&(t.gemini_thinking_budget=e)}let b=e.summary_provider||``,x=(g.value||``).trim();x!==b&&(x===``?t.clear_summary_provider=!0:t.summary_provider=x);let S=e.summary_model||``,C=(_.value||``).trim();return C!==S&&(C===``?t.clear_summary_model=!0:t.summary_model=C),Object.assign(t,Ji(e.debug_mode,v.value)),t},T=async()=>{y.value=!0,b.value=``;try{let n=w();if(Object.keys(n).length===0){t();return}await Ni(e.id,n),await ea(),t()}catch(e){b.value=e.error?.message||e.message||`Save failed`}finally{y.value=!1}},E=e=>{e.target===e.currentTarget&&t()},D=!!e.has_telegram;return d`
+    `}async function na(){try{let e=await ji();Pe(e.agents||e||[])}catch(e){console.error(`[agents] fetch failed:`,e)}}function ra({agent:e,onClose:t}){let n=a(e.description||``),r=a(e.model||``),i=a(e.posture||``),o=a(e.provider||``),s=a(`keep`),c=a(``),l=a(Qi(e.thinking_budget_tokens)),u=a(e.thinking_budget_tokens&&e.thinking_budget_tokens>0?String(e.thinking_budget_tokens):``),f=a($i(e.reasoning_effort)),p=a(e.reasoning_effort||``),m=a(Qi(e.gemini_thinking_budget)),h=a(e.gemini_thinking_budget&&e.gemini_thinking_budget>0?String(e.gemini_thinking_budget):``),g=a(e.summary_provider||``),_=a(e.summary_model||``),v=a(!!e.debug_mode),y=a(!1),b=a(``),x=H.value.model||``,S=H.value.provider||``,C=H.value.llm_providers||[],w=()=>{let t={};n.value!==(e.description||``)&&(t.description=n.value),(r.value||``)!==(e.model||``)&&(t.model=r.value||``),(i.value||``)!==(e.posture||``)&&(t.posture=i.value||``),(o.value||``)!==(e.provider||``)&&(t.provider=o.value||``),s.value===`set`&&c.value.trim()?t.telegram_token=c.value.trim():s.value===`remove`&&(t.telegram_token=``);let a=e.thinking_budget_tokens;if(l.value===`inherit`)a!=null&&(t.clear_thinking_budget_tokens=!0);else if(l.value===`disable`)a!==0&&(t.thinking_budget_tokens=0);else if(l.value===`custom`){let e=parseInt(u.value,10);!isNaN(e)&&e>=0&&e!==a&&(t.thinking_budget_tokens=e)}let d=e.reasoning_effort||null;f.value===`inherit`?d!=null&&(t.clear_reasoning_effort=!0):f.value===`custom`&&p.value&&p.value!==d&&(t.reasoning_effort=p.value);let y=e.gemini_thinking_budget;if(m.value===`inherit`)y!=null&&(t.clear_gemini_thinking_budget=!0);else if(m.value===`disable`)y!==0&&(t.gemini_thinking_budget=0);else if(m.value===`custom`){let e=parseInt(h.value,10);!isNaN(e)&&e>=0&&e!==y&&(t.gemini_thinking_budget=e)}let b=e.summary_provider||``,x=(g.value||``).trim();x!==b&&(x===``?t.clear_summary_provider=!0:t.summary_provider=x);let S=e.summary_model||``,C=(_.value||``).trim();return C!==S&&(C===``?t.clear_summary_model=!0:t.summary_model=C),Object.assign(t,Ji(e.debug_mode,v.value)),t},T=async()=>{y.value=!0,b.value=``;try{let n=w();if(Object.keys(n).length===0){t();return}await Ni(e.id,n),await na(),t()}catch(e){b.value=e.error?.message||e.message||`Save failed`}finally{y.value=!1}},E=e=>{e.target===e.currentTarget&&t()},D=!!e.has_telegram;return d`
         <div class="settings-overlay open" onClick=${E}>
             <div class="settings-modal agent-edit-modal">
                 <h2>${e.name}</h2>
@@ -1236,38 +1234,33 @@ Context: `+t.context_id+_}
                 <div class="agent-edit-section-title">Reasoning &amp; thinking</div>
 
                 <span class="settings-hint">
-                    Provider-specific. Each row applies only when this agent's effective provider matches —
-                    Anthropic / OpenAI / Gemini knobs are silently ignored on other providers. Explicit values
-                    take effect on the next run.
+                    Each row applies only when the agent is on that provider; the others ignore it.
                 </span>
 
-                <${Qi}
+                <!-- No per-row hints: the tri-state option labels already read
+                     "Inherit (server default)" / "Disable (0)" / "Custom". -->
+                <${ea}
                     label="Anthropic thinking budget"
-                    hint="Inherit = use server default. Disable = Some(0) (force off for this agent). Custom = override with N tokens."
                     agentValue=${e.thinking_budget_tokens}
                     mode=${l}
                     draft=${u} />
 
-                <${$i}
+                <${ta}
                     label="OpenAI reasoning effort"
-                    hint="Inherit = use server default. Custom picks an effort level for this agent."
                     mode=${f}
                     value=${p} />
 
-                <${Qi}
+                <${ea}
                     label="Gemini thinking budget"
-                    hint="Inherit = use server default. Disable = Some(0) (force off for this agent). Custom = override with N tokens."
                     agentValue=${e.gemini_thinking_budget}
                     mode=${m}
                     draft=${h} />
 
                 <div class="agent-edit-section-divider"></div>
-                <div class="agent-edit-section-title">Summary (compact strategy + episodic memory)</div>
+                <div class="agent-edit-section-title">Summary</div>
 
                 <span class="settings-hint">
-                    Per-agent summary provider/model. Drives both the in-loop compact-strategy compaction and the
-                    post-run episodic memory generation. Both fields must be set together — partial settings are
-                    rejected server-side. Leave both empty to inherit the server default.
+                    ${Xi} Leave both empty to use the server default.
                 </span>
 
                 <div class="settings-row">
@@ -1287,9 +1280,6 @@ Context: `+t.context_id+_}
                            placeholder="(use server default)"
                            value=${_.value}
                            onInput=${e=>{_.value=e.target.value}} />
-                    <span class="settings-hint">
-                        Model slug for the summary provider. Set together with Summary provider.
-                    </span>
                 </div>
 
                 <div class="agent-edit-section-divider"></div>
@@ -1303,14 +1293,7 @@ Context: `+t.context_id+_}
                                onChange=${e=>{v.value=e.target.checked}} />
                         <span>${v.value?`enabled`:`disabled`}</span>
                     </label>
-                    <span class="settings-hint">
-                        When enabled, every turn emits a snapshot of the full assembled context window
-                        (system prompts, workspace, episodic memory, history, tool definitions, in the order
-                        the runtime sends them). The web UI renders the snapshot in a collapsible panel
-                        below the chat. Works for both webchat and DM sessions — for DMs, each turn shows
-                        the per-perspective context the agent currently being inspected sees.
-                        Per-agent. Takes effect on the next run; previous turns are not retroactively shown.
-                    </span>
+                    <span class="settings-hint">${Yi}</span>
                 </div>
 
                 <div class="agent-edit-section-divider"></div>
@@ -1338,10 +1321,8 @@ Context: `+t.context_id+_}
                                onInput=${e=>{c.value=e.target.value}} />
                     `}
                     <span class="settings-hint">
-                        ${D?`A token is set but is never displayed. Replace overwrites it; Remove clears it.`:`Set a bot token to enable a dedicated Telegram polling loop for this agent.`}
-                    </span>
-                    <span class="settings-hint">
-                        Token changes only take effect after the daemon restarts. Tracked in #821.
+                        ${D?`The stored token is never displayed.`:`Set a bot token to give this agent its own Telegram bot.`}
+                        ${` `}Takes effect after a daemon restart.
                     </span>
                 </div>
 
@@ -1355,7 +1336,7 @@ Context: `+t.context_id+_}
                 </div>
             </div>
         </div>
-    `}function na({agent:e,isActive:t,onEdit:n}){let r=a(``),i=a(!1),o=a(null),s=H.value.model||``,c=H.value.provider||``;return d`
+    `}function ia({agent:e,isActive:t,onEdit:n}){let r=a(``),i=a(!1),o=a(null),s=H.value.model||``,c=H.value.provider||``;return d`
         <div class="agent-card ${t?`active`:``}"
              role="option"
              tabindex="0"
@@ -1387,15 +1368,15 @@ Context: `+t.context_id+_}
             <div class="agent-card-actions">
                 <button class="agent-card-btn" onClick=${t=>{t&&t.stopPropagation(),n(e)}}>Edit</button>
                 ${!e.is_default&&d`
-                    <button class="agent-card-btn" onClick=${async t=>{t&&t.stopPropagation();try{await Fi(e.id),await ea()}catch(e){r.value=e.error?.message||e.message||`Failed`}}}>Set Default</button>
+                    <button class="agent-card-btn" onClick=${async t=>{t&&t.stopPropagation();try{await Fi(e.id),await na()}catch(e){r.value=e.error?.message||e.message||`Failed`}}}>Set Default</button>
                 `}
                 ${i.value?d`
-                        <button class="agent-card-btn" style="color:var(--error); font-weight:600;" onClick=${async t=>{t&&t.stopPropagation(),o.value&&=(clearTimeout(o.value),null),i.value=!1;try{if(await Pi(e.id),await ea(),e.id===z.value){let e=B.value.find(e=>e.is_default)||B.value[0]||null;e?Nt(e.id):(z.value=null,oe.value=null)}}catch(e){r.value=e.error?.message||e.message||`Delete failed`}}}>Confirm?</button>
+                        <button class="agent-card-btn" style="color:var(--error); font-weight:600;" onClick=${async t=>{t&&t.stopPropagation(),o.value&&=(clearTimeout(o.value),null),i.value=!1;try{if(await Pi(e.id),await na(),e.id===z.value){let e=B.value.find(e=>e.is_default)||B.value[0]||null;e?Nt(e.id):(z.value=null,oe.value=null)}}catch(e){r.value=e.error?.message||e.message||`Delete failed`}}}>Confirm?</button>
                         <button class="agent-card-btn" onClick=${e=>{e&&e.stopPropagation(),o.value&&=(clearTimeout(o.value),null),i.value=!1}}>Cancel</button>
                     `:d`<button class="agent-card-btn" style="color:var(--error);" onClick=${e=>{e&&e.stopPropagation(),i.value=!0,o.value=setTimeout(()=>{i.value=!1},3e3)}}>Delete</button>`}
             </div>
         </div>
-    `}function ra(){let e=a(``),t=a(``),n=a(!1),r=a(null);i(()=>{X.value===`agents`&&ea()},[X.value]);let o=nt(e.value),s=(e.value||``).trim(),c=s!==``&&o!==s,l=async()=>{let r=nt(e.value);if(!r){(e.value||``).trim()===``?t.value=`Agent name is required`:t.value=`Agent name must contain at least one letter or digit`;return}let i=tt(r);if(i){t.value=i.message;return}t.value=``,n.value=!0;try{let t=await Mi({name:r});t.id||console.warn(`[agents] POST /agents returned no id for agent:`,r,t),e.value=``,await ea()}catch(e){t.value=e.error?.message||e.message||`Failed to create agent`}finally{n.value=!1}};return d`
+    `}function aa(){let e=a(``),t=a(``),n=a(!1),r=a(null);i(()=>{X.value===`agents`&&na()},[X.value]);let o=nt(e.value),s=(e.value||``).trim(),c=s!==``&&o!==s,l=async()=>{let r=nt(e.value);if(!r){(e.value||``).trim()===``?t.value=`Agent name is required`:t.value=`Agent name must contain at least one letter or digit`;return}let i=tt(r);if(i){t.value=i.message;return}t.value=``,n.value=!0;try{let t=await Mi({name:r});t.id||console.warn(`[agents] POST /agents returned no id for agent:`,r,t),e.value=``,await na()}catch(e){t.value=e.error?.message||e.message||`Failed to create agent`}finally{n.value=!1}};return d`
         <div class="agent-list-container">
             <div class="agent-create-row">
                 <input type="text" placeholder="New agent name..."
@@ -1418,19 +1399,19 @@ Context: `+t.context_id+_}
 
             <div class="agent-list" role="listbox" aria-label="Agents">
                 ${B.value.length===0?d`<div class="empty-state">No agents</div>`:B.value.map(e=>d`
-                        <${na} key=${e.id} agent=${e}
+                        <${ia} key=${e.id} agent=${e}
                                       isActive=${e.id===z.value}
                                       onEdit=${e=>{r.value=e}} />
                     `)}
             </div>
 
             ${r.value&&d`
-                <${ta}
+                <${ra}
                     agent=${r.value}
                     onClose=${()=>{r.value=null}} />
             `}
         </div>
-    `}var ia=e=>O(`/agents/${e}/workspace`),aa=(e,t,n)=>y(`/agents/${e}/workspace/${t}`,{content:n}),oa=e=>_(`/agents/${e}/workspace/open`,{}),sa=[`personality`,`goals`,`memories`,`user`];async function ca(){if(!z.value){U.value=null;return}try{let e=await ia(z.value);U.value=e.files||e}catch(e){e.status===404||e.error?.code===`NOT_FOUND`?U.value=`unavailable`:U.value=`error`}}function la({agentId:e,doOpen:t}){let n=a(!1),r=a(null),i=async()=>{if(!(n.value||!e)){n.value=!0,r.value=null;try{await t(e),r.value={kind:`ok`,text:`Opened`},setTimeout(()=>{r.value?.kind===`ok`&&(r.value=null)},2e3)}catch(e){let t=e?.error?.code,n=e?.error?.message||e?.message||`Failed to open workspace`,i=n;t===`NOT_CONFIGURED`?i=`Workspace dir not configured`:t===`WORKSPACE_PATH_MISSING`?i=`Workspace path is missing on disk`:t===`LAUNCHER_FAILED`&&(i=`Failed to launch file explorer`),r.value={kind:`err`,text:i,full:n}}finally{n.value=!1}}};return d`
+    `}var oa=e=>O(`/agents/${e}/workspace`),sa=(e,t,n)=>y(`/agents/${e}/workspace/${t}`,{content:n}),ca=e=>_(`/agents/${e}/workspace/open`,{}),la=[`personality`,`goals`,`memories`,`user`];async function ua(){if(!z.value){U.value=null;return}try{let e=await oa(z.value);U.value=e.files||e}catch(e){e.status===404||e.error?.code===`NOT_FOUND`?U.value=`unavailable`:U.value=`error`}}function da({agentId:e,doOpen:t}){let n=a(!1),r=a(null),i=async()=>{if(!(n.value||!e)){n.value=!0,r.value=null;try{await t(e),r.value={kind:`ok`,text:`Opened`},setTimeout(()=>{r.value?.kind===`ok`&&(r.value=null)},2e3)}catch(e){let t=e?.error?.code,n=e?.error?.message||e?.message||`Failed to open workspace`,i=n;t===`NOT_CONFIGURED`?i=`Workspace dir not configured`:t===`WORKSPACE_PATH_MISSING`?i=`Workspace path is missing on disk`:t===`LAUNCHER_FAILED`&&(i=`Failed to launch file explorer`),r.value={kind:`err`,text:i,full:n}}finally{n.value=!1}}};return d`
         <div class="ws-open-row">
             <button class="ws-open-btn"
                     type="button"
@@ -1449,7 +1430,7 @@ Context: `+t.context_id+_}
                 </span>
             `}
         </div>
-    `}function ua({agentId:e,filename:t,content:n}){let r=a(n||``),o=a(``),s=a(!1);return i(()=>{r.value=n||``},[n]),d`
+    `}function fa({agentId:e,filename:t,content:n}){let r=a(n||``),o=a(``),s=a(!1);return i(()=>{r.value=n||``},[n]),d`
         <div class="ws-file">
             <div class="ws-file-label">${t}</div>
             <textarea class="ws-textarea"
@@ -1457,7 +1438,7 @@ Context: `+t.context_id+_}
                       value=${r.value}
                       onInput=${e=>{r.value=e.target.value}}></textarea>
             <div style="display:flex; align-items:center; gap:var(--space-2);">
-                <button class="ws-save" onClick=${async()=>{if(!s.value){s.value=!0,o.value=``;try{await aa(e,t,r.value),o.value=`Saved`,setTimeout(()=>{o.value=``},2e3),await ca()}catch(e){o.value=`Error: `+(e.error?.message||e.message||`save failed`)}finally{s.value=!1}}}} disabled=${s.value}>
+                <button class="ws-save" onClick=${async()=>{if(!s.value){s.value=!0,o.value=``;try{await sa(e,t,r.value),o.value=`Saved`,setTimeout(()=>{o.value=``},2e3),await ua()}catch(e){o.value=`Error: `+(e.error?.message||e.message||`save failed`)}finally{s.value=!1}}}} disabled=${s.value}>
                     ${s.value?`Saving...`:`Save`}
                 </button>
                 ${o.value&&d`
@@ -1467,20 +1448,20 @@ Context: `+t.context_id+_}
                 `}
             </div>
         </div>
-    `}function da(){return i(()=>{X.value===`workspace`&&ca()},[X.value,z.value]),z.value?U.value===null?d`<div class="loading-state">Loading...</div>`:U.value===`unavailable`?d`<div class="ws-notice">Workspace not configured for this agent</div>`:U.value===`error`?d`<div class="ws-notice" style="color:var(--error);">Failed to load workspace</div>`:d`
+    `}function pa(){return i(()=>{X.value===`workspace`&&ua()},[X.value,z.value]),z.value?U.value===null?d`<div class="loading-state">Loading...</div>`:U.value===`unavailable`?d`<div class="ws-notice">Workspace not configured for this agent</div>`:U.value===`error`?d`<div class="ws-notice" style="color:var(--error);">Failed to load workspace</div>`:d`
         <div>
-            <${la}
+            <${da}
                 agentId=${z.value}
-                doOpen=${oa} />
-            ${sa.map(e=>d`
-                <${ua}
+                doOpen=${ca} />
+            ${la.map(e=>d`
+                <${fa}
                     key=${e}
                     agentId=${z.value}
                     filename=${e}
                     content=${U.value[e+`.md`]||U.value[e]||``} />
             `)}
         </div>
-    `:d`<div class="ws-notice">No agent selected</div>`}var fa=R.jobs;function pa(){return R.getJobMutationGeneration()}function ma(e,t){R.replaceJobs(e,t)}function ha(e){R.createOptimisticJob(e)}function ga(e,t){R.confirmOptimisticJobCreate(e,t)}function _a(e){R.rollbackOptimisticJobCreate(e)}function va(e){R.cancelOptimisticJob(e)}function ya(e,t){R.confirmOptimisticJobCancel(e,t)}function ba(e){R.rollbackOptimisticJobCancel(e)}var xa=()=>O(`/jobs`),Sa=e=>_(`/jobs`,e),Ca=e=>f(`/jobs/${e}`),wa=0,Ta=[{label:`1m`,cron:`* * * * *`,desc:`Every minute`},{label:`5m`,cron:`*/5 * * * *`,desc:`Every 5 minutes`},{label:`15m`,cron:`*/15 * * * *`,desc:`Every 15 minutes`},{label:`30m`,cron:`*/30 * * * *`,desc:`Every 30 minutes`},{label:`1h`,cron:`0 * * * *`,desc:`Every hour`},{label:`6h`,cron:`0 */6 * * *`,desc:`Every 6 hours`},{label:`12h`,cron:`0 */12 * * *`,desc:`Every 12 hours`},{label:`1d`,cron:`0 0 * * *`,desc:`Daily at midnight`}];function Ea(e){return e===`pending`||e===`active`}function Da(e){let t=e.status||`active`;return e.terminal_reason?`${t} (${e.terminal_reason.replaceAll(`_`,` `)})`:t}function Oa(e){return e.retry_count?`${e.retry_count} dispatch ${e.retry_count===1?`retry`:`retries`}`:``}function ka(e){if(!e)return``;let t=Ta.find(t=>t.cron===e.trim());return t?t.desc:e.trim().split(/\s+/).length===5?e:`Invalid cron (need 5 fields)`}function Aa(e){let t=e=>String(e).padStart(2,`0`);return`${e.getFullYear()}-${t(e.getMonth()+1)}-${t(e.getDate())}T${t(e.getHours())}:${t(e.getMinutes())}`}function ja(){let e=new Date(Date.now()+5*6e4);return e.setSeconds(0,0),Aa(e)}function Ma(){let e=new Date;return e.setSeconds(0,0),Aa(e)}async function Na(){let e=pa();try{let t=await xa();ma(t.jobs||t||[],e)}catch(e){console.error(`[jobs] fetch failed:`,e)}}function Pa(){let e=a(`recurring`),t=a(``),n=a(ja()),r=a(``),o=a(z.value||``),s=a(``),c=a(``),l=a(!1),u=a(!1);i(()=>{X.value===`jobs`&&Na()},[X.value]),i(()=>{o.value=z.value||``},[z.value]);let f=ka(t.value),p=e.value===`once`?!!n.value:!!t.value.trim(),m=!!o.value&&p&&!!r.value.trim(),h=async()=>{if(!m)return;s.value=``,c.value=``,l.value=!0;let i=null;try{let a;if(e.value===`once`){let e=new Date(n.value);if(isNaN(e.getTime())){s.value=`Invalid date/time. Please select a valid date.`,l.value=!1;return}a={type:`once`,run_at:e.toISOString()}}else a={type:`recurring`,cron:t.value.trim()};let d={agent_id:o.value,schedule:a,prompt:r.value.trim()};i=`optimistic-job-`+ ++wa,ha({id:i,...d,status:`pending`,next_run_at:null,last_run_at:null});let f=await Sa(d);ga(i,f),i=null,t.value=``,r.value=``,u.value=!1,n.value=ja(),c.value=e.value===`once`?`Job scheduled (one-time).`:`Recurring job created.`,setTimeout(()=>{c.value=``},4e3)}catch(e){i&&_a(i);let t=e.error?.message||e.message||``;s.value=t||`Failed to create job. Check that all fields are filled and the schedule is valid.`}finally{l.value=!1}},g=async e=>{s.value=``,va(e);try{ya(e,await Ca(e))}catch(t){ba(e),t.status===409&&await Na(),s.value=t.error?.message||t.message||`Failed to cancel job`}};return d`
+    `:d`<div class="ws-notice">No agent selected</div>`}var ma=R.jobs;function ha(){return R.getJobMutationGeneration()}function ga(e,t){R.replaceJobs(e,t)}function _a(e){R.createOptimisticJob(e)}function va(e,t){R.confirmOptimisticJobCreate(e,t)}function ya(e){R.rollbackOptimisticJobCreate(e)}function ba(e){R.cancelOptimisticJob(e)}function xa(e,t){R.confirmOptimisticJobCancel(e,t)}function Sa(e){R.rollbackOptimisticJobCancel(e)}var Ca=()=>O(`/jobs`),wa=e=>_(`/jobs`,e),Ta=e=>f(`/jobs/${e}`),Ea=0,Da=[{label:`1m`,cron:`* * * * *`,desc:`Every minute`},{label:`5m`,cron:`*/5 * * * *`,desc:`Every 5 minutes`},{label:`15m`,cron:`*/15 * * * *`,desc:`Every 15 minutes`},{label:`30m`,cron:`*/30 * * * *`,desc:`Every 30 minutes`},{label:`1h`,cron:`0 * * * *`,desc:`Every hour`},{label:`6h`,cron:`0 */6 * * *`,desc:`Every 6 hours`},{label:`12h`,cron:`0 */12 * * *`,desc:`Every 12 hours`},{label:`1d`,cron:`0 0 * * *`,desc:`Daily at midnight`}];function Oa(e){return e===`pending`||e===`active`}function ka(e){let t=e.status||`active`;return e.terminal_reason?`${t} (${e.terminal_reason.replaceAll(`_`,` `)})`:t}function Aa(e){return e.retry_count?`${e.retry_count} dispatch ${e.retry_count===1?`retry`:`retries`}`:``}function ja(e){if(!e)return``;let t=Da.find(t=>t.cron===e.trim());return t?t.desc:e.trim().split(/\s+/).length===5?e:`Invalid cron (need 5 fields)`}function Ma(e){let t=e=>String(e).padStart(2,`0`);return`${e.getFullYear()}-${t(e.getMonth()+1)}-${t(e.getDate())}T${t(e.getHours())}:${t(e.getMinutes())}`}function Na(){let e=new Date(Date.now()+5*6e4);return e.setSeconds(0,0),Ma(e)}function Pa(){let e=new Date;return e.setSeconds(0,0),Ma(e)}async function Fa(){let e=ha();try{let t=await Ca();ga(t.jobs||t||[],e)}catch(e){console.error(`[jobs] fetch failed:`,e)}}function Ia(){let e=a(`recurring`),t=a(``),n=a(Na()),r=a(``),o=a(z.value||``),s=a(``),c=a(``),l=a(!1),u=a(!1);i(()=>{X.value===`jobs`&&Fa()},[X.value]),i(()=>{o.value=z.value||``},[z.value]);let f=ja(t.value),p=e.value===`once`?!!n.value:!!t.value.trim(),m=!!o.value&&p&&!!r.value.trim(),h=async()=>{if(!m)return;s.value=``,c.value=``,l.value=!0;let i=null;try{let a;if(e.value===`once`){let e=new Date(n.value);if(isNaN(e.getTime())){s.value=`Invalid date/time. Please select a valid date.`,l.value=!1;return}a={type:`once`,run_at:e.toISOString()}}else a={type:`recurring`,cron:t.value.trim()};let d={agent_id:o.value,schedule:a,prompt:r.value.trim()};i=`optimistic-job-`+ ++Ea,_a({id:i,...d,status:`pending`,next_run_at:null,last_run_at:null});let f=await wa(d);va(i,f),i=null,t.value=``,r.value=``,u.value=!1,n.value=Na(),c.value=e.value===`once`?`Job scheduled (one-time).`:`Recurring job created.`,setTimeout(()=>{c.value=``},4e3)}catch(e){i&&ya(i);let t=e.error?.message||e.message||``;s.value=t||`Failed to create job. Check that all fields are filled and the schedule is valid.`}finally{l.value=!1}},g=async e=>{s.value=``,ba(e);try{xa(e,await Ta(e))}catch(t){Sa(e),t.status===409&&await Fa(),s.value=t.error?.message||t.message||`Failed to cancel job`}};return d`
         <div>
             <div class="jobs-form">
                 <select class="jobs-select" value=${o.value}
@@ -1503,7 +1484,7 @@ Context: `+t.context_id+_}
 
                 ${e.value===`recurring`?d`
                     <div class="cron-presets">
-                        ${Ta.map(e=>d`
+                        ${Da.map(e=>d`
                             <button class="cron-btn ${t.value===e.cron?`active`:``}"
                                     title=${e.desc}
                                     onClick=${()=>{t.value=e.cron,u.value=!1}}>
@@ -1529,7 +1510,7 @@ Context: `+t.context_id+_}
                 `:d`
                     <input class="jobs-input" type="datetime-local"
                            value=${n.value}
-                           min=${Ma()}
+                           min=${Pa()}
                            onInput=${e=>{n.value=e.target.value}} />
                 `}
 
@@ -1554,24 +1535,24 @@ Context: `+t.context_id+_}
 
             <div class="jobs-divider"></div>
 
-            ${fa.value.length===0?d`<div class="jobs-empty">No scheduled jobs</div>`:fa.value.map(e=>d`
+            ${ma.value.length===0?d`<div class="jobs-empty">No scheduled jobs</div>`:ma.value.map(e=>d`
                     <div class="job-item">
                         <div class="job-prompt">${e.prompt||e.task||`(no prompt)`}</div>
                         <div class="job-meta">
-                            <span>${ka(e.schedule?.cron)||(e.schedule?.type===`once`?`Once at `+Vn(e.schedule.run_at):JSON.stringify(e.schedule))}</span>
+                            <span>${ja(e.schedule?.cron)||(e.schedule?.type===`once`?`Once at `+Vn(e.schedule.run_at):JSON.stringify(e.schedule))}</span>
                             ${e.next_run_at&&d`<span> | next: ${Vn(e.next_run_at)}</span>`}
                             ${e.last_run_at&&d`<span> | last run: ${Vn(e.last_run_at)}</span>`}
-                            ${Oa(e)&&d`<span> | ${Oa(e)}</span>`}
+                            ${Aa(e)&&d`<span> | ${Aa(e)}</span>`}
                             ${e.last_error&&d`<span class="job-last-error"> | last error: ${e.last_error}</span>`}
                         </div>
-                        <span class="job-status-${e.status||`active`}">${Da(e)}</span>
-                        ${Ea(e.status||`active`)&&!e.optimistic&&d`
+                        <span class="job-status-${e.status||`active`}">${ka(e)}</span>
+                        ${Oa(e.status||`active`)&&!e.optimistic&&d`
                             <button class="job-cancel" onClick=${()=>g(e.id)}>Cancel</button>
                         `}
                     </div>
                 `)}
         </div>
-    `}var Fa=(e,t=50)=>O(`/audit?session_id=${e}&limit=${t}`),Ia=50;async function La(e){if(!S.value){W.value=null;return}try{let t=await Fa(S.value,e);W.value=t.events||t||[]}catch{W.value=[]}}function Ra(){let e=a(Ia),t=a(!1);i(()=>{X.value===`audit`&&(e.value=Ia,La(Ia))},[X.value,S.value]);let n=async()=>{t.value=!0;try{let t=e.value+Ia;e.value=t,await La(t)}catch(e){console.error(`[AuditTab] loadMore failed:`,e)}finally{t.value=!1}};if(!S.value)return d`<div class="empty-state">No session selected</div>`;if(W.value===null)return d`<div class="loading-state">Loading...</div>`;if(W.value.length===0)return d`<div class="empty-state">No audit events</div>`;let r=W.value.length>=e.value;return d`
+    `}var La=(e,t=50)=>O(`/audit?session_id=${e}&limit=${t}`),Ra=50;async function za(e){if(!S.value){W.value=null;return}try{let t=await La(S.value,e);W.value=t.events||t||[]}catch{W.value=[]}}function Ba(){let e=a(Ra),t=a(!1);i(()=>{X.value===`audit`&&(e.value=Ra,za(Ra))},[X.value,S.value]);let n=async()=>{t.value=!0;try{let t=e.value+Ra;e.value=t,await za(t)}catch(e){console.error(`[AuditTab] loadMore failed:`,e)}finally{t.value=!1}};if(!S.value)return d`<div class="empty-state">No session selected</div>`;if(W.value===null)return d`<div class="loading-state">Loading...</div>`;if(W.value.length===0)return d`<div class="empty-state">No audit events</div>`;let r=W.value.length>=e.value;return d`
         <div>
             ${W.value.map((e,t)=>d`
                 <div class="audit-event" key=${e.id||`audit-${e.timestamp||``}-${t}`}>
@@ -1593,7 +1574,7 @@ Context: `+t.context_id+_}
                 </button>
             `}
         </div>
-    `}var za=50,Ba={completed:`✓`,failed:`✗`,cancelled:`⊘`,running:`⋯`},Va={user:`user`,scheduled:`scheduled`,subagent:`subagent`,dm:`dm`,notification:`notif`,telegram:`telegram`},Ha={chat:`chat`,dm:`dm`,subagent:`sub`,job:`job`,notification:`notif`,telegram:`tg`};function Ua(e){if(e==null)return`--`;if(e<1e3)return e+`ms`;if(e<6e4)return(e/1e3).toFixed(1)+`s`;let t=Math.floor(e/6e4),n=Math.round(e%6e4/1e3);return t+`m`+(n>0?n+`s`:``)}function Wa(e){return e==null?`--`:e>=1e4?(e/1e3).toFixed(0)+`k`:e>=1e3?(e/1e3).toFixed(1)+`k`:String(e)}function Ga(e){if(!e)return``;let t=Date.now()-new Date(e).getTime();if(t<0)return`just now`;let n=Math.floor(t/1e3);if(n<60)return n+`s ago`;let r=Math.floor(n/60);if(r<60)return r+`m ago`;let i=Math.floor(r/60);return i<24?i+`h ago`:Math.floor(i/24)+`d ago`}function Ka(){let e=a([]),t=a(!1),n=a(``),r=async()=>{if(!z.value){e.value=[];return}t.value=!0,n.value=``;try{let t=await Qe(z.value,za);e.value=t.runs||[]}catch(t){console.error(`[RunsTab] fetch failed:`,t),n.value=t.error?.message||t.message||`Failed to load runs`,e.value=[]}finally{t.value=!1}};return i(()=>{X.value===`runs`&&r()},[X.value,z.value,Re.value]),z.value?t.value&&e.value.length===0?d`<div class="loading-state">Loading runs...</div>`:n.value?d`
+    `}var Va=50,Ha={completed:`✓`,failed:`✗`,cancelled:`⊘`,running:`⋯`},Ua={user:`user`,scheduled:`scheduled`,subagent:`subagent`,dm:`dm`,notification:`notif`,telegram:`telegram`},Wa={chat:`chat`,dm:`dm`,subagent:`sub`,job:`job`,notification:`notif`,telegram:`tg`};function Ga(e){if(e==null)return`--`;if(e<1e3)return e+`ms`;if(e<6e4)return(e/1e3).toFixed(1)+`s`;let t=Math.floor(e/6e4),n=Math.round(e%6e4/1e3);return t+`m`+(n>0?n+`s`:``)}function Ka(e){return e==null?`--`:e>=1e4?(e/1e3).toFixed(0)+`k`:e>=1e3?(e/1e3).toFixed(1)+`k`:String(e)}function qa(e){if(!e)return``;let t=Date.now()-new Date(e).getTime();if(t<0)return`just now`;let n=Math.floor(t/1e3);if(n<60)return n+`s ago`;let r=Math.floor(n/60);if(r<60)return r+`m ago`;let i=Math.floor(r/60);return i<24?i+`h ago`:Math.floor(i/24)+`d ago`}function Ja(){let e=a([]),t=a(!1),n=a(``),r=async()=>{if(!z.value){e.value=[];return}t.value=!0,n.value=``;try{let t=await Qe(z.value,Va);e.value=t.runs||[]}catch(t){console.error(`[RunsTab] fetch failed:`,t),n.value=t.error?.message||t.message||`Failed to load runs`,e.value=[]}finally{t.value=!1}};return i(()=>{X.value===`runs`&&r()},[X.value,z.value,Re.value]),z.value?t.value&&e.value.length===0?d`<div class="loading-state">Loading runs...</div>`:n.value?d`
             <div>
                 <div class="runs-tab-error">${n.value}</div>
                 <button class="runs-tab-retry" onClick=${r}>Retry</button>
@@ -1614,32 +1595,32 @@ Context: `+t.context_id+_}
                          onClick=${()=>e.session_id&&tn(e.session_id)}
                          title=${`Run `+e.run_id.slice(0,8)+` | Session `+(e.session_id||``).slice(0,8)}>
                         <div class="runs-tab-row-top">
-                            <span class="runs-tab-status">${Ba[e.status]||`·`}</span>
+                            <span class="runs-tab-status">${Ha[e.status]||`·`}</span>
                             <span class="runs-tab-trigger runs-tab-trigger--${e.trigger||`user`}">
-                                ${Va[e.trigger]||e.trigger||`user`}
+                                ${Ua[e.trigger]||e.trigger||`user`}
                             </span>
                             <span class="runs-tab-session-type">
-                                ${Ha[e.session_type]||e.session_type||``}
+                                ${Wa[e.session_type]||e.session_type||``}
                             </span>
-                            <span class="runs-tab-time">${Ga(e.ts)}</span>
+                            <span class="runs-tab-time">${qa(e.ts)}</span>
                         </div>
                         <div class="runs-tab-row-bottom">
-                            <span class="runs-tab-duration">${Ua(e.duration_ms)}</span>
+                            <span class="runs-tab-duration">${Ga(e.duration_ms)}</span>
                             <span class="runs-tab-tools">${e.tool_call_count==null?``:e.tool_call_count+` tools`}</span>
                             <span class="runs-tab-tokens">
-                                ${e.usage?Wa(e.usage.prompt_tokens)+` in / `+Wa(e.usage.completion_tokens)+` out`+(typeof e.usage.reasoning_tokens==`number`&&e.usage.reasoning_tokens>0?` (+`+Wa(e.usage.reasoning_tokens)+` reasoning)`:``)+(typeof e.usage.cache_read_input_tokens==`number`&&e.usage.cache_read_input_tokens>0?` (`+Wa(e.usage.cache_read_input_tokens)+` cached)`:``):``}
+                                ${e.usage?Ka(e.usage.prompt_tokens)+` in / `+Ka(e.usage.completion_tokens)+` out`+(typeof e.usage.reasoning_tokens==`number`&&e.usage.reasoning_tokens>0?` (+`+Ka(e.usage.reasoning_tokens)+` reasoning)`:``)+(typeof e.usage.cache_read_input_tokens==`number`&&e.usage.cache_read_input_tokens>0?` (`+Ka(e.usage.cache_read_input_tokens)+` cached)`:``):``}
                             </span>
                         </div>
                     </div>
                 `)}
             </div>
         </div>
-    `:d`<div class="runs-tab-empty">No agent selected</div>`}function qa(e,t=50,n=null){let r=`/agents/${e}/timeline?limit=${t}`;return n&&(r+=`&before=${encodeURIComponent(n)}`),O(r)}var Ja=50,Ya={run_started:`▶`,run_completed:`✓`,run_failed:`✗`,run_cancelled:`⊘`,run_ended:`■`,tool_call:`⚙`,message_received:`●`,message_sent:`○`,marker:`⚑`},Xa={run_started:`started`,run_completed:`completed`,run_failed:`failed`,run_cancelled:`cancelled`,run_ended:`ended`,tool_call:`tool`,message_received:`message`,message_sent:`sent`,marker:`marker`},Za={chat:`chat`,dm:`dm`,subagent:`sub`,job:`job`,notification:`notif`,telegram:`tg`,episodic:`epis`};function Qa(e){if(!e)return``;let t=Date.now()-new Date(e).getTime();if(t<0)return`just now`;let n=Math.floor(t/1e3);if(n<60)return n+`s ago`;let r=Math.floor(n/60);if(r<60)return r+`m ago`;let i=Math.floor(r/60);return i<24?i+`h ago`:Math.floor(i/24)+`d ago`}function $a(e){return e?new Date(e).toLocaleTimeString([],{hour:`2-digit`,minute:`2-digit`}):``}function eo(e){if(!e)return``;let t=new Date(e),n=new Date,r=new Date;return r.setDate(r.getDate()-1),t.toDateString()===n.toDateString()?`Today`:t.toDateString()===r.toDateString()?`Yesterday`:t.toLocaleDateString([],{weekday:`short`,month:`short`,day:`numeric`})}function to(){let e=a([]),t=a(!1),n=a(!1),r=a(``),o=a(!1),s=a(null),c=async(i=!1)=>{if(!z.value){e.value=[];return}i?n.value=!0:t.value=!0,r.value=``;try{let t=i?s.value:null,n=await qa(z.value,Ja,t),r=n.events||[];i?e.value=[...e.value,...r]:e.value=r,o.value=n.pagination?.has_more||!1,s.value=n.pagination?.next_before||null}catch(t){console.error(`[TimelineTab] fetch failed:`,t),r.value=t.error?.message||t.message||`Failed to load timeline`,i||(e.value=[])}finally{t.value=!1,n.value=!1}};if(i(()=>{X.value===`timeline`&&c(!1)},[X.value,z.value]),!z.value)return d`<div class="tl-empty">No agent selected</div>`;if(t.value&&e.value.length===0)return d`<div class="loading-state">Loading timeline...</div>`;if(r.value)return d`
+    `:d`<div class="runs-tab-empty">No agent selected</div>`}function Ya(e,t=50,n=null){let r=`/agents/${e}/timeline?limit=${t}`;return n&&(r+=`&before=${encodeURIComponent(n)}`),O(r)}var Xa=50,Za={run_started:`▶`,run_completed:`✓`,run_failed:`✗`,run_cancelled:`⊘`,run_ended:`■`,tool_call:`⚙`,message_received:`●`,message_sent:`○`,marker:`⚑`},Qa={run_started:`started`,run_completed:`completed`,run_failed:`failed`,run_cancelled:`cancelled`,run_ended:`ended`,tool_call:`tool`,message_received:`message`,message_sent:`sent`,marker:`marker`},$a={chat:`chat`,dm:`dm`,subagent:`sub`,job:`job`,notification:`notif`,telegram:`tg`,episodic:`epis`};function eo(e){if(!e)return``;let t=Date.now()-new Date(e).getTime();if(t<0)return`just now`;let n=Math.floor(t/1e3);if(n<60)return n+`s ago`;let r=Math.floor(n/60);if(r<60)return r+`m ago`;let i=Math.floor(r/60);return i<24?i+`h ago`:Math.floor(i/24)+`d ago`}function to(e){return e?new Date(e).toLocaleTimeString([],{hour:`2-digit`,minute:`2-digit`}):``}function no(e){if(!e)return``;let t=new Date(e),n=new Date,r=new Date;return r.setDate(r.getDate()-1),t.toDateString()===n.toDateString()?`Today`:t.toDateString()===r.toDateString()?`Yesterday`:t.toLocaleDateString([],{weekday:`short`,month:`short`,day:`numeric`})}function ro(){let e=a([]),t=a(!1),n=a(!1),r=a(``),o=a(!1),s=a(null),c=async(i=!1)=>{if(!z.value){e.value=[];return}i?n.value=!0:t.value=!0,r.value=``;try{let t=i?s.value:null,n=await Ya(z.value,Xa,t),r=n.events||[];i?e.value=[...e.value,...r]:e.value=r,o.value=n.pagination?.has_more||!1,s.value=n.pagination?.next_before||null}catch(t){console.error(`[TimelineTab] fetch failed:`,t),r.value=t.error?.message||t.message||`Failed to load timeline`,i||(e.value=[])}finally{t.value=!1,n.value=!1}};if(i(()=>{X.value===`timeline`&&c(!1)},[X.value,z.value]),!z.value)return d`<div class="tl-empty">No agent selected</div>`;if(t.value&&e.value.length===0)return d`<div class="loading-state">Loading timeline...</div>`;if(r.value)return d`
             <div>
                 <div class="tl-error">${r.value}</div>
                 <button class="tl-retry" onClick=${()=>c(!1)}>Retry</button>
             </div>
-        `;if(e.value.length===0)return d`<div class="tl-empty">No activity yet</div>`;let l=new Set;{let t=``;for(let n of e.value){let e=eo(n.timestamp);e!==t&&(l.add(n),t=e)}}return d`
+        `;if(e.value.length===0)return d`<div class="tl-empty">No activity yet</div>`;let l=new Set;{let t=``;for(let n of e.value){let e=no(n.timestamp);e!==t&&(l.add(n),t=e)}}return d`
         <div class="tl-tab">
             <div class="tl-header">
                 <span class="tl-count">${e.value.length} event${e.value.length===1?``:`s`}</span>
@@ -1649,7 +1630,7 @@ Context: `+t.context_id+_}
                 </button>
             </div>
             <div class="tl-list">
-                ${e.value.map((e,t)=>{let n=eo(e.timestamp),r=l.has(e),i=e.event_type===`tool_call`,a=e.event_type===`run_started`||e.event_type===`run_completed`||e.event_type===`run_failed`||e.event_type===`run_cancelled`||e.event_type===`run_ended`,o=e.metadata?.tool_name,s=e.event_type+`-`+e.timestamp+`-`+(e.run_id||``)+`-`+t+(o?`-`+o:``);return d`
+                ${e.value.map((e,t)=>{let n=no(e.timestamp),r=l.has(e),i=e.event_type===`tool_call`,a=e.event_type===`run_started`||e.event_type===`run_completed`||e.event_type===`run_failed`||e.event_type===`run_cancelled`||e.event_type===`run_ended`,o=e.metadata?.tool_name,s=e.event_type+`-`+e.timestamp+`-`+(e.run_id||``)+`-`+t+(o?`-`+o:``);return d`
                         ${r&&d`
                             <div class="tl-date-group" key=${`g-`+n}>${n}</div>
                         `}
@@ -1657,13 +1638,13 @@ Context: `+t.context_id+_}
                              key=${s}
                              onClick=${()=>tn(e.session_id)}
                              title=${`Session `+(e.session_id||``).slice(0,8)+(e.run_id?` | Run `+e.run_id.slice(0,8):``)}>
-                            <span class="tl-time">${$a(e.timestamp)}</span>
-                            <span class="tl-icon tl-icon--${e.event_type}">${Ya[e.event_type]||`·`}</span>
+                            <span class="tl-time">${to(e.timestamp)}</span>
+                            <span class="tl-icon tl-icon--${e.event_type}">${Za[e.event_type]||`·`}</span>
                             <span class="tl-session-badge tl-session-badge--${e.session_type||`chat`}">
-                                ${Za[e.session_type]||e.session_type||`chat`}
+                                ${$a[e.session_type]||e.session_type||`chat`}
                             </span>
-                            <span class="tl-event-label">${Xa[e.event_type]||e.event_type}</span>
-                            <span class="tl-ago">${Qa(e.timestamp)}</span>
+                            <span class="tl-event-label">${Qa[e.event_type]||e.event_type}</span>
+                            <span class="tl-ago">${eo(e.timestamp)}</span>
                         </div>
                         ${e.summary&&d`
                             <div class="tl-summary${i?` tl-summary--indent`:``}"
@@ -1681,18 +1662,18 @@ Context: `+t.context_id+_}
                 </button>
             `}
         </div>
-    `}function no({tab:e}){return e===`agents`?d`<${ra} />`:e===`workspace`?d`<${da} />`:e===`runs`?d`<${Ka} />`:e===`jobs`?d`<${Pa} />`:e===`audit`?d`<${Ra} />`:e===`timeline`?d`<${to} />`:null}function ro(){Y.value=null}function io(){return Y.value?d`
+    `}function io({tab:e}){return e===`agents`?d`<${aa} />`:e===`workspace`?d`<${pa} />`:e===`runs`?d`<${Ja} />`:e===`jobs`?d`<${Ia} />`:e===`audit`?d`<${Ba} />`:e===`timeline`?d`<${ro} />`:null}function ao(){Y.value=null}function oo(){return Y.value?d`
         <div id="panel" class="open">
             <div class="panel-header">
                 <span class="panel-header-title">${X.value.charAt(0).toUpperCase()+X.value.slice(1)}</span>
                 <button class="panel-close-btn" title="Close panel" aria-label="Close panel"
-                        onClick=${ro}>\u00D7</button>
+                        onClick=${ao}>\u00D7</button>
             </div>
             <div class="panel-body">
-                <${no} tab=${X.value} />
+                <${io} tab=${X.value} />
             </div>
         </div>
-    `:null}var ao=()=>O(`/auth/keys`),oo=(e,t)=>y(`/auth/keys`,{provider:e,key:t}),so=e=>f(`/auth/keys/${e}`),co=[`openai`,`anthropic`,`openrouter`,`gemini`];function Q({title:e,defaultOpen:t=!1,children:n}){let r=a(t);return d`
+    `:null}var so=()=>O(`/auth/keys`),co=(e,t)=>y(`/auth/keys`,{provider:e,key:t}),lo=e=>f(`/auth/keys/${e}`),uo=[`openai`,`anthropic`,`openrouter`,`gemini`];function Q({title:e,defaultOpen:t=!1,children:n}){let r=a(t);return d`
         <div class="settings-section">
             <button type="button" class="settings-section-toggle"
                     aria-expanded=${r.value}
@@ -1705,7 +1686,7 @@ Context: `+t.context_id+_}
                 ${n}
             </div>
         </div>
-    `}function lo({label:e,value:t,desc:n}){return d`
+    `}function fo({label:e,value:t,desc:n}){return d`
         <div class="settings-info-row">
             <div class="settings-info-row-header">
                 <span class="settings-info-row-label">${e}</span>
@@ -1721,10 +1702,10 @@ Context: `+t.context_id+_}
             </div>
             ${t&&d`<span class="settings-hint">${t}</span>`}
         </div>
-    `}function uo(){let e=a([]),t=a(null),n=a(``),r=a(!1),o=a(``),s=async()=>{try{let t=await ao();e.value=t.keys||[]}catch(e){console.error(`[auth] list keys failed:`,e)}};i(()=>{s()},[]);let c=async e=>{if(n.value.trim()){r.value=!0,o.value=``;try{await oo(e,n.value.trim()),n.value=``,t.value=null,await s()}catch(e){o.value=e.error?.message||e.message||`Failed to save key`}finally{r.value=!1}}},l=async e=>{try{await so(e),await s()}catch(e){o.value=e.error?.message||e.message||`Failed to remove key`}};return d`
+    `}function po(){let e=a([]),t=a(null),n=a(``),r=a(!1),o=a(``),s=async()=>{try{let t=await so();e.value=t.keys||[]}catch(e){console.error(`[auth] list keys failed:`,e)}};i(()=>{s()},[]);let c=async e=>{if(n.value.trim()){r.value=!0,o.value=``;try{await co(e,n.value.trim()),n.value=``,t.value=null,await s()}catch(e){o.value=e.error?.message||e.message||`Failed to save key`}finally{r.value=!1}}},l=async e=>{try{await lo(e),await s()}catch(e){o.value=e.error?.message||e.message||`Failed to remove key`}};return d`
         <div class="settings-row">
             <label class="settings-label">API Keys</label>
-            ${co.map(i=>{let a=e.value.find(e=>e.provider===i),o=a?.configured,s=a?.source||`none`,u=a?.key||``;return t.value===i?d`
+            ${uo.map(i=>{let a=e.value.find(e=>e.provider===i),o=a?.configured,s=a?.source||`none`,u=a?.key||``;return t.value===i?d`
                         <div class="api-key-row" key=${i}>
                             <span class="api-key-provider">${i}</span>
                             <input class="settings-input" type="password"
@@ -1764,13 +1745,22 @@ Context: `+t.context_id+_}
                 `})}
             ${o.value&&d`<div class="inline-error">${o.value}</div>`}
         </div>
-    `}function fo({open:e,onClose:t}){let n=a(!1),r=a(``),o=a(``),s=a(``),c=a(``),l=a(``),u=a(``),f=a(``),p=a(``),m=a(``),h=a(!0),g=a(``),_=a(``),v=a(``),y=a(``),b=a(``),x=a(``),S=a(``),C=a(``),w=a(!0),T=a(!1),E=a(``),D=a(``),ee=a(!0),te=a(!1),ne=a(``),O=a(!1),re=a(!1),k=a(!1),A=a(``);if(i(()=>{if(e){let e=H.value,t=e.context||{},i=e.session||{},a=e.tools||{},d=e.llm||{},k=d.anthropic||{},j=d.openai||{},M=d.gemini||{};r.value=t.strategy||`truncate`,o.value=t.max_input_tokens==null?``:String(t.max_input_tokens),s.value=t.compact_trigger_pct==null?``:String(t.compact_trigger_pct),c.value=t.compact_retain_pct==null?``:String(t.compact_retain_pct),l.value=t.summary_model||``,u.value=t.summary_provider||``,f.value=i.max_messages==null?``:String(i.max_messages),p.value=i.max_context_tokens==null?``:String(i.max_context_tokens),m.value=i.idle_timeout_secs==null?``:String(i.idle_timeout_secs),h.value=i.auto_archive==null||i.auto_archive,g.value=i.archive_ttl_secs==null?``:String(i.archive_ttl_secs),_.value=a.shell_policy||`sandboxed`,v.value=a.sandbox_root||`.`,y.value=a.timeout_secs==null?``:String(a.timeout_secs),b.value=a.max_output_bytes==null?``:String(a.max_output_bytes),x.value=e.model||``,S.value=e.provider||``,C.value=k.thinking_budget_tokens==null?``:String(k.thinking_budget_tokens),w.value=k.prompt_cache_enabled==null||!!k.prompt_cache_enabled,T.value=!1,E.value=j.reasoning_effort||``,D.value=M.thinking_budget==null?``:String(M.thinking_budget),ee.value=M.cache_enabled==null||!!M.cache_enabled,te.value=!1,ne.value=M.cache_ttl_seconds==null?``:String(M.cache_ttl_seconds);let N=B.value.find(e=>e.id===z.value);O.value=!!(N&&N.debug_mode),re.value=!1,n.value=!1,A.value=``}},[e]),!e)return null;let j=H.value,M=j.context||{},N=j.session||{},P=j.logging||{},ie=j.tools||{},F=j.llm||{},ae=F.anthropic||{},oe=F.openai||{},I=F.gemini||{},se=async()=>{k.value=!0,A.value=``,n.value=!1;let e={},i={};r.value&&r.value!==(M.strategy||``)&&(i.strategy=r.value);let a=parseInt(o.value,10);!isNaN(a)&&a!==M.max_input_tokens&&(i.max_input_tokens=a);let d=parseFloat(s.value);!isNaN(d)&&d!==M.compact_trigger_pct&&(i.compact_trigger_pct=d);let P=parseFloat(c.value);!isNaN(P)&&P!==M.compact_retain_pct&&(i.compact_retain_pct=P),l.value!==(M.summary_model||``)&&(i.summary_model=l.value),u.value!==(M.summary_provider||``)&&(i.summary_provider=u.value),Object.keys(i).length>0&&(e.context=i);let F={},se=parseInt(f.value,10);!isNaN(se)&&se!==N.max_messages&&(F.max_messages=se);let ce=parseInt(p.value,10);!isNaN(ce)&&ce!==N.max_context_tokens&&(F.max_context_tokens=ce);let le=parseInt(m.value,10);!isNaN(le)&&le!==N.idle_timeout_secs&&(F.idle_timeout_secs=le),h.value!==N.auto_archive&&(F.auto_archive=h.value);let ue=parseInt(g.value,10);!isNaN(ue)&&ue!==N.archive_ttl_secs&&(F.archive_ttl_secs=ue),Object.keys(F).length>0&&(e.session=F);let L={};_.value&&_.value!==(ie.shell_policy||``)&&(L.shell_policy=_.value),v.value!==(ie.sandbox_root||``)&&(L.sandbox_root=v.value);let de=parseInt(y.value,10);!isNaN(de)&&de!==ie.timeout_secs&&(L.timeout_secs=de);let fe=parseInt(b.value,10);!isNaN(fe)&&fe!==ie.max_output_bytes&&(L.max_output_bytes=fe),Object.keys(L).length>0&&(e.tools=L);let pe={},me={},he=parseInt(C.value,10);C.value!==``&&!isNaN(he)&&he!==ae.thinking_budget_tokens&&(me.thinking_budget_tokens=he),T.value&&w.value!==!!ae.prompt_cache_enabled&&(me.prompt_cache_enabled=w.value),Object.keys(me).length>0&&(pe.anthropic=me);let ge={},_e=oe.reasoning_effort||``;E.value!==_e&&(ge.reasoning_effort=E.value),Object.keys(ge).length>0&&(pe.openai=ge);let ve={},ye=parseInt(D.value,10);D.value!==``&&!isNaN(ye)&&ye!==I.thinking_budget&&(ve.thinking_budget=ye),te.value&&ee.value!==!!I.cache_enabled&&(ve.cache_enabled=ee.value);let be=parseInt(ne.value,10);if(ne.value!==``&&!isNaN(be)&&be!==I.cache_ttl_seconds&&(ve.cache_ttl_seconds=be),Object.keys(ve).length>0&&(pe.gemini=ve),Object.keys(pe).length>0&&(e.llm=pe),x.value&&x.value!==(j.model||``)&&(e.model=x.value),S.value&&S.value!==(j.provider||``)&&(e.provider=S.value),Object.keys(e).length>0)try{await ot(e),await st()}catch(e){let t=Array.isArray(e.errors)?e.errors.join(`; `):null;A.value=t||e.message||`Failed to save server settings`}if(re.value&&z.value){let e=B.value.find(e=>e.id===z.value),t=Ji(e&&e.debug_mode,O.value);if(Object.keys(t).length>0)try{await Ni(z.value,t);let e=await ji();e&&Array.isArray(e.agents)&&Pe(e.agents)}catch(e){A.value=e.error?.message||e.message||`Failed to save debug mode`}}A.value||(n.value=!0),k.value=!1,A.value||setTimeout(()=>t(),600)},ce=e=>{e.target===e.currentTarget&&t()},le=ie.enabled||j.enabled_tools||[];return d`
+    `}function mo({open:e,onClose:t}){let n=a(!1),r=a(``),o=a(``),s=a(``),c=a(``),l=a(``),u=a(``),f=a(``),p=a(``),m=a(``),h=a(!0),g=a(``),_=a(``),v=a(``),y=a(``),b=a(``),x=a(``),S=a(``),C=a(``),w=a(!0),T=a(!1),E=a(``),D=a(``),ee=a(!0),te=a(!1),ne=a(``),O=a(!1),re=a(!1),k=a(!1),A=a(``);if(i(()=>{if(e){let e=H.value,t=e.context||{},i=e.session||{},a=e.tools||{},d=e.llm||{},k=d.anthropic||{},j=d.openai||{},M=d.gemini||{};r.value=t.strategy||`truncate`,o.value=t.max_input_tokens==null?``:String(t.max_input_tokens),s.value=t.compact_trigger_pct==null?``:String(t.compact_trigger_pct),c.value=t.compact_retain_pct==null?``:String(t.compact_retain_pct),l.value=t.summary_model||``,u.value=t.summary_provider||``,f.value=i.max_messages==null?``:String(i.max_messages),p.value=i.max_context_tokens==null?``:String(i.max_context_tokens),m.value=i.idle_timeout_secs==null?``:String(i.idle_timeout_secs),h.value=i.auto_archive==null||i.auto_archive,g.value=i.archive_ttl_secs==null?``:String(i.archive_ttl_secs),_.value=a.shell_policy||`sandboxed`,v.value=a.sandbox_root||`.`,y.value=a.timeout_secs==null?``:String(a.timeout_secs),b.value=a.max_output_bytes==null?``:String(a.max_output_bytes),x.value=e.model||``,S.value=e.provider||``,C.value=k.thinking_budget_tokens==null?``:String(k.thinking_budget_tokens),w.value=k.prompt_cache_enabled==null||!!k.prompt_cache_enabled,T.value=!1,E.value=j.reasoning_effort||``,D.value=M.thinking_budget==null?``:String(M.thinking_budget),ee.value=M.cache_enabled==null||!!M.cache_enabled,te.value=!1,ne.value=M.cache_ttl_seconds==null?``:String(M.cache_ttl_seconds);let N=B.value.find(e=>e.id===z.value);O.value=!!(N&&N.debug_mode),re.value=!1,n.value=!1,A.value=``}},[e]),!e)return null;let j=H.value,M=j.context||{},N=j.session||{},P=j.logging||{},ie=j.tools||{},F=j.llm||{},ae=F.anthropic||{},oe=F.openai||{},I=F.gemini||{},se=async()=>{k.value=!0,A.value=``,n.value=!1;let e={},i={};r.value&&r.value!==(M.strategy||``)&&(i.strategy=r.value);let a=parseInt(o.value,10);!isNaN(a)&&a!==M.max_input_tokens&&(i.max_input_tokens=a);let d=parseFloat(s.value);!isNaN(d)&&d!==M.compact_trigger_pct&&(i.compact_trigger_pct=d);let P=parseFloat(c.value);!isNaN(P)&&P!==M.compact_retain_pct&&(i.compact_retain_pct=P),l.value!==(M.summary_model||``)&&(i.summary_model=l.value),u.value!==(M.summary_provider||``)&&(i.summary_provider=u.value),Object.keys(i).length>0&&(e.context=i);let F={},se=parseInt(f.value,10);!isNaN(se)&&se!==N.max_messages&&(F.max_messages=se);let ce=parseInt(p.value,10);!isNaN(ce)&&ce!==N.max_context_tokens&&(F.max_context_tokens=ce);let le=parseInt(m.value,10);!isNaN(le)&&le!==N.idle_timeout_secs&&(F.idle_timeout_secs=le),h.value!==N.auto_archive&&(F.auto_archive=h.value);let ue=parseInt(g.value,10);!isNaN(ue)&&ue!==N.archive_ttl_secs&&(F.archive_ttl_secs=ue),Object.keys(F).length>0&&(e.session=F);let L={};_.value&&_.value!==(ie.shell_policy||``)&&(L.shell_policy=_.value),v.value!==(ie.sandbox_root||``)&&(L.sandbox_root=v.value);let de=parseInt(y.value,10);!isNaN(de)&&de!==ie.timeout_secs&&(L.timeout_secs=de);let fe=parseInt(b.value,10);!isNaN(fe)&&fe!==ie.max_output_bytes&&(L.max_output_bytes=fe),Object.keys(L).length>0&&(e.tools=L);let pe={},me={},he=parseInt(C.value,10);C.value!==``&&!isNaN(he)&&he!==ae.thinking_budget_tokens&&(me.thinking_budget_tokens=he),T.value&&w.value!==!!ae.prompt_cache_enabled&&(me.prompt_cache_enabled=w.value),Object.keys(me).length>0&&(pe.anthropic=me);let ge={},_e=oe.reasoning_effort||``;E.value!==_e&&(ge.reasoning_effort=E.value),Object.keys(ge).length>0&&(pe.openai=ge);let ve={},ye=parseInt(D.value,10);D.value!==``&&!isNaN(ye)&&ye!==I.thinking_budget&&(ve.thinking_budget=ye),te.value&&ee.value!==!!I.cache_enabled&&(ve.cache_enabled=ee.value);let be=parseInt(ne.value,10);if(ne.value!==``&&!isNaN(be)&&be!==I.cache_ttl_seconds&&(ve.cache_ttl_seconds=be),Object.keys(ve).length>0&&(pe.gemini=ve),Object.keys(pe).length>0&&(e.llm=pe),x.value&&x.value!==(j.model||``)&&(e.model=x.value),S.value&&S.value!==(j.provider||``)&&(e.provider=S.value),Object.keys(e).length>0)try{await ot(e),await st()}catch(e){let t=Array.isArray(e.errors)?e.errors.join(`; `):null;A.value=t||e.message||`Failed to save server settings`}if(re.value&&z.value){let e=B.value.find(e=>e.id===z.value),t=Ji(e&&e.debug_mode,O.value);if(Object.keys(t).length>0)try{await Ni(z.value,t);let e=await ji();e&&Array.isArray(e.agents)&&Pe(e.agents)}catch(e){A.value=e.error?.message||e.message||`Failed to save debug mode`}}A.value||(n.value=!0),k.value=!1,A.value||setTimeout(()=>t(),600)},ce=e=>{e.target===e.currentTarget&&t()},le=ie.enabled||j.enabled_tools||[];return d`
         <div class="settings-overlay open" onClick=${ce}>
             <div class="settings-modal">
                 <h2>Settings</h2>
+                <!-- Propagation caveats stated once here rather than repeated
+                     per section: every mutable section takes effect on the
+                     next HTTP-triggered run, and every one of them is read
+                     from a boot-time snapshot on the Telegram path (see
+                     docs/api.md § 10.2). -->
+                <p class="settings-subtitle">
+                    Applies from the next run — Telegram-triggered runs after a daemon restart.
+                    Full reference: <code>docs/config.md</code>.
+                </p>
 
                 <!-- Security: API Keys -->
-                <${uo} />
+                <${po} />
 
                 <div class="settings-divider"></div>
 
@@ -1788,16 +1778,8 @@ Context: `+t.context_id+_}
                      is mirrored here as a discoverable shortcut for
                      the most common Debug-mode flow. -->
                 <${Q} key="debug" title="Debug" defaultOpen=${!1}>
-                    <span class="settings-hint settings-section-desc">
-                        Per-agent context-window inspection. When enabled, every turn from the active agent
-                        emits a snapshot of the full assembled LLM context (system prompts, workspace,
-                        episodic memory, history, tool definitions). Works for both webchat and DM sessions —
-                        for DMs, each turn shows the per-perspective context the agent currently being
-                        inspected sees on its turn. Takes effect on the next run; previous turns are not
-                        retroactively shown.
-                    </span>
                     <${$} label="Debug mode (active agent)"
-                        desc="Mirrors the per-agent toggle in the Agents panel. Applies only to the currently-selected agent.">
+                        desc=${Yi+` Applies to the selected agent only — same field as in the Agents panel.`}>
                         <label class="settings-toggle">
                             <input type="checkbox"
                                    checked=${O.value}
@@ -1819,16 +1801,10 @@ Context: `+t.context_id+_}
                      as every other section. -->
                 <${Q} key="defaults" title="Default LLM (model / provider)" defaultOpen=${!0}>
                     <span class="settings-hint settings-section-desc">
-                        Server-default LLM identity — agents inherit these values when they don't
-                        carry a per-agent override (per-agent values live on the agent record and are
-                        edited from the Agents panel). Changes apply to the next run — no restart —
-                        and are persisted to <code>settings.json</code> so they survive one. Runs
-                        already in flight keep the model they started on. Telegram-triggered runs
-                        use a boot-time snapshot until the daemon is restarted, same as the
-                        reasoning &amp; caching defaults below.
+                        Used by agents that don't set their own model or provider in the Agents panel.
                     </span>
                     <${$} label="Default LLM model"
-                        desc="Model id sent to the resolved provider's wire (e.g. z-ai/glm-5.2, claude-sonnet-4-6, gpt-5.4). Pick from the suggestions list or type any model the provider accepts.">
+                        desc="Any model id the provider accepts, e.g. claude-sonnet-4-6.">
                         <input class="settings-input settings-input-sm" type="text"
                                list="model-suggestions"
                                placeholder=${j.model||`model id`}
@@ -1839,11 +1815,11 @@ Context: `+t.context_id+_}
                         </span>
                     <//>
                     <${$} label="Default LLM provider"
-                        desc="Provider whose [llm.providers.NAME] entry the resolved model is sent to. Must be configured under [llm.providers] in alms.toml with a resolvable API key.">
+                        desc="Needs a working API key — see API Keys above.">
                         <select class="settings-select settings-input-sm"
                                 value=${S.value}
                                 onChange=${e=>{S.value=e.target.value}}>
-                            ${(j.llm_providers&&j.llm_providers.length>0?j.llm_providers:co).map(e=>{let t=Vi(e);return d`<option value=${e} key=${e}>${t===`Custom`?e:t}</option>`})}
+                            ${(j.llm_providers&&j.llm_providers.length>0?j.llm_providers:uo).map(e=>{let t=Vi(e);return d`<option value=${e} key=${e}>${t===`Custom`?e:t}</option>`})}
                         </select>
                     <//>
                     <datalist id="model-suggestions">
@@ -1854,12 +1830,12 @@ Context: `+t.context_id+_}
                 <!-- Context (server-level, editable) -->
                 <${Q} key="ctx" title="Context" defaultOpen=${!1}>
                     <span class="settings-hint settings-section-desc">
-                        truncate fits the most recent history into the token budget.
-                        compact summarises older messages once the session crosses the trigger threshold.
-                        Changes apply to the next run.
+                        How conversation history is fitted into the model's context window.
                     </span>
-                    <${$} label="Strategy"
-                        desc="truncate = drop oldest messages to fit the budget. compact = summarise old + keep recent verbatim once history crosses the trigger threshold.">
+                    <!-- No hint on Strategy: the two option labels below already
+                         say what each strategy does, and a hint here only restated
+                         them a third time. -->
+                    <${$} label="Strategy">
                         <select class="settings-select settings-input-sm"
                                 value=${r.value}
                                 onChange=${e=>{r.value=e.target.value}}>
@@ -1868,21 +1844,21 @@ Context: `+t.context_id+_}
                         </select>
                     <//>
                     <${$} label="Max input tokens"
-                        desc="Token budget per LLM request (should match your model's context window).">
+                        desc="Token budget per request. Set it to your model's context window.">
                         <input class="settings-input settings-input-sm" type="number" min="1" step="1000"
                                value=${o.value}
                                onInput=${e=>{o.value=e.target.value}} />
                     <//>
                     ${r.value===`compact`?d`
                     <${$} label="Compact trigger %"
-                        desc="Compact strategy: trigger compaction when assembled history exceeds this fraction of the effective history budget (max_input_tokens minus system / input / episodic / reserve overhead). Range: 0.50–0.95.">
+                        desc="Compact once history fills this share of the budget. 0.50–0.95.">
                         <input class="settings-input settings-input-sm" type="number"
                                min="0.50" max="0.95" step="0.05"
                                value=${s.value}
                                onInput=${e=>{s.value=e.target.value}} />
                     <//>
                     <${$} label="Compact retain %"
-                        desc="Compact strategy: retain at most this fraction of the effective history budget (max_input_tokens minus system / input / episodic / reserve overhead) worth of recent verbatim messages after compaction. Range: 0.20–0.60.">
+                        desc="Recent history kept verbatim afterwards. 0.20–0.60, and at least 0.10 below the trigger.">
                         <input class="settings-input settings-input-sm" type="number"
                                min="0.20" max="0.60" step="0.05"
                                value=${c.value}
@@ -1895,17 +1871,13 @@ Context: `+t.context_id+_}
                      in-loop compact-strategy compaction AND the post-run
                      episodic memory generation. Lifted out of the Context
                      section to make the dual-path scope obvious. -->
-                <${Q} key="summary" title="Summary (compact strategy + episodic memory)" defaultOpen=${!1}>
+                <${Q} key="summary" title="Summary" defaultOpen=${!1}>
                     <span class="settings-hint settings-section-desc">
-                        Optional dedicated provider/model for the summary task. Drives both the in-loop compact-strategy compaction
-                        (rolling context window) and the per-run episodic memory generation. Both fields must be set together — partial
-                        configurations are rejected so the user-supplied summary_model is never silently paired with the agent's primary provider.
-                        Per-agent overrides live on the agent record (Agents panel).
+                        ${Xi} Agents can override both in the Agents panel.
                     </span>
-                    <${$} label="Summary model"
-                        desc="Cheaper model for generating summaries. Set together with Summary provider, or leave both empty to use the agent's main LLM.">
+                    <${$} label="Summary model">
                         <input class="settings-input settings-input-sm" type="text"
-                               placeholder="leave empty to use the agent's main LLM"
+                               placeholder="use the agent's own LLM"
                                list="model-suggestions"
                                value=${l.value}
                                onInput=${e=>{l.value=e.target.value}} />
@@ -1913,13 +1885,12 @@ Context: `+t.context_id+_}
                             <${Ui} value=${l.value.trim()} defaultValue=${j.model} />
                         </span>
                     <//>
-                    <${$} label="Summary provider"
-                        desc="Dedicated provider for the summary task. Must be configured under [llm.providers.<name>] with a resolvable API key. Set together with Summary model.">
+                    <${$} label="Summary provider">
                         <select class="settings-select settings-input-sm"
                                 value=${u.value}
                                 onChange=${e=>{u.value=e.target.value}}>
-                            <option value="">Unset (no dedicated summary task)</option>
-                            ${(j.llm_providers&&j.llm_providers.length>0?j.llm_providers:co).map(e=>{let t=Vi(e);return d`<option value=${e} key=${e}>${t===`Custom`?e:t}</option>`})}
+                            <option value="">Unset (use the agent's own LLM)</option>
+                            ${(j.llm_providers&&j.llm_providers.length>0?j.llm_providers:uo).map(e=>{let t=Vi(e);return d`<option value=${e} key=${e}>${t===`Custom`?e:t}</option>`})}
                         </select>
                     <//>
                 <//>
@@ -1927,28 +1898,26 @@ Context: `+t.context_id+_}
                 <!-- Session (server-level, editable) -->
                 <${Q} key="sess" title="Session" defaultOpen=${!1}>
                     <span class="settings-hint settings-section-desc">
-                        Controls session storage and retention. Changes apply to the next run.
+                        How much history is kept on disk, and for how long.
                     </span>
-                    <${$} label="Max messages"
-                        desc="Maximum messages stored per session.">
+                    <${$} label="Max messages">
                         <input class="settings-input settings-input-sm" type="number" min="1"
                                value=${f.value}
                                onInput=${e=>{f.value=e.target.value}} />
                     <//>
                     <${$} label="Max context tokens"
-                        desc="Maximum tokens retained in session history (must be >= context max_input_tokens).">
+                        desc="Must be at least the Context max input tokens above.">
                         <input class="settings-input settings-input-sm" type="number" min="1" step="1000"
                                value=${p.value}
                                onInput=${e=>{p.value=e.target.value}} />
                     <//>
-                    <${$} label="Idle timeout (seconds)"
-                        desc="Time before a session is considered idle.">
+                    <${$} label="Idle timeout (seconds)">
                         <input class="settings-input settings-input-sm" type="number" min="0"
                                value=${m.value}
                                onInput=${e=>{m.value=e.target.value}} />
                     <//>
                     <${$} label="Auto archive"
-                        desc="Automatically archive idle sessions.">
+                        desc="Archive sessions once they go idle.">
                         <label class="settings-toggle">
                             <input type="checkbox"
                                    checked=${h.value}
@@ -1957,7 +1926,7 @@ Context: `+t.context_id+_}
                         </label>
                     <//>
                     <${$} label="Archive TTL (seconds)"
-                        desc="Delete archived sessions after this duration.">
+                        desc="Archived sessions are deleted after this.">
                         <input class="settings-input settings-input-sm" type="number" min="0"
                                value=${g.value}
                                onInput=${e=>{g.value=e.target.value}} />
@@ -1966,11 +1935,8 @@ Context: `+t.context_id+_}
 
                 <!-- Tools (server-level, editable) -->
                 <${Q} key="tools" title="Tools" defaultOpen=${!1}>
-                    <span class="settings-hint settings-section-desc">
-                        Tool execution settings. Changes apply to the next run.
-                    </span>
                     <${$} label="Shell policy"
-                        desc="sandboxed = restrict shell cwd to sandbox root. unrestricted = no cwd restriction.">
+                        desc="sandboxed pins the shell's working directory to the sandbox root; unrestricted removes the limit.">
                         <select class="settings-select settings-input-sm"
                                 value=${_.value}
                                 onChange=${e=>{_.value=e.target.value}}>
@@ -1979,43 +1945,42 @@ Context: `+t.context_id+_}
                         </select>
                     <//>
                     <${$} label="Sandbox root"
-                        desc="Filesystem sandbox root for fs_* tools. Empty = unrestricted.">
+                        desc="Root directory for the fs_* tools. Empty = unrestricted.">
                         <input class="settings-input settings-input-sm" type="text"
                                value=${v.value}
                                onInput=${e=>{v.value=e.target.value}} />
                     <//>
-                    <${$} label="Tool timeout (seconds)"
-                        desc="Maximum execution time per tool call.">
+                    <${$} label="Tool timeout (seconds)">
                         <input class="settings-input settings-input-sm" type="number" min="1"
                                value=${y.value}
                                onInput=${e=>{y.value=e.target.value}} />
                     <//>
-                    <${$} label="Max output (bytes)"
-                        desc="Maximum bytes returned from a single tool call.">
+                    <${$} label="Max output (bytes)">
                         <input class="settings-input settings-input-sm" type="number" min="1"
                                value=${b.value}
                                onInput=${e=>{b.value=e.target.value}} />
                     <//>
-                    <${lo} label="Enabled tools" value=${`${le.length} tools`}
+                    <${fo} label="Enabled tools" value=${`${le.length} tools`}
                         desc=${le.join(`, `)} />
                 <//>
 
                 <!-- LLM Providers (server-level, editable) — #809 / #804 Slice A -->
                 <${Q} key="llm" title="LLM Providers" defaultOpen=${!1}>
                     <span class="settings-hint settings-section-desc">
-                        Server-level reasoning &amp; caching defaults. Mutations propagate to the next HTTP-triggered run without restart; Telegram-triggered runs use a boot-time snapshot until the daemon is restarted.
+                        Reasoning and caching defaults. Each block applies only to agents on that
+                        provider; the others ignore it.
                     </span>
 
                     <h4 class="settings-llm-subhead">Anthropic</h4>
                     <${$} label="Thinking budget tokens"
-                        desc="0 = extended thinking off. Leave blank to keep the current server value. The wire surface has no clear sentinel — once PATCHed, revert by editing settings.json + restart.">
+                        desc="Extended-thinking budget. 0 turns it off; blank keeps the current value.">
                         <input class="settings-input settings-input-sm" type="number" min="0" step="1024"
                                placeholder=${ae.thinking_budget_tokens==null?`unset`:String(ae.thinking_budget_tokens)}
                                value=${C.value}
                                onInput=${e=>{C.value=e.target.value}} />
                     <//>
                     <${$} label="Prompt cache enabled"
-                        desc="Anthropic prefix caching (5-minute TTL). Server-level only.">
+                        desc="Caches the stable request prefix for 5 minutes.">
                         <label class="settings-toggle">
                             <input type="checkbox"
                                    checked=${w.value}
@@ -2026,7 +1991,7 @@ Context: `+t.context_id+_}
 
                     <h4 class="settings-llm-subhead">OpenAI / OpenRouter</h4>
                     <${$} label="Reasoning effort"
-                        desc="Applies to o-series, GPT-5, and reasoning-capable Grok models. Auto-stripped on non-reasoning models. Choose Unset to clear an existing override.">
+                        desc="Reasoning models only (o-series, GPT-5, Grok); dropped on any other model.">
                         <select class="settings-select settings-input-sm"
                                 value=${E.value}
                                 onChange=${e=>{E.value=e.target.value}}>
@@ -2040,14 +2005,14 @@ Context: `+t.context_id+_}
 
                     <h4 class="settings-llm-subhead">Gemini</h4>
                     <${$} label="Thinking budget"
-                        desc="0 = extended thinking off. Leave blank to keep the current server value. Once PATCHed, this value can only be reverted by editing settings.json + restart.">
+                        desc="Extended-thinking budget. 0 turns it off; blank keeps the current value.">
                         <input class="settings-input settings-input-sm" type="number" min="0" step="1024"
                                placeholder=${I.thinking_budget==null?`unset`:String(I.thinking_budget)}
                                value=${D.value}
                                onInput=${e=>{D.value=e.target.value}} />
                     <//>
                     <${$} label="Cache enabled"
-                        desc="Gemini context caching via cachedContents. Server-level only.">
+                        desc="Gemini context caching. Needs a 32k-token prefix; below that Gemini ignores it.">
                         <label class="settings-toggle">
                             <input type="checkbox"
                                    checked=${ee.value}
@@ -2056,7 +2021,7 @@ Context: `+t.context_id+_}
                         </label>
                     <//>
                     <${$} label="Cache TTL (seconds)"
-                        desc="Lifetime of a Gemini cache entry. Must be > 0.">
+                        desc="Must be greater than 0.">
                         <input class="settings-input settings-input-sm" type="number" min="1" step="60"
                                placeholder=${I.cache_ttl_seconds==null?`300`:String(I.cache_ttl_seconds)}
                                value=${ne.value}
@@ -2066,17 +2031,15 @@ Context: `+t.context_id+_}
 
                 <!-- Logging (server-level, read-only) -->
                 <${Q} key="log" title="Logging" defaultOpen=${!1}>
+                    <!-- Read-only rows: label + value is the whole story, so the
+                         per-row descriptions that only restated the label are gone. -->
                     <span class="settings-hint settings-section-desc">
-                        File-based logging settings. Requires restart to change.
+                        Read-only — edit <code>alms.toml</code> and restart to change.
                     </span>
-                    <${lo} label="File logging" value=${P.file_enabled==null?`--`:P.file_enabled?`enabled`:`disabled`}
-                        desc="Whether persistent file logging is active." />
-                    <${lo} label="File level" value=${P.file_level||`--`}
-                        desc="Log level for file output (trace, debug, info, warn, error)." />
-                    <${lo} label="Rotation" value=${P.rotation||`--`}
-                        desc="Log rotation policy: daily, hourly, or never." />
-                    <${lo} label="Log directory" value=${P.log_dir||`default (data/logs/)`}
-                        desc="Directory where log files are written." />
+                    <${fo} label="File logging" value=${P.file_enabled==null?`--`:P.file_enabled?`enabled`:`disabled`} />
+                    <${fo} label="File level" value=${P.file_level||`--`} />
+                    <${fo} label="Rotation" value=${P.rotation||`--`} />
+                    <${fo} label="Log directory" value=${P.log_dir||`default (data/logs/)`} />
                 <//>
 
                 <div class="settings-divider"></div>
@@ -2106,7 +2069,7 @@ Context: `+t.context_id+_}
                 </div>
             </div>
         </div>
-    `}function po(){let e=a(``),t=a(``),n=a(!1);return d`
+    `}function ho(){let e=a(``),t=a(``),n=a(!1);return d`
         <div id="onboarding">
             <form class="onboard-card" onSubmit=${async r=>{r.preventDefault();let i=e.value.trim();if(i){if(!/^[A-Za-z0-9](?:[A-Za-z0-9-]{0,62}[A-Za-z0-9])?$/.test(i)){t.value=`Invalid name: letters, digits, hyphens only (1-64 chars, no trailing hyphen)`;return}n.value=!0,t.value=``;try{let e=await Mi({name:i,is_default:!0});Pe((await ji()).agents||[]);let t=e.id||(B.value.find(e=>e.name===i)||{}).id;t?await Nt(t):console.warn(`[onboarding] POST /agents returned no id for agent:`,i,e)}catch(e){t.value=e.error?.message||e.message||`Failed to create agent`}finally{n.value=!1}}}}>
                 <h2>Welcome to ALMS</h2>
@@ -2125,9 +2088,9 @@ Context: `+t.context_id+_}
                 <div class="onboard-error">${t.value}</div>
             </form>
         </div>
-    `}function mo(e){if(!e)return``;if(e.status===`done`)return`Done`;if(e.status===`fail`)return`Failed`;if(e.status===`cancelled`)return`Cancelled`;let t=e.activity;if(!t||!t.kind)return`Starting…`;switch(t.kind){case`reasoning`:return`Reasoning…`;case`writing`:return`Writing…`;case`tool_start`:return t.tool?`Using ${t.tool}`:`Using tool`;case`tool_end`:return`Running…`;default:return`Running…`}}function ho(){let e=Object.entries(Ne.value);return e.length===0?null:d`
+    `}function go(e){if(!e)return``;if(e.status===`done`)return`Done`;if(e.status===`fail`)return`Failed`;if(e.status===`cancelled`)return`Cancelled`;let t=e.activity;if(!t||!t.kind)return`Starting…`;switch(t.kind){case`reasoning`:return`Reasoning…`;case`writing`:return`Writing…`;case`tool_start`:return t.tool?`Using ${t.tool}`:`Using tool`;case`tool_end`:return`Running…`;default:return`Running…`}}function _o(){let e=Object.entries(Ne.value);return e.length===0?null:d`
         <div class="sa-bar" aria-label="Subagent status bar">
-            ${e.map(([e,t])=>{let n=t.status===`running`,r=t.status===`done`?`✓`:`✗`,i=t.displayName||e,a=mo(t),o=()=>{t.sessionId&&me(t.sessionId)},s=e=>{qi(e)&&o()},c=e=>{Ki(e)&&(e.preventDefault(),o())},l=t.task?`${i}: ${t.task} — open subagent session`:`${i} — open subagent session`,u=le(t.sessionId),f=e=>t=>{if(t.stopPropagation(),t.key===`Escape`){t.preventDefault(),ue();return}(t.key===`Enter`||t.key===` `)&&(t.preventDefault(),e(t))},p=e=>{e.stopPropagation(),fe(t.sessionId)},m=e=>{e.stopPropagation(),he(t.sessionId)},h=e=>{e.stopPropagation(),ue()};return d`
+            ${e.map(([e,t])=>{let n=t.status===`running`,r=t.status===`done`?`✓`:`✗`,i=t.displayName||e,a=go(t),o=()=>{t.sessionId&&me(t.sessionId)},s=e=>{qi(e)&&o()},c=e=>{Ki(e)&&(e.preventDefault(),o())},l=t.task?`${i}: ${t.task} — open subagent session`:`${i} — open subagent session`,u=le(t.sessionId),f=e=>t=>{if(t.stopPropagation(),t.key===`Escape`){t.preventDefault(),ue();return}(t.key===`Enter`||t.key===` `)&&(t.preventDefault(),e(t))},p=e=>{e.stopPropagation(),fe(t.sessionId)},m=e=>{e.stopPropagation(),he(t.sessionId)},h=e=>{e.stopPropagation(),ue()};return d`
                     <div class="sa-chip ${n?`running`:t.status}"
                          role="button"
                          tabindex="0"
@@ -2162,7 +2125,7 @@ Context: `+t.context_id+_}
                     </div>
                 `})}
         </div>
-    `}function go(){let e=Fe.value,{phase:t,detail:n}=De.value,r=be(t,n),o=a(!1),s=a(!1),u=c(null),f=l(()=>{o.value=!o.value},[]),p=l(()=>{o.value=!1,s.value=!0},[]);return i(()=>{if(!o.value)return;let e=e=>{u.current&&!u.current.contains(e.target)&&(o.value=!1)};return document.addEventListener(`click`,e,!0),()=>document.removeEventListener(`click`,e,!0)},[o.value]),e?d`
+    `}function vo(){let e=Fe.value,{phase:t,detail:n}=De.value,r=be(t,n),o=a(!1),s=a(!1),u=c(null),f=l(()=>{o.value=!o.value},[]),p=l(()=>{o.value=!1,s.value=!0},[]);return i(()=>{if(!o.value)return;let e=e=>{u.current&&!u.current.contains(e.target)&&(o.value=!1)};return document.addEventListener(`click`,e,!0),()=>document.removeEventListener(`click`,e,!0)},[o.value]),e?d`
         <div class="agent-header-bar">
             <div class="agent-header-bar-left">
                 <span class="agent-header-bar-name">${e.name}</span>
@@ -2211,12 +2174,12 @@ Context: `+t.context_id+_}
             </div>
 
             ${s.value&&d`
-                <${ta}
+                <${ra}
                     agent=${e}
                     onClose=${()=>{s.value=!1}} />
             `}
         </div>
-    `:null}var _o=o(!1),vo=new Set;function yo(e,t,n){return e.fromAgent?e.fromAgent===t[0]?`left`:`right`:e.type===`agent`||e.role===`assistant`?n?n===t[0]?`left`:`right`:`left`:e.type===`user`||e.role===`user`?n?n===t[0]?`right`:`left`:`right`:`center`}function bo({msg:e,participants:t,perspectiveAgent:n}){let r=yo(e,t,n),a=e.fromAgent||(r===`left`?t[0]:t[1])||`?`,o=u(e.text||``),s=e.type===`agent`||e.role===`assistant`,l=c(null);return i(()=>{s&&ir(l.current)},[o,s]),d`
+    `:null}var yo=o(!1),bo=new Set;function xo(e,t,n){return e.fromAgent?e.fromAgent===t[0]?`left`:`right`:e.type===`agent`||e.role===`assistant`?n?n===t[0]?`left`:`right`:`left`:e.type===`user`||e.role===`user`?n?n===t[0]?`right`:`left`:`right`:`center`}function So({msg:e,participants:t,perspectiveAgent:n}){let r=xo(e,t,n),a=e.fromAgent||(r===`left`?t[0]:t[1])||`?`,o=u(e.text||``),s=e.type===`agent`||e.role===`assistant`,l=c(null);return i(()=>{s&&ir(l.current)},[o,s]),d`
         <div class="dm-msg dm-msg-${r}">
             <div class="dm-msg-name-row dm-msg-name-row-${r}">
                 <div class="dm-msg-name">${a}</div>
@@ -2225,11 +2188,11 @@ Context: `+t.context_id+_}
             <div class="dm-msg-bubble markdown-body" ref=${l}
                  dangerouslySetInnerHTML=${{__html:o}} />
         </div>
-    `}function xo({text:e}){return d`
+    `}function Co({text:e}){return d`
         <div class="dm-ended-banner">
             <span class="dm-ended-label">${e}</span>
         </div>
-    `}function So(e,t){if(!e)return!1;let n=e.trim();if(!n)return!1;for(let e of t||[]){if(e.tool!==`send_message`)continue;let t=e.params&&typeof e.params.message==`string`?e.params.message.trim():``;if(t&&t===n)return!0}return!1}function Co({runId:e,agentName:n,thinkingText:r,tools:i,status:a,isLive:o}){let[s,c]=t(!1),l=o&&Te.value.get(e)||``,u=r||l,f=So(u,i)?``:u,p=(i||[]).filter(e=>!(e.tool===`send_message`&&e.status===`done`)),m=p.length,h=(i||[]).length>0;return!o&&!h&&(!f||!f.trim())?null:d`
+    `}function wo(e,t){if(!e)return!1;let n=e.trim();if(!n)return!1;for(let e of t||[]){if(e.tool!==`send_message`)continue;let t=e.params&&typeof e.params.message==`string`?e.params.message.trim():``;if(t&&t===n)return!0}return!1}function To({runId:e,agentName:n,thinkingText:r,tools:i,status:a,isLive:o}){let[s,c]=t(!1),l=o&&Te.value.get(e)||``,u=r||l,f=wo(u,i)?``:u,p=(i||[]).filter(e=>!(e.tool===`send_message`&&e.status===`done`)),m=p.length,h=(i||[]).length>0;return!o&&!h&&(!f||!f.trim())?null:d`
         <div class=${`dm-reasoning-block`+(a===`failed`?` dm-reasoning-block--failed`:``)+(o?` dm-reasoning-block--live`:``)}>
             <div class="dm-reasoning-header" onClick=${()=>c(!s)}>
                 <span class="dm-reasoning-toggle">${s?`▼`:`▶`}</span>
@@ -2247,7 +2210,7 @@ Context: `+t.context_id+_}
                 </div>
             `}
         </div>
-    `}async function wo(){let e=S.value;if(!(!e||_o.value)){_o.value=!0;try{await se(e)}catch(e){console.error(`[cancel-dm] failed:`,e)}finally{_o.value=!1}}}function To(){let e=c(null),t=w.value;i(()=>{let t=0,n=r(()=>{A.value,cancelAnimationFrame(t),t=requestAnimationFrame(()=>{Un(e.current)})});return()=>{cancelAnimationFrame(t),n()}},[]);let n=A.value,a=Fe.value?Fe.value.name:null,o=t.length>=2?`${t[0]} <-> ${t[1]}`:`DM conversation`,s=!!V.value,l=!!xe.value,u=s||l,f=_o.value;return d`
+    `}async function Eo(){let e=S.value;if(!(!e||yo.value)){yo.value=!0;try{await se(e)}catch(e){console.error(`[cancel-dm] failed:`,e)}finally{yo.value=!1}}}function Do(){let e=c(null),t=w.value;i(()=>{let t=0,n=r(()=>{A.value,cancelAnimationFrame(t),t=requestAnimationFrame(()=>{Un(e.current)})});return()=>{cancelAnimationFrame(t),n()}},[]);let n=A.value,a=Fe.value?Fe.value.name:null,o=t.length>=2?`${t[0]} <-> ${t[1]}`:`DM conversation`,s=!!V.value,l=!!xe.value,u=s||l,f=yo.value;return d`
         <div class="dm-view-header">
             <span class="dm-view-header-icon" aria-hidden="true">\u2194</span>
             <span class="dm-view-header-label">${o}</span>
@@ -2257,12 +2220,12 @@ Context: `+t.context_id+_}
             ${n.length===0&&d`
                 <div class="empty-state">No messages in this conversation yet.</div>
             `}
-            ${n.map(e=>{if(e.type===`dm_ended`){let t=`Conversation ended -- ${e.reason||`ended`}`;return d`<${xo} key=${e.id} text=${t} />`}if(e.type===`system`)return d`<${xo} key=${e.id} text=${e.text} />`;if(e.type===`notification`){let t=e.metadata||{};if(t.type===`dm_ended_notification`){let n=ye[t.reason]||t.reason||`ended`,r=t.detail?`DM with ${t.peer||`unknown`} ended -- ${n}: ${t.detail}`:`DM with ${t.peer||`unknown`} ended -- ${n}`;return d`<${xo} key=${e.id} text=${r} />`}return d`<${xo} key=${e.id} text=${e.text} />`}if(e.type===`error`)return d`<div key=${e.id} class="dm-msg dm-msg-center"><div class="dm-msg-error">${e.text}</div></div>`;if(e.type===`tokens`)return null;if(e.type===`thinking`){let t=`Thinking…`;if(e.pending)t=`Sending…`;else if(e.queuedBehind>0)t=`Queued \u2014 position ${e.queuedBehind}\u2026`;else if(e.source){let n=e.source.startsWith(`peer:`)?e.source.slice(5):e.source;n&&(t=`${n} is thinking\u2026`)}return d`<div key=${e.id} class="dm-msg dm-msg-center"><div class="dm-msg-thinking">${t}</div></div>`}if(e.type===`warning`)return d`<${xo} key=${e.id} text=${e.text||`Warning`} />`;if(e.type===`run_boundary`){if(!e.status||e.status===`completed`)return null;let t=e.status===`failed`?`run failed`:e.status===`cancelled`?`run cancelled`:`run ${e.status}`;return d`<${xo} key=${e.id} text=${t} />`}if(e.type===`subagent_completed`){let t=`Subagent '${e.name||`subagent`}' ${e.status===`fail`?`failed`:`completed`}`;return d`<${xo} key=${e.id} text=${t} />`}if(e.type===`job_completed`)return d`<${xo} key=${e.id} text=${`Job '${e.jobName||`job`}' ${e.status||`completed`}`} />`;if(e.type===`context_debug`)return d`<${oi} key=${e.id} ...${e} />`;if(e.type===`dm_reasoning`)return d`<${Co} key=${e.id} ...${e} />`;if(e.type===`tool`){if(e.tool===`send_message`&&e.status===`done`&&!e.error)return null;vo.has(e.id)||(vo.add(e.id),console.warn(`[DmConversationView] ungrouped DM tool rendered as a standalone sibling row — this fallback is meant to be dead post-#1076/#1154. Tool:`,e.tool,`id:`,e.id,`runId:`,e.runId));let n=yo({type:`agent`,role:`assistant`},t,a),r=n===`left`?t[0]:t[1];return d`
+            ${n.map(e=>{if(e.type===`dm_ended`){let t=`Conversation ended -- ${e.reason||`ended`}`;return d`<${Co} key=${e.id} text=${t} />`}if(e.type===`system`)return d`<${Co} key=${e.id} text=${e.text} />`;if(e.type===`notification`){let t=e.metadata||{};if(t.type===`dm_ended_notification`){let n=ye[t.reason]||t.reason||`ended`,r=t.detail?`DM with ${t.peer||`unknown`} ended -- ${n}: ${t.detail}`:`DM with ${t.peer||`unknown`} ended -- ${n}`;return d`<${Co} key=${e.id} text=${r} />`}return d`<${Co} key=${e.id} text=${e.text} />`}if(e.type===`error`)return d`<div key=${e.id} class="dm-msg dm-msg-center"><div class="dm-msg-error">${e.text}</div></div>`;if(e.type===`tokens`)return null;if(e.type===`thinking`){let t=`Thinking…`;if(e.pending)t=`Sending…`;else if(e.queuedBehind>0)t=`Queued \u2014 position ${e.queuedBehind}\u2026`;else if(e.source){let n=e.source.startsWith(`peer:`)?e.source.slice(5):e.source;n&&(t=`${n} is thinking\u2026`)}return d`<div key=${e.id} class="dm-msg dm-msg-center"><div class="dm-msg-thinking">${t}</div></div>`}if(e.type===`warning`)return d`<${Co} key=${e.id} text=${e.text||`Warning`} />`;if(e.type===`run_boundary`){if(!e.status||e.status===`completed`)return null;let t=e.status===`failed`?`run failed`:e.status===`cancelled`?`run cancelled`:`run ${e.status}`;return d`<${Co} key=${e.id} text=${t} />`}if(e.type===`subagent_completed`){let t=`Subagent '${e.name||`subagent`}' ${e.status===`fail`?`failed`:`completed`}`;return d`<${Co} key=${e.id} text=${t} />`}if(e.type===`job_completed`)return d`<${Co} key=${e.id} text=${`Job '${e.jobName||`job`}' ${e.status||`completed`}`} />`;if(e.type===`context_debug`)return d`<${oi} key=${e.id} ...${e} />`;if(e.type===`dm_reasoning`)return d`<${To} key=${e.id} ...${e} />`;if(e.type===`tool`){if(e.tool===`send_message`&&e.status===`done`&&!e.error)return null;bo.has(e.id)||(bo.add(e.id),console.warn(`[DmConversationView] ungrouped DM tool rendered as a standalone sibling row — this fallback is meant to be dead post-#1076/#1154. Tool:`,e.tool,`id:`,e.id,`runId:`,e.runId));let n=xo({type:`agent`,role:`assistant`},t,a),r=n===`left`?t[0]:t[1];return d`
                         <div key=${e.id} class="dm-msg dm-msg-${n} dm-msg-tool-row">
                             <div class="dm-msg-name">${r||`?`}</div>
                             <${ei} ...${e} />
                         </div>
-                    `}if(e.type===`image`){let n=yo(e,t,a),r=e.fromAgent||(n===`left`?t[0]:t[1])||`?`;return d`
+                    `}if(e.type===`image`){let n=xo(e,t,a),r=e.fromAgent||(n===`left`?t[0]:t[1])||`?`;return d`
                         <div key=${e.id} class="dm-msg dm-msg-${n}">
                             <div class="dm-msg-name-row dm-msg-name-row-${n}">
                                 <div class="dm-msg-name">${r}</div>
@@ -2272,7 +2235,7 @@ Context: `+t.context_id+_}
                                 ${e.url?d`<img src=${e.url} alt=${e.alt||``} class="dm-msg-image" />`:`[Image${e.alt?`: `+e.alt:``}]`}
                             </div>
                         </div>
-                    `}return e.type===`user`||e.type===`agent`?d`<${bo} key=${e.id} msg=${e} participants=${t} perspectiveAgent=${a} />`:null})}
+                    `}return e.type===`user`||e.type===`agent`?d`<${So} key=${e.id} msg=${e} participants=${t} perspectiveAgent=${a} />`:null})}
         </div>
         <div class="dm-view-footer">
             ${u?d`
@@ -2280,7 +2243,7 @@ Context: `+t.context_id+_}
                             disabled=${f}
                             title="Stop this DM conversation"
                             aria-label="Stop conversation"
-                            onClick=${wo}>
+                            onClick=${Eo}>
                         <span class="dm-cancel-btn-icon" aria-hidden="true">\u25A0</span>
                         ${f?`Stopping…`:`Stop conversation`}
                     </button>
@@ -2288,7 +2251,7 @@ Context: `+t.context_id+_}
                     <span class="dm-view-footer-text">This is a read-only view of an agent-to-agent conversation.</span>
                 `}
         </div>
-    `}function Eo(){return je.value?d`
+    `}function Oo(){return je.value?d`
         <button
             type="button"
             class="stream-dead-banner"
@@ -2302,16 +2265,16 @@ Context: `+t.context_id+_}
                 Live updates disconnected — click to reconnect or reload.
             </span>
         </button>
-    `:null}r(()=>{let e=Fe.value;document.title=e?`ALMS - ${e.name}`:`ALMS`});var Do=o(`connecting...`);function Oo(e){let t=[],n=0;for(;n<e.length;)if(e[n].type===`tool`){let r=[];for(;n<e.length&&e[n].type===`tool`;)r.push(e[n]),n++;r.length>1?t.push({_isToolGroup:!0,key:`tg-`+r[0].id,tools:r}):t.push(r[0])}else t.push(e[n]),n++;return t}function ko(){let e=c(null);i(()=>{let t=0,n=r(()=>{A.value,cancelAnimationFrame(t),t=requestAnimationFrame(()=>{Un(e.current)})});return()=>{cancelAnimationFrame(t),n()}},[]);let t=Oo(A.value),n=b.value,a=p.value,o=ae.value,s=ee.value,l=F.value,u=o?s?.agent_name?s.agent_name+` notifications`:`Notification session`:s?.session_type===`job`?l?l+` job session`:`Job session`:s?.session_type===`subagent`?`Subagent session`:`Internal session`,f=o?`⚡`:s?.session_type===`job`?`⏰`:`⚙`,m=s?.session_type?`internal-session-`+s.session_type:``;return d`
+    `:null}r(()=>{let e=Fe.value;document.title=e?`ALMS - ${e.name}`:`ALMS`});var ko=o(`connecting...`);function Ao(e){let t=[],n=0;for(;n<e.length;)if(e[n].type===`tool`){let r=[];for(;n<e.length&&e[n].type===`tool`;)r.push(e[n]),n++;r.length>1?t.push({_isToolGroup:!0,key:`tg-`+r[0].id,tools:r}):t.push(r[0])}else t.push(e[n]),n++;return t}function jo(){let e=c(null);i(()=>{let t=0,n=r(()=>{A.value,cancelAnimationFrame(t),t=requestAnimationFrame(()=>{Un(e.current)})});return()=>{cancelAnimationFrame(t),n()}},[]);let t=Ao(A.value),n=b.value,a=p.value,o=ae.value,s=ee.value,l=F.value,u=o?s?.agent_name?s.agent_name+` notifications`:`Notification session`:s?.session_type===`job`?l?l+` job session`:`Job session`:s?.session_type===`subagent`?`Subagent session`:`Internal session`,f=o?`⚡`:s?.session_type===`job`?`⏰`:`⚙`,m=s?.session_type?`internal-session-`+s.session_type:``;return d`
         <div id="chat">
-            <${go} />
+            <${vo} />
             ${(We.value||qe.value)&&d`
                 <div id="messages" role="log" aria-live="polite">
                     ${We.value?d`<div class="loading-state">Loading agent...</div>`:d`<div class="loading-state">Loading session...</div>`}
                 </div>
             `}
             ${!We.value&&!qe.value&&n&&d`
-                <${To} />
+                <${Do} />
             `}
             ${!We.value&&!qe.value&&!n&&d`
             ${a&&d`
@@ -2366,7 +2329,7 @@ Context: `+t.context_id+_}
                             pending=${t.pending} queuedBehind=${t.queuedBehind} source=${t.source} />`:null})}
             </div>
             <${wi} />
-            <${ho} />
+            <${_o} />
             ${a?d`
                     <div class="internal-session-footer">
                         <span class="internal-session-footer-text">This is a read-only view of internal agent activity.</span>
@@ -2374,14 +2337,14 @@ Context: `+t.context_id+_}
                 `:d`<${Ai} />`}
             `}
         </div>
-    `}function Ao(){let e=a(!1);return d`
-        <${en} status=${Do} onOpenSettings=${()=>{e.value=!0}} />
-        <${Eo} />
+    `}function Mo(){let e=a(!1);return d`
+        <${en} status=${ko} onOpenSettings=${()=>{e.value=!0}} />
+        <${Oo} />
         ${B.value.length>0?d`
                 <div id="main">
                     <${zn} />
-                    <${ko} />
-                    <${io} />
-                </div>`:d`<${po} />`}
-        <${fo} open=${e.value} onClose=${()=>{e.value=!1}} />
-    `}n(d`<${Ao} />`,document.getElementById(`app`));function jo(){Ge.value=!1,Do.value=`connecting...`,At().then(()=>{Do.value=`connected`}).catch(()=>{Do.value=`offline`,Ge.value=!0})}Je(jo),Ee(),jo();export{jt as a,At as i,Ei as n,Dt as o,Ti as r,Nt as s,Do as status,Ai as t};
+                    <${jo} />
+                    <${oo} />
+                </div>`:d`<${ho} />`}
+        <${mo} open=${e.value} onClose=${()=>{e.value=!1}} />
+    `}n(d`<${Mo} />`,document.getElementById(`app`));function No(){Ge.value=!1,ko.value=`connecting...`,At().then(()=>{ko.value=`connected`}).catch(()=>{ko.value=`offline`,Ge.value=!0})}Je(No),Ee(),No();export{jt as a,At as i,Ei as n,Dt as o,Ti as r,Nt as s,ko as status,Ai as t};

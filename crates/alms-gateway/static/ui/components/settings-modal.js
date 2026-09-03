@@ -10,6 +10,7 @@ import {
     formatProviderLabel,
 } from '../utils/model-display.js';
 import { debugModePatchDelta } from '../utils/debug-mode-patch.js';
+import { DEBUG_MODE_HINT, SUMMARY_HINT } from './settings-copy.js';
 
 const PROVIDERS = ['openai', 'anthropic', 'openrouter', 'gemini'];
 
@@ -574,6 +575,15 @@ export function SettingsModal({ open, onClose }) {
         <div class="settings-overlay open" onClick=${onOverlayClick}>
             <div class="settings-modal">
                 <h2>Settings</h2>
+                <!-- Propagation caveats stated once here rather than repeated
+                     per section: every mutable section takes effect on the
+                     next HTTP-triggered run, and every one of them is read
+                     from a boot-time snapshot on the Telegram path (see
+                     docs/api.md § 10.2). -->
+                <p class="settings-subtitle">
+                    Applies from the next run — Telegram-triggered runs after a daemon restart.
+                    Full reference: <code>docs/config.md</code>.
+                </p>
 
                 <!-- Security: API Keys -->
                 <${ApiKeysSection} />
@@ -594,16 +604,8 @@ export function SettingsModal({ open, onClose }) {
                      is mirrored here as a discoverable shortcut for
                      the most common Debug-mode flow. -->
                 <${Section} key="debug" title="Debug" defaultOpen=${false}>
-                    <span class="settings-hint settings-section-desc">
-                        Per-agent context-window inspection. When enabled, every turn from the active agent
-                        emits a snapshot of the full assembled LLM context (system prompts, workspace,
-                        episodic memory, history, tool definitions). Works for both webchat and DM sessions —
-                        for DMs, each turn shows the per-perspective context the agent currently being
-                        inspected sees on its turn. Takes effect on the next run; previous turns are not
-                        retroactively shown.
-                    </span>
                     <${EditRow} label="Debug mode (active agent)"
-                        desc="Mirrors the per-agent toggle in the Agents panel. Applies only to the currently-selected agent.">
+                        desc=${DEBUG_MODE_HINT + ' Applies to the selected agent only — same field as in the Agents panel.'}>
                         <label class="settings-toggle">
                             <input type="checkbox"
                                    checked=${debugMode.value}
@@ -628,16 +630,10 @@ export function SettingsModal({ open, onClose }) {
                      as every other section. -->
                 <${Section} key="defaults" title="Default LLM (model / provider)" defaultOpen=${true}>
                     <span class="settings-hint settings-section-desc">
-                        Server-default LLM identity — agents inherit these values when they don't
-                        carry a per-agent override (per-agent values live on the agent record and are
-                        edited from the Agents panel). Changes apply to the next run — no restart —
-                        and are persisted to <code>settings.json</code> so they survive one. Runs
-                        already in flight keep the model they started on. Telegram-triggered runs
-                        use a boot-time snapshot until the daemon is restarted, same as the
-                        reasoning &amp; caching defaults below.
+                        Used by agents that don't set their own model or provider in the Agents panel.
                     </span>
                     <${EditRow} label="Default LLM model"
-                        desc="Model id sent to the resolved provider's wire (e.g. z-ai/glm-5.2, claude-sonnet-4-6, gpt-5.4). Pick from the suggestions list or type any model the provider accepts.">
+                        desc="Any model id the provider accepts, e.g. claude-sonnet-4-6.">
                         <input class="settings-input settings-input-sm" type="text"
                                list="model-suggestions"
                                placeholder=${defaults.model || 'model id'}
@@ -648,7 +644,7 @@ export function SettingsModal({ open, onClose }) {
                         </span>
                     <//>
                     <${EditRow} label="Default LLM provider"
-                        desc="Provider whose [llm.providers.NAME] entry the resolved model is sent to. Must be configured under [llm.providers] in alms.toml with a resolvable API key.">
+                        desc="Needs a working API key — see API Keys above.">
                         <select class="settings-select settings-input-sm"
                                 value=${defaultProvider.value}
                                 onChange=${e => { defaultProvider.value = e.target.value; }}>
@@ -669,12 +665,12 @@ export function SettingsModal({ open, onClose }) {
                 <!-- Context (server-level, editable) -->
                 <${Section} key="ctx" title="Context" defaultOpen=${false}>
                     <span class="settings-hint settings-section-desc">
-                        truncate fits the most recent history into the token budget.
-                        compact summarises older messages once the session crosses the trigger threshold.
-                        Changes apply to the next run.
+                        How conversation history is fitted into the model's context window.
                     </span>
-                    <${EditRow} label="Strategy"
-                        desc="truncate = drop oldest messages to fit the budget. compact = summarise old + keep recent verbatim once history crosses the trigger threshold.">
+                    <!-- No hint on Strategy: the two option labels below already
+                         say what each strategy does, and a hint here only restated
+                         them a third time. -->
+                    <${EditRow} label="Strategy">
                         <select class="settings-select settings-input-sm"
                                 value=${ctxStrategy.value}
                                 onChange=${e => { ctxStrategy.value = e.target.value; }}>
@@ -683,21 +679,21 @@ export function SettingsModal({ open, onClose }) {
                         </select>
                     <//>
                     <${EditRow} label="Max input tokens"
-                        desc="Token budget per LLM request (should match your model's context window).">
+                        desc="Token budget per request. Set it to your model's context window.">
                         <input class="settings-input settings-input-sm" type="number" min="1" step="1000"
                                value=${ctxMaxInput.value}
                                onInput=${e => { ctxMaxInput.value = e.target.value; }} />
                     <//>
                     ${ctxStrategy.value === 'compact' ? html`
                     <${EditRow} label="Compact trigger %"
-                        desc="Compact strategy: trigger compaction when assembled history exceeds this fraction of the effective history budget (max_input_tokens minus system / input / episodic / reserve overhead). Range: 0.50–0.95.">
+                        desc="Compact once history fills this share of the budget. 0.50–0.95.">
                         <input class="settings-input settings-input-sm" type="number"
                                min="0.50" max="0.95" step="0.05"
                                value=${ctxCompactTrigger.value}
                                onInput=${e => { ctxCompactTrigger.value = e.target.value; }} />
                     <//>
                     <${EditRow} label="Compact retain %"
-                        desc="Compact strategy: retain at most this fraction of the effective history budget (max_input_tokens minus system / input / episodic / reserve overhead) worth of recent verbatim messages after compaction. Range: 0.20–0.60.">
+                        desc="Recent history kept verbatim afterwards. 0.20–0.60, and at least 0.10 below the trigger.">
                         <input class="settings-input settings-input-sm" type="number"
                                min="0.20" max="0.60" step="0.05"
                                value=${ctxCompactRetain.value}
@@ -710,17 +706,13 @@ export function SettingsModal({ open, onClose }) {
                      in-loop compact-strategy compaction AND the post-run
                      episodic memory generation. Lifted out of the Context
                      section to make the dual-path scope obvious. -->
-                <${Section} key="summary" title="Summary (compact strategy + episodic memory)" defaultOpen=${false}>
+                <${Section} key="summary" title="Summary" defaultOpen=${false}>
                     <span class="settings-hint settings-section-desc">
-                        Optional dedicated provider/model for the summary task. Drives both the in-loop compact-strategy compaction
-                        (rolling context window) and the per-run episodic memory generation. Both fields must be set together — partial
-                        configurations are rejected so the user-supplied summary_model is never silently paired with the agent's primary provider.
-                        Per-agent overrides live on the agent record (Agents panel).
+                        ${SUMMARY_HINT} Agents can override both in the Agents panel.
                     </span>
-                    <${EditRow} label="Summary model"
-                        desc="Cheaper model for generating summaries. Set together with Summary provider, or leave both empty to use the agent's main LLM.">
+                    <${EditRow} label="Summary model">
                         <input class="settings-input settings-input-sm" type="text"
-                               placeholder="leave empty to use the agent's main LLM"
+                               placeholder="use the agent's own LLM"
                                list="model-suggestions"
                                value=${ctxSummaryModel.value}
                                onInput=${e => { ctxSummaryModel.value = e.target.value; }} />
@@ -728,12 +720,11 @@ export function SettingsModal({ open, onClose }) {
                             <${ModelDisplay} value=${ctxSummaryModel.value.trim()} defaultValue=${defaults.model} />
                         </span>
                     <//>
-                    <${EditRow} label="Summary provider"
-                        desc="Dedicated provider for the summary task. Must be configured under [llm.providers.<name>] with a resolvable API key. Set together with Summary model.">
+                    <${EditRow} label="Summary provider">
                         <select class="settings-select settings-input-sm"
                                 value=${ctxSummaryProvider.value}
                                 onChange=${e => { ctxSummaryProvider.value = e.target.value; }}>
-                            <option value="">Unset (no dedicated summary task)</option>
+                            <option value="">Unset (use the agent's own LLM)</option>
                             ${(defaults.llm_providers && defaults.llm_providers.length > 0
                                 ? defaults.llm_providers
                                 : PROVIDERS).map(p => {
@@ -751,28 +742,26 @@ export function SettingsModal({ open, onClose }) {
                 <!-- Session (server-level, editable) -->
                 <${Section} key="sess" title="Session" defaultOpen=${false}>
                     <span class="settings-hint settings-section-desc">
-                        Controls session storage and retention. Changes apply to the next run.
+                        How much history is kept on disk, and for how long.
                     </span>
-                    <${EditRow} label="Max messages"
-                        desc="Maximum messages stored per session.">
+                    <${EditRow} label="Max messages">
                         <input class="settings-input settings-input-sm" type="number" min="1"
                                value=${sessMaxMessages.value}
                                onInput=${e => { sessMaxMessages.value = e.target.value; }} />
                     <//>
                     <${EditRow} label="Max context tokens"
-                        desc="Maximum tokens retained in session history (must be >= context max_input_tokens).">
+                        desc="Must be at least the Context max input tokens above.">
                         <input class="settings-input settings-input-sm" type="number" min="1" step="1000"
                                value=${sessMaxCtxTokens.value}
                                onInput=${e => { sessMaxCtxTokens.value = e.target.value; }} />
                     <//>
-                    <${EditRow} label="Idle timeout (seconds)"
-                        desc="Time before a session is considered idle.">
+                    <${EditRow} label="Idle timeout (seconds)">
                         <input class="settings-input settings-input-sm" type="number" min="0"
                                value=${sessIdleTimeout.value}
                                onInput=${e => { sessIdleTimeout.value = e.target.value; }} />
                     <//>
                     <${EditRow} label="Auto archive"
-                        desc="Automatically archive idle sessions.">
+                        desc="Archive sessions once they go idle.">
                         <label class="settings-toggle">
                             <input type="checkbox"
                                    checked=${sessAutoArchive.value}
@@ -781,7 +770,7 @@ export function SettingsModal({ open, onClose }) {
                         </label>
                     <//>
                     <${EditRow} label="Archive TTL (seconds)"
-                        desc="Delete archived sessions after this duration.">
+                        desc="Archived sessions are deleted after this.">
                         <input class="settings-input settings-input-sm" type="number" min="0"
                                value=${sessArchiveTtl.value}
                                onInput=${e => { sessArchiveTtl.value = e.target.value; }} />
@@ -790,11 +779,8 @@ export function SettingsModal({ open, onClose }) {
 
                 <!-- Tools (server-level, editable) -->
                 <${Section} key="tools" title="Tools" defaultOpen=${false}>
-                    <span class="settings-hint settings-section-desc">
-                        Tool execution settings. Changes apply to the next run.
-                    </span>
                     <${EditRow} label="Shell policy"
-                        desc="sandboxed = restrict shell cwd to sandbox root. unrestricted = no cwd restriction.">
+                        desc="sandboxed pins the shell's working directory to the sandbox root; unrestricted removes the limit.">
                         <select class="settings-select settings-input-sm"
                                 value=${toolsShellPolicy.value}
                                 onChange=${e => { toolsShellPolicy.value = e.target.value; }}>
@@ -803,19 +789,17 @@ export function SettingsModal({ open, onClose }) {
                         </select>
                     <//>
                     <${EditRow} label="Sandbox root"
-                        desc="Filesystem sandbox root for fs_* tools. Empty = unrestricted.">
+                        desc="Root directory for the fs_* tools. Empty = unrestricted.">
                         <input class="settings-input settings-input-sm" type="text"
                                value=${toolsSandboxRoot.value}
                                onInput=${e => { toolsSandboxRoot.value = e.target.value; }} />
                     <//>
-                    <${EditRow} label="Tool timeout (seconds)"
-                        desc="Maximum execution time per tool call.">
+                    <${EditRow} label="Tool timeout (seconds)">
                         <input class="settings-input settings-input-sm" type="number" min="1"
                                value=${toolsTimeout.value}
                                onInput=${e => { toolsTimeout.value = e.target.value; }} />
                     <//>
-                    <${EditRow} label="Max output (bytes)"
-                        desc="Maximum bytes returned from a single tool call.">
+                    <${EditRow} label="Max output (bytes)">
                         <input class="settings-input settings-input-sm" type="number" min="1"
                                value=${toolsMaxOutput.value}
                                onInput=${e => { toolsMaxOutput.value = e.target.value; }} />
@@ -827,19 +811,20 @@ export function SettingsModal({ open, onClose }) {
                 <!-- LLM Providers (server-level, editable) — #809 / #804 Slice A -->
                 <${Section} key="llm" title="LLM Providers" defaultOpen=${false}>
                     <span class="settings-hint settings-section-desc">
-                        Server-level reasoning &amp; caching defaults. Mutations propagate to the next HTTP-triggered run without restart; Telegram-triggered runs use a boot-time snapshot until the daemon is restarted.
+                        Reasoning and caching defaults. Each block applies only to agents on that
+                        provider; the others ignore it.
                     </span>
 
                     <h4 class="settings-llm-subhead">Anthropic</h4>
                     <${EditRow} label="Thinking budget tokens"
-                        desc="0 = extended thinking off. Leave blank to keep the current server value. The wire surface has no clear sentinel — once PATCHed, revert by editing settings.json + restart.">
+                        desc="Extended-thinking budget. 0 turns it off; blank keeps the current value.">
                         <input class="settings-input settings-input-sm" type="number" min="0" step="1024"
                                placeholder=${llmAnth.thinking_budget_tokens != null ? String(llmAnth.thinking_budget_tokens) : 'unset'}
                                value=${llmAnthropicThinking.value}
                                onInput=${e => { llmAnthropicThinking.value = e.target.value; }} />
                     <//>
                     <${EditRow} label="Prompt cache enabled"
-                        desc="Anthropic prefix caching (5-minute TTL). Server-level only.">
+                        desc="Caches the stable request prefix for 5 minutes.">
                         <label class="settings-toggle">
                             <input type="checkbox"
                                    checked=${llmAnthropicCache.value}
@@ -853,7 +838,7 @@ export function SettingsModal({ open, onClose }) {
 
                     <h4 class="settings-llm-subhead">OpenAI / OpenRouter</h4>
                     <${EditRow} label="Reasoning effort"
-                        desc="Applies to o-series, GPT-5, and reasoning-capable Grok models. Auto-stripped on non-reasoning models. Choose Unset to clear an existing override.">
+                        desc="Reasoning models only (o-series, GPT-5, Grok); dropped on any other model.">
                         <select class="settings-select settings-input-sm"
                                 value=${llmOpenaiEffort.value}
                                 onChange=${e => { llmOpenaiEffort.value = e.target.value; }}>
@@ -867,14 +852,14 @@ export function SettingsModal({ open, onClose }) {
 
                     <h4 class="settings-llm-subhead">Gemini</h4>
                     <${EditRow} label="Thinking budget"
-                        desc="0 = extended thinking off. Leave blank to keep the current server value. Once PATCHed, this value can only be reverted by editing settings.json + restart.">
+                        desc="Extended-thinking budget. 0 turns it off; blank keeps the current value.">
                         <input class="settings-input settings-input-sm" type="number" min="0" step="1024"
                                placeholder=${llmGem.thinking_budget != null ? String(llmGem.thinking_budget) : 'unset'}
                                value=${llmGeminiThinking.value}
                                onInput=${e => { llmGeminiThinking.value = e.target.value; }} />
                     <//>
                     <${EditRow} label="Cache enabled"
-                        desc="Gemini context caching via cachedContents. Server-level only.">
+                        desc="Gemini context caching. Needs a 32k-token prefix; below that Gemini ignores it.">
                         <label class="settings-toggle">
                             <input type="checkbox"
                                    checked=${llmGeminiCache.value}
@@ -886,7 +871,7 @@ export function SettingsModal({ open, onClose }) {
                         </label>
                     <//>
                     <${EditRow} label="Cache TTL (seconds)"
-                        desc="Lifetime of a Gemini cache entry. Must be > 0.">
+                        desc="Must be greater than 0.">
                         <input class="settings-input settings-input-sm" type="number" min="1" step="60"
                                placeholder=${llmGem.cache_ttl_seconds != null ? String(llmGem.cache_ttl_seconds) : '300'}
                                value=${llmGeminiCacheTtl.value}
@@ -896,17 +881,15 @@ export function SettingsModal({ open, onClose }) {
 
                 <!-- Logging (server-level, read-only) -->
                 <${Section} key="log" title="Logging" defaultOpen=${false}>
+                    <!-- Read-only rows: label + value is the whole story, so the
+                         per-row descriptions that only restated the label are gone. -->
                     <span class="settings-hint settings-section-desc">
-                        File-based logging settings. Requires restart to change.
+                        Read-only — edit <code>alms.toml</code> and restart to change.
                     </span>
-                    <${InfoRow} label="File logging" value=${log.file_enabled != null ? (log.file_enabled ? 'enabled' : 'disabled') : '--'}
-                        desc="Whether persistent file logging is active." />
-                    <${InfoRow} label="File level" value=${log.file_level || '--'}
-                        desc="Log level for file output (trace, debug, info, warn, error)." />
-                    <${InfoRow} label="Rotation" value=${log.rotation || '--'}
-                        desc="Log rotation policy: daily, hourly, or never." />
-                    <${InfoRow} label="Log directory" value=${log.log_dir || 'default (data/logs/)'}
-                        desc="Directory where log files are written." />
+                    <${InfoRow} label="File logging" value=${log.file_enabled != null ? (log.file_enabled ? 'enabled' : 'disabled') : '--'} />
+                    <${InfoRow} label="File level" value=${log.file_level || '--'} />
+                    <${InfoRow} label="Rotation" value=${log.rotation || '--'} />
+                    <${InfoRow} label="Log directory" value=${log.log_dir || 'default (data/logs/)'} />
                 <//>
 
                 <div class="settings-divider"></div>

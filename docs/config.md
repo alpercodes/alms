@@ -8,7 +8,47 @@ ALMS loads configuration with layered precedence:
 
 Secrets — API keys, Telegram tokens, etc. — are never read from arbitrary environment variables. Store them with `alms auth set <provider> <key>` or declare a per-provider env var with `api_key_env` (see below).
 
-This document focuses on the **LLM provider** surface. See `docs/architecture.md` and `crates/alms-core/src/config/mod.rs` for the rest.
+Most of this document covers the **LLM provider** surface; the section immediately below covers the knobs the web UI's Settings modal exposes. See `docs/architecture.md`, `alms.toml.example` and `crates/alms-core/src/config/mod.rs` for the rest.
+
+---
+
+## Settings modal knobs
+
+The Settings modal in the web UI edits the runtime-mutable slice of this config through `PATCH /settings`. Its hints are deliberately short — one line saying what a field does plus its valid range. This section is where the detail behind them lives.
+
+Two behaviours apply to **every** section of the modal:
+
+- **Propagation.** An accepted PATCH takes effect on the next HTTP-triggered run, with no restart. Telegram-triggered runs read a boot-time snapshot and keep using it until the daemon restarts.
+- **Persistence.** The whole mutable surface is written to `{data_dir}/settings.json`, which wins over `alms.toml` on the next boot. To go back to a TOML- or env-driven value, edit or delete `settings.json` before restarting.
+
+See [`docs/api.md`](api.md) § 10.2 for the wire shapes, validation rules and error envelopes.
+
+### Context
+
+| Field | Range / default | Notes |
+|---|---|---|
+| `strategy` | `truncate` (default) / `compact` / `full` | `truncate` drops the oldest messages to fit; `compact` folds older messages into a summary and keeps a recent verbatim tail. `full` sends everything and is config-file / PATCH only — the modal's dropdown offers the first two. |
+| `max_input_tokens` | default `128000` | Per-request LLM budget. Set it to the model's context window. Cross-validated against the provider's published cap — see `ALMS_LLM_BUDGET_VALIDATION` below. |
+| `compact_trigger_pct` | `0.50`–`0.95`, default `0.80` | Compaction fires when assembled history exceeds this fraction of the **effective history budget** — `max_input_tokens` minus the system-prompt / user-input / episodic / reserve overhead, i.e. the room actually left for history. |
+| `compact_retain_pct` | `0.20`–`0.60`, default `0.40` | Fraction of that same effective history budget kept as recent verbatim messages after compaction. The invariant `compact_retain_pct + 0.10 <= compact_trigger_pct` is enforced on PATCH and on TOML load, so compaction always measurably shrinks the context. |
+
+The modal's **Summary** section (`summary_model` / `summary_provider`) drives both compaction summaries and post-run episodic memory. Set both or neither: a `summary_model` paired with the agent's own provider would be a slug from the wrong namespace, so partial configurations are rejected rather than silently mis-routed. Full notes in `alms.toml.example` under `[context]`.
+
+### Session
+
+`max_messages`, `idle_timeout_secs`, `auto_archive` and `archive_ttl_secs` bound on-disk session storage and retention. `max_context_tokens` is the **storage** limit and must be at least `context.max_input_tokens` — the session has to hold at least as much as one request can consume. Roughly 2× the context window is a comfortable setting.
+
+### Tools
+
+`shell_policy = "sandboxed"` pins the shell tool's working directory to `sandbox_root`; `"unrestricted"` removes that limit. `sandbox_root` is the canonicalization root for the `fs_*` tools, and an empty value disables the restriction. See [`docs/security-model.md`](security-model.md) § 4.4 for what the sandbox does and does not guarantee on each platform. `timeout_secs` and `max_output_bytes` bound a single tool call.
+
+### Reverting a thinking budget
+
+`llm.anthropic.thinking_budget_tokens` and `llm.gemini.thinking_budget` have **no clear sentinel** on the PATCH wire: `0` means "thinking disabled" and an omitted field means "leave alone", so neither expresses "go back to the config-file default". Once either has been PATCHed, the only way back is to edit `settings.json` and restart.
+
+### Debug mode
+
+The modal's Debug toggle is not a config knob at all — it is the per-agent `debug_mode` field on the agent record, PATCHed via `/agents/{id}`. It never changes what the LLM receives; it only mirrors the assembled context window to the UI for triage. Documented in [`docs/api.md`](api.md) § 9.4.
 
 ---
 

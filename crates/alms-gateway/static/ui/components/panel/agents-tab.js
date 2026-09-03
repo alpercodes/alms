@@ -14,6 +14,7 @@ import {
 import { normalizeAgentName, validateNormalizedAgentName } from '../../utils/agent-name.js';
 import { shouldActivateFromClick, shouldActivateFromKey } from '../../utils/card-activation.js';
 import { debugModePatchDelta } from '../../utils/debug-mode-patch.js';
+import { DEBUG_MODE_HINT, SUMMARY_HINT } from '../settings-copy.js';
 
 const REASONING_EFFORTS = ['minimal', 'low', 'medium', 'high'];
 
@@ -52,17 +53,13 @@ function modeFromEffort(value) {
  * doesn't immediately collapse back when the draft is empty (mirrors
  * the composer-advanced pattern from #804 Slice C).
  */
-function BudgetTriState({ label, hint, agentValue, mode, draft }) {
+function BudgetTriState({ label, agentValue, mode, draft }) {
     const onModeChange = (e) => {
         mode.value = e.target.value;
         if (mode.value !== 'custom') draft.value = '';
     };
     const onDraftChange = (e) => { draft.value = e.target.value; };
 
-    // Inheritance hint: when in Inherit mode, show what the agent
-    // currently inherits to (the server default — though the layered
-    // resolved value isn't directly exposed at this scope; render the
-    // server default as the most meaningful fallback for the operator).
     return html`
         <div class="settings-row">
             <label class="settings-label">${label}</label>
@@ -82,7 +79,6 @@ function BudgetTriState({ label, hint, agentValue, mode, draft }) {
                            onInput=${onDraftChange} />
                 `}
             </div>
-            ${hint && html`<span class="settings-hint">${hint}</span>`}
         </div>
     `;
 }
@@ -92,7 +88,7 @@ function BudgetTriState({ label, hint, agentValue, mode, draft }) {
  * not offered because `reasoning_effort` is `Option<enum>` and has no
  * "Some(0)" wire shape; Inherit is the only "no override" path.
  */
-function EffortTriState({ label, hint, mode, value }) {
+function EffortTriState({ label, mode, value }) {
     const onModeChange = (e) => {
         mode.value = e.target.value;
         if (mode.value !== 'custom') value.value = '';
@@ -116,7 +112,6 @@ function EffortTriState({ label, hint, mode, value }) {
                     </select>
                 `}
             </div>
-            ${hint && html`<span class="settings-hint">${hint}</span>`}
         </div>
     `;
 }
@@ -389,38 +384,33 @@ export function AgentEditModal({ agent, onClose }) {
                 <div class="agent-edit-section-title">Reasoning &amp; thinking</div>
 
                 <span class="settings-hint">
-                    Provider-specific. Each row applies only when this agent's effective provider matches —
-                    Anthropic / OpenAI / Gemini knobs are silently ignored on other providers. Explicit values
-                    take effect on the next run.
+                    Each row applies only when the agent is on that provider; the others ignore it.
                 </span>
 
+                <!-- No per-row hints: the tri-state option labels already read
+                     "Inherit (server default)" / "Disable (0)" / "Custom". -->
                 <${BudgetTriState}
                     label="Anthropic thinking budget"
-                    hint="Inherit = use server default. Disable = Some(0) (force off for this agent). Custom = override with N tokens."
                     agentValue=${agent.thinking_budget_tokens}
                     mode=${thinkingMode}
                     draft=${thinkingDraft} />
 
                 <${EffortTriState}
                     label="OpenAI reasoning effort"
-                    hint="Inherit = use server default. Custom picks an effort level for this agent."
                     mode=${effortMode}
                     value=${effortValue} />
 
                 <${BudgetTriState}
                     label="Gemini thinking budget"
-                    hint="Inherit = use server default. Disable = Some(0) (force off for this agent). Custom = override with N tokens."
                     agentValue=${agent.gemini_thinking_budget}
                     mode=${geminiMode}
                     draft=${geminiDraft} />
 
                 <div class="agent-edit-section-divider"></div>
-                <div class="agent-edit-section-title">Summary (compact strategy + episodic memory)</div>
+                <div class="agent-edit-section-title">Summary</div>
 
                 <span class="settings-hint">
-                    Per-agent summary provider/model. Drives both the in-loop compact-strategy compaction and the
-                    post-run episodic memory generation. Both fields must be set together — partial settings are
-                    rejected server-side. Leave both empty to inherit the server default.
+                    ${SUMMARY_HINT} Leave both empty to use the server default.
                 </span>
 
                 <div class="settings-row">
@@ -444,9 +434,6 @@ export function AgentEditModal({ agent, onClose }) {
                            placeholder="(use server default)"
                            value=${summaryModel.value}
                            onInput=${e => { summaryModel.value = e.target.value; }} />
-                    <span class="settings-hint">
-                        Model slug for the summary provider. Set together with Summary provider.
-                    </span>
                 </div>
 
                 <div class="agent-edit-section-divider"></div>
@@ -460,14 +447,7 @@ export function AgentEditModal({ agent, onClose }) {
                                onChange=${e => { debugMode.value = e.target.checked; }} />
                         <span>${debugMode.value ? 'enabled' : 'disabled'}</span>
                     </label>
-                    <span class="settings-hint">
-                        When enabled, every turn emits a snapshot of the full assembled context window
-                        (system prompts, workspace, episodic memory, history, tool definitions, in the order
-                        the runtime sends them). The web UI renders the snapshot in a collapsible panel
-                        below the chat. Works for both webchat and DM sessions — for DMs, each turn shows
-                        the per-perspective context the agent currently being inspected sees.
-                        Per-agent. Takes effect on the next run; previous turns are not retroactively shown.
-                    </span>
+                    <span class="settings-hint">${DEBUG_MODE_HINT}</span>
                 </div>
 
                 <div class="agent-edit-section-divider"></div>
@@ -499,11 +479,9 @@ export function AgentEditModal({ agent, onClose }) {
                     `}
                     <span class="settings-hint">
                         ${hasTelegram
-                            ? 'A token is set but is never displayed. Replace overwrites it; Remove clears it.'
-                            : 'Set a bot token to enable a dedicated Telegram polling loop for this agent.'}
-                    </span>
-                    <span class="settings-hint">
-                        Token changes only take effect after the daemon restarts. Tracked in #821.
+                            ? 'The stored token is never displayed.'
+                            : 'Set a bot token to give this agent its own Telegram bot.'}
+                        ${' '}Takes effect after a daemon restart.
                     </span>
                 </div>
 
