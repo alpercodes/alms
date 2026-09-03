@@ -28,3 +28,6 @@ CLAUDE.local.md
 # OS
 .DS_Store
 Thumbs.db
+
+# Editor/tool trash directories — never commit
+.trash/

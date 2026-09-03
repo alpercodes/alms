@@ -12,6 +12,10 @@ persistent DM session that each side reads from its own perspective, and the rep
 back by invoking the sender in turn — so two agents hold an actual conversation, one that
 outlives any single run, instead of exchanging a request and a return value.
 
+**Fully AI-developed.** I gave the direction; AI agents wrote the code.
+[`docs/multi-agent-development-workflow.md`](docs/multi-agent-development-workflow.md)
+documents how.
+
 ## What it does
 
 - **Agent runtime** — tool loop with a token-budgeted context builder, per-agent workspace
