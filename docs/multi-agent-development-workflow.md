@@ -46,7 +46,7 @@ You are Heph, the primary development agent.
 
 ## Workflow
 1. Read the GitHub issue if one exists
-2. Create a branch: `git fetch github main && git checkout -b <type>/<name> github/main`
+2. Create a branch: `git fetch origin develop && git checkout -b <type>/<name> origin/develop`
 3. Read relevant source files, plan the change
 4. Implement the change
 5. Run your project's CI checks (tests, linter, formatter)
@@ -54,15 +54,15 @@ You are Heph, the primary development agent.
    - `git config --worktree user.name "Heph"`
    - `git config --worktree user.email "noreply@anthropic.com"`
 7. Commit with Co-Authored-By trailer
-8. Push: `git push -u github <branch>`
-9. Create PR: `gh pr create --base main --title "..." --body "..."`
+8. Push: `git push -u origin <branch>`
+9. Create PR: `gh pr create --base develop --title "..." --body "..."`
 10. Report back with PR URL and summary
 
 ## Rules
-- Branch from `github/main`, never commit directly to main
+- Branch from `origin/develop`; a branch ruleset blocks direct pushes to `develop` and `main`
 - Focused changes only — don't refactor surrounding code
 - Always run tests before pushing
-- Git remote for GitHub is `github` (not `origin`)
+- Git remote is `origin`
 ```
 
 #### `.claude/agents/larry-bug-fix.md` — Bug Fixer
@@ -84,7 +84,7 @@ You are Larry, an autonomous bug-fix agent.
 
 ## Workflow
 1. Read the GitHub issue
-2. Create a branch: `git fetch github main && git checkout -b fix/<name> github/main`
+2. Create a branch: `git fetch origin develop && git checkout -b fix/<name> origin/develop`
 3. Investigate and fix the bug — minimal changes only
 4. Run CI checks (tests, linter, formatter)
 5. **Set per-worktree git identity** (use `--worktree`; plain `git config` writes to the shared `.git/config` and pollutes every other worktree — see Operational Rule #7):
@@ -95,8 +95,8 @@ You are Larry, an autonomous bug-fix agent.
 
 ## Rules
 - Minimal changes only — fix the bug, nothing else
-- Always branch from `github/main`
-- Git remote is `github`
+- Always branch from `origin/develop`
+- Git remote is `origin`
 ```
 
 #### `.claude/agents/alms-dev-guardian.md` — Code Reviewer
@@ -158,7 +158,7 @@ Add an agent team section to your project's `CLAUDE.md` so the main session know
 
 - All agents use `isolation: "worktree"` — they never interfere with each other
 - Never merge PRs without explicit human approval
-- After merging, always pull main
+- After merging, always pull develop
 - Never launch two agents targeting the same branch — use SendMessage to continue an existing agent
 ```
 
@@ -215,7 +215,7 @@ Atlas (the coordinator) has a persistent memory system that survives across sess
 ~/.claude/projects/<project>/memory/
   MEMORY.md                           # Index — one-line pointers to each memory file
   feedback_no_merge_without_approval.md  # "Never merge without human saying 'merge it'"
-  feedback_always_pull.md              # "After merge, always pull main"
+  feedback_always_pull.md              # "After merge, always pull develop"
   feedback_no_parallel_same_branch.md  # "Two agents on same branch = push conflict"
   feedback_git_author_names.md         # "Each agent sets own git user.name"
   project_v012_release.md             # "v0.1.2 tagged 2026-04-03"
@@ -232,7 +232,7 @@ type: feedback
 
 Never merge PRs unless the human explicitly says "merge it" or similar.
 
-**Why:** Human wants to maintain control over what goes into main.
+**Why:** Human wants to maintain control over what goes into `develop`.
 **How to apply:** After Tim reviews, report status and wait. Don't merge proactively.
 ```
 
@@ -301,7 +301,7 @@ Human: "have larry fix issue #456"
 [Tim completes review of #200] → "Ready to merge"
   Atlas: "Tim approved #200. Merge?"
   Human: "yes"
-  Atlas → merges, pulls main
+  Atlas → merges, pulls develop
 
   Atlas → launches Tim to review PR #201 (sequential — one Tim at a time)
 ```
@@ -370,7 +370,7 @@ Tim reviews are iterative:
 2. Heph/Larry addresses feedback → pushes to same branch
 3. Tim re-reviews → approves
 4. Human says "merge"
-5. Atlas merges and pulls main
+5. Atlas merges and pulls develop
 ```
 
 **Critical rule**: Tim reviews sequentially — never run two Tim instances in parallel. This prevents duplicate or conflicting reviews.
@@ -389,7 +389,7 @@ Even if Tim approves, wait for the human to say "merge it". The human may want t
 
 After every `gh pr merge`, immediately run:
 ```bash
-git checkout main && git pull github main
+git checkout develop && git pull origin develop
 ```
 Don't ask — just do it.
 
@@ -467,7 +467,7 @@ When multiple PRs land close together:
 
 ```
 Human: "merge #480. have tim review #481."
-Atlas → merges #480, pulls main
+Atlas → merges #480, pulls develop
 Atlas → launches Tim on #481
 [Tim completes]
 Human: "merge #481. have tim review #482."
