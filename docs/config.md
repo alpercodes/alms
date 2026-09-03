@@ -40,7 +40,9 @@ The modal's **Summary** section (`summary_model` / `summary_provider`) drives bo
 
 ### Tools
 
-`shell_policy = "sandboxed"` pins the shell tool's working directory to `sandbox_root`; `"unrestricted"` removes that limit. `sandbox_root` is the canonicalization root for the `fs_*` tools, and an empty value disables the restriction. See [`docs/security-model.md`](security-model.md) § 4.4 for what the sandbox does and does not guarantee on each platform. `timeout_secs` and `max_output_bytes` bound a single tool call.
+`shell_policy = "sandboxed"` pins the shell tool's working directory to `sandbox_root`; `"unrestricted"` removes that limit. `sandbox_root` is the canonicalization root for the `fs_*` tools, and an empty value disables the restriction. See [`docs/security-model.md`](security-model.md) § 4.4 for what the sandbox does and does not guarantee on each platform. `max_output_bytes` bounds the output of a single tool call.
+
+> **`timeout_secs` is vestigial.** It is validated, exposed on `GET /settings` and accepted by `PATCH /settings`, but nothing in the tool-execution path reads it — setting it has no effect. Tools are bounded by their own timeouts instead: the `shell` tool by its `timeout_ms` argument (120s default, 600s hard cap), `http_get` by a hardcoded 30s, and the `fs_*` tools not at all. Tracked in [#112](https://github.com/alpercodes/alms/issues/112), which will either wire the knob up or remove it.
 
 ### Reverting a thinking budget
 
@@ -48,7 +50,7 @@ The modal's **Summary** section (`summary_model` / `summary_provider`) drives bo
 
 ### Debug mode
 
-The modal's Debug toggle is not a config knob at all — it is the per-agent `debug_mode` field on the agent record, PATCHed via `/agents/{id}`. It never changes what the LLM receives; it only mirrors the assembled context window to the UI for triage. Documented in [`docs/api.md`](api.md) § 9.4.
+The modal's Debug toggle is not a config knob at all — it is the per-agent `debug_mode` field on the agent record, updated via `PUT /agents/{id_or_name}`. It never changes what the LLM receives; it only mirrors the assembled context window to the UI for triage. Documented in [`docs/api.md`](api.md) § 9.4.
 
 ---
 

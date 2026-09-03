@@ -17,6 +17,17 @@ export const DEBUG_MODE_HINT =
     'Emits a snapshot of the context window sent to the LLM on every turn, '
     + 'rendered below the chat. Applies from the next run.';
 
+/**
+ * Provider-scoping caveat for the reasoning / thinking controls.
+ *
+ * The two surfaces group these controls differently -- the modal by
+ * provider block, the Agents panel by row -- so the noun is a parameter
+ * rather than a second copy of the sentence.
+ */
+export function providerScopeHint(unit) {
+    return `Each ${unit} applies only when the agent is on that provider; the others are ignored.`;
+}
+
 /** Summary provider + model pair (compaction summaries and episodic memory). */
 export const SUMMARY_HINT =
     'Optional cheaper model for compaction summaries and episodic memory. '

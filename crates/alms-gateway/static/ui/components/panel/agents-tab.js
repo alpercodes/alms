@@ -14,7 +14,7 @@ import {
 import { normalizeAgentName, validateNormalizedAgentName } from '../../utils/agent-name.js';
 import { shouldActivateFromClick, shouldActivateFromKey } from '../../utils/card-activation.js';
 import { debugModePatchDelta } from '../../utils/debug-mode-patch.js';
-import { DEBUG_MODE_HINT, SUMMARY_HINT } from '../settings-copy.js';
+import { DEBUG_MODE_HINT, SUMMARY_HINT, providerScopeHint } from '../settings-copy.js';
 
 const REASONING_EFFORTS = ['minimal', 'low', 'medium', 'high'];
 
@@ -383,9 +383,7 @@ export function AgentEditModal({ agent, onClose }) {
                 <div class="agent-edit-section-divider"></div>
                 <div class="agent-edit-section-title">Reasoning &amp; thinking</div>
 
-                <span class="settings-hint">
-                    Each row applies only when the agent is on that provider; the others ignore it.
-                </span>
+                <span class="settings-hint">${providerScopeHint('row')}</span>
 
                 <!-- No per-row hints: the tri-state option labels already read
                      "Inherit (server default)" / "Disable (0)" / "Custom". -->

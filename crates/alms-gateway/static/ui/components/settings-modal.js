@@ -10,7 +10,7 @@ import {
     formatProviderLabel,
 } from '../utils/model-display.js';
 import { debugModePatchDelta } from '../utils/debug-mode-patch.js';
-import { DEBUG_MODE_HINT, SUMMARY_HINT } from './settings-copy.js';
+import { DEBUG_MODE_HINT, SUMMARY_HINT, providerScopeHint } from './settings-copy.js';
 
 const PROVIDERS = ['openai', 'anthropic', 'openrouter', 'gemini'];
 
@@ -794,7 +794,11 @@ export function SettingsModal({ open, onClose }) {
                                value=${toolsSandboxRoot.value}
                                onInput=${e => { toolsSandboxRoot.value = e.target.value; }} />
                     <//>
-                    <${EditRow} label="Tool timeout (seconds)">
+                    <!-- #112: this knob is validated and PATCHable but no tool
+                         execution path reads it. Silence here would hide that a
+                         value the operator sets does nothing. -->
+                    <${EditRow} label="Tool timeout (seconds)"
+                        desc="Not enforced yet — each tool applies its own timeout instead.">
                         <input class="settings-input settings-input-sm" type="number" min="1"
                                value=${toolsTimeout.value}
                                onInput=${e => { toolsTimeout.value = e.target.value; }} />
@@ -811,8 +815,7 @@ export function SettingsModal({ open, onClose }) {
                 <!-- LLM Providers (server-level, editable) — #809 / #804 Slice A -->
                 <${Section} key="llm" title="LLM Providers" defaultOpen=${false}>
                     <span class="settings-hint settings-section-desc">
-                        Reasoning and caching defaults. Each block applies only to agents on that
-                        provider; the others ignore it.
+                        Reasoning and caching defaults. ${providerScopeHint('block')}
                     </span>
 
                     <h4 class="settings-llm-subhead">Anthropic</h4>
