@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! Channel trait and message types for messaging platform adapters
 
 use crate::{AlmsResult, Timestamp};

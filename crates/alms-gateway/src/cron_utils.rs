@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! Cron expression utilities for scheduled job management.
 //!
 //! Wraps the `cron` crate (6-field: sec min hour dom month dow) and adapts it

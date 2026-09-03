@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 #[cfg(test)]
 use crate::NativeTool;
 use crate::{SandboxError, Tool, ToolContext, ToolIdentity, error::SandboxResult};

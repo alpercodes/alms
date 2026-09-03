@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! Marker classification and legacy run-boundary deduplication.
 //!
 //! Hosts the two marker predicates the context builder keys on: error

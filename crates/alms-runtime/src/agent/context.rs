@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 use crate::context::{
     ContextBuilder, HISTORY_RESERVE, estimate_session_message_tokens, estimate_tokens,
     is_stripped_display_marker,

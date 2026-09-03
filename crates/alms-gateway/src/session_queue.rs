@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! Bounded per-key work scheduling.
 //!
 //! Queue slots are created with one atomic DashMap entry operation, so

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! Token-budgeted history selection strategies.
 //!
 //! Three strategies compose the "fill the history budget with messages

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! In-memory job store with optional SQLite write-through.
 
 use crate::sqlite::SqliteStore;

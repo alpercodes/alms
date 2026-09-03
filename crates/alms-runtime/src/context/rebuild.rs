@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! Persisted-message → `LlmMessage` reconstruction.
 //!
 //! Bridges the session-store representation (`Message` with `Role` and

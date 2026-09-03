@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 use alms_core::SessionId;
 use alms_core::run::{RunId, ToolCallRecord, ToolCallRole};
 use alms_session::sqlite::{CURRENT_SCHEMA_VERSION, SqliteStore};

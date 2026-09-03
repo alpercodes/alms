@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! send_message tool -- sends a peer message from one agent to another.
 //!
 //! The tool returns immediately with a delivery confirmation; the sender's

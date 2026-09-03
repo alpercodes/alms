@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! `read_session` tool -- on-demand session recall for an agent's own sessions.
 //!
 //! Allows an agent to read conversation history from any of its own sessions

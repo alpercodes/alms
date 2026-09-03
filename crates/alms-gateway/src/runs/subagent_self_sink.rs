@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! Gateway implementation of [`SubagentSelfEventSink`] (#1180): streams a
 //! subagent's own run events to its own session's SSE log so the fullscreen
 //! subagent view streams live, replays, and seals on completion. Content events

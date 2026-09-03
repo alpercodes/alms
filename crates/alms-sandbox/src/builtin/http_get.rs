@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 use crate::error::SandboxResult;
 use crate::{SandboxError, Tool};
 use alms_core::truncate_to_char_boundary;

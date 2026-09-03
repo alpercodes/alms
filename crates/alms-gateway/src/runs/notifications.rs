@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! DM notification routing, scheduler integration, and trigger loops.
 
 use super::job_episode::{self, EPISODE_DEADLINE_SECS, RunCompletion};

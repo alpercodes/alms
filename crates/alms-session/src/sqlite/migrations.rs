@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! Ordered, transactional SQLite schema migrations.
 //!
 //! Version 1 adopts and normalizes every schema shape accepted by the former

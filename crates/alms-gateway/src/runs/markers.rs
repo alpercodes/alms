@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! Lifecycle marker persistence — a single helper that all lifecycle SSE
 //! events go through when they need to persist a marker message to the
 //! session history.

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! Behaviour tests for the embedded `static/ui/` modules.
 //!
 //! The parse-sweep in `static_assets_parse.rs` only confirms each JS file is

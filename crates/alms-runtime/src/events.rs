@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! Runtime events emitted during agent execution.
 //!
 //! These events bridge the runtime to the HTTP/SSE layer without coupling

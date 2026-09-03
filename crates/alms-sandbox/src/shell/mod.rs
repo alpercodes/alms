@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! Redesigned shell tool inspired by Claude Code's Bash tool.
 //!
 //! Key improvements over the original `ShellExecTool` (since removed):

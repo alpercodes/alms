@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! Timeline aggregation queries -- unified chronological event stream
 //! across all sessions for an agent.
 //!

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! HTTP handlers for API key management.
 //!
 //! GET    /auth/keys           — list providers with keys (masked)

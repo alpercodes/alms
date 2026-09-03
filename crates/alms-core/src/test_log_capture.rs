@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! Test-only `tracing` capture harness for this crate's unit tests.
 //!
 //! Mirror of `alms-gateway/src/test_log_capture.rs` — the two test

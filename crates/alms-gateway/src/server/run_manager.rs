@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! Run tracking, event broadcasting, cancellation, and persistence.
 //!
 //! [`RunManager`] is the central piece of run lifecycle management in the

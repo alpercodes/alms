@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 use alms_core::{AlmsError, AlmsResult};
 use alms_sandbox::{FileStateCache, SandboxError, ToolContext, ToolRegistry as SandboxRegistry};
 use serde_json::Value;

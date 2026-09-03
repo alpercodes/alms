@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! Run persistence -- save, load, mark_stale.
 
 use super::*;

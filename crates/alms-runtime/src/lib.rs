@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! ALMS Agent Runtime
 //!
 //! The runtime crate handles:

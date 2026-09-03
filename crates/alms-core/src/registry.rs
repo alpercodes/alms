@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! Agent registry types — persistent named agents.
 //!
 //! An `AgentRecord` represents a named, persistent agent registered in the system.

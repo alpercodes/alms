@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! Job-episode tracking for scheduled jobs (#1198).
 //!
 //! A **job episode** is the unit of work spanning a job firing's first turn

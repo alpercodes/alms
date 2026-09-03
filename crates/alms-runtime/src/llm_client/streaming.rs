@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! SSE streaming response pipeline for the LLM client.
 //!
 //! Wraps a successful `reqwest::Response` in a `BoxStream<StreamChunk>` that

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! Timing pins for the subagent status-bar chip's terminal signal (issue #1).
 //!
 //! The reported symptom was that the chip above the message composer only

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 use alms_core::{AgentId, AgentRecord, WorktreeMode, config::ReasoningEffort, validate_agent_name};
 use alms_session::SqliteStore;
 use clap::{Subcommand, ValueEnum};

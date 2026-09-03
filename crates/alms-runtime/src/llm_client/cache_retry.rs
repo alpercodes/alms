@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! Gemini cache-expired retry decision (#769).
 //!
 //! Pure decision function extracted from [`super::LlmClient::complete`] and

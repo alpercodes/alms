@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! Settings endpoints — exposes server-side defaults for UI pre-population
 //! and accepts partial config updates via PATCH.
 //!

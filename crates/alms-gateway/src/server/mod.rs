@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! HTTP server for ALMS Gateway
 //!
 //! Provides REST API endpoints per docs/api.md specification.

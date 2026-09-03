@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! Job types for scheduled agent runs.
 
 use crate::{

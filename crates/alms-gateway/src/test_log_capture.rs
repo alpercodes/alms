@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! Test-only `tracing` capture harness for this crate's unit tests.
 //!
 //! # The defect this exists to prevent (#1221)

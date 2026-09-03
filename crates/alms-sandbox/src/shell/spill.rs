@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! Spill full shell output to disk when head+tail truncation fires.
 //!
 //! When a command produces more than [`MAX_OUTPUT_BYTES`][super::types::MAX_OUTPUT_BYTES]

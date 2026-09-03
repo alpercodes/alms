@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! Output truncation for the shell tool.
 //!
 //! When command output exceeds the configured byte limit, we keep the first

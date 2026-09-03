@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! Parse-sweep over every JS module under `static/ui/`.
 //!
 //! Motivated by issue #829: PR #822 shipped a broken module (literal backticks

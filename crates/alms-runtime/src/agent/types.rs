@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 use alms_core::config::{
     ContextConfig, DEFAULT_AGENT_MAX_TOKENS, ShellClassificationMode, ShellPermissions,
     ShellSpillConfig,

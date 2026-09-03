@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! Permission-based allow/deny list for shell commands.
 //!
 //! Evaluates regex patterns against command strings before execution.

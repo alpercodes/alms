@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! Request-side helpers for the LLM client.
 //!
 //! Collected here so the pure transforms that `LlmClient::build_request`

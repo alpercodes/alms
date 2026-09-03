@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! `list_my_sessions` tool -- lets an agent discover its own sessions.
 //!
 //! Returns sessions the agent has participated in (keyed by agent_id),

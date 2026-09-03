@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 mod datetime;
 mod echo;
 mod fs_edit;

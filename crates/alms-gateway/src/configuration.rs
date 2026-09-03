@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! Shared configuration policies used by every mutation surface.
 
 mod resolution;

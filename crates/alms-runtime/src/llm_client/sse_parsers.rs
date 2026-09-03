@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! Pure SSE event-block parsers used by the streaming pipeline.
 //!
 //! Extracted from `mod.rs` (#793) as free functions that take `&str` and

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! Workspace tools — let the agent update and re-read its own workspace
 //! files.
 //!

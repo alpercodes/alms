@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! Telegram Bot API client implementation
 
 mod types;

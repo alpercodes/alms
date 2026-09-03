@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! Gemini explicit context caching (#769).
 //!
 //! Gemini's context-caching feature is a REST resource, not an inline

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 use crate::events::{PHASE_CALLING_LLM, PHASE_EXECUTING_TOOLS, RuntimeEvent, RuntimeEventSender};
 use crate::llm_types::*;
 use alms_core::{AlmsError, AlmsResult, AuditDecision, AuditEvent, TokenUsage, audit_error_string};

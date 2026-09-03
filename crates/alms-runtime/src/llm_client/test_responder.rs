@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! Hand-rolled single-shot TCP responder used by `mod.rs` tests to pin
 //! the cache-expired retry code paths in `complete()` / `complete_stream()`
 //! without taking on `wiremock` as a dev-dependency.

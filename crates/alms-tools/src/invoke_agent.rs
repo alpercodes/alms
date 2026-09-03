@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! invoke_agent tool — lets a running agent spawn a subagent via the Coordinator.
 
 use crate::event_forwarder::EventForwarder;

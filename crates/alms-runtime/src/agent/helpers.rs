@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 /// Check whether a tool result value indicates success.
 ///
 /// The runtime's notion of "did this tool call succeed?" feeds three

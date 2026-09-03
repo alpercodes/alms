@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! Rolling context summary persistence.
 
 use super::*;

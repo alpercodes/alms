@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! Integration tests for lifecycle.rs and notifications.rs error paths.
 //!
 //! These tests cover the scenarios identified in issue #629 (Tim's stability

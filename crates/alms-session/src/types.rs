@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 use alms_core::{AgentId, RunId, SessionId, Timestamp, truncate_to_char_boundary};
 
 /// Per-session episodic summary for cross-session memory.

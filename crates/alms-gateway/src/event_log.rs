@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! In-memory SSE event log for replay during current process lifetime (gateway-local).
 //!
 //! Events are stored in `Arc<RwLock<Vec<LoggedEvent>>>` and are lost on

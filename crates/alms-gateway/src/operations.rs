@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 use crate::server::AppState;
 use alms_session::sqlite::{DegradedField, PersistenceTable};
 use axum::{Json, extract::State};

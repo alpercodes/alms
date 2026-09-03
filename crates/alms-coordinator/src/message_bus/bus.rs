@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! `MessageBus` struct and `MessageSender` trait implementation.
 //!
 //! Contains the core message routing logic: `send()` delivers peer-to-peer

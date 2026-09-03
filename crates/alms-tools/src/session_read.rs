@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! Shared response contract for the three session-reading tools.
 //!
 //! `read_messages`, `read_session` and `read_subagent_session` all answer the

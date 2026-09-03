@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! Type-erased event forwarding trait for subagent tool events.
 //!
 //! Defined here in `alms-tools` so that [`SubagentDispatcher`](crate::SubagentDispatcher)

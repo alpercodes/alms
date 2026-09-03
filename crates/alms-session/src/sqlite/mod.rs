@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! SQLite-backed persistence for sessions, messages, and audit events.
 //!
 //! Used by `SessionManager` when `ALMS_DB_PATH` is set. Write-through on every

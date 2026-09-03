@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! Provider/model and per-agent configuration resolution.
 
 use alms_core::config::ProviderKind;

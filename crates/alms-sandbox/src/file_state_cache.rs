@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! Read-before-write/edit guard for filesystem tools.
 //!
 //! `FileStateCache` tracks which files have been read during a tool execution

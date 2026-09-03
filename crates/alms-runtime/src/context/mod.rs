@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! Context window builder for LLM requests.
 //!
 //! Manages what the LLM actually sees — assembles system prompt,

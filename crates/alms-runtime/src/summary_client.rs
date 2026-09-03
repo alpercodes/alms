@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! Shared helper for building the `LlmClient` used on the per-run summary path
 //! (`[context].summary_provider` / `summary_model`).
 //!

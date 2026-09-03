@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! Token-budget cross-validation against per-provider context windows (#919).
 //!
 //! Every LLM provider charges **input + output** against a single context-window

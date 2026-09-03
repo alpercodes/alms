@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 use crate::error::SandboxResult;
 use crate::file_state_cache::{FileStateCache, content_hash};
 use crate::{SandboxError, Tool};

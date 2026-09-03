@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! Episodic summary generation for cross-session memory.
 //!
 //! At the end of each successful run, the gateway may generate or update a

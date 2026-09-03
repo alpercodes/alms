@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! Cross-tool parity for subagent transcript ownership (#1298).
 //!
 //! `read_session` and `read_subagent_session` both decide who may read a

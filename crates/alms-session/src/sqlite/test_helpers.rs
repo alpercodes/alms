@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! Shared test helpers for the sqlite submodule tests.
 //!
 //! Eliminates duplication of `new_session()` and `new_message()` across

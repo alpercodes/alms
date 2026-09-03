@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! list_agents tool -- lets agents discover who they can talk to.
 //!
 //! Reads from the agent registry (SqliteStore) and returns each agent's

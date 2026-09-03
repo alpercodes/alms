@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! `SubagentSelfEventSink` (#1180) — mints a session-bound [`EventForwarder`]
 //! that writes a subagent's own run events to its own session's SSE log.
 //!

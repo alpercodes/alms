@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! Configuration struct definitions and their [`Default`] implementations.
 //!
 //! Each struct corresponds to a TOML section in `alms.toml`.  Methods that

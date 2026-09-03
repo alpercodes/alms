@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 use alms_core::{CreateRunRequest, CreateRunResponse, RunInput, RunStatusResponse, SessionId};
 use clap::Subcommand;
 

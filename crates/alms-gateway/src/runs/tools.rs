@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! Runtime event forwarding — bridges `alms-tools` events to `RuntimeEvent`.
 
 use crate::approvals::{ApprovalStore, PendingApproval};

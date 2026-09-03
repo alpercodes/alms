@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! read_subagent_session tool — on-demand context retrieval from a
 //! subagent's conversation history.
 //!
