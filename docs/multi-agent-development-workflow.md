@@ -199,7 +199,7 @@ After setup, your project should have this structure:
 
 | File | Purpose | Checked in? |
 |------|---------|-------------|
-| `.claude/agents/*.md` | Agent definitions | Yes — though not in this repo; see below |
+| `.claude/agents/*.md` | Agent definitions | Yes |
 | `.claude/agent-memory/` | Per-agent persistent memory (review patterns, findings) | No (gitignore) |
 | `.claude/settings.json` | Tool permissions | Optional |
 | `.claude/worktrees/` | Agent working copies | No (gitignore) |
@@ -209,16 +209,21 @@ After setup, your project should have this structure:
 ### `.gitignore` additions
 
 ```
-.claude/agent-memory/
-.claude/worktrees/
-.claude/scheduled_tasks.lock
+.claude/*
+!.claude/agents/
+CLAUDE.local.md
 ```
 
-Checking the agent definitions in is the recommendation — they are project configuration,
-and a contributor who clones the repo gets the same team you have. **This repository does
-not follow it**: all of `.claude/` is ignored here, so the definitions described above are
-not in the tree and you will not find them by browsing. The prose in this document is the
-authoritative description of them.
+Note the shape of that rule: ignore `.claude/` wholesale, then re-admit the agent
+definitions. Everything else under it is per-operator state — accumulated agent memory,
+scratch files, worktrees — and `settings.local.json` in particular tends to collect
+approved command patterns that are specific to your machine and sometimes genuinely
+sensitive. The definitions are the exception because they are project configuration, not
+personal state.
+
+This repository does exactly that, so the four agents described above are in the tree at
+[`.claude/agents/`](../.claude/agents/) — the definitions, not just this description of
+them.
 
 ### Atlas Memory System
 

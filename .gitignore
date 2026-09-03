@@ -14,10 +14,16 @@ secrets.json
 .env
 .env.local
 
-# Claude Code local state — agents, settings, scratch, and the review agents'
-# accumulated memory. All of it is personal to one operator's setup and is
-# deliberately kept out of the repository.
+# Claude Code local state — settings, scratch, worktrees, and the review agents'
+# accumulated memory. Personal to one operator's setup, and in the case of
+# settings.local.json genuinely sensitive, so the directory is ignored by default.
+#
+# The agent definitions are the exception: they are project configuration rather
+# than personal state, they are what `docs/multi-agent-development-workflow.md`
+# describes, and tracking them means changes to them get reviewed instead of
+# drifting silently.
 .claude/*
+!.claude/agents/
 CLAUDE.local.md
 
 # IDE
