@@ -59,7 +59,7 @@ You are Heph, the primary development agent.
 10. Report back with PR URL and summary
 
 ## Rules
-- Branch from `origin/develop`; a branch ruleset blocks direct pushes to `develop` and `main`
+- Branch from `origin/develop`, never commit directly to a protected branch
 - Focused changes only — don't refactor surrounding code
 - Always run tests before pushing
 - Git remote is `origin`
@@ -95,7 +95,7 @@ You are Larry, an autonomous bug-fix agent.
 
 ## Rules
 - Minimal changes only — fix the bug, nothing else
-- Always branch from `origin/develop`
+- Branch from `origin/develop`, never commit directly to a protected branch
 - Git remote is `origin`
 ```
 
@@ -536,3 +536,15 @@ To use this pattern on a different project:
 3. **Start small**: Begin with just Atlas + one dev agent (Heph). Add Tim for reviews once the basic loop works. Add Larry when you need parallel bug fixing.
 
 4. **Tune the prompts**: The more specific your agent prompts, the better the results. Include file paths, line numbers, and clear success criteria.
+
+## Provenance
+
+The issue and PR numbers cited throughout this document (`#497`, `#1045`, and similar)
+point at the project's **pre-migration** tracker. The repository moved on 2026-09-01 and
+issue numbering restarted at 1, so those numbers do not resolve against the current
+tracker — a low number may now resolve to an unrelated issue. They are retained because
+the examples reason about specific pieces of work, and stripping them would leave the
+worked examples without referents.
+
+The same convention is used in
+[`docs/engineering-reviews/README.md`](engineering-reviews/README.md).
