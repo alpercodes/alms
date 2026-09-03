@@ -50,6 +50,10 @@ cargo build --release
 ./target/release/alms auth set openrouter
 ```
 
+`./install.sh` does the same build and then copies the binary into `~/.cargo/bin`, which
+rustup already puts on your `PATH` — after it, every `./target/release/alms` below is just
+`alms`. It is a bash script; on Windows run it from Git Bash.
+
 Then start the gateway. It runs in the foreground:
 
 ```bash
