@@ -400,7 +400,7 @@ Notes:
 }
 ```
 
-`agent_id` is optional for normal sessions (the gateway resolves it from the session's owning agent) and **required** for shared DM sessions. The request body carries no config knobs — per-run overrides were removed in the #941 pivot. Operators change model / provider / posture / reasoning budgets via `PATCH /agents/{id}` (or `PATCH /settings` for server defaults) before starting the run.
+`agent_id` is optional for normal sessions (the gateway resolves it from the session's owning agent) and **required** for shared DM sessions. The request body carries no config knobs — per-run overrides were removed in the #941 pivot. Operators change model / provider / posture / reasoning budgets via `PUT /agents/{id_or_name}` (or `PATCH /settings` for server defaults) before starting the run.
 
 **Forward compatibility.** Unknown fields on the request body are silently ignored — the deserializer does NOT use `deny_unknown_fields`. UI clients on stale builds that still send `model`, `max_tokens`, `posture`, `provider`, `debug_mode`, `thinking_budget_tokens`, `reasoning_effort`, or `gemini_thinking_budget` will continue to function: the gateway accepts the request, drops the stale fields on the floor, and runs with the agent's resolved config.
 
@@ -519,7 +519,7 @@ Deliberately new in #1289 rather than restored: before #1278 the `AGENT_SESSION_
 
 The gateway pre-flights every `POST /runs` against the published context window for the resolved `(provider, model)` pair (per-agent override > server default). If the sum `[context].max_input_tokens + agent.max_tokens` overshoots the cap, the run is rejected before any LLM call is made. The body carries every datum the operator needs to fix the config (provider, resolved model, both knobs, computed total, table-published cap). Pairs the cap table doesn't know about (e.g. user-declared OpenRouter models, fine-tunes) skip the check silently. The `ALMS_LLM_BUDGET_VALIDATION=warn` env var downgrades the 400 to a structured WARN log; see [`docs/config.md`](config.md#alms_llm_budget_validation--provider-context-window-enforcement-919). The same error envelope is returned by `PATCH /settings` when the candidate `[context].max_input_tokens` would create the overshoot — see § 10.2.
 
-**Non-HTTP run failure mode (`run_error` SSE).** Triggered or queued runs that have no synchronous caller — peer DMs initiated via the `send_message` tool, scheduler / cron jobs, notification runs, subagent-completion runs, and HTTP runs whose effective budget was mutated by `PATCH /settings` or `PATCH /agents/{id}` while they sat in the queue — cannot receive a synchronous 400. The same pre-flight check fires inside `execute_run` for these paths and emits a `run_error` SSE event instead. The event uses the standard `run_error` shape documented in § 6.3 (`{ "run_id": "<uuid>", "error": { "code": "INVALID_TOKEN_BUDGET_FOR_PROVIDER", "message": "..." } }`) — no extra structured fields are added beyond `error.code` and `error.message`. The same budget detail the 400 envelope spreads across `provider` / `model` / `max_input_tokens` / `max_tokens` / `effective_total` / `provider_cap` keys is folded into the human-readable `error.message` string (e.g. `"configured token budget exceeds provider cap: context.max_input_tokens (250000) + agent.max_tokens (32000) = 282000 > anthropic claude-haiku-4-5 context window (200000). ..."`). The run is marked `Failed` before it ever enters the running set, and queue advance is broadcast so queued-behind runs see their positions decrement. Clients that already branch on `error.code` will pick this up without code changes; clients that want structured budget detail on the SSE surface should treat the 400 envelope from § 5.1 as the canonical field shape and either parse `error.message` or correlate by `run_id` to a separate `GET /runs/{run_id}` lookup.
+**Non-HTTP run failure mode (`run_error` SSE).** Triggered or queued runs that have no synchronous caller — peer DMs initiated via the `send_message` tool, scheduler / cron jobs, notification runs, subagent-completion runs, and HTTP runs whose effective budget was mutated by `PATCH /settings` or `PUT /agents/{id_or_name}` while they sat in the queue — cannot receive a synchronous 400. The same pre-flight check fires inside `execute_run` for these paths and emits a `run_error` SSE event instead. The event uses the standard `run_error` shape documented under § 5.3 *Event types* (`{ "run_id": "<uuid>", "error": { "code": "INVALID_TOKEN_BUDGET_FOR_PROVIDER", "message": "..." } }`) — no extra structured fields are added beyond `error.code` and `error.message`. The same budget detail the 400 envelope spreads across `provider` / `model` / `max_input_tokens` / `max_tokens` / `effective_total` / `provider_cap` keys is folded into the human-readable `error.message` string (e.g. `"configured token budget exceeds provider cap: context.max_input_tokens (250000) + agent.max_tokens (32000) = 282000 > anthropic claude-haiku-4-5 context window (200000). ..."`). The run is marked `Failed` before it ever enters the running set, and queue advance is broadcast so queued-behind runs see their positions decrement. Clients that already branch on `error.code` will pick this up without code changes; clients that want structured budget detail on the SSE surface should treat the 400 envelope from § 5.1 as the canonical field shape and either parse `error.message` or correlate by `run_id` to a separate `GET /runs/{run_id}` lookup.
 
 Why not `POST /agent/run`?
 - ALMS is about runs as first-class entities (auditable, cancellable, streamable).
@@ -947,7 +947,7 @@ Returns the concatenated extended-thinking ("reasoning") text for the **current 
 
 Reasoning text is streamed as `reasoning_delta` SSE events while a turn is in flight and only persisted to the session-messages store (as `reasoning_blocks` metadata on the final assistant message) at end-of-turn. The standard messages GET therefore returns nothing for an in-progress turn, and the default SSE replay cursor sits at the session HWM — past every `reasoning_delta` that has already fired. This endpoint plugs that gap by reading the per-session SSE event log directly.
 
-**Per-turn scoping (#1077).** A run may span multiple LLM turns, each closed by one or more parent-agent tool calls. Each closed turn's reasoning has already been sealed into the corresponding assistant message's `reasoning_blocks` metadata, which the messages GET (§5.3) already returns. This endpoint must therefore return ONLY reasoning that belongs to the still-open trailing turn — otherwise prior-turn reasoning would render twice on a mid-run reload (once from the sealed bubble, once seeded into a new unsealed bubble by the rehydration path). Concretely, the response includes only `reasoning_delta` events whose `event_id` is strictly greater than the latest parent-agent `tool_start` / `tool_end` event in this run. For tool-less runs and the first turn of any run (no boundary present yet), the response contains every `reasoning_delta` in the run — the original #1043 / #1054 contract.
+**Per-turn scoping (#1077).** A run may span multiple LLM turns, each closed by one or more parent-agent tool calls. Each closed turn's reasoning has already been sealed into the corresponding assistant message's `reasoning_blocks` metadata, which the messages GET (§ 4.4) already returns. This endpoint must therefore return ONLY reasoning that belongs to the still-open trailing turn — otherwise prior-turn reasoning would render twice on a mid-run reload (once from the sealed bubble, once seeded into a new unsealed bubble by the rehydration path). Concretely, the response includes only `reasoning_delta` events whose `event_id` is strictly greater than the latest parent-agent `tool_start` / `tool_end` event in this run. For tool-less runs and the first turn of any run (no boundary present yet), the response contains every `reasoning_delta` in the run — the original #1043 / #1054 contract.
 
 **Response 200**
 ```json
@@ -975,7 +975,7 @@ Returns the concatenated visible assistant reply text for the **current in-fligh
 
 Visible-reply text is streamed as `token_delta` SSE events which the gateway flags ephemeral in `send_event` and therefore does NOT persist to either the per-run or per-session event log. The persistence path is end-of-turn only (flushed onto the sealed assistant message). On a mid-stream session switch the UI's `chatMessages` state is wiped, the messages GET has nothing yet for the in-flight turn, and SSE replay carries no `token_delta` (ephemeral). This endpoint plugs that gap by reading an in-memory per-run accumulator that `send_event` maintains in parallel with the visible event log.
 
-**Per-turn scoping (mirrors §5.5's #1077 contract).** A run may span multiple LLM turns, each closed by one or more parent-agent tool calls. Each closed turn's visible text has by then been sealed onto the corresponding assistant message and persisted to the messages store (returned by the standard messages GET in §5.3). This endpoint must therefore return ONLY visible text that belongs to the still-open trailing turn — otherwise prior-turn text would render twice on a mid-run reload (once from the sealed bubble, once seeded into a new unsealed bubble by the rehydration path). Concretely, parent-agent `tool_start` / `tool_end` events clear the accumulator; only the post-boundary tail is returned.
+**Per-turn scoping (mirrors §5.5's #1077 contract).** A run may span multiple LLM turns, each closed by one or more parent-agent tool calls. Each closed turn's visible text has by then been sealed onto the corresponding assistant message and persisted to the messages store (returned by the standard messages GET in § 4.4). This endpoint must therefore return ONLY visible text that belongs to the still-open trailing turn — otherwise prior-turn text would render twice on a mid-run reload (once from the sealed bubble, once seeded into a new unsealed bubble by the rehydration path). Concretely, parent-agent `tool_start` / `tool_end` events clear the accumulator; only the post-boundary tail is returned.
 
 **Response 200**
 ```json
@@ -994,7 +994,7 @@ Notes:
 - Only **parent-agent** `tool_start` / `tool_end` events move the turn boundary. Subagent tool events do not clear the accumulator (the parent's turn frame is independent of subagent activity). `token_delta` events emitted with a non-null `source_agent` (subagent visible reply) are filtered out at append time, mirroring the UI's live `token_delta` handler which renders subagent output in a separate panel.
 - An unmatched parent-agent `tool_start` (approval-paused or cancelled mid-call) still seals the prior turn correctly: the boundary clear fires on the `tool_start` itself, so an `Inflight` tool invocation with no matching `tool_end` does not regress to the prior turn's slice.
 - The accumulator is keyed by `run_id`, so a sibling run on the same session (e.g. a background subagent run sharing the parent's session event log) never contaminates the parent's `/text` response.
-- The accumulator is evicted when the run reaches a terminal state (`Completed` / `Failed` / `Cancelled`), so post-completion calls return an empty `text` / null `last_event_id`. The messages GET in §5.3 is then the authoritative source — the Ok arm has sealed the visible text onto the final assistant message; the Cancelled-mid-stream arm drops the partial text by design (out of scope for in-flight rehydration).
+- The accumulator is evicted when the run reaches a terminal state (`Completed` / `Failed` / `Cancelled`), so post-completion calls return an empty `text` / null `last_event_id`. The messages GET in § 4.4 is then the authoritative source — the Ok arm has sealed the visible text onto the final assistant message; the Cancelled-mid-stream arm drops the partial text by design (out of scope for in-flight rehydration).
 - For DM sessions, visible reply is routed through a distinct `dm_message` event stream and `groupDmReasoningBlocks` layout. The frontend does not call this endpoint for DM sessions (`session_type !== 'dm'` gate). The backend remains uniform and would return whatever the buffer holds for a DM run, but the DM view does not render the main chat pane so the result is never consumed.
 
 ### 5.7 Cancel a run
@@ -1383,8 +1383,15 @@ persisted status, terminal reason, retry count, and last error are unchanged.
 ### 7.3 Run job now
 `POST /jobs/{job_id}:run`
 
+**Not implemented.** No route is registered for this path — the router in
+`crates/alms-gateway/src/server/routes.rs` mounts only `/jobs` and `/jobs/{job_id}`.
+Kept as the intended shape.
+
 ### 7.4 List job runs
 `GET /jobs/{job_id}/runs`
+
+**Not implemented** — same status as 7.3. The read side is covered today by
+`GET /runs?agent_id=<uuid>` (§ 5.8), whose entries carry the `job_id` that spawned them.
 
 ---
 
@@ -1544,7 +1551,7 @@ Three things to know before reading the number:
 - **The key set is stable.** Every table is reported including the zeroes, and
   reported even when no SQLite store is configured, so a scraper never sees
   keys appear and disappear. `timeline` is the `messages`/`runs` union behind
-  `GET /timeline` rather than a table of its own.
+  `GET /agents/{id_or_name}/timeline` rather than a table of its own.
 - **The key names the table the row came from, not the symptom — and one table
   can have several producers.** `sessions` is incremented by the three session
   loaders (symptom: a session missing from the sidebar), *and* by `delete_agent`
@@ -1722,7 +1729,7 @@ Named agents are persistent entities stored in SQLite. Each agent has a unique s
 
 `debug_mode` (#1003) is a per-agent toggle that enables a `context_debug` SSE event on each turn so the web UI can render the full assembled LLM context window in a dedicated panel. PATCH-mutable; not a config override of any kind — it never affects what the LLM receives, only what is mirrored to the UI for triage.
 
-> **CLI note.** `alms agent create` does not expose a `--debug-mode` flag — agents are always created with `debug_mode = false`. Operators flip the flag after creation via `PATCH /agents/{id}` (or the per-agent edit modal / Settings modal in the web UI), the same way every other PATCH-mutable knob is toggled. Debug mode is a triage tool, not a creation-time decision.
+> **CLI note.** `alms agent create` does not expose a `--debug-mode` flag — agents are always created with `debug_mode = false`. Operators flip the flag after creation via `PUT /agents/{id_or_name}` (or the per-agent edit modal / Settings modal in the web UI), the same way every other per-agent knob is toggled. Debug mode is a triage tool, not a creation-time decision.
 
 ### 9.2 Create agent
 `POST /agents`
@@ -1920,7 +1927,7 @@ Within `session`, `max_context_tokens` must be at least `[context].max_input_tok
 
 #### Top-level `model` / `provider` — the server-default LLM pair
 
-`model` and `provider` sit at the top level of the PATCH body (not nested under `llm`), mirroring the `[llm]` section of `alms.toml` and the top-level `model` / `provider` keys `GET /settings` returns. They are the **server default** — the bottom layer of the two-layer precedence chain. Agents carrying a per-agent `model` / `provider` on their registry record (`PATCH /agents/{id}`) are unaffected by changes here; agents without one pick the new pair up on their next run.
+`model` and `provider` sit at the top level of the PATCH body (not nested under `llm`), mirroring the `[llm]` section of `alms.toml` and the top-level `model` / `provider` keys `GET /settings` returns. They are the **server default** — the bottom layer of the two-layer precedence chain. Agents carrying a per-agent `model` / `provider` on their registry record (`PUT /agents/{id_or_name}`) are unaffected by changes here; agents without one pick the new pair up on their next run.
 
 Since #1148 this pair is **live**. An accepted PATCH commits it, rebuilds the shared `LlmClient` that `POST /runs`, the scheduler, peer-DM triggers, subagent spawns and completion notifications all resolve from, and persists it to `settings.json` for restart survival. The response is a plain `{ "status": "ok" }` — there is no `restart_required` flag on this endpoint any more. Runs already executing keep the client they resolved at start.
 

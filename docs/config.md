@@ -30,7 +30,7 @@ The sugar names `openai`, `openrouter`, and `anthropic` are auto-populated at co
 
 ```toml
 [llm.providers.<name>]
-kind         = "openai_compatible"   # "openai_compatible" | "anthropic"; default = openai_compatible
+kind         = "openai_compatible"   # "openai_compatible" | "anthropic" | "gemini"; default = openai_compatible
 base_url     = "https://api.x.ai/v1"  # required
 
 # API key (pick one, or use `alms auth set <name> <key>`)
@@ -144,7 +144,7 @@ The agent loop attempts streaming first and falls back to a buffered `complete()
 
 ## Anthropic extended thinking (issue #767)
 
-Claude 4.x exposes an optional extended-thinking mode where the model streams its internal reasoning as `thinking` content blocks before the final assistant text. ALMS can opt in on a per-server, per-agent, or per-run basis.
+Claude 4.x exposes an optional extended-thinking mode where the model streams its internal reasoning as `thinking` content blocks before the final assistant text. ALMS can opt in on a per-server or per-agent basis.
 
 ```toml
 [llm.anthropic]
@@ -258,7 +258,7 @@ Same two-layer chain as `model` / `max_tokens` / `thinking_budget_tokens`:
 1. **Per-agent** (highest) — `reasoning_effort` field on the agent registry entry (set via `POST /agents`, `PUT /agents/{id}`, or `alms agent create --reasoning-effort <value>`).
 2. **Server default** (lowest) — `[llm.openai].reasoning_effort` in `alms.toml`.
 
-Omitting the field at every layer means no `reasoning_effort` is sent — non-reasoning models behave exactly as before. There is no sentinel to clear a per-agent override back to "inherit server default" in a PATCH today (matches the `thinking_budget_tokens` PATCH shape); delete + recreate if you need that.
+Omitting the field at every layer means no `reasoning_effort` is sent — non-reasoning models behave exactly as before. A per-agent override is cleared back to "inherit server default" with the `clear_reasoning_effort: true` flag on `PUT /agents/{id_or_name}` — `thinking_budget_tokens` and `gemini_thinking_budget` have matching `clear_*` flags (see `docs/api.md` § 9.4). The CLI has no equivalent: `alms agent config` can set the value but not clear it.
 
 Per-run config overrides were removed in the #941 pivot; agents are the single per-tenant config surface.
 
