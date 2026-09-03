@@ -4,16 +4,24 @@ A self-hosted platform for running teams of LLM agents that collaborate on a pro
 One Rust binary provides the HTTP/SSE gateway, the agent runtime, a sandboxed tool layer,
 and SQLite persistence.
 
-ALMS exists because most agent frameworks give you *one* agent in a loop. ALMS is built
-around several: agents own persistent identity and memory, invoke each other as
-subagents, message each other directly, and keep working across restarts.
+Multi-agent frameworks mostly give you a tree: a parent spawns a worker, blocks on its
+return value, and the worker is gone. ALMS does that too — but its centre of gravity is
+peer-to-peer. Agents are addressable by name, and sending one a message *invokes* it
+rather than leaving a note in an inbox someone has to remember to poll. The pair share a
+persistent DM session that each side reads from its own perspective, and the reply comes
+back by invoking the sender in turn — so two agents hold an actual conversation, one that
+outlives any single run, instead of exchanging a request and a return value.
 
 ## What it does
 
 - **Agent runtime** — tool loop with a token-budgeted context builder, per-agent workspace
   files (personality, goals, memories), and cross-session episodic memory
-- **Multi-agent coordination** — hierarchical subagents via `invoke_agent`, peer-to-peer
-  direct messages via `send_message`, and a message bus underneath both
+- **Peer messaging** — `send_message` addresses another agent by name and invokes it;
+  `list_agents` discovers who is reachable; `ignore_message` declines a turn without
+  answering. Delivery never blocks the sender's loop, and a conversation ends explicitly,
+  with the peer notified either way
+- **Multi-agent coordination** — hierarchical subagents via `invoke_agent` alongside the
+  DM mesh, with one message bus underneath both
 - **Sandboxed tools** — filesystem tools pinned to the project root by path
   canonicalization, a destructive-command classifier and configurable permission rules over
   shell commands, and Landlock confinement of shell children on Linux

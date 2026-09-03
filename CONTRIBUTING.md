@@ -8,7 +8,7 @@ ALMS requires Rust nightly (specified in `rust-toolchain.toml`). The toolchain w
 
 ### First-time identity setup
 
-Three independent pieces. Set them up once after cloning; they make sure `git blame`, PR authorship, and comment attribution all point at you.
+Two independent pieces. Set them up once after cloning; they make sure `git blame`, PR authorship, and comment attribution all point at you.
 
 **1. Git author identity** (what `git blame` reads):
 
@@ -27,20 +27,7 @@ gh auth login
 
 Interactive flow — sign in to your own GitHub account. Every `gh pr create`, `gh issue comment`, `gh pr merge`, etc. will be attributed to whoever `gh auth status` reports. If you use Claude Code or another agent, it inherits this identity automatically — there's no separate agent account.
 
-**3. (Optional) Tell your AI coding agent to not add Co-Authored-By trailers**
-
-Claude Code and similar tools add a `Co-Authored-By: <agent> <noreply@anthropic.com>` trailer to commits by default. If you'd prefer commits to be solely authored by you (clean blame, no agent disclosure), create your own `CLAUDE.local.md` (gitignored) at the repo root with:
-
-```markdown
-# My local Claude Code instructions
-
-## Git identity
-- Commits in this repo should be authored solely by me (whatever `git config user.name` reports)
-- Do NOT add `Co-Authored-By` trailers for AI agents
-- Do NOT add agent-identification footers like "🤖 Generated with Claude Code" to commits, PR bodies, or issue comments
-```
-
-Note: the `Co-Authored-By` trailer does NOT affect `git blame` — blame only reads the primary author from your git config. The trailer is purely additive metadata visible on the GitHub commit page. So the "no trailer" choice is about commit cosmetics, not blame correctness.
+Agent `Co-Authored-By` trailers are fine — leave them in. Claude Code and similar tools add a `Co-Authored-By: <agent> <noreply@anthropic.com>` trailer to commits; it is purely additive metadata and does not affect `git blame`, which reads only the primary author from your git config. What matters is that the two pieces above are yours.
 
 ### Running CI Checks Locally
 
@@ -65,8 +52,7 @@ make test
 # Run golden tests specifically
 make test-golden
 
-# Parse-check every static UI JS module (catches the bug class
-# from PR #828 — see issue #829)
+# Parse-check every static UI JS module
 make test-static-assets
 ```
 
@@ -80,30 +66,17 @@ make test-static-assets
   `cargo test --all`. Module-syntax bugs (unterminated template literals,
   malformed `import` / `export`, stray tokens) fail CI before they ship.
   Module-resolution, runtime, and type errors are out of scope for this
-  check — see issue #829.
+  check.
 
 ### Git Workflow
 
-1. Fetch latest main from canonical:
-   ```bash
-   git fetch canonical main
-   git reset --hard canonical/main
-   ```
+Two conventions specific to this repository:
 
-2. Create feature branch:
-   ```bash
-   git checkout -b feature/<name>
-   ```
+- **Branch from `develop` and target `develop`.** `main` carries releases only, so a PR
+  opened against it will be asked to retarget.
+- **Name branches `feature/<name>` or `fix/<name>`.**
 
-3. Make changes and commit
-
-4. Verify changes before PR:
-   ```bash
-   git diff main..HEAD --stat
-   make ci
-   ```
-
-5. Push and create PR summary
+Run `make ci` before pushing.
 
 ## CI Pipeline
 
@@ -112,7 +85,7 @@ The CI pipeline (`.github/workflows/ci.yml`) runs:
 1. `cargo fmt --all -- --check` - Ensures consistent formatting
 2. `cargo clippy --all-targets --all-features -- -D warnings` - Static analysis
 3. `cargo test --all` - Runs all tests including golden tests and the
-   static-asset JS parse-sweep (`tests/static_assets_parse.rs`, #829)
+   static-asset JS parse-sweep (`tests/static_assets_parse.rs`)
 4. `cargo build --release` - Verifies release build works
 
 `make ci` runs all of these steps locally for parity.
@@ -142,8 +115,9 @@ it as its own PR rather than folding it into an unrelated one.
 - `crates/alms-core` - Core types and errors
 - `crates/alms-gateway` - HTTP API and SSE streaming
 - `crates/alms-runtime` - Agent runtime and tool execution
+- `crates/alms-tools` - Agent-facing tools (`send_message`, `invoke_agent`, session readers)
 - `crates/alms-coordinator` - Multi-agent orchestration
 - `crates/alms-session` - Session management
-- `crates/alms-sandbox` - WASM tool sandbox
+- `crates/alms-sandbox` - Builtin native tools (shell, `fs_*`, http, math) and the tool registry
 - `crates/alms-channel` - Messaging platform adapters
 - `crates/alms-cli` - Command-line interface
