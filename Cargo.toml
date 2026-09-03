@@ -15,14 +15,7 @@ resolver = "2"
 [workspace.package]
 version = "0.2.4"
 edition = "2024"
-authors = [
-    "Enis Alper Kale <17502599+alpercodes@users.noreply.github.com>",
-    "Atlas <alms@atlas.ai>",
-    "Heph <alms@heph.ai>",
-    "Tim <alms@tim.ai>",
-    "Larry <alms@larry.ai>",
-    "Iris <alms@iris.ai>",
-]
+authors = ["Enis Alper Kale <17502599+alpercodes@users.noreply.github.com>"]
 license = "Apache-2.0"
 repository = "https://github.com/alpercodes/alms"
 
