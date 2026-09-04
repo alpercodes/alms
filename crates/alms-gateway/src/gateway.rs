@@ -1442,7 +1442,7 @@ mod tests {
     /// is process-global, which is the #1221 flake — a callsite first
     /// touched by another test on a subscriber-less thread caches
     /// `Interest::never()` and this test's capture comes back empty.
-    use crate::test_log_capture::capture_logs;
+    use alms_test_support::capture_logs;
 
     /// `warn_full_os_access_at_boot` emits one structured WARN per
     /// listed agent. Acceptance check from #947: "WARN at agent-create

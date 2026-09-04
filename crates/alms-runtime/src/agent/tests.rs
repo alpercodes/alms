@@ -7,6 +7,7 @@ use crate::llm_types::*;
 use crate::tools::ToolRegistry;
 use alms_core::{AgentId, AlmsError};
 use alms_session::{SessionConfig, SessionManager};
+use alms_test_support::read_full_http_request;
 
 #[tokio::test]
 async fn test_agent_config_default() {
@@ -5917,38 +5918,6 @@ async fn emit_context_debug_attributes_dm_perspective_to_each_agent() {
 // `DM_EMPTY_REPLY_RETRY` warning, (b) injects the nudge message into
 // the next LLM request, and (c) returns the second turn's text as a
 // deliverable output.
-
-/// Read one full HTTP request (headers + Content-Length body) from a
-/// socket so the test can assert on the JSON payload the agent loop
-/// actually sent to the LLM on each turn.
-async fn read_full_http_request(sock: &mut tokio::net::TcpStream) -> String {
-    use tokio::io::AsyncReadExt;
-    let mut buf: Vec<u8> = Vec::new();
-    let mut tmp = [0u8; 8192];
-    loop {
-        let n = match sock.read(&mut tmp).await {
-            Ok(0) | Err(_) => break,
-            Ok(n) => n,
-        };
-        buf.extend_from_slice(&tmp[..n]);
-        let text = String::from_utf8_lossy(&buf);
-        if let Some(header_end) = text.find("\r\n\r\n") {
-            let content_length = text[..header_end]
-                .lines()
-                .find_map(|l| {
-                    let (k, v) = l.split_once(':')?;
-                    k.eq_ignore_ascii_case("content-length")
-                        .then(|| v.trim().parse::<usize>().ok())
-                        .flatten()
-                })
-                .unwrap_or(0);
-            if buf.len() >= header_end + 4 + content_length {
-                break;
-            }
-        }
-    }
-    String::from_utf8_lossy(&buf).into_owned()
-}
 
 #[tokio::test]
 async fn dm_empty_reply_nudge_retries_once_then_delivers_second_turn_text() {

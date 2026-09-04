@@ -1,0 +1,18 @@
+[package]
+name = "alms-test-support"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+publish = false
+description = "Dev-only fixtures shared by the workspace's test targets"
+
+# This crate is only ever a `[dev-dependencies]` entry. It must not depend on
+# any `alms-*` crate: `alms-core`'s own tests use it, and a dev-dependency
+# that (transitively) depends on the crate under test compiles that crate a
+# second time, so its types would not be the same types as `crate::*` inside
+# the test binary.
+[dependencies]
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

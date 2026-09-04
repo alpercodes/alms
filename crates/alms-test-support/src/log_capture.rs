@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Test-only `tracing` capture harness for this crate's unit tests.
+//! Interest-cache-safe `tracing` capture harness for log-asserting tests.
 //!
 //! # The defect this exists to prevent (#1221)
 //!
 //! The obvious way to assert on a structured log is to wrap the code
 //! under test in [`tracing::subscriber::with_default`] and read back an
-//! in-memory buffer. That is what every log-asserting test in this
-//! crate used to do, and it is subtly, intermittently wrong.
+//! in-memory buffer. That is what every log-asserting test in the
+//! workspace used to do, and it is subtly, intermittently wrong.
 //!
 //! `with_default` installs a subscriber on **one thread for the
 //! duration of one closure**, but `tracing` caches each callsite's
@@ -57,17 +57,18 @@
 //! # What this costs the tests that do not capture
 //!
 //! Pinning interest to `sometimes` and `MAX_LEVEL` to `TRACE` gives up
-//! `tracing`'s two static short-circuits, so every callsite in this test
-//! binary — including the `debug!`/`trace!` ones that used to die at the
-//! level check — now reaches a **runtime dispatch**: a `MAX_LEVEL` load,
-//! an `Interest` load, a global-dispatch lookup and two
-//! `Layered::enabled` calls before `CaptureFilter::enabled` reads the
-//! thread-local slot and answers `false`. That is tens of nanoseconds
-//! and allocation-free — `CaptureFilter` is the **outer** layer, so its
-//! `false` short-circuits before the `fmt` layer or the registry are
-//! touched, and `event!` keeps the field expressions inside its `if
-//! enabled` branch, so nothing is formatted. Cheap, but a dispatch
-//! rather than a thread-local read.
+//! `tracing`'s two static short-circuits, so every callsite in a test
+//! binary that calls [`capture_logs`] — including the `debug!`/`trace!`
+//! ones that used to die at the level check — now reaches a **runtime
+//! dispatch**: a `MAX_LEVEL` load, an `Interest` load, a global-dispatch
+//! lookup and two `Layered::enabled` calls before
+//! `CaptureFilter::enabled` reads the thread-local slot and answers
+//! `false`. That is tens of nanoseconds and allocation-free —
+//! `CaptureFilter` is the **outer** layer, so its `false` short-circuits
+//! before the `fmt` layer or the registry are touched, and `event!`
+//! keeps the field expressions inside its `if enabled` branch, so
+//! nothing is formatted. Cheap, but a dispatch rather than a
+//! thread-local read.
 //!
 //! **It stays cheap only because `tokio_unstable` is off.** The
 //! workspace enables tokio's `tracing` feature (root `Cargo.toml`), but
@@ -78,6 +79,13 @@
 //! usual reason) would silently make this harness resurrect tokio's
 //! per-poll instrumentation across every test in the binary. If test
 //! wall-time jumps after a build-flag change, start here.
+//!
+//! # One crate, one copy
+//!
+//! This used to be mirrored by hand between `alms-core` and
+//! `alms-gateway` because each test binary needs its own global
+//! subscriber. That is still true, and a shared crate still provides it:
+//! every test target links its own copy of this module's statics.
 //!
 //! [`Interest`]: tracing::subscriber::Interest
 //! [`Interest::never`]: tracing::subscriber::Interest::never
@@ -197,7 +205,7 @@ fn install_global_subscriber() {
             )
             .with(CaptureFilter);
         tracing::subscriber::set_global_default(subscriber).expect(
-            "alms-gateway's test binary must not install any other global tracing subscriber",
+            "a test binary that uses capture_logs must not install any other global tracing subscriber",
         );
     });
 }
@@ -209,7 +217,7 @@ fn install_global_subscriber() {
 /// Unlike `tracing::subscriber::with_default`, this is immune to
 /// `tracing`'s global callsite-interest cache — see the module docs and
 /// #1221.
-pub(crate) fn capture_logs<F: FnOnce()>(level: Level, f: F) -> String {
+pub fn capture_logs<F: FnOnce()>(level: Level, f: F) -> String {
     install_global_subscriber();
 
     // Installing the global default above already re-evaluates every

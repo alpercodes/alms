@@ -34,14 +34,14 @@ uuid.workspace = true
 # Test-only persistence-failure injection for the episode-close retry budget
 # (#1233). Dev-dependency feature: the hook is compiled out of release builds.
 alms-session = { path = "../alms-session", features = ["test-support"] }
+# `AgentRecord::for_test` for the registry-backed handler tests.
+alms-core = { path = "../alms-core", features = ["test-support"] }
+alms-test-support = { path = "../alms-test-support" }
 tempfile = "3"
 # Pulls tokio's `test-util` feature, required by the run-manager drain tests
 # (`wait_drain` under a paused clock) — see #1158.
 tokio-test.workspace = true
 walkdir.workspace = true
-# Test-only subscriber for asserting structured WARN logs fire on the
-# security path (#947). Same major version as the workspace dep.
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # JS parse-sweep over `static/ui/` modules — see tests/static_assets_parse.rs.
 # Pinned to the major versions current at the time of #829; bump when bumping
 # any other swc_* crate in the workspace.

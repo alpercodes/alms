@@ -2672,19 +2672,7 @@ mod tests {
     /// git repo so worktree-mode HTTP tests have a real working tree
     /// to fork from.
     fn agents_test_state_with_git_project(tmp_dir: &std::path::Path) -> crate::server::AppState {
-        let status = |args: &[&str]| {
-            let s = std::process::Command::new("git")
-                .current_dir(tmp_dir)
-                .env("GIT_TERMINAL_PROMPT", "0")
-                .args(args)
-                .status()
-                .expect("git command");
-            assert!(s.success(), "git {args:?} failed");
-        };
-        status(&["init", "--initial-branch=main"]);
-        status(&["config", "user.email", "test@example.com"]);
-        status(&["config", "user.name", "Test"]);
-        status(&["commit", "--allow-empty", "-m", "init"]);
+        init_git_repo(tmp_dir);
 
         let mut state = agents_test_app_state_with_sqlite();
         state.project_root = tmp_dir.to_path_buf();
@@ -2957,27 +2945,7 @@ mod tests {
     /// is process-global, which is the #1221 flake — a callsite first
     /// touched by another test on a subscriber-less thread caches
     /// `Interest::never()` and this test's capture comes back empty.
-    use crate::test_log_capture::capture_logs;
-
-    /// Initialize a fresh git repo with one commit at `dir`. Mirrors
-    /// the helper inside `worktree::tests` — duplicated here so the
-    /// agents-module tests don't have to depend on the worktree
-    /// module's private fixtures.
-    fn init_git_repo_for_tests(dir: &std::path::Path) {
-        let run = |args: &[&str]| {
-            let s = std::process::Command::new("git")
-                .current_dir(dir)
-                .env("GIT_TERMINAL_PROMPT", "0")
-                .args(args)
-                .status()
-                .expect("git command");
-            assert!(s.success(), "git {args:?} failed in {}", dir.display());
-        };
-        run(&["init", "--initial-branch=main"]);
-        run(&["config", "user.email", "test@example.com"]);
-        run(&["config", "user.name", "Test"]);
-        run(&["commit", "--allow-empty", "-m", "init"]);
-    }
+    use alms_test_support::{capture_logs, init_git_repo};
 
     /// Provision a worktree for `agent_name` under `project_root`,
     /// write `file_contents` to `agent-state.txt`, configure the
@@ -3025,7 +2993,7 @@ mod tests {
     #[test]
     fn off_to_git_persist_failure_compensates_by_deleting_worktree() {
         let tmp = tempfile::TempDir::new().unwrap();
-        init_git_repo_for_tests(tmp.path());
+        init_git_repo(tmp.path());
         let worktree_dir = tmp.path().join(".alms").join("worktrees").join("atlas");
 
         let captured = capture_logs(tracing::Level::WARN, || {
@@ -3088,7 +3056,7 @@ mod tests {
     #[test]
     fn git_to_off_persist_failure_compensates_by_recreating_worktree() {
         let tmp = tempfile::TempDir::new().unwrap();
-        init_git_repo_for_tests(tmp.path());
+        init_git_repo(tmp.path());
 
         // Pre-provision the worktree so the Git→Off flip has
         // something to remove.
@@ -3160,7 +3128,7 @@ mod tests {
     #[test]
     fn git_to_off_persist_failure_preserves_branch_history() {
         let tmp = tempfile::TempDir::new().unwrap();
-        init_git_repo_for_tests(tmp.path());
+        init_git_repo(tmp.path());
 
         // Provision the worktree and commit real work on the
         // agent branch so HEAD (parent's `main`) and `alms/atlas`
@@ -3277,7 +3245,7 @@ mod tests {
     #[test]
     fn off_to_git_persist_and_compensation_both_fail_surfaces_both_errors() {
         let tmp = tempfile::TempDir::new().unwrap();
-        init_git_repo_for_tests(tmp.path());
+        init_git_repo(tmp.path());
         let worktree_dir = tmp.path().join(".alms").join("worktrees").join("atlas");
 
         let captured = capture_logs(tracing::Level::ERROR, || {
@@ -3366,7 +3334,7 @@ mod tests {
     #[test]
     fn no_flip_persist_failure_skips_compensation() {
         let tmp = tempfile::TempDir::new().unwrap();
-        init_git_repo_for_tests(tmp.path());
+        init_git_repo(tmp.path());
         worktree::create_worktree(tmp.path(), "atlas").unwrap();
         let worktree_dir = tmp.path().join(".alms").join("worktrees").join("atlas");
 
@@ -3418,7 +3386,7 @@ mod tests {
     #[test]
     fn git_to_off_persist_failure_idempotent_when_branch_already_at_snapshot() {
         let tmp = tempfile::TempDir::new().unwrap();
-        init_git_repo_for_tests(tmp.path());
+        init_git_repo(tmp.path());
 
         // Provision + real commit so the branch carries history.
         let worktree_path = worktree::create_worktree(tmp.path(), "atlas")
@@ -3527,7 +3495,7 @@ mod tests {
     #[test]
     fn off_to_git_happy_path_no_compensation_log() {
         let tmp = tempfile::TempDir::new().unwrap();
-        init_git_repo_for_tests(tmp.path());
+        init_git_repo(tmp.path());
         let worktree_dir = tmp.path().join(".alms").join("worktrees").join("atlas");
 
         let captured = capture_logs(tracing::Level::WARN, || {
@@ -3573,7 +3541,7 @@ mod tests {
     #[test]
     fn off_to_git_persist_failure_preserves_pre_existing_worktree() {
         let tmp = tempfile::TempDir::new().unwrap();
-        init_git_repo_for_tests(tmp.path());
+        init_git_repo(tmp.path());
 
         // Pre-create the worktree to simulate operator drift —
         // the disk has a worktree even though the registry record
@@ -3705,7 +3673,7 @@ mod tests {
     #[test]
     fn git_to_off_persist_failure_skips_recreate_when_worktree_already_absent() {
         let tmp = tempfile::TempDir::new().unwrap();
-        init_git_repo_for_tests(tmp.path());
+        init_git_repo(tmp.path());
 
         // Drift simulation: registry says Git, disk says nothing.
         // No `create_worktree` is called — we go straight from
@@ -3808,7 +3776,7 @@ mod tests {
     #[test]
     fn git_to_off_persist_failure_restores_branch_when_worktree_already_absent() {
         let tmp = tempfile::TempDir::new().unwrap();
-        init_git_repo_for_tests(tmp.path());
+        init_git_repo(tmp.path());
 
         // Provision the worktree, commit real agent work on the
         // branch, then detach the worktree by hand (simulating
@@ -3955,7 +3923,7 @@ mod tests {
     #[test]
     fn git_to_off_persist_and_compensation_both_fail_surfaces_both_errors() {
         let tmp = tempfile::TempDir::new().unwrap();
-        init_git_repo_for_tests(tmp.path());
+        init_git_repo(tmp.path());
 
         // Set up the same shape as
         // `git_to_off_persist_failure_preserves_branch_history`:
@@ -4067,7 +4035,7 @@ mod tests {
     #[test]
     fn post_create_persist_failure_compensates_by_deleting_worktree() {
         let tmp = tempfile::TempDir::new().unwrap();
-        init_git_repo_for_tests(tmp.path());
+        init_git_repo(tmp.path());
         let worktree_dir = tmp.path().join(".alms").join("worktrees").join("atlas");
 
         let captured = capture_logs(tracing::Level::WARN, || {
@@ -4124,7 +4092,7 @@ mod tests {
     #[test]
     fn post_create_persist_and_compensation_both_fail_surfaces_both_errors() {
         let tmp = tempfile::TempDir::new().unwrap();
-        init_git_repo_for_tests(tmp.path());
+        init_git_repo(tmp.path());
         let worktree_dir = tmp.path().join(".alms").join("worktrees").join("atlas");
 
         let captured = capture_logs(tracing::Level::ERROR, || {
@@ -4196,7 +4164,7 @@ mod tests {
     #[test]
     fn post_create_race_duplicate_name_maps_to_409_and_cleans_up_worktree() {
         let tmp = tempfile::TempDir::new().unwrap();
-        init_git_repo_for_tests(tmp.path());
+        init_git_repo(tmp.path());
         let worktree_dir = tmp.path().join(".alms").join("worktrees").join("atlas");
 
         let result = apply_worktree_op_and_persist_with_mapper(
@@ -4258,7 +4226,7 @@ mod tests {
     #[test]
     fn delete_persist_failure_compensates_by_restoring_worktree() {
         let tmp = tempfile::TempDir::new().unwrap();
-        init_git_repo_for_tests(tmp.path());
+        init_git_repo(tmp.path());
 
         // Pre-provision the worktree with a real commit so the
         // restore step has actual branch history to preserve. This
@@ -4350,7 +4318,7 @@ mod tests {
     #[test]
     fn delete_persist_and_compensation_both_fail_surfaces_both_errors() {
         let tmp = tempfile::TempDir::new().unwrap();
-        init_git_repo_for_tests(tmp.path());
+        init_git_repo(tmp.path());
 
         // Same fixture shape as `delete_persist_failure_compensates_by_restoring_worktree`
         // — provision + real commit so the restore step has

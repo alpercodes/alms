@@ -2532,6 +2532,7 @@ impl Coordinator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alms_test_support::read_full_http_request;
     use alms_runtime::llm_types::LlmConfig;
 
     /// Build a Coordinator wired to the mock LLM and an in-memory SessionManager.
@@ -6454,39 +6455,6 @@ mod tests {
 
     // -- #1150 regression: a blocking foreground `invoke_agent` that outruns the
     //    parent's P3 tool-phase ceiling must NOT stall-fail the parent --------
-
-    /// Read one full HTTP request (headers + Content-Length body) from a socket
-    /// so the scripted LLM server consumes the agent's request before
-    /// responding. Mirrors the helper in the runtime's agent-loop integration
-    /// tests.
-    async fn read_full_http_request(sock: &mut tokio::net::TcpStream) -> String {
-        use tokio::io::AsyncReadExt;
-        let mut buf: Vec<u8> = Vec::new();
-        let mut tmp = [0u8; 8192];
-        loop {
-            let n = match sock.read(&mut tmp).await {
-                Ok(0) | Err(_) => break,
-                Ok(n) => n,
-            };
-            buf.extend_from_slice(&tmp[..n]);
-            let text = String::from_utf8_lossy(&buf);
-            if let Some(header_end) = text.find("\r\n\r\n") {
-                let content_length = text[..header_end]
-                    .lines()
-                    .find_map(|l| {
-                        let (k, v) = l.split_once(':')?;
-                        k.eq_ignore_ascii_case("content-length")
-                            .then(|| v.trim().parse::<usize>().ok())
-                            .flatten()
-                    })
-                    .unwrap_or(0);
-                if buf.len() >= header_end + 4 + content_length {
-                    break;
-                }
-            }
-        }
-        String::from_utf8_lossy(&buf).into_owned()
-    }
 
     /// A `SubagentDispatcher` whose foreground `dispatch` blocks for a fixed
     /// duration — standing in for a long-but-productive subagent — then returns
