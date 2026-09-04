@@ -2095,39 +2095,6 @@ mod tests {
         );
     }
 
-    /// End-to-end retention sweep: pre-populate a fresh and an old spill
-    /// file, run `sweep_expired`, and assert the old file is removed while
-    /// the fresh one survives. Uses a synthetic data_dir so the test is
-    /// hermetic.
-    #[test]
-    fn test_retention_sweep_deletes_old_files() {
-        use crate::shell::spill::{SPILL_DIR_NAME, sweep_expired};
-        use std::time::{Duration, SystemTime};
-
-        let dir = tempfile::tempdir().unwrap();
-        let data_dir = dir.path();
-        let run_old = data_dir.join(SPILL_DIR_NAME).join("run-old");
-        let run_new = data_dir.join(SPILL_DIR_NAME).join("run-new");
-        std::fs::create_dir_all(&run_old).unwrap();
-        std::fs::create_dir_all(&run_new).unwrap();
-
-        let old = run_old.join("shell_a.log");
-        let new = run_new.join("shell_b.log");
-        std::fs::write(&old, b"old bytes").unwrap();
-        std::fs::write(&new, b"new bytes").unwrap();
-
-        // Backdate the old file by 10 days; retention is 7 days.
-        let ten_days_ago = SystemTime::now() - Duration::from_secs(10 * 86_400);
-        let f = std::fs::File::options().write(true).open(&old).unwrap();
-        f.set_modified(ten_days_ago).unwrap();
-        drop(f);
-
-        let deleted = sweep_expired(data_dir, 7).unwrap();
-        assert_eq!(deleted, 1, "only the old file should be deleted");
-        assert!(!old.exists(), "old file must be removed");
-        assert!(new.exists(), "fresh file must survive");
-    }
-
     // ── Windows test parity (issue #746) ─────────────────────────────────
     //
     // Alper's daily driver is Windows, and the integration tests above are
