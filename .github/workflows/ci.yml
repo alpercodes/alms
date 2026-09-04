@@ -121,8 +121,18 @@ jobs:
     # and the verdict is cargo-audit's own: non-zero on vulnerabilities, not on
     # informational advisories.
     #
-    # A job-level `permissions:` block replaces the defaults wholesale, so
-    # `contents: read` has to be restated for actions/checkout.
+    # `contents: read` is restated because a job-level `permissions:` block
+    # replaces the defaults wholesale. It is kept rather than dropped so this job
+    # carries its own least-privilege floor, instead of inheriting whatever the
+    # repository default happens to be later.
+    #
+    # `RUSTUP_TOOLCHAIN: stable` overrides `rust-toolchain.toml`. `cargo audit`
+    # reads `Cargo.lock`, which is toolchain-independent, so pinning this job to
+    # the project's nightly bought nothing and cost something: it downloaded a
+    # nightly plus rustfmt, clippy and rust-src that the audit never uses, and it
+    # left a second way for this job to die building its tool rather than reading
+    # the lockfile -- a nightly bump that breaks cargo-audit's build is the
+    # `tinyvec` failure below arriving from the other direction.
     #
     # Why not `rustsec/audit-check@v2` (removed 2026-09-04). It builds
     # `cargo-audit` from source *without* `--locked`, so the tool's dependency
@@ -148,6 +158,8 @@ jobs:
     # permission, no failure mode; `checks: write` is dropped here.
     permissions:
       contents: read
+    env:
+      RUSTUP_TOOLCHAIN: stable
     steps:
     - uses: actions/checkout@v4
 

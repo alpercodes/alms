@@ -12,8 +12,16 @@
 # `rustsec/audit-check` action, which tried to publish its advisory table as a
 # check run on *any* finding and rethrew the resulting permission error instead
 # of falling back to stdout (issue #1252). That action was removed on
-# 2026-09-04, so the failure mode is gone with it -- but the ignore entries it
-# motivated are still the right calls on their own merits.
+# 2026-09-04, so the failure mode is gone with it.
+#
+# Be clear about what the entries below now do, because it is less than it was.
+# With the action gone, an informational advisory no longer fails anything on its
+# own: `cargo audit` exits non-zero on vulnerabilities, and warnings affect the
+# exit code only when named in `[output] deny`, which this file does not set. So
+# an `informational` ignore entry now suppresses a line of log output and changes
+# no CI verdict. They are kept because the rationale and exit condition each
+# records are worth having written down, not because removing one would turn the
+# gate red. If that ever proves false, this paragraph is what is wrong.
 #
 # Every entry here must carry a date, a rationale, and an exit condition.
 
