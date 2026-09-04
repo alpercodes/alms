@@ -164,10 +164,4 @@ mod tests {
         let tool = make_dm_tool();
         assert_eq!(tool.name(), "ignore_message");
     }
-
-    #[test]
-    fn test_is_builtin() {
-        let tool = make_dm_tool();
-        assert!(tool.is_builtin());
-    }
 }

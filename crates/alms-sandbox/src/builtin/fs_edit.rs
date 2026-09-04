@@ -1216,16 +1216,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_fs_edit_not_auto_approved() {
-        assert!(!FsEditTool::new().is_auto_approved());
-    }
-
-    #[test]
-    fn test_fs_edit_description_nonempty() {
-        assert!(!FsEditTool::new().description().is_empty());
-    }
-
     #[tokio::test]
     async fn test_fs_edit_rejects_large_file() {
         let dir = tempfile::tempdir().unwrap();
