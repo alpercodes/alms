@@ -2532,8 +2532,8 @@ impl Coordinator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alms_test_support::read_full_http_request;
     use alms_runtime::llm_types::LlmConfig;
+    use alms_test_support::read_full_http_request;
 
     /// Build a Coordinator wired to the mock LLM and an in-memory SessionManager.
     fn test_coordinator() -> Coordinator {
@@ -5551,25 +5551,7 @@ mod tests {
     // -- (n) #1278 — a named subagent is filed under the invoked agent ----------
 
     fn register_agent(manager: &SessionManager, name: &str) -> AgentId {
-        let record = alms_core::AgentRecord {
-            id: AgentId::new(),
-            name: name.to_string(),
-            description: String::new(),
-            model: None,
-            posture: None,
-            provider: None,
-            telegram_token: None,
-            thinking_budget_tokens: None,
-            reasoning_effort: None,
-            gemini_thinking_budget: None,
-            summary_provider: None,
-            summary_model: None,
-            worktree_mode: alms_core::WorktreeMode::Off,
-            debug_mode: false,
-            is_default: false,
-            created_at: chrono::Utc::now(),
-            last_active: chrono::Utc::now(),
-        };
+        let record = alms_core::AgentRecord::for_test(name);
         manager.store().unwrap().create_agent(&record).unwrap();
         record.id
     }

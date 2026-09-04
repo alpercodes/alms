@@ -1241,6 +1241,7 @@ pub async fn set_default(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::TestAppState;
     use alms_session::SqliteStore;
 
     #[test]
@@ -1255,26 +1256,7 @@ mod tests {
     }
 
     fn new_agent(name: &str) -> AgentRecord {
-        let now = Utc::now();
-        AgentRecord {
-            id: AgentId::new(),
-            name: name.to_string(),
-            description: String::new(),
-            model: None,
-            posture: None,
-            provider: None,
-            telegram_token: None,
-            thinking_budget_tokens: None,
-            reasoning_effort: None,
-            gemini_thinking_budget: None,
-            summary_provider: None,
-            summary_model: None,
-            worktree_mode: WorktreeMode::Off,
-            debug_mode: false,
-            is_default: false,
-            created_at: now,
-            last_active: now,
-        }
+        AgentRecord::for_test(name)
     }
 
     #[test]
@@ -2092,26 +2074,7 @@ mod tests {
     /// the plumbing for the four channels collapsed into `_` since the
     /// per-agent CRUD path doesn't drive any of them.
     fn agents_test_app_state_with_sqlite() -> crate::server::AppState {
-        let gateway_config = crate::gateway::GatewayConfig {
-            db_path: Some(":memory:".to_string()),
-            ..crate::gateway::GatewayConfig::default()
-        };
-        let gateway = crate::gateway::Gateway::new(gateway_config).unwrap();
-        let scheduler = std::sync::Arc::new(alms_runtime::Scheduler::new());
-        let shutdown_token = tokio_util::sync::CancellationToken::new();
-        let (completion_tx, _completion_rx) = tokio::sync::mpsc::unbounded_channel();
-        // Bounded (#842 / B11) to match the production channel shape.
-        let (trigger_tx, _trigger_rx) = tokio::sync::mpsc::channel(8);
-        let (dm_event_tx, _dm_event_rx) = tokio::sync::mpsc::channel(8);
-        crate::server::AppState::new(
-            gateway,
-            scheduler,
-            shutdown_token,
-            completion_tx,
-            trigger_tx,
-            dm_event_tx,
-        )
-        .unwrap()
+        TestAppState::new().in_memory_sqlite().build()
     }
 
     /// Inject an `[llm.providers.openrouter]` entry into the test state

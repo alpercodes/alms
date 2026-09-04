@@ -1400,25 +1400,10 @@ mod tests {
         let store = SqliteStore::open_in_memory().unwrap();
         // Pre-populate with an agent
         let existing_id = AgentId::new();
-        let now = chrono::Utc::now();
         let existing = AgentRecord {
             id: existing_id,
-            name: "atlas".to_string(),
-            description: String::new(),
-            model: None,
-            posture: None,
-            provider: None,
-            telegram_token: None,
-            thinking_budget_tokens: None,
-            reasoning_effort: None,
-            gemini_thinking_budget: None,
-            summary_provider: None,
-            summary_model: None,
-            worktree_mode: alms_core::WorktreeMode::Off,
-            debug_mode: false,
             is_default: true,
-            created_at: now,
-            last_active: now,
+            ..AgentRecord::for_test("atlas")
         };
         store.create_agent(&existing).unwrap();
 

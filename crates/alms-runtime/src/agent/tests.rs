@@ -9,6 +9,39 @@ use alms_core::{AgentId, AlmsError};
 use alms_session::{SessionConfig, SessionManager};
 use alms_test_support::read_full_http_request;
 
+/// Baseline `AgentRuntime` for tests: the given `llm`, default
+/// `AgentConfig`, an empty tool registry, no workspace, no event sender,
+/// no cancel token, an unrestricted shell with default permissions and
+/// classification, and every spill / truncation policy disabled.
+///
+/// Tests override the fields they care about with struct-update syntax —
+/// `AgentRuntime { event_sender: Some(tx), ..base_runtime(llm) }` — so a
+/// new `AgentRuntime` field means one edit here, not one per test.
+fn base_runtime(llm: LlmClient) -> AgentRuntime {
+    AgentRuntime {
+        agent_id: AgentId::new(),
+        config: AgentConfig::default(),
+        llm,
+        summary_llm: None,
+        tools: ToolRegistry::new(),
+        workspace: None,
+        event_sender: None,
+        run_id: None,
+        cancel_token: None,
+        resolved_sandbox_root: None,
+        shell_unrestricted: true,
+        shell_default_env: std::collections::HashMap::new(),
+        shell_permissions: alms_core::config::ShellPermissions::default(),
+        shell_classification_mode: alms_core::config::ShellClassificationMode::default(),
+        shell_spill_policy: alms_sandbox::shell::spill::ShellSpillPolicy::disabled(),
+        tool_output_truncate_policy:
+            crate::tool_output_truncate::ToolOutputTruncatePolicy::disabled(),
+        extra_fs_read_roots: Vec::new(),
+        agent_name: None,
+        dm_implicit_reply: false,
+    }
+}
+
 #[tokio::test]
 async fn test_agent_config_default() {
     let config = AgentConfig::default();
@@ -24,26 +57,8 @@ async fn test_stream_llm_call_emits_token_deltas() {
         ..LlmConfig::default()
     };
     let runtime = AgentRuntime {
-        agent_id: AgentId::new(),
-        config: AgentConfig::default(),
-        llm: LlmClient::new(config).unwrap(),
-        summary_llm: None,
-        tools: ToolRegistry::new(),
-        workspace: None,
         event_sender: Some(tx),
-        run_id: None,
-        cancel_token: None,
-        resolved_sandbox_root: None,
-        shell_unrestricted: true,
-        shell_default_env: std::collections::HashMap::new(),
-        shell_permissions: alms_core::config::ShellPermissions::default(),
-        shell_classification_mode: alms_core::config::ShellClassificationMode::default(),
-        shell_spill_policy: alms_sandbox::shell::spill::ShellSpillPolicy::disabled(),
-        tool_output_truncate_policy:
-            crate::tool_output_truncate::ToolOutputTruncatePolicy::disabled(),
-        extra_fs_read_roots: Vec::new(),
-        agent_name: None,
-        dm_implicit_reply: false,
+        ..base_runtime(LlmClient::new(config).unwrap())
     };
 
     let request =
@@ -83,28 +98,7 @@ async fn test_stream_llm_call_emits_token_deltas() {
 
 #[tokio::test]
 async fn test_build_context() {
-    let runtime = AgentRuntime {
-        agent_id: AgentId::new(),
-        config: AgentConfig::default(),
-        llm: LlmClient::new(LlmConfig::default()).unwrap(),
-        summary_llm: None,
-        tools: ToolRegistry::new(),
-        workspace: None,
-        event_sender: None,
-        run_id: None,
-        cancel_token: None,
-        resolved_sandbox_root: None,
-        shell_unrestricted: true,
-        shell_default_env: std::collections::HashMap::new(),
-        shell_permissions: alms_core::config::ShellPermissions::default(),
-        shell_classification_mode: alms_core::config::ShellClassificationMode::default(),
-        shell_spill_policy: alms_sandbox::shell::spill::ShellSpillPolicy::disabled(),
-        tool_output_truncate_policy:
-            crate::tool_output_truncate::ToolOutputTruncatePolicy::disabled(),
-        extra_fs_read_roots: Vec::new(),
-        agent_name: None,
-        dm_implicit_reply: false,
-    };
+    let runtime = base_runtime(LlmClient::new(LlmConfig::default()).unwrap());
 
     let session_config = SessionConfig::default();
     let session_manager = SessionManager::new(session_config);
@@ -123,26 +117,8 @@ async fn test_build_context() {
 #[tokio::test]
 async fn test_build_context_dm_perspective_mapping() {
     let runtime = AgentRuntime {
-        agent_id: AgentId::new(),
-        config: AgentConfig::default(),
-        llm: LlmClient::new(LlmConfig::default()).unwrap(),
-        summary_llm: None,
-        tools: ToolRegistry::new(),
-        workspace: None,
-        event_sender: None,
-        run_id: None,
-        cancel_token: None,
-        resolved_sandbox_root: None,
-        shell_unrestricted: true,
-        shell_default_env: std::collections::HashMap::new(),
-        shell_permissions: alms_core::config::ShellPermissions::default(),
-        shell_classification_mode: alms_core::config::ShellClassificationMode::default(),
-        shell_spill_policy: alms_sandbox::shell::spill::ShellSpillPolicy::disabled(),
-        tool_output_truncate_policy:
-            crate::tool_output_truncate::ToolOutputTruncatePolicy::disabled(),
-        extra_fs_read_roots: Vec::new(),
         agent_name: Some("bob".to_string()),
-        dm_implicit_reply: false,
+        ..base_runtime(LlmClient::new(LlmConfig::default()).unwrap())
     };
 
     let session_config = SessionConfig::default();
@@ -210,26 +186,8 @@ async fn test_build_context_dm_perspective_mapping() {
 async fn test_build_context_non_dm_no_perspective() {
     // When context_id does NOT start with "dm:", no perspective mapping should occur
     let runtime = AgentRuntime {
-        agent_id: AgentId::new(),
-        config: AgentConfig::default(),
-        llm: LlmClient::new(LlmConfig::default()).unwrap(),
-        summary_llm: None,
-        tools: ToolRegistry::new(),
-        workspace: None,
-        event_sender: None,
-        run_id: None,
-        cancel_token: None,
-        resolved_sandbox_root: None,
-        shell_unrestricted: true,
-        shell_default_env: std::collections::HashMap::new(),
-        shell_permissions: alms_core::config::ShellPermissions::default(),
-        shell_classification_mode: alms_core::config::ShellClassificationMode::default(),
-        shell_spill_policy: alms_sandbox::shell::spill::ShellSpillPolicy::disabled(),
-        tool_output_truncate_policy:
-            crate::tool_output_truncate::ToolOutputTruncatePolicy::disabled(),
-        extra_fs_read_roots: Vec::new(),
         agent_name: Some("bob".to_string()),
-        dm_implicit_reply: false,
+        ..base_runtime(LlmClient::new(LlmConfig::default()).unwrap())
     };
 
     let session_config = SessionConfig::default();
@@ -457,24 +415,9 @@ async fn test_guarded_posture_sequential_approvals() {
             posture: Posture::Guarded,
             ..AgentConfig::default()
         },
-        llm: LlmClient::new(config).unwrap(),
-        summary_llm: None,
         tools,
-        workspace: None,
         event_sender: Some(tx),
-        run_id: None,
-        cancel_token: None,
-        resolved_sandbox_root: None,
-        shell_unrestricted: true,
-        shell_default_env: std::collections::HashMap::new(),
-        shell_permissions: alms_core::config::ShellPermissions::default(),
-        shell_classification_mode: alms_core::config::ShellClassificationMode::default(),
-        shell_spill_policy: alms_sandbox::shell::spill::ShellSpillPolicy::disabled(),
-        tool_output_truncate_policy:
-            crate::tool_output_truncate::ToolOutputTruncatePolicy::disabled(),
-        extra_fs_read_roots: Vec::new(),
-        agent_name: None,
-        dm_implicit_reply: false,
+        ..base_runtime(LlmClient::new(config).unwrap())
     };
 
     let tool_calls = vec![
@@ -565,24 +508,9 @@ async fn test_denied_approval_appends_deny_audit_entry() {
             posture: Posture::Guarded,
             ..AgentConfig::default()
         },
-        llm: LlmClient::new(llm_config).unwrap(),
-        summary_llm: None,
         tools,
-        workspace: None,
         event_sender: Some(tx),
-        run_id: None,
-        cancel_token: None,
-        resolved_sandbox_root: None,
-        shell_unrestricted: true,
-        shell_default_env: std::collections::HashMap::new(),
-        shell_permissions: alms_core::config::ShellPermissions::default(),
-        shell_classification_mode: alms_core::config::ShellClassificationMode::default(),
-        shell_spill_policy: alms_sandbox::shell::spill::ShellSpillPolicy::disabled(),
-        tool_output_truncate_policy:
-            crate::tool_output_truncate::ToolOutputTruncatePolicy::disabled(),
-        extra_fs_read_roots: Vec::new(),
-        agent_name: None,
-        dm_implicit_reply: false,
+        ..base_runtime(LlmClient::new(llm_config).unwrap())
     };
 
     let tool_call = ToolCall::new("tc-deny", "math", r#"{"operation":"add","a":1,"b":2}"#);
@@ -717,24 +645,10 @@ async fn test_denied_approval_cancels_run_and_stops_batch() {
             posture: Posture::Guarded,
             ..AgentConfig::default()
         },
-        llm: LlmClient::new(llm_config).unwrap(),
-        summary_llm: None,
         tools,
-        workspace: None,
         event_sender: Some(tx),
-        run_id: None,
         cancel_token: Some(cancel_token.clone()),
-        resolved_sandbox_root: None,
-        shell_unrestricted: true,
-        shell_default_env: std::collections::HashMap::new(),
-        shell_permissions: alms_core::config::ShellPermissions::default(),
-        shell_classification_mode: alms_core::config::ShellClassificationMode::default(),
-        shell_spill_policy: alms_sandbox::shell::spill::ShellSpillPolicy::disabled(),
-        tool_output_truncate_policy:
-            crate::tool_output_truncate::ToolOutputTruncatePolicy::disabled(),
-        extra_fs_read_roots: Vec::new(),
-        agent_name: None,
-        dm_implicit_reply: false,
+        ..base_runtime(LlmClient::new(llm_config).unwrap())
     };
 
     let tool_calls = vec![
@@ -874,24 +788,10 @@ async fn test_cancel_during_approval_wait_emits_tool_end() {
             posture: Posture::Guarded,
             ..AgentConfig::default()
         },
-        llm: LlmClient::new(llm_config).unwrap(),
-        summary_llm: None,
         tools,
-        workspace: None,
         event_sender: Some(tx),
-        run_id: None,
         cancel_token: Some(cancel_token.clone()),
-        resolved_sandbox_root: None,
-        shell_unrestricted: true,
-        shell_default_env: std::collections::HashMap::new(),
-        shell_permissions: alms_core::config::ShellPermissions::default(),
-        shell_classification_mode: alms_core::config::ShellClassificationMode::default(),
-        shell_spill_policy: alms_sandbox::shell::spill::ShellSpillPolicy::disabled(),
-        tool_output_truncate_policy:
-            crate::tool_output_truncate::ToolOutputTruncatePolicy::disabled(),
-        extra_fs_read_roots: Vec::new(),
-        agent_name: None,
-        dm_implicit_reply: false,
+        ..base_runtime(LlmClient::new(llm_config).unwrap())
     };
 
     let tool_call = ToolCall::new("tc1", "math", r#"{"operation":"add","a":1,"b":2}"#);
@@ -1008,24 +908,10 @@ async fn test_cancel_during_approval_wait_appends_audit_entry() {
             posture: Posture::Guarded,
             ..AgentConfig::default()
         },
-        llm: LlmClient::new(llm_config).unwrap(),
-        summary_llm: None,
         tools,
-        workspace: None,
         event_sender: Some(tx),
-        run_id: None,
         cancel_token: Some(cancel_token.clone()),
-        resolved_sandbox_root: None,
-        shell_unrestricted: true,
-        shell_default_env: std::collections::HashMap::new(),
-        shell_permissions: alms_core::config::ShellPermissions::default(),
-        shell_classification_mode: alms_core::config::ShellClassificationMode::default(),
-        shell_spill_policy: alms_sandbox::shell::spill::ShellSpillPolicy::disabled(),
-        tool_output_truncate_policy:
-            crate::tool_output_truncate::ToolOutputTruncatePolicy::disabled(),
-        extra_fs_read_roots: Vec::new(),
-        agent_name: None,
-        dm_implicit_reply: false,
+        ..base_runtime(LlmClient::new(llm_config).unwrap())
     };
 
     let tool_call = ToolCall::new("tc-cancel", "math", r#"{"operation":"add","a":1,"b":2}"#);
@@ -1143,24 +1029,9 @@ async fn test_approval_channel_closed_appends_audit_entry() {
             posture: Posture::Guarded,
             ..AgentConfig::default()
         },
-        llm: LlmClient::new(llm_config).unwrap(),
-        summary_llm: None,
         tools,
-        workspace: None,
         event_sender: Some(tx),
-        run_id: None,
-        cancel_token: None,
-        resolved_sandbox_root: None,
-        shell_unrestricted: true,
-        shell_default_env: std::collections::HashMap::new(),
-        shell_permissions: alms_core::config::ShellPermissions::default(),
-        shell_classification_mode: alms_core::config::ShellClassificationMode::default(),
-        shell_spill_policy: alms_sandbox::shell::spill::ShellSpillPolicy::disabled(),
-        tool_output_truncate_policy:
-            crate::tool_output_truncate::ToolOutputTruncatePolicy::disabled(),
-        extra_fs_read_roots: Vec::new(),
-        agent_name: None,
-        dm_implicit_reply: false,
+        ..base_runtime(LlmClient::new(llm_config).unwrap())
     };
 
     let tool_call = ToolCall::new("tc-closed", "math", r#"{"operation":"add","a":1,"b":2}"#);
@@ -1278,24 +1149,9 @@ async fn test_approval_channel_closed_emits_matching_tool_end() {
             posture: Posture::Guarded,
             ..AgentConfig::default()
         },
-        llm: LlmClient::new(llm_config).unwrap(),
-        summary_llm: None,
         tools,
-        workspace: None,
         event_sender: Some(tx),
-        run_id: None,
-        cancel_token: None,
-        resolved_sandbox_root: None,
-        shell_unrestricted: true,
-        shell_default_env: std::collections::HashMap::new(),
-        shell_permissions: alms_core::config::ShellPermissions::default(),
-        shell_classification_mode: alms_core::config::ShellClassificationMode::default(),
-        shell_spill_policy: alms_sandbox::shell::spill::ShellSpillPolicy::disabled(),
-        tool_output_truncate_policy:
-            crate::tool_output_truncate::ToolOutputTruncatePolicy::disabled(),
-        extra_fs_read_roots: Vec::new(),
-        agent_name: None,
-        dm_implicit_reply: false,
+        ..base_runtime(LlmClient::new(llm_config).unwrap())
     };
 
     let tool_call = ToolCall::new("tc-closed", "math", r#"{"operation":"add","a":1,"b":2}"#);
@@ -1423,24 +1279,9 @@ async fn test_auto_approved_tool_bypasses_approval_in_guarded_posture() {
             posture: Posture::Guarded,
             ..AgentConfig::default()
         },
-        llm: LlmClient::new(config).unwrap(),
-        summary_llm: None,
         tools,
-        workspace: None,
         event_sender: Some(tx),
-        run_id: None,
-        cancel_token: None,
-        resolved_sandbox_root: None,
-        shell_unrestricted: true,
-        shell_default_env: std::collections::HashMap::new(),
-        shell_permissions: alms_core::config::ShellPermissions::default(),
-        shell_classification_mode: alms_core::config::ShellClassificationMode::default(),
-        shell_spill_policy: alms_sandbox::shell::spill::ShellSpillPolicy::disabled(),
-        tool_output_truncate_policy:
-            crate::tool_output_truncate::ToolOutputTruncatePolicy::disabled(),
-        extra_fs_read_roots: Vec::new(),
-        agent_name: None,
-        dm_implicit_reply: false,
+        ..base_runtime(LlmClient::new(config).unwrap())
     };
 
     let tc = ToolCall::new("tc1", "echo", r#"{"message":"hello"}"#);
@@ -1514,24 +1355,10 @@ async fn test_classifier_blocked_shell_surfaces_target_in_tool_end() {
             posture: Posture::Autonomous,
             ..AgentConfig::default()
         },
-        llm: LlmClient::new(config).unwrap(),
-        summary_llm: None,
         tools,
-        workspace: None,
         event_sender: Some(tx),
-        run_id: None,
-        cancel_token: None,
-        resolved_sandbox_root: None,
-        shell_unrestricted: true,
-        shell_default_env: std::collections::HashMap::new(),
-        shell_permissions: alms_core::config::ShellPermissions::default(),
         shell_classification_mode: alms_core::config::ShellClassificationMode::BlockDestructive,
-        shell_spill_policy: alms_sandbox::shell::spill::ShellSpillPolicy::disabled(),
-        tool_output_truncate_policy:
-            crate::tool_output_truncate::ToolOutputTruncatePolicy::disabled(),
-        extra_fs_read_roots: Vec::new(),
-        agent_name: None,
-        dm_implicit_reply: false,
+        ..base_runtime(LlmClient::new(config).unwrap())
     };
 
     let tc = ToolCall::new("tc-blocked", "shell", r#"{"command":"rm -rf /etc"}"#);
@@ -2887,29 +2714,12 @@ fn make_runtime_for_conflict_exec_test(posture: Posture) -> AgentRuntime {
     let tools =
         crate::tools::ToolRegistry::with_builtins_sandboxed(None, true, &["echo".to_string()]);
     AgentRuntime {
-        agent_id: AgentId::new(),
         config: AgentConfig {
             posture,
             ..AgentConfig::default()
         },
-        llm: LlmClient::new(llm_config).unwrap(),
-        summary_llm: None,
         tools,
-        workspace: None,
-        event_sender: None,
-        run_id: None,
-        cancel_token: None,
-        resolved_sandbox_root: None,
-        shell_unrestricted: true,
-        shell_default_env: std::collections::HashMap::new(),
-        shell_permissions: alms_core::config::ShellPermissions::default(),
-        shell_classification_mode: alms_core::config::ShellClassificationMode::default(),
-        shell_spill_policy: alms_sandbox::shell::spill::ShellSpillPolicy::disabled(),
-        tool_output_truncate_policy:
-            crate::tool_output_truncate::ToolOutputTruncatePolicy::disabled(),
-        extra_fs_read_roots: Vec::new(),
-        agent_name: None,
-        dm_implicit_reply: false,
+        ..base_runtime(LlmClient::new(llm_config).unwrap())
     }
 }
 
@@ -3887,29 +3697,14 @@ fn make_runtime_for_cancel_test(
     let tools = ToolRegistry::new();
     tools.register(tool);
     AgentRuntime {
-        agent_id: AgentId::new(),
         config: AgentConfig {
             posture,
             ..AgentConfig::default()
         },
-        llm: LlmClient::new(llm_config).unwrap(),
-        summary_llm: None,
         tools,
-        workspace: None,
         event_sender: Some(tx),
-        run_id: None,
         cancel_token: Some(cancel_token),
-        resolved_sandbox_root: None,
-        shell_unrestricted: true,
-        shell_default_env: std::collections::HashMap::new(),
-        shell_permissions: alms_core::config::ShellPermissions::default(),
-        shell_classification_mode: alms_core::config::ShellClassificationMode::default(),
-        shell_spill_policy: alms_sandbox::shell::spill::ShellSpillPolicy::disabled(),
-        tool_output_truncate_policy:
-            crate::tool_output_truncate::ToolOutputTruncatePolicy::disabled(),
-        extra_fs_read_roots: Vec::new(),
-        agent_name: None,
-        dm_implicit_reply: false,
+        ..base_runtime(LlmClient::new(llm_config).unwrap())
     }
 }
 
@@ -4815,25 +4610,8 @@ mod tool_output_truncate_integration {
         policy.max_bytes = 4 * 1024;
         policy.max_lines = 100;
         AgentRuntime {
-            agent_id: AgentId::new(),
-            config: AgentConfig::default(),
-            llm: LlmClient::new(llm_config).unwrap(),
-            summary_llm: None,
-            tools: ToolRegistry::new(),
-            workspace: None,
-            event_sender: None,
-            run_id: None,
-            cancel_token: None,
-            resolved_sandbox_root: None,
-            shell_unrestricted: true,
-            shell_default_env: std::collections::HashMap::new(),
-            shell_permissions: alms_core::config::ShellPermissions::default(),
-            shell_classification_mode: alms_core::config::ShellClassificationMode::default(),
-            shell_spill_policy: alms_sandbox::shell::spill::ShellSpillPolicy::disabled(),
             tool_output_truncate_policy: policy,
-            extra_fs_read_roots: Vec::new(),
-            agent_name: None,
-            dm_implicit_reply: false,
+            ..base_runtime(LlmClient::new(llm_config).unwrap())
         }
     }
 
@@ -5726,24 +5504,9 @@ fn build_test_runtime_for_emit(
             debug_mode: true,
             ..AgentConfig::default()
         },
-        llm: LlmClient::new(config).unwrap(),
-        summary_llm: None,
-        tools: ToolRegistry::new(),
-        workspace: None,
         event_sender: Some(event_sender),
-        run_id: None,
-        cancel_token: None,
-        resolved_sandbox_root: None,
-        shell_unrestricted: true,
-        shell_default_env: std::collections::HashMap::new(),
-        shell_permissions: alms_core::config::ShellPermissions::default(),
-        shell_classification_mode: alms_core::config::ShellClassificationMode::default(),
-        shell_spill_policy: alms_sandbox::shell::spill::ShellSpillPolicy::disabled(),
-        tool_output_truncate_policy:
-            crate::tool_output_truncate::ToolOutputTruncatePolicy::disabled(),
-        extra_fs_read_roots: Vec::new(),
         agent_name,
-        dm_implicit_reply: false,
+        ..base_runtime(LlmClient::new(config).unwrap())
     }
 }
 
@@ -6966,25 +6729,8 @@ fn manager_with_one_episodic_summary(
 fn episodic_probe_runtime(agent_id: AgentId) -> AgentRuntime {
     AgentRuntime {
         agent_id,
-        config: AgentConfig::default(),
-        llm: LlmClient::new(LlmConfig::default()).unwrap(),
-        summary_llm: None,
-        tools: ToolRegistry::new(),
-        workspace: None,
-        event_sender: None,
-        run_id: None,
-        cancel_token: None,
-        resolved_sandbox_root: None,
-        shell_unrestricted: true,
-        shell_default_env: std::collections::HashMap::new(),
-        shell_permissions: alms_core::config::ShellPermissions::default(),
-        shell_classification_mode: alms_core::config::ShellClassificationMode::default(),
-        shell_spill_policy: alms_sandbox::shell::spill::ShellSpillPolicy::disabled(),
-        tool_output_truncate_policy:
-            crate::tool_output_truncate::ToolOutputTruncatePolicy::disabled(),
-        extra_fs_read_roots: Vec::new(),
         agent_name: Some("reviewer".to_string()),
-        dm_implicit_reply: false,
+        ..base_runtime(LlmClient::new(LlmConfig::default()).unwrap())
     }
 }
 

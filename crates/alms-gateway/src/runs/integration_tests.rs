@@ -19,6 +19,7 @@
 use crate::gateway::GatewayConfig;
 use crate::server::AppState;
 use crate::sse::SseEventData;
+use crate::test_support::{AppStateWithChannels, TestAppState};
 use alms_coordinator::message_bus::{DmEvent, MessageSource, RunTrigger};
 use alms_coordinator::{SubagentCompletion, TaskId, TaskStatus};
 use alms_core::{AgentId, Run, RunId, RunStatus, SessionId, TokenUsage};
@@ -37,36 +38,8 @@ use tokio_util::sync::CancellationToken;
 ///
 /// Uses in-memory session storage (no SQLite), a dummy LLM config, and
 /// fresh channels for completion/trigger/dm-event loops.
-fn test_app_state() -> (
-    AppState,
-    CancellationToken,
-    mpsc::UnboundedReceiver<SubagentCompletion>,
-    mpsc::Receiver<RunTrigger>,
-    mpsc::Receiver<DmEvent>,
-) {
-    let gateway_config = GatewayConfig::default();
-    let gateway = crate::gateway::Gateway::new(gateway_config).unwrap();
-    let scheduler = Arc::new(alms_runtime::Scheduler::new());
-    let shutdown_token = CancellationToken::new();
-    let (completion_tx, completion_rx) = mpsc::unbounded_channel();
-    let (trigger_tx, trigger_rx) = mpsc::channel(64);
-    let (dm_event_tx, dm_event_rx) = mpsc::channel(64);
-    let state = AppState::new(
-        gateway,
-        scheduler,
-        shutdown_token.clone(),
-        completion_tx,
-        trigger_tx,
-        dm_event_tx,
-    )
-    .unwrap();
-    (
-        state,
-        shutdown_token,
-        completion_rx,
-        trigger_rx,
-        dm_event_rx,
-    )
+fn test_app_state() -> AppStateWithChannels {
+    TestAppState::new().build_with_channels()
 }
 
 /// Build an `AppState` backed by an in-memory SQLite store.
@@ -75,39 +48,8 @@ fn test_app_state() -> (
 /// resolution in `handle_dm_run_failure`). Mirrors the channel plumbing of
 /// [`test_app_state`] but threads `db_path = Some(":memory:")` into the
 /// `GatewayConfig` so `session_manager.store()` returns `Some(...)`.
-fn test_app_state_with_sqlite() -> (
-    AppState,
-    CancellationToken,
-    mpsc::UnboundedReceiver<SubagentCompletion>,
-    mpsc::Receiver<RunTrigger>,
-    mpsc::Receiver<DmEvent>,
-) {
-    let gateway_config = GatewayConfig {
-        db_path: Some(":memory:".to_string()),
-        ..GatewayConfig::default()
-    };
-    let gateway = crate::gateway::Gateway::new(gateway_config).unwrap();
-    let scheduler = Arc::new(alms_runtime::Scheduler::new());
-    let shutdown_token = CancellationToken::new();
-    let (completion_tx, completion_rx) = mpsc::unbounded_channel();
-    let (trigger_tx, trigger_rx) = mpsc::channel(64);
-    let (dm_event_tx, dm_event_rx) = mpsc::channel(64);
-    let state = AppState::new(
-        gateway,
-        scheduler,
-        shutdown_token.clone(),
-        completion_tx,
-        trigger_tx,
-        dm_event_tx,
-    )
-    .unwrap();
-    (
-        state,
-        shutdown_token,
-        completion_rx,
-        trigger_rx,
-        dm_event_rx,
-    )
+fn test_app_state_with_sqlite() -> AppStateWithChannels {
+    TestAppState::new().in_memory_sqlite().build_with_channels()
 }
 
 /// Build an `AppState` whose LLM client runs in mock mode and is backed
@@ -116,58 +58,17 @@ fn test_app_state_with_sqlite() -> (
 /// subagent to completion (mock LLM avoids the network) and (b) the full
 /// gateway router so `GET /sessions/{id}/messages` exercises the actual
 /// JSON serialization path the UI sees.
-fn test_app_state_with_mock_llm() -> (
-    AppState,
-    CancellationToken,
-    mpsc::UnboundedReceiver<SubagentCompletion>,
-    mpsc::Receiver<RunTrigger>,
-    mpsc::Receiver<DmEvent>,
-) {
+fn test_app_state_with_mock_llm() -> AppStateWithChannels {
     test_app_state_with_mock_llm_at(":memory:")
 }
 
 /// File-backed variant of [`test_app_state_with_mock_llm`] for tests that
 /// need to reopen the SQLite database and verify restart-visible state.
-fn test_app_state_with_mock_llm_at(
-    db_path: &str,
-) -> (
-    AppState,
-    CancellationToken,
-    mpsc::UnboundedReceiver<SubagentCompletion>,
-    mpsc::Receiver<RunTrigger>,
-    mpsc::Receiver<DmEvent>,
-) {
-    let llm_config = alms_runtime::LlmConfig {
-        mock: true,
-        ..alms_runtime::LlmConfig::default()
-    };
-    let gateway_config = GatewayConfig {
-        db_path: Some(db_path.to_string()),
-        llm_config,
-        ..GatewayConfig::default()
-    };
-    let gateway = crate::gateway::Gateway::new(gateway_config).unwrap();
-    let scheduler = Arc::new(alms_runtime::Scheduler::new());
-    let shutdown_token = CancellationToken::new();
-    let (completion_tx, completion_rx) = mpsc::unbounded_channel();
-    let (trigger_tx, trigger_rx) = mpsc::channel(64);
-    let (dm_event_tx, dm_event_rx) = mpsc::channel(64);
-    let state = AppState::new(
-        gateway,
-        scheduler,
-        shutdown_token.clone(),
-        completion_tx,
-        trigger_tx,
-        dm_event_tx,
-    )
-    .unwrap();
-    (
-        state,
-        shutdown_token,
-        completion_rx,
-        trigger_rx,
-        dm_event_rx,
-    )
+fn test_app_state_with_mock_llm_at(db_path: &str) -> AppStateWithChannels {
+    TestAppState::new()
+        .db_path(db_path)
+        .mock_llm()
+        .build_with_channels()
 }
 
 /// Build an `AppState` whose LLM client points at an unreachable local
@@ -176,13 +77,7 @@ fn test_app_state_with_mock_llm_at(
 /// generic `Err(_)` arm.  Used by the #912 follow-up regression test
 /// (PR #930) that asserts the gateway lifecycle no longer writes a
 /// duplicate `(run failed) ...` `kind: "error"` marker.
-fn test_app_state_with_failing_llm() -> (
-    AppState,
-    CancellationToken,
-    mpsc::UnboundedReceiver<SubagentCompletion>,
-    mpsc::Receiver<RunTrigger>,
-    mpsc::Receiver<DmEvent>,
-) {
+fn test_app_state_with_failing_llm() -> AppStateWithChannels {
     // Port 1 is reserved (`tcpmux`) and almost universally unbound on
     // CI / dev machines, so `connect()` fails immediately with
     // ECONNREFUSED rather than hanging.  Combined with a 1-second
@@ -196,32 +91,9 @@ fn test_app_state_with_failing_llm() -> (
         ..alms_runtime::LlmConfig::default()
     };
 
-    let gateway_config = GatewayConfig {
-        llm_config,
-        ..GatewayConfig::default()
-    };
-    let gateway = crate::gateway::Gateway::new(gateway_config).unwrap();
-    let scheduler = Arc::new(alms_runtime::Scheduler::new());
-    let shutdown_token = CancellationToken::new();
-    let (completion_tx, completion_rx) = mpsc::unbounded_channel();
-    let (trigger_tx, trigger_rx) = mpsc::channel(64);
-    let (dm_event_tx, dm_event_rx) = mpsc::channel(64);
-    let state = AppState::new(
-        gateway,
-        scheduler,
-        shutdown_token.clone(),
-        completion_tx,
-        trigger_tx,
-        dm_event_tx,
-    )
-    .unwrap();
-    (
-        state,
-        shutdown_token,
-        completion_rx,
-        trigger_rx,
-        dm_event_rx,
-    )
+    TestAppState::new()
+        .llm_config(llm_config)
+        .build_with_channels()
 }
 
 /// Build an `AppState` whose LLM client points at a TCP listener that
@@ -241,13 +113,7 @@ fn test_app_state_with_failing_llm() -> (
 /// Returns `(state, shutdown_token, completion_rx, trigger_rx,
 /// dm_event_rx, listener_join)`. The listener task runs until the test
 /// drops `state`.
-async fn test_app_state_with_hanging_llm() -> (
-    AppState,
-    CancellationToken,
-    mpsc::UnboundedReceiver<SubagentCompletion>,
-    mpsc::Receiver<RunTrigger>,
-    mpsc::Receiver<DmEvent>,
-) {
+async fn test_app_state_with_hanging_llm() -> AppStateWithChannels {
     use tokio::net::TcpListener;
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -274,32 +140,9 @@ async fn test_app_state_with_hanging_llm() -> (
         ..alms_runtime::LlmConfig::default()
     };
 
-    let gateway_config = GatewayConfig {
-        llm_config,
-        ..GatewayConfig::default()
-    };
-    let gateway = crate::gateway::Gateway::new(gateway_config).unwrap();
-    let scheduler = Arc::new(alms_runtime::Scheduler::new());
-    let shutdown_token = CancellationToken::new();
-    let (completion_tx, completion_rx) = mpsc::unbounded_channel();
-    let (trigger_tx, trigger_rx) = mpsc::channel(64);
-    let (dm_event_tx, dm_event_rx) = mpsc::channel(64);
-    let state = AppState::new(
-        gateway,
-        scheduler,
-        shutdown_token.clone(),
-        completion_tx,
-        trigger_tx,
-        dm_event_tx,
-    )
-    .unwrap();
-    (
-        state,
-        shutdown_token,
-        completion_rx,
-        trigger_rx,
-        dm_event_rx,
-    )
+    TestAppState::new()
+        .llm_config(llm_config)
+        .build_with_channels()
 }
 
 /// Seed two agents (`alice` and `bob`) into the SQLite-backed agent registry
@@ -309,30 +152,11 @@ async fn test_app_state_with_hanging_llm() -> (
 /// Returns `(alice_id, bob_id)`.
 fn seed_alice_bob(state: &AppState) -> (AgentId, AgentId) {
     use alms_core::registry::AgentRecord;
-    use chrono::Utc;
     let store = state
         .session_manager
         .store()
         .expect("test_app_state_with_sqlite must provide a SQLite store");
-    let alice = AgentRecord {
-        id: AgentId::new(),
-        name: "alice".into(),
-        description: String::new(),
-        model: None,
-        posture: None,
-        provider: None,
-        telegram_token: None,
-        thinking_budget_tokens: None,
-        reasoning_effort: None,
-        gemini_thinking_budget: None,
-        summary_provider: None,
-        summary_model: None,
-        worktree_mode: alms_core::WorktreeMode::Off,
-        debug_mode: false,
-        is_default: false,
-        created_at: Utc::now(),
-        last_active: Utc::now(),
-    };
+    let alice = AgentRecord::for_test("alice");
     let bob = AgentRecord {
         id: AgentId::new(),
         name: "bob".into(),
@@ -349,30 +173,11 @@ fn seed_alice_bob(state: &AppState) -> (AgentId, AgentId) {
 /// third party to show the fold removes exactly one recipient.
 fn seed_agent(state: &AppState, name: &str) -> AgentId {
     use alms_core::registry::AgentRecord;
-    use chrono::Utc;
     let store = state
         .session_manager
         .store()
         .expect("test_app_state_with_sqlite must provide a SQLite store");
-    let record = AgentRecord {
-        id: AgentId::new(),
-        name: name.into(),
-        description: String::new(),
-        model: None,
-        posture: None,
-        provider: None,
-        telegram_token: None,
-        thinking_budget_tokens: None,
-        reasoning_effort: None,
-        gemini_thinking_budget: None,
-        summary_provider: None,
-        summary_model: None,
-        worktree_mode: alms_core::WorktreeMode::Off,
-        debug_mode: false,
-        is_default: false,
-        created_at: Utc::now(),
-        last_active: Utc::now(),
-    };
+    let record = AgentRecord::for_test(name);
     store.create_agent(&record).unwrap();
     record.id
 }
@@ -4103,33 +3908,22 @@ async fn create_run_ignores_stale_per_run_override_fields() {
     use alms_core::registry::AgentRecord;
     use axum::Json;
     use axum::extract::State;
-    use chrono::Utc;
 
     let (state, shutdown_token, _cr, _tr, _dr) = test_app_state_with_sqlite();
     let agent_id = AgentId::new();
-    let now = Utc::now();
 
     // Seed an agent record whose per-agent overrides differ on every
     // assertable knob from the stale payload below. The resolved config
     // post-#941 must reflect THESE values, never the payload's.
     let agent = AgentRecord {
         id: agent_id,
-        name: "stale-payload-victim".into(),
-        description: String::new(),
         model: Some("claude-sonnet-4-6".into()),
         posture: Some("autonomous".into()),
         provider: Some("anthropic".into()),
-        telegram_token: None,
         thinking_budget_tokens: Some(2048),
         reasoning_effort: Some(ReasoningEffort::Low),
         gemini_thinking_budget: Some(4096),
-        summary_provider: None,
-        summary_model: None,
-        worktree_mode: alms_core::WorktreeMode::Off,
-        debug_mode: false,
-        is_default: false,
-        created_at: now,
-        last_active: now,
+        ..AgentRecord::for_test("stale-payload-victim")
     };
     state
         .session_manager
@@ -4387,28 +4181,13 @@ fn seed_llm_default_test_agent(
     provider: Option<&str>,
 ) -> AgentId {
     use alms_core::registry::AgentRecord;
-    use chrono::Utc;
 
     let agent_id = AgentId::new();
-    let now = Utc::now();
     let agent = AgentRecord {
         id: agent_id,
-        name: name.to_string(),
-        description: String::new(),
         model: model.map(str::to_string),
-        posture: None,
         provider: provider.map(str::to_string),
-        telegram_token: None,
-        thinking_budget_tokens: None,
-        reasoning_effort: None,
-        gemini_thinking_budget: None,
-        summary_provider: None,
-        summary_model: None,
-        worktree_mode: alms_core::WorktreeMode::Off,
-        debug_mode: false,
-        is_default: false,
-        created_at: now,
-        last_active: now,
+        ..AgentRecord::for_test(name)
     };
     state
         .session_manager
@@ -4806,29 +4585,14 @@ async fn create_run_resolves_per_agent_config_for_shared_session_via_requested_a
     use alms_core::{CreateRunRequest, RunInput};
     use axum::Json;
     use axum::extract::State;
-    use chrono::Utc;
 
     let (state, shutdown_token, _cr, _tr, _dr) = test_app_state_with_sqlite();
     let agent_id = AgentId::new();
-    let now = Utc::now();
     let agent = AgentRecord {
         id: agent_id,
-        name: "chamunchuk".into(),
-        description: String::new(),
         model: Some("claude-sonnet-4-6".into()),
-        posture: None,
         provider: Some("anthropic".into()),
-        telegram_token: None,
-        thinking_budget_tokens: None,
-        reasoning_effort: None,
-        gemini_thinking_budget: None,
-        summary_provider: None,
-        summary_model: None,
-        worktree_mode: alms_core::WorktreeMode::Off,
-        debug_mode: false,
-        is_default: false,
-        created_at: now,
-        last_active: now,
+        ..AgentRecord::for_test("chamunchuk")
     };
     state
         .session_manager
@@ -4912,30 +4676,14 @@ async fn create_run_rejects_provider_switch_with_no_model_anywhere() {
     use alms_core::{CreateRunRequest, RunInput};
     use axum::Json;
     use axum::extract::State;
-    use chrono::Utc;
 
     let (state, _shutdown_token, _cr, _tr, _dr) = test_app_state_with_sqlite();
     let agent_id = AgentId::new();
-    let now = Utc::now();
     let agent = AgentRecord {
         id: agent_id,
-        name: "leaky-agent".into(),
-        description: String::new(),
         // The #863 trigger: provider override with NO model at any layer.
-        model: None,
-        posture: None,
         provider: Some("anthropic".into()),
-        telegram_token: None,
-        thinking_budget_tokens: None,
-        reasoning_effort: None,
-        gemini_thinking_budget: None,
-        summary_provider: None,
-        summary_model: None,
-        worktree_mode: alms_core::WorktreeMode::Off,
-        debug_mode: false,
-        is_default: false,
-        created_at: now,
-        last_active: now,
+        ..AgentRecord::for_test("leaky-agent")
     };
     state
         .session_manager
@@ -5010,31 +4758,15 @@ async fn create_run_does_not_reject_when_provider_unchanged() {
     use alms_core::{CreateRunRequest, RunInput};
     use axum::Json;
     use axum::extract::State;
-    use chrono::Utc;
 
     let (state, shutdown_token, _cr, _tr, _dr) = test_app_state_with_sqlite();
     let agent_id = AgentId::new();
-    let now = Utc::now();
     let agent = AgentRecord {
         id: agent_id,
-        name: "happy-agent".into(),
-        description: String::new(),
-        model: None,
-        posture: None,
         // Same provider as the server default (`openrouter` per
         // `LlmConfig::default()`). No switch -> no leak guard.
         provider: Some("openrouter".into()),
-        telegram_token: None,
-        thinking_budget_tokens: None,
-        reasoning_effort: None,
-        gemini_thinking_budget: None,
-        summary_provider: None,
-        summary_model: None,
-        worktree_mode: alms_core::WorktreeMode::Off,
-        debug_mode: false,
-        is_default: false,
-        created_at: now,
-        last_active: now,
+        ..AgentRecord::for_test("happy-agent")
     };
     state
         .session_manager
@@ -5070,30 +4802,15 @@ async fn create_run_accepts_provider_switch_with_per_agent_model() {
     use alms_core::{CreateRunRequest, RunInput};
     use axum::Json;
     use axum::extract::State;
-    use chrono::Utc;
 
     let (state, shutdown_token, _cr, _tr, _dr) = test_app_state_with_sqlite();
     let agent_id = AgentId::new();
-    let now = Utc::now();
     let agent = AgentRecord {
         id: agent_id,
-        name: "well-configured".into(),
-        description: String::new(),
         // Per-agent model in the new provider's namespace -> success.
         model: Some("claude-sonnet-4-6".into()),
-        posture: None,
         provider: Some("anthropic".into()),
-        telegram_token: None,
-        thinking_budget_tokens: None,
-        reasoning_effort: None,
-        gemini_thinking_budget: None,
-        summary_provider: None,
-        summary_model: None,
-        worktree_mode: alms_core::WorktreeMode::Off,
-        debug_mode: false,
-        is_default: false,
-        created_at: now,
-        last_active: now,
+        ..AgentRecord::for_test("well-configured")
     };
     state
         .session_manager
@@ -5153,7 +4870,6 @@ async fn create_run_accepts_provider_switch_with_per_agent_model() {
 async fn execute_run_failure_arm_marks_run_failed_with_structured_error_on_provider_switch_without_model()
  {
     use alms_core::registry::AgentRecord;
-    use chrono::Utc;
 
     let (state, shutdown_token, _cr, _tr, _dr) = test_app_state_with_sqlite();
 
@@ -5163,25 +4879,10 @@ async fn execute_run_failure_arm_marks_run_failed_with_structured_error_on_provi
     // cross-namespace switch and the in-loop `resolve_agent_config` will
     // fail with `MissingModelAfterProviderSwitch`.
     let agent_id = AgentId::new();
-    let now = Utc::now();
     let agent = AgentRecord {
         id: agent_id,
-        name: "non-http-trigger-agent".into(),
-        description: String::new(),
-        model: None,
-        posture: None,
         provider: Some("anthropic".into()),
-        telegram_token: None,
-        thinking_budget_tokens: None,
-        reasoning_effort: None,
-        gemini_thinking_budget: None,
-        summary_provider: None,
-        summary_model: None,
-        worktree_mode: alms_core::WorktreeMode::Off,
-        debug_mode: false,
-        is_default: false,
-        created_at: now,
-        last_active: now,
+        ..AgentRecord::for_test("non-http-trigger-agent")
     };
     state
         .session_manager
@@ -8221,7 +7922,6 @@ async fn create_run_rejects_per_agent_override_that_blows_provider_cap() {
     use alms_core::{CreateRunRequest, RunInput};
     use axum::Json;
     use axum::extract::State;
-    use chrono::Utc;
 
     // Pin strict mode for this test so a concurrent warn-mode test
     // can't make us silently accept the overbudget config.
@@ -8237,27 +7937,13 @@ async fn create_run_rejects_per_agent_override_that_blows_provider_cap() {
     }
 
     let agent_id = AgentId::new();
-    let now = Utc::now();
     let agent = AgentRecord {
         id: agent_id,
-        name: "overbudget-agent".into(),
-        description: String::new(),
         // Pin a model whose 200K cap is smaller than the 282K effective
         // total once we bump max_input_tokens above.
         model: Some("claude-haiku-4-5".into()),
-        posture: None,
         provider: Some("anthropic".into()),
-        telegram_token: None,
-        thinking_budget_tokens: None,
-        reasoning_effort: None,
-        gemini_thinking_budget: None,
-        summary_provider: None,
-        summary_model: None,
-        worktree_mode: alms_core::WorktreeMode::Off,
-        debug_mode: false,
-        is_default: false,
-        created_at: now,
-        last_active: now,
+        ..AgentRecord::for_test("overbudget-agent")
     };
     state
         .session_manager
@@ -8330,7 +8016,6 @@ async fn create_run_warn_mode_accepts_overbudget_config() {
     use alms_core::{CreateRunRequest, RunInput};
     use axum::Json;
     use axum::extract::State;
-    use chrono::Utc;
 
     // Pin warn mode for this test, holding the global env-var lock so
     // concurrent strict-mode tests can't see the warn value.
@@ -8343,25 +8028,11 @@ async fn create_run_warn_mode_accepts_overbudget_config() {
     }
 
     let agent_id = AgentId::new();
-    let now = Utc::now();
     let agent = AgentRecord {
         id: agent_id,
-        name: "overbudget-warn-agent".into(),
-        description: String::new(),
         model: Some("claude-haiku-4-5".into()),
-        posture: None,
         provider: Some("anthropic".into()),
-        telegram_token: None,
-        thinking_budget_tokens: None,
-        reasoning_effort: None,
-        gemini_thinking_budget: None,
-        summary_provider: None,
-        summary_model: None,
-        worktree_mode: alms_core::WorktreeMode::Off,
-        debug_mode: false,
-        is_default: false,
-        created_at: now,
-        last_active: now,
+        ..AgentRecord::for_test("overbudget-warn-agent")
     };
     state
         .session_manager
@@ -8396,7 +8067,6 @@ async fn create_run_accepts_unknown_model_regardless_of_budget() {
     use alms_core::{CreateRunRequest, RunInput};
     use axum::Json;
     use axum::extract::State;
-    use chrono::Utc;
 
     // Pin strict mode — the unknown-pair branch must skip the check
     // regardless of mode, but we hold the lock so a concurrent warn-mode
@@ -8413,28 +8083,14 @@ async fn create_run_accepts_unknown_model_regardless_of_budget() {
     }
 
     let agent_id = AgentId::new();
-    let now = Utc::now();
     let agent = AgentRecord {
         id: agent_id,
-        name: "unknown-model-agent".into(),
-        description: String::new(),
         // Per-agent provider override to anthropic with a model NOT in
         // the table — falls through to None at lookup time, validator
         // skips silently.
         model: Some("claude-2.1".into()),
-        posture: None,
         provider: Some("anthropic".into()),
-        telegram_token: None,
-        thinking_budget_tokens: None,
-        reasoning_effort: None,
-        gemini_thinking_budget: None,
-        summary_provider: None,
-        summary_model: None,
-        worktree_mode: alms_core::WorktreeMode::Off,
-        debug_mode: false,
-        is_default: false,
-        created_at: now,
-        last_active: now,
+        ..AgentRecord::for_test("unknown-model-agent")
     };
     // Bump session storage to match so the cross-section validator is
     // satisfied.
@@ -8473,7 +8129,6 @@ async fn create_run_mock_mode_bypasses_budget_validation() {
     use alms_core::{CreateRunRequest, RunInput};
     use axum::Json;
     use axum::extract::State;
-    use chrono::Utc;
 
     // Pin strict mode — the mock-mode bypass must take effect regardless
     // of `ALMS_LLM_BUDGET_VALIDATION`. Hold the global env-var lock so a
@@ -8519,28 +8174,14 @@ async fn create_run_mock_mode_bypasses_budget_validation() {
     }
 
     let agent_id = AgentId::new();
-    let now = Utc::now();
     let agent = AgentRecord {
         id: agent_id,
-        name: "mock-mode-agent".into(),
-        description: String::new(),
         // A known table-row whose 200K cap is smaller than the 282K
         // effective total — without the mock bypass the validator would
         // fire here.
         model: Some("claude-haiku-4-5".into()),
-        posture: None,
         provider: Some("anthropic".into()),
-        telegram_token: None,
-        thinking_budget_tokens: None,
-        reasoning_effort: None,
-        gemini_thinking_budget: None,
-        summary_provider: None,
-        summary_model: None,
-        worktree_mode: alms_core::WorktreeMode::Off,
-        debug_mode: false,
-        is_default: false,
-        created_at: now,
-        last_active: now,
+        ..AgentRecord::for_test("mock-mode-agent")
     };
     state
         .session_manager
@@ -8597,7 +8238,6 @@ async fn create_run_mock_mode_bypasses_budget_validation() {
 #[tokio::test]
 async fn execute_run_rejects_overbudget_resolved_config_on_non_http_path() {
     use alms_core::registry::AgentRecord;
-    use chrono::Utc;
 
     // Pin strict mode so a concurrent warn-mode test can't make us silently
     // accept the overbudget config.
@@ -8611,27 +8251,13 @@ async fn execute_run_rejects_overbudget_resolved_config_on_non_http_path() {
     }
 
     let agent_id = AgentId::new();
-    let now = Utc::now();
     let agent = AgentRecord {
         id: agent_id,
-        name: "overbudget-non-http-agent".into(),
-        description: String::new(),
         // 250K + 32K = 282K overshoots Haiku 4.5's 200K cap — same fixture
         // as the create_run-side test, exercised from the non-HTTP path.
         model: Some("claude-haiku-4-5".into()),
-        posture: None,
         provider: Some("anthropic".into()),
-        telegram_token: None,
-        thinking_budget_tokens: None,
-        reasoning_effort: None,
-        gemini_thinking_budget: None,
-        summary_provider: None,
-        summary_model: None,
-        worktree_mode: alms_core::WorktreeMode::Off,
-        debug_mode: false,
-        is_default: false,
-        created_at: now,
-        last_active: now,
+        ..AgentRecord::for_test("overbudget-non-http-agent")
     };
     state
         .session_manager
@@ -8773,7 +8399,6 @@ async fn execute_run_rejects_overbudget_resolved_config_on_non_http_path() {
 #[tokio::test]
 async fn execute_run_mock_mode_skips_budget_validation_on_non_http_path() {
     use alms_core::registry::AgentRecord;
-    use chrono::Utc;
 
     let _env = BudgetValidationEnvGuard::unset();
 
@@ -8810,25 +8435,11 @@ async fn execute_run_mock_mode_skips_budget_validation_on_non_http_path() {
     }
 
     let agent_id = AgentId::new();
-    let now = Utc::now();
     let agent = AgentRecord {
         id: agent_id,
-        name: "mock-mode-non-http-agent".into(),
-        description: String::new(),
         model: Some("claude-haiku-4-5".into()),
-        posture: None,
         provider: Some("anthropic".into()),
-        telegram_token: None,
-        thinking_budget_tokens: None,
-        reasoning_effort: None,
-        gemini_thinking_budget: None,
-        summary_provider: None,
-        summary_model: None,
-        worktree_mode: alms_core::WorktreeMode::Off,
-        debug_mode: false,
-        is_default: false,
-        created_at: now,
-        last_active: now,
+        ..AgentRecord::for_test("mock-mode-non-http-agent")
     };
     state
         .session_manager
@@ -8914,7 +8525,6 @@ async fn drive_notification_run_with_debug_mode(
     debug_mode: bool,
 ) -> (alms_core::Run, Vec<SseEventData>) {
     use alms_core::registry::AgentRecord;
-    use chrono::Utc;
 
     // Mock-mode LLM: the run completes deterministically without a provider,
     // and `finish_run`'s `if self.config.debug_mode` gate is still exercised
@@ -8948,25 +8558,10 @@ async fn drive_notification_run_with_debug_mode(
     // No per-agent model/provider overrides — the run uses the server-default
     // mock client unchanged, so nothing can fail before the runtime starts.
     let agent_id = AgentId::new();
-    let now = Utc::now();
     let agent = AgentRecord {
         id: agent_id,
-        name: "notify-debug-gate-agent".into(),
-        description: String::new(),
-        model: None,
-        posture: None,
-        provider: None,
-        telegram_token: None,
-        thinking_budget_tokens: None,
-        reasoning_effort: None,
-        gemini_thinking_budget: None,
-        summary_provider: None,
-        summary_model: None,
-        worktree_mode: alms_core::WorktreeMode::Off,
         debug_mode,
-        is_default: false,
-        created_at: now,
-        last_active: now,
+        ..AgentRecord::for_test("notify-debug-gate-agent")
     };
     state
         .session_manager
@@ -12864,13 +12459,7 @@ async fn queued_then_cancelled_non_peer_run_does_not_notify() {
 /// the generous `stream_chunk_timeout_secs` fires, long after the test ends.
 /// That is exactly the live condition under which the "chip stuck on
 /// Starting…" bug was reproduced.
-async fn test_app_state_with_streaming_then_stalling_llm() -> (
-    AppState,
-    CancellationToken,
-    mpsc::UnboundedReceiver<SubagentCompletion>,
-    mpsc::Receiver<RunTrigger>,
-    mpsc::Receiver<DmEvent>,
-) {
+async fn test_app_state_with_streaming_then_stalling_llm() -> AppStateWithChannels {
     use tokio::io::AsyncWriteExt;
     use tokio::net::TcpListener;
 
@@ -12910,32 +12499,9 @@ async fn test_app_state_with_streaming_then_stalling_llm() -> (
         stream_chunk_timeout_secs: 60,
         ..alms_runtime::LlmConfig::default()
     };
-    let gateway_config = GatewayConfig {
-        llm_config,
-        ..GatewayConfig::default()
-    };
-    let gateway = crate::gateway::Gateway::new(gateway_config).unwrap();
-    let scheduler = Arc::new(alms_runtime::Scheduler::new());
-    let shutdown_token = CancellationToken::new();
-    let (completion_tx, completion_rx) = mpsc::unbounded_channel();
-    let (trigger_tx, trigger_rx) = mpsc::channel(64);
-    let (dm_event_tx, dm_event_rx) = mpsc::channel(64);
-    let state = AppState::new(
-        gateway,
-        scheduler,
-        shutdown_token.clone(),
-        completion_tx,
-        trigger_tx,
-        dm_event_tx,
-    )
-    .unwrap();
-    (
-        state,
-        shutdown_token,
-        completion_rx,
-        trigger_rx,
-        dm_event_rx,
-    )
+    TestAppState::new()
+        .llm_config(llm_config)
+        .build_with_channels()
 }
 
 /// REGRESSION (#1189 follow-up): a session-stream subscriber that attaches

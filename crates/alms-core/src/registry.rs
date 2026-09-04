@@ -224,6 +224,42 @@ pub struct AgentRecord {
     pub last_active: DateTime<Utc>,
 }
 
+#[cfg(any(test, feature = "test-support"))]
+impl AgentRecord {
+    /// Test fixture: an agent called `name` with a fresh id, an empty
+    /// description, every per-agent override unset, `worktree_mode: Off`,
+    /// `debug_mode: false`, `is_default: false`, and both timestamps at
+    /// "now".
+    ///
+    /// Tests set the fields they care about with struct-update syntax —
+    /// `AgentRecord { model: Some("x".into()), ..AgentRecord::for_test("a") }`
+    /// — so a new `AgentRecord` field means one edit here, not one per
+    /// test. Available to downstream crates' test targets through the
+    /// `test-support` feature; never compiled into a production build.
+    pub fn for_test(name: &str) -> Self {
+        let now = Utc::now();
+        Self {
+            id: AgentId::new(),
+            name: name.to_string(),
+            description: String::new(),
+            model: None,
+            posture: None,
+            provider: None,
+            telegram_token: None,
+            thinking_budget_tokens: None,
+            reasoning_effort: None,
+            gemini_thinking_budget: None,
+            summary_provider: None,
+            summary_model: None,
+            worktree_mode: WorktreeMode::Off,
+            debug_mode: false,
+            is_default: false,
+            created_at: now,
+            last_active: now,
+        }
+    }
+}
+
 /// Request body for creating a new agent.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateAgentRequest {
