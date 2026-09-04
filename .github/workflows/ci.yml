@@ -116,28 +116,58 @@ jobs:
   audit-rust:
     name: Security audit (Rust)
     runs-on: ubuntu-latest
-    # `rustsec/audit-check` publishes its advisory table as a check run, and it
-    # attempts that POST whenever there is anything at all to report --
-    # informational warnings included. Without `checks: write` the POST returns
-    # "Resource not accessible by integration"; on push events (where
-    # GITHUB_HEAD_REF is unset) the action rethrows instead of falling back to
-    # stdout, so the job failed on *any* finding before its actual verdict
-    # ("fail only on non-informational vulnerabilities") was ever reached. That,
-    # not a deliberate fail-on-warning rule, is what kept this job red on an
-    # unmaintained advisory alone -- see the note in `.cargo/audit.toml`.
+    # Installs `cargo-audit` with `--locked` and runs it. The ignore set lives in
+    # `.cargo/audit.toml` so local runs and CI cannot silently disagree (#1248),
+    # and the verdict is cargo-audit's own: non-zero on vulnerabilities, not on
+    # informational advisories.
     #
-    # A job-level `permissions:` block replaces the defaults wholesale, so
-    # `contents: read` has to be restated for actions/checkout.
+    # `contents: read` is restated because a job-level `permissions:` block
+    # replaces the defaults wholesale. It is kept rather than dropped so this job
+    # carries its own least-privilege floor, instead of inheriting whatever the
+    # repository default happens to be later.
+    #
+    # `RUSTUP_TOOLCHAIN: stable` overrides `rust-toolchain.toml`. `cargo audit`
+    # reads `Cargo.lock`, which is toolchain-independent, so pinning this job to
+    # the project's nightly bought nothing and cost something: it downloaded a
+    # nightly plus rustfmt, clippy and rust-src that the audit never uses, and it
+    # left a second way for this job to die building its tool rather than reading
+    # the lockfile -- a nightly bump that breaks cargo-audit's build is the
+    # `tinyvec` failure below arriving from the other direction.
+    #
+    # Why not `rustsec/audit-check@v2` (removed 2026-09-04). It builds
+    # `cargo-audit` from source *without* `--locked`, so the tool's dependency
+    # graph is re-resolved on every run against whatever is newest on crates.io.
+    # `tinyvec 1.13.0` was published on 2026-09-03 and does not compile
+    # (`cannot find macro `vec` in this scope`), which took this job red on every
+    # branch within the hour -- while auditing nothing at all, since it died
+    # building the tool rather than reading `Cargo.lock`. ALMS's own lockfile
+    # pins `tinyvec 1.10.0`; the broken version was never in our graph.
+    #
+    # This job is a *required* status check, so its failure blocks every merge in
+    # the repository. A build that re-resolves third-party dependencies on each
+    # run is not a dependency worth having in that position, which is the
+    # argument for `--locked` over waiting for the upstream yank.
+    #
+    # Two things went with the action. It published its advisory table as a check
+    # run, which a plain binary cannot do -- findings now appear in the job log.
+    # And that POST was the reason this job needed `checks: write`: without it
+    # the POST returned "Resource not accessible by integration", and on push
+    # events the action rethrew rather than falling back to stdout, so the job
+    # died on *any* finding before reaching its own verdict -- which is what once
+    # kept it red on an unmaintained advisory alone (#1252). No POST, no
+    # permission, no failure mode; `checks: write` is dropped here.
     permissions:
       contents: read
-      checks: write
+    env:
+      RUSTUP_TOOLCHAIN: stable
     steps:
     - uses: actions/checkout@v4
 
+    - name: Install cargo-audit (locked)
+      run: cargo install --locked cargo-audit
+
     - name: Run cargo audit
-      uses: rustsec/audit-check@v2
-      with:
-        token: ${{ secrets.GITHUB_TOKEN }}
+      run: cargo audit
 
   # Frontend: package-lock.json against the npm advisory DB. Mirrors the Rust
   # job above, but needs the pinned Node/npm toolchain: `npm audit` resolves the
