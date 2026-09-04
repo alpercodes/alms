@@ -44,9 +44,11 @@ The modal's **Summary** section (`summary_model` / `summary_provider`) drives bo
 
 > **`timeout_secs` is vestigial.** It is validated, exposed on `GET /settings` and accepted by `PATCH /settings`, but nothing in the tool-execution path reads it — setting it has no effect. What bounds a tool instead varies, and for most tools is nothing: `shell` by its own `timeout_ms` argument (120s default, 600s hard cap), `http_get` by a hardcoded 30s, and everything else — the `fs_*` tools, the remaining builtins, and all eight agent tools in `alms-tools` — by no timeout of its own. A batch that hangs on one of those is caught by the run-level `tool_phase_ceiling_secs` backstop (see *Agent-loop hard caps* above) rather than by anything per-tool. The exception is `invoke_agent`: a foreground call is exempt from that ceiling (P3b) and blocks for the subagent's whole run, bounded by the subagent's own loop caps (`max_iterations`, the phase-inactivity budgets, `max_run_duration_secs`) — a different kind of bound from a timeout. Tracked in [#112](https://github.com/alpercodes/alms/issues/112), which will either wire the knob up or remove it.
 
-### Reverting a thinking budget
+### Reverting a server-default thinking budget
 
 `llm.anthropic.thinking_budget_tokens` and `llm.gemini.thinking_budget` have **no clear sentinel** on the PATCH wire: `0` means "thinking disabled" and an omitted field means "leave alone", so neither expresses "go back to the config-file default". Once either has been PATCHed, the only way back is to edit `settings.json` and restart.
+
+This is the **server-default** layer only. A *per-agent* override of the same two fields is clearable — `PUT /agents/{id_or_name}` takes `clear_thinking_budget_tokens` and `clear_gemini_thinking_budget` flags (plus `clear_reasoning_effort`) that reset an agent back to inheriting the server default. See [`docs/api.md`](api.md) § 9.4.
 
 ### Debug mode
 
