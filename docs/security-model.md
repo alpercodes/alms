@@ -92,6 +92,19 @@ ALMS should support multiple security postures.
 - **Developer**: approvals off or reduced (local dev only)
 - **Locked-down**: most tools disabled, allowlist-only
 
+**What shipped: agent postures.** The implemented surface is the per-agent `posture`
+(set with `alms agent create --posture`, changed with `PUT /agents/{id_or_name}`), with
+three values. `guarded` (default) sends every tool call that is not auto-approved through
+the approval gate — `needs_approval_gate = posture == Guarded && !auto_approved` in the
+agent loop. `full_control` executes tools without approval. `autonomous` also executes
+without approval, and is what a `guarded` agent's system-triggered runs (peer DMs,
+notifications, subagent completions, scheduled jobs) are promoted to, because nobody is
+present to approve. `resolve_posture_for_run` overrides `Guarded` only, so a
+`full_control` agent keeps its own posture on those runs — see § 8. "Safe" above
+corresponds to `guarded` and "Developer" to `full_control`;
+"Locked-down" has no posture of its own — the nearest lever is the `[tools].enabled`
+allowlist, which keeps a tool out of the registry altogether.
+
 ### When to require approval (recommended)
 - `shell.exec` outside workspace
 - `fs.write` outside workspace
@@ -502,7 +515,7 @@ keep working from inside the worktree.
 Worktree mode is a **per-agent** setting stored on the agent's
 registry record (`worktree_mode: "off" | "git"`, default `"off"`).
 There is no `[agent.worktree]` block in `alms.toml` — operators set it
-at agent-create time and toggle it via PATCH:
+at agent-create time and toggle it via the CLI or `PUT /agents/{id_or_name}`:
 
 ```bash
 # Set at create time
@@ -521,7 +534,7 @@ agent resolves under the worktree, and the persistent shell cwd
 defaults to the worktree.
 
 The worktree is provisioned at agent-create time (or on a `mode: off → git`
-PATCH). On non-git projects, both create and PATCH return
+update). On non-git projects, both create and update return
 `400 WORKTREE_REQUIRES_GIT` and refuse to persist the agent record —
 there is no silent fallback to project-root mode. Worktree creation is
 idempotent: when the directory and branch already exist (e.g. the
@@ -544,11 +557,11 @@ Removal at agent-delete time runs `git worktree remove` followed by
 `git branch -D alms/<name>`. The remove refuses on uncommitted changes
 unless the operator passes `--force` (CLI) or
 `force_worktree_remove: true` (HTTP); force discards both the working
-tree and the branch. A `mode: git → off` PATCH is just a remove with
+tree and the branch. A `mode: git → off` update is just a remove with
 the same semantics.
 
 **Force-true reversibility asymmetry.** If a `DELETE /agents` or a
-`PATCH /agents` `mode: git → off` flip is invoked with `force = true`
+`PUT /agents/{id_or_name}` `mode: git → off` flip is invoked with `force = true`
 and the underlying SQLite write subsequently fails, the gateway runs a
 best-effort compensation that restores the agent's `alms/<name>` branch
 and worktree directory at the SHA snapshotted before the remove (#1019,
@@ -852,7 +865,7 @@ edit the TOML and restart the daemon. The same model is applied to
 
 **Current:** `bash -c` command strings + `env_clear()` + best-effort command denylist + project-root path prefix enforcement for fs tools (the [single sandbox root](#filesystem-sandboxing) pinned by `with_project_root`) + persistent cwd restriction for shell (validated against the same root on each invocation) + **Landlock filesystem sandboxing on Linux 5.13+** (fail-closed: if Landlock is supported but enforcement fails, the command is aborted; only gracefully degrades on kernels without Landlock support).
 
-**Landlock read set — `/etc/passwd` excluded (#743 / #734 item 2):** The Linux Landlock policy grants the child process read access to a small allow-list of system paths (`/usr`, `/bin`, `/lib`, `/lib64`, the dynamic linker config under `/etc/ld.so.*`, `/etc/nsswitch.conf`, `/etc/resolv.conf`, `/etc/localtime`, `/dev/{null,urandom,zero}`, `/proc/self`). `/etc/passwd` is intentionally **not** in the read set: granting it would let a sandboxed agent enumerate every local user on a shared host, which is a valuable reconnaissance step for an attacker who has subverted the agent. The trade-off is that bash's `~user` tilde expansion to *other* users' homes no longer resolves (bash needs `getpwnam` to translate the name to a path), and `ls -l`/`whoami` may print numeric UIDs instead of names. `~/path` for the **current** user still works because bash uses the `$HOME` env var, which doesn't read `/etc/passwd`. Agents that legitimately need user enumeration (rare) can run unsandboxed by setting `tools.shell_unrestricted = true` in `alms.toml`.
+**Landlock read set — `/etc/passwd` excluded (#743 / #734 item 2):** The Linux Landlock policy grants the child process read access to a small allow-list of system paths (`/usr`, `/bin`, `/lib`, `/lib64`, the dynamic linker config under `/etc/ld.so.*`, `/etc/nsswitch.conf`, `/etc/resolv.conf`, `/etc/localtime`, `/dev/{null,urandom,zero}`, `/proc/self`). `/etc/passwd` is intentionally **not** in the read set: granting it would let a sandboxed agent enumerate every local user on a shared host, which is a valuable reconnaissance step for an attacker who has subverted the agent. The trade-off is that bash's `~user` tilde expansion to *other* users' homes no longer resolves (bash needs `getpwnam` to translate the name to a path), and `ls -l`/`whoami` may print numeric UIDs instead of names. `~/path` for the **current** user still works because bash uses the `$HOME` env var, which doesn't read `/etc/passwd`. Agents that legitimately need user enumeration (rare) can be listed under `[security].allow_full_os_access` (the operator escape hatch in § 4.4): an unrestricted shell skips the Landlock ruleset along with the rest of the sandbox. There is no `tools.shell_unrestricted` knob.
 
 **Next — additional OS-level isolation:**
 - **Restricted OS user**: run the daemon (or just tool execution) as a low-privilege OS user with filesystem ACLs limiting access to the workspace. Battle-tested, simple, works on all platforms. Requires deployment-time setup (create user, set permissions).
@@ -1021,7 +1034,7 @@ Default posture recommendations:
 - Shell env cleared — **implemented**: `env_clear()` prevents secret leakage to child processes
 - Shell cwd restricted — **implemented**: shell's persistent cwd defaults to the [single sandbox root](#filesystem-sandboxing) (project root by default, worktree path under per-agent [worktree mode](#opt-in-worktree-mode)); explicit `cwd` params are validated against the same root
 - Strict output truncation — **implemented**: 30KB stdout/stderr cap with head+tail line preservation; `fs_read` defaults to 2000 lines and a 64 KiB output budget (lowered from 512 KiB in #917 to match prevailing caps and reduce pre-truncation bloat now that the in-loop truncate caps at 32 KB anyway), with a 256 KiB whole-file size gate that fires only on parameter-less calls (passing `offset` or `limit` skips the whole-file gate and falls back to the output-byte budget — see #813 / #901); each line is independently allocation-capped at 256 KiB before being returned, with surplus bytes drained and an inline `[line truncated to N bytes; M bytes discarded]` marker plus a `line_truncated: true` flag on the response (#902 — bounds per-line allocation on pathological single-line inputs once the whole-file gate is bypassed); `fs_grep` shares the same 256 KiB per-line cap via the `builtin::line_cap` module (#913) and surfaces a `truncated_lines` counter on its response so agents can detect partial scans; UTF-8 safe truncation
-- No `sudo` — not yet enforced (command denylist not implemented; use OS-level restrictions)
+- No `sudo` — **implemented** as a classifier floor: `sudo`, `su`, `doas`, `pkexec`, `runuser` and `gosu` are classified `Destructive` (`PRIV_BINS` in `crates/alms-sandbox/src/shell/classification.rs`) and blocked in every `shell_classification_mode` except `off`. Heuristic, so bypassable like the rest of the classifier (§ 4.3); OS-level restrictions remain the real boundary
 - Network allowlist empty by default — not yet implemented
 - Auto-approved tools skip approval in Guarded posture — **implemented**: `datetime`, `echo`, `list_agents`, `list_my_sessions`, `read_session`, `read_messages`, `read_subagent_session` return `is_auto_approved() = true`; all other tools still require user approval
 - Cronjob creation requires approval — implemented via Guarded posture
