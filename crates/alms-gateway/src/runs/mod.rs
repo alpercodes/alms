@@ -238,6 +238,20 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_user_initiated_keeps_autonomous_and_full_control() {
+        assert_eq!(
+            resolve_posture_for_run(Posture::Autonomous, false),
+            Posture::Autonomous,
+            "Autonomous posture should be preserved for user-initiated runs"
+        );
+        assert_eq!(
+            resolve_posture_for_run(Posture::FullControl, false),
+            Posture::FullControl,
+            "FullControl posture should be preserved for user-initiated runs"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // Model-override end-to-end tests (#833 / #860)
     //

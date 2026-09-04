@@ -2079,6 +2079,8 @@ mod tests {
         assert_eq!(rm.in_flight_count(), 2);
         rm.untrack_in_flight();
         assert_eq!(rm.in_flight_count(), 1);
+        rm.untrack_in_flight();
+        assert_eq!(rm.in_flight_count(), 0);
     }
 
     /// After cancelling all tokens, runs that check their cancel_token
