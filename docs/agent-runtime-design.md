@@ -90,9 +90,9 @@ poll_interval_secs = 5
 **Principles:**
 - Secrets (API keys, tokens) come from **`.alms/secrets.json`** via `alms auth set`, never config files or env vars
 - Every field has a default — zero-config startup should work (with mock LLM)
-- Human-readable durations (`"24h"`, `"30d"`, `"5m"`)
+- Human-readable durations (`"24h"`, `"30d"`, `"5m"`) — *not implemented: every duration is an integer `*_secs` field*
 - Validation on startup: reject invalid values with clear messages before starting
-- `alms config check` CLI command to validate without starting
+- `alms config check` CLI command to validate without starting — *not implemented: there is no `config` subcommand; validation runs when the gateway loads the file*
 
 **Implementation:**
 - Use the `config` crate (already in workspace deps) with layered loading:
@@ -114,7 +114,7 @@ OpenClaw tells the agent to "summarize your session" — this fails because:
 - It's non-deterministic (different quality each time)
 - The user sees degraded responses and doesn't know why
 
-ALMS originally hardcoded `take(50)` messages in the agent loop. No compression, no awareness of token budget. (This has since been replaced by the `ContextBuilder` in `context.rs`.)
+ALMS originally hardcoded `take(50)` messages in the agent loop. No compression, no awareness of token budget. (This has since been replaced by the `ContextBuilder` in `crates/alms-runtime/src/context/`.)
 
 ### Design
 
@@ -236,7 +236,7 @@ The invariant lives in two distinct layers, and both matter independently:
 - The **Anthropic adapter** (`to_anthropic_request` in `anthropic.rs`) relabels `role="tool"` → `role="user"` so that tool_result blocks land inside a user message, which is what Anthropic requires. That relabel can create adjacencies that the builder invariant does not forbid — concretely, a canonical tail of `[tool_result, user_text]` becomes two adjacent `user` wire messages, which Anthropic rejects with a 400. The adapter therefore runs `merge_consecutive_roles` after its conversion loop, concatenating adjacent same-role messages' content blocks in order. A post-pass `debug_assert!` pins the wire-level no-adjacent-same-role property as a tripwire.
 - The **OpenAI-compatible adapter** (OpenAI / OpenRouter / generic OpenAI-compatible providers) serialises the canonical builder shape directly. No role relabeling is needed because OpenAI natively has the `tool` role, so the builder invariant already holds at the wire.
 
-The invariant is pinned by unit tests in `context.rs` (builder layer) and by `debug_assert!`s plus adapter-level tests inside `anthropic.rs` (wire layer — non-empty messages array, trailing user role, no adjacent same-role messages after merge). Provider adapters do ONLY their own genuinely-provider-specific work.
+The invariant is pinned by unit tests in the `context/` module (builder layer) and by `debug_assert!`s plus adapter-level tests inside `anthropic.rs` (wire layer — non-empty messages array, trailing user role, no adjacent same-role messages after merge). Provider adapters do ONLY their own genuinely-provider-specific work.
 
 ---
 
