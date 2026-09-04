@@ -796,9 +796,11 @@ export function SettingsModal({ open, onClose }) {
                     <//>
                     <!-- #112: this knob is validated and PATCHable but no tool
                          execution path reads it. Silence here would hide that a
-                         value the operator sets does nothing. -->
+                         value the operator sets does nothing. What *does* bound
+                         each tool varies per tool and is documented in config.md;
+                         this row only needs to say the knob is inert. -->
                     <${EditRow} label="Tool timeout (seconds)"
-                        desc="Not enforced yet — each tool applies its own timeout instead.">
+                        desc="Not enforced yet — setting it has no effect.">
                         <input class="settings-input settings-input-sm" type="number" min="1"
                                value=${toolsTimeout.value}
                                onInput=${e => { toolsTimeout.value = e.target.value; }} />
