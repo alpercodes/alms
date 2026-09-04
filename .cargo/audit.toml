@@ -1,20 +1,27 @@
 # cargo-audit configuration.
 #
-# Read by the `cargo audit` binary run from the repo root. The CI
-# `rustsec/audit-check` action shells out to that same binary, so this file is
+# Read by the `cargo audit` binary run from the repo root. CI runs that same
+# binary directly (`audit-rust` in `.github/workflows/ci.yml`), so this file is
 # the single source of truth for the ignore set -- local runs and CI cannot
 # silently disagree (issue #1248).
 #
-# Note: an informational `unmaintained` advisory alone has been enough to turn
-# the CI gate red -- but not, as previously recorded here, because `audit-check`
-# treats warnings as failures. It does not: its verdict is "fail only on
-# non-informational vulnerabilities". What happened is that *any* finding makes
-# the action try to publish its advisory table as a check run, that POST was
-# rejected with "Resource not accessible by integration" for lack of
-# `checks: write`, and on push events the action rethrows the permission error
-# instead of falling back to stdout -- so the job died before reaching its own
-# verdict. The `permissions:` block on the `audit-rust` job in
-# `.github/workflows/ci.yml` addresses that (issue #1252).
+# Historical note, kept because it explains an entry below. An informational
+# `unmaintained` advisory alone was once enough to turn the CI gate red -- not
+# because the verdict counts warnings as failures (it does not; it fails only on
+# non-informational vulnerabilities), but because CI then used the
+# `rustsec/audit-check` action, which tried to publish its advisory table as a
+# check run on *any* finding and rethrew the resulting permission error instead
+# of falling back to stdout (issue #1252). That action was removed on
+# 2026-09-04, so the failure mode is gone with it.
+#
+# Be clear about what the entries below now do, because it is less than it was.
+# With the action gone, an informational advisory no longer fails anything on its
+# own: `cargo audit` exits non-zero on vulnerabilities, and warnings affect the
+# exit code only when named in `[output] deny`, which this file does not set. So
+# an `informational` ignore entry now suppresses a line of log output and changes
+# no CI verdict. They are kept because the rationale and exit condition each
+# records are worth having written down, not because removing one would turn the
+# gate red. If that ever proves false, this paragraph is what is wrong.
 #
 # Every entry here must carry a date, a rationale, and an exit condition.
 
