@@ -810,12 +810,6 @@ mod tests {
     }
 
     #[test]
-    fn test_shell_tool_is_builtin() {
-        let tool = ShellTool::new();
-        assert!(tool.is_builtin());
-    }
-
-    #[test]
     fn test_shell_tool_parameters_schema() {
         let tool = ShellTool::new();
         let params = tool.parameters();

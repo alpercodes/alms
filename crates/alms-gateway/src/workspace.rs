@@ -342,9 +342,9 @@ mod open_tests {
     //! reads it). Two parallel tests both setting the same value to "1" is
     //! a no-op race, not a correctness hazard.
     use super::*;
-    use alms_core::{AgentId, AgentRecord};
+    use crate::test_support::TestAppState;
+    use alms_core::AgentRecord;
     use axum::http::StatusCode;
-    use chrono::Utc;
     use tempfile::TempDir;
 
     #[test]
@@ -373,50 +373,15 @@ mod open_tests {
     /// for the duration of the test (its Drop removes the directory).
     pub(super) fn open_test_app_state() -> (TempDir, crate::server::AppState) {
         let tmp = TempDir::new().expect("tempdir for workspace");
-        let gateway_config = crate::gateway::GatewayConfig {
-            db_path: Some(":memory:".to_string()),
-            workspace_dir: Some(tmp.path().to_path_buf()),
-            ..crate::gateway::GatewayConfig::default()
-        };
-        let gateway = crate::gateway::Gateway::new(gateway_config).unwrap();
-        let scheduler = std::sync::Arc::new(alms_runtime::Scheduler::new());
-        let shutdown_token = tokio_util::sync::CancellationToken::new();
-        let (completion_tx, _completion_rx) = tokio::sync::mpsc::unbounded_channel();
-        let (trigger_tx, _trigger_rx) = tokio::sync::mpsc::channel(8);
-        let (dm_event_tx, _dm_event_rx) = tokio::sync::mpsc::channel(8);
-        let state = crate::server::AppState::new(
-            gateway,
-            scheduler,
-            shutdown_token,
-            completion_tx,
-            trigger_tx,
-            dm_event_tx,
-        )
-        .unwrap();
+        let state = TestAppState::new()
+            .in_memory_sqlite()
+            .workspace_dir(tmp.path())
+            .build();
         (tmp, state)
     }
 
     pub(super) fn new_agent(name: &str) -> AgentRecord {
-        let now = Utc::now();
-        AgentRecord {
-            id: AgentId::new(),
-            name: name.to_string(),
-            description: String::new(),
-            model: None,
-            posture: None,
-            provider: None,
-            telegram_token: None,
-            thinking_budget_tokens: None,
-            reasoning_effort: None,
-            gemini_thinking_budget: None,
-            summary_provider: None,
-            summary_model: None,
-            worktree_mode: alms_core::WorktreeMode::Off,
-            debug_mode: false,
-            is_default: false,
-            created_at: now,
-            last_active: now,
-        }
+        AgentRecord::for_test(name)
     }
 
     /// Extract `(StatusCode, JSON body)` from an `IntoResponse` produced by

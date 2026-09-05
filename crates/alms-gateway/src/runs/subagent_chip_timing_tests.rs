@@ -36,6 +36,7 @@
 use crate::gateway::GatewayConfig;
 use crate::server::AppState;
 use alms_core::{AgentId, Run};
+use alms_test_support::read_full_http_request;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
@@ -50,37 +51,6 @@ const PARENT_TAIL_MS: u64 = 1_000;
 /// parent's `run_finished`. Comfortably under `PARENT_TAIL_MS` so the pin is
 /// about the ordering, not about scheduler jitter.
 const MIN_LEAD_MS: u128 = 500;
-
-/// Read one complete HTTP request (headers + `Content-Length` body) off the
-/// socket. Mirrors the helper the `alms-runtime` scripted-LLM tests use.
-async fn read_full_http_request(sock: &mut tokio::net::TcpStream) -> String {
-    use tokio::io::AsyncReadExt;
-    let mut buf = Vec::new();
-    let mut chunk = [0u8; 4096];
-    loop {
-        let n = match sock.read(&mut chunk).await {
-            Ok(0) | Err(_) => break,
-            Ok(n) => n,
-        };
-        buf.extend_from_slice(&chunk[..n]);
-        let text = String::from_utf8_lossy(&buf);
-        if let Some(header_end) = text.find("\r\n\r\n") {
-            let content_length = text[..header_end]
-                .lines()
-                .find_map(|l| {
-                    let (k, v) = l.split_once(':')?;
-                    k.eq_ignore_ascii_case("content-length")
-                        .then(|| v.trim().parse::<usize>().ok())
-                        .flatten()
-                })
-                .unwrap_or(0);
-            if buf.len() >= header_end + 4 + content_length {
-                break;
-            }
-        }
-    }
-    String::from_utf8_lossy(&buf).into_owned()
-}
 
 /// One OpenAI-style streamed text turn (the default `openrouter` provider
 /// parses this wire shape).

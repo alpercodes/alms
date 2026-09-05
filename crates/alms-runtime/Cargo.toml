@@ -47,6 +47,7 @@ dashmap.workspace = true
 # (`tokio::time::pause()` / `advance()`) — see #1158.
 tokio-test.workspace = true
 tempfile = "3"
+alms-test-support = { path = "../alms-test-support" }
 # Integration test for the Gemini cache-expired retry cycle (#795). Scoped
 # to dev-dependencies so it never ships in the binary. Pinned conservatively;
 # wiremock 0.6 is stable on tokio 1 + reqwest 0.12 (our workspace pins).

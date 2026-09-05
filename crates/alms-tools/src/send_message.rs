@@ -615,25 +615,7 @@ mod tests {
     #[tokio::test]
     async fn delivered_result_carries_a_planning_note() {
         let store = alms_session::SqliteStore::open_in_memory().unwrap();
-        let recipient = alms_core::AgentRecord {
-            id: AgentId::new(),
-            name: "bob".into(),
-            description: String::new(),
-            model: None,
-            posture: None,
-            provider: None,
-            telegram_token: None,
-            thinking_budget_tokens: None,
-            reasoning_effort: None,
-            gemini_thinking_budget: None,
-            summary_provider: None,
-            summary_model: None,
-            worktree_mode: alms_core::WorktreeMode::Off,
-            debug_mode: false,
-            is_default: false,
-            created_at: alms_core::Timestamp::now().0,
-            last_active: alms_core::Timestamp::now().0,
-        };
+        let recipient = alms_core::AgentRecord::for_test("bob");
         store.create_agent(&recipient).unwrap();
         let mgr = Arc::new(
             SessionManager::with_store(alms_session::SessionConfig::default(), store).unwrap(),
@@ -744,25 +726,7 @@ mod tests {
     }
 
     fn agent_record(name: &str) -> alms_core::AgentRecord {
-        alms_core::AgentRecord {
-            id: AgentId::new(),
-            name: name.into(),
-            description: String::new(),
-            model: None,
-            posture: None,
-            provider: None,
-            telegram_token: None,
-            thinking_budget_tokens: None,
-            reasoning_effort: None,
-            gemini_thinking_budget: None,
-            summary_provider: None,
-            summary_model: None,
-            worktree_mode: alms_core::WorktreeMode::Off,
-            debug_mode: false,
-            is_default: false,
-            created_at: alms_core::Timestamp::now().0,
-            last_active: alms_core::Timestamp::now().0,
-        }
+        alms_core::AgentRecord::for_test(name)
     }
 
     /// #2: delivery uses the recipient's canonical registry name, not the

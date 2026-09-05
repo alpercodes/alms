@@ -36,3 +36,5 @@ uuid.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
+# `AgentRecord::for_test` for the `agent config` / `agent create` tests.
+alms-core = { path = "../alms-core", features = ["test-support"] }
