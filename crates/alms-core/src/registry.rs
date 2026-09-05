@@ -236,6 +236,10 @@ impl AgentRecord {
     /// — so a new `AgentRecord` field means one edit here, not one per
     /// test. Available to downstream crates' test targets through the
     /// `test-support` feature; never compiled into a production build.
+    ///
+    /// `created_at` and `last_active` are filled from one `Utc::now()`, so
+    /// they are exactly equal, not merely close. A test that needs
+    /// `last_active > created_at` must set the later one itself.
     pub fn for_test(name: &str) -> Self {
         let now = Utc::now();
         Self {
