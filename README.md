@@ -41,56 +41,59 @@ collects the review threads it produced.
 
 Requires Rust nightly, installed automatically from `rust-toolchain.toml`.
 
-`./install.sh` runs the build below and then copies the binary into `~/.cargo/bin` —
-usually already on your `PATH` if you installed Rust with rustup, though the script only
-reminds you to check. Run it and every `./target/release/alms` in this README becomes
-just `alms`. It is a bash script; on Windows run it from Git Bash.
+Three commands. Everything else — the provider key, agents, sessions, the first message —
+happens in the browser.
 
 ```bash
 cargo build --release
 
-# Store a provider key — openai, anthropic, openrouter, or gemini.
-# Do this before starting the gateway: the daemon reads secrets.json once
-# at boot, so a key stored while it is running will not be picked up.
-./target/release/alms auth set openrouter
-```
-
-Then start the gateway. It runs in the foreground:
-
-```bash
-# Defaults to 127.0.0.1:8080
+# Runs in the foreground; leave it running. Defaults to 127.0.0.1:8080
 ./target/release/alms gateway
 ```
 
-In a second shell, create an agent and open the web UI. Agents are read from SQLite per
-call, so creating one against a running gateway works:
+Then, in a second shell:
 
 ```bash
-./target/release/alms agent create atlas \
-    --description "Coordinator" \
-    --posture guarded
-
-# The shortest path to a first run — the dashboard creates the session
-# for you and streams the agent's output live
 ./target/release/alms dashboard
 ```
 
-Postures are `guarded` (approval required for sensitive tools), `full_control`, and
-`autonomous`.
+`alms dashboard` checks that the gateway is answering before opening a browser, so a daemon
+that failed to start says so instead of handing you a connection-refused page. Opening
+<http://127.0.0.1:8080> yourself works too.
 
-To drive it over the API instead — sessions are created against an agent UUID, and these
-examples need `jq`:
+`./install.sh` runs the same release build and copies the binary into `~/.cargo/bin` —
+usually already on your `PATH` if you installed Rust with rustup. Run it and both commands
+above become just `alms`. It is a bash script; on Windows run it from Git Bash.
 
-```bash
-AGENT=$(./target/release/alms agent show atlas --json | jq -r .id)
+### In the browser
 
-SESSION=$(curl -sX POST http://127.0.0.1:8080/sessions \
-    -H 'content-type: application/json' \
-    -d "{\"agent_id\":\"$AGENT\",\"context_id\":\"cli\"}" | jq -r .session_id)
+**Paste a provider key first.** The gear in the header opens Settings; under **API Keys**,
+paste a key next to `openrouter` and press Save. It applies immediately, no restart.
+`openrouter` is the default provider, so a key there needs no further configuration; for
+`openai`, `anthropic`, or `gemini`, also point *Default LLM provider* and *Default LLM
+model* at your choice. Do this before your first message: without a key the first reply
+fails with *Authentication failed — check your API key in Settings*.
 
-./target/release/alms run create --session "$SESSION" --input "Summarise this repo"
-./target/release/alms health
-```
+**Then create your agent.** The first screen asks for a name, creates the agent, opens a
+session, and drops you into the chat. Send it anything: a new agent's opening reply is a
+short interview about who you are and what it is for, and what it learns becomes workspace
+files it carries into every later session.
+
+- **Sidebar** — this agent's sessions; *+ New session* starts another.
+- **Agents**, in the header — create more agents and set each one's model, provider, and
+  posture.
+- **Gear** — server-wide settings: the API keys above, default model and provider, and the
+  context budget.
+
+New agents inherit the server's default posture, `guarded`, so the first risky tool call
+raises an approval card in the chat and waits for you. `full_control` and `autonomous`
+skip that gate;
+[`docs/security-model.md` § 2](docs/security-model.md#2-approval-model-human-in-the-loop)
+covers what each one checks.
+
+To drive ALMS from a script instead, the same agent → session → run flow over HTTP is in
+[`docs/api.md` § 2](docs/api.md#scripted-first-run), and `alms --help` lists the CLI
+equivalents.
 
 ## Before you run this
 

@@ -73,6 +73,62 @@ pub(crate) fn api_client() -> anyhow::Result<reqwest::Client> {
     Ok(builder.build().unwrap_or_else(|_| reqwest::Client::new()))
 }
 
+/// Deadline for the `/health` pre-flight probe.
+///
+/// Short on purpose: the common failure is a gateway that was never started,
+/// which refuses the connection immediately. The timeout only matters for a
+/// host that swallows the SYN, where waiting longer tells the operator nothing
+/// new.
+const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Outcome of a `GET {url}/health` probe against a gateway.
+#[derive(Debug)]
+pub(crate) enum GatewayProbe {
+    /// `/health` answered 2xx — the gateway is up.
+    Healthy,
+    /// Something answered, but not with a success status: a gateway still
+    /// coming up, or a proxy in front of it intercepting `/health`.
+    Unhealthy(reqwest::StatusCode),
+    /// Nothing answered — connection refused, DNS failure, or timeout.
+    Unreachable(String),
+}
+
+/// Probe a gateway's `/health` endpoint with a short deadline.
+///
+/// `GET /health` is on the gateway's **public** router (see `public_router` in
+/// `alms-gateway/src/server/routes.rs`), so the result is meaningful whether or
+/// not `ALMS_AUTH_TOKEN` is set — an operator without a token in their shell
+/// environment still gets a true answer rather than a 401.
+pub(crate) async fn probe_gateway(client: &reqwest::Client, url: &str) -> GatewayProbe {
+    match client
+        .get(api_url(url, "health"))
+        .timeout(PROBE_TIMEOUT)
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status().is_success() => GatewayProbe::Healthy,
+        Ok(resp) => GatewayProbe::Unhealthy(resp.status()),
+        Err(e) => GatewayProbe::Unreachable(error_chain(&e)),
+    }
+}
+
+/// Flatten an error and its `source()` chain into a single line.
+///
+/// `reqwest::Error`'s own `Display` is only ever "error sending request for url
+/// (...)" — whether the connection was refused, timed out, or failed to resolve
+/// lives one or two links down the chain, and that distinction is the entire
+/// point of the probe's message.
+fn error_chain(err: &dyn std::error::Error) -> String {
+    let mut out = err.to_string();
+    let mut source = err.source();
+    while let Some(cause) = source {
+        out.push_str(": ");
+        out.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    out
+}
+
 /// Parse an HTTP error response body into a user-friendly message.
 ///
 /// The gateway emits error bodies in **two** shapes and this reads both
@@ -309,5 +365,60 @@ mod tests {
     fn test_short_id_short_string() {
         let s = short_id(&"abc");
         assert_eq!(s, "abc");
+    }
+
+    /// `alms dashboard` refuses to open a browser onto a dead gateway, so the
+    /// "nothing is listening" case has to come back as `Unreachable` rather
+    /// than as any flavour of HTTP answer.
+    #[tokio::test]
+    async fn test_probe_gateway_reports_unreachable_when_nothing_is_listening() {
+        // Bind then drop: the OS hands out a port it knows is free, and the
+        // drop guarantees nothing is behind it by the time we probe.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        let probe =
+            probe_gateway(&api_client().unwrap(), &format!("http://127.0.0.1:{port}")).await;
+        assert!(
+            matches!(probe, GatewayProbe::Unreachable(_)),
+            "expected Unreachable, got {probe:?}"
+        );
+    }
+
+    /// The reason a probe failed is what makes the `alms dashboard` message
+    /// worth printing, and it is never in `reqwest::Error`'s own `Display`.
+    ///
+    /// Built from a real `reqwest::Error` rather than a stand-in, because the
+    /// claim is about *that* type's `Display`/`source` split — a hand-rolled
+    /// error would pin nothing. The assertions are on the shape (outer message
+    /// first, then strictly more) rather than on any wording, since what the OS
+    /// calls a refused connection differs per platform.
+    #[tokio::test]
+    async fn test_error_chain_appends_reqwest_causes_to_the_outer_display() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        let err = api_client()
+            .unwrap()
+            .get(format!("http://127.0.0.1:{port}/health"))
+            .timeout(PROBE_TIMEOUT)
+            .send()
+            .await
+            .expect_err("nothing is listening on this port");
+
+        let outer = err.to_string();
+        let chained = error_chain(&err);
+
+        assert!(
+            chained.starts_with(&outer),
+            "chain must lead with the error's own Display; got {chained:?}"
+        );
+        assert!(
+            chained.len() > outer.len(),
+            "error_chain added nothing to {outer:?} — reqwest's own Display carries no cause, \
+             so `alms dashboard` would print a reason-free message"
+        );
     }
 }
