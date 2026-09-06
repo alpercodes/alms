@@ -88,6 +88,40 @@ Suggested MVP error codes:
 - `INTERNAL`
 - `UNAUTHORIZED` (if enabled)
 
+### Scripted first run
+
+The web UI is the normal way in — it creates the agent, the session, and the run for you (see the README quick start). To do the same from a script, against a gateway that is already running, with `jq` installed:
+
+```bash
+BASE=http://127.0.0.1:8080
+
+# 1. Create an agent (§ 9.2). To reuse an existing one instead:
+#    AGENT=$(curl -s $BASE/agents/atlas | jq -r .id)
+AGENT=$(curl -sX POST $BASE/agents \
+    -H 'content-type: application/json' \
+    -d '{"name":"atlas","description":"Coordinator","posture":"guarded"}' | jq -r .id)
+
+# 2. Sessions are keyed by agent UUID, not by name (§ 4.2). This step is
+#    HTTP-only — there is no `alms session create`.
+SESSION=$(curl -sX POST $BASE/sessions \
+    -H 'content-type: application/json' \
+    -d "{\"agent_id\":\"$AGENT\",\"context_id\":\"cli\"}" | jq -r .session_id)
+
+# 3. Start a run (§ 5.1). `input` is an object, not a bare string.
+RUN=$(curl -sX POST $BASE/runs \
+    -H 'content-type: application/json' \
+    -d "{\"session_id\":\"$SESSION\",\"input\":{\"type\":\"text\",\"text\":\"Summarise this repo\"}}" \
+    | jq -r .run_id)
+
+# 4. Stream the output (§ 5.3) — `POST /runs` returns as soon as the run is
+#    queued, so the result arrives here rather than in step 3's response.
+curl -N $BASE/runs/$RUN/events
+```
+
+A provider key has to be configured or the run in step 3 fails with a 401: `PUT /auth/keys` sets one on a **running** daemon and takes effect on the next run, while `alms auth set <provider>` writes `.alms/secrets.json` for a daemon that has **not started yet** — a key it writes to an already-running daemon is not picked up, because the store is loaded once at boot (`docs/config.md`).
+
+If the gateway was started with `ALMS_AUTH_TOKEN` set, every call above needs `-H "Authorization: Bearer $ALMS_AUTH_TOKEN"` (§ 13). The CLI covers steps 1 and 3 — `alms agent create atlas --posture guarded` and `alms run create --session <uuid> --input "..."` — plus `alms health` and `alms session list`. `alms agent create` writes straight to SQLite rather than calling the gateway, but the gateway resolves agents from the store on every call, so an agent created that way is visible to a gateway that is already running.
+
 ---
 
 ## 3) Health

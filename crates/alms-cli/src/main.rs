@@ -13,7 +13,7 @@ use cmd_auth::AuthCommands;
 use cmd_job::JobCommands;
 use cmd_run::RunCommands;
 use cmd_session::SessionCommands;
-use helpers::{api_client, open_db};
+use helpers::{GatewayProbe, api_client, open_db, probe_gateway};
 
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::{Shell, generate};
@@ -296,6 +296,27 @@ async fn main() -> anyhow::Result<()> {
         }
         Commands::Dashboard { url } => {
             let url = url.trim_end_matches('/').to_string();
+
+            // Pre-flight health probe. `open::that` succeeds whether or not
+            // anything is listening, so without this an operator whose gateway
+            // never started gets a browser connection-refused page and no hint
+            // about the cause — and `alms dashboard` is the README quick
+            // start's main path into ALMS.
+            match probe_gateway(&api_client()?, &url).await {
+                GatewayProbe::Healthy => {}
+                GatewayProbe::Unhealthy(status) => {
+                    // Something is listening, so the browser will render
+                    // *something*: say what looks wrong and get out of the way.
+                    eprintln!("Warning: {url}/health returned HTTP {status} — opening anyway.");
+                }
+                GatewayProbe::Unreachable(err) => {
+                    anyhow::bail!(
+                        "Cannot reach the ALMS gateway at {url}: {err}\n\
+                         Start it with `alms gateway`, then run `alms dashboard` again."
+                    );
+                }
+            }
+
             println!("Opening {url} ...");
             match open::that(&url) {
                 Ok(()) => {

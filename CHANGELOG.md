@@ -98,6 +98,12 @@ Each item below changes behaviour for a deployment that has not set the knob exp
 - A reverted shell `cd` is visible to the agent.
 - Tool re-registration no longer logs on the happy path, so `WARN` is worth reading again.
 
+### CLI
+
+- `alms dashboard` checks that the gateway answers `/health` before opening a browser.
+  When nothing is listening it now reports the reason and points at `alms gateway`, and
+  **exits non-zero**, instead of opening a browser onto a connection-refused page.
+
 ### Frontend
 
 - Normalized entity state for messages, jobs, and runs, with authoritative reconnect
