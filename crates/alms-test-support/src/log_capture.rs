@@ -126,6 +126,13 @@ pub struct CapturedEvent {
 impl CapturedEvent {
     /// The recorded value of `name`, or `None` when the event did not
     /// carry that field.
+    ///
+    /// The value is rendered the way the macro recorded it: a bare `&str`
+    /// and a `%value` are the bare text, but a `?value` is its `Debug`
+    /// form — so a `String` recorded with `?` comes back **quoted**, and
+    /// the assertion is `Some("\"foo\"")`, not `Some("foo")`. If that
+    /// surprises you at the assertion, the fix is usually `%` at the
+    /// callsite, not a different expected string here.
     pub fn field(&self, name: &str) -> Option<&str> {
         self.fields.get(name).map(String::as_str)
     }
