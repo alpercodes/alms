@@ -9,6 +9,7 @@ members = [
     "crates/alms-core",
     "crates/alms-coordinator",
     "crates/alms-tools",
+    "crates/alms-test-support",
 ]
 resolver = "2"
 

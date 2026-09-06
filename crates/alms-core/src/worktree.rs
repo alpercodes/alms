@@ -779,29 +779,9 @@ fn git_cmd(cwd: &Path) -> Command {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alms_test_support::init_git_repo;
     use std::process::Command;
     use tempfile::TempDir;
-
-    /// Initialize a fresh git repo at `dir` with one commit so
-    /// `git worktree add` has a HEAD to fork from.
-    fn init_git_repo(dir: &Path) {
-        let run = |args: &[&str]| {
-            let status = Command::new("git")
-                .current_dir(dir)
-                .env("GIT_TERMINAL_PROMPT", "0")
-                .args(args)
-                .status()
-                .expect("git command");
-            assert!(status.success(), "git {args:?} failed in {}", dir.display());
-        };
-
-        run(&["init", "--initial-branch=main"]);
-        run(&["config", "user.email", "test@example.com"]);
-        run(&["config", "user.name", "Test"]);
-        // An empty commit so HEAD exists — `git worktree add -b`
-        // refuses to fork from a repo with no commits.
-        run(&["commit", "--allow-empty", "-m", "init"]);
-    }
 
     #[test]
     fn worktree_path_under_alms_worktrees() {
@@ -1485,7 +1465,7 @@ mod tests {
     /// thread cached `Interest::never()` and this test's capture came
     /// back empty. That is #1221 (and the flakiness the old comment here
     /// noted as "#1033"); `test_log_capture` is immune to it.
-    use crate::test_log_capture::capture_logs;
+    use alms_test_support::capture_logs;
 
     /// #1025 regression guard: `remove_worktree` on a missing worktree
     /// directory still tries `git branch -D alms/<name>` as best-effort

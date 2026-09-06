@@ -1202,25 +1202,10 @@ mod tests {
     #[test]
     fn test_config_clear_override() {
         let store = new_store();
-        let now = chrono::Utc::now();
         let agent = AgentRecord {
-            id: AgentId::new(),
-            name: "clearable".to_string(),
-            description: String::new(),
             model: Some("old-model".to_string()),
             posture: Some("guarded".to_string()),
-            provider: None,
-            telegram_token: None,
-            thinking_budget_tokens: None,
-            reasoning_effort: None,
-            gemini_thinking_budget: None,
-            summary_provider: None,
-            summary_model: None,
-            worktree_mode: WorktreeMode::Off,
-            debug_mode: false,
-            is_default: false,
-            created_at: now,
-            last_active: now,
+            ..AgentRecord::for_test("clearable")
         };
         store.create_agent(&agent).unwrap();
 
@@ -1701,25 +1686,10 @@ mod tests {
         // both via the dedicated sentinels — same pattern as the HTTP
         // API's `clear_summary_provider` / `clear_summary_model`.
         let store = new_store();
-        let now = chrono::Utc::now();
         let agent = AgentRecord {
-            id: AgentId::new(),
-            name: "summary-clear".to_string(),
-            description: String::new(),
-            model: None,
-            posture: None,
-            provider: None,
-            telegram_token: None,
-            thinking_budget_tokens: None,
-            reasoning_effort: None,
-            gemini_thinking_budget: None,
             summary_provider: Some("openrouter".to_string()),
             summary_model: Some("minimax/minimax-m2.7".to_string()),
-            worktree_mode: WorktreeMode::Off,
-            debug_mode: false,
-            is_default: false,
-            created_at: now,
-            last_active: now,
+            ..AgentRecord::for_test("summary-clear")
         };
         store.create_agent(&agent).unwrap();
 
@@ -1856,25 +1826,10 @@ mod tests {
         // model would leave provider stranded — same shape the HTTP
         // PATCH layer rejects.
         let store = new_store();
-        let now = chrono::Utc::now();
         let agent = AgentRecord {
-            id: AgentId::new(),
-            name: "asymmetric-b".to_string(),
-            description: String::new(),
-            model: None,
-            posture: None,
-            provider: None,
-            telegram_token: None,
-            thinking_budget_tokens: None,
-            reasoning_effort: None,
-            gemini_thinking_budget: None,
             summary_provider: Some("openrouter".to_string()),
             summary_model: Some("minimax/minimax-m2.7".to_string()),
-            worktree_mode: WorktreeMode::Off,
-            debug_mode: false,
-            is_default: false,
-            created_at: now,
-            last_active: now,
+            ..AgentRecord::for_test("asymmetric-b")
         };
         store.create_agent(&agent).unwrap();
 

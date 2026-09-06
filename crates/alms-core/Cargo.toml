@@ -5,6 +5,11 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 
+[features]
+# Test fixtures for downstream crates' test targets (`AgentRecord::for_test`).
+# Enabled only as a dev-dependency feature; never in a production build.
+test-support = []
+
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
@@ -24,4 +29,4 @@ rand.workspace = true
 # Pulls tokio's `test-util` feature (paused-clock test helpers) — see #1158.
 tokio-test.workspace = true
 tempfile = "3"
-tracing-subscriber.workspace = true
+alms-test-support = { path = "../alms-test-support" }

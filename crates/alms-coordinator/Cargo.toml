@@ -24,6 +24,8 @@ async-trait.workspace = true
 
 [dev-dependencies]
 alms-sandbox = { path = "../alms-sandbox" }
+alms-core = { path = "../alms-core", features = ["test-support"] }
+alms-test-support = { path = "../alms-test-support" }
 # Pulls tokio's `test-util` feature (paused-clock test helpers) — see #1158.
 tokio-test.workspace = true
 tempfile = "3"

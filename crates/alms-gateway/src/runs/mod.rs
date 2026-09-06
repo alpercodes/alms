@@ -176,25 +176,10 @@ mod tests {
     }
 
     fn test_agent(model: Option<&str>, posture: Option<&str>) -> AgentRecord {
-        let now = Utc::now();
         AgentRecord {
-            id: AgentId::new(),
-            name: "test-agent".into(),
-            description: String::new(),
             model: model.map(String::from),
             posture: posture.map(String::from),
-            provider: None,
-            telegram_token: None,
-            thinking_budget_tokens: None,
-            reasoning_effort: None,
-            gemini_thinking_budget: None,
-            summary_provider: None,
-            summary_model: None,
-            worktree_mode: alms_core::WorktreeMode::Off,
-            debug_mode: false,
-            is_default: false,
-            created_at: now,
-            last_active: now,
+            ..AgentRecord::for_test("test-agent")
         }
     }
 

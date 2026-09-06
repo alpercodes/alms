@@ -1217,25 +1217,7 @@ mod tests {
     fn registry_tool(name: &str) -> (ReadSubagentSessionTool, Arc<SessionManager>, AgentId) {
         let store = alms_session::SqliteStore::open_in_memory().unwrap();
         let mgr = Arc::new(SessionManager::with_store(SessionConfig::default(), store).unwrap());
-        let record = alms_core::AgentRecord {
-            id: AgentId::new(),
-            name: name.to_string(),
-            description: String::new(),
-            model: None,
-            posture: None,
-            provider: None,
-            telegram_token: None,
-            thinking_budget_tokens: None,
-            reasoning_effort: None,
-            gemini_thinking_budget: None,
-            summary_provider: None,
-            summary_model: None,
-            worktree_mode: alms_core::WorktreeMode::Off,
-            debug_mode: false,
-            is_default: false,
-            created_at: alms_core::Timestamp::now().0,
-            last_active: alms_core::Timestamp::now().0,
-        };
+        let record = alms_core::AgentRecord::for_test(name);
         mgr.store().unwrap().create_agent(&record).unwrap();
         let tool = ReadSubagentSessionTool::new(mgr.clone(), AgentId::new());
         (tool, mgr, record.id)

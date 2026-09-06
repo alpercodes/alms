@@ -27,3 +27,5 @@ tracing.workspace = true
 # Pulls tokio's `test-util` feature (paused-clock test helpers) — see #1158.
 tokio-test.workspace = true
 tempfile = "3"
+# `AgentRecord::for_test` for the agents-table tests.
+alms-core = { path = "../alms-core", features = ["test-support"] }

@@ -999,6 +999,7 @@ mod tests {
     //!   enrichment reused from `list_sessions`.
     use super::*;
     use crate::server::AppState;
+    use crate::test_support::TestAppState;
     use alms_core::Run;
 
     async fn response_body(response: axum::response::Response) -> Vec<u8> {
@@ -1073,26 +1074,9 @@ mod tests {
         }
     }
 
-    /// Build a minimal `AppState` with in-memory session storage. Matches
-    /// `runs::integration_tests::test_app_state` but lives here so the
-    /// `routes` test module is self-contained.
+    /// Build a minimal `AppState` with in-memory session storage.
     fn test_app_state() -> AppState {
-        let gateway = crate::gateway::Gateway::new(crate::gateway::GatewayConfig::default())
-            .expect("gateway construction");
-        let scheduler = std::sync::Arc::new(alms_runtime::Scheduler::new());
-        let shutdown_token = tokio_util::sync::CancellationToken::new();
-        let (completion_tx, _completion_rx) = tokio::sync::mpsc::unbounded_channel();
-        let (trigger_tx, _trigger_rx) = tokio::sync::mpsc::channel(8);
-        let (dm_event_tx, _dm_event_rx) = tokio::sync::mpsc::channel(8);
-        AppState::new(
-            gateway,
-            scheduler,
-            shutdown_token,
-            completion_tx,
-            trigger_tx,
-            dm_event_tx,
-        )
-        .expect("AppState::new")
+        TestAppState::new().build()
     }
 
     /// Drive the handler through axum's `IntoResponse` and return

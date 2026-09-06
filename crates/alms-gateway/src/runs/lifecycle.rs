@@ -4167,7 +4167,7 @@ mod tests {
     /// in the PR rather than left to look like coverage.
     mod tool_registration_logging {
         use super::*;
-        use crate::test_log_capture::capture_logs;
+        use alms_test_support::capture_logs;
 
         /// The sandbox branch `execute_run` picks between. All three are
         /// exercised: they register different tools and the middle one

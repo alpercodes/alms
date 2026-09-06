@@ -37,10 +37,9 @@ pub mod server;
 pub mod session_queue;
 pub mod settings;
 pub mod sse;
-/// Shared, interest-cache-safe `tracing` capture harness for this
-/// crate's log-asserting unit tests — see the module docs and #1221.
+/// Test-only `AppState` builder shared by every test module in this crate.
 #[cfg(test)]
-pub(crate) mod test_log_capture;
+pub(crate) mod test_support;
 pub mod timeline;
 pub mod workspace;
 

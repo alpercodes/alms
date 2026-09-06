@@ -187,26 +187,7 @@ pub(crate) fn new_store() -> SqliteStore {
 
 #[cfg(test)]
 pub(crate) fn make_agent(store: &SqliteStore, name: &str) -> AgentRecord {
-    let now = chrono::Utc::now();
-    let agent = AgentRecord {
-        id: AgentId::new(),
-        name: name.to_string(),
-        description: String::new(),
-        model: None,
-        posture: None,
-        provider: None,
-        telegram_token: None,
-        thinking_budget_tokens: None,
-        reasoning_effort: None,
-        gemini_thinking_budget: None,
-        summary_provider: None,
-        summary_model: None,
-        worktree_mode: alms_core::WorktreeMode::Off,
-        debug_mode: false,
-        is_default: false,
-        created_at: now,
-        last_active: now,
-    };
+    let agent = AgentRecord::for_test(name);
     store.create_agent(&agent).unwrap();
     agent
 }

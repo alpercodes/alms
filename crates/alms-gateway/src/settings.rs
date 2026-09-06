@@ -2214,6 +2214,7 @@ pub fn load_persisted_settings(data_dir: &Path) -> Option<PersistedSettings> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::TestAppState;
 
     /// Simulate the pre-#869 settings.json format (full ContextConfig with
     /// `recent_window` / `summary_interval`). Verify backward compatibility:
@@ -2765,22 +2766,7 @@ mod tests {
     /// channels — same shape as `runs::integration_tests::test_app_state`,
     /// inlined here because that helper is private to its module.
     fn settings_test_app_state() -> crate::server::AppState {
-        let gateway_config = crate::gateway::GatewayConfig::default();
-        let gateway = crate::gateway::Gateway::new(gateway_config).unwrap();
-        let scheduler = std::sync::Arc::new(alms_runtime::Scheduler::new());
-        let shutdown_token = tokio_util::sync::CancellationToken::new();
-        let (completion_tx, _completion_rx) = tokio::sync::mpsc::unbounded_channel();
-        let (trigger_tx, _trigger_rx) = tokio::sync::mpsc::channel(8);
-        let (dm_event_tx, _dm_event_rx) = tokio::sync::mpsc::channel(8);
-        crate::server::AppState::new(
-            gateway,
-            scheduler,
-            shutdown_token,
-            completion_tx,
-            trigger_tx,
-            dm_event_tx,
-        )
-        .unwrap()
+        TestAppState::new().build()
     }
 
     #[tokio::test]
@@ -7123,25 +7109,7 @@ mod tests {
     /// in-memory default helper above. Mirrors
     /// `runs::integration_tests::test_app_state_with_sqlite`.
     fn settings_test_app_state_with_sqlite() -> crate::server::AppState {
-        let gateway_config = crate::gateway::GatewayConfig {
-            db_path: Some(":memory:".to_string()),
-            ..crate::gateway::GatewayConfig::default()
-        };
-        let gateway = crate::gateway::Gateway::new(gateway_config).unwrap();
-        let scheduler = std::sync::Arc::new(alms_runtime::Scheduler::new());
-        let shutdown_token = tokio_util::sync::CancellationToken::new();
-        let (completion_tx, _cr) = tokio::sync::mpsc::unbounded_channel();
-        let (trigger_tx, _tr) = tokio::sync::mpsc::channel(8);
-        let (dm_event_tx, _dr) = tokio::sync::mpsc::channel(8);
-        crate::server::AppState::new(
-            gateway,
-            scheduler,
-            shutdown_token,
-            completion_tx,
-            trigger_tx,
-            dm_event_tx,
-        )
-        .unwrap()
+        TestAppState::new().in_memory_sqlite().build()
     }
 
     /// Seed an `AgentRecord` with the given per-agent provider/model pair.
@@ -7154,26 +7122,10 @@ mod tests {
         model: Option<&str>,
     ) {
         use alms_core::registry::AgentRecord;
-        use chrono::Utc;
-        let now = Utc::now();
         let record = AgentRecord {
-            id: alms_core::AgentId::new(),
-            name: name.to_string(),
-            description: String::new(),
             model: model.map(|s| s.to_string()),
-            posture: None,
             provider: provider.map(|s| s.to_string()),
-            telegram_token: None,
-            thinking_budget_tokens: None,
-            reasoning_effort: None,
-            gemini_thinking_budget: None,
-            summary_provider: None,
-            summary_model: None,
-            worktree_mode: alms_core::WorktreeMode::Off,
-            debug_mode: false,
-            is_default: false,
-            created_at: now,
-            last_active: now,
+            ..AgentRecord::for_test(name)
         };
         state
             .session_manager

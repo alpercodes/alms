@@ -120,6 +120,7 @@ dependencies = [
  "alms-runtime",
  "alms-sandbox",
  "alms-session",
+ "alms-test-support",
  "alms-tools",
  "async-trait",
  "chrono",
@@ -140,6 +141,7 @@ name = "alms-core"
 version = "0.2.4"
 dependencies = [
  "aes-gcm",
+ "alms-test-support",
  "async-trait",
  "chrono",
  "hkdf",
@@ -153,7 +155,6 @@ dependencies = [
  "tokio-test",
  "toml 0.8.23",
  "tracing",
- "tracing-subscriber",
  "uuid",
 ]
 
@@ -166,6 +167,7 @@ dependencies = [
  "alms-core",
  "alms-runtime",
  "alms-session",
+ "alms-test-support",
  "alms-tools",
  "async-trait",
  "axum",
@@ -187,7 +189,6 @@ dependencies = [
  "tokio-util",
  "tower",
  "tracing",
- "tracing-subscriber",
  "uuid",
  "walkdir",
 ]
@@ -199,6 +200,7 @@ dependencies = [
  "alms-core",
  "alms-sandbox",
  "alms-session",
+ "alms-test-support",
  "async-trait",
  "chrono",
  "config",
@@ -259,6 +261,15 @@ dependencies = [
  "tokio-test",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "alms-test-support"
+version = "0.2.4"
+dependencies = [
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

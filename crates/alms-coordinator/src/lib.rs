@@ -2533,6 +2533,7 @@ impl Coordinator {
 mod tests {
     use super::*;
     use alms_runtime::llm_types::LlmConfig;
+    use alms_test_support::read_full_http_request;
 
     /// Build a Coordinator wired to the mock LLM and an in-memory SessionManager.
     fn test_coordinator() -> Coordinator {
@@ -5550,25 +5551,7 @@ mod tests {
     // -- (n) #1278 — a named subagent is filed under the invoked agent ----------
 
     fn register_agent(manager: &SessionManager, name: &str) -> AgentId {
-        let record = alms_core::AgentRecord {
-            id: AgentId::new(),
-            name: name.to_string(),
-            description: String::new(),
-            model: None,
-            posture: None,
-            provider: None,
-            telegram_token: None,
-            thinking_budget_tokens: None,
-            reasoning_effort: None,
-            gemini_thinking_budget: None,
-            summary_provider: None,
-            summary_model: None,
-            worktree_mode: alms_core::WorktreeMode::Off,
-            debug_mode: false,
-            is_default: false,
-            created_at: chrono::Utc::now(),
-            last_active: chrono::Utc::now(),
-        };
+        let record = alms_core::AgentRecord::for_test(name);
         manager.store().unwrap().create_agent(&record).unwrap();
         record.id
     }
@@ -6454,39 +6437,6 @@ mod tests {
 
     // -- #1150 regression: a blocking foreground `invoke_agent` that outruns the
     //    parent's P3 tool-phase ceiling must NOT stall-fail the parent --------
-
-    /// Read one full HTTP request (headers + Content-Length body) from a socket
-    /// so the scripted LLM server consumes the agent's request before
-    /// responding. Mirrors the helper in the runtime's agent-loop integration
-    /// tests.
-    async fn read_full_http_request(sock: &mut tokio::net::TcpStream) -> String {
-        use tokio::io::AsyncReadExt;
-        let mut buf: Vec<u8> = Vec::new();
-        let mut tmp = [0u8; 8192];
-        loop {
-            let n = match sock.read(&mut tmp).await {
-                Ok(0) | Err(_) => break,
-                Ok(n) => n,
-            };
-            buf.extend_from_slice(&tmp[..n]);
-            let text = String::from_utf8_lossy(&buf);
-            if let Some(header_end) = text.find("\r\n\r\n") {
-                let content_length = text[..header_end]
-                    .lines()
-                    .find_map(|l| {
-                        let (k, v) = l.split_once(':')?;
-                        k.eq_ignore_ascii_case("content-length")
-                            .then(|| v.trim().parse::<usize>().ok())
-                            .flatten()
-                    })
-                    .unwrap_or(0);
-                if buf.len() >= header_end + 4 + content_length {
-                    break;
-                }
-            }
-        }
-        String::from_utf8_lossy(&buf).into_owned()
-    }
 
     /// A `SubagentDispatcher` whose foreground `dispatch` blocks for a fixed
     /// duration — standing in for a long-but-productive subagent — then returns
