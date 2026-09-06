@@ -116,6 +116,12 @@ struct RunParams {
 /// section) and `job_*` sessions are always returned (collapsed Jobs group,
 /// #1197).  Both remain internal for notification-*targeting* purposes —
 /// a job-completion marker must never land on another job's session.
+///
+/// This is a *policy* over the types `alms_core::classify_session_type`
+/// defines, not a second classifier. The runtime keeps its own policy list
+/// for a different question (`AgentRuntime::is_user_facing_context`: which
+/// types get `user.md`); the two may differ and are kept separate on
+/// purpose. A new prefix needs a decision in each.
 const INTERNAL_SESSION_PREFIXES: &[&str] =
     &["job_", "subagent_", "dm:", "notifications:", "episodic:"];
 

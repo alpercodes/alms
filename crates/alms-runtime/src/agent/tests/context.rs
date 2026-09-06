@@ -327,9 +327,11 @@ async fn test_system_prompt_order_dm_tool_loop_layers() {
     );
 }
 
-/// An `episodic:` run gets the same system prompt a `dm:` / `subagent_` /
-/// `job_` / `notifications:` run gets — personality, goals and memories,
-/// **without** `## About the User`.
+/// An `episodic:` run gets the same system prompt every other non-user-facing
+/// run gets — personality, goals and memories, **without** `## About the
+/// User` — and the shown-view guard follows: a default (replacing)
+/// `workspace_write` on `user` in that run is refused as `never_shown`,
+/// where the user-facing control run on the same workspace is allowed.
 ///
 /// `episodic:` is reserved for the summariser's internal sessions and every
 /// other classifier already treats it as internal (`classify_session_type`,
@@ -337,12 +339,11 @@ async fn test_system_prompt_order_dm_tool_loop_layers() {
 /// runtime's `is_user_facing_context` was written three days before the
 /// prefix existed (#372) and is default-open, so an `episodic:` run fell
 /// through to injection. This goes through `build_context` rather than the
-/// classifier so it pins the prompt, not the boolean: the user-facing control
-/// run on the same workspace proves the omission is the gate and not a
-/// missing file.
+/// classifier so it pins the prompt and the guard, not the boolean: the
+/// control run proves the omission is the gate and not a missing file.
 #[tokio::test]
 async fn test_episodic_context_omits_user_md_from_the_system_prompt() {
-    use crate::workspace::{AgentWorkspace, WorkspaceFile};
+    use crate::workspace::{AgentWorkspace, CheckedWrite, RefusedWrite, WorkspaceFile};
     use tempfile::tempdir;
 
     let dir = tempdir().unwrap();
@@ -373,32 +374,52 @@ async fn test_episodic_context_omits_user_md_from_the_system_prompt() {
     .with_workspace(workspace);
     let session_manager = SessionManager::new(SessionConfig::default());
 
-    let system_prompt_for = |context_id: &'static str| {
-        let runtime = &runtime;
-        let session_manager = &session_manager;
-        async move {
-            let session = session_manager.get_or_create(runtime.agent_id, context_id);
-            let messages = runtime
-                .build_context(session_manager, &session.id, context_id, "hi")
-                .await
-                .unwrap();
-            messages[0].content.clone().unwrap_or_default()
-        }
-    };
+    // The control runs FIRST: if the workspace never recorded `user.md` at
+    // all, the episodic row's refusal would pass for the wrong reason.
+    for (context_id, user_facing, expected_write) in [
+        ("web-chat-1", true, CheckedWrite::Written),
+        (
+            "episodic:8f2c1a4e-0000-4000-8000-000000000000",
+            false,
+            CheckedWrite::Refused(RefusedWrite::NeverShown),
+        ),
+    ] {
+        // Each run starts from a fresh record (`build_context` forgets the
+        // previous run's views), so the guard's answer is this run's alone.
+        let session = session_manager.get_or_create(runtime.agent_id, context_id);
+        let messages = runtime
+            .build_context(&session_manager, &session.id, context_id, "hi")
+            .await
+            .unwrap();
+        let prompt = messages[0].content.clone().unwrap_or_default();
 
-    let episodic = system_prompt_for("episodic:8f2c1a4e-0000-4000-8000-000000000000").await;
-    let user_facing = system_prompt_for("web-chat-1").await;
+        assert!(
+            prompt.contains("I am Alice."),
+            "[{context_id}] the rest of the workspace is always injected. Got:\n{prompt}"
+        );
+        assert_eq!(
+            prompt.contains("## About the User") && prompt.contains("USER_MD_MARKER"),
+            user_facing,
+            "[{context_id}] user.md injected iff the context is user-facing. Got:\n{prompt}"
+        );
 
-    assert!(
-        user_facing.contains("## About the User") && user_facing.contains("USER_MD_MARKER"),
-        "control: a user-facing run on this workspace must get user.md. Got:\n{user_facing}"
-    );
-    assert!(
-        episodic.contains("I am Alice."),
-        "an episodic run still gets the rest of the workspace. Got:\n{episodic}"
-    );
-    assert!(
-        !episodic.contains("## About the User") && !episodic.contains("USER_MD_MARKER"),
-        "an episodic run must not get user.md. Got:\n{episodic}"
-    );
+        // The guard follows the prompt: a default-mode `workspace_write` on
+        // `user` replaces the file only in the run that was shown it.
+        let workspace = runtime.workspace.as_ref().expect("workspace attached");
+        assert_eq!(
+            workspace
+                .write_file_checked(WorkspaceFile::User, "Name: Someone Else")
+                .unwrap(),
+            expected_write,
+            "[{context_id}]"
+        );
+        // Restore for the next row (the control writes; the episodic row must
+        // not, which the file content confirms either way).
+        workspace
+            .write_file_as_operator(
+                WorkspaceFile::User,
+                "Name: Alper. Prefers concise answers. USER_MD_MARKER",
+            )
+            .unwrap();
+    }
 }

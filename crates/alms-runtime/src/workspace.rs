@@ -82,10 +82,10 @@ enum ShownGuard {
 pub enum RefusedWrite {
     /// Nothing has shown this file to the agent. The everyday instance is
     /// `user.md` in a non-user-facing run: `build_system_prompt_prefix`
-    /// omits it for `dm:` / `subagent_` / `job_` / `notifications:`
-    /// contexts, so an agent in one of those runs has never seen it — and
-    /// `user.md` defaults to `"write"`, so the *default* call there was a
-    /// silent whole-file erasure.
+    /// omits it for every context `AgentRuntime::is_user_facing_context`
+    /// rejects (the list lives there and only there), so an agent in one of
+    /// those runs has never seen it — and `user.md` defaults to `"write"`,
+    /// so the *default* call there was a silent whole-file erasure.
     NeverShown,
     /// The agent was shown a window, not the file. Reachable for
     /// `memories.md` past [`MEMORIES_INJECTION_CAP`], and for any file past
@@ -1111,8 +1111,9 @@ impl AgentWorkspace {
     /// Build system prompt prefix from workspace files.
     ///
     /// When `include_user` is false, `user.md` is omitted from the prefix.
-    /// This saves tokens and avoids confusion in non-user-facing contexts
-    /// (DM sessions, subagent runs, scheduled jobs).
+    /// This saves tokens and avoids confusion in non-user-facing contexts —
+    /// `AgentRuntime::is_user_facing_context` is the caller that decides,
+    /// and the one place the context list is written down.
     ///
     /// This is also the moment the agent is *shown* its workspace, so each
     /// read is recorded as the base for [`Self::write_file_checked`] (#1310).
@@ -2337,11 +2338,11 @@ mod tests {
 
     /// Nothing has shown the agent the file, so a replacement is refused.
     ///
-    /// Not a contrived state. It is every `dm:` / `subagent_` / `job_` /
-    /// `notifications:` run's relationship with `user.md`, which
-    /// `build_system_prompt_prefix` leaves out of the prompt — and `user.md`
-    /// defaults to `"write"`, so before this the *default* call in those runs
-    /// replaced a file the agent had no copy of.
+    /// Not a contrived state. It is every non-user-facing run's relationship
+    /// with `user.md` (the contexts `AgentRuntime::is_user_facing_context`
+    /// rejects), which `build_system_prompt_prefix` leaves out of the prompt
+    /// — and `user.md` defaults to `"write"`, so before this the *default*
+    /// call in those runs replaced a file the agent had no copy of.
     ///
     /// The file being untouched afterwards is half the assertion: a refusal
     /// that had already renamed the staging file into place would satisfy the
