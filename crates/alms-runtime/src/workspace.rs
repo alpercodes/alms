@@ -664,10 +664,10 @@ impl AgentWorkspace {
     ///    marker on the window saying so, which is the best a string can do;
     ///    this is the part that does not depend on the model reading it.
     /// 2. It was **never shown**. `build_system_prompt_prefix` omits
-    ///    `user.md` from `dm:` / `subagent_` / `job_` / `notifications:`
-    ///    runs, and `user.md` defaults to `"write"` — so in those runs the
-    ///    *default* `workspace_write` on `user` replaced a file the agent had
-    ///    no copy of.
+    ///    `user.md` from `dm:` / `subagent_` / `job_` / `notifications:` /
+    ///    `episodic:` runs, and `user.md` defaults to `"write"` — so in those
+    ///    runs the *default* `workspace_write` on `user` replaced a file the
+    ///    agent had no copy of.
     /// 3. It has **changed since**. Another live instance of the same named
     ///    agent (the coordinator's `active_named` guard permits several), an
     ///    operator editing from the UI, or this very run's own earlier

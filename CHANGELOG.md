@@ -97,6 +97,9 @@ Each item below changes behaviour for a deployment that has not set the knob exp
   now report what they omitted.
 - A reverted shell `cd` is visible to the agent.
 - Tool re-registration no longer logs on the happy path, so `WARN` is worth reading again.
+- `user.md` is no longer injected into runs on `episodic:` sessions. The prefix is reserved
+  for internal summariser sessions everywhere else (session listing, notifications, source
+  labels) but the runtime's user-profile gate predated it and defaulted to injecting.
 
 ### Frontend
 

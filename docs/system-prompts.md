@@ -123,7 +123,8 @@ appended after it:
    - `personality.md` (raw content)
    - `goals.md` (prefixed with `## Current Goals`)
    - `user.md` (prefixed with `## About the User`) — **conditional**: skipped for
-     non-user-facing sessions (DM, subagent, and job contexts) to save tokens
+     non-user-facing sessions (DM, subagent, job, notification, and episodic
+     contexts) to save tokens
    - `memories.md` (prefixed with `## Memories`, tail-windowed at 4000 bytes — past
      the cap the agent is shown the *most recent* 4000 bytes behind a leading
      truncation marker, not the oldest; see `agent-runtime-design.md` § "Size

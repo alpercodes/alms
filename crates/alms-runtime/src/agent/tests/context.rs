@@ -326,3 +326,79 @@ async fn test_system_prompt_order_dm_tool_loop_layers() {
         "Order layer 3->4 violated (tool_loop before dm_addendum). Got:\n{assembled}"
     );
 }
+
+/// An `episodic:` run gets the same system prompt a `dm:` / `subagent_` /
+/// `job_` / `notifications:` run gets — personality, goals and memories,
+/// **without** `## About the User`.
+///
+/// `episodic:` is reserved for the summariser's internal sessions and every
+/// other classifier already treats it as internal (`classify_session_type`,
+/// `derive_source_label`, the gateway's `INTERNAL_SESSION_PREFIXES`). The
+/// runtime's `is_user_facing_context` was written three days before the
+/// prefix existed (#372) and is default-open, so an `episodic:` run fell
+/// through to injection. This goes through `build_context` rather than the
+/// classifier so it pins the prompt, not the boolean: the user-facing control
+/// run on the same workspace proves the omission is the gate and not a
+/// missing file.
+#[tokio::test]
+async fn test_episodic_context_omits_user_md_from_the_system_prompt() {
+    use crate::workspace::{AgentWorkspace, WorkspaceFile};
+    use tempfile::tempdir;
+
+    let dir = tempdir().unwrap();
+    let workspace = AgentWorkspace::new(dir.path(), "alice");
+    workspace
+        .write_file_as_operator(WorkspaceFile::Personality, "I am Alice.")
+        .unwrap();
+    workspace
+        .write_file_as_operator(
+            WorkspaceFile::User,
+            "Name: Alper. Prefers concise answers. USER_MD_MARKER",
+        )
+        .unwrap();
+
+    let runtime = AgentRuntime::new(
+        AgentId::new(),
+        AgentConfig {
+            sandbox_root: "".into(),
+            ..AgentConfig::default()
+        },
+        LlmClient::new(LlmConfig {
+            mock: true,
+            ..LlmConfig::default()
+        })
+        .unwrap(),
+    )
+    .unwrap()
+    .with_workspace(workspace);
+    let session_manager = SessionManager::new(SessionConfig::default());
+
+    let system_prompt_for = |context_id: &'static str| {
+        let runtime = &runtime;
+        let session_manager = &session_manager;
+        async move {
+            let session = session_manager.get_or_create(runtime.agent_id, context_id);
+            let messages = runtime
+                .build_context(session_manager, &session.id, context_id, "hi")
+                .await
+                .unwrap();
+            messages[0].content.clone().unwrap_or_default()
+        }
+    };
+
+    let episodic = system_prompt_for("episodic:8f2c1a4e-0000-4000-8000-000000000000").await;
+    let user_facing = system_prompt_for("web-chat-1").await;
+
+    assert!(
+        user_facing.contains("## About the User") && user_facing.contains("USER_MD_MARKER"),
+        "control: a user-facing run on this workspace must get user.md. Got:\n{user_facing}"
+    );
+    assert!(
+        episodic.contains("I am Alice."),
+        "an episodic run still gets the rest of the workspace. Got:\n{episodic}"
+    );
+    assert!(
+        !episodic.contains("## About the User") && !episodic.contains("USER_MD_MARKER"),
+        "an episodic run must not get user.md. Got:\n{episodic}"
+    );
+}

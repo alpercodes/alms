@@ -49,17 +49,26 @@ impl AgentRuntime {
     /// Returns true if the given context_id represents a user-facing session
     /// (web chat, Telegram, etc.) where `user.md` should be included in the
     /// system prompt.  Non-user-facing contexts (DM, subagent, job,
-    /// notification) return false.
+    /// notification, episodic) return false.
+    ///
+    /// This answers exactly one question — *does this run get `user.md`?* —
+    /// and is deliberately not shared with the gateway's
+    /// `is_internal_context_id`, which answers a different one (*should this
+    /// session receive user-facing notifications?*). The two lists may
+    /// legitimately differ; keep them separate.
     ///
     /// NOTE: This function is **default-open** — unknown context_id prefixes
     /// are treated as user-facing.  When adding a new non-user-facing context
-    /// type, add its prefix to the exclusion list below.
+    /// type, add its prefix to the exclusion list below.  `episodic:` is the
+    /// cautionary tale: the prefix was reserved (#372) three days after this
+    /// list was written and fell through to injection until it was added.
     pub(crate) fn is_user_facing_context(context_id: &str) -> bool {
         // These prefixes indicate non-user-facing sessions.
         !(context_id.starts_with("dm:")
             || context_id.starts_with("subagent_")
             || context_id.starts_with("job_")
-            || context_id.starts_with("notifications:"))
+            || context_id.starts_with("notifications:")
+            || context_id.starts_with("episodic:"))
     }
 
     /// Build context window for LLM using ContextBuilder.
