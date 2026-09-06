@@ -336,7 +336,7 @@ async fn completed_run_is_not_cancellable() {
 /// reverting the production change and observing the assertion fire.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn failed_with_tool_calls_arm_flips_state_before_broadcasting() {
-    let (state, shutdown_token, _cr, _tr, _dr) = test_app_state_with_hanging_llm().await;
+    let ((state, shutdown_token, _cr, _tr, _dr), _llm) = test_app_state_with_hanging_llm().await;
     let agent_id = AgentId::new();
     let session = state
         .session_manager

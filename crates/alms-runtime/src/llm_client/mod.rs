@@ -5,9 +5,6 @@ mod diagnostic;
 mod request;
 mod sse_parsers;
 mod streaming;
-#[cfg(test)]
-mod test_responder;
-
 use crate::gemini_cache::{CacheLookup, GeminiCacheStore};
 use crate::llm_types::*;
 use alms_core::config::{AuthScheme, ProviderKind};
@@ -1139,11 +1136,8 @@ impl LlmClient {
 #[cfg(test)]
 mod tests {
     use super::sse_parsers::{parse_gemini_sse_block, parse_openai_sse};
-    use super::test_responder::{
-        spawn_sequential_responder, spawn_slow_body_responder, spawn_slow_headers_responder,
-        spawn_truncated_body_responder,
-    };
     use super::*;
+    use alms_test_support::{Canned, RawServer, ScriptedLlm, Wire};
     use std::sync::Mutex;
 
     /// Module-local env-var serialization mutex. `cargo test` runs unit
@@ -2615,16 +2609,16 @@ mod tests {
         //      Must NOT be parsed — must surface as the structured
         //      `AlmsError::SubagentLlmError { provider, status: 500, .. }`
         //      variant (#920) rather than a parse error.
-        let base_url = spawn_sequential_responder(vec![
-            (
+        let llm = ScriptedLlm::in_order(vec![
+            Canned::json(
                 404,
                 r#"{"error":{"code":404,"status":"NOT_FOUND","message":"CachedContent cachedContents/abc was not found"}}"#,
             ),
-            (500, r#"{"error":{"message":"internal"}}"#),
+            Canned::json(500, r#"{"error":{"message":"internal"}}"#),
         ])
         .await;
 
-        let client = gemini_client_with_base_url(base_url);
+        let client = gemini_client_with_base_url(format!("{}/v1beta", llm.base_url()));
 
         // Seed the gemini cache store with an Active handle so the
         // first request carries `cachedContent: "cachedContents/abc"`
@@ -2678,16 +2672,16 @@ mod tests {
     /// body flow into `stream_response` as if it were an SSE stream.
     #[tokio::test]
     async fn complete_stream_cache_retry_non_success_yields_typed_http_error() {
-        let base_url = spawn_sequential_responder(vec![
-            (
+        let llm = ScriptedLlm::in_order(vec![
+            Canned::json(
                 404,
                 r#"{"error":{"code":404,"status":"NOT_FOUND","message":"CachedContent cachedContents/abc was not found"}}"#,
             ),
-            (500, r#"{"error":{"message":"internal"}}"#),
+            Canned::json(500, r#"{"error":{"message":"internal"}}"#),
         ])
         .await;
 
-        let client = gemini_client_with_base_url(base_url);
+        let client = gemini_client_with_base_url(format!("{}/v1beta", llm.base_url()));
 
         let session = alms_core::SessionId::new();
         client.gemini_cache.install_active_for_test(
@@ -2783,9 +2777,9 @@ mod tests {
         // field" claim in the diagnostic. The original fixture
         // hardcoded `application/json` regardless of body, which made
         // this assertion mildly dishonest about real upstream behaviour.
-        let base_url =
-            spawn_sequential_responder(vec![(200, "text/html; charset=utf-8", html_body)]).await;
-        let client = openai_client_with_base_url(base_url);
+        let llm =
+            ScriptedLlm::always(Canned::new(200, "text/html; charset=utf-8", html_body)).await;
+        let client = openai_client_with_base_url(llm.base_url());
         let request =
             CompletionRequest::new("gpt-4o-mini").with_messages(vec![LlmMessage::user("hi")]);
 
@@ -2844,8 +2838,8 @@ mod tests {
         // missing every required field — schema drift / partial
         // response.
         let drift_body = r#"{"unexpected":"shape","no_content":true}"#;
-        let base_url = spawn_sequential_responder(vec![(200, drift_body)]).await;
-        let client = anthropic_client_with_base_url(base_url);
+        let llm = ScriptedLlm::always(Canned::json(200, drift_body)).await;
+        let client = anthropic_client_with_base_url(llm.base_url());
         let request =
             CompletionRequest::new("claude-sonnet-4-5").with_messages(vec![LlmMessage::user("hi")]);
 
@@ -2893,10 +2887,8 @@ mod tests {
         let mut huge_body = String::from(r#"{"truncated":"yes","filler":""#);
         huge_body.push_str(&"abc".repeat(4000)); // ~12 KB of filler
         // Don't close the JSON — let serde fail mid-parse on the cap.
-        // Static body lifetime for the responder helper:
-        let leaked: &'static str = Box::leak(huge_body.into_boxed_str());
-        let base_url = spawn_sequential_responder(vec![(200, leaked)]).await;
-        let client = openai_client_with_base_url(base_url);
+        let llm = ScriptedLlm::always(Canned::json(200, huge_body)).await;
+        let client = openai_client_with_base_url(llm.base_url());
         let request =
             CompletionRequest::new("gpt-4o-mini").with_messages(vec![LlmMessage::user("hi")]);
 
@@ -2944,12 +2936,13 @@ mod tests {
     /// (HTTP/2 RST_STREAM, mid-body connection reset, malformed chunked
     /// transfer), so plugging this gap is load-bearing.
     ///
-    /// Fixture: [`spawn_truncated_body_responder`] writes valid HTTP
-    /// headers advertising `Content-Length: N` strictly greater than
-    /// the body it actually sends, then drops the socket. reqwest sees
-    /// the premature EOF on the body stream and surfaces a
-    /// `BodyDecodeError` on the next `bytes_stream()` poll — exactly
-    /// what we want to drive through the `Ok(Some(Err(e)))` arm.
+    /// Fixture: a raw wire script that writes valid HTTP headers
+    /// advertising `Content-Length: N` strictly greater than the body it
+    /// actually sends, then drops the socket. reqwest sees the premature
+    /// EOF on the body stream and surfaces a `BodyDecodeError` on the
+    /// next `bytes_stream()` poll — exactly what we want to drive through
+    /// the `Ok(Some(Err(e)))` arm. (A real HTTP server will not lie about
+    /// its content length, which is why this is not on `wiremock`.)
     #[tokio::test]
     async fn complete_stream_mid_stream_decode_failure_carries_enriched_diagnostic() {
         use futures::StreamExt;
@@ -2962,17 +2955,19 @@ mod tests {
         // `Need more data` branch until the stream errors out.
         let partial_body =
             "data: {\"id\":\"chatcmpl-1\",\"choices\":[{\"delta\":{\"content\":\"hel";
-        let base_url = spawn_truncated_body_responder(
-            200,
-            "text/event-stream",
-            partial_body,
-            // Advertise far more bytes than we send — reqwest will fault
-            // on the close because the body stream ends short of the
-            // advertised length.
-            4096,
-        )
+        let llm = RawServer::serve(vec![vec![
+            Wire::Headers {
+                status: 200,
+                content_type: "text/event-stream",
+                // Advertise far more bytes than we send — reqwest will fault
+                // on the close because the body stream ends short of the
+                // advertised length.
+                content_length: Some(4096),
+            },
+            Wire::Body(partial_body.into()),
+        ]])
         .await;
-        let client = openai_client_with_base_url(base_url);
+        let client = openai_client_with_base_url(llm.base_url());
         let request =
             CompletionRequest::new("gpt-4o-mini").with_messages(vec![LlmMessage::user("hi")]);
 
@@ -3097,19 +3092,22 @@ mod tests {
         // Advertise far more bytes than we send, then stall for longer than
         // the per-read window (1s) but well under the total deadline (30s).
         let partial = r#"{"id":"chatcmpl-1","object":"chat.completion","#;
-        let base_url = spawn_slow_body_responder(
-            200,
-            "application/json",
-            partial,
-            8192, // claimed length the body never reaches
+        let llm = RawServer::serve(vec![vec![
+            Wire::Headers {
+                status: 200,
+                content_type: "application/json",
+                // A claimed length the body never reaches.
+                content_length: Some(8192),
+            },
+            Wire::Body(partial.into()),
             // Stall longer than the *total* deadline (30s) so the only thing
             // that can fault the read at ~1s is the per-read timeout. Without
             // it, the call would block until the 30s total deadline (caught
             // by the `< 15s` assertion below).
-            40,
-        )
+            Wire::Sleep(std::time::Duration::from_secs(40)),
+        ]])
         .await;
-        let client = openai_client_short_read_timeout(base_url);
+        let client = openai_client_short_read_timeout(llm.base_url());
         let request = CompletionRequest::new("minimax/minimax-m3")
             .with_messages(vec![LlmMessage::user("hi")]);
 
@@ -3165,8 +3163,17 @@ mod tests {
         let partial = "data: {\"id\":\"chatcmpl-1\",\"choices\":[{\"delta\":{\"content\":\"hel";
         // Stall longer than the total deadline (30s); the application-level
         // per-chunk SSE timeout (1s) in `stream_response` must catch it first.
-        let base_url = spawn_slow_body_responder(200, "text/event-stream", partial, 8192, 40).await;
-        let client = openai_client_short_read_timeout(base_url);
+        let llm = RawServer::serve(vec![vec![
+            Wire::Headers {
+                status: 200,
+                content_type: "text/event-stream",
+                content_length: Some(8192),
+            },
+            Wire::Body(partial.into()),
+            Wire::Sleep(std::time::Duration::from_secs(40)),
+        ]])
+        .await;
+        let client = openai_client_short_read_timeout(llm.base_url());
         let request = CompletionRequest::new("minimax/minimax-m3")
             .with_messages(vec![LlmMessage::user("hi")]);
 
@@ -3243,8 +3250,10 @@ mod tests {
         // healthy-but-slow-to-start response. The body-only guard must let it
         // through; the pre-rework client `.read_timeout()` would have clipped
         // it at ~1s.
-        let base_url = spawn_slow_headers_responder(200, "application/json", body, 3).await;
-        let client = openai_client_short_read_timeout(base_url);
+        let llm =
+            ScriptedLlm::always(Canned::json(200, body).after(std::time::Duration::from_secs(3)))
+                .await;
+        let client = openai_client_short_read_timeout(llm.base_url());
         let request = CompletionRequest::new("minimax/minimax-m3")
             .with_messages(vec![LlmMessage::user("hi")]);
 

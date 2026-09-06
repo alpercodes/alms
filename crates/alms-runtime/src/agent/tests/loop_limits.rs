@@ -8,7 +8,7 @@ use crate::llm_client::LlmClient;
 use crate::llm_types::*;
 use alms_core::AgentId;
 use alms_session::{SessionConfig, SessionManager};
-use alms_test_support::read_full_http_request;
+use alms_test_support::{Canned, RawServer, ScriptedLlm, Wire};
 
 // ──────────────────────────────────────────────────────────────────────
 // #1154 design default #3 — loop-level DM empty-reply nudge (Tim's S2
@@ -22,9 +22,6 @@ use alms_test_support::read_full_http_request;
 
 #[tokio::test]
 async fn dm_empty_reply_nudge_retries_once_then_delivers_second_turn_text() {
-    use tokio::io::AsyncWriteExt;
-    use tokio::net::TcpListener;
-
     const REPLY_TEXT: &str = "Hello alice, here is a real reply.";
 
     // Scripted two-turn LLM: turn 1 streams no content (empty delta +
@@ -48,35 +45,10 @@ async fn dm_empty_reply_nudge_retries_once_then_delivers_second_turn_text() {
         REPLY_TEXT
     );
 
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let base_url = format!("http://{}", listener.local_addr().unwrap());
-
-    // Capture the request bodies so the nudge-injection assertion can
-    // look at what the loop actually sent on the second turn.
-    let captured: std::sync::Arc<tokio::sync::Mutex<Vec<String>>> =
-        std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new()));
-    let captured_writer = captured.clone();
-    tokio::spawn(async move {
-        for body in [turn1_body.to_string(), turn2_body] {
-            let (mut sock, _) = match listener.accept().await {
-                Ok(s) => s,
-                Err(_) => return,
-            };
-            let req = read_full_http_request(&mut sock).await;
-            captured_writer.lock().await.push(req);
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\
-                 Content-Length: {}\r\nConnection: close\r\n\r\n{}",
-                body.len(),
-                body
-            );
-            let _ = sock.write_all(response.as_bytes()).await;
-            let _ = sock.shutdown().await;
-        }
-    });
+    let llm = ScriptedLlm::in_order(vec![Canned::sse(turn1_body), Canned::sse(turn2_body)]).await;
 
     let llm_config = LlmConfig {
-        base_url,
+        base_url: llm.base_url(),
         api_key: "test-key".to_string(),
         default_model: "test-model".to_string(),
         timeout_secs: 5,
@@ -149,7 +121,7 @@ async fn dm_empty_reply_nudge_retries_once_then_delivers_second_turn_text() {
     );
 
     // (b) The nudge message was injected into the second LLM request.
-    let requests = captured.lock().await;
+    let requests = llm.request_bodies().await;
     assert_eq!(requests.len(), 2, "the loop must have made two LLM calls");
     assert!(
         !requests[0].contains("ERROR: Your run produced no reply text"),
@@ -171,9 +143,6 @@ async fn dm_empty_reply_nudge_retries_once_then_delivers_second_turn_text() {
 /// conversation end so the peer is notified rather than stranded.
 #[tokio::test]
 async fn agent_loop_iteration_cap_terminates_with_error() {
-    use tokio::io::AsyncWriteExt;
-    use tokio::net::TcpListener;
-
     // A streaming SSE chunk that always requests one `echo` tool call and
     // never produces final text — so the loop can never terminate on its
     // own and must hit the iteration cap.
@@ -186,36 +155,13 @@ async fn agent_loop_iteration_cap_terminates_with_error() {
         "data: [DONE]\n\n"
     );
 
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let base_url = format!("http://{}", listener.local_addr().unwrap());
-
-    // Serve the tool-call response on every accepted connection until the
-    // test drops the listener. Count how many LLM calls the loop actually
-    // made so we can assert it stopped at the cap.
-    let call_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let call_count_writer = call_count.clone();
-    tokio::spawn(async move {
-        loop {
-            let (mut sock, _) = match listener.accept().await {
-                Ok(s) => s,
-                Err(_) => return,
-            };
-            let _ = read_full_http_request(&mut sock).await;
-            call_count_writer.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\
-                 Content-Length: {}\r\nConnection: close\r\n\r\n{}",
-                tool_call_body.len(),
-                tool_call_body
-            );
-            let _ = sock.write_all(response.as_bytes()).await;
-            let _ = sock.shutdown().await;
-        }
-    });
+    // Serve the tool-call response on every request; the call count is how
+    // we assert the loop stopped at the cap.
+    let llm = ScriptedLlm::always(Canned::sse(tool_call_body)).await;
 
     const MAX_ITERS: u32 = 3;
     let llm_config = LlmConfig {
-        base_url,
+        base_url: llm.base_url(),
         api_key: "test-key".to_string(),
         default_model: "test-model".to_string(),
         timeout_secs: 5,
@@ -276,7 +222,7 @@ async fn agent_loop_iteration_cap_terminates_with_error() {
     // Exactly `max_iterations` LLM calls were made — the cap fires before the
     // (would-be) 4th call.
     assert_eq!(
-        call_count.load(std::sync::atomic::Ordering::SeqCst),
+        llm.calls(),
         MAX_ITERS as usize,
         "the loop must make exactly max_iterations LLM calls before tripping the cap"
     );
@@ -299,10 +245,6 @@ async fn agent_loop_iteration_cap_terminates_with_error() {
 /// that content, having made exactly TWO upstream calls.
 #[tokio::test]
 async fn agent_loop_stalled_stream_falls_back_to_buffered_and_recovers() {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use tokio::io::AsyncWriteExt;
-    use tokio::net::TcpListener;
-
     // A valid SSE prefix with no event terminator: the parser stays in "need
     // more data", and because the server then holds the connection open the
     // per-chunk idle guard fires (-> "stream stalled", not "operation timed out").
@@ -311,46 +253,32 @@ async fn agent_loop_stalled_stream_falls_back_to_buffered_and_recovers() {
     // The buffered (non-streaming) retry's full response.
     let buffered_body = r#"{"id":"cmpl-1","object":"chat.completion","created":1,"model":"test-model","choices":[{"index":0,"message":{"role":"assistant","content":"recovered via buffered"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":2,"total_tokens":3}}"#;
 
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let base_url = format!("http://{}", listener.local_addr().unwrap());
-
-    let call_count = std::sync::Arc::new(AtomicUsize::new(0));
-    let call_count_writer = call_count.clone();
-    tokio::spawn(async move {
-        loop {
-            let (mut sock, _) = match listener.accept().await {
-                Ok(s) => s,
-                Err(_) => return,
-            };
-            let _ = read_full_http_request(&mut sock).await;
-            // `fetch_add` returns the prior value: 0 = streaming, 1 = buffered.
-            let n = call_count_writer.fetch_add(1, Ordering::SeqCst);
-            if n == 0 {
-                // Streaming attempt: headers + partial, then stall past the 1s
-                // per-chunk window so the idle guard faults it ("stream stalled").
-                let headers = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\
-                               Content-Length: 8192\r\nConnection: close\r\n\r\n";
-                let _ = sock.write_all(headers.as_bytes()).await;
-                let _ = sock.write_all(partial.as_bytes()).await;
-                let _ = sock.flush().await;
-                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-                drop(sock);
-            } else {
-                // Buffered `complete()`: one full, valid non-streaming JSON.
-                let response = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
-                     Content-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    buffered_body.len(),
-                    buffered_body
-                );
-                let _ = sock.write_all(response.as_bytes()).await;
-                let _ = sock.shutdown().await;
-            }
-        }
-    });
+    let llm = RawServer::serve(vec![
+        // Streaming attempt: headers + partial, then stall past the 1s
+        // per-chunk window so the idle guard faults it ("stream stalled").
+        vec![
+            Wire::Headers {
+                status: 200,
+                content_type: "text/event-stream",
+                content_length: Some(8192),
+            },
+            Wire::Body(partial.into()),
+            Wire::Sleep(std::time::Duration::from_secs(3)),
+        ],
+        // Buffered `complete()`: one full, valid non-streaming JSON.
+        vec![
+            Wire::Headers {
+                status: 200,
+                content_type: "application/json",
+                content_length: Some(buffered_body.len()),
+            },
+            Wire::Body(buffered_body.into()),
+        ],
+    ])
+    .await;
 
     let llm_config = LlmConfig {
-        base_url,
+        base_url: llm.base_url(),
         api_key: "test-key".to_string(),
         default_model: "test-model".to_string(),
         // Per-chunk window (1s) below the total deadline (30s): the streaming
@@ -405,7 +333,7 @@ async fn agent_loop_stalled_stream_falls_back_to_buffered_and_recovers() {
     // buffered retry that succeeded (proving the recovery the narrowing exists
     // for; pre-narrowing the stall short-circuited at one call).
     assert_eq!(
-        call_count.load(Ordering::SeqCst),
+        llm.calls(),
         2,
         "a stall must fall through to the buffered retry (stream + buffered = 2)"
     );
@@ -420,39 +348,24 @@ async fn agent_loop_stalled_stream_falls_back_to_buffered_and_recovers() {
 /// `.timeout()` is what faults the read.
 #[tokio::test]
 async fn agent_loop_total_timeout_stream_skips_futile_buffered_fallback() {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use tokio::io::AsyncWriteExt;
-    use tokio::net::TcpListener;
-
     let partial = "data: {\"id\":\"x\",\"object\":\"chat.completion.chunk\",\
                    \"choices\":[{\"delta\":{\"content\":\"hel";
 
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let base_url = format!("http://{}", listener.local_addr().unwrap());
-
-    let call_count = std::sync::Arc::new(AtomicUsize::new(0));
-    let call_count_writer = call_count.clone();
-    tokio::spawn(async move {
-        loop {
-            let (mut sock, _) = match listener.accept().await {
-                Ok(s) => s,
-                Err(_) => return,
-            };
-            let _ = read_full_http_request(&mut sock).await;
-            call_count_writer.fetch_add(1, Ordering::SeqCst);
-            // Headers + partial, then hold open past the total deadline.
-            let headers = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\
-                           Content-Length: 8192\r\nConnection: close\r\n\r\n";
-            let _ = sock.write_all(headers.as_bytes()).await;
-            let _ = sock.write_all(partial.as_bytes()).await;
-            let _ = sock.flush().await;
-            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-            drop(sock);
-        }
-    });
+    // Headers + partial, then hold open past the total deadline — on every
+    // connection, so a futile retry would be counted.
+    let llm = RawServer::serve(vec![vec![
+        Wire::Headers {
+            status: 200,
+            content_type: "text/event-stream",
+            content_length: Some(8192),
+        },
+        Wire::Body(partial.into()),
+        Wire::Sleep(std::time::Duration::from_secs(5)),
+    ]])
+    .await;
 
     let llm_config = LlmConfig {
-        base_url,
+        base_url: llm.base_url(),
         api_key: "test-key".to_string(),
         default_model: "test-model".to_string(),
         // Total deadline (2s) BELOW the per-chunk window (30s): the reqwest
@@ -516,7 +429,7 @@ async fn agent_loop_total_timeout_stream_skips_futile_buffered_fallback() {
     // Defining assertion: exactly ONE upstream call — the buffered fallback is
     // futile for a total timeout and must be skipped.
     assert_eq!(
-        call_count.load(Ordering::SeqCst),
+        llm.calls(),
         1,
         "a total-timeout streaming failure must NOT trigger the buffered fallback"
     );
@@ -533,9 +446,6 @@ async fn agent_loop_total_timeout_stream_skips_futile_buffered_fallback() {
 /// identifying the time limit.
 #[tokio::test]
 async fn agent_loop_duration_cap_terminates_with_error() {
-    use tokio::io::AsyncWriteExt;
-    use tokio::net::TcpListener;
-
     // Always requests one `echo` tool call, but sleeps ~1.2s before
     // responding so a 1-second duration budget is exceeded.
     let tool_call_body = concat!(
@@ -547,29 +457,13 @@ async fn agent_loop_duration_cap_terminates_with_error() {
         "data: [DONE]\n\n"
     );
 
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let base_url = format!("http://{}", listener.local_addr().unwrap());
-    tokio::spawn(async move {
-        loop {
-            let (mut sock, _) = match listener.accept().await {
-                Ok(s) => s,
-                Err(_) => return,
-            };
-            let _ = read_full_http_request(&mut sock).await;
-            tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\
-                 Content-Length: {}\r\nConnection: close\r\n\r\n{}",
-                tool_call_body.len(),
-                tool_call_body
-            );
-            let _ = sock.write_all(response.as_bytes()).await;
-            let _ = sock.shutdown().await;
-        }
-    });
+    let llm = ScriptedLlm::always(
+        Canned::sse(tool_call_body).after(std::time::Duration::from_millis(1200)),
+    )
+    .await;
 
     let llm_config = LlmConfig {
-        base_url,
+        base_url: llm.base_url(),
         api_key: "test-key".to_string(),
         default_model: "test-model".to_string(),
         timeout_secs: 5,
@@ -638,9 +532,6 @@ async fn agent_loop_duration_cap_terminates_with_error() {
 /// runs to the final text proves `0` disabled both caps.
 #[tokio::test]
 async fn agent_loop_zero_caps_disable_both_limits() {
-    use tokio::io::AsyncWriteExt;
-    use tokio::net::TcpListener;
-
     const REPLY_TEXT: &str = "Done after three tool turns.";
 
     // A streaming SSE chunk that requests one `echo` tool call (no final
@@ -666,38 +557,16 @@ async fn agent_loop_zero_caps_disable_both_limits() {
         REPLY_TEXT
     );
 
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let base_url = format!("http://{}", listener.local_addr().unwrap());
-
-    let call_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let call_count_writer = call_count.clone();
-    tokio::spawn(async move {
-        let bodies = [
-            tool_call_body.clone(),
-            tool_call_body.clone(),
-            tool_call_body,
-            final_body,
-        ];
-        for body in bodies {
-            let (mut sock, _) = match listener.accept().await {
-                Ok(s) => s,
-                Err(_) => return,
-            };
-            let _ = read_full_http_request(&mut sock).await;
-            call_count_writer.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\
-                 Content-Length: {}\r\nConnection: close\r\n\r\n{}",
-                body.len(),
-                body
-            );
-            let _ = sock.write_all(response.as_bytes()).await;
-            let _ = sock.shutdown().await;
-        }
-    });
+    let llm = ScriptedLlm::in_order(vec![
+        Canned::sse(tool_call_body.clone()),
+        Canned::sse(tool_call_body.clone()),
+        Canned::sse(tool_call_body),
+        Canned::sse(final_body),
+    ])
+    .await;
 
     let llm_config = LlmConfig {
-        base_url,
+        base_url: llm.base_url(),
         api_key: "test-key".to_string(),
         default_model: "test-model".to_string(),
         timeout_secs: 5,
@@ -742,7 +611,7 @@ async fn agent_loop_zero_caps_disable_both_limits() {
     let output = result.expect("zero caps must disable both limits; the loop must complete");
     assert_eq!(output.response, REPLY_TEXT);
     assert_eq!(
-        call_count.load(std::sync::atomic::Ordering::SeqCst),
+        llm.calls(),
         4,
         "the loop must make all four LLM calls — three tool turns plus the final text"
     );
@@ -805,37 +674,12 @@ const SLEEP_TOOL_SSE_BODY: &str = concat!(
 /// first; the run is terminated at the following checkpoint, not mid-tool.)
 #[tokio::test]
 async fn agent_loop_inactivity_tool_ceiling_terminates_with_error() {
-    use tokio::io::AsyncWriteExt;
-    use tokio::net::TcpListener;
-
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let base_url = format!("http://{}", listener.local_addr().unwrap());
-
-    // Serve the sleep-tool response on every accepted connection. Count the
-    // calls so we can assert the ceiling tripped right after the first batch.
-    let call_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let call_count_writer = call_count.clone();
-    tokio::spawn(async move {
-        loop {
-            let (mut sock, _) = match listener.accept().await {
-                Ok(s) => s,
-                Err(_) => return,
-            };
-            let _ = read_full_http_request(&mut sock).await;
-            call_count_writer.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\
-                 Content-Length: {}\r\nConnection: close\r\n\r\n{}",
-                SLEEP_TOOL_SSE_BODY.len(),
-                SLEEP_TOOL_SSE_BODY
-            );
-            let _ = sock.write_all(response.as_bytes()).await;
-            let _ = sock.shutdown().await;
-        }
-    });
+    // Serve the sleep-tool response on every request; the call count is how
+    // we assert the ceiling tripped right after the first batch.
+    let llm = ScriptedLlm::always(Canned::sse(SLEEP_TOOL_SSE_BODY)).await;
 
     let llm_config = LlmConfig {
-        base_url,
+        base_url: llm.base_url(),
         api_key: "test-key".to_string(),
         default_model: "test-model".to_string(),
         timeout_secs: 5,
@@ -898,7 +742,7 @@ async fn agent_loop_inactivity_tool_ceiling_terminates_with_error() {
     // The ceiling tripped at the FIRST checkpoint after the slow batch, so the
     // loop made exactly one LLM call — it never reached a second turn.
     assert_eq!(
-        call_count.load(std::sync::atomic::Ordering::SeqCst),
+        llm.calls(),
         1,
         "the loop must trip on the ceiling after exactly one tool round-trip"
     );
@@ -923,36 +767,11 @@ async fn agent_loop_inactivity_tool_ceiling_terminates_with_error() {
 /// progress-aware one so long-but-productive runs are not killed.
 #[tokio::test]
 async fn agent_loop_inactivity_productive_run_survives() {
-    use tokio::io::AsyncWriteExt;
-    use tokio::net::TcpListener;
-
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let base_url = format!("http://{}", listener.local_addr().unwrap());
-
-    let call_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let call_count_writer = call_count.clone();
-    tokio::spawn(async move {
-        loop {
-            let (mut sock, _) = match listener.accept().await {
-                Ok(s) => s,
-                Err(_) => return,
-            };
-            let _ = read_full_http_request(&mut sock).await;
-            call_count_writer.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\
-                 Content-Length: {}\r\nConnection: close\r\n\r\n{}",
-                SLEEP_TOOL_SSE_BODY.len(),
-                SLEEP_TOOL_SSE_BODY
-            );
-            let _ = sock.write_all(response.as_bytes()).await;
-            let _ = sock.shutdown().await;
-        }
-    });
+    let llm = ScriptedLlm::always(Canned::sse(SLEEP_TOOL_SSE_BODY)).await;
 
     const MAX_ITERS: u32 = 4;
     let llm_config = LlmConfig {
-        base_url,
+        base_url: llm.base_url(),
         api_key: "test-key".to_string(),
         default_model: "test-model".to_string(),
         timeout_secs: 5,
@@ -1017,7 +836,7 @@ async fn agent_loop_inactivity_productive_run_survives() {
         "the inactivity timer must NOT clip a productive run; got: {msg}"
     );
     assert_eq!(
-        call_count.load(std::sync::atomic::Ordering::SeqCst),
+        llm.calls(),
         MAX_ITERS as usize,
         "all four productive turns must run before the iteration cap trips"
     );

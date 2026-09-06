@@ -23,7 +23,14 @@
 
 pub mod git;
 pub mod http;
+pub mod llm_server;
 pub mod log_capture;
+pub mod raw_http;
+
+// The two fake upstreams: `wiremock` for complete responses, raw sockets
+// for wire pathologies. See each module's docs for which to reach for.
+pub use llm_server::{Canned, ScriptedLlm};
+pub use raw_http::{RawServer, Wire, WireScript};
 
 pub use git::init_git_repo;
 pub use http::read_full_http_request;

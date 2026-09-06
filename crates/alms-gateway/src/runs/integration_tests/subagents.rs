@@ -6,6 +6,7 @@ use super::{drain_events, subscribe_session, test_app_state, test_app_state_with
 use crate::test_support::{AppStateWithChannels, TestAppState};
 use alms_coordinator::{SubagentCompletion, TaskId, TaskStatus};
 use alms_core::{AgentId, RunId, SessionId, TokenUsage};
+use alms_test_support::RawServer;
 use alms_tools::SubagentDispatcher;
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -1021,38 +1022,32 @@ async fn cancelled_subagent_emits_terminal_sse_on_its_own_session() {
 /// the generous `stream_chunk_timeout_secs` fires, long after the test ends.
 /// That is exactly the live condition under which the "chip stuck on
 /// Starting…" bug was reproduced.
-async fn test_app_state_with_streaming_then_stalling_llm() -> AppStateWithChannels {
-    use tokio::io::AsyncWriteExt;
-    use tokio::net::TcpListener;
+async fn test_app_state_with_streaming_then_stalling_llm() -> (AppStateWithChannels, RawServer) {
+    use alms_test_support::Wire;
 
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let base_url = format!("http://{addr}");
-
-    tokio::spawn(async move {
-        while let Ok((mut sock, _)) = listener.accept().await {
-            tokio::spawn(async move {
-                // One OpenAI-compatible SSE chunk with visible content, then
-                // hold the socket (no finish_reason, no EOF): the client's
-                // stream stays "in flight" for the rest of the test.
-                let chunk = concat!(
-                    "data: {\"id\":\"stall\",\"object\":\"chat.completion.chunk\",",
-                    "\"created\":0,\"model\":\"m\",\"choices\":[{\"index\":0,",
-                    "\"delta\":{\"role\":\"assistant\",\"content\":\"partial answer \"},",
-                    "\"finish_reason\":null}]}\n\n"
-                );
-                let response =
-                    format!("HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\r\n{chunk}");
-                let _ = sock.write_all(response.as_bytes()).await;
-                let _ = sock.flush().await;
-                // Park until the client goes away.
-                std::future::pending::<()>().await;
-            });
-        }
-    });
+    // One OpenAI-compatible SSE chunk with visible content, then hold the
+    // socket (no finish_reason, no EOF): the client's stream stays "in
+    // flight" for the rest of the test. A mid-body stall is a wire
+    // pathology, which is why this is a raw script rather than wiremock.
+    let chunk = concat!(
+        "data: {\"id\":\"stall\",\"object\":\"chat.completion.chunk\",",
+        "\"created\":0,\"model\":\"m\",\"choices\":[{\"index\":0,",
+        "\"delta\":{\"role\":\"assistant\",\"content\":\"partial answer \"},",
+        "\"finish_reason\":null}]}\n\n"
+    );
+    let llm = RawServer::serve(vec![vec![
+        Wire::Headers {
+            status: 200,
+            content_type: "text/event-stream",
+            content_length: None,
+        },
+        Wire::Body(chunk.into()),
+        Wire::Hold,
+    ]])
+    .await;
 
     let llm_config = alms_runtime::LlmConfig {
-        base_url,
+        base_url: llm.base_url(),
         api_key: "fake-key-for-test".to_string(),
         // Generous timeouts: the run must still be mid-stream ("writing")
         // when the test reattaches — nothing here should fire during the
@@ -1061,9 +1056,12 @@ async fn test_app_state_with_streaming_then_stalling_llm() -> AppStateWithChanne
         stream_chunk_timeout_secs: 60,
         ..alms_runtime::LlmConfig::default()
     };
-    TestAppState::new()
-        .llm_config(llm_config)
-        .build_with_channels()
+    (
+        TestAppState::new()
+            .llm_config(llm_config)
+            .build_with_channels(),
+        llm,
+    )
 }
 
 /// REGRESSION (#1189 follow-up): a session-stream subscriber that attaches
@@ -1088,7 +1086,7 @@ async fn test_app_state_with_streaming_then_stalling_llm() -> AppStateWithChanne
 /// subscriber receives nothing and the final assertions fail.
 #[tokio::test]
 async fn reattached_session_stream_receives_subagent_activity_snapshot() {
-    let (state, shutdown_token, _cr, _tr, _dr) =
+    let ((state, shutdown_token, _cr, _tr, _dr), _llm) =
         test_app_state_with_streaming_then_stalling_llm().await;
 
     let parent_agent_id = AgentId::new();

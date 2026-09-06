@@ -16,3 +16,7 @@ description = "Dev-only fixtures shared by the workspace's test targets"
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+wiremock = "0.6"
+
+[dev-dependencies]
+reqwest.workspace = true

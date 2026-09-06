@@ -36,7 +36,7 @@
 use crate::gateway::GatewayConfig;
 use crate::server::AppState;
 use alms_core::{AgentId, Run};
-use alms_test_support::read_full_http_request;
+use alms_test_support::{Canned, ScriptedLlm};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
@@ -111,47 +111,25 @@ struct Observed {
 /// a background subagent's turn runs concurrently with the parent's follow-up
 /// turn.
 async fn observe_parent_session_stream(background: bool) -> Vec<Observed> {
-    use tokio::io::AsyncWriteExt;
-    use tokio::net::TcpListener;
-
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let base_url = format!("http://{}", listener.local_addr().unwrap());
     let tool_call_turn = invoke_agent_turn(background);
-    tokio::spawn(async move {
-        loop {
-            let (mut sock, _) = match listener.accept().await {
-                Ok(s) => s,
-                Err(_) => return,
-            };
-            let tool_call_turn = tool_call_turn.clone();
-            tokio::spawn(async move {
-                let req = read_full_http_request(&mut sock).await;
-                let body = if req.contains(PARENT_TOOL_CALL_ID) {
-                    // The parent's follow-up turn: it carries the tool result
-                    // for the invoke_agent call. Stall so the parent still has
-                    // work left long after the subagent is done.
-                    tokio::time::sleep(Duration::from_millis(PARENT_TAIL_MS)).await;
-                    text_turn("parent finished")
-                } else if req.contains(PARENT_INPUT) {
-                    tool_call_turn
-                } else {
-                    // The subagent's own turn — finishes immediately.
-                    text_turn("subagent finished")
-                };
-                let response = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\
-                     Content-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    body.len(),
-                    body
-                );
-                let _ = sock.write_all(response.as_bytes()).await;
-                let _ = sock.shutdown().await;
-            });
+    let llm = ScriptedLlm::routed(move |req| {
+        let body = String::from_utf8_lossy(&req.body);
+        if body.contains(PARENT_TOOL_CALL_ID) {
+            // The parent's follow-up turn: it carries the tool result for
+            // the invoke_agent call. Stall so the parent still has work
+            // left long after the subagent is done.
+            Canned::sse(text_turn("parent finished")).after(Duration::from_millis(PARENT_TAIL_MS))
+        } else if body.contains(PARENT_INPUT) {
+            Canned::sse(tool_call_turn.clone())
+        } else {
+            // The subagent's own turn — finishes immediately.
+            Canned::sse(text_turn("subagent finished"))
         }
-    });
+    })
+    .await;
 
     let llm_config = alms_runtime::LlmConfig {
-        base_url,
+        base_url: llm.base_url(),
         api_key: "test-key".to_string(),
         default_model: "test-model".to_string(),
         timeout_secs: 30,

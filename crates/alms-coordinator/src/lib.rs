@@ -2533,7 +2533,7 @@ impl Coordinator {
 mod tests {
     use super::*;
     use alms_runtime::llm_types::LlmConfig;
-    use alms_test_support::read_full_http_request;
+    use alms_test_support::{Canned, ScriptedLlm};
 
     /// Build a Coordinator wired to the mock LLM and an in-memory SessionManager.
     fn test_coordinator() -> Coordinator {
@@ -6490,9 +6490,6 @@ mod tests {
     /// background-dispatch tests do not exercise this interaction.
     #[tokio::test]
     async fn foreground_invoke_agent_past_p3_does_not_stall_parent() {
-        use tokio::io::AsyncWriteExt;
-        use tokio::net::TcpListener;
-
         // Turn 1: request a single FOREGROUND `invoke_agent` (no `background`
         // flag) and no final text, so the loop must run the subagent then
         // iterate. Turn 2: a plain text reply that ends the run.
@@ -6512,34 +6509,13 @@ mod tests {
             "data: [DONE]\n\n"
         );
 
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let base_url = format!("http://{}", listener.local_addr().unwrap());
-
-        // Serve exactly the two scripted turns, counting calls so we can assert
-        // the parent made both (the subagent turn AND the final-text turn).
-        let call_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let call_count_writer = call_count.clone();
-        tokio::spawn(async move {
-            for body in [turn1_body, turn2_body] {
-                let (mut sock, _) = match listener.accept().await {
-                    Ok(s) => s,
-                    Err(_) => return,
-                };
-                let _ = read_full_http_request(&mut sock).await;
-                call_count_writer.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                let response = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\
-                     Content-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    body.len(),
-                    body
-                );
-                let _ = sock.write_all(response.as_bytes()).await;
-                let _ = sock.shutdown().await;
-            }
-        });
+        // Serve the two scripted turns; the call count is how we assert the
+        // parent made both (the subagent turn AND the final-text turn).
+        let llm =
+            ScriptedLlm::in_order(vec![Canned::sse(turn1_body), Canned::sse(turn2_body)]).await;
 
         let llm_config = LlmConfig {
-            base_url,
+            base_url: llm.base_url(),
             api_key: "test-key".to_string(),
             default_model: "test-model".to_string(),
             timeout_secs: 5,
@@ -6610,7 +6586,7 @@ mod tests {
             "the foreground subagent must have actually run (and blocked) once"
         );
         assert_eq!(
-            call_count.load(std::sync::atomic::Ordering::SeqCst),
+            llm.calls(),
             2,
             "the parent must make two LLM calls: the invoke_agent turn and the final-text turn"
         );

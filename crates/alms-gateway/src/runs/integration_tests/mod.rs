@@ -20,6 +20,8 @@ use crate::server::AppState;
 use crate::sse::SseEventData;
 use crate::test_support::{AppStateWithChannels, TestAppState};
 use alms_core::{AgentId, SessionId};
+use alms_test_support::{Canned, ScriptedLlm};
+use std::time::Duration;
 
 mod activity_feed;
 mod cancellation;
@@ -112,39 +114,27 @@ fn test_app_state_with_failing_llm() -> AppStateWithChannels {
 /// (early in `execute_run`) and the producer's terminal-arm
 /// `mark_run_as_failed`.
 ///
-/// Returns `(state, shutdown_token, completion_rx, trigger_rx,
-/// dm_event_rx, listener_join)`. The listener task runs until the test
-/// drops `state`.
-async fn test_app_state_with_hanging_llm() -> AppStateWithChannels {
-    use tokio::net::TcpListener;
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let base_url = format!("http://{addr}");
-    // Spawn an accept loop that holds connections without responding.
-    // The test runtime will drop the listener when the AppState drops.
-    tokio::spawn(async move {
-        while let Ok((sock, _)) = listener.accept().await {
-            // Hold the connection forever (or until the client
-            // times out). Spawn a task to keep the socket alive.
-            tokio::spawn(async move {
-                let _sock = sock;
-                // Park indefinitely.
-                std::future::pending::<()>().await;
-            });
-        }
-    });
+/// Returns the state tuple and the scripted upstream, which the caller
+/// must keep alive for as long as the state can make LLM calls.
+async fn test_app_state_with_hanging_llm() -> (AppStateWithChannels, ScriptedLlm) {
+    // Accept every request and answer it an hour from now — i.e. never,
+    // as far as the 1-second client timeout is concerned.
+    let llm = ScriptedLlm::always(Canned::json(200, "{}").after(Duration::from_secs(3600))).await;
 
     let llm_config = alms_runtime::LlmConfig {
-        base_url,
+        base_url: llm.base_url(),
         api_key: "fake-key-for-test".to_string(),
         timeout_secs: 1,
         stream_chunk_timeout_secs: 1,
         ..alms_runtime::LlmConfig::default()
     };
 
-    TestAppState::new()
-        .llm_config(llm_config)
-        .build_with_channels()
+    (
+        TestAppState::new()
+            .llm_config(llm_config)
+            .build_with_channels(),
+        llm,
+    )
 }
 
 /// Seed two agents (`alice` and `bob`) into the SQLite-backed agent registry
