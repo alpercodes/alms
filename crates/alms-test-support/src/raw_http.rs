@@ -49,6 +49,11 @@ pub type WireScript = Vec<Wire>;
 /// A running raw server. Point an `LlmClient` at
 /// [`base_url`](Self::base_url). The accept loop stops when this is
 /// dropped; connections already being served run their script out.
+///
+/// So it must outlive every connection the test opens. Binding it to a
+/// bare `_` drops it on that line and the client meets connection-refused
+/// instead of the script — and a test about a stall or a truncated body,
+/// which expects an error, can pass on that wrong one. Bind `_llm`.
 pub struct RawServer {
     base_url: String,
     calls: Arc<AtomicUsize>,

@@ -115,7 +115,10 @@ fn test_app_state_with_failing_llm() -> AppStateWithChannels {
 /// `mark_run_as_failed`.
 ///
 /// Returns the state tuple and the scripted upstream, which the caller
-/// must keep alive for as long as the state can make LLM calls.
+/// must keep alive for as long as the state can make LLM calls — bind it
+/// `_llm`, not `_`. A bare `_` drops the server on that line, the run
+/// then fails on connection-refused within the same 1s window, and this
+/// "hanging LLM" test passes without any LLM ever having hung.
 async fn test_app_state_with_hanging_llm() -> (AppStateWithChannels, ScriptedLlm) {
     // Accept every request and answer it an hour from now — i.e. never,
     // as far as the 1-second client timeout is concerned.

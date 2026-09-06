@@ -14,7 +14,10 @@
 //! response open. Those cases are [`crate::raw_http::RawServer`].
 //!
 //! Keep the returned [`ScriptedLlm`] alive for the test — dropping it
-//! shuts the server down.
+//! shuts the server down. Binding it to a bare `_` drops it on that line,
+//! so the client meets connection-refused instead of the script; a test
+//! about a hang or a slow upstream then fails the run for the wrong reason
+//! and may still pass. Bind `_llm`, not `_`.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -103,6 +106,13 @@ impl Respond for Routed {
 
 /// A running scripted upstream. Point an `LlmClient` at
 /// [`base_url`](Self::base_url).
+///
+/// Dropping it shuts the server down, so it must outlive every request
+/// the test makes. A fixture that builds one and returns only the state it
+/// configured has already killed it; a caller that binds it to a bare `_`
+/// has too. Either way the client sees connection-refused, and a test that
+/// expects the run to fail (a hang, a timeout) can pass on the wrong
+/// failure. Bind `_llm`.
 pub struct ScriptedLlm {
     server: MockServer,
     calls: Arc<AtomicUsize>,

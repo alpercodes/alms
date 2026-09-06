@@ -1022,6 +1022,11 @@ async fn cancelled_subagent_emits_terminal_sse_on_its_own_session() {
 /// the generous `stream_chunk_timeout_secs` fires, long after the test ends.
 /// That is exactly the live condition under which the "chip stuck on
 /// Starting…" bug was reproduced.
+///
+/// The returned server must be bound `_llm`, not `_`: a bare `_` drops it
+/// on that line, the subagent's call meets connection-refused instead of a
+/// stalled stream, and the "writing" signal this test exists to observe is
+/// never emitted.
 async fn test_app_state_with_streaming_then_stalling_llm() -> (AppStateWithChannels, RawServer) {
     use alms_test_support::Wire;
 
