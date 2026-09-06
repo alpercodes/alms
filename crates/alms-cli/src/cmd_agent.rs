@@ -416,13 +416,12 @@ pub(crate) fn agent_create(store: &SqliteStore, opts: AgentCreateOpts<'_>) -> an
         // Per-agent summary overrides (#872, #876). The empty /
         // whitespace-only rejection and the pair-only invariant are
         // both enforced above, so at this point both fields are either
-        // `Some(non_empty)` together or both `None`. Values reach the
-        // registry without further trimming — the HTTP layers (POST
-        // back-compat normalize, PUT trim-on-apply) do their own
-        // trimming, and a CLI operator who explicitly typed a value
-        // with surrounding whitespace probably means it.
-        summary_provider,
-        summary_model,
+        // `Some(non_empty)` together or both `None`. Trimmed on the way
+        // to the registry, like `agent config`, `POST` and `PUT /agents`
+        // — a provider key or model slug with surrounding whitespace
+        // never resolves, so it is never what the operator meant.
+        summary_provider: summary_provider.map(|s| s.trim().to_string()),
+        summary_model: summary_model.map(|s| s.trim().to_string()),
         worktree_mode,
         // Debug mode (#1003) is operator-flippable via PATCH /agents/{id}
         // (or the per-agent edit modal in the web UI) — `alms agent
@@ -1568,6 +1567,38 @@ mod tests {
         )
         .unwrap();
         let agent = resolve_agent(&store, "summary-set").unwrap();
+        assert_eq!(agent.summary_provider.as_deref(), Some("openrouter"));
+        assert_eq!(agent.summary_model.as_deref(), Some("minimax/minimax-m2.7"));
+    }
+
+    /// `agent create` trims the pair on the way to the registry, as
+    /// `agent config` always has and as both HTTP paths do — the CLI's two
+    /// write paths used to disagree on this.
+    #[test]
+    fn test_create_trims_summary_fields() {
+        let store = new_store();
+        agent_create(
+            &store,
+            AgentCreateOpts {
+                name: "summary-trimmed".into(),
+                description: None,
+                model: None,
+                posture: None,
+                provider: None,
+                thinking_budget_tokens: None,
+                reasoning_effort: None,
+                gemini_thinking_budget: None,
+                summary_provider: Some("  openrouter ".into()),
+                summary_model: Some(" minimax/minimax-m2.7\t".into()),
+                worktree_mode: WorktreeMode::Off,
+                project_root: None,
+                default: false,
+                json: false,
+                workspace_dir: None,
+            },
+        )
+        .unwrap();
+        let agent = resolve_agent(&store, "summary-trimmed").unwrap();
         assert_eq!(agent.summary_provider.as_deref(), Some("openrouter"));
         assert_eq!(agent.summary_model.as_deref(), Some("minimax/minimax-m2.7"));
     }

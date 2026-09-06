@@ -24,9 +24,17 @@ use tracing::{debug, info, warn};
 /// A `root` that does not exist is not an error — there is nothing to
 /// sweep — and returns `Ok(0)`.
 ///
-/// Errors on individual entries are logged at `warn` and skipped; the sweep
-/// never aborts partway through because of one bad entry. Only a failure to
-/// read `root` itself is returned.
+/// The sweep never aborts partway through because of one bad entry; only a
+/// failure to read `root` itself is returned. What happens to a bad entry
+/// depends on what failed, and one of the answers is deletion:
+///
+/// - a directory or file entry that cannot be *listed* is logged at `warn`
+///   and skipped;
+/// - a file whose `mtime` cannot be *read* is treated as infinitely old
+///   and **deleted**, traced only by the `debug!` on unlink — the
+///   `metadata()` / `modified()` failure falls back to `UNIX_EPOCH`;
+/// - a file that cannot be *unlinked* is logged at `warn` and kept, and
+///   keeps its per-run directory from being removed.
 ///
 /// Returns the number of files deleted, for the caller's startup log line.
 pub fn sweep_expired_under(root: &Path, retention_days: u32) -> io::Result<u64> {

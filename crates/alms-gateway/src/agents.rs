@@ -208,19 +208,12 @@ pub async fn create_agent(
 
     // Per-agent summary overrides (#872) — pair-only validation. Treat
     // the empty string the same as a missing field for back-compat with
-    // CLIs / scripts that habitually pass `""` to mean "unset".
-    let summary_provider_norm = req
-        .summary_provider
-        .as_ref()
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-        .map(str::to_string);
-    let summary_model_norm = req
-        .summary_model
-        .as_ref()
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-        .map(str::to_string);
+    // CLIs / scripts that habitually pass `""` to mean "unset" — the same
+    // empty-means-unset policy `PATCH /settings` and `alms.toml` apply.
+    let summary_provider_norm =
+        alms_core::config::normalize_summary_field(req.summary_provider.as_deref());
+    let summary_model_norm =
+        alms_core::config::normalize_summary_field(req.summary_model.as_deref());
     validate_summary_pair(
         &state,
         summary_provider_norm.as_deref(),

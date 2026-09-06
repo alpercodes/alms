@@ -21,7 +21,7 @@ mod tests;
 pub use budget::{
     TokenBudgetError, ValidationMode, provider_context_window, validate_token_budget,
 };
-pub use summary_pair::{SummaryPairError, check_summary_pair};
+pub use summary_pair::{SummaryPairError, check_summary_pair, normalize_summary_field};
 pub use types::{
     AnthropicConfig, AuthScheme, ChannelsConfig, ContextConfig, DEFAULT_AGENT_MAX_TOKENS,
     FsEditConfig, GeminiConfig, LlmConfig, LoggingConfig, OpenAiConfig, ProviderEntry,

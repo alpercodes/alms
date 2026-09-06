@@ -2176,6 +2176,25 @@ summary_model = "minimax/minimax-m2.7"
     );
 }
 
+/// The TOML surface applies the same empty-means-unset normalisation as
+/// `PATCH /settings` (`normalize_summary_field`): a non-empty value is
+/// trimmed, so `" openrouter "` is the `openrouter` provider entry and not
+/// a key that can never resolve.
+#[test]
+fn test_context_toml_summary_pair_is_trimmed() {
+    let toml_str = r#"
+[context]
+summary_provider = " openrouter "
+summary_model = "	google/gemma-4-31b-it "
+"#;
+    let cfg: AlmsConfig = toml::from_str(toml_str).expect("TOML parses");
+    assert_eq!(cfg.context.summary_provider.as_deref(), Some("openrouter"));
+    assert_eq!(
+        cfg.context.summary_model.as_deref(),
+        Some("google/gemma-4-31b-it")
+    );
+}
+
 /// #1191: empty strings are the explicit-clear sentinel (mirroring PATCH
 /// /settings). Setting both to `""` opts back into inheriting the
 /// agent's resolved (provider, model) for summaries — both land as None

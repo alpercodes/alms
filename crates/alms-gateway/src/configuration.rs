@@ -31,13 +31,6 @@ pub(crate) struct ValidatedSummaryPair {
     pub(crate) model: Option<String>,
 }
 
-fn normalized(value: Option<&str>) -> Option<String> {
-    value
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_owned)
-}
-
 /// Validate and normalize the dedicated summary provider/model pair.
 ///
 /// The two values are one policy unit: both inherit from the primary LLM
@@ -48,8 +41,8 @@ pub(crate) fn validate_summary_pair(
     providers: &BTreeMap<String, ProviderEntry>,
     secrets: &SecretsStore,
 ) -> Result<ValidatedSummaryPair, ConfigPolicyError> {
-    let provider = normalized(provider);
-    let model = normalized(model);
+    let provider = alms_core::config::normalize_summary_field(provider);
+    let model = alms_core::config::normalize_summary_field(model);
     alms_core::config::check_summary_pair(provider.as_deref(), model.as_deref()).map_err(|e| {
         ConfigPolicyError {
             code: e.code(),

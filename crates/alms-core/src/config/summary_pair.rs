@@ -13,9 +13,16 @@
 //! load, `PATCH /settings`, `POST` / `PUT /agents`, and `alms agent create`
 //! / `config` — applies this one rule and then adds only what it alone can
 //! check (the gateway verifies the provider exists and has a key; the CLI
-//! cannot, and leaves that to the daemon). Normalisation is the caller's:
-//! pass `None` for "unset", after whatever trimming or empty-string policy
-//! the surface applies.
+//! cannot, and leaves that to the daemon).
+//!
+//! Two normalisation policies sit in front of the rule, and they are kept
+//! distinct on purpose. The surfaces where an empty value means *unset* —
+//! `alms.toml` (the `""` clear sentinel), `PATCH /settings` and `POST
+//! /agents` — share [`normalize_summary_field`], so a trimmed non-empty
+//! value and `None` for empty are one behaviour, not three copies of it.
+//! The surfaces with an explicit clear operation — `PUT /agents`'s
+//! `clear_*` sentinels and the CLI's `--clear-*` flags — reject an empty
+//! value instead, because there it can only be a mistake.
 
 /// Why a summary pair was rejected.
 ///
@@ -46,11 +53,25 @@ impl SummaryPairError {
     }
 }
 
+/// Trim one half of the pair and map an empty or whitespace-only value to
+/// `None` (unset).
+///
+/// This is the empty-means-unset policy, shared by every surface that has
+/// no explicit clear operation so that `PATCH /settings`, `POST /agents`
+/// and `alms.toml` cannot drift into accepting different inputs for the
+/// same field.
+pub fn normalize_summary_field(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+}
+
 /// Apply the pair rule: both set or both unset.
 ///
-/// `None` means unset. Callers normalise first — the gateway trims and maps
-/// empty to `None`, the TOML deserializer does the same for the `""` clear
-/// sentinel, and the CLI rejects empty values outright before it gets here.
+/// `None` means unset. Callers normalise first — with
+/// [`normalize_summary_field`] where empty means unset, or by rejecting
+/// empty values outright where a clear operation exists.
 pub fn check_summary_pair(
     provider: Option<&str>,
     model: Option<&str>,
@@ -65,6 +86,17 @@ pub fn check_summary_pair(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn normalize_trims_and_maps_empty_to_unset() {
+        assert_eq!(normalize_summary_field(None), None);
+        assert_eq!(normalize_summary_field(Some("")), None);
+        assert_eq!(normalize_summary_field(Some("  \t\n")), None);
+        assert_eq!(
+            normalize_summary_field(Some(" openrouter ")).as_deref(),
+            Some("openrouter")
+        );
+    }
 
     #[test]
     fn both_or_neither_is_the_rule_and_the_codes_name_the_missing_half() {

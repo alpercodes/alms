@@ -1140,19 +1140,20 @@ impl<'de> Deserialize<'de> for ContextConfig {
         // half-configured state the #877 pair-only validator exists to
         // reject at load time. Rules:
         //   - both fields absent → inherit the default pair;
-        //   - anything else → taken as written, with `""` (empty string)
-        //     normalised to `None` as an explicit clear, mirroring the
-        //     PATCH /settings sentinel. `summary_model = ""` +
-        //     `summary_provider = ""` therefore opts back into inheriting
-        //     the agent's resolved (provider, model) for summaries, and an
-        //     asymmetric survivor is rejected by `AlmsConfig::validate`.
+        //   - anything else → `normalize_summary_field`, the same
+        //     empty-means-unset policy PATCH /settings applies: trimmed,
+        //     with `""` (or whitespace) normalised to `None` as an explicit
+        //     clear. `summary_model = ""` + `summary_provider = ""`
+        //     therefore opts back into inheriting the agent's resolved
+        //     (provider, model) for summaries, and an asymmetric survivor
+        //     is rejected by `AlmsConfig::validate`.
         let (summary_model, summary_provider) =
             if raw.summary_model.is_none() && raw.summary_provider.is_none() {
                 (defaults.summary_model, defaults.summary_provider)
             } else {
                 (
-                    raw.summary_model.filter(|s| !s.trim().is_empty()),
-                    raw.summary_provider.filter(|s| !s.trim().is_empty()),
+                    super::normalize_summary_field(raw.summary_model.as_deref()),
+                    super::normalize_summary_field(raw.summary_provider.as_deref()),
                 )
             };
 
