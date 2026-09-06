@@ -207,7 +207,10 @@ async fn test_run_on_session_fails_if_session_missing() {
     assert!(result.is_err(), "Should fail if session does not exist");
 }
 
-/// Verify `dm_peer_name` extracts the correct peer from a DM context_id.
+/// `dm_peer_name` is `alms_core::dm_peer` applied to the runtime's own
+/// agent name. The parsing is that function's test; what this wrapper
+/// adds is the seat lookup — and its one own behaviour, that a runtime
+/// with no agent name has no peer, which no core test can express.
 #[test]
 fn test_dm_peer_name() {
     let config = crate::llm_types::LlmConfig {
@@ -220,33 +223,17 @@ fn test_dm_peer_name() {
         ..AgentConfig::default()
     };
 
-    // Agent named "bob" in "dm:alice:bob" → peer is "alice".
-    let rt = AgentRuntime::new(AgentId::new(), agent_config.clone(), llm.clone())
+    let unnamed = AgentRuntime::new(AgentId::new(), agent_config.clone(), llm.clone()).unwrap();
+    assert_eq!(
+        unnamed.dm_peer_name("dm:alice:bob"),
+        None,
+        "no agent name means no seat in the DM, so no peer"
+    );
+
+    let bob = AgentRuntime::new(AgentId::new(), agent_config, llm)
         .unwrap()
         .with_agent_name("bob".to_string());
-    assert_eq!(rt.dm_peer_name("dm:alice:bob"), Some("alice".to_string()));
-
-    // Agent named "alice" in "dm:alice:bob" → peer is "bob".
-    let rt2 = AgentRuntime::new(AgentId::new(), agent_config.clone(), llm.clone())
-        .unwrap()
-        .with_agent_name("alice".to_string());
-    assert_eq!(rt2.dm_peer_name("dm:alice:bob"), Some("bob".to_string()));
-
-    // Non-DM context_id → None (not a valid DM context).
-    assert_eq!(rt.dm_peer_name("some-context"), None);
-
-    // Malformed context_id → None.
-    assert_eq!(rt.dm_peer_name("dm:only-one"), None);
-
-    // Agent name not in context_id → None.
-    let rt3 = AgentRuntime::new(AgentId::new(), agent_config.clone(), llm.clone())
-        .unwrap()
-        .with_agent_name("charlie".to_string());
-    assert_eq!(rt3.dm_peer_name("dm:alice:bob"), None);
-
-    // No agent_name set → None.
-    let rt4 = AgentRuntime::new(AgentId::new(), agent_config, llm).unwrap();
-    assert_eq!(rt4.dm_peer_name("dm:alice:bob"), None);
+    assert_eq!(bob.dm_peer_name("dm:alice:bob"), Some("alice".to_string()));
 }
 
 /// Verify that the DM system prompt addendum is injected into the context

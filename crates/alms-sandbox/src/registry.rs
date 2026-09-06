@@ -135,7 +135,7 @@ impl ToolRegistry {
             );
         }
 
-        debug!("Registering tool: {}", name);
+        debug!(tool = %name, "Registering tool");
         self.tools.insert(name.clone(), tool);
 
         Ok(())
@@ -192,7 +192,7 @@ impl ToolRegistry {
             );
         }
 
-        debug!("Registering tool alias: '{}' -> '{}'", alias, tool.name());
+        debug!(alias = %alias, tool = %tool.name(), "Registering tool alias");
         self.tools.insert(alias.to_string(), tool);
         Ok(())
     }

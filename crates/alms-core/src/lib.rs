@@ -663,34 +663,29 @@ mod tests {
 
     // -- dm_peer ---------------------------------------------------------------
 
+    /// The other participant, from either seat and however the caller
+    /// spells the agent; `None` for a non-participant, a non-DM context,
+    /// a malformed one, and the empty string. This is the only unit
+    /// test of the function — its three one-line wrappers
+    /// (`extract_dm_peer`, `dm_peer_name`, `extract_peer_from_dm_context`)
+    /// add nothing a test could pin beyond delegation.
     #[test]
-    fn test_dm_peer_first_name() {
-        assert_eq!(dm_peer("dm:alice:bob", "alice"), Some("bob"));
-    }
-
-    #[test]
-    fn test_dm_peer_second_name() {
-        assert_eq!(dm_peer("dm:alice:bob", "bob"), Some("alice"));
-    }
-
-    #[test]
-    fn test_dm_peer_not_participant() {
-        assert_eq!(dm_peer("dm:alice:bob", "charlie"), None);
-    }
-
-    #[test]
-    fn test_dm_peer_non_dm_context() {
-        assert_eq!(dm_peer("web-chat-123", "alice"), None);
-    }
-
-    #[test]
-    fn test_dm_peer_malformed() {
-        assert_eq!(dm_peer("dm:alice", "alice"), None);
-    }
-
-    #[test]
-    fn test_dm_peer_empty() {
-        assert_eq!(dm_peer("", "alice"), None);
+    fn test_dm_peer_returns_the_other_participant_or_none() {
+        for (context_id, agent, expected) in [
+            ("dm:alice:bob", "alice", Some("bob")),
+            ("dm:alice:bob", "bob", Some("alice")),
+            ("dm:Atlas:bob", "atlas", Some("bob")),
+            ("dm:alice:bob", "charlie", None),
+            ("web-chat-123", "alice", None),
+            ("dm:alice", "alice", None),
+            ("", "alice", None),
+        ] {
+            assert_eq!(
+                dm_peer(context_id, agent),
+                expected,
+                "dm_peer({context_id:?}, {agent:?})"
+            );
+        }
     }
 
     #[test]

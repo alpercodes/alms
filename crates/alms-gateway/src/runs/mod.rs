@@ -167,7 +167,7 @@ mod tests {
     use alms_runtime::{AgentConfig, Posture};
     use alms_tools::message_sender::ConversationEndReason;
     use chrono::Utc;
-    use lifecycle::{extract_peer_from_dm_context, resolve_posture_for_run};
+    use lifecycle::resolve_posture_for_run;
     use notifications::{
         DM_HISTORY_MAX_CHARS, format_dm_conversation_history, format_dm_ended_notification,
     };
@@ -879,51 +879,6 @@ mod tests {
              carries (#837 triage invariant)"
         );
         assert_eq!(snapshot.provider, "anthropic");
-    }
-
-    // -----------------------------------------------------------------------
-    // extract_peer_from_dm_context tests (#387)
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_extract_peer_agent_name_is_first() {
-        // Context: dm:alice:bob, agent is alice -> peer is bob
-        let peer = extract_peer_from_dm_context("dm:alice:bob", "alice");
-        assert_eq!(peer.as_deref(), Some("bob"));
-    }
-
-    #[test]
-    fn test_extract_peer_agent_name_is_second() {
-        // Context: dm:alice:bob, agent is bob -> peer is alice
-        let peer = extract_peer_from_dm_context("dm:alice:bob", "bob");
-        assert_eq!(peer.as_deref(), Some("alice"));
-    }
-
-    #[test]
-    fn test_extract_peer_agent_name_not_found() {
-        // Agent name not in the context_id at all
-        let peer = extract_peer_from_dm_context("dm:alice:bob", "charlie");
-        assert!(peer.is_none());
-    }
-
-    #[test]
-    fn test_extract_peer_non_dm_context() {
-        // Not a DM context ID
-        let peer = extract_peer_from_dm_context("notifications:alice", "alice");
-        assert!(peer.is_none());
-    }
-
-    #[test]
-    fn test_extract_peer_malformed_context() {
-        // Missing second name
-        let peer = extract_peer_from_dm_context("dm:alice", "alice");
-        assert!(peer.is_none());
-    }
-
-    #[test]
-    fn test_extract_peer_empty_context() {
-        let peer = extract_peer_from_dm_context("", "alice");
-        assert!(peer.is_none());
     }
 
     // -----------------------------------------------------------------------

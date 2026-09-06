@@ -1427,7 +1427,7 @@ mod tests {
     /// is process-global, which is the #1221 flake — a callsite first
     /// touched by another test on a subscriber-less thread caches
     /// `Interest::never()` and this test's capture comes back empty.
-    use alms_test_support::capture_logs;
+    use alms_test_support::capture_events;
 
     /// `warn_full_os_access_at_boot` emits one structured WARN per
     /// listed agent. Acceptance check from #947: "WARN at agent-create
@@ -1438,34 +1438,24 @@ mod tests {
             allow_full_os_access: vec!["alice".into(), "bob".into()],
         };
 
-        let captured = capture_logs(tracing::Level::WARN, || {
+        let captured = capture_events(tracing::Level::WARN, || {
             warn_full_os_access_at_boot(&security_config);
         });
 
-        // The structured fields each appear in the output (the fmt
-        // subscriber renders them as `field_name=value`).
-        assert!(
-            captured.contains("agent_name=alice"),
-            "WARN must carry structured agent_name=alice: {captured}"
-        );
-        assert!(
-            captured.contains("agent_name=bob"),
-            "WARN must carry structured agent_name=bob: {captured}"
-        );
-        assert!(
-            captured.contains("allow_full_os_access=true"),
-            "WARN must carry structured allow_full_os_access=true: {captured}"
-        );
-        // Target is the configured "alms.security" string.
-        assert!(
-            captured.contains("alms.security"),
-            "WARN must use the alms.security tracing target: {captured}"
-        );
-        // Two listed agents → at least two `WARN` markers.
-        let warn_lines = captured.matches("WARN").count();
-        assert!(
-            warn_lines >= 2,
-            "Expected ≥2 WARN lines (one per listed agent), got {warn_lines}: {captured}"
+        // One WARN per listed agent, on the alms.security target, each
+        // carrying the agent name and the knob that put it there.
+        let warned: Vec<&str> = captured
+            .at_target("alms.security")
+            .map(|e| {
+                assert_eq!(e.level, tracing::Level::WARN, "{e}");
+                assert_eq!(e.field("allow_full_os_access"), Some("true"), "{e}");
+                e.field("agent_name").expect("agent_name field")
+            })
+            .collect();
+        assert_eq!(
+            warned,
+            ["alice", "bob"],
+            "one WARN per listed agent, in list order; got:\n{captured}"
         );
     }
 
@@ -1473,12 +1463,13 @@ mod tests {
     #[test]
     fn boot_warn_silent_when_list_is_empty() {
         let security_config = alms_core::config::SecurityConfig::default();
-        let captured = capture_logs(tracing::Level::WARN, || {
+        let captured = capture_events(tracing::Level::WARN, || {
             warn_full_os_access_at_boot(&security_config);
         });
 
-        assert!(
-            !captured.contains("alms.security"),
+        assert_eq!(
+            captured.at_target("alms.security").count(),
+            0,
             "no WARN must fire when the list is empty: {captured}"
         );
     }

@@ -649,6 +649,7 @@ pub fn remove_worktree(
             tracing::warn!(
                 target: "alms.worktree",
                 agent_name = %agent_name,
+                drift = "already_absent",
                 error = %e,
                 "delete_branch failed on AlreadyAbsent path — branch may be orphaned"
             );
@@ -1465,7 +1466,7 @@ mod tests {
     /// thread cached `Interest::never()` and this test's capture came
     /// back empty. That is #1221 (and the flakiness the old comment here
     /// noted as "#1033"); `test_log_capture` is immune to it.
-    use alms_test_support::capture_logs;
+    use alms_test_support::capture_events;
 
     /// #1025 regression guard: `remove_worktree` on a missing worktree
     /// directory still tries `git branch -D alms/<name>` as best-effort
@@ -1492,7 +1493,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
 
         let mut outcome: Option<WorktreeResult<WorktreeRemove>> = None;
-        let captured = capture_logs(tracing::Level::WARN, || {
+        let captured = capture_events(tracing::Level::WARN, || {
             outcome = Some(remove_worktree(tmp.path(), "ghost", false));
         });
 
@@ -1507,26 +1508,17 @@ mod tests {
         );
 
         // Audit trail: structured WARN at the alms.worktree target,
-        // carrying the agent name and the underlying error message.
+        // carrying the agent name, the path taken, and the underlying
+        // error.
+        let event = captured
+            .at_target("alms.worktree")
+            .find(|e| e.field("drift") == Some("already_absent"))
+            .unwrap_or_else(|| panic!("expected the AlreadyAbsent-path warning, got:\n{captured}"));
+        assert_eq!(event.level, tracing::Level::WARN);
+        assert_eq!(event.field("agent_name"), Some("ghost"));
         assert!(
-            captured.contains("WARN"),
-            "expected WARN-level log, got:\n{captured}"
-        );
-        assert!(
-            captured.contains("alms.worktree"),
-            "expected target=alms.worktree, got:\n{captured}"
-        );
-        assert!(
-            captured.contains("agent_name=\"ghost\"") || captured.contains("agent_name=ghost"),
-            "expected agent_name=ghost field, got:\n{captured}"
-        );
-        assert!(
-            captured.contains("error="),
-            "expected error= field, got:\n{captured}"
-        );
-        assert!(
-            captured.contains("AlreadyAbsent"),
-            "expected message to identify the AlreadyAbsent path, got:\n{captured}"
+            event.has_field("error"),
+            "expected the underlying error as a field, got: {event}"
         );
     }
 }

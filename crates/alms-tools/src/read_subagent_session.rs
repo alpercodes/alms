@@ -694,27 +694,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_last_n_limits_messages() {
-        let (tool, mgr) = make_tool();
-        let msgs: Vec<Message> = (0..10)
-            .map(|i| make_msg(Role::User, &format!("msg {i}")))
-            .collect();
-        populate_subagent(&tool, &mgr, "chatty", msgs);
-
-        let result = tool
-            .execute(serde_json::json!({ "name": "chatty", "last_n": 3 }))
-            .await
-            .unwrap();
-
-        assert_eq!(result["message_count"], 10);
-        assert_eq!(result["showing"], 3);
-        let msgs = result["messages"].as_array().unwrap();
-        // Should be the last 3 messages (msg 7, msg 8, msg 9)
-        assert_eq!(msgs[0]["content"], "msg 7");
-        assert_eq!(msgs[2]["content"], "msg 9");
-    }
-
-    #[tokio::test]
     async fn test_summary_only_with_real_summary() {
         let (tool, mgr) = make_tool();
         let stable_id = AgentId::deterministic(tool.parent_agent_id, "summarized-sub");

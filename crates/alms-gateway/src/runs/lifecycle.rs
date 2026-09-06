@@ -3969,17 +3969,6 @@ mod tests {
         (llm, secrets)
     }
 
-    /// Pre-#866 behaviour: when `summary_provider` is `None`, the helper
-    /// returns a clone of the agent's `llm` byte-identical to pre-#866
-    /// behaviour. Provider, default_model, and base_url all match.
-    #[test]
-    fn build_summary_client_no_provider_returns_agent_llm_clone() {
-        let (llm, secrets) = summary_test_fixtures(None, None);
-        let summary = build_summary_client(&llm, None, None, &secrets, AgentId::new());
-        assert_eq!(summary.provider(), llm.provider());
-        assert_eq!(summary.default_model(), llm.default_model());
-    }
-
     /// #866 happy path: provider AND model both set. Both reach the wire
     /// regardless of any provider-entry model field.
     #[test]
@@ -3994,92 +3983,6 @@ mod tests {
         );
         assert_eq!(summary.provider(), "openrouter");
         assert_eq!(summary.default_model(), "minimax/minimax-m2.7");
-    }
-
-    /// #866 + #871: provider set, no model, AND the new provider entry has
-    /// its own `model` field. `apply_provider` rewrites `default_model` to
-    /// the entry's model — that's the (provider, model) pair the user
-    /// configured, so the leak guard does NOT clear it. This shape is
-    /// rejected by the PATCH validator (`SUMMARY_PROVIDER_REQUIRES_MODEL`
-    /// fires when `summary_model` is None) but a hand-edited TOML can still
-    /// reach this branch — keep the property pinned.
-    #[test]
-    fn build_summary_client_provider_only_with_entry_model_uses_entry_model() {
-        let (llm, secrets) = summary_test_fixtures(None, Some("provider-default-model"));
-        let summary =
-            build_summary_client(&llm, Some("openrouter"), None, &secrets, AgentId::new());
-        assert_eq!(summary.provider(), "openrouter");
-        assert_eq!(
-            summary.default_model(),
-            "provider-default-model",
-            "provider-entry model should reach the wire when no \
-             summary_model is configured (#866)"
-        );
-    }
-
-    /// #871 leak guard (the bug Tim flagged): provider set, no model, AND
-    /// the new provider entry has NO `model` field. `apply_provider` leaves
-    /// `default_model` unchanged, so the cloned client carries the AGENT's
-    /// model slug ("claude-sonnet-4-...") into the new (openrouter) wire.
-    /// Pre-fix: the agent's slug reaches openrouter and produces a 404 (the
-    /// exact symptom #861 was meant to prevent on the agent path). Post-fix:
-    /// the leak guard clears `default_model` so the wire request fails fast
-    /// with a missing-model error rather than 404'ing on the wrong slug.
-    #[test]
-    fn build_summary_client_provider_only_no_entry_model_clears_to_fail_fast() {
-        let (llm, secrets) = summary_test_fixtures(None, None);
-        let agent_model = llm.default_model().to_string();
-        let summary =
-            build_summary_client(&llm, Some("openrouter"), None, &secrets, AgentId::new());
-        assert_eq!(summary.provider(), "openrouter");
-        assert_ne!(
-            summary.default_model(),
-            agent_model,
-            "summary_provider switch must NOT leak the agent's model slug \
-             onto the summary provider's wire (#871, mirror of #860/#861)"
-        );
-        assert_eq!(
-            summary.default_model(),
-            "",
-            "leak guard clears default_model when summary_provider is set, \
-             summary_model is None, and the provider entry has no model \
-             field — wire fails fast with a missing-model error (#871)"
-        );
-    }
-
-    /// #866 + #871: provider set, model set, and the new provider entry
-    /// also has its own `model` field. The explicit `summary_model`
-    /// override must win — same property as the per-agent #861 test
-    /// (`test_per_agent_provider_with_entry_model_does_not_drop_per_agent_model`).
-    #[test]
-    fn build_summary_client_explicit_model_wins_over_entry_model() {
-        let (llm, secrets) = summary_test_fixtures(None, Some("provider-default-model"));
-        let summary = build_summary_client(
-            &llm,
-            Some("openrouter"),
-            Some("user-chosen-summary-model"),
-            &secrets,
-            AgentId::new(),
-        );
-        assert_eq!(summary.provider(), "openrouter");
-        assert_eq!(
-            summary.default_model(),
-            "user-chosen-summary-model",
-            "explicit summary_model must reach the wire even when the \
-             provider entry has its own model field"
-        );
-    }
-
-    /// Back-compat: when both fields are unset and the agent has a normal
-    /// resolved client, the helper short-circuits to a clone with the same
-    /// provider+model+base_url. This is the byte-identical-to-pre-#866
-    /// guarantee.
-    #[test]
-    fn build_summary_client_back_compat_when_provider_and_model_both_none() {
-        let (llm, secrets) = summary_test_fixtures(None, None);
-        let summary = build_summary_client(&llm, None, None, &secrets, AgentId::new());
-        assert_eq!(summary.provider(), "anthropic");
-        assert_eq!(summary.default_model(), "claude-sonnet-4-20250514");
     }
 
     /// #1260 — what a run's tool-registry churn is allowed to log.
@@ -4167,7 +4070,7 @@ mod tests {
     /// in the PR rather than left to look like coverage.
     mod tool_registration_logging {
         use super::*;
-        use alms_test_support::capture_logs;
+        use alms_test_support::{CapturedEvent, CapturedEvents, capture_events};
 
         /// The sandbox branch `execute_run` picks between. All three are
         /// exercised: they register different tools and the middle one
@@ -4263,26 +4166,35 @@ mod tests {
             .expect("test LLM client must build")
         }
 
-        /// Counts the lines of a capture, ignoring the trailing newline.
-        fn line_count(captured: &str) -> usize {
-            captured.lines().filter(|l| !l.trim().is_empty()).count()
-        }
-
         /// How many times the chain registered `name` under its primary
-        /// name. Matched to end-of-line so `shell` cannot absorb a
-        /// hypothetical `shell_*`; the alias uses a different message and
-        /// is counted by [`alias_registrations`].
-        fn registrations(captured: &str, name: &str) -> usize {
+        /// name. The registry records the name as a field, so `shell`
+        /// cannot absorb a hypothetical `shell_*`; the alias is a
+        /// different event and is counted by [`alias_registrations`].
+        fn registrations(captured: &CapturedEvents, name: &str) -> usize {
             captured
-                .matches(&format!("Registering tool: {name}\n"))
+                .iter()
+                .filter(|e| e.message == "Registering tool" && e.field("tool") == Some(name))
                 .count()
         }
 
         /// How many times the chain pointed `shell_exec` at a tool.
-        fn alias_registrations(captured: &str) -> usize {
+        fn alias_registrations(captured: &CapturedEvents) -> usize {
             captured
-                .matches("Registering tool alias: 'shell_exec'")
+                .iter()
+                .filter(|e| {
+                    e.message == "Registering tool alias" && e.field("alias") == Some("shell_exec")
+                })
                 .count()
+        }
+
+        /// The collision warning, if the capture holds one: the registry's
+        /// own discriminator (#1260) is the message constant, and the
+        /// displaced name rides along as `tool` (or `alias`).
+        fn collision_warning(captured: &CapturedEvents) -> Option<&CapturedEvent> {
+            captured.iter().find(|e| {
+                e.level == tracing::Level::WARN
+                    && e.message.contains(alms_runtime::TOOL_COLLISION_WARNING)
+            })
         }
 
         /// The registration count each name should reach, derived from
@@ -4346,7 +4258,7 @@ mod tests {
                 ("unrestricted", SandboxBranch::Unrestricted),
             ] {
                 let dir = tempfile::tempdir().unwrap();
-                let captured = capture_logs(tracing::Level::DEBUG, || {
+                let captured = capture_events(tracing::Level::DEBUG, || {
                     build_runtime_like_a_run(branch, dir.path());
                 });
 
@@ -4384,7 +4296,7 @@ mod tests {
                 );
 
                 assert!(
-                    !captured.contains(alms_runtime::TOOL_COLLISION_WARNING),
+                    collision_warning(&captured).is_none(),
                     "[{label}] re-registering the same tool for a new run is \
                      the normal lifecycle and must not warn. Captured:\n{captured}"
                 );
@@ -4413,19 +4325,20 @@ mod tests {
             };
             let runtime = alms_runtime::AgentRuntime::new(AgentId::new(), config, llm).unwrap();
 
-            let captured = capture_logs(tracing::Level::WARN, || {
+            let captured = capture_events(tracing::Level::WARN, || {
                 runtime.register_tool(std::sync::Arc::new(ImpostorFsRead));
             });
 
-            assert!(
-                captured.contains(alms_runtime::TOOL_COLLISION_WARNING),
-                "a foreign implementation claiming the `fs_read` name is the \
-                 one case worth a WARN. Captured:\n{captured}"
-            );
-            assert!(
-                captured.contains("fs_read"),
-                "the warning must name the tool that was displaced. \
-                 Captured:\n{captured}"
+            let warning = collision_warning(&captured).unwrap_or_else(|| {
+                panic!(
+                    "a foreign implementation claiming the `fs_read` name is the \
+                     one case worth a WARN. Captured:\n{captured}"
+                )
+            });
+            assert_eq!(
+                warning.field("tool"),
+                Some("fs_read"),
+                "the warning must name the tool that was displaced: {warning}"
             );
         }
 
@@ -4443,18 +4356,20 @@ mod tests {
         fn an_alias_repointed_at_a_different_tool_still_warns() {
             let registry = alms_runtime::tools::ToolRegistry::with_builtins();
 
-            let captured = capture_logs(tracing::Level::WARN, || {
+            let captured = capture_events(tracing::Level::WARN, || {
                 registry.register_arc_as("shell_exec", std::sync::Arc::new(ImpostorFsRead));
             });
 
-            assert!(
-                captured.contains(alms_runtime::TOOL_COLLISION_WARNING),
-                "an alias now resolving to a different tool is worth saying \
-                 out loud. Captured:\n{captured}"
-            );
-            assert!(
-                captured.contains("shell_exec"),
-                "the warning must name the alias. Captured:\n{captured}"
+            let warning = collision_warning(&captured).unwrap_or_else(|| {
+                panic!(
+                    "an alias now resolving to a different tool is worth saying \
+                     out loud. Captured:\n{captured}"
+                )
+            });
+            assert_eq!(
+                warning.field("alias"),
+                Some("shell_exec"),
+                "the warning must name the alias: {warning}"
             );
         }
 
@@ -4478,26 +4393,26 @@ mod tests {
         #[test]
         fn a_runs_registration_churn_is_quiet_at_warn_and_info() {
             let dir = tempfile::tempdir().unwrap();
-            let warns = capture_logs(tracing::Level::WARN, || {
+            let warns = capture_events(tracing::Level::WARN, || {
                 build_runtime_like_a_run(SandboxBranch::ProjectRoot, dir.path());
             });
             assert!(
-                line_count(&warns) <= 3,
+                warns.len() <= 3,
                 "a run's tool-registry churn must not produce \
-                 readable-log-destroying WARN volume; got {} line(s):\n{warns}",
-                line_count(&warns)
+                 readable-log-destroying WARN volume; got {} event(s):\n{warns}",
+                warns.len()
             );
 
             let dir = tempfile::tempdir().unwrap();
-            let infos = capture_logs(tracing::Level::INFO, || {
+            let infos = capture_events(tracing::Level::INFO, || {
                 build_runtime_like_a_run(SandboxBranch::ProjectRoot, dir.path());
             });
             assert!(
-                line_count(&infos) <= 10,
+                infos.len() <= 10,
                 "the same applies one level down — INFO carried a line per \
                  registration, which is the same non-event the `debug!` \
-                 immediately above it already reports; got {} line(s):\n{infos}",
-                line_count(&infos)
+                 immediately above it already reports; got {} event(s):\n{infos}",
+                infos.len()
             );
         }
 

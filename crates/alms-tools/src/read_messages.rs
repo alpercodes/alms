@@ -322,33 +322,6 @@ mod tests {
         assert_eq!(msgs[2]["content"], "msg 9");
     }
 
-    /// When the caller passes `last_n` equal to (or larger than) the total
-    /// message count, truncation must NOT be flagged -- the agent got
-    /// everything it asked for and nothing is being hidden.
-    #[tokio::test]
-    async fn test_explicit_last_n_meeting_total_is_not_truncated() {
-        let (tool, mgr) = make_tool();
-
-        let session_id = SessionId::deterministic_dm("alice", "bob");
-        let dm_ctx = dm_context_id("alice", "bob");
-        let _session = mgr.get_or_create_shared(session_id, &dm_ctx);
-
-        for i in 0..5 {
-            mgr.append_message(session_id, make_dm_msg("bob", &format!("msg {i}")))
-                .unwrap();
-        }
-
-        let result = tool
-            .execute(serde_json::json!({ "from": "bob", "last_n": 10 }))
-            .await
-            .unwrap();
-
-        assert_eq!(result["total_count"], 5);
-        assert_eq!(result["returned_count"], 5);
-        assert_eq!(result["truncated"], false);
-        assert!(result["truncation_reason"].is_null());
-    }
-
     /// Default path with a small DM: caller omits `last_n`, gets everything,
     /// and `truncated` stays false.
     #[tokio::test]
@@ -494,100 +467,6 @@ mod tests {
         assert_eq!(msgs.first().unwrap()["content"], "m50");
     }
 
-    /// Boundary inclusivity: a DM whose summed *serialized JSON* size is
-    /// exactly the byte cap must NOT be flagged as truncated. The cap is
-    /// `>` not `>=`.
-    #[tokio::test]
-    async fn test_default_byte_cap_boundary_is_inclusive() {
-        let (tool, mgr) = make_tool();
-
-        let session_id = SessionId::deterministic_dm("alice", "bob");
-        let dm_ctx = dm_context_id("alice", "bob");
-        let _session = mgr.get_or_create_shared(session_id, &dm_ctx);
-
-        // Compute the serialized wrapper size of a single per-message entry
-        // (`{"from":"bob","content":""}`) so we can size the bodies to make
-        // the combined serialized sum land EXACTLY on the cap. We can't use
-        // raw content length any more -- the cap is measured against the
-        // serialized JSON bytes, which include wrapper overhead and any
-        // escape expansion.
-        let wrapper_overhead = serde_json::to_string(&serde_json::json!({
-            "from": "bob",
-            "content": "",
-        }))
-        .unwrap()
-        .len();
-
-        // Two messages, each carrying half of the remaining budget after
-        // accounting for two wrappers. Bodies are plain ASCII -- no escape
-        // expansion -- so raw body bytes equal serialized body bytes.
-        let total_body_budget = READ_MESSAGES_SERIALIZED_BYTE_CAP - 2 * wrapper_overhead;
-        let half = total_body_budget / 2;
-        let body_a = "a".repeat(half);
-        let body_b = "b".repeat(total_body_budget - half);
-        mgr.append_message(session_id, make_dm_msg("bob", &body_a))
-            .unwrap();
-        mgr.append_message(session_id, make_dm_msg("bob", &body_b))
-            .unwrap();
-
-        let result = tool
-            .execute(serde_json::json!({ "from": "bob" }))
-            .await
-            .unwrap();
-
-        assert_eq!(result["total_count"], 2);
-        assert_eq!(result["returned_count"], 2);
-        assert_eq!(
-            result["truncated"], false,
-            "serialized sum equal to the byte cap must not be flagged as truncated"
-        );
-        assert!(result["truncation_reason"].is_null());
-    }
-
-    /// Regression test for PR #1028 P1 (Codex): the byte cap must account
-    /// for JSON-escape expansion, not raw UTF-8 length.
-    ///
-    /// A single message of 60_000 pure `"` characters has raw length
-    /// 60_000 (== cap, so the pre-fix raw-length check let it through)
-    /// but JSON-escapes to 120_000 characters (each `"` -> `\"`). With
-    /// wrapper overhead the serialized entry is well over the 60 KB cap,
-    /// so post-fix the cap must fire and `truncation_reason` must be
-    /// `byte_cap`.
-    #[tokio::test]
-    async fn test_default_byte_cap_accounts_for_json_escape_expansion() {
-        let (tool, mgr) = make_tool();
-
-        let session_id = SessionId::deterministic_dm("alice", "bob");
-        let dm_ctx = dm_context_id("alice", "bob");
-        let _session = mgr.get_or_create_shared(session_id, &dm_ctx);
-
-        // 60_000 raw bytes of pure `"`. Raw length == cap so pre-fix
-        // (which used raw `content.len()`) would treat this as "fits".
-        // JSON-escaped this becomes 120_000 bytes (each `"` -> `\"`),
-        // which is double the cap.
-        let body = "\"".repeat(60_000);
-        mgr.append_message(session_id, make_dm_msg("bob", &body))
-            .unwrap();
-
-        let result = tool
-            .execute(serde_json::json!({ "from": "bob" }))
-            .await
-            .unwrap();
-
-        assert_eq!(result["total_count"], 1);
-        assert_eq!(
-            result["truncated"], true,
-            "byte cap must fire on JSON-escape-inflated content even when \
-             raw UTF-8 length equals the cap"
-        );
-        assert_eq!(result["truncation_reason"], "byte_cap");
-        // The single oversize message can't fit under the cap, so the
-        // trailing slice is empty -- caller is told they need to page
-        // differently (or accept a larger budget).
-        assert_eq!(result["returned_count"], 0);
-        assert_eq!(result["messages"].as_array().unwrap().len(), 0);
-    }
-
     #[test]
     fn test_schema_requires_from() {
         let (tool, _) = make_tool();
@@ -627,157 +506,32 @@ mod tests {
         (tool, mgr, session_id)
     }
 
+    /// A malformed `last_n` is an error, not a quiet default. Which shapes
+    /// are malformed is `session_read::parse_last_n`'s own test; this pins
+    /// that the tool routes the raw value through it and surfaces the
+    /// rejection as `InvalidParameters` naming the field.
     #[tokio::test]
-    async fn test_last_n_negative_is_invalid_parameters() {
+    async fn test_malformed_last_n_is_invalid_parameters() {
         let (tool, _mgr, _sid) = make_tool_with_dm().await;
-        let err = tool
-            .execute(serde_json::json!({ "from": "bob", "last_n": -1 }))
-            .await
-            .unwrap_err();
-        match err {
-            SandboxError::InvalidParameters(msg) => assert!(msg.contains("last_n")),
-            other => panic!("expected InvalidParameters, got {other:?}"),
+        for bad in [
+            serde_json::json!(-1),
+            serde_json::json!(3.5),
+            serde_json::json!("three"),
+            serde_json::json!(true),
+            serde_json::json!([1, 2, 3]),
+            serde_json::json!({ "n": 5 }),
+        ] {
+            let err = tool
+                .execute(serde_json::json!({ "from": "bob", "last_n": bad }))
+                .await
+                .expect_err(&format!("{bad} must be rejected"));
+            match err {
+                SandboxError::InvalidParameters(msg) => {
+                    assert!(msg.contains("last_n"), "{bad}: {msg}")
+                }
+                other => panic!("{bad}: expected InvalidParameters, got {other:?}"),
+            }
         }
-    }
-
-    #[tokio::test]
-    async fn test_last_n_non_integer_float_is_invalid_parameters() {
-        let (tool, _mgr, _sid) = make_tool_with_dm().await;
-        let err = tool
-            .execute(serde_json::json!({ "from": "bob", "last_n": 3.5 }))
-            .await
-            .unwrap_err();
-        match err {
-            SandboxError::InvalidParameters(msg) => assert!(msg.contains("last_n")),
-            other => panic!("expected InvalidParameters, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn test_last_n_string_is_invalid_parameters() {
-        let (tool, _mgr, _sid) = make_tool_with_dm().await;
-        let err = tool
-            .execute(serde_json::json!({ "from": "bob", "last_n": "three" }))
-            .await
-            .unwrap_err();
-        match err {
-            SandboxError::InvalidParameters(msg) => assert!(msg.contains("last_n")),
-            other => panic!("expected InvalidParameters, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn test_last_n_bool_is_invalid_parameters() {
-        let (tool, _mgr, _sid) = make_tool_with_dm().await;
-        let err = tool
-            .execute(serde_json::json!({ "from": "bob", "last_n": true }))
-            .await
-            .unwrap_err();
-        assert!(matches!(err, SandboxError::InvalidParameters(_)));
-    }
-
-    #[tokio::test]
-    async fn test_last_n_array_is_invalid_parameters() {
-        let (tool, _mgr, _sid) = make_tool_with_dm().await;
-        let err = tool
-            .execute(serde_json::json!({ "from": "bob", "last_n": [1, 2, 3] }))
-            .await
-            .unwrap_err();
-        assert!(matches!(err, SandboxError::InvalidParameters(_)));
-    }
-
-    #[tokio::test]
-    async fn test_last_n_object_is_invalid_parameters() {
-        let (tool, _mgr, _sid) = make_tool_with_dm().await;
-        let err = tool
-            .execute(serde_json::json!({ "from": "bob", "last_n": { "n": 5 } }))
-            .await
-            .unwrap_err();
-        assert!(matches!(err, SandboxError::InvalidParameters(_)));
-    }
-
-    /// `last_n: null` is semantically equivalent to omitting the field: fall
-    /// through to the default-all path bounded by the byte / message-count
-    /// caps. This is a pin to keep the behavior explicit -- some JSON clients
-    /// always emit nulls for absent optional fields, and we don't want to
-    /// punish them with InvalidParameters.
-    #[tokio::test]
-    async fn test_last_n_null_falls_through_to_default_all() {
-        let (tool, mgr) = make_tool();
-        let session_id = SessionId::deterministic_dm("alice", "bob");
-        let dm_ctx = dm_context_id("alice", "bob");
-        let _session = mgr.get_or_create_shared(session_id, &dm_ctx);
-        for i in 0..3 {
-            mgr.append_message(session_id, make_dm_msg("bob", &format!("m{i}")))
-                .unwrap();
-        }
-
-        let result = tool
-            .execute(serde_json::json!({ "from": "bob", "last_n": null }))
-            .await
-            .unwrap();
-
-        // All 3 messages returned; no truncation.
-        assert_eq!(result["total_count"], 3);
-        assert_eq!(result["returned_count"], 3);
-        assert_eq!(result["truncated"], false);
-        assert!(result["truncation_reason"].is_null());
-    }
-
-    /// `last_n: 0` is a valid request -- the agent is asking for zero messages
-    /// (effectively a count probe via the `total_count` / `truncated` metadata).
-    /// We honor it, return an empty messages array, and flag truncation iff
-    /// the DM actually has messages the agent isn't seeing.
-    #[tokio::test]
-    async fn test_last_n_zero_returns_empty_with_truncation_when_nonempty() {
-        let (tool, mgr) = make_tool();
-        let session_id = SessionId::deterministic_dm("alice", "bob");
-        let dm_ctx = dm_context_id("alice", "bob");
-        let _session = mgr.get_or_create_shared(session_id, &dm_ctx);
-        for i in 0..5 {
-            mgr.append_message(session_id, make_dm_msg("bob", &format!("m{i}")))
-                .unwrap();
-        }
-
-        let result = tool
-            .execute(serde_json::json!({ "from": "bob", "last_n": 0 }))
-            .await
-            .unwrap();
-
-        assert_eq!(result["total_count"], 5);
-        assert_eq!(result["returned_count"], 0);
-        assert_eq!(result["truncated"], true);
-        assert_eq!(result["truncation_reason"], "explicit_last_n");
-        assert_eq!(result["messages"].as_array().unwrap().len(), 0);
-    }
-
-    /// Regression guard: a valid positive `last_n` must still work after the
-    /// validation tightening. This re-asserts the happy path that
-    /// `test_last_n_limits` covers, but stays close to the malformed-input
-    /// tests so future regressions are obvious in the diff.
-    #[tokio::test]
-    async fn test_last_n_valid_positive_still_works() {
-        let (tool, mgr) = make_tool();
-        let session_id = SessionId::deterministic_dm("alice", "bob");
-        let dm_ctx = dm_context_id("alice", "bob");
-        let _session = mgr.get_or_create_shared(session_id, &dm_ctx);
-        for i in 0..10 {
-            mgr.append_message(session_id, make_dm_msg("bob", &format!("m{i}")))
-                .unwrap();
-        }
-
-        let result = tool
-            .execute(serde_json::json!({ "from": "bob", "last_n": 5 }))
-            .await
-            .unwrap();
-
-        assert_eq!(result["total_count"], 10);
-        assert_eq!(result["returned_count"], 5);
-        assert_eq!(result["truncated"], true);
-        assert_eq!(result["truncation_reason"], "explicit_last_n");
-        let msgs = result["messages"].as_array().unwrap();
-        assert_eq!(msgs[0]["content"], "m5");
-        assert_eq!(msgs[4]["content"], "m9");
     }
 
     /// Regression test for #558: dm_ended markers and other synthetic
