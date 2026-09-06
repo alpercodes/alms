@@ -413,8 +413,19 @@ async fn test_episodic_context_omits_user_md_from_the_system_prompt() {
             expected_write,
             "[{context_id}]"
         );
-        // Restore for the next row (the control writes; the episodic row must
-        // not, which the file content confirms either way).
+        // The file agrees with the verdict. A refusal that had already
+        // renamed the staging file into place would satisfy the return
+        // value and lose the data anyway.
+        let on_disk = workspace.read_file(WorkspaceFile::User).unwrap_or_default();
+        if user_facing {
+            assert_eq!(on_disk, "Name: Someone Else", "[{context_id}]");
+        } else {
+            assert!(
+                on_disk.contains("USER_MD_MARKER"),
+                "[{context_id}] a refused write must leave the file untouched; got: {on_disk:?}"
+            );
+        }
+        // Restore for the next row.
         workspace
             .write_file_as_operator(
                 WorkspaceFile::User,
