@@ -44,7 +44,7 @@
 use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 
 /// The base directory under `{data_dir}` where in-loop tool output spills
 /// live. Distinct from `shell_output/` (which holds the shell tool's
@@ -465,95 +465,14 @@ fn relative_path(spill_path: &Path, workspace_root: Option<&Path>) -> String {
 /// Delete spilled tool-output files older than `retention_days` under
 /// `{data_dir}/tool-output/`.
 ///
-/// Mirrors [`crate::spill::sweep_expired`]: walks every per-run directory,
-/// unlinks any file older than the cutoff, removes empty per-run dirs.
-/// Returns the number of files deleted.
+/// The sweep itself is [`alms_sandbox::retention::sweep_expired_under`],
+/// shared with the shell tool's `shell_output/` spill; this binds it to the
+/// tool-output root. Returns the number of files deleted.
 pub fn sweep_expired(data_dir: &Path, retention_days: u32) -> io::Result<u64> {
-    let root = data_dir.join(TOOL_OUTPUT_DIR_NAME);
-    if !root.exists() {
-        return Ok(0);
-    }
-
-    let cutoff = SystemTime::now()
-        .checked_sub(Duration::from_secs(u64::from(retention_days) * 86_400))
-        .unwrap_or(SystemTime::UNIX_EPOCH);
-
-    let mut deleted: u64 = 0;
-    let dir_iter = match std::fs::read_dir(&root) {
-        Ok(it) => it,
-        Err(e) => {
-            warn!(path = %root.display(), error = %e, "Failed to read tool-output directory");
-            return Err(e);
-        }
-    };
-
-    for run_entry in dir_iter {
-        let run_entry = match run_entry {
-            Ok(e) => e,
-            Err(e) => {
-                warn!(error = %e, "Failed to read tool-output run entry");
-                continue;
-            }
-        };
-        let run_path = run_entry.path();
-        if !run_path.is_dir() {
-            continue;
-        }
-
-        let files = match std::fs::read_dir(&run_path) {
-            Ok(it) => it,
-            Err(e) => {
-                warn!(path = %run_path.display(), error = %e, "Failed to read tool-output run dir");
-                continue;
-            }
-        };
-
-        let mut remaining: u64 = 0;
-        for file_entry in files {
-            let file_entry = match file_entry {
-                Ok(e) => e,
-                Err(e) => {
-                    warn!(error = %e, "Failed to read tool-output file entry");
-                    continue;
-                }
-            };
-            let file_path = file_entry.path();
-            let mtime = file_entry
-                .metadata()
-                .and_then(|m| m.modified())
-                .unwrap_or(SystemTime::UNIX_EPOCH);
-            if mtime < cutoff {
-                match std::fs::remove_file(&file_path) {
-                    Ok(()) => {
-                        deleted += 1;
-                        debug!(path = %file_path.display(), "Removed expired tool-output spill file");
-                    }
-                    Err(e) => {
-                        warn!(path = %file_path.display(), error = %e, "Failed to remove expired tool-output spill file");
-                        remaining += 1;
-                    }
-                }
-            } else {
-                remaining += 1;
-            }
-        }
-
-        if remaining == 0
-            && let Err(e) = std::fs::remove_dir(&run_path)
-        {
-            debug!(path = %run_path.display(), error = %e, "Failed to remove empty tool-output run dir");
-        }
-    }
-
-    if deleted > 0 {
-        info!(
-            deleted,
-            tool_output_root = %root.display(),
-            retention_days,
-            "Swept expired tool-output spill files"
-        );
-    }
-    Ok(deleted)
+    alms_sandbox::retention::sweep_expired_under(
+        &data_dir.join(TOOL_OUTPUT_DIR_NAME),
+        retention_days,
+    )
 }
 
 #[cfg(test)]
@@ -715,47 +634,42 @@ mod tests {
         assert!(rel.contains("call_rel"));
     }
 
+    /// `sweep_expired` is the shared sweep bound to `tool-output/`. The
+    /// algorithm is tested in `alms_sandbox::retention`; the only thing this
+    /// wrapper adds is the root, so that is what is pinned: an expired file
+    /// under the tool-output root goes, and an expired file under any other
+    /// directory of `data_dir` is not this sweep's to touch.
     #[test]
-    fn sweep_expired_deletes_old_files() {
+    fn sweep_expired_is_bound_to_the_tool_output_dir() {
         let dir = tempfile::tempdir().unwrap();
-        let run_dir = dir.path().join(TOOL_OUTPUT_DIR_NAME).join("run-old");
-        std::fs::create_dir_all(&run_dir).unwrap();
-        let old_file = run_dir.join("tool_old.txt");
-        std::fs::write(&old_file, b"old bytes").unwrap();
         let ten_days_ago = SystemTime::now() - Duration::from_secs(10 * 86_400);
-        let f = std::fs::File::options()
-            .write(true)
-            .open(&old_file)
-            .unwrap();
-        f.set_modified(ten_days_ago).unwrap();
-        drop(f);
+        let expired = |path: PathBuf| {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, b"old bytes").unwrap();
+            let f = std::fs::File::options().write(true).open(&path).unwrap();
+            f.set_modified(ten_days_ago).unwrap();
+            path
+        };
+        let ours = expired(
+            dir.path()
+                .join(TOOL_OUTPUT_DIR_NAME)
+                .join("run-old")
+                .join("tool_a.txt"),
+        );
+        let theirs = expired(
+            dir.path()
+                .join("elsewhere")
+                .join("run-old")
+                .join("tool_a.txt"),
+        );
 
         let deleted = sweep_expired(dir.path(), 7).unwrap();
         assert_eq!(deleted, 1);
-        assert!(!old_file.exists(), "old file must be deleted");
-    }
-
-    #[test]
-    fn sweep_expired_keeps_fresh_files() {
-        let dir = tempfile::tempdir().unwrap();
-        let run_dir = dir.path().join(TOOL_OUTPUT_DIR_NAME).join("run-fresh");
-        std::fs::create_dir_all(&run_dir).unwrap();
-        let fresh_file = run_dir.join("tool_fresh.txt");
-        std::fs::write(&fresh_file, b"fresh").unwrap();
-
-        let deleted = sweep_expired(dir.path(), 7).unwrap();
-        assert_eq!(deleted, 0);
+        assert!(!ours.exists(), "expired tool-output spill must be deleted");
         assert!(
-            fresh_file.exists(),
-            "fresh file must survive retention sweep"
+            theirs.exists(),
+            "a sibling of the tool-output root is not this sweep's to touch"
         );
-    }
-
-    #[test]
-    fn sweep_expired_missing_root_returns_zero() {
-        let dir = tempfile::tempdir().unwrap();
-        let deleted = sweep_expired(dir.path(), 7).unwrap();
-        assert_eq!(deleted, 0);
     }
 
     #[test]

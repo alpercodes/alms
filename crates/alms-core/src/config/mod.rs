@@ -12,6 +12,7 @@
 //! security — agents can read env vars via `shell_exec`.
 
 mod budget;
+mod summary_pair;
 mod types;
 
 #[cfg(test)]
@@ -20,6 +21,7 @@ mod tests;
 pub use budget::{
     TokenBudgetError, ValidationMode, provider_context_window, validate_token_budget,
 };
+pub use summary_pair::{SummaryPairError, check_summary_pair};
 pub use types::{
     AnthropicConfig, AuthScheme, ChannelsConfig, ContextConfig, DEFAULT_AGENT_MAX_TOKENS,
     FsEditConfig, GeminiConfig, LlmConfig, LoggingConfig, OpenAiConfig, ProviderEntry,
@@ -492,40 +494,24 @@ impl AlmsConfig {
         // The two `compact_*` knobs are bounded by `normalize_episodic`'s
         // soft clamps; no hard validate-time check is needed.
 
-        // Symmetric pair-only validation for `[context].summary_provider`
-        // / `[context].summary_model` (#877). The PATCH layer (and the
-        // per-agent CRUD path, see `validate_summary_pair` in
-        // `alms-gateway/src/agents.rs`) already reject asymmetric inputs,
-        // but a hand-edited `alms.toml` can land the daemon in that
-        // shape without going through PATCH. Validate at config-load
-        // time so the daemon refuses to start rather than silently
-        // shipping a half-configured summary path. Rule: both fields
-        // must be `Some` together or both `None` together — exactly
-        // one set is the broken case.
-        match (
+        // Pair-only validation for `[context].summary_provider` /
+        // `[context].summary_model` (#877). The PATCH layer and the
+        // per-agent CRUD path already reject asymmetric inputs, but a
+        // hand-edited `alms.toml` can land the daemon in that shape
+        // without going through either. Validate at config-load time so
+        // the daemon refuses to start rather than silently shipping a
+        // half-configured summary path. The rule itself is
+        // `check_summary_pair`; the deserializer has already mapped the
+        // `""` clear sentinel to `None`.
+        if let Err(e) = check_summary_pair(
             self.context.summary_provider.as_deref(),
             self.context.summary_model.as_deref(),
         ) {
-            (Some(_), None) => {
-                return Err(AlmsError::InvalidConfig(
-                    "context.summary_provider is set but context.summary_model is empty. \
-                     Set both fields together — the summary provider's wire model namespace \
-                     is independent of the agent's primary provider, so partial settings \
-                     cannot be safely resolved. Either set both, or remove both to \
-                     fall through to the agent's primary provider/model."
-                        .into(),
-                ));
-            }
-            (None, Some(_)) => {
-                return Err(AlmsError::InvalidConfig(
-                    "context.summary_model is set but context.summary_provider is empty. \
-                     Set both fields together — leaving summary_provider unset would fall \
-                     through to the agent's primary provider, which may not match this \
-                     model's namespace. Either set both, or remove both."
-                        .into(),
-                ));
-            }
-            _ => {}
+            return Err(AlmsError::InvalidConfig(format!(
+                "[context] {e} — the summary wire-model namespace is independent of the \
+                 agent's primary provider, so a half-set pair cannot be resolved; remove \
+                 both to fall through to the agent's primary provider/model"
+            )));
         }
 
         // Cross-section validation: session storage must hold at least one

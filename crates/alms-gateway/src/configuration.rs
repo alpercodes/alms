@@ -50,26 +50,16 @@ pub(crate) fn validate_summary_pair(
 ) -> Result<ValidatedSummaryPair, ConfigPolicyError> {
     let provider = normalized(provider);
     let model = normalized(model);
-    match (&provider, &model) {
-        (None, None) => {
-            return Ok(ValidatedSummaryPair { provider, model });
+    alms_core::config::check_summary_pair(provider.as_deref(), model.as_deref()).map_err(|e| {
+        ConfigPolicyError {
+            code: e.code(),
+            message: e.to_string(),
         }
-        (Some(_), None) => {
-            return Err(ConfigPolicyError {
-                code: "SUMMARY_PROVIDER_REQUIRES_MODEL",
-                message: "summary_provider is set but summary_model is empty; set both fields together or clear both".to_string(),
-            });
-        }
-        (None, Some(_)) => {
-            return Err(ConfigPolicyError {
-                code: "SUMMARY_MODEL_REQUIRES_PROVIDER",
-                message: "summary_model is set but summary_provider is empty; set both fields together or clear both".to_string(),
-            });
-        }
-        (Some(_), Some(_)) => {}
-    }
-
-    let provider_name = provider.as_deref().expect("validated provider presence");
+    })?;
+    let Some(provider_name) = provider.as_deref() else {
+        // Both unset: inherit the primary LLM configuration.
+        return Ok(ValidatedSummaryPair { provider, model });
+    };
     let Some(entry) = providers.get(provider_name) else {
         return Err(ConfigPolicyError {
             code: "SUMMARY_PROVIDER_UNKNOWN",

@@ -2397,31 +2397,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn post_agents_rejects_summary_model_without_provider() {
-        let mut state = agents_test_app_state_with_sqlite();
-        inject_openrouter_provider_with_key(&mut state);
-        let req = alms_core::CreateAgentRequest {
-            name: "asymmetric-b".into(),
-            description: None,
-            model: None,
-            posture: None,
-            provider: None,
-            telegram_token: None,
-            thinking_budget_tokens: None,
-            reasoning_effort: None,
-            gemini_thinking_budget: None,
-            summary_provider: None,
-            summary_model: Some("minimax/minimax-m2.7".into()),
-            worktree_mode: None,
-            debug_mode: None,
-            is_default: None,
-        };
-        let (status, body) = create_agent_err(state, req).await;
-        assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
-        assert_eq!(err_code(&body), "SUMMARY_MODEL_REQUIRES_PROVIDER");
-    }
-
-    #[tokio::test]
     async fn post_agents_accepts_summary_pair_with_resolvable_key() {
         // Happy path: provider entry exists AND has a resolvable key.
         // Both fields land in the persisted record verbatim.
