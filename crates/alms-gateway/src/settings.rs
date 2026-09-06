@@ -1816,17 +1816,21 @@ impl PersistedContextOverrides {
         // string is the persisted EXPLICIT-CLEAR sentinel — the operator
         // cleared the pair via PATCH to restore inherit-agent-model
         // behaviour, and that opt-out must override the compiled
-        // `Some(...)` default pair on reboot. Map the sentinel back to
-        // `None`; apply `Some(non-empty)` as a normal override; leave a
-        // genuinely absent field (`None`) untouched so the compiled /
-        // TOML value still wins for non-overridden deployments. Mirrors
-        // the TOML clear shape (`summary_model = ""` +
-        // `summary_provider = ""`), whose deserializer trims the same way.
+        // `Some(...)` default pair on reboot. `normalize_summary_field` is
+        // the one empty-means-unset policy: the sentinel maps back to
+        // `None`, a non-empty value is trimmed and applied as a normal
+        // override, and a genuinely absent field (`None`) is left untouched
+        // so the compiled / TOML value still wins for non-overridden
+        // deployments. This overlay is applied AFTER `AlmsConfig::validate`
+        // and nothing re-validates it, so a hand-edited `settings.json` is
+        // the one path that reaches the run-time provider lookup without
+        // passing through PATCH — the normaliser is what keeps it from
+        // landing `" openrouter "` as a key that can never resolve.
         if let Some(ref v) = self.summary_model {
-            ctx.summary_model = (!v.trim().is_empty()).then(|| v.clone());
+            ctx.summary_model = alms_core::config::normalize_summary_field(Some(v));
         }
         if let Some(ref v) = self.summary_provider {
-            ctx.summary_provider = (!v.trim().is_empty()).then(|| v.clone());
+            ctx.summary_provider = alms_core::config::normalize_summary_field(Some(v));
         }
         if let Some(ref v) = self.run_summary_mode {
             ctx.run_summary_mode = v.clone();
@@ -2375,6 +2379,24 @@ mod tests {
                 ctx.summary_provider
             );
         }
+    }
+
+    /// A hand-edited `settings.json` is applied over the already-validated
+    /// config and nothing re-validates it, so this overlay must normalise
+    /// like every other empty-means-unset surface: a non-empty value is
+    /// trimmed, not stored verbatim as a provider key that can never
+    /// resolve.
+    #[test]
+    fn context_overrides_summary_pair_is_trimmed() {
+        let mut ctx = alms_core::config::ContextConfig::default();
+        let overrides = PersistedContextOverrides {
+            summary_model: Some(" google/gemma-4-31b-it\t".into()),
+            summary_provider: Some("  openrouter ".into()),
+            ..Default::default()
+        };
+        overrides.apply_to(&mut ctx);
+        assert_eq!(ctx.summary_model.as_deref(), Some("google/gemma-4-31b-it"));
+        assert_eq!(ctx.summary_provider.as_deref(), Some("openrouter"));
     }
 
     /// Session overrides with partial fields should only overwrite `Some` fields.

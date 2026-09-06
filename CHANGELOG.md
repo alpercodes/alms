@@ -122,11 +122,12 @@ one.
   `alms_core::config::check_summary_pair`, applied by TOML load, `PATCH /settings`, the
   agent CRUD endpoints and the CLI. Error codes are unchanged; the CLI and boot-time
   messages now lead with the code and use the same sentence as the HTTP surface. The
-  empty-means-unset normalisation is likewise one function, so two inputs fell into line:
-  a `[context].summary_*` value with surrounding whitespace in `alms.toml` is now trimmed
-  (it used to be kept verbatim, as a provider key that could never resolve), and
-  `alms agent create --summary-provider`/`--summary-model` trim their values as
-  `agent config` already did. The retention sweep for `shell_output/` and `tool-output/`
+  empty-means-unset normalisation is likewise one function, so three inputs fell into line:
+  a `[context].summary_*` value with surrounding whitespace in `alms.toml` or in a
+  hand-edited `settings.json` is now trimmed (both used to keep it verbatim, as a provider
+  key that could never resolve — and the `settings.json` overlay is applied after config
+  validation, so nothing else would have caught it), and `alms agent create
+  --summary-provider`/`--summary-model` trim their values as `agent config` already did. The retention sweep for `shell_output/` and `tool-output/`
   spill files is likewise one routine, `alms_sandbox::retention::sweep_expired_under`;
   on-disk layout and behaviour are unchanged.
 
