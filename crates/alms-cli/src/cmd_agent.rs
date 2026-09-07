@@ -385,30 +385,20 @@ pub(crate) fn agent_create(store: &SqliteStore, opts: AgentCreateOpts<'_>) -> an
         );
     }
 
-    // Pair-only invariant for the per-agent summary fields (#872, #876).
-    // Mirrors the HTTP `POST /agents` validator — setting one without the
-    // other is meaningless and would silently fall through to the
-    // server-level `[context].summary_*`. Surface a clear CLI error here
-    // rather than letting the user discover the mismatch only when the
-    // summary task fires at run time.
-    match (summary_provider.as_deref(), summary_model.as_deref()) {
-        (Some(_), None) => {
-            anyhow::bail!(
-                "--summary-provider is set but --summary-model is empty. \
-                 Set both flags together — the summary provider's wire model \
-                 namespace is independent of the agent's primary provider, so \
-                 partial settings cannot be safely resolved."
-            );
-        }
-        (None, Some(_)) => {
-            anyhow::bail!(
-                "--summary-model is set but --summary-provider is empty. \
-                 Set both flags together — leaving --summary-provider unset \
-                 would fall through to the server-level [context].summary_provider, \
-                 which may not match this model's namespace."
-            );
-        }
-        _ => {}
+    // Pair-only invariant for the per-agent summary fields (#872, #876),
+    // the same rule the HTTP `POST /agents` validator applies — setting
+    // one without the other is meaningless and would silently fall through
+    // to the server-level `[context].summary_*`. Surface it here rather
+    // than letting the user discover the mismatch only when the summary
+    // task fires at run time.
+    if let Err(e) =
+        alms_core::config::check_summary_pair(summary_provider.as_deref(), summary_model.as_deref())
+    {
+        anyhow::bail!(
+            "{}: {e}. Set --summary-provider and --summary-model together, or omit \
+             both to inherit the server-level [context].summary_*.",
+            e.code()
+        );
     }
 
     let now = chrono::Utc::now();
@@ -426,13 +416,12 @@ pub(crate) fn agent_create(store: &SqliteStore, opts: AgentCreateOpts<'_>) -> an
         // Per-agent summary overrides (#872, #876). The empty /
         // whitespace-only rejection and the pair-only invariant are
         // both enforced above, so at this point both fields are either
-        // `Some(non_empty)` together or both `None`. Values reach the
-        // registry without further trimming — the HTTP layers (POST
-        // back-compat normalize, PUT trim-on-apply) do their own
-        // trimming, and a CLI operator who explicitly typed a value
-        // with surrounding whitespace probably means it.
-        summary_provider,
-        summary_model,
+        // `Some(non_empty)` together or both `None`. Trimmed on the way
+        // to the registry, like `agent config`, `POST` and `PUT /agents`
+        // — a provider key or model slug with surrounding whitespace
+        // never resolves, so it is never what the operator meant.
+        summary_provider: summary_provider.map(|s| s.trim().to_string()),
+        summary_model: summary_model.map(|s| s.trim().to_string()),
         worktree_mode,
         // Debug mode (#1003) is operator-flippable via PATCH /agents/{id}
         // (or the per-agent edit modal in the web UI) — `alms agent
@@ -887,27 +876,23 @@ pub(crate) fn agent_config(store: &SqliteStore, opts: AgentConfigOpts<'_>) -> an
     // AppState, so we leave that check to the daemon at run time —
     // matches the contract Atlas described (load-time vs run-time
     // layers in #877/#878).
-    match (
+    if let Err(e) = alms_core::config::check_summary_pair(
         agent.summary_provider.as_deref(),
         agent.summary_model.as_deref(),
     ) {
-        (Some(_), None) => {
-            anyhow::bail!(
-                "SUMMARY_PROVIDER_REQUIRES_MODEL: agent.summary_provider would \
-                 be set but agent.summary_model is empty after this update. \
-                 Pass --summary-model together with --summary-provider, or \
-                 add --clear-summary-provider to drop the existing override."
-            );
-        }
-        (None, Some(_)) => {
-            anyhow::bail!(
-                "SUMMARY_MODEL_REQUIRES_PROVIDER: agent.summary_model would be \
-                 set but agent.summary_provider is empty after this update. \
-                 Pass --summary-provider together with --summary-model, or \
-                 add --clear-summary-model to drop the existing override."
-            );
-        }
-        _ => {}
+        let (set_flag, clear_flag) = match e {
+            alms_core::config::SummaryPairError::ProviderRequiresModel => {
+                ("--summary-model", "--clear-summary-provider")
+            }
+            alms_core::config::SummaryPairError::ModelRequiresProvider => {
+                ("--summary-provider", "--clear-summary-model")
+            }
+        };
+        anyhow::bail!(
+            "{}: after this update, {e}. Pass {set_flag} as well, or add {clear_flag} to \
+             drop the existing override.",
+            e.code()
+        );
     }
 
     agent.last_active = chrono::Utc::now();
@@ -1586,6 +1571,38 @@ mod tests {
         assert_eq!(agent.summary_model.as_deref(), Some("minimax/minimax-m2.7"));
     }
 
+    /// `agent create` trims the pair on the way to the registry, as
+    /// `agent config` always has and as both HTTP paths do — the CLI's two
+    /// write paths used to disagree on this.
+    #[test]
+    fn test_create_trims_summary_fields() {
+        let store = new_store();
+        agent_create(
+            &store,
+            AgentCreateOpts {
+                name: "summary-trimmed".into(),
+                description: None,
+                model: None,
+                posture: None,
+                provider: None,
+                thinking_budget_tokens: None,
+                reasoning_effort: None,
+                gemini_thinking_budget: None,
+                summary_provider: Some("  openrouter ".into()),
+                summary_model: Some(" minimax/minimax-m2.7\t".into()),
+                worktree_mode: WorktreeMode::Off,
+                project_root: None,
+                default: false,
+                json: false,
+                workspace_dir: None,
+            },
+        )
+        .unwrap();
+        let agent = resolve_agent(&store, "summary-trimmed").unwrap();
+        assert_eq!(agent.summary_provider.as_deref(), Some("openrouter"));
+        assert_eq!(agent.summary_model.as_deref(), Some("minimax/minimax-m2.7"));
+    }
+
     #[test]
     fn test_create_rejects_summary_provider_without_model() {
         // Pair-only invariant — surface the same error code at the CLI
@@ -1614,38 +1631,8 @@ mod tests {
         )
         .unwrap_err();
         assert!(
-            err.to_string().contains("--summary-model is empty"),
-            "expected partial-pair error, got: {err}"
-        );
-    }
-
-    #[test]
-    fn test_create_rejects_summary_model_without_provider() {
-        let store = new_store();
-        let err = agent_create(
-            &store,
-            AgentCreateOpts {
-                name: "partial-pair-b".into(),
-                description: None,
-                model: None,
-                posture: None,
-                provider: None,
-                thinking_budget_tokens: None,
-                reasoning_effort: None,
-                gemini_thinking_budget: None,
-                summary_provider: None,
-                summary_model: Some("minimax/minimax-m2.7".into()),
-                worktree_mode: WorktreeMode::Off,
-                project_root: None,
-                default: false,
-                json: false,
-                workspace_dir: None,
-            },
-        )
-        .unwrap_err();
-        assert!(
-            err.to_string().contains("--summary-provider is empty"),
-            "expected partial-pair error, got: {err}"
+            err.to_string().contains("SUMMARY_PROVIDER_REQUIRES_MODEL"),
+            "expected SUMMARY_PROVIDER_REQUIRES_MODEL, got: {err}"
         );
     }
 
@@ -1781,42 +1768,6 @@ mod tests {
         assert!(
             err.to_string().contains("CLEAR_AND_VALUE_CONFLICT"),
             "expected CLEAR_AND_VALUE_CONFLICT, got: {err}"
-        );
-    }
-
-    #[test]
-    fn test_config_rejects_setting_only_summary_provider() {
-        // Pair-only invariant on the post-update record state — when the
-        // pre-existing record has both fields None, setting only the
-        // provider would leave the record asymmetric. Reject with the
-        // same error code the HTTP `PUT /agents/{id}` validator uses.
-        let store = new_store();
-        make_agent(&store, "asymmetric-a");
-        let err = agent_config(
-            &store,
-            AgentConfigOpts {
-                name_or_id: "asymmetric-a",
-                model: None,
-                posture: None,
-                provider: None,
-                description: None,
-                thinking_budget_tokens: None,
-                reasoning_effort: None,
-                gemini_thinking_budget: None,
-                summary_provider: Some("openrouter".into()),
-                summary_model: None,
-                clear_summary_provider: false,
-                clear_summary_model: false,
-                worktree_mode: None,
-                force_worktree_remove: false,
-                project_root: None,
-                json: false,
-            },
-        )
-        .unwrap_err();
-        assert!(
-            err.to_string().contains("SUMMARY_PROVIDER_REQUIRES_MODEL"),
-            "expected SUMMARY_PROVIDER_REQUIRES_MODEL, got: {err}"
         );
     }
 

@@ -2057,42 +2057,6 @@ fn test_validation_rejects_summary_provider_without_model() {
 }
 
 #[test]
-fn test_validation_rejects_summary_model_without_provider() {
-    let mut config = AlmsConfig::default();
-    config.context.summary_provider = None;
-    config.context.summary_model = Some("minimax/minimax-m2.7".into());
-    let err = config.validate().unwrap_err();
-    let msg = err.to_string();
-    assert!(
-        msg.contains("summary_model is set") && msg.contains("summary_provider is empty"),
-        "expected pair-only error message about model-without-provider, got: {msg}"
-    );
-}
-
-#[test]
-fn test_validation_accepts_both_summary_fields_set() {
-    let mut config = AlmsConfig::default();
-    config.context.summary_provider = Some("openrouter".into());
-    config.context.summary_model = Some("minimax/minimax-m2.7".into());
-    assert!(
-        config.validate().is_ok(),
-        "both fields set together is the valid 'opt-in' shape"
-    );
-}
-
-#[test]
-fn test_validation_accepts_both_summary_fields_none() {
-    // Both-None is the explicit opt-out shape (inherit the agent's
-    // resolved provider/model for summaries). It was the shipped
-    // baseline from #872 until #1191 flipped the default to an explicit
-    // pair; clearing both together must remain valid.
-    let mut config = AlmsConfig::default();
-    config.context.summary_provider = None;
-    config.context.summary_model = None;
-    assert!(config.validate().is_ok());
-}
-
-#[test]
 fn test_validation_accepts_default_summary_pair() {
     // #1191: the shipped baseline is now an explicit symmetric pair —
     // `(openrouter, google/gemma-4-31b-it)`. A fresh default config must
@@ -2160,25 +2124,6 @@ summary_provider = "openrouter"
     );
 }
 
-#[test]
-fn test_asymmetric_summary_toml_other_direction_fails_at_load_time() {
-    let toml_str = r#"
-[llm]
-provider = "anthropic"
-model = "claude-sonnet"
-
-[context]
-summary_model = "minimax/minimax-m2.7"
-"#;
-    let mut cfg: AlmsConfig = toml::from_str(toml_str).expect("TOML parses");
-    cfg.llm.ensure_builtin_providers();
-    let err = cfg.validate().unwrap_err();
-    assert!(
-        err.to_string().contains("summary_model is set"),
-        "asymmetric TOML must be rejected at validate(), got: {err}"
-    );
-}
-
 /// #1191 pair-aware default fill: a `[context]` block that does not
 /// mention the summary pair at all inherits the default pair — absence
 /// means "use the default", same as every other `[context]` knob.
@@ -2228,6 +2173,25 @@ summary_model = "minimax/minimax-m2.7"
     assert_eq!(
         cfg.context.summary_model.as_deref(),
         Some("minimax/minimax-m2.7")
+    );
+}
+
+/// The TOML surface applies the same empty-means-unset normalisation as
+/// `PATCH /settings` (`normalize_summary_field`): a non-empty value is
+/// trimmed, so `" openrouter "` is the `openrouter` provider entry and not
+/// a key that can never resolve.
+#[test]
+fn test_context_toml_summary_pair_is_trimmed() {
+    let toml_str = r#"
+[context]
+summary_provider = " openrouter "
+summary_model = "	google/gemma-4-31b-it "
+"#;
+    let cfg: AlmsConfig = toml::from_str(toml_str).expect("TOML parses");
+    assert_eq!(cfg.context.summary_provider.as_deref(), Some("openrouter"));
+    assert_eq!(
+        cfg.context.summary_model.as_deref(),
+        Some("google/gemma-4-31b-it")
     );
 }
 

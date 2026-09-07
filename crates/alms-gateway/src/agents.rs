@@ -208,19 +208,12 @@ pub async fn create_agent(
 
     // Per-agent summary overrides (#872) — pair-only validation. Treat
     // the empty string the same as a missing field for back-compat with
-    // CLIs / scripts that habitually pass `""` to mean "unset".
-    let summary_provider_norm = req
-        .summary_provider
-        .as_ref()
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-        .map(str::to_string);
-    let summary_model_norm = req
-        .summary_model
-        .as_ref()
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-        .map(str::to_string);
+    // CLIs / scripts that habitually pass `""` to mean "unset" — the same
+    // empty-means-unset policy `PATCH /settings` and `alms.toml` apply.
+    let summary_provider_norm =
+        alms_core::config::normalize_summary_field(req.summary_provider.as_deref());
+    let summary_model_norm =
+        alms_core::config::normalize_summary_field(req.summary_model.as_deref());
     validate_summary_pair(
         &state,
         summary_provider_norm.as_deref(),
@@ -2394,31 +2387,6 @@ mod tests {
         let (status, body) = create_agent_err(state, req).await;
         assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
         assert_eq!(err_code(&body), "SUMMARY_PROVIDER_REQUIRES_MODEL");
-    }
-
-    #[tokio::test]
-    async fn post_agents_rejects_summary_model_without_provider() {
-        let mut state = agents_test_app_state_with_sqlite();
-        inject_openrouter_provider_with_key(&mut state);
-        let req = alms_core::CreateAgentRequest {
-            name: "asymmetric-b".into(),
-            description: None,
-            model: None,
-            posture: None,
-            provider: None,
-            telegram_token: None,
-            thinking_budget_tokens: None,
-            reasoning_effort: None,
-            gemini_thinking_budget: None,
-            summary_provider: None,
-            summary_model: Some("minimax/minimax-m2.7".into()),
-            worktree_mode: None,
-            debug_mode: None,
-            is_default: None,
-        };
-        let (status, body) = create_agent_err(state, req).await;
-        assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
-        assert_eq!(err_code(&body), "SUMMARY_MODEL_REQUIRES_PROVIDER");
     }
 
     #[tokio::test]

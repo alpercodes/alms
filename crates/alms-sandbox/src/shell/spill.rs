@@ -33,7 +33,7 @@
 use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
-use tracing::{debug, info, warn};
+use tracing::debug;
 
 /// The fixed base directory name under `{data_dir}/` where spill files live.
 ///
@@ -186,107 +186,11 @@ pub fn relative_spill_path(spill_path: &Path, workspace_root: Option<&Path>) -> 
 /// Delete spilled log files older than `retention_days` under
 /// `{data_dir}/shell_output/`.
 ///
-/// Walks every `{data_dir}/shell_output/<run_id>/*.log`, checks filesystem
-/// `mtime`, and unlinks any file older than the retention window. Empty
-/// `<run_id>` directories are also removed so the tree stays tidy.
-///
-/// Errors on individual files are logged at `warn` level; the sweep never
-/// aborts partway through because of one bad entry.
-///
-/// Returns the number of files deleted (for diagnostics / logging at the
-/// gateway-startup callsite).
+/// The sweep itself is [`crate::retention::sweep_expired_under`], shared
+/// with the runtime's `tool-output/` spill; this binds it to the shell
+/// spill root. Returns the number of files deleted.
 pub fn sweep_expired(data_dir: &Path, retention_days: u32) -> io::Result<u64> {
-    let spill_root = data_dir.join(SPILL_DIR_NAME);
-    if !spill_root.exists() {
-        return Ok(0);
-    }
-
-    let cutoff = SystemTime::now()
-        .checked_sub(Duration::from_secs(u64::from(retention_days) * 86_400))
-        // If subtraction underflows (retention_days is absurdly large), fall
-        // back to UNIX_EPOCH — every on-disk file will be older, meaning the
-        // caller would delete everything. That is the correct behaviour for
-        // an "everything is expired" request.
-        .unwrap_or(SystemTime::UNIX_EPOCH);
-
-    let mut deleted: u64 = 0;
-    let dir_iter = match std::fs::read_dir(&spill_root) {
-        Ok(it) => it,
-        Err(e) => {
-            warn!(path = %spill_root.display(), error = %e, "Failed to read shell_output directory");
-            return Err(e);
-        }
-    };
-
-    for run_entry in dir_iter {
-        let run_entry = match run_entry {
-            Ok(e) => e,
-            Err(e) => {
-                warn!(error = %e, "Failed to read shell_output run entry");
-                continue;
-            }
-        };
-        let run_path = run_entry.path();
-        if !run_path.is_dir() {
-            continue;
-        }
-
-        let files = match std::fs::read_dir(&run_path) {
-            Ok(it) => it,
-            Err(e) => {
-                warn!(path = %run_path.display(), error = %e, "Failed to read run spill dir");
-                continue;
-            }
-        };
-
-        let mut remaining: u64 = 0;
-        for file_entry in files {
-            let file_entry = match file_entry {
-                Ok(e) => e,
-                Err(e) => {
-                    warn!(error = %e, "Failed to read spill file entry");
-                    continue;
-                }
-            };
-            let file_path = file_entry.path();
-            let mtime = file_entry
-                .metadata()
-                .and_then(|m| m.modified())
-                .unwrap_or(SystemTime::UNIX_EPOCH);
-            if mtime < cutoff {
-                match std::fs::remove_file(&file_path) {
-                    Ok(()) => {
-                        deleted += 1;
-                        debug!(path = %file_path.display(), "Removed expired shell spill file");
-                    }
-                    Err(e) => {
-                        warn!(path = %file_path.display(), error = %e, "Failed to remove expired spill file");
-                        remaining += 1;
-                    }
-                }
-            } else {
-                remaining += 1;
-            }
-        }
-
-        // If the per-run directory is now empty, remove it too.
-        if remaining == 0
-            && let Err(e) = std::fs::remove_dir(&run_path)
-        {
-            // Not fatal — the next sweep will try again.
-            debug!(path = %run_path.display(), error = %e, "Failed to remove empty run spill dir");
-        }
-    }
-
-    if deleted > 0 {
-        info!(
-            deleted,
-            spill_root = %spill_root.display(),
-            retention_days,
-            "Swept expired shell output spill files"
-        );
-    }
-    Ok(deleted)
+    crate::retention::sweep_expired_under(&data_dir.join(SPILL_DIR_NAME), retention_days)
 }
 
 #[cfg(test)]
@@ -378,96 +282,36 @@ mod tests {
         assert_eq!(rel, "/var/log/spill.log");
     }
 
+    /// `sweep_expired` is the shared sweep bound to `shell_output/`. The
+    /// algorithm is tested in `crate::retention`; the only thing this wrapper
+    /// adds is the root, so that is what is pinned: an expired file under
+    /// the shell spill root goes, and an expired file under any other
+    /// directory of `data_dir` is not this sweep's to touch.
     #[test]
-    fn sweep_expired_missing_root_returns_zero() {
+    fn sweep_expired_is_bound_to_the_shell_output_dir() {
         let dir = tempfile::tempdir().unwrap();
-        let deleted = sweep_expired(dir.path(), 7).unwrap();
-        assert_eq!(deleted, 0);
-    }
-
-    #[test]
-    fn sweep_expired_leaves_fresh_files_alone() {
-        let dir = tempfile::tempdir().unwrap();
-        let run_dir = dir.path().join(SPILL_DIR_NAME).join("run-fresh");
-        std::fs::create_dir_all(&run_dir).unwrap();
-        let file = run_dir.join("shell_a.log");
-        std::fs::write(&file, b"hello").unwrap();
-
-        let deleted = sweep_expired(dir.path(), 7).unwrap();
-        assert_eq!(deleted, 0);
-        assert!(file.exists(), "fresh file must survive retention sweep");
-    }
-
-    #[test]
-    fn sweep_expired_deletes_old_files() {
-        let dir = tempfile::tempdir().unwrap();
-        let run_dir = dir.path().join(SPILL_DIR_NAME).join("run-old");
-        std::fs::create_dir_all(&run_dir).unwrap();
-        let old_file = run_dir.join("shell_a.log");
-        std::fs::write(&old_file, b"old bytes").unwrap();
-
-        // Backdate the file by 10 days by setting mtime via the filetime
-        // crate isn't available here — use std::fs::File::set_modified, which
-        // is stable on Rust 1.75+. The project targets nightly so this is
-        // fine.
         let ten_days_ago = SystemTime::now() - Duration::from_secs(10 * 86_400);
-        let f = std::fs::File::options()
-            .write(true)
-            .open(&old_file)
-            .unwrap();
-        f.set_modified(ten_days_ago).unwrap();
-        drop(f);
-
-        let deleted = sweep_expired(dir.path(), 7).unwrap();
-        assert_eq!(deleted, 1);
-        assert!(!old_file.exists(), "old file must be deleted");
-    }
-
-    #[test]
-    fn sweep_expired_removes_empty_run_dir() {
-        let dir = tempfile::tempdir().unwrap();
-        let run_dir = dir.path().join(SPILL_DIR_NAME).join("run-empty");
-        std::fs::create_dir_all(&run_dir).unwrap();
-        let old_file = run_dir.join("shell_a.log");
-        std::fs::write(&old_file, b"").unwrap();
-        let ten_days_ago = SystemTime::now() - Duration::from_secs(10 * 86_400);
-        let f = std::fs::File::options()
-            .write(true)
-            .open(&old_file)
-            .unwrap();
-        f.set_modified(ten_days_ago).unwrap();
-        drop(f);
-
-        sweep_expired(dir.path(), 7).unwrap();
-        assert!(
-            !run_dir.exists(),
-            "empty per-run dir should be removed after sweep"
+        let expired = |path: PathBuf| {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, b"old bytes").unwrap();
+            let f = std::fs::File::options().write(true).open(&path).unwrap();
+            f.set_modified(ten_days_ago).unwrap();
+            path
+        };
+        let ours = expired(
+            dir.path()
+                .join(SPILL_DIR_NAME)
+                .join("run-old")
+                .join("a.log"),
         );
-    }
-
-    #[test]
-    fn sweep_expired_keeps_run_dir_with_fresh_files() {
-        let dir = tempfile::tempdir().unwrap();
-        let run_dir = dir.path().join(SPILL_DIR_NAME).join("run-mixed");
-        std::fs::create_dir_all(&run_dir).unwrap();
-
-        // One old file (should be deleted), one fresh file (should survive).
-        let old_file = run_dir.join("shell_old.log");
-        let fresh_file = run_dir.join("shell_fresh.log");
-        std::fs::write(&old_file, b"old").unwrap();
-        std::fs::write(&fresh_file, b"fresh").unwrap();
-        let ten_days_ago = SystemTime::now() - Duration::from_secs(10 * 86_400);
-        let f = std::fs::File::options()
-            .write(true)
-            .open(&old_file)
-            .unwrap();
-        f.set_modified(ten_days_ago).unwrap();
-        drop(f);
+        let theirs = expired(dir.path().join("elsewhere").join("run-old").join("a.log"));
 
         let deleted = sweep_expired(dir.path(), 7).unwrap();
         assert_eq!(deleted, 1);
-        assert!(!old_file.exists());
-        assert!(fresh_file.exists());
-        assert!(run_dir.exists(), "run dir with fresh files must survive");
+        assert!(!ours.exists(), "expired shell spill must be deleted");
+        assert!(
+            theirs.exists(),
+            "a sibling of the shell spill root is not this sweep's to touch"
+        );
     }
 }

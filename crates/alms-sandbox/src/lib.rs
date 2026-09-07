@@ -8,6 +8,7 @@ pub mod builtin;
 pub mod error;
 pub mod file_state_cache;
 pub mod registry;
+pub mod retention;
 pub mod shell;
 
 pub use builtin::{
