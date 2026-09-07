@@ -50,8 +50,8 @@ impl AgentRuntime {
 
     /// Returns true if the given context_id represents a user-facing session
     /// (web chat, Telegram, etc.) where `user.md` should be included in the
-    /// system prompt.  Non-user-facing contexts (DM, subagent, job,
-    /// notification, episodic) return false.
+    /// system prompt.  Non-user-facing contexts — the prefixes listed in the
+    /// body — return false.
     ///
     /// This is a **policy** over context types, not a classification of
     /// them. `alms_core::classify_session_type` is the single source of
