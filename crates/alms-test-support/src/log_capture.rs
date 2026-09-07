@@ -2,6 +2,14 @@
 
 //! Interest-cache-safe `tracing` capture harness for log-asserting tests.
 //!
+//! Events are captured **structured** — level, target, message and the
+//! recorded fields — not as rendered text. The fields are the contract a
+//! log-asserting test pins; the rendering belongs to whichever formatter
+//! the deployment installs, and it has changed once already (the old
+//! string harness left tests hedging `direction="off->git"` against
+//! `direction=off->git`, which is the tell that the rendering was never
+//! the thing being asserted).
+//!
 //! # The defect this exists to prevent (#1221)
 //!
 //! The obvious way to assert on a structured log is to wrap the code
@@ -35,40 +43,37 @@
 //! # How this module removes the failure mode
 //!
 //! One subscriber is installed as the **global** default, once per test
-//! binary, and capturing becomes a *writer*-level concern rather than a
+//! binary, and capturing becomes a per-thread concern rather than a
 //! subscriber-level one:
 //!
-//! * `CaptureFilter::register_callsite` returns [`Interest::sometimes`]
+//! * `CaptureLayer::register_callsite` returns [`Interest::sometimes`]
 //!   for every callsite — never [`Interest::never`] — so no cached
 //!   interest can short-circuit an event, whichever thread touches a
 //!   callsite first. There is no thread without a subscriber any more.
-//! * `CaptureFilter::max_level_hint` pins `tracing`'s process-global
+//! * `CaptureLayer::max_level_hint` pins `tracing`'s process-global
 //!   `MAX_LEVEL` to `TRACE`, so the macros' static level check cannot
 //!   short-circuit either.
 //! * The actual "should this be recorded" decision moves to
-//!   `CaptureFilter::enabled`, which is re-evaluated per event **on the
+//!   `CaptureLayer::enabled`, which is re-evaluated per event **on the
 //!   emitting thread** against that thread's capture slot. Threads that
 //!   are not capturing answer `false`.
 //!
 //! Because no per-capture `Dispatch` is created any more, the interest
-//! cache is never re-evaluated mid-run, and the capture buffer is
-//! thread-local, so parallel tests cannot see each other's output.
+//! cache is never re-evaluated mid-run, and the capture slot is
+//! thread-local, so parallel tests cannot see each other's events.
 //!
 //! # What this costs the tests that do not capture
 //!
 //! Pinning interest to `sometimes` and `MAX_LEVEL` to `TRACE` gives up
 //! `tracing`'s two static short-circuits, so every callsite in a test
-//! binary that calls [`capture_logs`] — including the `debug!`/`trace!`
+//! binary that calls [`capture_events`] — including the `debug!`/`trace!`
 //! ones that used to die at the level check — now reaches a **runtime
 //! dispatch**: a `MAX_LEVEL` load, an `Interest` load, a global-dispatch
-//! lookup and two `Layered::enabled` calls before
-//! `CaptureFilter::enabled` reads the thread-local slot and answers
-//! `false`. That is tens of nanoseconds and allocation-free —
-//! `CaptureFilter` is the **outer** layer, so its `false` short-circuits
-//! before the `fmt` layer or the registry are touched, and `event!`
-//! keeps the field expressions inside its `if enabled` branch, so
-//! nothing is formatted. Cheap, but a dispatch rather than a
-//! thread-local read.
+//! lookup and one `Layered::enabled` call before `CaptureLayer::enabled`
+//! reads the thread-local slot and answers `false`. That is tens of
+//! nanoseconds and allocation-free — `event!` keeps the field
+//! expressions inside its `if enabled` branch, so nothing is formatted.
+//! Cheap, but a dispatch rather than a thread-local read.
 //!
 //! **It stays cheap only because `tokio_unstable` is off.** The
 //! workspace enables tokio's `tracing` feature (root `Cargo.toml`), but
@@ -92,25 +97,108 @@
 //! [`Interest::sometimes`]: tracing::subscriber::Interest::sometimes
 
 use std::cell::RefCell;
-use std::io;
+use std::collections::BTreeMap;
+use std::fmt;
+use std::ops::Deref;
 use std::sync::{Arc, Mutex, OnceLock};
 
+use tracing::field::{Field, Visit};
 use tracing::level_filters::LevelFilter;
 use tracing::subscriber::Interest;
-use tracing::{Level, Metadata, Subscriber};
+use tracing::{Event, Level, Metadata, Subscriber};
 use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
 
+/// One `tracing` event as the subscriber saw it: severity, target, the
+/// message, and every other recorded field rendered to a string.
+///
+/// Field values are rendered the way the macro recorded them — a `&str`
+/// or a `%value` lands as its bare text (no quotes), a `?value` as its
+/// `Debug` form, numbers and booleans via `to_string`. Assert on
+/// [`field`](Self::field), not on a rendering of the whole line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CapturedEvent {
+    pub level: Level,
+    pub target: String,
+    pub message: String,
+    pub fields: BTreeMap<String, String>,
+}
+
+impl CapturedEvent {
+    /// The recorded value of `name`, or `None` when the event did not
+    /// carry that field.
+    ///
+    /// The value is rendered the way the macro recorded it: a bare `&str`
+    /// and a `%value` are the bare text, but a `?value` is its `Debug`
+    /// form — so a `String` recorded with `?` comes back **quoted**, and
+    /// the assertion is `Some("\"foo\"")`, not `Some("foo")`. If that
+    /// surprises you at the assertion, the fix is usually `%` at the
+    /// callsite, not a different expected string here.
+    pub fn field(&self, name: &str) -> Option<&str> {
+        self.fields.get(name).map(String::as_str)
+    }
+
+    /// Whether the event carried a field called `name`, whatever its value.
+    pub fn has_field(&self, name: &str) -> bool {
+        self.fields.contains_key(name)
+    }
+}
+
+impl fmt::Display for CapturedEvent {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} {}: {}", self.level, self.target, self.message)?;
+        for (k, v) in &self.fields {
+            write!(f, " {k}={v:?}")?;
+        }
+        Ok(())
+    }
+}
+
+/// The events one capture window recorded, in emission order.
+///
+/// Derefs to `[CapturedEvent]`, so the slice and iterator vocabulary
+/// (`len`, `iter().any(..)`, `iter().filter(..)`) is the assertion API.
+/// `Display` renders one event per line for panic messages.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CapturedEvents(pub Vec<CapturedEvent>);
+
+impl CapturedEvents {
+    /// The events emitted at `target`, in order.
+    pub fn at_target<'a>(&'a self, target: &'a str) -> impl Iterator<Item = &'a CapturedEvent> {
+        self.iter().filter(move |e| e.target == target)
+    }
+}
+
+impl Deref for CapturedEvents {
+    type Target = [CapturedEvent];
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl fmt::Display for CapturedEvents {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.0.is_empty() {
+            return write!(f, "(no events captured)");
+        }
+        for e in &self.0 {
+            writeln!(f, "{e}")?;
+        }
+        Ok(())
+    }
+}
+
 /// One thread's in-flight capture: the minimum severity it wants and
-/// the buffer the formatted events land in.
+/// the vector the recorded events land in.
 #[derive(Clone)]
 struct Capture {
     level: Level,
-    buf: Arc<Mutex<Vec<u8>>>,
+    events: Arc<Mutex<Vec<CapturedEvent>>>,
 }
 
 thread_local! {
     /// The calling thread's active capture, or `None` when this thread
-    /// is not inside [`capture_logs`].
+    /// is not inside [`capture_events`].
     static ACTIVE: RefCell<Option<Capture>> = const { RefCell::new(None) };
 }
 
@@ -131,12 +219,70 @@ impl Drop for ActiveGuard {
     }
 }
 
-/// The layer that keeps every callsite permanently live (see the module
-/// docs) while gating the actual recording on the emitting thread's
-/// capture slot.
-struct CaptureFilter;
+/// Renders an event's fields into a [`CapturedEvent`].
+struct FieldRecorder {
+    message: String,
+    fields: BTreeMap<String, String>,
+}
 
-impl<S: Subscriber> Layer<S> for CaptureFilter {
+impl FieldRecorder {
+    fn put(&mut self, field: &Field, value: String) {
+        if field.name() == "message" {
+            self.message = value;
+        } else {
+            self.fields.insert(field.name().to_string(), value);
+        }
+    }
+}
+
+impl Visit for FieldRecorder {
+    fn record_debug(&mut self, field: &Field, value: &dyn fmt::Debug) {
+        // `%value` arrives here wrapped in a type whose `Debug` is the
+        // value's `Display`, so this is the bare text for those; a
+        // `?value` is its `Debug` form; a format-args message is the
+        // formatted string.
+        self.put(field, format!("{value:?}"));
+    }
+
+    fn record_str(&mut self, field: &Field, value: &str) {
+        self.put(field, value.to_string());
+    }
+
+    fn record_i64(&mut self, field: &Field, value: i64) {
+        self.put(field, value.to_string());
+    }
+
+    fn record_u64(&mut self, field: &Field, value: u64) {
+        self.put(field, value.to_string());
+    }
+
+    fn record_i128(&mut self, field: &Field, value: i128) {
+        self.put(field, value.to_string());
+    }
+
+    fn record_u128(&mut self, field: &Field, value: u128) {
+        self.put(field, value.to_string());
+    }
+
+    fn record_f64(&mut self, field: &Field, value: f64) {
+        self.put(field, value.to_string());
+    }
+
+    fn record_bool(&mut self, field: &Field, value: bool) {
+        self.put(field, value.to_string());
+    }
+
+    fn record_error(&mut self, field: &Field, value: &(dyn std::error::Error + 'static)) {
+        self.put(field, value.to_string());
+    }
+}
+
+/// The layer that keeps every callsite permanently live (see the module
+/// docs), gates recording on the emitting thread's capture slot, and
+/// records the events that pass.
+struct CaptureLayer;
+
+impl<S: Subscriber> Layer<S> for CaptureLayer {
     fn register_callsite(&self, _meta: &'static Metadata<'static>) -> Interest {
         // Deliberately never `Interest::never()`: a cached `never` is
         // the #1221 defect. `sometimes` keeps the callsite live and
@@ -155,69 +301,50 @@ impl<S: Subscriber> Layer<S> for CaptureFilter {
     fn max_level_hint(&self) -> Option<LevelFilter> {
         Some(LevelFilter::TRACE)
     }
-}
 
-/// Routes each recorded event into the emitting thread's capture
-/// buffer. `CaptureFilter::enabled` has already vetted the event, so a
-/// missing slot here can only happen if some other layer re-enables an
-/// event on a non-capturing thread — in which case the bytes are
-/// dropped.
-struct CaptureWriter(Option<Arc<Mutex<Vec<u8>>>>);
-
-impl io::Write for CaptureWriter {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        if let Some(sink) = &self.0 {
-            sink.lock().unwrap().extend_from_slice(buf);
-        }
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
-
-#[derive(Clone, Copy)]
-struct ThreadLocalCapture;
-
-impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for ThreadLocalCapture {
-    type Writer = CaptureWriter;
-
-    fn make_writer(&'a self) -> Self::Writer {
-        CaptureWriter(ACTIVE.with_borrow(|active| active.as_ref().map(|c| Arc::clone(&c.buf))))
+    fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
+        // `enabled` has already vetted the event, so a missing slot here
+        // can only happen if some other layer re-enables an event on a
+        // non-capturing thread — in which case the event is dropped.
+        let Some(sink) =
+            ACTIVE.with_borrow(|active| active.as_ref().map(|c| Arc::clone(&c.events)))
+        else {
+            return;
+        };
+        let mut recorder = FieldRecorder {
+            message: String::new(),
+            fields: BTreeMap::new(),
+        };
+        event.record(&mut recorder);
+        let meta = event.metadata();
+        sink.lock().unwrap().push(CapturedEvent {
+            level: *meta.level(),
+            target: meta.target().to_string(),
+            message: recorder.message,
+            fields: recorder.fields,
+        });
     }
 }
 
 /// Install the process-wide capture subscriber. Idempotent; the first
-/// [`capture_logs`] call in the binary wins.
+/// [`capture_events`] call in the binary wins.
 fn install_global_subscriber() {
     static INSTALLED: OnceLock<()> = OnceLock::new();
     INSTALLED.get_or_init(|| {
-        let subscriber = tracing_subscriber::registry()
-            .with(
-                tracing_subscriber::fmt::layer()
-                    .with_writer(ThreadLocalCapture)
-                    // `with_target(true)` is required so assertions can
-                    // match on targets such as `alms.worktree`.
-                    .with_target(true)
-                    .without_time()
-                    .with_ansi(false),
-            )
-            .with(CaptureFilter);
+        let subscriber = tracing_subscriber::registry().with(CaptureLayer);
         tracing::subscriber::set_global_default(subscriber).expect(
-            "a test binary that uses capture_logs must not install any other global tracing subscriber",
+            "a test binary that uses capture_events must not install any other global tracing subscriber",
         );
     });
 }
 
 /// Run `f` with every `tracing` event at `level` or more severe emitted
-/// **on this thread** captured into an in-memory buffer, and return the
-/// captured text.
+/// **on this thread** recorded, and return the recorded events.
 ///
 /// Unlike `tracing::subscriber::with_default`, this is immune to
 /// `tracing`'s global callsite-interest cache — see the module docs and
 /// #1221.
-pub fn capture_logs<F: FnOnce()>(level: Level, f: F) -> String {
+pub fn capture_events<F: FnOnce()>(level: Level, f: F) -> CapturedEvents {
     install_global_subscriber();
 
     // Installing the global default above already re-evaluates every
@@ -233,21 +360,21 @@ pub fn capture_logs<F: FnOnce()>(level: Level, f: F) -> String {
     // public, documented API there.
     tracing::callsite::rebuild_interest_cache();
 
-    let buf = Arc::new(Mutex::new(Vec::new()));
+    let events = Arc::new(Mutex::new(Vec::new()));
     {
         let _guard = ActiveGuard::install(Capture {
             level,
-            buf: Arc::clone(&buf),
+            events: Arc::clone(&events),
         });
         f();
     }
-    let bytes = buf.lock().unwrap();
-    String::from_utf8_lossy(&bytes).into_owned()
+    let recorded = std::mem::take(&mut *events.lock().unwrap());
+    CapturedEvents(recorded)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::capture_logs;
+    use super::capture_events;
 
     /// #1221 regression guard, and the deterministic reproduction of the
     /// flake this module exists to kill.
@@ -259,11 +386,11 @@ mod tests {
     /// brand-new callsite is evaluated against *that* thread's absent
     /// subscriber, `Interest::never()` is cached process-wide, and the
     /// capturing thread's own event is dropped before it is dispatched:
-    /// `captured` comes back `""`, which is exactly the empty value in
+    /// the capture comes back empty, which is exactly the empty value in
     /// the #1221 CI panics.
     ///
     /// To watch it fail, restore the old `with_default` body of
-    /// `capture_logs` and run this test with `--test-threads=1` (or
+    /// `capture_events` and run this test with `--test-threads=1` (or
     /// `--exact`). The isolation matters: `tracing_core` only takes the
     /// single-dispatcher fast path that consults *the registering
     /// thread's* subscriber while at most one `Dispatch` is registered,
@@ -284,7 +411,7 @@ mod tests {
             );
         }
 
-        let captured = capture_logs(tracing::Level::WARN, || {
+        let captured = capture_events(tracing::Level::WARN, || {
             std::thread::spawn(emit_probe)
                 .join()
                 .expect("probe thread must not panic");
@@ -292,19 +419,21 @@ mod tests {
         });
 
         assert!(
-            captured.contains("interest-poisoning probe"),
-            "capture_logs must capture an event whose callsite was first \
-             registered on a thread with no subscriber installed; got {captured:?}"
+            captured
+                .iter()
+                .any(|e| e.field("probe") == Some("callsite-interest")),
+            "capture_events must capture an event whose callsite was first \
+             registered on a thread with no subscriber installed; got {captured}"
         );
     }
 
-    /// The capture buffer is per-thread: an event emitted on another
+    /// The capture slot is per-thread: an event emitted on another
     /// thread must not leak into this thread's capture. (The old harness
     /// got this from `with_default` being thread-scoped; the replacement
     /// has to keep it.)
     #[test]
     fn does_not_capture_events_from_other_threads() {
-        let captured = capture_logs(tracing::Level::WARN, || {
+        let captured = capture_events(tracing::Level::WARN, || {
             std::thread::spawn(|| {
                 tracing::warn!(target: "alms.test_log_capture", "emitted off-thread");
             })
@@ -313,8 +442,8 @@ mod tests {
         });
 
         assert!(
-            !captured.contains("emitted off-thread"),
-            "a capture must only see events emitted on its own thread; got {captured:?}"
+            captured.is_empty(),
+            "a capture must only see events emitted on its own thread; got {captured}"
         );
     }
 
@@ -323,56 +452,71 @@ mod tests {
     /// drop INFO.
     #[test]
     fn honours_the_requested_level() {
-        let captured = capture_logs(tracing::Level::WARN, || {
+        let captured = capture_events(tracing::Level::WARN, || {
             tracing::info!(target: "alms.test_log_capture", "info line");
             tracing::warn!(target: "alms.test_log_capture", "warn line");
             tracing::error!(target: "alms.test_log_capture", "error line");
         });
 
-        assert!(
-            !captured.contains("info line"),
-            "INFO is below a WARN capture and must be dropped; got {captured:?}"
-        );
-        assert!(
-            captured.contains("warn line") && captured.contains("error line"),
-            "WARN and ERROR must both be captured at WARN; got {captured:?}"
+        let levels: Vec<tracing::Level> = captured.iter().map(|e| e.level).collect();
+        assert_eq!(
+            levels,
+            vec![tracing::Level::WARN, tracing::Level::ERROR],
+            "got {captured}"
         );
     }
 
-    /// Events emitted outside any capture window must not accumulate
-    /// anywhere — the global subscriber is always installed, so this is
-    /// worth pinning.
+    /// Events outside a capture window are not recorded — neither the
+    /// ones before it nor the ones after — and the level, target, message
+    /// and fields arrive as the macro recorded them.
     #[test]
-    fn captures_nothing_outside_a_capture_window() {
-        tracing::warn!(target: "alms.test_log_capture", "outside the window");
-        let captured = capture_logs(tracing::Level::WARN, || {});
-
-        assert!(
-            captured.is_empty(),
-            "a capture must start empty and stay empty when nothing is \
-             emitted inside it; got {captured:?}"
-        );
-    }
-
-    /// The `max_level_hint` pin is what stops the macros' static level
-    /// check from short-circuiting before an event is ever dispatched.
-    ///
-    /// Unlike the end-to-end guard above, this one fails
-    /// **deterministically** if the harness is ever restored to
-    /// `with_default`: that design's `MAX_LEVEL` is the max hint across
-    /// the live dispatchers, i.e. whatever level the capture itself asked
-    /// for, and no call site in the tree captures below `INFO` — so it
-    /// can never be `TRACE`.
-    #[test]
-    fn pins_the_global_max_level_to_trace() {
-        capture_logs(tracing::Level::WARN, || {
-            assert_eq!(
-                tracing::level_filters::LevelFilter::current(),
-                tracing::level_filters::LevelFilter::TRACE,
-                "the capture subscriber must pin the global MAX_LEVEL to \
-                 TRACE, or the macros' static level check will drop events \
-                 before they reach the subscriber"
+    fn records_level_target_message_and_fields_inside_the_window_only() {
+        tracing::warn!(target: "alms.test_log_capture", "before the window");
+        let captured = capture_events(tracing::Level::INFO, || {
+            let name = "atlas";
+            let direction = "off->git";
+            tracing::warn!(
+                target: "alms.test_log_capture",
+                agent_name = %name,
+                direction,
+                count = 3u64,
+                flag = true,
+                detail = ?Some("x"),
+                "flip {} for {}",
+                direction,
+                name
             );
         });
+        tracing::warn!(target: "alms.test_log_capture", "after the window");
+
+        assert_eq!(captured.len(), 1, "got {captured}");
+        let e = &captured[0];
+        assert_eq!(e.level, tracing::Level::WARN);
+        assert_eq!(e.target, "alms.test_log_capture");
+        assert_eq!(e.message, "flip off->git for atlas");
+        // `%` and a bare `&str` both land as the bare text — the two
+        // renderings the old string harness had to hedge between.
+        assert_eq!(e.field("agent_name"), Some("atlas"));
+        assert_eq!(e.field("direction"), Some("off->git"));
+        assert_eq!(e.field("count"), Some("3"));
+        assert_eq!(e.field("flag"), Some("true"));
+        assert_eq!(e.field("detail"), Some("Some(\"x\")"));
+        assert!(!e.has_field("absent"));
+    }
+
+    /// The static `MAX_LEVEL` short-circuit is disabled for the whole
+    /// binary once the harness is installed, so a `debug!` inside a
+    /// capture reaches the subscriber.
+    #[test]
+    fn pins_the_global_max_level_to_trace() {
+        let captured = capture_events(tracing::Level::TRACE, || {
+            tracing::trace!(target: "alms.test_log_capture", "trace line");
+        });
+        assert_eq!(
+            tracing::level_filters::LevelFilter::current(),
+            tracing::level_filters::LevelFilter::TRACE
+        );
+        assert_eq!(captured.len(), 1, "got {captured}");
+        assert_eq!(captured[0].level, tracing::Level::TRACE);
     }
 }

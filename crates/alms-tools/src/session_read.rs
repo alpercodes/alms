@@ -333,6 +333,30 @@ mod tests {
         assert_eq!(sel.truncation_reason, None);
     }
 
+    /// The byte cap is inclusive: a set whose serialized sum lands exactly
+    /// on the cap fits and is not flagged; one byte less drops the oldest
+    /// entry and names the cap.
+    #[test]
+    fn byte_cap_boundary_is_inclusive() {
+        let items = entries(2, "m");
+        let exact: usize = items
+            .iter()
+            .map(|i| serde_json::to_string(&project(i)).unwrap().len())
+            .sum();
+
+        let sel = select_recent(&items, None, exact, MESSAGE_CAP, project);
+        assert_eq!(sel.returned_count(), 2);
+        assert_eq!(sel.truncation_reason, None, "equal to the cap fits");
+
+        let sel = select_recent(&items, None, exact - 1, MESSAGE_CAP, project);
+        assert_eq!(sel.returned_count(), 1);
+        assert_eq!(sel.truncation_reason, Some(reason::BYTE_CAP));
+        assert_eq!(
+            sel.entries[0]["content"], "m1",
+            "the newest is the one kept"
+        );
+    }
+
     #[test]
     fn entries_come_back_in_chronological_order() {
         let items = entries(3, "m");

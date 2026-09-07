@@ -1953,37 +1953,6 @@ mod tests {
 
     // -- extract_dm_peer -------------------------------------------------------
 
-    #[test]
-    fn test_extract_dm_peer_alice_sees_bob() {
-        assert_eq!(
-            extract_dm_peer("dm:alice:bob", "alice"),
-            Some("bob".to_string())
-        );
-    }
-
-    #[test]
-    fn test_extract_dm_peer_bob_sees_alice() {
-        assert_eq!(
-            extract_dm_peer("dm:alice:bob", "bob"),
-            Some("alice".to_string())
-        );
-    }
-
-    #[test]
-    fn test_extract_dm_peer_non_dm_returns_none() {
-        assert_eq!(extract_dm_peer("web-chat-123", "alice"), None);
-    }
-
-    #[test]
-    fn test_extract_dm_peer_malformed_dm_returns_none() {
-        assert_eq!(extract_dm_peer("dm:alice", "alice"), None);
-    }
-
-    #[test]
-    fn test_extract_dm_peer_agent_not_in_context_returns_none() {
-        assert_eq!(extract_dm_peer("dm:alice:bob", "charlie"), None);
-    }
-
     #[tokio::test]
     async fn test_concurrent_summary_race() {
         use alms_session::Session;

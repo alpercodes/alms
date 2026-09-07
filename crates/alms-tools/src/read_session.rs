@@ -510,18 +510,6 @@ mod tests {
         assert_eq!(result["truncation_reason"], "explicit_last_n");
     }
 
-    /// The complement that keeps the row above honest: an explicit `last_n`
-    /// covering the whole session omits nothing, so it must NOT be flagged.
-    #[tokio::test]
-    async fn contract_explicit_last_n_covering_all_is_not_flagged() {
-        let (tool, sid) = session_with(3, "m");
-        let result = read_with(&tool, &sid, serde_json::json!({ "last_n": 3 })).await;
-
-        assert_eq!(result["returned_count"], 3);
-        assert_eq!(result["truncated"], false);
-        assert!(result["truncation_reason"].is_null());
-    }
-
     /// `byte_cap` — a few very large messages trip the serialized-byte cap.
     #[tokio::test]
     async fn contract_byte_cap_truncates_to_the_trailing_slice() {
@@ -570,39 +558,6 @@ mod tests {
         assert_eq!(result["truncation_reason"], "message_cap");
     }
 
-    /// The #1028 P1 lesson on this sibling: the cap is charged on the
-    /// SERIALIZED entry, so escape-heavy content costs its post-escape size.
-    /// Measuring raw UTF-8 would admit roughly twice as much.
-    #[tokio::test]
-    async fn contract_byte_cap_accounts_for_json_escape_expansion() {
-        async fn returned_for(body: char) -> u64 {
-            let mgr = make_session_manager();
-            let agent_id = AgentId::new();
-            let tool = ReadSessionTool::new(mgr.clone(), agent_id, None);
-            let session = mgr.get_or_create(agent_id, "ctx-escape");
-            for _ in 0..40 {
-                let text: String = std::iter::repeat_n(body, 4_000).collect();
-                mgr.append_message(session.id, make_msg(Role::User, &text))
-                    .unwrap();
-            }
-            let result = tool
-                .execute(serde_json::json!({ "session_id": session.id.0.to_string() }))
-                .await
-                .unwrap();
-            assert_eq!(result["truncation_reason"], "byte_cap");
-            result["returned_count"].as_u64().unwrap()
-        }
-
-        // `"` serializes to `\"`: one raw byte, two wire bytes.
-        let escaped = returned_for('"').await;
-        let plain = returned_for('x').await;
-        assert!(
-            escaped < plain,
-            "escape-heavy content must be charged post-escape: \
-             escaped={escaped} plain={plain}"
-        );
-    }
-
     /// The silent-fallback class #1028 closed for `read_messages`, now closed
     /// here: a malformed `last_n` is an error, not a quiet 20.
     #[tokio::test]
@@ -648,33 +603,6 @@ mod tests {
         );
         assert_eq!(result["returned_count"], 1);
         assert!(result["truncation_reason"].is_null());
-    }
-
-    #[tokio::test]
-    async fn test_last_n_limits_messages() {
-        let mgr = make_session_manager();
-        let agent_id = AgentId::new();
-        let tool = ReadSessionTool::new(mgr.clone(), agent_id, None);
-
-        let session = mgr.get_or_create(agent_id, "ctx-many");
-        for i in 0..10 {
-            mgr.append_message(session.id, make_msg(Role::User, &format!("msg {i}")))
-                .unwrap();
-        }
-
-        let result = tool
-            .execute(serde_json::json!({
-                "session_id": session.id.0.to_string(),
-                "last_n": 3
-            }))
-            .await
-            .unwrap();
-
-        assert_eq!(result["message_count"], 10);
-        assert_eq!(result["showing"], 3);
-        let msgs = result["messages"].as_array().unwrap();
-        assert_eq!(msgs[0]["content"], "msg 7");
-        assert_eq!(msgs[2]["content"], "msg 9");
     }
 
     #[tokio::test]

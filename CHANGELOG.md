@@ -145,6 +145,11 @@ one.
   did. The retention sweep for `shell_output/` and `tool-output/` spill files is
   likewise one routine, `alms_sandbox::retention::sweep_expired_under`; on-disk
   layout and behaviour are unchanged.
+- Three log lines gained structured fields so tests assert on fields rather than rendered
+  text: the tool registry's `debug!` now says `Registering tool` with `tool=<name>` (was
+  `Registering tool: <name>`), and the worktree drift warnings carry
+  `drift=already_present` / `drift=already_absent`. Levels, targets and the rest of the
+  fields are unchanged.
 
 ## v0.2.3 — released (tag `v0.2.3`)
 

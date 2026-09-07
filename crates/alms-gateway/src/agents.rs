@@ -848,6 +848,7 @@ fn apply_worktree_op_and_persist_with_mapper(
                         target: "alms.worktree",
                         agent_name = %agent_name,
                         direction = direction,
+                        drift = "already_present",
                         "worktree was already on disk before the side-effect ran \
                          (operator drift / prior failed handler); \
                          compensation will skip destructive cleanup on persist failure."
@@ -886,6 +887,7 @@ fn apply_worktree_op_and_persist_with_mapper(
                         target: "alms.worktree",
                         agent_name = %agent_name,
                         direction = direction,
+                        drift = "already_absent",
                         "worktree was already absent before the side-effect ran \
                          (operator drift / manual cleanup); \
                          compensation will skip recreate on persist failure."
@@ -2876,7 +2878,34 @@ mod tests {
     /// is process-global, which is the #1221 flake — a callsite first
     /// touched by another test on a subscriber-less thread caches
     /// `Interest::never()` and this test's capture comes back empty.
-    use alms_test_support::{capture_logs, init_git_repo};
+    use alms_test_support::{CapturedEvent, CapturedEvents, capture_events, init_git_repo};
+
+    /// The compensation audit event: the one `alms.worktree` event that
+    /// carries `persist_error`. WARN without `compensation_error` is the
+    /// inverse op succeeding; ERROR with it is the inverse op failing too.
+    /// Exactly one is emitted per failed persist, so more than one is as
+    /// wrong as none.
+    fn compensation_event(captured: &CapturedEvents) -> &CapturedEvent {
+        let mut found = captured
+            .at_target("alms.worktree")
+            .filter(|e| e.has_field("persist_error"));
+        let event = found.next().unwrap_or_else(|| {
+            panic!("expected a compensation event on alms.worktree; got:\n{captured}")
+        });
+        assert!(
+            found.next().is_none(),
+            "expected exactly one compensation event; got:\n{captured}"
+        );
+        event
+    }
+
+    /// No compensation ran: nothing on `alms.worktree` carries a persist
+    /// error.
+    fn no_compensation_event(captured: &CapturedEvents) -> bool {
+        captured
+            .at_target("alms.worktree")
+            .all(|e| !e.has_field("persist_error"))
+    }
 
     /// Provision a worktree for `agent_name` under `project_root`,
     /// write `file_contents` to `agent-state.txt`, configure the
@@ -2927,7 +2956,7 @@ mod tests {
         init_git_repo(tmp.path());
         let worktree_dir = tmp.path().join(".alms").join("worktrees").join("atlas");
 
-        let captured = capture_logs(tracing::Level::WARN, || {
+        let captured = capture_events(tracing::Level::WARN, || {
             let result = apply_worktree_flip_and_persist(
                 tmp.path(),
                 "atlas",
@@ -2958,24 +2987,16 @@ mod tests {
             worktree_dir.display(),
         );
 
-        // Audit log: structured WARN at alms.worktree target with
-        // direction + persist_error + the explicit "compensation
-        // succeeded" verb.
+        // Audit log: the compensation event — WARN at alms.worktree with
+        // agent_name, direction and the persist error, and no
+        // compensation_error (that field is the dual-failure marker).
+        let event = compensation_event(&captured);
+        assert_eq!(event.level, tracing::Level::WARN, "{event}");
+        assert_eq!(event.field("agent_name"), Some("atlas"), "{event}");
+        assert_eq!(event.field("direction"), Some("off->git"), "{event}");
         assert!(
-            captured.contains("alms.worktree"),
-            "compensation event must use the alms.worktree tracing target: {captured}"
-        );
-        assert!(
-            captured.contains("agent_name=\"atlas\"") || captured.contains("agent_name=atlas"),
-            "compensation event must carry structured agent_name: {captured}"
-        );
-        assert!(
-            captured.contains("direction=\"off->git\"") || captured.contains("direction=off->git"),
-            "compensation event must carry structured direction=off->git: {captured}"
-        );
-        assert!(
-            captured.contains("compensation succeeded"),
-            "compensation event message must say 'compensation succeeded': {captured}"
+            !event.has_field("compensation_error"),
+            "compensation succeeded, so no compensation_error: {event}"
         );
     }
 
@@ -2995,7 +3016,7 @@ mod tests {
         let worktree_dir = tmp.path().join(".alms").join("worktrees").join("atlas");
         assert!(worktree_dir.is_dir());
 
-        let captured = capture_logs(tracing::Level::WARN, || {
+        let captured = capture_events(tracing::Level::WARN, || {
             let result = apply_worktree_flip_and_persist(
                 tmp.path(),
                 "atlas",
@@ -3022,19 +3043,14 @@ mod tests {
             worktree_dir.display(),
         );
 
-        // Audit log: structured WARN at alms.worktree with the
-        // git->off direction.
+        // Audit log: the compensation event, tagged with the git->off
+        // direction.
+        let event = compensation_event(&captured);
+        assert_eq!(event.level, tracing::Level::WARN, "{event}");
+        assert_eq!(event.field("direction"), Some("git->off"), "{event}");
         assert!(
-            captured.contains("alms.worktree"),
-            "compensation event must use the alms.worktree tracing target: {captured}"
-        );
-        assert!(
-            captured.contains("direction=\"git->off\"") || captured.contains("direction=git->off"),
-            "compensation event must carry structured direction=git->off: {captured}"
-        );
-        assert!(
-            captured.contains("compensation succeeded"),
-            "compensation event must say 'compensation succeeded': {captured}"
+            !event.has_field("compensation_error"),
+            "compensation succeeded, so no compensation_error: {event}"
         );
     }
 
@@ -3179,7 +3195,7 @@ mod tests {
         init_git_repo(tmp.path());
         let worktree_dir = tmp.path().join(".alms").join("worktrees").join("atlas");
 
-        let captured = capture_logs(tracing::Level::ERROR, || {
+        let captured = capture_events(tracing::Level::ERROR, || {
             let result = apply_worktree_flip_and_persist(
                 tmp.path(),
                 "atlas",
@@ -3232,28 +3248,17 @@ mod tests {
              — this is the divergence the operator needs to clean up manually"
         );
 
-        // Audit log: ERROR-level event with BOTH persist_error and
-        // compensation_error fields, and the explicit "compensation
-        // also failed" verb.
-        assert!(
-            captured.contains("alms.worktree"),
-            "dual-failure event must use the alms.worktree tracing target: {captured}"
+        // Audit log: the compensation event at ERROR, carrying BOTH
+        // persist_error and compensation_error.
+        let event = compensation_event(&captured);
+        assert_eq!(
+            event.level,
+            tracing::Level::ERROR,
+            "dual failure must log at ERROR level (not WARN): {event}"
         );
         assert!(
-            captured.contains("ERROR"),
-            "dual failure must log at ERROR level (not WARN): {captured}"
-        );
-        assert!(
-            captured.contains("persist_error"),
-            "dual-failure event must carry structured persist_error: {captured}"
-        );
-        assert!(
-            captured.contains("compensation_error"),
-            "dual-failure event must carry structured compensation_error: {captured}"
-        );
-        assert!(
-            captured.contains("compensation also failed"),
-            "dual-failure event message must say 'compensation also failed': {captured}"
+            event.has_field("compensation_error"),
+            "dual-failure event must carry structured compensation_error: {event}"
         );
     }
 
@@ -3348,7 +3353,7 @@ mod tests {
         let project_root = tmp.path().to_path_buf();
         let snapshot_for_closure = snapshot_sha.clone();
 
-        let captured = capture_logs(tracing::Level::INFO, || {
+        let captured = capture_events(tracing::Level::INFO, || {
             let result = apply_worktree_flip_and_persist(
                 tmp.path(),
                 "atlas",
@@ -3406,17 +3411,17 @@ mod tests {
             "worktree dir must be restored after compensation"
         );
 
-        // Audit log: the alms.worktree info-level trace must
-        // mention the idempotency skip — proves the new code path
-        // actually fired (rather than the test accidentally taking
-        // the case-(a) branch-missing path).
+        // Audit log: the alms.worktree INFO event for the idempotency
+        // skip names the branch and the SHA it was already at — proves
+        // the new code path actually fired (rather than the test
+        // accidentally taking the case-(a) branch-missing path).
         assert!(
-            captured.contains("alms.worktree"),
-            "compensation must emit alms.worktree event: {captured}"
-        );
-        assert!(
-            captured.contains("Branch already at snapshot SHA"),
-            "compensation must log the idempotency-skip message: {captured}"
+            captured.at_target("alms.worktree").any(|e| {
+                e.level == tracing::Level::INFO
+                    && e.field("branch") == Some("alms/atlas")
+                    && e.field("sha") == Some(snapshot_sha.as_str())
+            }),
+            "compensation must log the idempotency skip with branch + sha: {captured}"
         );
     }
 
@@ -3429,7 +3434,7 @@ mod tests {
         init_git_repo(tmp.path());
         let worktree_dir = tmp.path().join(".alms").join("worktrees").join("atlas");
 
-        let captured = capture_logs(tracing::Level::WARN, || {
+        let captured = capture_events(tracing::Level::WARN, || {
             apply_worktree_flip_and_persist(
                 tmp.path(),
                 "atlas",
@@ -3444,8 +3449,8 @@ mod tests {
 
         assert!(worktree_dir.is_dir(), "worktree must exist on happy path");
         assert!(
-            !captured.contains("compensation"),
-            "happy path must not emit a compensation log line: {captured}"
+            no_compensation_event(&captured),
+            "happy path must not emit a compensation event: {captured}"
         );
     }
 
@@ -3509,7 +3514,7 @@ mod tests {
         // `remove_worktree(..., force=true)` even though the
         // side-effect call was a no-op (`AlreadyExisted`),
         // deleting the worktree dir + branch + commit above.
-        let captured = capture_logs(tracing::Level::WARN, || {
+        let captured = capture_events(tracing::Level::WARN, || {
             let result = apply_worktree_flip_and_persist(
                 tmp.path(),
                 "atlas",
@@ -3565,19 +3570,18 @@ mod tests {
         // Operators rely on this line to recognize drift cases in
         // post-mortem.
         assert!(
-            captured.contains("alms.worktree"),
-            "no-op-create event must use the alms.worktree tracing target: {captured}"
-        );
-        assert!(
-            captured.contains("already on disk") || captured.contains("AlreadyExisted"),
+            captured.at_target("alms.worktree").any(|e| {
+                e.level == tracing::Level::WARN
+                    && e.field("agent_name") == Some("atlas")
+                    && e.field("drift") == Some("already_present")
+            }),
             "no-op-create event must explicitly call out the pre-existing \
              state so operators can spot drift in audit logs: {captured}"
         );
         assert!(
-            !captured.contains("compensation succeeded")
-                && !captured.contains("compensation also failed"),
-            "no destructive compensation must run, so neither 'compensation \
-             succeeded' nor 'compensation also failed' must appear: {captured}"
+            no_compensation_event(&captured),
+            "no destructive compensation must run, so no compensation event \
+             (succeeded or failed) must appear: {captured}"
         );
     }
 
@@ -3629,7 +3633,7 @@ mod tests {
         // on the (Git, Off) transition and run `create_worktree`
         // (because pre_remove_branch_sha was None), fabricating a
         // worktree + branch this PATCH never owned.
-        let captured = capture_logs(tracing::Level::WARN, || {
+        let captured = capture_events(tracing::Level::WARN, || {
             let result = apply_worktree_flip_and_persist(
                 tmp.path(),
                 "atlas",
@@ -3672,19 +3676,18 @@ mod tests {
         // Audit log: the helper must emit a structured WARN
         // explicitly noting that the worktree was already absent.
         assert!(
-            captured.contains("alms.worktree"),
-            "no-op-remove event must use the alms.worktree tracing target: {captured}"
-        );
-        assert!(
-            captured.contains("already absent") || captured.contains("AlreadyAbsent"),
+            captured.at_target("alms.worktree").any(|e| {
+                e.level == tracing::Level::WARN
+                    && e.field("agent_name") == Some("atlas")
+                    && e.field("drift") == Some("already_absent")
+            }),
             "no-op-remove event must explicitly call out the pre-absent \
              state so operators can spot drift in audit logs: {captured}"
         );
         assert!(
-            !captured.contains("compensation succeeded")
-                && !captured.contains("compensation also failed"),
-            "no compensation must run, so neither 'compensation succeeded' \
-             nor 'compensation also failed' must appear: {captured}"
+            no_compensation_event(&captured),
+            "no compensation must run, so no compensation event (succeeded \
+             or failed) must appear: {captured}"
         );
     }
 
@@ -3881,7 +3884,7 @@ mod tests {
         run(&worktree_path, &["add", "agent-state.txt"]);
         run(&worktree_path, &["commit", "-m", "agent commit"]);
 
-        let captured = capture_logs(tracing::Level::ERROR, || {
+        let captured = capture_events(tracing::Level::ERROR, || {
             let result = apply_worktree_flip_and_persist(
                 tmp.path(),
                 "atlas",
@@ -3922,32 +3925,22 @@ mod tests {
             );
         });
 
-        // Audit log: ERROR-level event with BOTH persist_error and
-        // compensation_error fields, the explicit "compensation
-        // also failed" verb, and direction tagged "git->off".
-        assert!(
-            captured.contains("alms.worktree"),
-            "dual-failure event must use the alms.worktree tracing target: {captured}"
+        // Audit log: the compensation event at ERROR, carrying BOTH
+        // persist_error and compensation_error, tagged git->off.
+        let event = compensation_event(&captured);
+        assert_eq!(
+            event.level,
+            tracing::Level::ERROR,
+            "dual failure must log at ERROR level (not WARN): {event}"
         );
         assert!(
-            captured.contains("ERROR"),
-            "dual failure must log at ERROR level (not WARN): {captured}"
+            event.has_field("compensation_error"),
+            "dual-failure event must carry structured compensation_error: {event}"
         );
-        assert!(
-            captured.contains("persist_error"),
-            "dual-failure event must carry structured persist_error: {captured}"
-        );
-        assert!(
-            captured.contains("compensation_error"),
-            "dual-failure event must carry structured compensation_error: {captured}"
-        );
-        assert!(
-            captured.contains("compensation also failed"),
-            "dual-failure event message must say compensation also failed: {captured}"
-        );
-        assert!(
-            captured.contains("git->off"),
-            "dual-failure event must tag direction = git->off: {captured}"
+        assert_eq!(
+            event.field("direction"),
+            Some("git->off"),
+            "dual-failure event must tag direction = git->off: {event}"
         );
     }
 
@@ -3969,7 +3962,7 @@ mod tests {
         init_git_repo(tmp.path());
         let worktree_dir = tmp.path().join(".alms").join("worktrees").join("atlas");
 
-        let captured = capture_logs(tracing::Level::WARN, || {
+        let captured = capture_events(tracing::Level::WARN, || {
             let result =
                 apply_worktree_op_and_persist(tmp.path(), "atlas", WorktreeOp::Create, || {
                     // Synthetic SQLite failure — same shape "database
@@ -3996,20 +3989,19 @@ mod tests {
             worktree_dir.display(),
         );
 
-        // Audit log: structured WARN at alms.worktree with direction
-        // off->git (Create op uses the same direction as the PATCH
-        // off→git flip because they share the same forward op).
-        assert!(
-            captured.contains("alms.worktree"),
-            "compensation event must use the alms.worktree tracing target: {captured}"
+        // Audit log: the compensation event, tagged off->git (Create op
+        // uses the same direction as the PATCH off→git flip because they
+        // share the same forward op).
+        let event = compensation_event(&captured);
+        assert_eq!(event.level, tracing::Level::WARN, "{event}");
+        assert_eq!(
+            event.field("direction"),
+            Some("off->git"),
+            "Create-op compensation event must carry structured direction=off->git: {event}"
         );
         assert!(
-            captured.contains("direction=\"off->git\"") || captured.contains("direction=off->git"),
-            "Create-op compensation event must carry structured direction=off->git: {captured}"
-        );
-        assert!(
-            captured.contains("compensation succeeded"),
-            "compensation event message must say 'compensation succeeded': {captured}"
+            !event.has_field("compensation_error"),
+            "compensation succeeded, so no compensation_error: {event}"
         );
     }
 
@@ -4026,7 +4018,7 @@ mod tests {
         init_git_repo(tmp.path());
         let worktree_dir = tmp.path().join(".alms").join("worktrees").join("atlas");
 
-        let captured = capture_logs(tracing::Level::ERROR, || {
+        let captured = capture_events(tracing::Level::ERROR, || {
             let result =
                 apply_worktree_op_and_persist(tmp.path(), "atlas", WorktreeOp::Create, || {
                     // Inside the persist closure, after the worktree
@@ -4066,21 +4058,20 @@ mod tests {
              — this is the divergence the operator needs to clean up manually"
         );
 
-        assert!(
-            captured.contains("alms.worktree"),
-            "dual-failure event must use the alms.worktree tracing target: {captured}"
+        let event = compensation_event(&captured);
+        assert_eq!(
+            event.level,
+            tracing::Level::ERROR,
+            "dual failure must log at ERROR level (not WARN): {event}"
         );
         assert!(
-            captured.contains("ERROR"),
-            "dual failure must log at ERROR level (not WARN): {captured}"
+            event.has_field("compensation_error"),
+            "dual-failure event must carry structured compensation_error: {event}"
         );
-        assert!(
-            captured.contains("compensation also failed"),
-            "dual-failure event message must say 'compensation also failed': {captured}"
-        );
-        assert!(
-            captured.contains("off->git"),
-            "POST dual-failure event must tag direction = off->git: {captured}"
+        assert_eq!(
+            event.field("direction"),
+            Some("off->git"),
+            "POST dual-failure event must tag direction = off->git: {event}"
         );
     }
 
@@ -4176,7 +4167,7 @@ mod tests {
             .unwrap()
             .expect("agent branch must exist after commit");
 
-        let captured = capture_logs(tracing::Level::WARN, || {
+        let captured = capture_events(tracing::Level::WARN, || {
             let result = apply_worktree_op_and_persist(
                 tmp.path(),
                 "atlas",
@@ -4221,20 +4212,19 @@ mod tests {
              must preserve agent branch history, not re-fork from HEAD"
         );
 
-        // Audit log: structured WARN at alms.worktree with direction
-        // git->off (Remove op uses the same direction as the PATCH
-        // git→off flip — they share the same forward op shape).
-        assert!(
-            captured.contains("alms.worktree"),
-            "compensation event must use the alms.worktree tracing target: {captured}"
+        // Audit log: the compensation event, tagged git->off (Remove op
+        // uses the same direction as the PATCH git→off flip — they share
+        // the same forward op shape).
+        let event = compensation_event(&captured);
+        assert_eq!(event.level, tracing::Level::WARN, "{event}");
+        assert_eq!(
+            event.field("direction"),
+            Some("git->off"),
+            "Remove-op compensation event must carry structured direction=git->off: {event}"
         );
         assert!(
-            captured.contains("direction=\"git->off\"") || captured.contains("direction=git->off"),
-            "Remove-op compensation event must carry structured direction=git->off: {captured}"
-        );
-        assert!(
-            captured.contains("compensation succeeded"),
-            "compensation event message must say 'compensation succeeded': {captured}"
+            !event.has_field("compensation_error"),
+            "compensation succeeded, so no compensation_error: {event}"
         );
     }
 
@@ -4258,7 +4248,7 @@ mod tests {
         let _worktree_path =
             provision_worktree_with_commit(tmp.path(), "atlas", "agent work", "agent commit");
 
-        let captured = capture_logs(tracing::Level::ERROR, || {
+        let captured = capture_events(tracing::Level::ERROR, || {
             let result = apply_worktree_op_and_persist(
                 tmp.path(),
                 "atlas",
@@ -4286,21 +4276,20 @@ mod tests {
             );
         });
 
-        assert!(
-            captured.contains("alms.worktree"),
-            "dual-failure event must use the alms.worktree tracing target: {captured}"
+        let event = compensation_event(&captured);
+        assert_eq!(
+            event.level,
+            tracing::Level::ERROR,
+            "dual failure must log at ERROR level (not WARN): {event}"
         );
         assert!(
-            captured.contains("ERROR"),
-            "dual failure must log at ERROR level (not WARN): {captured}"
+            event.has_field("compensation_error"),
+            "dual-failure event must carry structured compensation_error: {event}"
         );
-        assert!(
-            captured.contains("compensation also failed"),
-            "dual-failure event message must say 'compensation also failed': {captured}"
-        );
-        assert!(
-            captured.contains("git->off"),
-            "DELETE dual-failure event must tag direction = git->off: {captured}"
+        assert_eq!(
+            event.field("direction"),
+            Some("git->off"),
+            "DELETE dual-failure event must tag direction = git->off: {event}"
         );
     }
 
