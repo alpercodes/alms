@@ -97,6 +97,14 @@ Each item below changes behaviour for a deployment that has not set the knob exp
   now report what they omitted.
 - A reverted shell `cd` is visible to the agent.
 - Tool re-registration no longer logs on the happy path, so `WARN` is worth reading again.
+- `user.md` is no longer injected into runs on `episodic:` sessions. The prefix is reserved
+  for internal summariser sessions everywhere else (session listing, notifications, source
+  labels) but the runtime's user-profile gate predated it and defaulted to injecting. The
+  shown-view guard follows the prompt, so on such a run a `workspace_write` on `user` in its
+  default (replacing) mode is now refused with `never_shown` instead of replacing a file the
+  agent can no longer see — the same rule every other non-user-facing run already has;
+  `workspace_read` first, or `mode: "append"`, still works. No production code path
+  creates an `episodic:` session today, so this changes what *would* happen, not what does.
 
 ### CLI
 

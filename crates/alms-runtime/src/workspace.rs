@@ -80,12 +80,17 @@ enum ShownGuard {
 /// that has to recover.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RefusedWrite {
+    // `AgentRuntime::is_user_facing_context` is spelled as a plain code span
+    // here and in the other docs of this file on purpose: it is `pub(crate)`,
+    // and an intra-doc link to it from a `pub` item would trip rustdoc's
+    // `private_intra_doc_links` lint.
     /// Nothing has shown this file to the agent. The everyday instance is
     /// `user.md` in a non-user-facing run: `build_system_prompt_prefix`
-    /// omits it for `dm:` / `subagent_` / `job_` / `notifications:`
-    /// contexts, so an agent in one of those runs has never seen it — and
-    /// `user.md` defaults to `"write"`, so the *default* call there was a
-    /// silent whole-file erasure.
+    /// omits it for every context `AgentRuntime::is_user_facing_context`
+    /// rejects (the list lives there and only there), so an agent in one of
+    /// those runs has never seen it — and `user.md` defaults to `"write"`,
+    /// so the *default* call there is a whole-file erasure of a file the
+    /// agent is not holding, which is what this refuses.
     NeverShown,
     /// The agent was shown a window, not the file. Reachable for
     /// `memories.md` past [`MEMORIES_INJECTION_CAP`], and for any file past
@@ -664,10 +669,11 @@ impl AgentWorkspace {
     ///    marker on the window saying so, which is the best a string can do;
     ///    this is the part that does not depend on the model reading it.
     /// 2. It was **never shown**. `build_system_prompt_prefix` omits
-    ///    `user.md` from `dm:` / `subagent_` / `job_` / `notifications:`
-    ///    runs, and `user.md` defaults to `"write"` — so in those runs the
-    ///    *default* `workspace_write` on `user` replaced a file the agent had
-    ///    no copy of.
+    ///    `user.md` from every non-user-facing run (the contexts
+    ///    `AgentRuntime::is_user_facing_context` rejects), and `user.md`
+    ///    defaults to `"write"` — so in those runs the *default*
+    ///    `workspace_write` on `user` is a replacement of a file the agent
+    ///    has no copy of, and this is what refuses it.
     /// 3. It has **changed since**. Another live instance of the same named
     ///    agent (the coordinator's `active_named` guard permits several), an
     ///    operator editing from the UI, or this very run's own earlier
@@ -1111,8 +1117,9 @@ impl AgentWorkspace {
     /// Build system prompt prefix from workspace files.
     ///
     /// When `include_user` is false, `user.md` is omitted from the prefix.
-    /// This saves tokens and avoids confusion in non-user-facing contexts
-    /// (DM sessions, subagent runs, scheduled jobs).
+    /// This saves tokens and avoids confusion in non-user-facing contexts —
+    /// `AgentRuntime::is_user_facing_context` is the caller that decides,
+    /// and the one place the context list is written down.
     ///
     /// This is also the moment the agent is *shown* its workspace, so each
     /// read is recorded as the base for [`Self::write_file_checked`] (#1310).
@@ -2337,11 +2344,11 @@ mod tests {
 
     /// Nothing has shown the agent the file, so a replacement is refused.
     ///
-    /// Not a contrived state. It is every `dm:` / `subagent_` / `job_` /
-    /// `notifications:` run's relationship with `user.md`, which
-    /// `build_system_prompt_prefix` leaves out of the prompt — and `user.md`
-    /// defaults to `"write"`, so before this the *default* call in those runs
-    /// replaced a file the agent had no copy of.
+    /// Not a contrived state. It is every non-user-facing run's relationship
+    /// with `user.md` (the contexts `AgentRuntime::is_user_facing_context`
+    /// rejects), which `build_system_prompt_prefix` leaves out of the prompt
+    /// — and `user.md` defaults to `"write"`, so before this the *default*
+    /// call in those runs replaced a file the agent had no copy of.
     ///
     /// The file being untouched afterwards is half the assertion: a refusal
     /// that had already renamed the staging file into place would satisfy the

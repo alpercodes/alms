@@ -42,6 +42,15 @@ pub use source_label::{derive_source_label, tail_to_char_boundary, truncate_to_c
 /// all callers (gateway session list, tool output, etc.) should use this
 /// function rather than maintaining their own prefix checks.
 ///
+/// That directive is about the *type* mapping. Two functions keep prefix
+/// lists of their own on purpose and are not in breach of it: the gateway's
+/// `is_internal_context_id` (which types receive user-facing notifications)
+/// and the runtime's `AgentRuntime::is_user_facing_context` (which types get
+/// `user.md` in the prompt). Each is a **policy** over these types, the two
+/// policies legitimately disagree (`job_` gets no `user.md` but does show in
+/// the sidebar), and folding either into this function would turn a type
+/// into a policy. Add new prefixes here *and* decide each policy for them.
+///
 /// Mapping:
 ///
 /// - `"dm:{a}:{b}"` -> `"dm"`

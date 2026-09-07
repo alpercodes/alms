@@ -32,7 +32,9 @@ impl AgentRuntime {
     /// internal order.
     ///
     /// When `include_user` is false, `user.md` is omitted from the workspace
-    /// prefix. This is used for non-user-facing sessions (DM, subagent, job).
+    /// prefix. This is used for non-user-facing sessions — the contexts
+    /// [`Self::is_user_facing_context`] rejects, which is the one place the
+    /// list is written down.
     pub(crate) fn assemble_system_prompt(&self, base_prompt: &str, include_user: bool) -> String {
         if let Some(ref ws) = self.workspace {
             let prefix = ws.build_system_prompt_prefix(include_user);
@@ -48,18 +50,35 @@ impl AgentRuntime {
 
     /// Returns true if the given context_id represents a user-facing session
     /// (web chat, Telegram, etc.) where `user.md` should be included in the
-    /// system prompt.  Non-user-facing contexts (DM, subagent, job,
-    /// notification) return false.
+    /// system prompt.  Non-user-facing contexts — the prefixes listed in the
+    /// body — return false.
+    ///
+    /// This is a **policy** over context types, not a classification of
+    /// them. `alms_core::classify_session_type` is the single source of
+    /// truth for *what type a context id is*, and its doc tells callers not
+    /// to keep their own prefix checks — that directive is about the type
+    /// mapping, and this function does not compete with it. What this
+    /// decides is *which types get `user.md`*, exactly as the gateway's
+    /// `is_internal_context_id` decides which types receive user-facing
+    /// notifications. Those are two policies over the same types, they are
+    /// free to disagree (a `job_` session gets no `user.md` but does show in
+    /// the sidebar), and folding either into the classifier would turn a
+    /// type into a policy. Keep them separate.
     ///
     /// NOTE: This function is **default-open** — unknown context_id prefixes
     /// are treated as user-facing.  When adding a new non-user-facing context
-    /// type, add its prefix to the exclusion list below.
+    /// type, add its prefix to the exclusion list below, and nowhere else:
+    /// every other mention of "non-user-facing" in this crate points here
+    /// rather than repeating the list.  `episodic:` is the cautionary tale:
+    /// the prefix was reserved (#372) three days after this list was written
+    /// and fell through to injection until it was added.
     pub(crate) fn is_user_facing_context(context_id: &str) -> bool {
         // These prefixes indicate non-user-facing sessions.
         !(context_id.starts_with("dm:")
             || context_id.starts_with("subagent_")
             || context_id.starts_with("job_")
-            || context_id.starts_with("notifications:"))
+            || context_id.starts_with("notifications:")
+            || context_id.starts_with("episodic:"))
     }
 
     /// Build context window for LLM using ContextBuilder.

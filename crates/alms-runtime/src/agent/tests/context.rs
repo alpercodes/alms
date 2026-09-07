@@ -326,3 +326,111 @@ async fn test_system_prompt_order_dm_tool_loop_layers() {
         "Order layer 3->4 violated (tool_loop before dm_addendum). Got:\n{assembled}"
     );
 }
+
+/// An `episodic:` run gets the same system prompt every other non-user-facing
+/// run gets — personality, goals and memories, **without** `## About the
+/// User` — and the shown-view guard follows: a default (replacing)
+/// `workspace_write` on `user` in that run is refused as `never_shown`,
+/// where the user-facing control run on the same workspace is allowed.
+///
+/// `episodic:` is reserved for the summariser's internal sessions and every
+/// other classifier already treats it as internal (`classify_session_type`,
+/// `derive_source_label`, the gateway's `INTERNAL_SESSION_PREFIXES`). The
+/// runtime's `is_user_facing_context` was written three days before the
+/// prefix existed (#372) and is default-open, so an `episodic:` run fell
+/// through to injection. This goes through `build_context` rather than the
+/// classifier so it pins the prompt and the guard, not the boolean: the
+/// control run proves the omission is the gate and not a missing file.
+#[tokio::test]
+async fn test_episodic_context_omits_user_md_from_the_system_prompt() {
+    use crate::workspace::{AgentWorkspace, CheckedWrite, RefusedWrite, WorkspaceFile};
+    use tempfile::tempdir;
+
+    let dir = tempdir().unwrap();
+    let workspace = AgentWorkspace::new(dir.path(), "alice");
+    workspace
+        .write_file_as_operator(WorkspaceFile::Personality, "I am Alice.")
+        .unwrap();
+    workspace
+        .write_file_as_operator(
+            WorkspaceFile::User,
+            "Name: Alper. Prefers concise answers. USER_MD_MARKER",
+        )
+        .unwrap();
+
+    let runtime = AgentRuntime::new(
+        AgentId::new(),
+        AgentConfig {
+            sandbox_root: "".into(),
+            ..AgentConfig::default()
+        },
+        LlmClient::new(LlmConfig {
+            mock: true,
+            ..LlmConfig::default()
+        })
+        .unwrap(),
+    )
+    .unwrap()
+    .with_workspace(workspace);
+    let session_manager = SessionManager::new(SessionConfig::default());
+
+    // The control runs FIRST: if the workspace never recorded `user.md` at
+    // all, the episodic row's refusal would pass for the wrong reason.
+    for (context_id, user_facing, expected_write) in [
+        ("web-chat-1", true, CheckedWrite::Written),
+        (
+            "episodic:8f2c1a4e-0000-4000-8000-000000000000",
+            false,
+            CheckedWrite::Refused(RefusedWrite::NeverShown),
+        ),
+    ] {
+        // Each run starts from a fresh record (`build_context` forgets the
+        // previous run's views), so the guard's answer is this run's alone.
+        let session = session_manager.get_or_create(runtime.agent_id, context_id);
+        let messages = runtime
+            .build_context(&session_manager, &session.id, context_id, "hi")
+            .await
+            .unwrap();
+        let prompt = messages[0].content.clone().unwrap_or_default();
+
+        assert!(
+            prompt.contains("I am Alice."),
+            "[{context_id}] the rest of the workspace is always injected. Got:\n{prompt}"
+        );
+        assert_eq!(
+            prompt.contains("## About the User") && prompt.contains("USER_MD_MARKER"),
+            user_facing,
+            "[{context_id}] user.md injected iff the context is user-facing. Got:\n{prompt}"
+        );
+
+        // The guard follows the prompt: a default-mode `workspace_write` on
+        // `user` replaces the file only in the run that was shown it.
+        let workspace = runtime.workspace.as_ref().expect("workspace attached");
+        assert_eq!(
+            workspace
+                .write_file_checked(WorkspaceFile::User, "Name: Someone Else")
+                .unwrap(),
+            expected_write,
+            "[{context_id}]"
+        );
+        // The file agrees with the verdict. A refusal that had already
+        // renamed the staging file into place would satisfy the return
+        // value and lose the data anyway.
+        let on_disk = workspace.read_file(WorkspaceFile::User).unwrap_or_default();
+        if user_facing {
+            assert_eq!(on_disk, "Name: Someone Else", "[{context_id}]");
+        } else {
+            assert!(
+                on_disk.contains("USER_MD_MARKER"),
+                "[{context_id}] a refused write must leave the file untouched; got: {on_disk:?}"
+            );
+        }
+        // Restore for the next row.
+        workspace
+            .write_file_as_operator(
+                WorkspaceFile::User,
+                "Name: Alper. Prefers concise answers. USER_MD_MARKER",
+            )
+            .unwrap();
+    }
+}

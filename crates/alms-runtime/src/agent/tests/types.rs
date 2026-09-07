@@ -41,7 +41,7 @@ fn test_is_user_facing_context() {
     assert!(AgentRuntime::is_user_facing_context("web-chat-123"));
     assert!(AgentRuntime::is_user_facing_context("telegram_agent_456"));
 
-    // Non-user-facing: DM, subagent, job, notification
+    // Non-user-facing: DM, subagent, job, notification, episodic
     assert!(!AgentRuntime::is_user_facing_context("dm:alice:bob"));
     assert!(!AgentRuntime::is_user_facing_context("subagent_task123"));
     assert!(!AgentRuntime::is_user_facing_context(
@@ -51,6 +51,14 @@ fn test_is_user_facing_context() {
     assert!(!AgentRuntime::is_user_facing_context("notifications:alice"));
     assert!(!AgentRuntime::is_user_facing_context(
         "notifications:my-agent"
+    ));
+    // `episodic:` is reserved for the summariser's internal sessions
+    // (`classify_session_type`, `derive_source_label`, the gateway's
+    // `INTERNAL_SESSION_PREFIXES` all treat it as internal); it was missing
+    // here and the function is default-open, so it fell through to injection.
+    assert!(!AgentRuntime::is_user_facing_context("episodic:main"));
+    assert!(!AgentRuntime::is_user_facing_context(
+        "episodic:8f2c1a4e-0000-4000-8000-000000000000"
     ));
 
     // Edge cases: empty string and unknown prefix default to user-facing
@@ -64,6 +72,8 @@ fn test_is_user_facing_context() {
     assert!(AgentRuntime::is_user_facing_context(
         "notification_something"
     ));
+    assert!(AgentRuntime::is_user_facing_context("episodic_something"));
+    assert!(AgentRuntime::is_user_facing_context("episodicx:something"));
 }
 
 // ── tool_result_ok tests ─────────────────────────────────────────────────
