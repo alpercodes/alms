@@ -127,9 +127,10 @@ one.
   hand-edited `settings.json` is now trimmed (both used to keep it verbatim, as a provider
   key that could never resolve — and the `settings.json` overlay is applied after config
   validation, so nothing else would have caught it), and `alms agent create
-  --summary-provider`/`--summary-model` trim their values as `agent config` already did. The retention sweep for `shell_output/` and `tool-output/`
-  spill files is likewise one routine, `alms_sandbox::retention::sweep_expired_under`;
-  on-disk layout and behaviour are unchanged.
+  --summary-provider`/`--summary-model` trim their values as `agent config` already
+  did. The retention sweep for `shell_output/` and `tool-output/` spill files is
+  likewise one routine, `alms_sandbox::retention::sweep_expired_under`; on-disk
+  layout and behaviour are unchanged.
 
 ## v0.2.3 — released (tag `v0.2.3`)
 
