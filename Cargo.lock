@@ -267,9 +267,11 @@ dependencies = [
 name = "alms-test-support"
 version = "0.2.4"
 dependencies = [
+ "reqwest",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "wiremock",
 ]
 
 [[package]]

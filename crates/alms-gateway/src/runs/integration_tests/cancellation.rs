@@ -1518,7 +1518,7 @@ async fn http_cancel_emits_terminal_sse_even_when_the_terminal_arm_skips() {
 async fn http_cancel_and_execute_run_emit_single_event() {
     use axum::extract::{Path, State};
 
-    let (state, shutdown_token, _cr, _tr, _dr) = test_app_state_with_hanging_llm().await;
+    let ((state, shutdown_token, _cr, _tr, _dr), _llm) = test_app_state_with_hanging_llm().await;
     let agent_id = AgentId::new();
     let session = state
         .session_manager
