@@ -68,9 +68,15 @@ function KeyStep({ onSaved, onSkip }) {
             <button class="onboard-btn" type="submit" disabled=${saving.value || !key.value.trim()}>
                 ${saving.value ? 'Saving...' : 'Save Key'}
             </button>
-            <button class="onboard-skip" type="button" onClick=${onSkip} disabled=${saving.value}>
-                I've already set a key — skip
-            </button>
+            <div>
+                <button class="onboard-skip" type="button" onClick=${onSkip} disabled=${saving.value}>
+                    Skip for now
+                </button>
+                <div class="onboard-hint">
+                    A key exported as <code>OPENROUTER_API_KEY</code> works but is not visible
+                    from here, and you can always set one later in Settings.
+                </div>
+            </div>
             <div class="onboard-error">${error.value}</div>
             <p class="onboard-footnote">
                 The provider, the chat model and the summary model can all be changed later in

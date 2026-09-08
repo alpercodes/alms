@@ -121,6 +121,11 @@ Each item below changes behaviour for a deployment that has not set the knob exp
 - A DM reasoning collapsible is no longer labelled with whichever agent the sidebar
   happens to be showing.
 - The sidebar active-run indicator lights on cross-agent sessions.
+- First run now offers to store a provider key before the first agent is created, so a
+  fresh install no longer starts with a failed run. The step is skipped when a key is
+  already in the secrets store, and skippable when it is not — env-var keys are invisible
+  to `GET /auth/keys` by design, so it is never a gate. Keys set here apply to the running
+  gateway immediately.
 
 ### Internal
 
