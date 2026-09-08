@@ -1,21 +1,31 @@
 // Pinned behaviour for issue #162 half A: the onboarding key step decides
 // whether to show itself from `GET /auth/keys`, and that endpoint answers a
-// narrower question than the step is asking.
+// narrower question than the step is asking — in TWO independent ways.
 //
-// `list_keys` (crates/alms-gateway/src/auth_keys.rs) reports ONLY keys held
-// in the secrets store — env-var keys are deliberately excluded, because an
-// agent with `shell_exec` can read the environment. So an operator running
-// with `OPENROUTER_API_KEY` exported gets `configured: false` for every
-// provider while being fully configured.
+// 1. `list_keys` (crates/alms-gateway/src/auth_keys.rs) reports ONLY keys held
+//    in the secrets store — env-var keys are deliberately excluded, because an
+//    agent with `shell_exec` can read the environment. So an operator running
+//    with `OPENROUTER_API_KEY` exported gets `configured: false` for every
+//    provider while being fully configured.
+//
+// 2. It iterates `VALID_PROVIDERS`, which is a list of SECRET SLOTS, not of
+//    LLM providers: `telegram` is in there as a channel bot token. A stored
+//    Telegram token authenticates nothing an agent can think with.
 //
 // That makes the predicate one-directional, and these tests exist to keep it
 // that way: `true` is licence to SKIP the step, `false` is licence only to
 // SHOW it. Nothing downstream may read `false` as "this operator has no key"
 // and turn the step into a gate — the field is optional and the skip button
 // is unconditional. See `static/ui/utils/onboarding-keys.js`.
+//
+// Component-level invariants (skip button rendered and enabled, probe failure
+// resolving to step 1, agent creation not gated) are NOT covered here — this
+// module is a pure predicate. They are pinned in
+// `frontend/e2e/onboarding.spec.ts` against the real bundle.
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
 import path from 'node:path';
 import url from 'node:url';
 
@@ -25,10 +35,40 @@ const MODULE_PATH = path.resolve(
     __dirname,
     '../../static/ui/utils/onboarding-keys.js'
 );
+const PROVIDERS_MODULE_PATH = path.resolve(
+    __dirname,
+    '../../static/ui/utils/providers.js'
+);
+const SECRETS_RS_PATH = path.resolve(
+    __dirname,
+    '../../../alms-core/src/secrets.rs'
+);
 
 const { hasStoredKey, ONBOARDING_PROVIDER } = await import(
     url.pathToFileURL(MODULE_PATH).href
 );
+const { LLM_PROVIDERS } = await import(
+    url.pathToFileURL(PROVIDERS_MODULE_PATH).href
+);
+
+/**
+ * `VALID_PROVIDERS` as the backend actually declares it, parsed out of
+ * `secrets.rs` rather than retyped.
+ *
+ * Retyping it is what let the telegram bug through: the fixture below used to
+ * carry a comment claiming "every provider present" over a list of four, so a
+ * suite of this size sailed past the fifth. Reading the Rust makes that
+ * particular lie impossible — if the list grows, this file fails until someone
+ * classifies the newcomer.
+ */
+function validProvidersFromRust() {
+    const src = fs.readFileSync(SECRETS_RS_PATH, 'utf8');
+    const match = src.match(/VALID_PROVIDERS:\s*&\[&str\]\s*=\s*&\[([^\]]*)\]/);
+    assert.notEqual(match, null, `could not find VALID_PROVIDERS in ${SECRETS_RS_PATH}`);
+    return [...match[1].matchAll(/"([^"]+)"/g)].map((m) => m[1]);
+}
+
+const VALID_PROVIDERS = validProvidersFromRust();
 
 /** Shape of one entry in the `GET /auth/keys` response. */
 const entry = (provider, configured) => ({
@@ -38,14 +78,12 @@ const entry = (provider, configured) => ({
     source: configured ? 'secrets' : 'none',
 });
 
-/** The full fresh-install payload: every provider present, none configured. */
+/**
+ * The fresh-install payload: every slot the handler emits — i.e. every entry
+ * of `VALID_PROVIDERS`, telegram included — present and unconfigured.
+ */
 const FRESH_INSTALL = {
-    keys: [
-        entry('openai', false),
-        entry('anthropic', false),
-        entry('openrouter', false),
-        entry('gemini', false),
-    ],
+    keys: VALID_PROVIDERS.map((p) => entry(p, false)),
 };
 
 test('#162: hasStoredKey is exported as a function', () => {
@@ -68,17 +106,77 @@ test('#162: fresh install (nothing stored) does not skip the key step', () => {
     assert.equal(hasStoredKey(FRESH_INSTALL), false);
 });
 
-test('#162: any stored key skips the step, whichever provider holds it', () => {
+/** FRESH_INSTALL with exactly one slot flipped to configured. */
+const withStored = (provider) => ({
+    keys: FRESH_INSTALL.keys.map((k) =>
+        k.provider === provider ? entry(provider, true) : k
+    ),
+});
+
+test('#162: any stored LLM key skips the step, whichever provider holds it', () => {
     // The step offers OpenRouter, but an operator who already pasted an
     // Anthropic key in Settings is configured and must not be asked again.
-    for (const provider of ['openai', 'anthropic', 'openrouter', 'gemini']) {
-        const payload = {
-            keys: FRESH_INSTALL.keys.map((k) =>
-                k.provider === provider ? entry(provider, true) : k
-            ),
-        };
-        assert.equal(hasStoredKey(payload), true, `expected skip for ${provider}`);
+    for (const provider of LLM_PROVIDERS) {
+        assert.equal(hasStoredKey(withStored(provider)), true, `expected skip for ${provider}`);
     }
+});
+
+test('#163: a stored telegram token does NOT skip the step', () => {
+    // THE bug this filter exists for (Tim's review of PR #163). `telegram` is
+    // in `VALID_PROVIDERS` because it is a secret slot — `alms auth set
+    // telegram` writes it and the gateway reads it at startup to spawn the
+    // polling loop — but it is a channel bot token, not an LLM credential.
+    //
+    // Before the filter, an operator who wired up Telegram before first
+    // opening the dashboard had step 1 skipped, created an agent, and hit
+    // exactly the failed first run #162 exists to prevent. The one case where
+    // skipping is wrong was the one case that fired.
+    assert.equal(hasStoredKey(withStored('telegram')), false);
+
+    // ...and it must not mask a genuinely missing LLM key when combined with
+    // other unconfigured rows, nor suppress a real one when both are present.
+    assert.equal(
+        hasStoredKey({ keys: [entry('telegram', true)] }),
+        false
+    );
+    assert.equal(
+        hasStoredKey({ keys: [entry('telegram', true), entry('openrouter', true)] }),
+        true
+    );
+});
+
+test('#163: unknown provider slots are ignored, not trusted', () => {
+    // A future secret slot (or a hand-rolled `secrets.json`) must not be read
+    // as an LLM credential by default. The safe direction is to show the step.
+    assert.equal(hasStoredKey({ keys: [entry('smtp', true)] }), false);
+    assert.equal(hasStoredKey({ keys: [entry('', true)] }), false);
+    assert.equal(hasStoredKey({ keys: [{ configured: true }] }), false);
+});
+
+test('#163: LLM_PROVIDERS is VALID_PROVIDERS minus the non-LLM slots', () => {
+    // The drift guard. `GET /auth/keys` iterates `VALID_PROVIDERS`, so every
+    // entry of it reaches `hasStoredKey`, and each one has to be classified:
+    // either it is an LLM credential (skipping the step is correct) or it is
+    // not (skipping is the #163 bug).
+    //
+    // Adding a slot to secrets.rs without deciding fails HERE, loudly, rather
+    // than silently widening the skip. If the newcomer is an LLM provider, add
+    // it to `static/ui/utils/providers.js`; if it is another channel or
+    // service token, add it to the list below.
+    const NON_LLM_SLOTS = ['telegram'];
+
+    assert.deepEqual(
+        [...VALID_PROVIDERS].sort(),
+        [...LLM_PROVIDERS, ...NON_LLM_SLOTS].sort(),
+        'VALID_PROVIDERS (secrets.rs) has an entry that is in neither '
+        + 'LLM_PROVIDERS nor NON_LLM_SLOTS — classify it before shipping'
+    );
+
+    // Sanity on the parse itself: if the regex ever silently matched nothing
+    // the assertion above could pass vacuously against an empty JS list.
+    assert.ok(VALID_PROVIDERS.length >= 5, 'parsed too few providers from secrets.rs');
+    assert.ok(VALID_PROVIDERS.includes('telegram'));
+    assert.ok(VALID_PROVIDERS.includes(ONBOARDING_PROVIDER));
 });
 
 test('#162: several stored keys still read as "stored"', () => {
