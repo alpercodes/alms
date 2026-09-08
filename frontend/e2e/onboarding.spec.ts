@@ -122,12 +122,33 @@ test("no stored key: the key step is offered and the skip button works", async (
   await expect(keyStep(page)).toBeVisible();
   await expect(page.getByRole("heading", { name: "Welcome to ALMS" })).toBeVisible();
 
-  // The copy carries three claims the operator acts on. Pin them: OpenRouter
-  // is the recommendation, and one key there covers BOTH compiled defaults.
+  // The copy carries claims the operator acts on. Pin them: OpenRouter is the
+  // recommendation, and one key there covers BOTH compiled defaults.
   const card = page.locator(".onboard-card");
   await expect(card).toContainText("z-ai/glm-5.2");
   await expect(card).toContainText("google/gemma-4-31b-it");
   await expect(card).toContainText("no restart");
+
+  // The skip sub-line, pinned as one span rather than by fragment, for two
+  // reasons.
+  //
+  // Whitespace: htm trims text at LINE boundaries but not within them, so the
+  // spaces around `under` survive only because that word and its `<code>`
+  // sibling happen to share a source line. A three-character reflow silently
+  // renders `api_key_envunder[llm.providers.openrouter]`, and the earlier
+  // `${" "}` fix elsewhere in this card is a convention, which is a weak lever
+  // against reflow. Playwright collapses whitespace runs but never inserts
+  // one, so a lost space fails here.
+  //
+  // Content: it re-pins the correction in c63747c. `api_key_env` in
+  // `alms.toml` is the key source that works while invisible to
+  // `GET /auth/keys`; a bare `OPENROUTER_API_KEY` export is NOT one (startup
+  // logs "detected but IGNORED for security"), and naming it here sent readers
+  // into the failed first run this flow exists to close. The misconception has
+  // a fossil to regenerate from — `docs/_archive/argus-review-2026-03-15.md`
+  // records the old behaviour, where config really did fold those env vars
+  // into one key — so it is worth an assertion, not just a comment.
+  await expect(card).toContainText("api_key_env under [llm.providers.openrouter]");
 
   // The invariant. Not merely present — ENABLED, with no key stored. This is
   // the assertion that fails if someone "tightens" the step into a gate.
