@@ -1,4 +1,4 @@
-import{a as e,c as t,d as n,i as r,l as i,n as a,o,r as s,s as c,u as l}from"./index-B9JnQNlm.js";import{n as u,t as d}from"./deps-EujoLFFs.js";import{A as f,C as p,D as m,E as h,M as g,N as _,O as v,P as y,S as b,T as x,_ as S,a as C,b as w,c as T,d as E,f as D,g as ee,h as te,i as ne,j as O,l as re,m as k,o as A,p as j,r as M,s as N,t as P,u as ie,v as F,w as ae,x as oe,y as I}from"./pending-messages-CM83ImuS.js";import{A as se,C as ce,D as le,E as ue,I as L,M as de,O as fe,P as pe,S as me,T as he,a as ge,b as _e,c as ve,d as ye,g as be,h as xe,j as Se,k as Ce,l as we,n as Te,o as Ee,p as De,r as Oe,s as ke,t as Ae,u as je,x as Me,y as Ne}from"./use-session-stream-CcJmR-F3.js";import{t as R}from"./entity-state-Dvifu_4n.js";import{a as Pe,n as z,r as B,t as Fe}from"./agents-MtmSsFse.js";import{activeRunId as V,clearRuns as Ie,replaceRuns as Le,runListGeneration as Re,selectedRunId as ze}from"./runs-BolhorsL.js";import{a as Be,i as Ve,o as He,r as Ue}from"./chat-actions-uXEv39RD.js";import{agentSwitchLoading as We,bootRetryAvailable as Ge,runBoot as Ke,sessionSwitchLoading as qe,setRunBoot as Je}from"./loading-Bbj2RyMp.js";import{n as Ye,t as Xe}from"./select-generation-DvILpFQd.js";import{n as Ze,o as Qe,r as $e,t as et}from"./runs-D2UUJKOD.js";import{a as tt,i as nt,r as rt,t as it}from"./load-session-BfMat4Kx.js";var at=()=>O(`/settings`),ot=e=>g(`/settings`,e),H=o({});async function st(){try{H.value=await at()}catch(e){console.error(`[settings] refresh failed:`,e)}}var U=o(null),W=o(null),G=null,ct=null,lt=0,ut=10,dt=null,K=null,q=null;function ft(e,t){let n=t&&t.streamEpoch!=null?String(t.streamEpoch):null;if(mt(),!e)return;q!==null&&(clearTimeout(q),q=null);let r=localStorage.getItem(`alms_auth_token`),i=new URLSearchParams;r&&i.set(`token`,r),t&&t.lastEventId!=null&&i.set(`last_event_id`,String(t.lastEventId)),n&&i.set(`stream_epoch`,n);let a=i.toString(),o=`/events/session-activity${a?`?`+a:``}`,s=new EventSource(o);G=s,ct=e,lt=0,dt=t&&t.lastEventId!=null?t.lastEventId:null,K=n;let c=!1,l=!1,u=!1,d=null,f=null,p=0,m=!1,h=(e,t,n)=>re(e,t,n,K),g=async(e,t=K)=>{let n=Number.isSafeInteger(e)?e:null,r=t;if(l){u=!0,f===r?n!=null&&(d=d==null?n:Math.max(d,n)):(f=r,d=n);return}if(s!==G)return;l=!0;let i=ie(n,r),a=null;try{a=await L(null,{includeDms:!0})}catch(e){console.error(`[agent-events] activity reconciliation failed:`,e)}if(s!==G){T(i);return}a?D(i,a.sessions||[])?p=0:(u=!0,d=n,f=r):T(i),l=!1;let o=u,c=d,m=f;if(u=!1,d=null,f=null,o&&s===G){g(c,m);return}if(!a&&s===G){p++;let e=Math.min(1e3*2**(p-1),3e4);s._reconciliationRetryTimer=setTimeout(()=>{s._reconciliationRetryTimer=null,s===G&&g(null)},e)}};s.addEventListener(`open`,()=>{if(s!==G)return;let e=c||!!(t&&t.reconcileOnOpen);c=!0,ge(`agent-events`),e&&g(null)});let _=async(t,n)=>{if(!(m||s!==G)){m=!0,s.close(),console.error(`[agent-events] rejected live event; reconciling:`,n);try{let n=await L(null,{includeDms:!0});if(s!==G)return;k(n.sessions||[],t,K),G=null,ft(e,{lastEventId:t,streamEpoch:K,reconcileOnOpen:!0})}catch(e){console.error(`[agent-events] contract reconciliation failed:`,e),ke(`agent-events`)}}},v=(e,t)=>s.addEventListener(e,n=>{if(s!==G)return;let r=n.lastEventId,i=r&&/^\d+$/.test(r)?Number(r):null;try{let a=globalThis.__almsContracts;if(!a)throw Error(`Frontend contract bridge is not installed`);t({data:a.parseSseJsonPayload(e,n.data),lastEventId:n.lastEventId}),i!=null&&(dt=r)}catch(t){i==null?(console.error(`[agent-events]`,e,`handler failed:`,t),s.close(),ke(`agent-events`)):_(i,t)}});v(`session_activity_started`,e=>{let t=e.data,n=/^\d+$/.test(e.lastEventId)?Number(e.lastEventId):null;h(`session_activity_started`,t,n)}),v(`session_activity_ended`,e=>{let t=e.data,n=/^\d+$/.test(e.lastEventId)?Number(e.lastEventId):null;h(`session_activity_ended`,t,n)}),v(`stream_state`,e=>{let t=e.data,n=!!(K&&t.stream_epoch&&K!==t.stream_epoch);if(t.stream_epoch&&(K=t.stream_epoch),t.requires_reconciliation||n){let e=Number.isSafeInteger(t.newest)?t.newest:null;g(e)}}),s.onerror=()=>{if(s.readyState===EventSource.CLOSED){if(lt++,lt>=ut){console.error(`[agent-events] Max retries reached for agent`,e),ke(`agent-events`);return}let t=Math.min(2e3*2**(lt-1),3e4),n=e,r=dt,i=K;q=setTimeout(()=>{q=null,ct===n&&ft(n,{lastEventId:r,streamEpoch:i,reconcileOnOpen:!0})},t)}}}function pt(){lt=0;let e=ct;e?ft(e,{lastEventId:dt,streamEpoch:K,reconcileOnOpen:!0}):ge(`agent-events`)}we(pt);function mt(){G&&=(G._reconciliationRetryTimer!=null&&(clearTimeout(G._reconciliationRetryTimer),G._reconciliationRetryTimer=null),G.close(),null),ct=null,dt=null,K=null,lt=0,q!==null&&(clearTimeout(q),q=null),ge(`agent-events`)}function ht(e,t){return!t||typeof t!=`string`?e??null:t===e?null:t}function gt(e){return!e||typeof e!=`string`?null:e}function _t(e,t){return!t||typeof t!=`string`||!e||typeof e!=`string`?!1:e===t}function vt(e){let t=new Map;if(!Array.isArray(e))return t;for(let n of e){if(!n||typeof n.agent_id!=`string`||!n.agent_id)continue;let e=t.get(n.agent_id);e?e.push(n):t.set(n.agent_id,[n])}return t}function yt(e,t){if(!e||!t||typeof t!=`string`)return!1;if(e.session_type===`notification`)return rt(e.agent_name,t);if(e.session_type===`dm`){let n=e.participants;return Array.isArray(n)&&n.some(e=>rt(e,t))}return!1}function bt(e,t){if(!Array.isArray(e))return[];let n=e.map((e,n)=>({s:e,idx:n,owned:+!yt(e,t)}));return n.sort((e,t)=>e.owned-t.owned||e.idx-t.idx),n.map(e=>e.s)}function xt(e){return Array.isArray(e)?e.filter(e=>e&&e.session_type!==`notification`&&e.session_type!==`job`&&e.session_type!==`subagent`):[]}function St(e){return Array.isArray(e)?e.filter(e=>e&&e.session_type===`job`):[]}function Ct(e){return Array.isArray(e)?e.filter(e=>e&&e.session_type===`subagent`):[]}function wt(e){return!!e&&e.session_type!==`subagent`}var Tt=`alms_active_agent`,J=0;function Et(e){return`alms_active_session_${e}`}function Dt(e,t){e&&t&&localStorage.setItem(Et(e),t)}function Ot(e,t,n){if(n){let e=t.find(e=>e.id===n);if(e)return e}let r=localStorage.getItem(Et(e));if(r){let e=t.find(e=>e.id===r);if(e)return e}return t[0]||null}async function kt(e,t){let n=localStorage.getItem(Et(e));if(!n||t.some(e=>e.id===n))return null;try{return await pe(n),n}catch(t){return t&&t.status===404&&localStorage.removeItem(Et(e)),null}}async function At(){try{let e=await at();H.value=e,Pe(e.agents||[]);let t=localStorage.getItem(Tt),n=B.value.find(e=>e.is_default),r=B.value[0],i=B.value.find(e=>e.id===t)||n||r;i&&(z.value=i.id,oe.value=gt(i.id),localStorage.setItem(Tt,i.id),await Mt(i.id))}catch(e){throw console.error(`[boot] failed:`,e),e}}async function jt(){try{return(await L(null,{includeDms:!0})).sessions||[]}catch(e){return console.error(`[fetchCrossAgentSurfaces] failed:`,e),[]}}async function Mt(e,t){let n=++J;try{let[r,i]=await Promise.all([L(e,{includeDms:!1}),jt()]);if(n!==J)return;let a=xt(r.sessions||[]);h(a,i),k([...a,...i]),ft(e);let o=t?null:await kt(e,a);if(n!==J)return;if(o)S.value=o,Dt(e,o),await it(o,{isStale:()=>n!==J,logPrefix:`loadAgentSessions:hidden`});else if(a.length>0){let r=Ot(e,a,t);S.value=r.id,Dt(e,r.id),await it(r.id,{isStale:()=>n!==J,logPrefix:`loadAgentSessions`})}else{let t=await Se(e,`web-chat-`+Date.now());if(n!==J)return;let[r,i]=await Promise.all([L(e,{includeDms:!1}),jt()]);if(n!==J)return;h(xt(r.sessions||[]),i),S.value=t.session_id,Be([],t.session_id),Le(t.session_id,[]),Oe(t.session_id)}}catch(e){if(n!==J)return;console.error(`[loadAgentSessions] failed:`,e)}}async function Nt(e,t){if(!B.value.find(t=>t.id===e))return;Ae(),mt(),Xe(),z.value=e,oe.value=gt(e),localStorage.setItem(Tt,e),We.value=!0,S.value=null,ze.value=null,m(),Be([]),j.value=[],U.value=null,W.value=null,_e();let n=Mt(e,t&&t.targetSessionId),r=J;try{await n}finally{r===J&&(We.value=!1)}}var Y=o(null),X=o(`agents`);function Pt(e){Y.value===e?Y.value=null:(Y.value=e,X.value=e)}var Ft=`alms_theme`;function It(){return localStorage.getItem(Ft)||`dark`}var Lt=o(It());function Rt(){let e=Lt.value===`dark`?`light`:`dark`;Lt.value=e,localStorage.setItem(Ft,e),document.documentElement.setAttribute(`data-theme`,e)}document.documentElement.setAttribute(`data-theme`,It());var zt=()=>d`<svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><circle cx="10" cy="10" r="8"/><path d="M10 6v4l3 3"/></svg>`,Bt=()=>d`<svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M3 5a2 2 0 012-2h3l2 2h5a2 2 0 012 2v7a2 2 0 01-2 2H5a2 2 0 01-2-2V5z"/></svg>`,Vt=()=>d`<svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M5 5l10 10M15 5L5 15"/></svg>`,Ht=()=>d`<svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 15V5M10 5L5 10M10 5l5 5"/></svg>`,Ut=()=>d`<svg width="20" height="20" viewBox="0 0 20 20" fill="currentColor"><rect x="5" y="5" width="10" height="10" rx="1.5"/></svg>`,Wt=()=>d`<svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M6 4l10 6-10 6V4z"/></svg>`,Gt=()=>d`<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12.22 2h-.44a2 2 0 00-2 2v.18a2 2 0 01-1 1.73l-.43.25a2 2 0 01-2 0l-.15-.08a2 2 0 00-2.73.73l-.22.38a2 2 0 00.73 2.73l.15.1a2 2 0 011 1.72v.51a2 2 0 01-1 1.74l-.15.09a2 2 0 00-.73 2.73l.22.38a2 2 0 002.73.73l.15-.08a2 2 0 012 0l.43.25a2 2 0 011 1.73V20a2 2 0 002 2h.44a2 2 0 002-2v-.18a2 2 0 011-1.73l.43-.25a2 2 0 012 0l.15.08a2 2 0 002.73-.73l.22-.39a2 2 0 00-.73-2.73l-.15-.08a2 2 0 01-1-1.74v-.5a2 2 0 011-1.74l.15-.09a2 2 0 00.73-2.73l-.22-.38a2 2 0 00-2.73-.73l-.15.08a2 2 0 01-2 0l-.43-.25a2 2 0 01-1-1.73V4a2 2 0 00-2-2z"/><circle cx="12" cy="12" r="3"/></svg>`,Kt=()=>d`<svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M3 5h14M3 10h14M3 15h14"/></svg>`,qt=()=>d`<svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><circle cx="10" cy="10" r="4"/><path d="M10 2v2M10 16v2M3.5 10H2M18 10h-1.5M5.05 5.05L3.63 3.63M16.37 16.37l-1.42-1.42M5.05 14.95l-1.42 1.42M16.37 3.63l-1.42 1.42"/></svg>`,Jt=()=>d`<svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M17 12.5A7.5 7.5 0 017.5 3 7.5 7.5 0 1017 12.5z"/></svg>`,Yt=o(!1);function Xt(){Yt.value=!Yt.value}function Zt(){Yt.value=!1}var Qt=[`agents`,`jobs`,`audit`],$t=s(()=>H.value.posture||`guarded`);function en({onOpenSettings:e,status:t}){let n=$t.value,r=t.value===`connected`?`ok`:t.value===`running`?`running`:t.value===`error`||t.value===`offline`?`error`:``;return d`
+import{a as e,c as t,d as n,i as r,l as i,n as a,o,r as s,s as c,u as l}from"./index-CT4_xDfP.js";import{n as u,t as d}from"./deps-BbwRjbfu.js";import{A as f,C as p,D as m,E as h,M as g,N as _,O as v,P as y,S as b,T as x,_ as S,a as C,b as w,c as T,d as E,f as D,g as ee,h as te,i as ne,j as O,l as re,m as k,o as A,p as j,r as M,s as N,t as P,u as ie,v as F,w as ae,x as oe,y as I}from"./pending-messages-DKgkQu4U.js";import{A as se,C as ce,D as le,E as ue,I as L,M as de,O as fe,P as pe,S as me,T as he,a as ge,b as _e,c as ve,d as ye,g as be,h as xe,j as Se,k as Ce,l as we,n as Te,o as Ee,p as De,r as Oe,s as ke,t as Ae,u as je,x as Me,y as Ne}from"./use-session-stream-D6bbe1DS.js";import{t as R}from"./entity-state-Dvifu_4n.js";import{a as Pe,n as z,r as B,t as Fe}from"./agents-BbiYYpN-.js";import{activeRunId as V,clearRuns as Ie,replaceRuns as Le,runListGeneration as Re,selectedRunId as ze}from"./runs-Br24gelM.js";import{a as Be,i as Ve,o as He,r as Ue}from"./chat-actions-uXEv39RD.js";import{agentSwitchLoading as We,bootRetryAvailable as Ge,runBoot as Ke,sessionSwitchLoading as qe,setRunBoot as Je}from"./loading-D1osfiA_.js";import{n as Ye,t as Xe}from"./select-generation-DvILpFQd.js";import{n as Ze,o as Qe,r as $e,t as et}from"./runs-DVjzj6EK.js";import{a as tt,i as nt,r as rt,t as it}from"./load-session-B61DeJ_Q.js";var at=()=>O(`/settings`),ot=e=>g(`/settings`,e),H=o({});async function st(){try{H.value=await at()}catch(e){console.error(`[settings] refresh failed:`,e)}}var U=o(null),W=o(null),G=null,ct=null,lt=0,ut=10,dt=null,K=null,q=null;function ft(e,t){let n=t&&t.streamEpoch!=null?String(t.streamEpoch):null;if(mt(),!e)return;q!==null&&(clearTimeout(q),q=null);let r=localStorage.getItem(`alms_auth_token`),i=new URLSearchParams;r&&i.set(`token`,r),t&&t.lastEventId!=null&&i.set(`last_event_id`,String(t.lastEventId)),n&&i.set(`stream_epoch`,n);let a=i.toString(),o=`/events/session-activity${a?`?`+a:``}`,s=new EventSource(o);G=s,ct=e,lt=0,dt=t&&t.lastEventId!=null?t.lastEventId:null,K=n;let c=!1,l=!1,u=!1,d=null,f=null,p=0,m=!1,h=(e,t,n)=>re(e,t,n,K),g=async(e,t=K)=>{let n=Number.isSafeInteger(e)?e:null,r=t;if(l){u=!0,f===r?n!=null&&(d=d==null?n:Math.max(d,n)):(f=r,d=n);return}if(s!==G)return;l=!0;let i=ie(n,r),a=null;try{a=await L(null,{includeDms:!0})}catch(e){console.error(`[agent-events] activity reconciliation failed:`,e)}if(s!==G){T(i);return}a?D(i,a.sessions||[])?p=0:(u=!0,d=n,f=r):T(i),l=!1;let o=u,c=d,m=f;if(u=!1,d=null,f=null,o&&s===G){g(c,m);return}if(!a&&s===G){p++;let e=Math.min(1e3*2**(p-1),3e4);s._reconciliationRetryTimer=setTimeout(()=>{s._reconciliationRetryTimer=null,s===G&&g(null)},e)}};s.addEventListener(`open`,()=>{if(s!==G)return;let e=c||!!(t&&t.reconcileOnOpen);c=!0,ge(`agent-events`),e&&g(null)});let _=async(t,n)=>{if(!(m||s!==G)){m=!0,s.close(),console.error(`[agent-events] rejected live event; reconciling:`,n);try{let n=await L(null,{includeDms:!0});if(s!==G)return;k(n.sessions||[],t,K),G=null,ft(e,{lastEventId:t,streamEpoch:K,reconcileOnOpen:!0})}catch(e){console.error(`[agent-events] contract reconciliation failed:`,e),ke(`agent-events`)}}},v=(e,t)=>s.addEventListener(e,n=>{if(s!==G)return;let r=n.lastEventId,i=r&&/^\d+$/.test(r)?Number(r):null;try{let a=globalThis.__almsContracts;if(!a)throw Error(`Frontend contract bridge is not installed`);t({data:a.parseSseJsonPayload(e,n.data),lastEventId:n.lastEventId}),i!=null&&(dt=r)}catch(t){i==null?(console.error(`[agent-events]`,e,`handler failed:`,t),s.close(),ke(`agent-events`)):_(i,t)}});v(`session_activity_started`,e=>{let t=e.data,n=/^\d+$/.test(e.lastEventId)?Number(e.lastEventId):null;h(`session_activity_started`,t,n)}),v(`session_activity_ended`,e=>{let t=e.data,n=/^\d+$/.test(e.lastEventId)?Number(e.lastEventId):null;h(`session_activity_ended`,t,n)}),v(`stream_state`,e=>{let t=e.data,n=!!(K&&t.stream_epoch&&K!==t.stream_epoch);if(t.stream_epoch&&(K=t.stream_epoch),t.requires_reconciliation||n){let e=Number.isSafeInteger(t.newest)?t.newest:null;g(e)}}),s.onerror=()=>{if(s.readyState===EventSource.CLOSED){if(lt++,lt>=ut){console.error(`[agent-events] Max retries reached for agent`,e),ke(`agent-events`);return}let t=Math.min(2e3*2**(lt-1),3e4),n=e,r=dt,i=K;q=setTimeout(()=>{q=null,ct===n&&ft(n,{lastEventId:r,streamEpoch:i,reconcileOnOpen:!0})},t)}}}function pt(){lt=0;let e=ct;e?ft(e,{lastEventId:dt,streamEpoch:K,reconcileOnOpen:!0}):ge(`agent-events`)}we(pt);function mt(){G&&=(G._reconciliationRetryTimer!=null&&(clearTimeout(G._reconciliationRetryTimer),G._reconciliationRetryTimer=null),G.close(),null),ct=null,dt=null,K=null,lt=0,q!==null&&(clearTimeout(q),q=null),ge(`agent-events`)}function ht(e,t){return!t||typeof t!=`string`?e??null:t===e?null:t}function gt(e){return!e||typeof e!=`string`?null:e}function _t(e,t){return!t||typeof t!=`string`||!e||typeof e!=`string`?!1:e===t}function vt(e){let t=new Map;if(!Array.isArray(e))return t;for(let n of e){if(!n||typeof n.agent_id!=`string`||!n.agent_id)continue;let e=t.get(n.agent_id);e?e.push(n):t.set(n.agent_id,[n])}return t}function yt(e,t){if(!e||!t||typeof t!=`string`)return!1;if(e.session_type===`notification`)return rt(e.agent_name,t);if(e.session_type===`dm`){let n=e.participants;return Array.isArray(n)&&n.some(e=>rt(e,t))}return!1}function bt(e,t){if(!Array.isArray(e))return[];let n=e.map((e,n)=>({s:e,idx:n,owned:+!yt(e,t)}));return n.sort((e,t)=>e.owned-t.owned||e.idx-t.idx),n.map(e=>e.s)}function xt(e){return Array.isArray(e)?e.filter(e=>e&&e.session_type!==`notification`&&e.session_type!==`job`&&e.session_type!==`subagent`):[]}function St(e){return Array.isArray(e)?e.filter(e=>e&&e.session_type===`job`):[]}function Ct(e){return Array.isArray(e)?e.filter(e=>e&&e.session_type===`subagent`):[]}function wt(e){return!!e&&e.session_type!==`subagent`}var Tt=`alms_active_agent`,J=0;function Et(e){return`alms_active_session_${e}`}function Dt(e,t){e&&t&&localStorage.setItem(Et(e),t)}function Ot(e,t,n){if(n){let e=t.find(e=>e.id===n);if(e)return e}let r=localStorage.getItem(Et(e));if(r){let e=t.find(e=>e.id===r);if(e)return e}return t[0]||null}async function kt(e,t){let n=localStorage.getItem(Et(e));if(!n||t.some(e=>e.id===n))return null;try{return await pe(n),n}catch(t){return t&&t.status===404&&localStorage.removeItem(Et(e)),null}}async function At(){try{let e=await at();H.value=e,Pe(e.agents||[]);let t=localStorage.getItem(Tt),n=B.value.find(e=>e.is_default),r=B.value[0],i=B.value.find(e=>e.id===t)||n||r;i&&(z.value=i.id,oe.value=gt(i.id),localStorage.setItem(Tt,i.id),await Mt(i.id))}catch(e){throw console.error(`[boot] failed:`,e),e}}async function jt(){try{return(await L(null,{includeDms:!0})).sessions||[]}catch(e){return console.error(`[fetchCrossAgentSurfaces] failed:`,e),[]}}async function Mt(e,t){let n=++J;try{let[r,i]=await Promise.all([L(e,{includeDms:!1}),jt()]);if(n!==J)return;let a=xt(r.sessions||[]);h(a,i),k([...a,...i]),ft(e);let o=t?null:await kt(e,a);if(n!==J)return;if(o)S.value=o,Dt(e,o),await it(o,{isStale:()=>n!==J,logPrefix:`loadAgentSessions:hidden`});else if(a.length>0){let r=Ot(e,a,t);S.value=r.id,Dt(e,r.id),await it(r.id,{isStale:()=>n!==J,logPrefix:`loadAgentSessions`})}else{let t=await Se(e,`web-chat-`+Date.now());if(n!==J)return;let[r,i]=await Promise.all([L(e,{includeDms:!1}),jt()]);if(n!==J)return;h(xt(r.sessions||[]),i),S.value=t.session_id,Be([],t.session_id),Le(t.session_id,[]),Oe(t.session_id)}}catch(e){if(n!==J)return;console.error(`[loadAgentSessions] failed:`,e)}}async function Nt(e,t){if(!B.value.find(t=>t.id===e))return;Ae(),mt(),Xe(),z.value=e,oe.value=gt(e),localStorage.setItem(Tt,e),We.value=!0,S.value=null,ze.value=null,m(),Be([]),j.value=[],U.value=null,W.value=null,_e();let n=Mt(e,t&&t.targetSessionId),r=J;try{await n}finally{r===J&&(We.value=!1)}}var Y=o(null),X=o(`agents`);function Pt(e){Y.value===e?Y.value=null:(Y.value=e,X.value=e)}var Ft=`alms_theme`;function It(){return localStorage.getItem(Ft)||`dark`}var Lt=o(It());function Rt(){let e=Lt.value===`dark`?`light`:`dark`;Lt.value=e,localStorage.setItem(Ft,e),document.documentElement.setAttribute(`data-theme`,e)}document.documentElement.setAttribute(`data-theme`,It());var zt=()=>d`<svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><circle cx="10" cy="10" r="8"/><path d="M10 6v4l3 3"/></svg>`,Bt=()=>d`<svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M3 5a2 2 0 012-2h3l2 2h5a2 2 0 012 2v7a2 2 0 01-2 2H5a2 2 0 01-2-2V5z"/></svg>`,Vt=()=>d`<svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M5 5l10 10M15 5L5 15"/></svg>`,Ht=()=>d`<svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 15V5M10 5L5 10M10 5l5 5"/></svg>`,Ut=()=>d`<svg width="20" height="20" viewBox="0 0 20 20" fill="currentColor"><rect x="5" y="5" width="10" height="10" rx="1.5"/></svg>`,Wt=()=>d`<svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M6 4l10 6-10 6V4z"/></svg>`,Gt=()=>d`<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12.22 2h-.44a2 2 0 00-2 2v.18a2 2 0 01-1 1.73l-.43.25a2 2 0 01-2 0l-.15-.08a2 2 0 00-2.73.73l-.22.38a2 2 0 00.73 2.73l.15.1a2 2 0 011 1.72v.51a2 2 0 01-1 1.74l-.15.09a2 2 0 00-.73 2.73l.22.38a2 2 0 002.73.73l.15-.08a2 2 0 012 0l.43.25a2 2 0 011 1.73V20a2 2 0 002 2h.44a2 2 0 002-2v-.18a2 2 0 011-1.73l.43-.25a2 2 0 012 0l.15.08a2 2 0 002.73-.73l.22-.39a2 2 0 00-.73-2.73l-.15-.08a2 2 0 01-1-1.74v-.5a2 2 0 011-1.74l.15-.09a2 2 0 00.73-2.73l-.22-.38a2 2 0 00-2.73-.73l-.15.08a2 2 0 01-2 0l-.43-.25a2 2 0 01-1-1.73V4a2 2 0 00-2-2z"/><circle cx="12" cy="12" r="3"/></svg>`,Kt=()=>d`<svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M3 5h14M3 10h14M3 15h14"/></svg>`,qt=()=>d`<svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><circle cx="10" cy="10" r="4"/><path d="M10 2v2M10 16v2M3.5 10H2M18 10h-1.5M5.05 5.05L3.63 3.63M16.37 16.37l-1.42-1.42M5.05 14.95l-1.42 1.42M16.37 3.63l-1.42 1.42"/></svg>`,Jt=()=>d`<svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M17 12.5A7.5 7.5 0 017.5 3 7.5 7.5 0 1017 12.5z"/></svg>`,Yt=o(!1);function Xt(){Yt.value=!Yt.value}function Zt(){Yt.value=!1}var Qt=[`agents`,`jobs`,`audit`],$t=s(()=>H.value.posture||`guarded`);function en({onOpenSettings:e,status:t}){let n=$t.value,r=t.value===`connected`?`ok`:t.value===`running`?`running`:t.value===`error`||t.value===`offline`?`error`:``;return d`
         <header>
             <button class="sidebar-toggle-btn" title="Toggle sessions" aria-label="Toggle sessions"
                     onClick=${Xt}>
@@ -2072,28 +2072,81 @@ Context: `+t.context_id+_}
                 </div>
             </div>
         </div>
-    `}function go(){let e=a(``),t=a(``),n=a(!1);return d`
-        <div id="onboarding">
-            <form class="onboard-card" onSubmit=${async r=>{r.preventDefault();let i=e.value.trim();if(i){if(!/^[A-Za-z0-9](?:[A-Za-z0-9-]{0,62}[A-Za-z0-9])?$/.test(i)){t.value=`Invalid name: letters, digits, hyphens only (1-64 chars, no trailing hyphen)`;return}n.value=!0,t.value=``;try{let e=await Mi({name:i,is_default:!0});Pe((await ji()).agents||[]);let t=e.id||(B.value.find(e=>e.name===i)||{}).id;t?await Nt(t):console.warn(`[onboarding] POST /agents returned no id for agent:`,i,e)}catch(e){t.value=e.error?.message||e.message||`Failed to create agent`}finally{n.value=!1}}}}>
-                <h2>Welcome to ALMS</h2>
-                <p>Create your first agent to get started. The agent will introduce itself and learn about you in a short setup conversation.</p>
-                <div>
-                    <label>Agent name</label>
-                    <input type="text" placeholder="my-agent" autofocus
-                        value=${e.value}
-                        onInput=${t=>{e.value=t.target.value}}
-                        disabled=${n.value} />
-                    <div class="onboard-hint">letters, digits, hyphens (1-64 chars)</div>
+    `}var go=`openrouter`;function _o(e){let t=e&&e.keys;return Array.isArray(t)?t.some(e=>e&&e.configured===!0):!1}var vo=`https://openrouter.ai/keys`;function yo({onSaved:e,onSkip:t}){let n=a(``),r=a(``),o=a(!1),s=c(null);return i(()=>{s.current?.focus()},[]),d`
+        <form class="onboard-card" onSubmit=${async t=>{t.preventDefault();let i=n.value.trim();if(i){o.value=!0,r.value=``;try{await lo(go,i),n.value=``,e()}catch(e){r.value=e.error?.message||e.message||`Failed to save key`}finally{o.value=!1}}}}>
+            <div class="onboard-step">Step 1 of 2</div>
+            <h2>Welcome to ALMS</h2>
+            <p>
+                An agent answers through an LLM provider, so it needs a key before it can reply
+                at all. <strong>OpenRouter</strong> is the recommended one: it is the default
+                provider, and one key there covers both defaults —${` `}
+                <code>z-ai/glm-5.2</code> for chat and <code>google/gemma-4-31b-it</code> for
+                summaries (compaction and episodic memory). Nothing else to configure.
+            </p>
+            <div>
+                <div class="onboard-label-row">
+                    <label>OpenRouter API key</label>
+                    <a href=${vo} target="_blank" rel="noopener noreferrer">Get a key</a>
                 </div>
-                <button class="onboard-btn" type="submit" disabled=${n.value||!e.value.trim()}>
-                    ${n.value?`Creating...`:`Create Agent`}
-                </button>
-                <div class="onboard-error">${t.value}</div>
-            </form>
+                <input type="password" autocomplete="off" placeholder="sk-or-..."
+                    value=${n.value}
+                    ref=${s}
+                    onInput=${e=>{n.value=e.target.value}}
+                    disabled=${o.value} />
+                <div class="onboard-hint">
+                    Applies to the running gateway immediately — no restart needed.
+                </div>
+            </div>
+            <button class="onboard-btn" type="submit" disabled=${o.value||!n.value.trim()}>
+                ${o.value?`Saving...`:`Save Key`}
+            </button>
+            <button class="onboard-skip" type="button" onClick=${t} disabled=${o.value}>
+                I've already set a key — skip
+            </button>
+            <div class="onboard-error">${r.value}</div>
+            <p class="onboard-footnote">
+                The provider, the chat model and the summary model can all be changed later in
+                Settings (the gear in the header).
+            </p>
+        </form>
+    `}function bo({stepLabel:e,keySaved:t}){let n=a(``),r=a(``),o=a(!1),s=c(null);return i(()=>{s.current?.focus()},[]),d`
+        <form class="onboard-card" onSubmit=${async e=>{e.preventDefault();let t=n.value.trim();if(t){if(!/^[A-Za-z0-9](?:[A-Za-z0-9-]{0,62}[A-Za-z0-9])?$/.test(t)){r.value=`Invalid name: letters, digits, hyphens only (1-64 chars, no trailing hyphen)`;return}o.value=!0,r.value=``;try{let e=await Mi({name:t,is_default:!0});Pe((await ji()).agents||[]);let n=e.id||(B.value.find(e=>e.name===t)||{}).id;n?await Nt(n):console.warn(`[onboarding] POST /agents returned no id for agent:`,t,e)}catch(e){r.value=e.error?.message||e.message||`Failed to create agent`}finally{o.value=!1}}}}>
+            ${e&&d`<div class="onboard-step">${e}</div>`}
+            <h2>Name your agent</h2>
+            ${t&&d`<div class="onboard-note">OpenRouter key saved — live now, no restart.</div>`}
+            <p>Create your first agent to get started. The agent will introduce itself and learn about you in a short setup conversation.</p>
+            <div>
+                <label>Agent name</label>
+                <input type="text" placeholder="my-agent"
+                    value=${n.value}
+                    ref=${s}
+                    onInput=${e=>{n.value=e.target.value}}
+                    disabled=${o.value} />
+                <div class="onboard-hint">letters, digits, hyphens (1-64 chars)</div>
+            </div>
+            <button class="onboard-btn" type="submit" disabled=${o.value||!n.value.trim()}>
+                ${o.value?`Creating...`:`Create Agent`}
+            </button>
+            <div class="onboard-error">${r.value}</div>
+        </form>
+    `}function xo(){let e=a(`probing`),t=a(!1),n=a(!1);return i(()=>{let n=!1,r=r=>{n||(e.value=r,r===`key`&&(t.value=!0))};return co().then(e=>r(_o(e)?`name`:`key`)).catch(e=>{console.warn(`[onboarding] GET /auth/keys failed:`,e),r(`key`)}),()=>{n=!0}},[]),e.value===`probing`?d`
+            <div id="onboarding">
+                <div class="onboard-card">
+                    <h2>Welcome to ALMS</h2>
+                    <p class="onboard-hint">Checking configuration...</p>
+                </div>
+            </div>
+        `:d`
+        <div id="onboarding">
+            ${e.value===`key`?d`<${yo}
+                    onSaved=${()=>{n.value=!0,e.value=`name`}}
+                    onSkip=${()=>{e.value=`name`}} />`:d`<${bo}
+                    stepLabel=${t.value?`Step 2 of 2`:null}
+                    keySaved=${n.value} />`}
         </div>
-    `}function _o(e){if(!e)return``;if(e.status===`done`)return`Done`;if(e.status===`fail`)return`Failed`;if(e.status===`cancelled`)return`Cancelled`;let t=e.activity;if(!t||!t.kind)return`Starting…`;switch(t.kind){case`reasoning`:return`Reasoning…`;case`writing`:return`Writing…`;case`tool_start`:return t.tool?`Using ${t.tool}`:`Using tool`;case`tool_end`:return`Running…`;default:return`Running…`}}function vo(){let e=Object.entries(Ne.value);return e.length===0?null:d`
+    `}function So(e){if(!e)return``;if(e.status===`done`)return`Done`;if(e.status===`fail`)return`Failed`;if(e.status===`cancelled`)return`Cancelled`;let t=e.activity;if(!t||!t.kind)return`Starting…`;switch(t.kind){case`reasoning`:return`Reasoning…`;case`writing`:return`Writing…`;case`tool_start`:return t.tool?`Using ${t.tool}`:`Using tool`;case`tool_end`:return`Running…`;default:return`Running…`}}function Co(){let e=Object.entries(Ne.value);return e.length===0?null:d`
         <div class="sa-bar" aria-label="Subagent status bar">
-            ${e.map(([e,t])=>{let n=t.status===`running`,r=t.status===`done`?`✓`:`✗`,i=t.displayName||e,a=_o(t),o=()=>{t.sessionId&&me(t.sessionId)},s=e=>{qi(e)&&o()},c=e=>{Ki(e)&&(e.preventDefault(),o())},l=t.task?`${i}: ${t.task} — open subagent session`:`${i} — open subagent session`,u=le(t.sessionId),f=e=>t=>{if(t.stopPropagation(),t.key===`Escape`){t.preventDefault(),ue();return}(t.key===`Enter`||t.key===` `)&&(t.preventDefault(),e(t))},p=e=>{e.stopPropagation(),fe(t.sessionId)},m=e=>{e.stopPropagation(),he(t.sessionId)},h=e=>{e.stopPropagation(),ue()};return d`
+            ${e.map(([e,t])=>{let n=t.status===`running`,r=t.status===`done`?`✓`:`✗`,i=t.displayName||e,a=So(t),o=()=>{t.sessionId&&me(t.sessionId)},s=e=>{qi(e)&&o()},c=e=>{Ki(e)&&(e.preventDefault(),o())},l=t.task?`${i}: ${t.task} — open subagent session`:`${i} — open subagent session`,u=le(t.sessionId),f=e=>t=>{if(t.stopPropagation(),t.key===`Escape`){t.preventDefault(),ue();return}(t.key===`Enter`||t.key===` `)&&(t.preventDefault(),e(t))},p=e=>{e.stopPropagation(),fe(t.sessionId)},m=e=>{e.stopPropagation(),he(t.sessionId)},h=e=>{e.stopPropagation(),ue()};return d`
                     <div class="sa-chip ${n?`running`:t.status}"
                          role="button"
                          tabindex="0"
@@ -2128,7 +2181,7 @@ Context: `+t.context_id+_}
                     </div>
                 `})}
         </div>
-    `}function yo(){let e=Fe.value,{phase:t,detail:n}=De.value,r=be(t,n),o=a(!1),s=a(!1),u=c(null),f=l(()=>{o.value=!o.value},[]),p=l(()=>{o.value=!1,s.value=!0},[]);return i(()=>{if(!o.value)return;let e=e=>{u.current&&!u.current.contains(e.target)&&(o.value=!1)};return document.addEventListener(`click`,e,!0),()=>document.removeEventListener(`click`,e,!0)},[o.value]),e?d`
+    `}function wo(){let e=Fe.value,{phase:t,detail:n}=De.value,r=be(t,n),o=a(!1),s=a(!1),u=c(null),f=l(()=>{o.value=!o.value},[]),p=l(()=>{o.value=!1,s.value=!0},[]);return i(()=>{if(!o.value)return;let e=e=>{u.current&&!u.current.contains(e.target)&&(o.value=!1)};return document.addEventListener(`click`,e,!0),()=>document.removeEventListener(`click`,e,!0)},[o.value]),e?d`
         <div class="agent-header-bar">
             <div class="agent-header-bar-left">
                 <span class="agent-header-bar-name">${e.name}</span>
@@ -2182,7 +2235,7 @@ Context: `+t.context_id+_}
                     onClose=${()=>{s.value=!1}} />
             `}
         </div>
-    `:null}var bo=o(!1),xo=new Set;function So(e,t,n){return e.fromAgent?e.fromAgent===t[0]?`left`:`right`:e.type===`agent`||e.role===`assistant`?n?n===t[0]?`left`:`right`:`left`:e.type===`user`||e.role===`user`?n?n===t[0]?`right`:`left`:`right`:`center`}function Co({msg:e,participants:t,perspectiveAgent:n}){let r=So(e,t,n),a=e.fromAgent||(r===`left`?t[0]:t[1])||`?`,o=u(e.text||``),s=e.type===`agent`||e.role===`assistant`,l=c(null);return i(()=>{s&&ir(l.current)},[o,s]),d`
+    `:null}var To=o(!1),Eo=new Set;function Do(e,t,n){return e.fromAgent?e.fromAgent===t[0]?`left`:`right`:e.type===`agent`||e.role===`assistant`?n?n===t[0]?`left`:`right`:`left`:e.type===`user`||e.role===`user`?n?n===t[0]?`right`:`left`:`right`:`center`}function Oo({msg:e,participants:t,perspectiveAgent:n}){let r=Do(e,t,n),a=e.fromAgent||(r===`left`?t[0]:t[1])||`?`,o=u(e.text||``),s=e.type===`agent`||e.role===`assistant`,l=c(null);return i(()=>{s&&ir(l.current)},[o,s]),d`
         <div class="dm-msg dm-msg-${r}">
             <div class="dm-msg-name-row dm-msg-name-row-${r}">
                 <div class="dm-msg-name">${a}</div>
@@ -2191,11 +2244,11 @@ Context: `+t.context_id+_}
             <div class="dm-msg-bubble markdown-body" ref=${l}
                  dangerouslySetInnerHTML=${{__html:o}} />
         </div>
-    `}function wo({text:e}){return d`
+    `}function ko({text:e}){return d`
         <div class="dm-ended-banner">
             <span class="dm-ended-label">${e}</span>
         </div>
-    `}function To(e,t){if(!e)return!1;let n=e.trim();if(!n)return!1;for(let e of t||[]){if(e.tool!==`send_message`)continue;let t=e.params&&typeof e.params.message==`string`?e.params.message.trim():``;if(t&&t===n)return!0}return!1}function Eo({runId:e,agentName:n,thinkingText:r,tools:i,status:a,isLive:o}){let[s,c]=t(!1),l=o&&Te.value.get(e)||``,u=r||l,f=To(u,i)?``:u,p=(i||[]).filter(e=>!(e.tool===`send_message`&&e.status===`done`)),m=p.length,h=(i||[]).length>0;return!o&&!h&&(!f||!f.trim())?null:d`
+    `}function Ao(e,t){if(!e)return!1;let n=e.trim();if(!n)return!1;for(let e of t||[]){if(e.tool!==`send_message`)continue;let t=e.params&&typeof e.params.message==`string`?e.params.message.trim():``;if(t&&t===n)return!0}return!1}function jo({runId:e,agentName:n,thinkingText:r,tools:i,status:a,isLive:o}){let[s,c]=t(!1),l=o&&Te.value.get(e)||``,u=r||l,f=Ao(u,i)?``:u,p=(i||[]).filter(e=>!(e.tool===`send_message`&&e.status===`done`)),m=p.length,h=(i||[]).length>0;return!o&&!h&&(!f||!f.trim())?null:d`
         <div class=${`dm-reasoning-block`+(a===`failed`?` dm-reasoning-block--failed`:``)+(o?` dm-reasoning-block--live`:``)}>
             <div class="dm-reasoning-header" onClick=${()=>c(!s)}>
                 <span class="dm-reasoning-toggle">${s?`▼`:`▶`}</span>
@@ -2213,7 +2266,7 @@ Context: `+t.context_id+_}
                 </div>
             `}
         </div>
-    `}async function Do(){let e=S.value;if(!(!e||bo.value)){bo.value=!0;try{await se(e)}catch(e){console.error(`[cancel-dm] failed:`,e)}finally{bo.value=!1}}}function Oo(){let e=c(null),t=w.value;i(()=>{let t=0,n=r(()=>{A.value,cancelAnimationFrame(t),t=requestAnimationFrame(()=>{Un(e.current)})});return()=>{cancelAnimationFrame(t),n()}},[]);let n=A.value,a=Fe.value?Fe.value.name:null,o=t.length>=2?`${t[0]} <-> ${t[1]}`:`DM conversation`,s=!!V.value,l=!!xe.value,u=s||l,f=bo.value;return d`
+    `}async function Mo(){let e=S.value;if(!(!e||To.value)){To.value=!0;try{await se(e)}catch(e){console.error(`[cancel-dm] failed:`,e)}finally{To.value=!1}}}function No(){let e=c(null),t=w.value;i(()=>{let t=0,n=r(()=>{A.value,cancelAnimationFrame(t),t=requestAnimationFrame(()=>{Un(e.current)})});return()=>{cancelAnimationFrame(t),n()}},[]);let n=A.value,a=Fe.value?Fe.value.name:null,o=t.length>=2?`${t[0]} <-> ${t[1]}`:`DM conversation`,s=!!V.value,l=!!xe.value,u=s||l,f=To.value;return d`
         <div class="dm-view-header">
             <span class="dm-view-header-icon" aria-hidden="true">\u2194</span>
             <span class="dm-view-header-label">${o}</span>
@@ -2223,12 +2276,12 @@ Context: `+t.context_id+_}
             ${n.length===0&&d`
                 <div class="empty-state">No messages in this conversation yet.</div>
             `}
-            ${n.map(e=>{if(e.type===`dm_ended`){let t=`Conversation ended -- ${e.reason||`ended`}`;return d`<${wo} key=${e.id} text=${t} />`}if(e.type===`system`)return d`<${wo} key=${e.id} text=${e.text} />`;if(e.type===`notification`){let t=e.metadata||{};if(t.type===`dm_ended_notification`){let n=ye[t.reason]||t.reason||`ended`,r=t.detail?`DM with ${t.peer||`unknown`} ended -- ${n}: ${t.detail}`:`DM with ${t.peer||`unknown`} ended -- ${n}`;return d`<${wo} key=${e.id} text=${r} />`}return d`<${wo} key=${e.id} text=${e.text} />`}if(e.type===`error`)return d`<div key=${e.id} class="dm-msg dm-msg-center"><div class="dm-msg-error">${e.text}</div></div>`;if(e.type===`tokens`)return null;if(e.type===`thinking`){let t=`Thinking…`;if(e.pending)t=`Sending…`;else if(e.queuedBehind>0)t=`Queued \u2014 position ${e.queuedBehind}\u2026`;else if(e.source){let n=e.source.startsWith(`peer:`)?e.source.slice(5):e.source;n&&(t=`${n} is thinking\u2026`)}return d`<div key=${e.id} class="dm-msg dm-msg-center"><div class="dm-msg-thinking">${t}</div></div>`}if(e.type===`warning`)return d`<${wo} key=${e.id} text=${e.text||`Warning`} />`;if(e.type===`run_boundary`){if(!e.status||e.status===`completed`)return null;let t=e.status===`failed`?`run failed`:e.status===`cancelled`?`run cancelled`:`run ${e.status}`;return d`<${wo} key=${e.id} text=${t} />`}if(e.type===`subagent_completed`){let t=`Subagent '${e.name||`subagent`}' ${e.status===`fail`?`failed`:`completed`}`;return d`<${wo} key=${e.id} text=${t} />`}if(e.type===`job_completed`)return d`<${wo} key=${e.id} text=${`Job '${e.jobName||`job`}' ${e.status||`completed`}`} />`;if(e.type===`context_debug`)return d`<${oi} key=${e.id} ...${e} />`;if(e.type===`dm_reasoning`)return d`<${Eo} key=${e.id} ...${e} />`;if(e.type===`tool`){if(e.tool===`send_message`&&e.status===`done`&&!e.error)return null;xo.has(e.id)||(xo.add(e.id),console.warn(`[DmConversationView] ungrouped DM tool rendered as a standalone sibling row — this fallback is meant to be dead post-#1076/#1154. Tool:`,e.tool,`id:`,e.id,`runId:`,e.runId));let n=So({type:`agent`,role:`assistant`},t,a),r=n===`left`?t[0]:t[1];return d`
+            ${n.map(e=>{if(e.type===`dm_ended`){let t=`Conversation ended -- ${e.reason||`ended`}`;return d`<${ko} key=${e.id} text=${t} />`}if(e.type===`system`)return d`<${ko} key=${e.id} text=${e.text} />`;if(e.type===`notification`){let t=e.metadata||{};if(t.type===`dm_ended_notification`){let n=ye[t.reason]||t.reason||`ended`,r=t.detail?`DM with ${t.peer||`unknown`} ended -- ${n}: ${t.detail}`:`DM with ${t.peer||`unknown`} ended -- ${n}`;return d`<${ko} key=${e.id} text=${r} />`}return d`<${ko} key=${e.id} text=${e.text} />`}if(e.type===`error`)return d`<div key=${e.id} class="dm-msg dm-msg-center"><div class="dm-msg-error">${e.text}</div></div>`;if(e.type===`tokens`)return null;if(e.type===`thinking`){let t=`Thinking…`;if(e.pending)t=`Sending…`;else if(e.queuedBehind>0)t=`Queued \u2014 position ${e.queuedBehind}\u2026`;else if(e.source){let n=e.source.startsWith(`peer:`)?e.source.slice(5):e.source;n&&(t=`${n} is thinking\u2026`)}return d`<div key=${e.id} class="dm-msg dm-msg-center"><div class="dm-msg-thinking">${t}</div></div>`}if(e.type===`warning`)return d`<${ko} key=${e.id} text=${e.text||`Warning`} />`;if(e.type===`run_boundary`){if(!e.status||e.status===`completed`)return null;let t=e.status===`failed`?`run failed`:e.status===`cancelled`?`run cancelled`:`run ${e.status}`;return d`<${ko} key=${e.id} text=${t} />`}if(e.type===`subagent_completed`){let t=`Subagent '${e.name||`subagent`}' ${e.status===`fail`?`failed`:`completed`}`;return d`<${ko} key=${e.id} text=${t} />`}if(e.type===`job_completed`)return d`<${ko} key=${e.id} text=${`Job '${e.jobName||`job`}' ${e.status||`completed`}`} />`;if(e.type===`context_debug`)return d`<${oi} key=${e.id} ...${e} />`;if(e.type===`dm_reasoning`)return d`<${jo} key=${e.id} ...${e} />`;if(e.type===`tool`){if(e.tool===`send_message`&&e.status===`done`&&!e.error)return null;Eo.has(e.id)||(Eo.add(e.id),console.warn(`[DmConversationView] ungrouped DM tool rendered as a standalone sibling row — this fallback is meant to be dead post-#1076/#1154. Tool:`,e.tool,`id:`,e.id,`runId:`,e.runId));let n=Do({type:`agent`,role:`assistant`},t,a),r=n===`left`?t[0]:t[1];return d`
                         <div key=${e.id} class="dm-msg dm-msg-${n} dm-msg-tool-row">
                             <div class="dm-msg-name">${r||`?`}</div>
                             <${ei} ...${e} />
                         </div>
-                    `}if(e.type===`image`){let n=So(e,t,a),r=e.fromAgent||(n===`left`?t[0]:t[1])||`?`;return d`
+                    `}if(e.type===`image`){let n=Do(e,t,a),r=e.fromAgent||(n===`left`?t[0]:t[1])||`?`;return d`
                         <div key=${e.id} class="dm-msg dm-msg-${n}">
                             <div class="dm-msg-name-row dm-msg-name-row-${n}">
                                 <div class="dm-msg-name">${r}</div>
@@ -2238,7 +2291,7 @@ Context: `+t.context_id+_}
                                 ${e.url?d`<img src=${e.url} alt=${e.alt||``} class="dm-msg-image" />`:`[Image${e.alt?`: `+e.alt:``}]`}
                             </div>
                         </div>
-                    `}return e.type===`user`||e.type===`agent`?d`<${Co} key=${e.id} msg=${e} participants=${t} perspectiveAgent=${a} />`:null})}
+                    `}return e.type===`user`||e.type===`agent`?d`<${Oo} key=${e.id} msg=${e} participants=${t} perspectiveAgent=${a} />`:null})}
         </div>
         <div class="dm-view-footer">
             ${u?d`
@@ -2246,7 +2299,7 @@ Context: `+t.context_id+_}
                             disabled=${f}
                             title="Stop this DM conversation"
                             aria-label="Stop conversation"
-                            onClick=${Do}>
+                            onClick=${Mo}>
                         <span class="dm-cancel-btn-icon" aria-hidden="true">\u25A0</span>
                         ${f?`Stopping…`:`Stop conversation`}
                     </button>
@@ -2254,7 +2307,7 @@ Context: `+t.context_id+_}
                     <span class="dm-view-footer-text">This is a read-only view of an agent-to-agent conversation.</span>
                 `}
         </div>
-    `}function ko(){return je.value?d`
+    `}function Po(){return je.value?d`
         <button
             type="button"
             class="stream-dead-banner"
@@ -2268,16 +2321,16 @@ Context: `+t.context_id+_}
                 Live updates disconnected — click to reconnect or reload.
             </span>
         </button>
-    `:null}r(()=>{let e=Fe.value;document.title=e?`ALMS - ${e.name}`:`ALMS`});var Ao=o(`connecting...`);function jo(e){let t=[],n=0;for(;n<e.length;)if(e[n].type===`tool`){let r=[];for(;n<e.length&&e[n].type===`tool`;)r.push(e[n]),n++;r.length>1?t.push({_isToolGroup:!0,key:`tg-`+r[0].id,tools:r}):t.push(r[0])}else t.push(e[n]),n++;return t}function Mo(){let e=c(null);i(()=>{let t=0,n=r(()=>{A.value,cancelAnimationFrame(t),t=requestAnimationFrame(()=>{Un(e.current)})});return()=>{cancelAnimationFrame(t),n()}},[]);let t=jo(A.value),n=b.value,a=p.value,o=ae.value,s=ee.value,l=F.value,u=o?s?.agent_name?s.agent_name+` notifications`:`Notification session`:s?.session_type===`job`?l?l+` job session`:`Job session`:s?.session_type===`subagent`?`Subagent session`:`Internal session`,f=o?`⚡`:s?.session_type===`job`?`⏰`:`⚙`,m=s?.session_type?`internal-session-`+s.session_type:``;return d`
+    `:null}r(()=>{let e=Fe.value;document.title=e?`ALMS - ${e.name}`:`ALMS`});var Fo=o(`connecting...`);function Io(e){let t=[],n=0;for(;n<e.length;)if(e[n].type===`tool`){let r=[];for(;n<e.length&&e[n].type===`tool`;)r.push(e[n]),n++;r.length>1?t.push({_isToolGroup:!0,key:`tg-`+r[0].id,tools:r}):t.push(r[0])}else t.push(e[n]),n++;return t}function Lo(){let e=c(null);i(()=>{let t=0,n=r(()=>{A.value,cancelAnimationFrame(t),t=requestAnimationFrame(()=>{Un(e.current)})});return()=>{cancelAnimationFrame(t),n()}},[]);let t=Io(A.value),n=b.value,a=p.value,o=ae.value,s=ee.value,l=F.value,u=o?s?.agent_name?s.agent_name+` notifications`:`Notification session`:s?.session_type===`job`?l?l+` job session`:`Job session`:s?.session_type===`subagent`?`Subagent session`:`Internal session`,f=o?`⚡`:s?.session_type===`job`?`⏰`:`⚙`,m=s?.session_type?`internal-session-`+s.session_type:``;return d`
         <div id="chat">
-            <${yo} />
+            <${wo} />
             ${(We.value||qe.value)&&d`
                 <div id="messages" role="log" aria-live="polite">
                     ${We.value?d`<div class="loading-state">Loading agent...</div>`:d`<div class="loading-state">Loading session...</div>`}
                 </div>
             `}
             ${!We.value&&!qe.value&&n&&d`
-                <${Oo} />
+                <${No} />
             `}
             ${!We.value&&!qe.value&&!n&&d`
             ${a&&d`
@@ -2332,7 +2385,7 @@ Context: `+t.context_id+_}
                             pending=${t.pending} queuedBehind=${t.queuedBehind} source=${t.source} />`:null})}
             </div>
             <${wi} />
-            <${vo} />
+            <${Co} />
             ${a?d`
                     <div class="internal-session-footer">
                         <span class="internal-session-footer-text">This is a read-only view of internal agent activity.</span>
@@ -2340,14 +2393,14 @@ Context: `+t.context_id+_}
                 `:d`<${Ai} />`}
             `}
         </div>
-    `}function No(){let e=a(!1);return d`
-        <${en} status=${Ao} onOpenSettings=${()=>{e.value=!0}} />
-        <${ko} />
+    `}function Ro(){let e=a(!1);return d`
+        <${en} status=${Fo} onOpenSettings=${()=>{e.value=!0}} />
+        <${Po} />
         ${B.value.length>0?d`
                 <div id="main">
                     <${zn} />
-                    <${Mo} />
+                    <${Lo} />
                     <${so} />
-                </div>`:d`<${go} />`}
+                </div>`:d`<${xo} />`}
         <${ho} open=${e.value} onClose=${()=>{e.value=!1}} />
-    `}n(d`<${No} />`,document.getElementById(`app`));function Po(){Ge.value=!1,Ao.value=`connecting...`,At().then(()=>{Ao.value=`connected`}).catch(()=>{Ao.value=`offline`,Ge.value=!0})}Je(Po),Ee(),Po();export{jt as a,At as i,Ei as n,Dt as o,Ti as r,Nt as s,Ao as status,Ai as t};
+    `}n(d`<${Ro} />`,document.getElementById(`app`));function zo(){Ge.value=!1,Fo.value=`connecting...`,At().then(()=>{Fo.value=`connected`}).catch(()=>{Fo.value=`offline`,Ge.value=!0})}Je(zo),Ee(),zo();export{jt as a,At as i,Ei as n,Dt as o,Ti as r,Nt as s,Fo as status,Ai as t};

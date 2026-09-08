@@ -574,6 +574,23 @@ fn session_owner_js_behaviour() {
     run_node_test("session-owner.test.mjs");
 }
 
+/// Pinned behaviour for issue #162 (half A): onboarding now offers to store a
+/// provider key before creating the first agent, and skips that step when the
+/// daemon already holds one. The skip decision reads `GET /auth/keys`, which
+/// answers a narrower question than the step asks — `list_keys` in
+/// `auth_keys.rs` deliberately ignores env-var keys, so `configured: false`
+/// means "nothing in the secrets store", NOT "this operator has no key".
+///
+/// Covers the pure predicate `utils/onboarding-keys.js::hasStoredKey`, whose
+/// contract is one-directional: `true` licenses skipping the step, `false`
+/// licenses only showing it. The env-var caveat is pinned as its own case so
+/// a later refactor cannot quietly turn the offer into a gate and lock out
+/// operators who exported `OPENROUTER_API_KEY`.
+#[test]
+fn onboarding_keys_js_behaviour() {
+    run_node_test("onboarding-keys.test.mjs");
+}
+
 /// Guard against the two runners drifting apart (issue #7).
 ///
 /// The suites in `tests/ui/` have two entry points, and until #7 they could
