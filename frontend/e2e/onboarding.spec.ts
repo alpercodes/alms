@@ -8,11 +8,12 @@
  * against) left all 512 behaviour tests green. These specs drive the real
  * bundle so that mistake fails.
  *
- * Why an offer and not a gate: `GET /auth/keys` deliberately ignores env-var
- * keys (`list_keys`, auth_keys.rs — agents can read the environment via
- * `shell_exec`), so `configured: false` is indistinguishable between "no key
- * anywhere" and "a working `OPENROUTER_API_KEY` export". The step may skip
- * itself when a key IS stored; it may never require one when none is.
+ * Why an offer and not a gate: `GET /auth/keys` reports only the secrets store
+ * (`list_keys`, auth_keys.rs), so `configured: false` is indistinguishable
+ * between "no key anywhere" and a key wired into `alms.toml` through
+ * `[llm.providers.<name>].api_key_env`, which resolves at gateway startup and
+ * survives per-run re-resolution. The step may skip itself when a key IS
+ * stored; it may never require one when none is.
  *
  * `OnboardingView` renders only when `agents` is empty, hence
  * `settingsFixture(id, { withAgent: false })`.

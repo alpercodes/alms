@@ -2,11 +2,15 @@
 // whether to show itself from `GET /auth/keys`, and that endpoint answers a
 // narrower question than the step is asking — in TWO independent ways.
 //
-// 1. `list_keys` (crates/alms-gateway/src/auth_keys.rs) reports ONLY keys held
-//    in the secrets store — env-var keys are deliberately excluded, because an
-//    agent with `shell_exec` can read the environment. So an operator running
-//    with `OPENROUTER_API_KEY` exported gets `configured: false` for every
-//    provider while being fully configured.
+// 1. `list_keys` (crates/alms-gateway/src/auth_keys.rs) reports ONLY the
+//    secrets store — what `alms auth set` and the Settings modal write. A key
+//    declared in `alms.toml` as `[llm.providers.<name>].api_key_env` (or an
+//    inline `api_key`) resolves at gateway startup and survives per-run
+//    re-resolution, so it works while showing `configured: false` on every row.
+//
+//    A bare `OPENROUTER_API_KEY` export is NOT such a source — startup logs
+//    "detected but IGNORED for security" and `resolve_key` has no env fallback.
+//    Do not reintroduce that claim; see the module header for the full trap.
 //
 // 2. It iterates `VALID_PROVIDERS`, which is a list of SECRET SLOTS, not of
 //    LLM providers: `telegram` is in there as a channel bot token. A stored
@@ -227,12 +231,14 @@ test('#162: every non-answer means "show the step", never "hide it"', () => {
     assert.equal(hasStoredKey(42), false);
 });
 
-test('#162: env-var keys are invisible here — false is not "has no key"', () => {
+test('#162: keys outside the secrets store are invisible — false is not "has no key"', () => {
     // The load-bearing caveat, pinned as a test so it cannot be forgotten
-    // during a refactor. An operator with `OPENROUTER_API_KEY` exported and
-    // an empty secrets store produces EXACTLY the fresh-install payload:
-    // there is no field that distinguishes them, which is the deliberate
-    // design of `list_keys`, not an oversight to be worked around here.
+    // during a refactor. An operator whose key is wired through
+    // `[llm.providers.openrouter].api_key_env` in `alms.toml` has an empty
+    // secrets store, and so produces EXACTLY the fresh-install payload below:
+    // there is no field that distinguishes them, because `list_keys` reports
+    // one store and that key lives in another place entirely. That is the
+    // design, not an oversight to be worked around here.
     //
     // Consequence for the caller: `false` may only be used to SHOW step 1.
     // It may never be used to require a key, disable the skip button, or

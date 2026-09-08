@@ -7,11 +7,28 @@
 //
 // TWO ways that endpoint answers a narrower question than the step is asking:
 //
-// 1. `list_keys` in `crates/alms-gateway/src/auth_keys.rs` DELIBERATELY
-//    ignores keys supplied through the environment — agents can read env vars
-//    via `shell_exec`, so only the secrets store is reported. An operator
-//    running with `OPENROUTER_API_KEY` exported therefore sees
-//    `configured: false` for every provider while having a working setup.
+// 1. `list_keys` in `crates/alms-gateway/src/auth_keys.rs` reports ONLY the
+//    secrets store — what `alms auth set` and the Settings modal write. It is
+//    not the only place a working key can live. A key declared in `alms.toml`
+//    as `[llm.providers.<name>].api_key_env` (read from the named variable) or
+//    as an inline `api_key` is resolved at gateway startup
+//    (`gateway.rs`, `entry.resolve_api_key()`) and SURVIVES per-run
+//    re-resolution, because `LlmClient::with_secrets` keeps the existing key
+//    when the store has none. `AlmsConfig::validate` even suppresses its
+//    missing-key warning for that setup. Such an operator sees
+//    `configured: false` on every row — a payload byte-identical to a fresh
+//    install's — while being able to run perfectly well.
+//
+//    NOT a key source, and the trap to avoid re-deriving: a bare
+//    `OPENROUTER_API_KEY` (or `OPENAI_API_KEY`, ...) export. Startup detects
+//    it and logs "API key env var detected but IGNORED for security"
+//    (`config/mod.rs::warn_deprecated_secret_env_vars`), `resolve_key` has no
+//    env fallback (pinned by `secrets.rs::test_resolve_key_no_env_fallback`),
+//    and `docs/config.md` states it as policy. `select_llm_api_key` reads like
+//    production precedence logic and does implement an env chain — it lives in
+//    `config/tests.rs` and is labelled "Used only in tests". Naming a bare
+//    export as a working option in this UI would send the reader straight into
+//    the failed first run this flow exists to close.
 //
 // 2. It iterates `VALID_PROVIDERS` (`alms-core/src/secrets.rs`), which is not
 //    a list of LLM providers: `telegram` is in there too, as a channel bot

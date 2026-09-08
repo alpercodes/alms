@@ -10,9 +10,11 @@ const KEYS_URL = 'https://openrouter.ai/keys';
 /**
  * Step 1 — offer to store a provider key.
  *
- * An offer, never a gate (issue #162): `GET /auth/keys` cannot see env-var
- * keys, so "no key stored" is not the same as "no key". `onSkip` is always
- * one click away and the field is never required.
+ * An offer, never a gate (issue #162): `GET /auth/keys` reports only the
+ * secrets store, and that is not the only place a working key can live — see
+ * `utils/onboarding-keys.js` for the one that is invisible here. "No key
+ * stored" is therefore not "no key". `onSkip` is always one click away and
+ * the field is never required.
  */
 function KeyStep({ onSaved, onSkip }) {
     const key = useSignal('');
@@ -73,8 +75,10 @@ function KeyStep({ onSaved, onSkip }) {
                     Skip for now
                 </button>
                 <div class="onboard-hint">
-                    A key exported as <code>OPENROUTER_API_KEY</code> works but is not visible
-                    from here, and you can always set one later in Settings.
+                    A key declared in <code>alms.toml</code>${' '}
+                    (<code>api_key_env</code> under <code>[llm.providers.openrouter]</code>)
+                    works but is not visible from here. You can also set one later in
+                    Settings.
                 </div>
             </div>
             <div class="onboard-error">${error.value}</div>

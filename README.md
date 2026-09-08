@@ -71,9 +71,10 @@ above become just `alms`. It is a bash script; on Windows run it from Git Bash.
 `openrouter` is the default provider and one key there covers both defaults — the chat
 model and the summary model — so it needs no further configuration. It applies to the
 running gateway immediately, no restart. The step skips itself when a key is already in
-the secrets store, and there is a skip button for when yours comes from the environment
-instead. On another provider? Skip, then paste that key under Settings → **API Keys** and
-point *Default LLM provider* and *Default LLM model* at it.
+the secrets store, and **Skip for now** covers everything else — a key declared in
+`alms.toml` works but is invisible from there. On another provider? Skip, then paste that
+key under Settings → **API Keys** and point *Default LLM provider* and *Default LLM model*
+at it.
 
 **Step two names your agent.** It creates the agent, opens a session, and drops you into
 the chat. Send it anything: a new agent's opening reply is a short interview about who you

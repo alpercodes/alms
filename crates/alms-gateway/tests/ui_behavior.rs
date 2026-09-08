@@ -578,14 +578,17 @@ fn session_owner_js_behaviour() {
 /// provider key before creating the first agent, and skips that step when the
 /// daemon already holds one. The skip decision reads `GET /auth/keys`, which
 /// answers a narrower question than the step asks — `list_keys` in
-/// `auth_keys.rs` deliberately ignores env-var keys, so `configured: false`
-/// means "nothing in the secrets store", NOT "this operator has no key".
+/// `auth_keys.rs` reports only the secrets store, so `configured: false`
+/// means "nothing in that store", NOT "this operator has no key". A key
+/// declared in `alms.toml` as `[llm.providers.<name>].api_key_env` resolves at
+/// startup and survives per-run re-resolution while showing `false` on every
+/// row.
 ///
 /// Covers the pure predicate `utils/onboarding-keys.js::hasStoredKey`, whose
 /// contract is one-directional: `true` licenses skipping the step, `false`
-/// licenses only showing it. The env-var caveat is pinned as its own case so
-/// a later refactor cannot quietly turn the offer into a gate and lock out
-/// operators who exported `OPENROUTER_API_KEY`.
+/// licenses only showing it. That caveat is pinned as its own case so a later
+/// refactor cannot quietly turn the offer into a gate and lock out an operator
+/// who configured the daemon through the config file.
 #[test]
 fn onboarding_keys_js_behaviour() {
     run_node_test("onboarding-keys.test.mjs");
