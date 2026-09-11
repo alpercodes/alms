@@ -106,6 +106,25 @@ Each item below changes behaviour for a deployment that has not set the knob exp
   `workspace_read` first, or `mode: "append"`, still works. No production code path
   creates an `episodic:` session today, so this changes what *would* happen, not what does.
 
+### LLM errors
+
+- A failed LLM call is labelled with the provider you configured and no longer claims a
+  subagent was involved. The run record's `error` and the live `run_error` SSE message now
+  read `LLM error (openrouter 401): …` where they read `Subagent LLM error (openai 401): …`
+  before: `Subagent` was wrong on every top-level run (the same error is raised for every
+  LLM call), and `openai` was the wire-protocol family — wrong for OpenRouter and every
+  other OpenAI-compatible entry. The persisted session marker keeps its status-class labels
+  minus that prefix (`LLM request rejected`, `LLM rate limit exceeded`, `LLM server
+  error`), and a 401/403 now says which key and where — "LLM authentication error:
+  openrouter rejected the API key (HTTP 401). Check the openrouter key in the dashboard
+  Settings." A custom `[llm.providers.<name>]` entry is pointed at its own `api_key_env` /
+  `api_key` instead, since Settings does not accept its name. The audit log is unchanged in
+  shape — it has carried the redacted status-class label since #997, which for a 401/403 is
+  now the hint above — and only sees this at all when the failing call was a subagent's,
+  since audit rows are tool-scoped. The provider's response body is still never persisted.
+  Grep queries on `Subagent LLM` need updating; the `AlmsError` variant is renamed
+  `SubagentLlmError` → `LlmApiError`.
+
 ### CLI
 
 - `alms dashboard` checks that the gateway answers `/health` before opening a browser.

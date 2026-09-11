@@ -1017,7 +1017,7 @@ mod tests {
             // (message_type: "dm", from_agent: "bob").
             make_msg_with_meta(
                 Role::User,
-                Content::Text("[Run failed: Subagent LLM request rejected]".to_string()),
+                Content::Text("[Run failed: LLM request rejected]".to_string()),
                 serde_json::json!({ "from_agent": "bob", "message_type": "dm" }),
             ),
             // Alice's follow-up DM (the trigger for the next run).
