@@ -2741,72 +2741,195 @@ mod tests {
         LlmClient::new(runtime_cfg).unwrap()
     }
 
-    /// #162: a non-2xx from an OpenAI-compatible endpoint is labelled with
-    /// the *configured* provider key (`openrouter`) — what
-    /// `resolved_config.provider` on the run record says and what the
-    /// operator's `[llm.providers.<name>]` entry is called — not the
-    /// wire-protocol family (`openai`) the request was built against,
-    /// which is what the old `provider_name()` label reported. And it is
-    /// not a "Subagent" error: this is a plain top-level call. The fixture
-    /// is the issue's exact state (no key at all — `apply_auth` sends no
-    /// `Authorization` header) with OpenRouter's verbatim 401 body.
-    #[tokio::test]
-    async fn non_success_is_labelled_with_configured_provider_not_wire_family() {
-        let llm = ScriptedLlm::always(Canned::json(
-            401,
-            r#"{"error":{"message":"No cookie auth credentials found","code":401}}"#,
-        ))
-        .await;
+    // ------------------------------------------------------------------
+    // #162: the error label is the *configured* provider key — what
+    // `resolved_config.provider` on the run record says (both read
+    // `LlmConfig::provider`, so they cannot drift) and what the operator's
+    // `[llm.providers.<name>]` entry is called — not the wire-protocol
+    // family the request was built against, which is what the deleted
+    // `provider_name()` reported. One test per raise site, each under a
+    // name that differs from its wire family so the two are
+    // distinguishable (Tim's #167 review: the gemini fixtures above run
+    // under the name `gemini`, where they are not).
+    // ------------------------------------------------------------------
+
+    /// OpenRouter's verbatim 401 body from the #162 trace.
+    const OPENROUTER_401_BODY: &str =
+        r#"{"error":{"message":"No cookie auth credentials found","code":401}}"#;
+
+    /// An OpenAI-family client configured as `openrouter`, in the issue's
+    /// exact state: no key at all (`apply_auth` sends no `Authorization`
+    /// header).
+    fn openrouter_client_no_key(base_url: String) -> LlmClient {
         let mut core_cfg = alms_core::config::LlmConfig::default();
         core_cfg.ensure_builtin_providers();
         core_cfg.provider = "openrouter".into();
         let mut runtime_cfg: LlmConfig = core_cfg.into();
         runtime_cfg.api_key = String::new();
-        runtime_cfg.base_url = llm.base_url();
+        runtime_cfg.base_url = base_url;
         runtime_cfg.timeout_secs = 10;
         let client = LlmClient::new(runtime_cfg).unwrap();
         // Sanity: this IS the OpenAI wire family — the old label came
         // from exactly this discriminant.
         assert_eq!(client.provider, Provider::OpenAi);
+        client
+    }
 
-        let request =
-            CompletionRequest::new("z-ai/glm-5.2").with_messages(vec![LlmMessage::user("hello")]);
-        let err = client
-            .complete(request)
-            .await
-            .expect_err("a 401 must surface as an error");
+    /// A Gemini-*kind* client under a custom `[llm.providers.<name>]`
+    /// name (the builtin `gemini` entry cloned under `provider`). The two
+    /// cache-retry raise sites are Gemini-only, so this is the only way
+    /// to run them under a name that differs from the wire family.
+    fn gemini_kind_client_named(provider: &str, base_url: String) -> LlmClient {
+        let mut core_cfg = alms_core::config::LlmConfig::default();
+        core_cfg.ensure_builtin_providers();
+        let gemini_entry = core_cfg
+            .providers
+            .get("gemini")
+            .cloned()
+            .expect("builtin gemini entry");
+        core_cfg
+            .providers
+            .insert(provider.to_string(), gemini_entry);
+        core_cfg.provider = provider.to_string();
+        let mut runtime_cfg: LlmConfig = core_cfg.into();
+        runtime_cfg.api_key = "gemini-test-key".into();
+        runtime_cfg.base_url = base_url;
+        runtime_cfg.timeout_secs = 10;
+        let client = LlmClient::new(runtime_cfg).unwrap();
+        assert_eq!(client.provider, Provider::Gemini);
+        client
+    }
 
-        match &err {
+    /// The #162 label contract, shared by the four raise-site tests.
+    fn assert_labelled_with_configured_provider(
+        err: &AlmsError,
+        expected_provider: &str,
+        wire_family: &str,
+        expected_status: u16,
+        body_fragment: &str,
+    ) {
+        match err {
             AlmsError::LlmApiError {
                 provider,
                 status,
                 body,
             } => {
                 assert_eq!(
-                    provider, "openrouter",
+                    provider, expected_provider,
                     "label must be the configured provider key, not the wire family"
                 );
-                assert_eq!(*status, 401);
+                assert_eq!(*status, expected_status);
                 assert!(
-                    body.contains("No cookie auth credentials found"),
+                    body.contains(body_fragment),
                     "body must carry the provider payload: {body}"
                 );
             }
             other => panic!("expected LlmApiError, got {other:?}"),
         }
         let msg = err.to_string();
+        let expected_prefix = format!("LLM error ({expected_provider} {expected_status}):");
         assert!(
-            msg.starts_with("LLM error (openrouter 401):"),
+            msg.starts_with(&expected_prefix),
             "expected configured-provider label, got: {msg}"
         );
         assert!(
-            !msg.contains("openai"),
-            "wire family must not appear as the label, got: {msg}"
+            !msg.contains(&format!("({wire_family} ")),
+            "wire family must not be the label, got: {msg}"
         );
         assert!(
             !msg.to_lowercase().contains("subagent"),
             "a top-level call is nobody's subagent, got: {msg}"
         );
+    }
+
+    fn cache_retry_script() -> Vec<Canned> {
+        vec![
+            Canned::json(
+                404,
+                r#"{"error":{"code":404,"status":"NOT_FOUND","message":"CachedContent cachedContents/abc was not found"}}"#,
+            ),
+            Canned::json(500, r#"{"error":{"message":"internal"}}"#),
+        ]
+    }
+
+    fn cache_retry_request(client: &LlmClient) -> CompletionRequest {
+        let session = alms_core::SessionId::new();
+        client.gemini_cache.install_active_for_test(
+            session,
+            "cachedContents/abc".into(),
+            0xabcd_ef01,
+        );
+        CompletionRequest::new("gemini-2.5-pro")
+            .with_messages(vec![LlmMessage::user("hi")])
+            .with_session_id(session)
+            .with_gemini_cache_enabled(true)
+    }
+
+    /// #162: `complete()`, main branch.
+    #[tokio::test]
+    async fn complete_non_success_is_labelled_with_configured_provider_not_wire_family() {
+        let llm = ScriptedLlm::always(Canned::json(401, OPENROUTER_401_BODY)).await;
+        let client = openrouter_client_no_key(llm.base_url());
+        let request =
+            CompletionRequest::new("z-ai/glm-5.2").with_messages(vec![LlmMessage::user("hello")]);
+        let err = client
+            .complete(request)
+            .await
+            .expect_err("a 401 must surface as an error");
+        assert_labelled_with_configured_provider(
+            &err,
+            "openrouter",
+            "openai",
+            401,
+            "No cookie auth credentials found",
+        );
+    }
+
+    /// #162: `complete_stream()`, main branch.
+    #[tokio::test]
+    async fn complete_stream_non_success_is_labelled_with_configured_provider_not_wire_family() {
+        let llm = ScriptedLlm::always(Canned::json(401, OPENROUTER_401_BODY)).await;
+        let client = openrouter_client_no_key(llm.base_url());
+        let request =
+            CompletionRequest::new("z-ai/glm-5.2").with_messages(vec![LlmMessage::user("hello")]);
+        // `BoxStream` isn't `Debug`, so hand-match instead of `expect_err`.
+        let err = match client.complete_stream(request).await {
+            Ok(_) => panic!("a 401 must surface as an error"),
+            Err(e) => e,
+        };
+        assert_labelled_with_configured_provider(
+            &err,
+            "openrouter",
+            "openai",
+            401,
+            "No cookie auth credentials found",
+        );
+    }
+
+    /// #162: `complete()`, cache-retry branch.
+    #[tokio::test]
+    async fn complete_cache_retry_non_success_is_labelled_with_configured_provider() {
+        let llm = ScriptedLlm::in_order(cache_retry_script()).await;
+        let client = gemini_kind_client_named("vertex-eu", format!("{}/v1beta", llm.base_url()));
+        let request = cache_retry_request(&client);
+        let err = client
+            .complete(request)
+            .await
+            .expect_err("retry returning 500 must surface as a typed error");
+        assert_labelled_with_configured_provider(&err, "vertex-eu", "gemini", 500, "internal");
+    }
+
+    /// #162: `complete_stream()`, cache-retry branch.
+    #[tokio::test]
+    async fn complete_stream_cache_retry_non_success_is_labelled_with_configured_provider() {
+        let llm = ScriptedLlm::in_order(cache_retry_script()).await;
+        let client = gemini_kind_client_named("vertex-eu", format!("{}/v1beta", llm.base_url()));
+        let request = cache_retry_request(&client);
+        let err = match client.complete_stream(request).await {
+            Ok(_) => panic!("stream retry returning 500 must surface as a typed error"),
+            Err(e) => e,
+        };
+        assert_labelled_with_configured_provider(&err, "vertex-eu", "gemini", 500, "internal");
     }
 
     fn anthropic_client_with_base_url(base_url: String) -> LlmClient {

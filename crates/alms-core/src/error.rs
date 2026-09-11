@@ -128,12 +128,19 @@ impl AlmsError {
     /// site (`error!("LLM API error: {} - {}", status, error_text)` in
     /// `llm_client::mod.rs`).
     ///
+    /// `provider` gets the same treatment via [`normalise_provider_label`]
+    /// — newlines collapsed, trimmed, length-clamped, empty replaced —
+    /// because since #162 it is `LlmConfig::provider`, which the agent API
+    /// accepts with only trim-and-reject-empty, and it now reaches the
+    /// sanitiser's fixed-shape output.
+    ///
     /// All emission sites (`LlmClient::complete`, `complete_stream`, and
     /// their cache-retry branches) MUST go through this constructor so
     /// the single-line invariant holds at every boundary. Tests in this
     /// file pin the contract — see
-    /// `llm_api_error_constructor_normalises_newlines`. Issue #920 /
-    /// PR #995 polish.
+    /// `llm_api_error_constructor_normalises_newlines` and
+    /// `llm_api_error_constructor_normalises_provider_label`. Issue #920 /
+    /// PR #995 polish; #162.
     pub fn llm_api_error(
         provider: impl Into<String>,
         status: u16,
@@ -148,10 +155,51 @@ impl AlmsError {
             .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
             .collect();
         AlmsError::LlmApiError {
-            provider: provider.into(),
+            provider: normalise_provider_label(provider.into()),
             status,
             body: normalised,
         }
+    }
+}
+
+/// Upper bound on the `provider` label carried by [`AlmsError::LlmApiError`].
+///
+/// Real provider names are `[llm.providers.<name>]` keys — a few characters
+/// — but the per-agent `provider` override arrives through `POST /agents` /
+/// `PATCH /agents/{id}` with only trim-and-reject-empty applied, so an
+/// arbitrary string can reach the label. 64 is generous for a real name
+/// and small enough to keep a persisted marker one tractable line.
+const MAX_PROVIDER_LABEL_CHARS: usize = 64;
+
+/// Bring a configured provider name into label shape (#162; Tim's #167
+/// review).
+///
+/// The name lands in `Display` (run record, SSE `run_error`, the parent's
+/// `tool_result`) and — on the 401/403 arm — in
+/// [`sanitize_error_for_session`]'s output, the one surface designed to be
+/// fixed-shape. `body` has been newline-normalised since #995 for exactly
+/// that reason; `provider` was a `&'static str` from a closed set of three
+/// until #162 made it `LlmConfig::provider`, which the agent API does not
+/// validate (its neighbour `summary_provider` is checked against the live
+/// providers map; the plain override is not). So: CR/LF become spaces, the
+/// result is trimmed, clamped to [`MAX_PROVIDER_LABEL_CHARS`] with a
+/// trailing `…` so truncation is visible, and an empty name becomes
+/// `unknown` rather than rendering `LLM error ( 401)`.
+fn normalise_provider_label(raw: String) -> String {
+    let collapsed: String = raw
+        .chars()
+        .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
+        .collect();
+    let trimmed = collapsed.trim();
+    if trimmed.is_empty() {
+        return "unknown".to_string();
+    }
+    let mut chars = trimmed.chars();
+    let clamped: String = chars.by_ref().take(MAX_PROVIDER_LABEL_CHARS).collect();
+    if chars.next().is_some() {
+        format!("{clamped}…")
+    } else {
+        clamped
     }
 }
 
@@ -291,7 +339,8 @@ pub fn sanitize_error_for_session(err: &AlmsError) -> String {
         // tokens. Categorise by HTTP status so session history reflects
         // the failure class without persisting the body (#920). Only the
         // `provider` field is surfaced, and only on the auth arm: it is
-        // the operator-authored config key (`[llm].provider`), never
+        // the configured provider key (`[llm].provider` or a per-agent
+        // override, brought into label shape by the constructor), never
         // provider output, and it is what tells the operator WHICH key
         // to fix (#162).
         AlmsError::LlmApiError {
@@ -312,18 +361,30 @@ pub fn sanitize_error_for_session(err: &AlmsError) -> String {
 }
 
 /// Session-history label for an LLM 401/403: names the provider whose key
-/// was rejected and the routes that actually set one (#162).
+/// was rejected and where that key is set (#162).
 ///
-/// The routes differ by provider name, and naming a route that rejects the
-/// name is worse than naming none:
+/// Two audiences read this string, and the second shapes it more than the
+/// first. It renders as a web-chat bubble (`[Run failed: …]`), and it is
+/// also rebuilt into the agent's own context on the next turn
+/// (`context/error_markers.rs`), so it sits in a model's prompt. That is
+/// why it is descriptive — a place to look — and never an imperative
+/// command: an agent with the shell tool, asked to fix the failure, could
+/// run `alms auth set <p> <key>` literally and store the string `<key>` as
+/// the key (Tim's #167 review). The descriptive half is also the
+/// actionable one — the bubble's reader is already in the dashboard.
 ///
-/// - Entries in [`crate::secrets::VALID_PROVIDERS`] (`openai`, `anthropic`,
-///   `openrouter`, `gemini`) are accepted by `PUT /auth/keys` — the
-///   dashboard's Settings key rows, live on a running gateway — and by
-///   `alms auth set`, which writes `secrets.json` that the gateway reads
-///   once at boot (#145), hence "restart".
-/// - Any other `[llm.providers.<name>]` entry is rejected by both; its key
-///   comes from the entry's own `api_key_env` / `api_key` in `alms.toml`.
+/// Where the key lives differs by provider name, and naming a place that
+/// rejects the name is worse than naming none:
+///
+/// - Names in [`crate::secrets::VALID_PROVIDERS`] — the five secrets-store
+///   slots: `openai`, `anthropic`, `openrouter`, `gemini`, plus `telegram`,
+///   a channel token no LLM call runs under — are what `PUT /auth/keys`
+///   accepts. That is the dashboard's Settings key rows, live on a running
+///   gateway, so the hint points there.
+/// - Any other `[llm.providers.<name>]` entry is rejected by that route;
+///   its key comes from the entry's own `api_key_env` / `api_key` in
+///   `alms.toml`, which is read once at boot (`[llm.providers]` is
+///   config-file-only, never mutable at runtime) — hence "restart".
 ///
 /// A bare `OPENROUTER_API_KEY`-style export is deliberately NOT named:
 /// startup detects and ignores it
@@ -335,8 +396,7 @@ fn llm_auth_error_hint(provider: &str, status: u16) -> String {
     if crate::secrets::VALID_PROVIDERS.contains(&provider) {
         format!(
             "LLM authentication error: {provider} rejected the API key (HTTP {status}). \
-             Check the {provider} key in the dashboard Settings, or run \
-             `alms auth set {provider} <key>` and restart the gateway."
+             Check the {provider} key in the dashboard Settings."
         )
     } else {
         format!(
@@ -561,13 +621,13 @@ mod tests {
     }
 
     /// #162: a 401/403 must persist as a label that names the provider
-    /// whose key was rejected and the routes that actually set one — and
-    /// must NOT persist the provider's response body, which is the leak
-    /// class `sanitize_error_for_session` exists to close. Both halves
-    /// are pinned; the omission half is the one that would catch a body
+    /// whose key was rejected and where that key is set — and must NOT
+    /// persist the provider's response body, which is the leak class
+    /// `sanitize_error_for_session` exists to close. Both halves are
+    /// pinned; the omission half is the one that would catch a body
     /// leaking through a future rewrite of the hint.
     #[test]
-    fn sanitize_llm_api_error_401_names_provider_and_key_routes_but_omits_body() {
+    fn sanitize_llm_api_error_401_names_provider_and_settings_but_omits_body() {
         // OpenRouter's verbatim 401 body from the #162 trace, padded with
         // an API-key-shaped token and a URL so the omission half has teeth.
         let body = r#"{"error":{"message":"No cookie auth credentials found","code":401},"request":"https://openrouter.ai/api/v1/chat/completions","authorization":"Bearer sk-or-v1-test-12345"}"#;
@@ -577,9 +637,9 @@ mod tests {
             let http = format!("HTTP {status}");
 
             // What the persisted rendering must say: the category, the
-            // provider, the credential, and the two routes that accept
+            // provider, the credential, and the one place that accepts
             // `openrouter` (`PUT /auth/keys` behind the dashboard's
-            // Settings, live; `alms auth set`, read once at boot — #145).
+            // Settings, live on a running gateway).
             assert!(
                 s.starts_with("LLM authentication error"),
                 "category prefix must survive for grep compatibility, got: {s}"
@@ -587,9 +647,7 @@ mod tests {
             for needle in [
                 "openrouter rejected the API key",
                 http.as_str(),
-                "Settings",
-                "alms auth set openrouter <key>",
-                "restart the gateway",
+                "Check the openrouter key in the dashboard Settings",
             ] {
                 assert!(
                     s.contains(needle),
@@ -622,6 +680,14 @@ mod tests {
                 "OPENROUTER_API_KEY",
                 "_API_KEY",
                 "export ",
+                // This marker is rebuilt into the agent's own context
+                // (`context/error_markers.rs`), so it must never carry a
+                // runnable command with a placeholder: an agent with the
+                // shell tool could run it literally and store `<key>` as
+                // the key (Tim's #167 review). Descriptive only.
+                "alms auth set",
+                "<key>",
+                "restart",
             ] {
                 assert!(
                     !s.contains(needle),
@@ -631,30 +697,39 @@ mod tests {
         }
     }
 
-    /// #162: every provider `PUT /auth/keys` and `alms auth set` accept
-    /// gets those routes in its hint, spelled with its own name.
+    /// #162: every provider `PUT /auth/keys` accepts is pointed at the
+    /// dashboard's Settings, spelled with its own name — and none of them
+    /// gets a runnable command (see the prompt-hazard note in the test
+    /// above). This list is the four LLM slots of `VALID_PROVIDERS`; it
+    /// catches a removal from the constant.
     #[test]
-    fn sanitize_llm_api_error_401_known_providers_get_auth_set_route() {
+    fn sanitize_llm_api_error_401_known_providers_point_at_settings_never_a_command() {
         for provider in ["openai", "anthropic", "openrouter", "gemini"] {
             let err = AlmsError::llm_api_error(provider, 401, "body");
             let s = sanitize_error_for_session(&err);
-            let route = format!("alms auth set {provider} <key>");
+            let place = format!("Check the {provider} key in the dashboard Settings");
             assert!(
-                s.contains(&route),
-                "{provider} is in VALID_PROVIDERS and must get the auth-set route, got: {s}"
+                s.contains(&place),
+                "{provider} is in VALID_PROVIDERS and must be pointed at Settings, got: {s}"
             );
             assert!(
                 s.contains(&format!("{provider} rejected the API key")),
                 "hint must name the provider, got: {s}"
             );
+            for needle in ["alms auth set", "<key>", "restart", "api_key_env"] {
+                assert!(
+                    !s.contains(needle),
+                    "known-provider hint must omit {needle:?}, got: {s}"
+                );
+            }
         }
     }
 
     /// #162: a provider that is NOT in `VALID_PROVIDERS` (a custom
-    /// `[llm.providers.<name>]` entry) is rejected by both `PUT /auth/keys`
-    /// and `alms auth set`, so the hint must point at the entry's own
-    /// `api_key_env` / `api_key` in `alms.toml` — and must not name either
-    /// route that would fail on the name.
+    /// `[llm.providers.<name>]` entry) is rejected by `PUT /auth/keys`, so
+    /// the hint must point at the entry's own `api_key_env` / `api_key` in
+    /// `alms.toml` — and must not name Settings, which would fail on the
+    /// name, nor any runnable command.
     #[test]
     fn sanitize_llm_api_error_401_custom_provider_points_at_toml_entry() {
         let err = AlmsError::llm_api_error(
@@ -677,6 +752,7 @@ mod tests {
         }
         for needle in [
             "alms auth set",
+            "<key>",
             "Settings",
             "sk-test-12345",
             "invalid key",
@@ -689,6 +765,75 @@ mod tests {
                 "persisted label must omit {needle:?}, got: {s}"
             );
         }
+    }
+
+    /// Tim's #167 review: `provider` is `LlmConfig::provider`, which the
+    /// agent API accepts with only trim-and-reject-empty, so a
+    /// newline-bearing or oversized name can reach the label. The
+    /// constructor must bring it into the same single-line shape `body`
+    /// gets, and the 401 sanitiser output — the fixed-shape surface —
+    /// must stay one line on every rendering.
+    #[test]
+    fn llm_api_error_constructor_normalises_provider_label() {
+        // Line breaks collapse to spaces and the result is trimmed.
+        let err = AlmsError::llm_api_error("open\nrouter\r\n", 401, "body");
+        match &err {
+            AlmsError::LlmApiError { provider, .. } => assert_eq!(provider, "open router"),
+            other => panic!("expected LlmApiError, got {other:?}"),
+        }
+        for rendered in [
+            err.to_string(),
+            sanitize_error_for_session(&err),
+            audit_error_string(&err),
+        ] {
+            assert!(
+                !rendered.contains('\n') && !rendered.contains('\r'),
+                "every rendering must be one line, got: {rendered:?}"
+            );
+        }
+
+        // Oversized names are clamped, and visibly so.
+        let long = "p".repeat(MAX_PROVIDER_LABEL_CHARS + 40);
+        let err = AlmsError::llm_api_error(long.clone(), 401, "body");
+        match &err {
+            AlmsError::LlmApiError { provider, .. } => {
+                assert!(
+                    provider.starts_with(&"p".repeat(MAX_PROVIDER_LABEL_CHARS)),
+                    "clamp must keep the first {MAX_PROVIDER_LABEL_CHARS} chars, got: {provider}"
+                );
+                assert!(
+                    provider.ends_with('…'),
+                    "truncation must be visible: {provider}"
+                );
+                assert_eq!(provider.chars().count(), MAX_PROVIDER_LABEL_CHARS + 1);
+            }
+            other => panic!("expected LlmApiError, got {other:?}"),
+        }
+        assert!(
+            !sanitize_error_for_session(&err).contains(&long),
+            "the unclamped name must not reach the persisted label"
+        );
+
+        // A name exactly at the bound is untouched.
+        let exact = "p".repeat(MAX_PROVIDER_LABEL_CHARS);
+        match AlmsError::llm_api_error(exact.clone(), 401, "body") {
+            AlmsError::LlmApiError { provider, .. } => assert_eq!(provider, exact),
+            other => panic!("expected LlmApiError, got {other:?}"),
+        }
+
+        // An empty name (unreachable via the API, which rejects it) still
+        // renders a readable label instead of `LLM error ( 401)`.
+        let err = AlmsError::llm_api_error("  ", 401, "body");
+        assert!(
+            err.to_string().starts_with("LLM error (unknown 401):"),
+            "got: {err}"
+        );
+        assert!(
+            sanitize_error_for_session(&err)
+                .starts_with("LLM authentication error: unknown rejected the API key (HTTP 401)"),
+            "got: {}",
+            sanitize_error_for_session(&err)
+        );
     }
 
     /// #162: the variant is raised for every LLM call — a top-level chat
