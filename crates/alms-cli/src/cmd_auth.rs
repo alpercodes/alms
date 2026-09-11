@@ -3,10 +3,15 @@
 //! CLI commands for managing API key credentials.
 //!
 //! ```text
-//! alms auth set <provider>       — set API key (prompts securely)
+//! alms auth set <provider>       — set API key (prompts on stdin)
 //! alms auth list                 — list providers with keys (masked)
 //! alms auth remove <provider>    — remove a stored key
 //! ```
+//!
+//! Omitting the key argument reads it from stdin, which keeps it out of
+//! `argv` — so out of `ps` output and shell history. That is the only
+//! property claimed: the prompt does **not** suppress terminal echo, so
+//! the key is visible as it is typed.
 //!
 //! # Where a key change lands (#145)
 //!
@@ -23,10 +28,17 @@
 //! daemon's own secrets file, so the change still survives a restart —
 //! and writing both would mean two processes writing one file, where the
 //! daemon's next save (it writes its whole map) decides the outcome.
+//!
+//! Both commands write their result to a caller-supplied sink rather than
+//! to `println!`, so the `--json` body — including the `target` field a
+//! script reads to tell a live change from a file write — is asserted by
+//! tests rather than merely exercised. `list` is untouched by #145 and
+//! still prints directly.
 
 use crate::helpers::{GatewayProbe, api_delete_json, api_put, probe_gateway};
 use alms_core::secrets::{self, SecretsStore, VALID_PROVIDERS};
 use clap::Subcommand;
+use std::io::Write;
 use std::path::Path;
 
 #[derive(Subcommand, Debug)]
@@ -92,14 +104,19 @@ fn route_key_change(probe: GatewayProbe, url: &str) -> KeyTarget {
 /// Refusing to fall back to the file after a running gateway rejects the
 /// change: writing it then would restore exactly the silent failure #145
 /// is about.
-fn gateway_refused(url: &str, data_dir: &Path, err: &anyhow::Error) -> anyhow::Error {
+///
+/// Deliberately names no path. The CLI resolves the secrets file from
+/// `data_dir` while the gateway resolves it from its `db_path`
+/// (`secrets_path_from_db`), and `ALMS_DB_PATH` can point those at
+/// different files — so "the file the gateway reads" is a claim this
+/// command is not in a position to make (Tim S1 on #168).
+fn gateway_refused(url: &str, err: &anyhow::Error) -> anyhow::Error {
     anyhow::anyhow!(
         "The gateway at {url} rejected the change: {err}\n\
-         Nothing was written: {} is read only when a gateway boots, so writing it while that \
-         one runs would look like success and change nothing.\n\
+         Nothing was written: a gateway reads its secrets file once, at boot, so writing that \
+         file now would look like success and change nothing while this one runs.\n\
          Set ALMS_AUTH_TOKEN if the gateway requires a token, or stop the gateway and run this \
-         again.",
-        secrets::secrets_path(data_dir).display()
+         again."
     )
 }
 
@@ -121,6 +138,7 @@ pub(crate) async fn auth_set(
     provider: &str,
     key: Option<String>,
     json: bool,
+    out: &mut dyn Write,
 ) -> anyhow::Result<()> {
     reject_unknown_provider(provider)?;
 
@@ -149,7 +167,7 @@ pub(crate) async fn auth_set(
             let body = serde_json::json!({ "provider": provider, "key": key });
             api_put(client, url, "auth/keys", &body)
                 .await
-                .map_err(|e| gateway_refused(url, data_dir, &e))?;
+                .map_err(|e| gateway_refused(url, &e))?;
         }
         KeyTarget::SecretsFile { warning } => {
             if let Some(warning) = warning {
@@ -161,7 +179,8 @@ pub(crate) async fn auth_set(
     }
 
     if json {
-        println!(
+        writeln!(
+            out,
             "{}",
             serde_json::json!({
                 "ok": true,
@@ -169,15 +188,16 @@ pub(crate) async fn auth_set(
                 "key": masked,
                 "target": target.label(),
             })
-        );
+        )?;
     } else {
         match target {
-            KeyTarget::RunningGateway => println!(
+            KeyTarget::RunningGateway => writeln!(
+                out,
                 "Saved API key for '{provider}': {masked} — applied to the gateway at {url}, \
                  no restart needed."
-            ),
+            )?,
             KeyTarget::SecretsFile { .. } => {
-                println!("Saved API key for '{provider}': {masked}")
+                writeln!(out, "Saved API key for '{provider}': {masked}")?
             }
         }
     }
@@ -224,6 +244,7 @@ pub(crate) async fn auth_remove(
     data_dir: &Path,
     provider: &str,
     json: bool,
+    out: &mut dyn Write,
 ) -> anyhow::Result<()> {
     reject_unknown_provider(provider)?;
 
@@ -236,10 +257,15 @@ pub(crate) async fn auth_remove(
         KeyTarget::RunningGateway => {
             let resp = api_delete_json(client, url, &format!("auth/keys/{provider}"))
                 .await
-                .map_err(|e| gateway_refused(url, data_dir, &e))?;
+                .map_err(|e| gateway_refused(url, &e))?;
+            // The handler always sends `removed`, so this default is
+            // defensive only — and of the two, `false` under-claims where
+            // `true` would report a revocation nothing confirmed. On a
+            // credential path, prefer the one that makes an operator check
+            // (Tim S3 on #168).
             resp.get("removed")
                 .and_then(|v| v.as_bool())
-                .unwrap_or(true)
+                .unwrap_or(false)
         }
         KeyTarget::SecretsFile { warning } => {
             if let Some(warning) = warning {
@@ -251,7 +277,8 @@ pub(crate) async fn auth_remove(
     };
 
     if json {
-        println!(
+        writeln!(
+            out,
             "{}",
             serde_json::json!({
                 "ok": true,
@@ -259,16 +286,17 @@ pub(crate) async fn auth_remove(
                 "provider": provider,
                 "target": target.label(),
             })
-        );
+        )?;
     } else if !existed {
-        println!("No API key stored for '{provider}'");
+        writeln!(out, "No API key stored for '{provider}'")?;
     } else {
         match target {
-            KeyTarget::RunningGateway => println!(
+            KeyTarget::RunningGateway => writeln!(
+                out,
                 "Removed API key for '{provider}' — applied to the gateway at {url}, \
                  no restart needed."
-            ),
-            KeyTarget::SecretsFile { .. } => println!("Removed API key for '{provider}'"),
+            )?,
+            KeyTarget::SecretsFile { .. } => writeln!(out, "Removed API key for '{provider}'")?,
         }
     }
     Ok(())
@@ -281,12 +309,29 @@ mod tests {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
+    const TEST_KEY: &str = "sk-test-key-0123456789";
+
     fn health_ok() -> Mock {
         Mock::given(method("GET"))
             .and(path("/health"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "status": "healthy"
             })))
+    }
+
+    /// A gateway that takes a `PUT /auth/keys` and answers like the real
+    /// handler does.
+    async fn gateway_accepting_keys() -> MockServer {
+        let server = MockServer::start().await;
+        health_ok().mount(&server).await;
+        Mock::given(method("PUT"))
+            .and(path("/auth/keys"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true, "provider": "openrouter", "key": "sk-t...6789",
+            })))
+            .mount(&server)
+            .await;
+        server
     }
 
     /// A URL nothing is listening on: bind to let the OS pick a free port,
@@ -300,6 +345,10 @@ mod tests {
 
     fn secrets_of(dir: &Path) -> SecretsStore {
         SecretsStore::load(secrets::secrets_path(dir)).unwrap()
+    }
+
+    fn as_json(out: Vec<u8>) -> serde_json::Value {
+        serde_json::from_slice(&out).expect("--json must emit one JSON object")
     }
 
     #[test]
@@ -346,24 +395,17 @@ mod tests {
     /// boot and will never read again.
     #[tokio::test]
     async fn test_auth_set_sends_the_key_to_a_running_gateway_and_skips_the_file() {
-        let server = MockServer::start().await;
-        health_ok().mount(&server).await;
-        Mock::given(method("PUT"))
-            .and(path("/auth/keys"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "ok": true, "provider": "openrouter", "key": "sk-t...key",
-            })))
-            .mount(&server)
-            .await;
-
+        let server = gateway_accepting_keys().await;
         let dir = tempfile::tempdir().unwrap();
+
         auth_set(
             &api_client().unwrap(),
             &server.uri(),
             dir.path(),
             "openrouter",
-            Some("sk-test-key-0123456789".into()),
+            Some(TEST_KEY.into()),
             false,
+            &mut std::io::sink(),
         )
         .await
         .unwrap();
@@ -376,7 +418,7 @@ mod tests {
         assert_eq!(put.url.path(), "/auth/keys");
         let body: serde_json::Value = serde_json::from_slice(&put.body).unwrap();
         assert_eq!(body["provider"], "openrouter");
-        assert_eq!(body["key"], "sk-test-key-0123456789");
+        assert_eq!(body["key"], TEST_KEY);
 
         assert!(
             !secrets::secrets_path(dir.path()).exists(),
@@ -393,16 +435,61 @@ mod tests {
             &dead_url(),
             dir.path(),
             "openrouter",
-            Some("sk-test-key-0123456789".into()),
+            Some(TEST_KEY.into()),
             false,
+            &mut std::io::sink(),
         )
         .await
         .unwrap();
 
+        assert_eq!(secrets_of(dir.path()).get_key("openrouter"), Some(TEST_KEY));
+    }
+
+    /// `target` is the one field a script needs to tell a live change from
+    /// a file write, so both of its values are pinned here rather than
+    /// left to the routing tests — those prove where the change *went*,
+    /// not what the CLI *said* about it (Tim S2 on #168).
+    #[tokio::test]
+    async fn test_auth_set_json_names_the_target_that_took_the_change() {
+        let server = gateway_accepting_keys().await;
+        let dir = tempfile::tempdir().unwrap();
+        let mut out = Vec::new();
+
+        auth_set(
+            &api_client().unwrap(),
+            &server.uri(),
+            dir.path(),
+            "openrouter",
+            Some(TEST_KEY.into()),
+            true,
+            &mut out,
+        )
+        .await
+        .unwrap();
+
+        let body = as_json(out);
+        assert_eq!(body["target"], "gateway");
+        assert_eq!(body["ok"], true);
+        assert_eq!(body["provider"], "openrouter");
         assert_eq!(
-            secrets_of(dir.path()).get_key("openrouter"),
-            Some("sk-test-key-0123456789")
+            body["key"], "sk-t...6789",
+            "the key must be masked in output"
         );
+
+        let mut out = Vec::new();
+        auth_set(
+            &api_client().unwrap(),
+            &dead_url(),
+            dir.path(),
+            "openrouter",
+            Some(TEST_KEY.into()),
+            true,
+            &mut out,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(as_json(out)["target"], "secrets_file");
     }
 
     /// A gateway that answers `/health` but rejects the write — a token
@@ -427,8 +514,9 @@ mod tests {
             &server.uri(),
             dir.path(),
             "openrouter",
-            Some("sk-test-key-0123456789".into()),
+            Some(TEST_KEY.into()),
             false,
+            &mut std::io::sink(),
         )
         .await
         .expect_err("a rejected key must not be reported as saved");
@@ -463,12 +551,14 @@ mod tests {
             .set_key("openrouter", "sk-daemon-owned-key")
             .unwrap();
 
+        let mut out = Vec::new();
         auth_remove(
             &api_client().unwrap(),
             &server.uri(),
             dir.path(),
             "openrouter",
-            false,
+            true,
+            &mut out,
         )
         .await
         .unwrap();
@@ -481,6 +571,9 @@ mod tests {
                     && r.url.path() == "/auth/keys/openrouter"),
             "the removal must reach the running gateway"
         );
+        let body = as_json(out);
+        assert_eq!(body["target"], "gateway");
+        assert_eq!(body["removed"], true);
         assert_eq!(
             secrets_of(dir.path()).get_key("openrouter"),
             Some("sk-daemon-owned-key"),
@@ -488,23 +581,64 @@ mod tests {
         );
     }
 
+    /// A 2xx whose body does not carry `removed` is not evidence that a
+    /// key was revoked. Reporting one anyway is the failure mode worth
+    /// avoiding on a credential path: under-claiming makes an operator
+    /// check, over-claiming makes them stop (Tim S3 on #168).
+    #[tokio::test]
+    async fn test_auth_remove_does_not_claim_a_revocation_the_gateway_did_not_confirm() {
+        let server = MockServer::start().await;
+        health_ok().mount(&server).await;
+        Mock::given(method("DELETE"))
+            .and(path("/auth/keys/openrouter"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({ "ok": true })),
+            )
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut out = Vec::new();
+        auth_remove(
+            &api_client().unwrap(),
+            &server.uri(),
+            dir.path(),
+            "openrouter",
+            true,
+            &mut out,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            as_json(out)["removed"],
+            false,
+            "a missing `removed` must not be read as a confirmed revocation"
+        );
+    }
+
     #[tokio::test]
     async fn test_auth_remove_edits_the_file_when_no_gateway_answers() {
         let dir = tempfile::tempdir().unwrap();
         secrets_of(dir.path())
-            .set_key("openrouter", "sk-test-key-0123456789")
+            .set_key("openrouter", TEST_KEY)
             .unwrap();
 
+        let mut out = Vec::new();
         auth_remove(
             &api_client().unwrap(),
             &dead_url(),
             dir.path(),
             "openrouter",
-            false,
+            true,
+            &mut out,
         )
         .await
         .unwrap();
 
+        let body = as_json(out);
+        assert_eq!(body["target"], "secrets_file");
+        assert_eq!(body["removed"], true);
         assert_eq!(secrets_of(dir.path()).get_key("openrouter"), None);
     }
 
@@ -518,8 +652,9 @@ mod tests {
             &dead_url(),
             dir.path(),
             "not-a-provider",
-            Some("sk-test-key-0123456789".into()),
+            Some(TEST_KEY.into()),
             false,
+            &mut std::io::sink(),
         )
         .await
         .expect_err("unknown providers must be rejected");
