@@ -38,3 +38,7 @@ uuid.workspace = true
 tempfile = "3"
 # `AgentRecord::for_test` for the `agent config` / `agent create` tests.
 alms-core = { path = "../alms-core", features = ["test-support"] }
+# A stand-in gateway for the `alms auth set` / `auth remove` routing tests
+# (#145) — same fake the runtime and sandbox crates use for complete HTTP
+# responses.
+wiremock = "0.6"
