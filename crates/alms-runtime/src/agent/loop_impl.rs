@@ -488,7 +488,7 @@ fn buffered_fallback_reconcile_events(
 /// Gated on the `AlmsError::Runtime` transport/decode variant: every genuine
 /// timeout signal (total/connect, body-stall, send-phase) is `Runtime`
 /// (`streaming.rs`, `mod.rs`), while a non-2xx provider response is
-/// `AlmsError::SubagentLlmError` and is excluded by construction — its `Display`
+/// `AlmsError::LlmApiError` and is excluded by construction — its `Display`
 /// carries the raw provider body, which must never short-circuit. Within the
 /// `Runtime` string the model's partial output (a decode error's
 /// `body_prefix="…"`) is stripped before matching, so only the trusted formatter
@@ -2291,7 +2291,7 @@ impl AgentRuntime {
                             result: None,
                             // #997: route every audit emission carrying an
                             // `AlmsError` value through the variant-dispatch
-                            // helper so future `SubagentLlmError`-shaped
+                            // helper so future `LlmApiError`-shaped
                             // errors that surface here cannot leak the raw
                             // provider response body. For the
                             // `ToolExecution` value built immediately above
@@ -2676,7 +2676,7 @@ impl AgentRuntime {
                 //
                 // #997: route the audit `error` field through
                 // `audit_error_string` (variant dispatch) so a
-                // `SubagentLlmError` here — which carries the raw
+                // `LlmApiError` here — which carries the raw
                 // provider response body and can echo prompt content,
                 // model output, or API-key-shaped tokens — is collapsed
                 // to its status-class category label before it lands in
@@ -3109,14 +3109,14 @@ mod stream_error_classification_tests {
     }
 
     /// Codex P2 on #1177: a non-2xx provider response is
-    /// `AlmsError::SubagentLlmError`, whose `Display` carries the raw provider
+    /// `AlmsError::LlmApiError`, whose `Display` carries the raw provider
     /// body. Even if that body says `operation timed out` (a 504 / proxy timeout
     /// page) it must classify NOT-timeout so the buffered fallback still runs —
     /// only `AlmsError::Runtime` transport errors may short-circuit. Fails if the
     /// variant gate is removed.
     #[test]
-    fn subagent_llm_error_with_timeout_phrase_in_body_is_not_timeout_class() {
-        let err = AlmsError::subagent_llm_error("openrouter", 504, "upstream operation timed out");
+    fn llm_api_error_with_timeout_phrase_in_body_is_not_timeout_class() {
+        let err = AlmsError::llm_api_error("openrouter", 504, "upstream operation timed out");
         assert!(!stream_error_is_timeout(&err));
     }
 }

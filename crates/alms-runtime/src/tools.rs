@@ -264,7 +264,7 @@ impl ToolRegistry {
             // sandbox boundary by `invoke_agent` — unwrap the box
             // and propagate the inner variant verbatim so the
             // parent agent's `tool_result` reads as one tractable
-            // line (e.g. `Subagent LLM error (anthropic 400): ...`)
+            // line (e.g. `LLM error (anthropic 400): ...`)
             // instead of the legacy 4-prefix
             // `Tool execution failed: IO error: Subagent error:
             // Runtime error: Runtime error: ...` wrap. Issue #920.
@@ -301,7 +301,7 @@ mod tests {
         use std::sync::Arc;
 
         /// Mock tool whose `execute` always returns the structured
-        /// `SandboxError::Subagent(Box<AlmsError::SubagentLlmError>)`
+        /// `SandboxError::Subagent(Box<AlmsError::LlmApiError>)`
         /// shape — exactly what `InvokeAgentTool` produces in
         /// production via the `From<AlmsError>` impl on
         /// `SandboxError`. The realistic body is a verbatim Anthropic
@@ -311,7 +311,7 @@ mod tests {
         #[async_trait]
         impl Tool for LlmErrorMockTool {
             fn name(&self) -> &str {
-                "mock_subagent_llm_error"
+                "mock_llm_api_error"
             }
             fn description(&self) -> &str {
                 "test"
@@ -320,7 +320,7 @@ mod tests {
                 serde_json::json!({"type":"object","properties":{}})
             }
             async fn execute(&self, _params: Value) -> SandboxResult<Value> {
-                Err(SandboxError::from(AlmsError::SubagentLlmError {
+                Err(SandboxError::from(AlmsError::LlmApiError {
                     provider: "anthropic".to_string(),
                     status: 400,
                     body: r#"{"error":{"message":"prompt is too long: 270000 tokens > 262144 maximum"}}"#.to_string(),
@@ -335,17 +335,17 @@ mod tests {
         registry.register(Arc::new(LlmErrorMockTool));
 
         let err = registry
-            .execute("mock_subagent_llm_error", serde_json::json!({}))
+            .execute("mock_llm_api_error", serde_json::json!({}))
             .await
             .unwrap_err();
 
-        // #920 contract: the typed `SubagentLlmError` arrives at the
+        // #920 contract: the typed `LlmApiError` arrives at the
         // tool registry's caller verbatim. No `Tool execution failed:`
         // wrap, no `Runtime error: Runtime error:` double-prefix, no
         // `IO error: Subagent error:` from the legacy `SandboxError::Io`
         // shim.
         match &err {
-            AlmsError::SubagentLlmError {
+            AlmsError::LlmApiError {
                 provider,
                 status,
                 body,
@@ -354,7 +354,7 @@ mod tests {
                 assert_eq!(*status, 400);
                 assert!(body.contains("prompt is too long"));
             }
-            other => panic!("expected SubagentLlmError, got {other:?}"),
+            other => panic!("expected LlmApiError, got {other:?}"),
         }
 
         // The error message the parent agent's `tool_result` will
@@ -363,7 +363,7 @@ mod tests {
         let parent_visible = format!("Error: {}", err);
         assert_eq!(
             parent_visible,
-            r#"Error: Subagent LLM error (anthropic 400): {"error":{"message":"prompt is too long: 270000 tokens > 262144 maximum"}}"#,
+            r#"Error: LLM error (anthropic 400): {"error":{"message":"prompt is too long: 270000 tokens > 262144 maximum"}}"#,
             "parent's tool_result message must be a single tractable line"
         );
         for forbidden in [

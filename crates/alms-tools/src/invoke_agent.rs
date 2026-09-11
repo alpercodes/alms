@@ -342,7 +342,7 @@ mod tests {
                 _parent_cancel_token: Option<CancellationToken>,
                 _parent_tool_invocation_id: Option<Uuid>,
             ) -> AlmsResult<(String, SessionId)> {
-                Err(alms_core::AlmsError::SubagentLlmError {
+                Err(alms_core::AlmsError::LlmApiError {
                     provider: "anthropic".to_string(),
                     status: 400,
                     body: r#"{"error":{"message":"prompt is too long"}}"#.to_string(),
@@ -366,11 +366,11 @@ mod tests {
             other => panic!("expected SandboxError::Subagent, got {other:?}"),
         };
         // Pin the inner `AlmsError` shape — the typed
-        // `SubagentLlmError` triple must arrive at the SandboxError
+        // `LlmApiError` triple must arrive at the SandboxError
         // boundary verbatim, ready for `ToolRegistry::execute` to
         // unwrap it back to the parent's tool_result message.
         match inner {
-            alms_core::AlmsError::SubagentLlmError {
+            alms_core::AlmsError::LlmApiError {
                 provider,
                 status,
                 body,
@@ -379,11 +379,11 @@ mod tests {
                 assert_eq!(status, 400);
                 assert!(body.contains("prompt is too long"));
             }
-            other => panic!("expected inner SubagentLlmError, got {other:?}"),
+            other => panic!("expected inner LlmApiError, got {other:?}"),
         }
     }
 
-    /// #920: a generic (non-SubagentLlmError) `AlmsError` from the
+    /// #920: a generic (non-LlmApiError) `AlmsError` from the
     /// dispatcher must also flow through `SandboxError::Subagent` so the
     /// `From` boundary is the same regardless of the underlying variant.
     /// The runtime side then propagates the typed variant verbatim.
