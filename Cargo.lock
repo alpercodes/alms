@@ -110,6 +110,7 @@ dependencies = [
  "tracing-appender",
  "tracing-subscriber",
  "uuid",
+ "wiremock",
 ]
 
 [[package]]

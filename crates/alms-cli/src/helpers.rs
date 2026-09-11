@@ -211,6 +211,31 @@ pub(crate) async fn api_post(
     Ok((status, serde_json::from_str(&body_text)?))
 }
 
+/// Send a PUT request with a JSON body and return the response body as JSON.
+pub(crate) async fn api_put(
+    client: &reqwest::Client,
+    base_url: &str,
+    path: &str,
+    body: &impl serde::Serialize,
+) -> anyhow::Result<serde_json::Value> {
+    let url = api_url(base_url, path);
+    let resp = client.put(&url).json(body).send().await.map_err(|e| {
+        if e.is_connect() {
+            anyhow::anyhow!(
+                "Cannot connect to gateway at {base_url}. Is it running? Start with: alms gateway"
+            )
+        } else {
+            anyhow::anyhow!("Request failed: {e}")
+        }
+    })?;
+    let status = resp.status();
+    let body_text = resp.text().await?;
+    if !status.is_success() {
+        anyhow::bail!("{}", parse_api_error(status, &body_text));
+    }
+    Ok(serde_json::from_str(&body_text)?)
+}
+
 /// Send a DELETE request and return the status code.
 pub(crate) async fn api_delete(
     client: &reqwest::Client,
@@ -233,6 +258,35 @@ pub(crate) async fn api_delete(
         anyhow::bail!("{}", parse_api_error(status, &body));
     }
     Ok(status)
+}
+
+/// Send a DELETE request and return the response body as JSON.
+///
+/// Separate from [`api_delete`] because `DELETE /auth/keys/{provider}`
+/// answers `{"removed": bool}` and `alms auth remove` prints a different
+/// line for a key that was not there — a distinction the status code
+/// alone cannot carry.
+pub(crate) async fn api_delete_json(
+    client: &reqwest::Client,
+    base_url: &str,
+    path: &str,
+) -> anyhow::Result<serde_json::Value> {
+    let url = api_url(base_url, path);
+    let resp = client.delete(&url).send().await.map_err(|e| {
+        if e.is_connect() {
+            anyhow::anyhow!(
+                "Cannot connect to gateway at {base_url}. Is it running? Start with: alms gateway"
+            )
+        } else {
+            anyhow::anyhow!("Request failed: {e}")
+        }
+    })?;
+    let status = resp.status();
+    let body_text = resp.text().await?;
+    if !status.is_success() {
+        anyhow::bail!("{}", parse_api_error(status, &body_text));
+    }
+    Ok(serde_json::from_str(&body_text)?)
 }
 
 // Test helpers shared across modules

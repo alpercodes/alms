@@ -96,6 +96,16 @@ enum Commands {
         /// Output as JSON instead of human-readable text
         #[arg(long, global = true)]
         json: bool,
+        /// Gateway URL. `set` / `remove` send the change here when a
+        /// gateway answers, because a daemon reads the secrets file only
+        /// at boot (#145); they write the file when nothing answers.
+        #[arg(
+            long,
+            global = true,
+            default_value = "http://127.0.0.1:8080",
+            env = "ALMS_GATEWAY_URL"
+        )]
+        url: String,
     },
     /// Manage agents
     Agent {
@@ -352,18 +362,19 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         }
-        Commands::Auth { cmd, json } => {
+        Commands::Auth { cmd, json, url } => {
             let config = alms_core::AlmsConfig::load_or_default();
             let data_dir: std::path::PathBuf = config.server.data_dir.into();
+            let client = api_client()?;
             match cmd {
                 AuthCommands::Set { provider, key } => {
-                    cmd_auth::auth_set(&data_dir, &provider, key, json)?;
+                    cmd_auth::auth_set(&client, &url, &data_dir, &provider, key, json).await?;
                 }
                 AuthCommands::List => {
                     cmd_auth::auth_list(&data_dir, json)?;
                 }
                 AuthCommands::Remove { provider } => {
-                    cmd_auth::auth_remove(&data_dir, &provider, json)?;
+                    cmd_auth::auth_remove(&client, &url, &data_dir, &provider, json).await?;
                 }
             }
         }

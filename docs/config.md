@@ -99,6 +99,8 @@ API key precedence at gateway startup:
 
 When resolution fails, the gateway logs a warning and continues; the first outgoing request will surface an auth error from the upstream.
 
+The `SecretsStore` is loaded once, at boot. `alms auth set <name> <key>` and `alms auth remove <name>` therefore probe `GET /health` at `--url` (default `http://127.0.0.1:8080`, or `ALMS_GATEWAY_URL`) and send the change to a gateway that answers, so it applies to the next run with no restart; the gateway persists it to its own secrets file, so it survives a restart too. When nothing answers they edit the file directly, as before. If something answers but not with a 2xx, the file is written and the command warns that a gateway there needs a restart.
+
 > Note: the `alms auth set <name> <key>` command currently restricts `<name>` to a fixed list (`openai`, `anthropic`, `gemini`, `openrouter`, `telegram`). For any *other* provider you declare in `[llm.providers.<name>]`, use `api_key_env` instead. Extending `alms auth set` to accept arbitrary provider names is tracked separately.
 
 ### Auth schemes

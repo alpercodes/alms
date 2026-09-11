@@ -111,6 +111,18 @@ Each item below changes behaviour for a deployment that has not set the knob exp
 - `alms dashboard` checks that the gateway answers `/health` before opening a browser.
   When nothing is listening it now reports the reason and points at `alms gateway`, and
   **exits non-zero**, instead of opening a browser onto a connection-refused page.
+- `alms auth set` / `alms auth remove` apply to a gateway that is already running. Both
+  probe `/health` at `--url` (default `http://127.0.0.1:8080`, `ALMS_GATEWAY_URL`) and,
+  when a gateway answers, send the change to `PUT`/`DELETE /auth/keys` instead of writing
+  `.alms/secrets.json` — the daemon persists it to its own secrets file, so nothing is
+  lost on restart, and the key takes effect on the next run. Previously the file was written and
+  the running daemon never saw it, because the secrets store is read once at boot: the
+  key was visibly on disk and the next run still failed to authenticate. With no gateway
+  answering, both commands write the file exactly as before. A gateway that answers and
+  then *rejects* the change (a missing `ALMS_AUTH_TOKEN`, say) is now an error rather
+  than a silent fall back to the file. `--json` output gains a `target` field
+  (`"gateway"` or `"secrets_file"`); `alms auth list` is unchanged and still reads the
+  file.
 
 ### Frontend
 
