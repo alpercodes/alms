@@ -90,7 +90,7 @@ Suggested MVP error codes:
 
 ### Scripted first run
 
-The web UI is the normal way in — it creates the agent, the session, and the run for you (see the README quick start). To do the same from a script, against a gateway that is already running, with `jq` installed:
+The web UI is the normal way in — it offers to store a provider key first, then creates the agent, the session, and the run for you (see the README quick start). To do the same from a script, against a gateway that is already running, with `jq` installed:
 
 ```bash
 BASE=http://127.0.0.1:8080

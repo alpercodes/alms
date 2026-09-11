@@ -11,8 +11,11 @@ import {
 } from '../utils/model-display.js';
 import { debugModePatchDelta } from '../utils/debug-mode-patch.js';
 import { DEBUG_MODE_HINT, SUMMARY_HINT, providerScopeHint } from './settings-copy.js';
-
-const PROVIDERS = ['openai', 'anthropic', 'openrouter', 'gemini'];
+// The four LLM key slots. `VALID_PROVIDERS` in secrets.rs also carries
+// `telegram`, which is a channel bot token and has no place in these rows or
+// in a model-provider picker. Shared with the onboarding key probe so the two
+// cannot drift (PR #163).
+import { LLM_PROVIDERS as PROVIDERS } from '../utils/providers.js';
 
 /** Format large numbers with commas for readability. */
 function fmt(n) {

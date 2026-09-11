@@ -1,4 +1,14 @@
-export function settingsFixture(agentId: string) {
+export interface SettingsFixtureOptions {
+  /**
+   * Include the `atlas` agent record. Pass `false` for the first-run state:
+   * `App` renders `OnboardingView` exactly when `agents` is empty, so the
+   * onboarding flow is unreachable in a browser test without this (#162).
+   */
+  readonly withAgent?: boolean;
+}
+
+export function settingsFixture(agentId: string, options: SettingsFixtureOptions = {}) {
+  const { withAgent = true } = options;
   return {
     version: "0.2.4",
     provider: "openai",
@@ -7,20 +17,22 @@ export function settingsFixture(agentId: string) {
     base_url: "https://api.openai.com/v1",
     stream_chunk_timeout_secs: 30,
     llm_providers: ["openai"],
-    agents: [
-      {
-        id: agentId,
-        name: "atlas",
-        is_default: true,
-        model: null,
-        needs_bootstrap: false,
-        has_telegram: false,
-        worktree_mode: "off",
-        debug_mode: false,
-        created_at: "2026-07-12T10:00:00Z",
-        last_active: "2026-07-12T10:00:00Z",
-      },
-    ],
+    agents: withAgent
+      ? [
+          {
+            id: agentId,
+            name: "atlas",
+            is_default: true,
+            model: null,
+            needs_bootstrap: false,
+            has_telegram: false,
+            worktree_mode: "off",
+            debug_mode: false,
+            created_at: "2026-07-12T10:00:00Z",
+            last_active: "2026-07-12T10:00:00Z",
+          },
+        ]
+      : [],
     context: {
       strategy: "sliding_summary",
       max_input_tokens: 100_000,

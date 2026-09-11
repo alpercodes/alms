@@ -67,22 +67,24 @@ above become just `alms`. It is a bash script; on Windows run it from Git Bash.
 
 ### In the browser
 
-**Paste a provider key first.** The gear in the header opens Settings; under **API Keys**,
-paste a key next to `openrouter` and press Save. It applies immediately, no restart.
-`openrouter` is the default provider, so a key there needs no further configuration; for
-`openai`, `anthropic`, or `gemini`, also point *Default LLM provider* and *Default LLM
-model* at your choice. Do this before your first message: without a key the first reply
-fails with *Authentication failed — check your API key in Settings*.
+**The first screen sets you up, in two steps.** Step one takes an OpenRouter key.
+`openrouter` is the default provider and one key there covers both defaults — the chat
+model and the summary model — so it needs no further configuration. It applies to the
+running gateway immediately, no restart. The step skips itself when a key is already in
+the secrets store, and **Skip for now** covers everything else — a key declared in
+`alms.toml` works but is invisible from there. On another provider? Skip, then paste that
+key under Settings → **API Keys** and point *Default LLM provider* and *Default LLM model*
+at it.
 
-**Then create your agent.** The first screen asks for a name, creates the agent, opens a
-session, and drops you into the chat. Send it anything: a new agent's opening reply is a
-short interview about who you are and what it is for, and what it learns becomes workspace
-files it carries into every later session.
+**Step two names your agent.** It creates the agent, opens a session, and drops you into
+the chat. Send it anything: a new agent's opening reply is a short interview about who you
+are and what it is for, and what it learns becomes workspace files it carries into every
+later session.
 
 - **Sidebar** — this agent's sessions; *+ New session* starts another.
 - **Agents**, in the header — create more agents and set each one's model, provider, and
   posture.
-- **Gear** — server-wide settings: the API keys above, default model and provider, and the
+- **Gear** — server-wide settings: provider keys, default model and provider, and the
   context budget.
 
 New agents inherit the server's default posture, `guarded`, so the first risky tool call

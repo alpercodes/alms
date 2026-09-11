@@ -574,6 +574,26 @@ fn session_owner_js_behaviour() {
     run_node_test("session-owner.test.mjs");
 }
 
+/// Pinned behaviour for issue #162 (half A): onboarding now offers to store a
+/// provider key before creating the first agent, and skips that step when the
+/// daemon already holds one. The skip decision reads `GET /auth/keys`, which
+/// answers a narrower question than the step asks — `list_keys` in
+/// `auth_keys.rs` reports only the secrets store, so `configured: false`
+/// means "nothing in that store", NOT "this operator has no key". A key
+/// declared in `alms.toml` as `[llm.providers.<name>].api_key_env` resolves at
+/// startup and survives per-run re-resolution while showing `false` on every
+/// row.
+///
+/// Covers the pure predicate `utils/onboarding-keys.js::hasStoredKey`, whose
+/// contract is one-directional: `true` licenses skipping the step, `false`
+/// licenses only showing it. That caveat is pinned as its own case so a later
+/// refactor cannot quietly turn the offer into a gate and lock out an operator
+/// who configured the daemon through the config file.
+#[test]
+fn onboarding_keys_js_behaviour() {
+    run_node_test("onboarding-keys.test.mjs");
+}
+
 /// Guard against the two runners drifting apart (issue #7).
 ///
 /// The suites in `tests/ui/` have two entry points, and until #7 they could
