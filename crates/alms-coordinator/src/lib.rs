@@ -579,7 +579,7 @@ impl Coordinator {
         // #920: typed error channel, parallel to the JSON `result_rx`.
         // `run_subagent` fires this when the agent loop returns an error
         // so `dispatch()` can propagate the structured `AlmsError`
-        // (e.g. `SubagentLlmError`) without going through the JSON
+        // (e.g. `LlmApiError`) without going through the JSON
         // stringification round trip that previously double-wrapped the
         // error as `AlmsError::Runtime(stringified)`.
         let (error_tx, error_rx) = oneshot::channel::<AlmsError>();
@@ -921,7 +921,7 @@ impl SubagentDispatcher for Coordinator {
             )),
             TaskStatus::Failed => {
                 // Prefer the typed `AlmsError` when present so the
-                // structured variant (e.g. `SubagentLlmError`) survives
+                // structured variant (e.g. `LlmApiError`) survives
                 // the boundary unchanged. Fall back to the JSON string
                 // for paths that never produced a structured error
                 // (timeout, missing typed channel) — those still come
@@ -1116,7 +1116,7 @@ async fn run_subagent(
     // structured `AlmsError` from `run_agent_loop` when the subagent
     // failed; never fired on success / cancel / timeout. `dispatch()`
     // awaits this in preference to the JSON `result["error"]` so the
-    // typed variant (e.g. `SubagentLlmError`) propagates without a
+    // typed variant (e.g. `LlmApiError`) propagates without a
     // stringification round trip.
     error_tx: oneshot::Sender<AlmsError>,
     session_manager: Arc<SessionManager>,

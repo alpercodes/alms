@@ -126,22 +126,6 @@ impl LlmClient {
         })
     }
 
-    /// Stable, lowercase short name for the wire-protocol family.
-    ///
-    /// Used to label structured `AlmsError::SubagentLlmError` payloads
-    /// (#920) so callers can tell which provider returned the failing
-    /// status without re-parsing the body. Distinct from
-    /// `LlmConfig::provider`, which carries the user-facing config key
-    /// and may be a sugar alias (`openrouter`, `groq`, ...) — we always
-    /// return the protocol family the request was actually built against.
-    fn provider_name(&self) -> &'static str {
-        match self.provider {
-            Provider::OpenAi => "openai",
-            Provider::Anthropic => "anthropic",
-            Provider::Gemini => "gemini",
-        }
-    }
-
     /// Determine the wire-protocol family for the current provider.
     ///
     /// Checks the `providers` table first (populated from
@@ -383,13 +367,19 @@ impl LlmClient {
                     );
                     // #920: emit the structured variant so the parent
                     // agent's `tool_result` reads as one tractable line
-                    // (`Subagent LLM error (gemini 400): ...`) instead of
+                    // (`LLM error (gemini 400): ...`) instead of
                     // the legacy 4-prefix wrap. The constructor
                     // normalises newlines in `body` so multi-line
                     // provider responses (e.g. Gemini's pretty JSON)
                     // still render as a single tractable line.
-                    return Err(AlmsError::subagent_llm_error(
-                        self.provider_name(),
+                    //
+                    // #162: the label is the *configured* provider key
+                    // (`openrouter`, a custom `[llm.providers.<name>]`
+                    // entry), not the wire family `self.provider` — it
+                    // must match `resolved_config.provider` on the run
+                    // record and name the entry whose key to fix.
+                    return Err(AlmsError::llm_api_error(
+                        self.config.provider.clone(),
                         retry_status.as_u16(),
                         retry_err,
                     ));
@@ -401,8 +391,8 @@ impl LlmClient {
             error!("LLM API error: {} - {}", status, error_text);
             // #920: structured variant (see cache-retry branch above for
             // the full rationale).
-            return Err(AlmsError::subagent_llm_error(
-                self.provider_name(),
+            return Err(AlmsError::llm_api_error(
+                self.config.provider.clone(),
                 status.as_u16(),
                 error_text,
             ));
@@ -723,11 +713,13 @@ impl LlmClient {
                     );
                     // #920: structured variant (mirrors the non-stream
                     // branch — parent's `tool_result` should read as
-                    // `Subagent LLM error (gemini 400): ...`). The
+                    // `LLM error (gemini 400): ...`). The
                     // constructor normalises newlines so multi-line
-                    // provider bodies still render as one line.
-                    return Err(AlmsError::subagent_llm_error(
-                        self.provider_name(),
+                    // provider bodies still render as one line. #162:
+                    // labelled with the configured provider key, as in
+                    // `complete()`.
+                    return Err(AlmsError::llm_api_error(
+                        self.config.provider.clone(),
                         retry_status.as_u16(),
                         retry_err,
                     ));
@@ -743,8 +735,8 @@ impl LlmClient {
             error!("LLM API error: {} - {}", status, error_text);
             // #920: structured variant (see cache-retry branch above for
             // the full rationale).
-            return Err(AlmsError::subagent_llm_error(
-                self.provider_name(),
+            return Err(AlmsError::llm_api_error(
+                self.config.provider.clone(),
                 status.as_u16(),
                 error_text,
             ));
@@ -2597,7 +2589,7 @@ mod tests {
 
     /// Nit 1: when the cache-expired retry in `complete()` itself fails
     /// with a non-success status, the client must surface the structured
-    /// `AlmsError::SubagentLlmError` variant (#920) carrying provider /
+    /// `AlmsError::LlmApiError` variant (#920) carrying provider /
     /// status / body — not a JSON parse error from feeding the error body
     /// to the success-path parser.
     #[tokio::test]
@@ -2607,7 +2599,7 @@ mod tests {
         //      Triggers the retry branch via `decide_cache_retry`.
         //   2. Retry request: 500 with a generic error body.
         //      Must NOT be parsed — must surface as the structured
-        //      `AlmsError::SubagentLlmError { provider, status: 500, .. }`
+        //      `AlmsError::LlmApiError { provider, status: 500, .. }`
         //      variant (#920) rather than a parse error.
         let llm = ScriptedLlm::in_order(vec![
             Canned::json(
@@ -2644,7 +2636,7 @@ mod tests {
         // typed shape sticks, and the Display rendering so callers get a
         // single tractable line.
         match &err {
-            AlmsError::SubagentLlmError {
+            AlmsError::LlmApiError {
                 provider,
                 status,
                 body,
@@ -2653,11 +2645,11 @@ mod tests {
                 assert_eq!(*status, 500);
                 assert!(body.contains("internal"), "body must carry payload: {body}");
             }
-            other => panic!("expected SubagentLlmError, got {other:?}"),
+            other => panic!("expected LlmApiError, got {other:?}"),
         }
         let msg = err.to_string();
         assert!(
-            msg.contains("Subagent LLM error (gemini 500)"),
+            msg.contains("LLM error (gemini 500)"),
             "expected structured Display, got: {msg}"
         );
         assert!(
@@ -2702,17 +2694,17 @@ mod tests {
         };
         // #920: structured variant on the stream branch too.
         match &err {
-            AlmsError::SubagentLlmError {
+            AlmsError::LlmApiError {
                 provider, status, ..
             } => {
                 assert_eq!(provider, "gemini");
                 assert_eq!(*status, 500);
             }
-            other => panic!("expected SubagentLlmError, got {other:?}"),
+            other => panic!("expected LlmApiError, got {other:?}"),
         }
         let msg = err.to_string();
         assert!(
-            msg.contains("Subagent LLM error (gemini 500)"),
+            msg.contains("LLM error (gemini 500)"),
             "expected structured Display, got: {msg}"
         );
     }
@@ -2747,6 +2739,197 @@ mod tests {
         runtime_cfg.base_url = base_url;
         runtime_cfg.timeout_secs = 10;
         LlmClient::new(runtime_cfg).unwrap()
+    }
+
+    // ------------------------------------------------------------------
+    // #162: the error label is the *configured* provider key — what
+    // `resolved_config.provider` on the run record says (both read
+    // `LlmConfig::provider`, so they cannot drift) and what the operator's
+    // `[llm.providers.<name>]` entry is called — not the wire-protocol
+    // family the request was built against, which is what the deleted
+    // `provider_name()` reported. One test per raise site, each under a
+    // name that differs from its wire family so the two are
+    // distinguishable (Tim's #167 review: the gemini fixtures above run
+    // under the name `gemini`, where they are not).
+    // ------------------------------------------------------------------
+
+    /// OpenRouter's verbatim 401 body from the #162 trace.
+    const OPENROUTER_401_BODY: &str =
+        r#"{"error":{"message":"No cookie auth credentials found","code":401}}"#;
+
+    /// An OpenAI-family client configured as `openrouter`, in the issue's
+    /// exact state: no key at all (`apply_auth` sends no `Authorization`
+    /// header).
+    fn openrouter_client_no_key(base_url: String) -> LlmClient {
+        let mut core_cfg = alms_core::config::LlmConfig::default();
+        core_cfg.ensure_builtin_providers();
+        core_cfg.provider = "openrouter".into();
+        let mut runtime_cfg: LlmConfig = core_cfg.into();
+        runtime_cfg.api_key = String::new();
+        runtime_cfg.base_url = base_url;
+        runtime_cfg.timeout_secs = 10;
+        let client = LlmClient::new(runtime_cfg).unwrap();
+        // Sanity: this IS the OpenAI wire family — the old label came
+        // from exactly this discriminant.
+        assert_eq!(client.provider, Provider::OpenAi);
+        client
+    }
+
+    /// A Gemini-*kind* client under a custom `[llm.providers.<name>]`
+    /// name (the builtin `gemini` entry cloned under `provider`). The two
+    /// cache-retry raise sites are Gemini-only, so this is the only way
+    /// to run them under a name that differs from the wire family.
+    fn gemini_kind_client_named(provider: &str, base_url: String) -> LlmClient {
+        let mut core_cfg = alms_core::config::LlmConfig::default();
+        core_cfg.ensure_builtin_providers();
+        let gemini_entry = core_cfg
+            .providers
+            .get("gemini")
+            .cloned()
+            .expect("builtin gemini entry");
+        core_cfg
+            .providers
+            .insert(provider.to_string(), gemini_entry);
+        core_cfg.provider = provider.to_string();
+        let mut runtime_cfg: LlmConfig = core_cfg.into();
+        runtime_cfg.api_key = "gemini-test-key".into();
+        runtime_cfg.base_url = base_url;
+        runtime_cfg.timeout_secs = 10;
+        let client = LlmClient::new(runtime_cfg).unwrap();
+        assert_eq!(client.provider, Provider::Gemini);
+        client
+    }
+
+    /// The #162 label contract, shared by the four raise-site tests.
+    fn assert_labelled_with_configured_provider(
+        err: &AlmsError,
+        expected_provider: &str,
+        wire_family: &str,
+        expected_status: u16,
+        body_fragment: &str,
+    ) {
+        match err {
+            AlmsError::LlmApiError {
+                provider,
+                status,
+                body,
+            } => {
+                assert_eq!(
+                    provider, expected_provider,
+                    "label must be the configured provider key, not the wire family"
+                );
+                assert_eq!(*status, expected_status);
+                assert!(
+                    body.contains(body_fragment),
+                    "body must carry the provider payload: {body}"
+                );
+            }
+            other => panic!("expected LlmApiError, got {other:?}"),
+        }
+        let msg = err.to_string();
+        let expected_prefix = format!("LLM error ({expected_provider} {expected_status}):");
+        assert!(
+            msg.starts_with(&expected_prefix),
+            "expected configured-provider label, got: {msg}"
+        );
+        assert!(
+            !msg.contains(&format!("({wire_family} ")),
+            "wire family must not be the label, got: {msg}"
+        );
+        assert!(
+            !msg.to_lowercase().contains("subagent"),
+            "a top-level call is nobody's subagent, got: {msg}"
+        );
+    }
+
+    fn cache_retry_script() -> Vec<Canned> {
+        vec![
+            Canned::json(
+                404,
+                r#"{"error":{"code":404,"status":"NOT_FOUND","message":"CachedContent cachedContents/abc was not found"}}"#,
+            ),
+            Canned::json(500, r#"{"error":{"message":"internal"}}"#),
+        ]
+    }
+
+    fn cache_retry_request(client: &LlmClient) -> CompletionRequest {
+        let session = alms_core::SessionId::new();
+        client.gemini_cache.install_active_for_test(
+            session,
+            "cachedContents/abc".into(),
+            0xabcd_ef01,
+        );
+        CompletionRequest::new("gemini-2.5-pro")
+            .with_messages(vec![LlmMessage::user("hi")])
+            .with_session_id(session)
+            .with_gemini_cache_enabled(true)
+    }
+
+    /// #162: `complete()`, main branch.
+    #[tokio::test]
+    async fn complete_non_success_is_labelled_with_configured_provider_not_wire_family() {
+        let llm = ScriptedLlm::always(Canned::json(401, OPENROUTER_401_BODY)).await;
+        let client = openrouter_client_no_key(llm.base_url());
+        let request =
+            CompletionRequest::new("z-ai/glm-5.2").with_messages(vec![LlmMessage::user("hello")]);
+        let err = client
+            .complete(request)
+            .await
+            .expect_err("a 401 must surface as an error");
+        assert_labelled_with_configured_provider(
+            &err,
+            "openrouter",
+            "openai",
+            401,
+            "No cookie auth credentials found",
+        );
+    }
+
+    /// #162: `complete_stream()`, main branch.
+    #[tokio::test]
+    async fn complete_stream_non_success_is_labelled_with_configured_provider_not_wire_family() {
+        let llm = ScriptedLlm::always(Canned::json(401, OPENROUTER_401_BODY)).await;
+        let client = openrouter_client_no_key(llm.base_url());
+        let request =
+            CompletionRequest::new("z-ai/glm-5.2").with_messages(vec![LlmMessage::user("hello")]);
+        // `BoxStream` isn't `Debug`, so hand-match instead of `expect_err`.
+        let err = match client.complete_stream(request).await {
+            Ok(_) => panic!("a 401 must surface as an error"),
+            Err(e) => e,
+        };
+        assert_labelled_with_configured_provider(
+            &err,
+            "openrouter",
+            "openai",
+            401,
+            "No cookie auth credentials found",
+        );
+    }
+
+    /// #162: `complete()`, cache-retry branch.
+    #[tokio::test]
+    async fn complete_cache_retry_non_success_is_labelled_with_configured_provider() {
+        let llm = ScriptedLlm::in_order(cache_retry_script()).await;
+        let client = gemini_kind_client_named("vertex-eu", format!("{}/v1beta", llm.base_url()));
+        let request = cache_retry_request(&client);
+        let err = client
+            .complete(request)
+            .await
+            .expect_err("retry returning 500 must surface as a typed error");
+        assert_labelled_with_configured_provider(&err, "vertex-eu", "gemini", 500, "internal");
+    }
+
+    /// #162: `complete_stream()`, cache-retry branch.
+    #[tokio::test]
+    async fn complete_stream_cache_retry_non_success_is_labelled_with_configured_provider() {
+        let llm = ScriptedLlm::in_order(cache_retry_script()).await;
+        let client = gemini_kind_client_named("vertex-eu", format!("{}/v1beta", llm.base_url()));
+        let request = cache_retry_request(&client);
+        let err = match client.complete_stream(request).await {
+            Ok(_) => panic!("stream retry returning 500 must surface as a typed error"),
+            Err(e) => e,
+        };
+        assert_labelled_with_configured_provider(&err, "vertex-eu", "gemini", 500, "internal");
     }
 
     fn anthropic_client_with_base_url(base_url: String) -> LlmClient {
