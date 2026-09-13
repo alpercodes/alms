@@ -49,7 +49,7 @@ pub enum SandboxError {
     Internal(String),
 
     /// A subagent's `AgentRuntime` returned a structured `AlmsError`
-    /// (typically [`alms_core::AlmsError::SubagentLlmError`] when the
+    /// (typically [`alms_core::AlmsError::LlmApiError`] when the
     /// downstream provider returned a non-success HTTP status).
     ///
     /// Carries the inner error verbatim so [`crate::ToolRegistry`]'s
