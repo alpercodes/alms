@@ -162,14 +162,19 @@ pub(crate) fn parse_api_error(status: reqwest::StatusCode, body: &str) -> String
     format!("HTTP {status}: {body}")
 }
 
-/// Send a GET request and return the response body as JSON Value.
-pub(crate) async fn api_get(
-    client: &reqwest::Client,
+/// Send a built request and return `(status, body)` when the gateway
+/// answers with a 2xx.
+///
+/// This is the entire body of every `api_*` helper below: the connect-error
+/// remap that names the gateway and how to start it, the `is_success` gate,
+/// and `parse_api_error` on a failure body. The helpers differ only in
+/// method, in whether they attach a JSON body, and in how much of the
+/// answer their callers want back.
+async fn send(
+    req: reqwest::RequestBuilder,
     base_url: &str,
-    path: &str,
-) -> anyhow::Result<serde_json::Value> {
-    let url = api_url(base_url, path);
-    let resp = client.get(&url).send().await.map_err(|e| {
+) -> anyhow::Result<(reqwest::StatusCode, String)> {
+    let resp = req.send().await.map_err(|e| {
         if e.is_connect() {
             anyhow::anyhow!(
                 "Cannot connect to gateway at {base_url}. Is it running? Start with: alms gateway"
@@ -183,6 +188,16 @@ pub(crate) async fn api_get(
     if !status.is_success() {
         anyhow::bail!("{}", parse_api_error(status, &body));
     }
+    Ok((status, body))
+}
+
+/// Send a GET request and return the response body as JSON Value.
+pub(crate) async fn api_get(
+    client: &reqwest::Client,
+    base_url: &str,
+    path: &str,
+) -> anyhow::Result<serde_json::Value> {
+    let (_status, body) = send(client.get(api_url(base_url, path)), base_url).await?;
     Ok(serde_json::from_str(&body)?)
 }
 
@@ -193,22 +208,19 @@ pub(crate) async fn api_post(
     path: &str,
     body: &impl serde::Serialize,
 ) -> anyhow::Result<(reqwest::StatusCode, serde_json::Value)> {
-    let url = api_url(base_url, path);
-    let resp = client.post(&url).json(body).send().await.map_err(|e| {
-        if e.is_connect() {
-            anyhow::anyhow!(
-                "Cannot connect to gateway at {base_url}. Is it running? Start with: alms gateway"
-            )
-        } else {
-            anyhow::anyhow!("Request failed: {e}")
-        }
-    })?;
-    let status = resp.status();
-    let body_text = resp.text().await?;
-    if !status.is_success() {
-        anyhow::bail!("{}", parse_api_error(status, &body_text));
-    }
-    Ok((status, serde_json::from_str(&body_text)?))
+    let (status, text) = send(client.post(api_url(base_url, path)).json(body), base_url).await?;
+    Ok((status, serde_json::from_str(&text)?))
+}
+
+/// Send a PUT request with a JSON body and return the response body as JSON.
+pub(crate) async fn api_put(
+    client: &reqwest::Client,
+    base_url: &str,
+    path: &str,
+    body: &impl serde::Serialize,
+) -> anyhow::Result<serde_json::Value> {
+    let (_status, text) = send(client.put(api_url(base_url, path)).json(body), base_url).await?;
+    Ok(serde_json::from_str(&text)?)
 }
 
 /// Send a DELETE request and return the status code.
@@ -217,22 +229,23 @@ pub(crate) async fn api_delete(
     base_url: &str,
     path: &str,
 ) -> anyhow::Result<reqwest::StatusCode> {
-    let url = api_url(base_url, path);
-    let resp = client.delete(&url).send().await.map_err(|e| {
-        if e.is_connect() {
-            anyhow::anyhow!(
-                "Cannot connect to gateway at {base_url}. Is it running? Start with: alms gateway"
-            )
-        } else {
-            anyhow::anyhow!("Request failed: {e}")
-        }
-    })?;
-    let status = resp.status();
-    if !status.is_success() {
-        let body = resp.text().await?;
-        anyhow::bail!("{}", parse_api_error(status, &body));
-    }
+    let (status, _body) = send(client.delete(api_url(base_url, path)), base_url).await?;
     Ok(status)
+}
+
+/// Send a DELETE request and return the response body as JSON.
+///
+/// Separate from [`api_delete`] because `DELETE /auth/keys/{provider}`
+/// answers `{"removed": bool}` and `alms auth remove` prints a different
+/// line for a key that was not there — a distinction the status code
+/// alone cannot carry.
+pub(crate) async fn api_delete_json(
+    client: &reqwest::Client,
+    base_url: &str,
+    path: &str,
+) -> anyhow::Result<serde_json::Value> {
+    let (_status, body) = send(client.delete(api_url(base_url, path)), base_url).await?;
+    Ok(serde_json::from_str(&body)?)
 }
 
 // Test helpers shared across modules

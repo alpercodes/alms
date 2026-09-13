@@ -118,7 +118,7 @@ RUN=$(curl -sX POST $BASE/runs \
 curl -N $BASE/runs/$RUN/events
 ```
 
-A provider key has to be configured or the run in step 3 fails with a 401: `PUT /auth/keys` sets one on a **running** daemon and takes effect on the next run, while `alms auth set <provider>` writes `.alms/secrets.json` for a daemon that has **not started yet** — a key it writes to an already-running daemon is not picked up, because the store is loaded once at boot (`docs/config.md`).
+A provider key has to be configured or the run in step 3 fails with a 401: `PUT /auth/keys` sets one on a **running** daemon and takes effect on the next run. `alms auth set <provider>` calls that same endpoint whenever a gateway answers `GET /health` at its `--url` (default `http://127.0.0.1:8080`), and writes `.alms/secrets.json` when none does — either way the key is on disk for the next boot, since the handler persists it too. The file itself is read **once, at boot**, so a key written there behind a running daemon's back is invisible to it until a restart (`docs/config.md`).
 
 If the gateway was started with `ALMS_AUTH_TOKEN` set, every call above needs `-H "Authorization: Bearer $ALMS_AUTH_TOKEN"` (§ 13). The CLI covers steps 1 and 3 — `alms agent create atlas --posture guarded` and `alms run create --session <uuid> --input "..."` — plus `alms health` and `alms session list`. `alms agent create` writes straight to SQLite rather than calling the gateway, but the gateway resolves agents from the store on every call, so an agent created that way is visible to a gateway that is already running.
 
