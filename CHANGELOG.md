@@ -186,6 +186,15 @@ one.
   `Registering tool: <name>`), and the worktree drift warnings carry
   `drift=already_present` / `drift=already_absent`. Levels, targets and the rest of the
   fields are unchanged.
+- `rustls` 0.23.36 -> 0.23.45 (with `rustls-webpki` 0.103.13 -> 0.103.15) to clear
+  RUSTSEC-2026-0285, a TLS 1.3 handshake bug. v0.2.3 carries the affected version, but no
+  ALMS connection goes through rustls: `reqwest` is declared with `rustls-tls` *and* its own
+  defaults, and reqwest selects the platform backend whenever `default-tls` is on and
+  `http3` is off — OpenSSL on Linux, Security.framework on macOS, SChannel on Windows —
+  while nothing in `crates/` calls `use_rustls_tls`. So this clears the audit gate on code
+  that ships but is never reached; no operator action. Lockfile-only, and it also moved four
+  Windows-only crates' `windows-sys` link 0.52.0 -> 0.60.2 (`errno`, `rustix`, `tempfile`,
+  `winapi-util`), which any update touching `ring` triggers.
 
 ## v0.2.3 — released (tag `v0.2.3`)
 
