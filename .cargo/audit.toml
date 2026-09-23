@@ -17,11 +17,15 @@
 # Be clear about what the entries below now do, because it is less than it was.
 # With the action gone, an informational advisory no longer fails anything on its
 # own: `cargo audit` exits non-zero on vulnerabilities, and warnings affect the
-# exit code only when named in `[output] deny`, which this file does not set. So
-# an `informational` ignore entry now suppresses a line of log output and changes
-# no CI verdict. They are kept because the rationale and exit condition each
-# records are worth having written down, not because removing one would turn the
-# gate red. If that ever proves false, this paragraph is what is wrong.
+# exit code only when their kind is named in `[output] deny`. That list names
+# `unsound` alone (see `[output]` at the end of this file). So an ignore entry
+# for an `unmaintained` advisory -- the only kind below today -- suppresses a
+# line of log output and changes no CI verdict. They are kept because the
+# rationale and exit condition each records are worth having written down, not
+# because removing one would turn the gate red. An ignore entry for an
+# `unsound` advisory is different: it does hold the gate open, so it has to
+# argue that the unsound code is unreachable from what we ship. If any of this
+# ever proves false, this paragraph is what is wrong.
 #
 # Every entry here must carry a date, a rationale, and an exit condition.
 
@@ -45,3 +49,30 @@ ignore = [
     # Added 2026-08-21. Revisit when the swc bump lands, and drop this entry.
     "RUSTSEC-2026-0249",
 ]
+
+[output]
+# Warning kinds that fail the audit instead of only being printed.
+#
+# `unsound` -- RustSec's informational category for soundness bugs: a safe API
+# that can trigger undefined behaviour, which is where memory-safety bugs land
+# when they are not filed as vulnerabilities. `cargo audit` reports them as
+# warnings, so without this line one would print in the `Security audit (Rust)`
+# log and pass, unread -- the way the yanked-crate warning for `chacha20 0.10.0`
+# did, with that crate in the shipped binary (alms-cli -> brush-core -> rand),
+# until review of #175. Naming it here also makes cargo-audit report the
+# category even if `informational_warnings` is ever narrowed. An unsound
+# advisory that is genuinely unreachable goes in `ignore` above, with the usual
+# date, rationale and exit condition.
+#
+# Not `yanked`, deliberately. It would turn this required check red the moment
+# anything in Cargo.lock is yanked upstream -- an event outside our control that
+# then blocks every merge -- and that trade is its own decision. With chacha20
+# at 0.10.2 the tree has no yanked crates, so it can be taken up separately.
+#
+# Added 2026-09-23.
+deny = ["unsound"]
+
+# Not a setting anyone chose: `false` is the default. But cargo-audit (0.22.2)
+# rejects an `[output]` table that omits it -- "missing field `quiet`" -- and a
+# config parse error kills the audit before it reads Cargo.lock. Keep it.
+quiet = false
