@@ -4,7 +4,7 @@
 
 ### Prerequisites
 
-ALMS requires Rust nightly (specified in `rust-toolchain.toml`). The toolchain will be automatically installed when you run cargo commands.
+ALMS requires Rust nightly (specified in `rust-toolchain.toml`). If you installed Rust with [rustup](https://rustup.rs), the toolchain will be automatically installed when you run cargo commands. A `cargo` from a package manager (e.g. `brew install rust`) ignores `rust-toolchain.toml` and builds with whatever compiler it ships, which may be too old for this workspace.
 
 ### First-time identity setup
 
