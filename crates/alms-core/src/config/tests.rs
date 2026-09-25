@@ -2685,3 +2685,183 @@ fn test_env_strategy_sliding_summary_normalises_to_compact() {
         "normalize_episodic rewrites the alias for env-var-fed configs"
     );
 }
+
+// ---------------------------------------------------------------------------
+// #179: the "No LLM API key configured" warning reads the secrets file
+// ---------------------------------------------------------------------------
+
+/// A config that reaches the key check: a real (not mock) default provider
+/// with no `api_key_env` / `api_key`, and `data_dir` as its data directory.
+fn key_check_config(data_dir: &std::path::Path) -> AlmsConfig {
+    let mut config = AlmsConfig::default();
+    config.llm.ensure_builtin_providers();
+    config.llm.mock = false;
+    config.server.data_dir = data_dir.to_string_lossy().into_owned();
+    config
+}
+
+/// Every WARN `validate()` emits for `config`, as structured events.
+fn validate_warnings(config: &AlmsConfig) -> alms_test_support::CapturedEvents {
+    alms_test_support::capture_events(tracing::Level::WARN, || {
+        config.validate().expect("the config is valid");
+    })
+}
+
+/// Holds `ENV_LOCK` with `ALMS_MASTER_KEY` unset and `ALMS_DB_PATH` set to
+/// `db_path`, or unset for `None`, restoring both on drop.
+struct KeyCheckEnv {
+    _db: SingleEnvGuard,
+    _master_key: SingleEnvGuard,
+    _lock: MutexGuard<'static, ()>,
+}
+
+fn key_check_env(db_path: Option<&std::path::Path>) -> KeyCheckEnv {
+    // Through a poisoned lock: every guard restores its variable on drop,
+    // so one failing test must not fail the others by poisoning.
+    let lock = ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let master_key = SingleEnvGuard::remove(crate::secrets::MASTER_KEY_ENV);
+    let db = match db_path {
+        Some(path) => SingleEnvGuard::set("ALMS_DB_PATH", &path.to_string_lossy()),
+        None => SingleEnvGuard::remove("ALMS_DB_PATH"),
+    };
+    KeyCheckEnv {
+        _db: db,
+        _master_key: master_key,
+        _lock: lock,
+    }
+}
+
+const OPENROUTER_KEY_FILE: &str = r#"{"api_keys":{"openrouter":"sk-or-test-key-1234"}}"#;
+
+/// With no key anywhere the warning still fires, and names the provider and
+/// the file it looked in.
+#[test]
+fn key_warning_names_the_provider_and_file_when_no_source_has_a_key() {
+    let _env = key_check_env(None);
+    let dir = tempfile::tempdir().unwrap();
+
+    let warnings = validate_warnings(&key_check_config(dir.path()));
+
+    let warning = warnings
+        .at_target("alms_core::config")
+        .find(|e| e.has_field("secrets_path"))
+        .unwrap_or_else(|| panic!("expected the key warning; got {warnings}"));
+    assert_eq!(warning.field("provider"), Some("openrouter"));
+    assert_eq!(
+        warning.field("secrets_path"),
+        Some(
+            dir.path()
+                .join("secrets.json")
+                .display()
+                .to_string()
+                .as_str()
+        )
+    );
+}
+
+/// The report: a key stored with `alms auth set` must silence the warning.
+/// The read is quiet: nothing from the secrets module either.
+#[test]
+fn key_warning_is_absent_when_the_secrets_file_holds_the_providers_key() {
+    let _env = key_check_env(None);
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("secrets.json"), OPENROUTER_KEY_FILE).unwrap();
+
+    let warnings = validate_warnings(&key_check_config(dir.path()));
+
+    assert!(warnings.is_empty(), "expected no warnings; got {warnings}");
+}
+
+/// The file is the one `ServerConfig::secrets_path` resolves, beside the
+/// database (#170), not `{data_dir}/secrets.json`: with `ALMS_DB_PATH` set
+/// elsewhere, a key there silences the warning and a key in the data
+/// directory does not.
+#[test]
+fn key_warning_reads_the_secrets_file_beside_alms_db_path() {
+    let data = tempfile::tempdir().unwrap();
+    let elsewhere = tempfile::tempdir().unwrap();
+    let _env = key_check_env(Some(&elsewhere.path().join("alms.db")));
+    let config = key_check_config(data.path());
+
+    std::fs::write(elsewhere.path().join("secrets.json"), OPENROUTER_KEY_FILE).unwrap();
+    let warnings = validate_warnings(&config);
+    assert!(
+        warnings.is_empty(),
+        "key beside the database; got {warnings}"
+    );
+
+    std::fs::remove_file(elsewhere.path().join("secrets.json")).unwrap();
+    std::fs::write(data.path().join("secrets.json"), OPENROUTER_KEY_FILE).unwrap();
+    let warnings = validate_warnings(&config);
+    let warning = warnings
+        .at_target("alms_core::config")
+        .find(|e| e.has_field("secrets_path"))
+        .unwrap_or_else(|| panic!("key only in data_dir must still warn; got {warnings}"));
+    assert_eq!(
+        warning.field("secrets_path"),
+        Some(
+            elsewhere
+                .path()
+                .join("secrets.json")
+                .display()
+                .to_string()
+                .as_str()
+        )
+    );
+}
+
+/// A file that exists but cannot be read says nothing about the key, so it
+/// does not warn: encrypted with `ALMS_MASTER_KEY` unset, unparseable, or
+/// not a readable file at all.
+#[test]
+fn key_warning_is_absent_when_the_secrets_file_cannot_be_read() {
+    let _env = key_check_env(None);
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("secrets.json");
+    let config = key_check_config(dir.path());
+
+    // Not plaintext JSON, so it is taken as encrypted, and there is no
+    // master key to decrypt it with.
+    let mut encrypted = vec![0x01_u8];
+    encrypted.extend(std::iter::repeat_n(0xAB_u8, 80));
+    std::fs::write(&file, encrypted).unwrap();
+    let warnings = validate_warnings(&config);
+    assert!(
+        warnings.is_empty(),
+        "encrypted, no master key; got {warnings}"
+    );
+
+    std::fs::write(&file, "{not json").unwrap();
+    let warnings = validate_warnings(&config);
+    assert!(warnings.is_empty(), "unparseable; got {warnings}");
+
+    std::fs::remove_file(&file).unwrap();
+    std::fs::create_dir(&file).unwrap();
+    let warnings = validate_warnings(&config);
+    assert!(warnings.is_empty(), "unreadable; got {warnings}");
+}
+
+/// The existing exemptions stand: mock mode, and a provider entry with its
+/// own key source, never look for a stored key.
+#[test]
+fn key_warning_is_absent_under_mock_or_with_a_provider_key_source() {
+    let _env = key_check_env(None);
+    let dir = tempfile::tempdir().unwrap();
+
+    let mut mock = key_check_config(dir.path());
+    mock.llm.mock = true;
+    let warnings = validate_warnings(&mock);
+    assert!(warnings.is_empty(), "mock; got {warnings}");
+
+    let mut keyed = key_check_config(dir.path());
+    keyed
+        .llm
+        .providers
+        .get_mut("openrouter")
+        .expect("builtin provider")
+        .api_key_env = Some("SOME_KEY_VAR".into());
+    let warnings = validate_warnings(&keyed);
+    assert!(warnings.is_empty(), "api_key_env; got {warnings}");
+}

@@ -147,6 +147,13 @@ Each item below changes behaviour for a deployment that has not set the knob exp
 - `alms dashboard` checks that the gateway answers `/health` before opening a browser.
   When nothing is listening it now reports the reason and points at `alms gateway`, and
   **exits non-zero**, instead of opening a browser onto a connection-refused page.
+- Commands no longer start with a false `No LLM API key configured` warning. Config
+  validation looked for the key in the config itself, where keys never are (they live in
+  `secrets.json`), so it fired on nearly every command, including `alms auth list` right
+  after `alms auth set`. It now reads the secrets file the gateway uses, beside the
+  database, and warns only when that file holds no key for the configured provider. The
+  warning names the provider and the file. A file it cannot read (encrypted with
+  `ALMS_MASTER_KEY` unset, or not valid) does not count as a missing key.
 - `alms auth set` / `alms auth remove` apply to a gateway that is already running. Both
   probe `/health` at `--url` (default `http://127.0.0.1:8080`, `ALMS_GATEWAY_URL`) and,
   when a gateway answers, send the change to `PUT`/`DELETE /auth/keys` instead of writing

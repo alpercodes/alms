@@ -30,6 +30,7 @@ pub use types::{
     ToolOutputTruncateConfig, ToolsConfig,
 };
 
+use crate::secrets::{SecretsStore, StoredKey};
 use crate::{AlmsError, AlmsResult};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -431,9 +432,24 @@ impl AlmsConfig {
             .get(&self.llm.provider)
             .is_some_and(|e| e.api_key_env.is_some() || e.api_key.is_some());
         if !self.llm.mock && self.llm.api_key.is_none() && !entry_has_key_source {
-            warn!(
-                "No LLM API key configured. Run `alms auth set <provider> <key>` to store a key, or enable mock mode with ALMS_LLM_MOCK=1"
-            );
+            // #179: keys live in the secrets file, which config loading does
+            // not read, so this used to warn on every correctly configured
+            // instance. Look in the file the gateway and `alms auth` use
+            // (`secrets_path`, #170), quietly, and warn only when it
+            // provably holds no key for the provider. A file that cannot be
+            // read (encrypted without `ALMS_MASTER_KEY`, unparseable) is not
+            // a missing key.
+            let secrets_path = self.server.secrets_path();
+            if SecretsStore::peek_key(&secrets_path, &self.llm.provider) == StoredKey::Absent {
+                warn!(
+                    provider = %self.llm.provider,
+                    secrets_path = %secrets_path.display(),
+                    "No LLM API key configured for provider '{}'. Run `alms auth set {} <key>` \
+                     to store one, or enable mock mode with ALMS_LLM_MOCK=1",
+                    self.llm.provider,
+                    self.llm.provider
+                );
+            }
         }
 
         // Provider must either match a built-in sugar name or be declared

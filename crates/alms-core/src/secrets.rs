@@ -235,6 +235,57 @@ fn is_plaintext_json(data: &[u8]) -> bool {
     }
 }
 
+/// Decode the raw bytes of a secrets file into its keys, and whether the file
+/// was plaintext JSON. Pure: no I/O and no logging. [`SecretsStore::load`]
+/// and [`SecretsStore::peek_key`] both decode through here, and only `load`
+/// reports on what it found.
+fn decode_keys(
+    raw: &[u8],
+    master_key: Option<&[u8]>,
+) -> AlmsResult<(HashMap<String, String>, bool)> {
+    if raw.is_empty() {
+        return Ok((HashMap::new(), false));
+    }
+    if is_plaintext_json(raw) {
+        let content = std::str::from_utf8(raw).map_err(|e| {
+            crate::AlmsError::Runtime(format!("Secrets file is not valid UTF-8: {e}"))
+        })?;
+        let file: SecretsFile = serde_json::from_str(content)
+            .map_err(|e| crate::AlmsError::Runtime(format!("Failed to parse secrets file: {e}")))?;
+        return Ok((file.api_keys, true));
+    }
+    let Some(master_key) = master_key else {
+        return Err(crate::AlmsError::Runtime(format!(
+            "Secrets file is encrypted but {} is not set. \
+             Set the environment variable to decrypt",
+            MASTER_KEY_ENV
+        )));
+    };
+    let plaintext = decrypt_data(raw, master_key)?;
+    let content = String::from_utf8(plaintext).map_err(|e| {
+        crate::AlmsError::Runtime(format!("Decrypted secrets file is not valid UTF-8: {e}"))
+    })?;
+    let file: SecretsFile = serde_json::from_str(&content).map_err(|e| {
+        crate::AlmsError::Runtime(format!("Failed to parse decrypted secrets: {e}"))
+    })?;
+    Ok((file.api_keys, false))
+}
+
+/// What a secrets file says about one provider's key, as read by
+/// [`SecretsStore::peek_key`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StoredKey {
+    /// The file holds a non-empty key for the provider.
+    Present,
+    /// The file was read and holds no key for the provider, or there is no
+    /// file at all.
+    Absent,
+    /// The file exists but could not be read: an I/O error, contents that do
+    /// not parse, or an encrypted file with `ALMS_MASTER_KEY` unset or
+    /// wrong. That says nothing about whether a key is stored.
+    Unknown,
+}
+
 /// Read the master key from the environment variable, if set.
 fn read_master_key() -> Option<Vec<u8>> {
     std::env::var(MASTER_KEY_ENV)
@@ -288,18 +339,11 @@ impl SecretsStore {
                 crate::AlmsError::Runtime(format!("Failed to read secrets file: {e}"))
             })?;
 
-            if raw.is_empty() {
-                HashMap::new()
-            } else if is_plaintext_json(&raw) {
+            // Plaintext JSON, or an encrypted file decrypted with the master
+            // key; an encrypted file with no master key is an error.
+            let (keys, plaintext) = decode_keys(&raw, master_key.as_deref())?;
+            if plaintext {
                 was_plaintext = true;
-                // Plain text JSON — parse it
-                let content = String::from_utf8(raw).map_err(|e| {
-                    crate::AlmsError::Runtime(format!("Secrets file is not valid UTF-8: {e}"))
-                })?;
-                let file: SecretsFile = serde_json::from_str(&content).map_err(|e| {
-                    crate::AlmsError::Runtime(format!("Failed to parse secrets file: {e}"))
-                })?;
-
                 if master_key.is_some() {
                     tracing::info!("Found unencrypted secrets file — will encrypt on next save");
                 } else {
@@ -308,28 +352,8 @@ impl SecretsStore {
                         MASTER_KEY_ENV
                     );
                 }
-
-                file.api_keys
-            } else if let Some(ref mk) = master_key {
-                // Encrypted file — decrypt
-                let plaintext = decrypt_data(&raw, mk)?;
-                let content = String::from_utf8(plaintext).map_err(|e| {
-                    crate::AlmsError::Runtime(format!(
-                        "Decrypted secrets file is not valid UTF-8: {e}"
-                    ))
-                })?;
-                let file: SecretsFile = serde_json::from_str(&content).map_err(|e| {
-                    crate::AlmsError::Runtime(format!("Failed to parse decrypted secrets: {e}"))
-                })?;
-                file.api_keys
-            } else {
-                // Encrypted file but no master key
-                return Err(crate::AlmsError::Runtime(format!(
-                    "Secrets file is encrypted but {} is not set. \
-                     Set the environment variable to decrypt",
-                    MASTER_KEY_ENV
-                )));
             }
+            keys
         } else {
             if master_key.is_none() {
                 tracing::warn!(
@@ -355,6 +379,36 @@ impl SecretsStore {
         }
 
         Ok(store)
+    }
+
+    /// Whether the secrets file at `path` holds a key for `provider`, read
+    /// quietly: no logging, no file created, nothing migrated.
+    ///
+    /// For callers that only need to know whether a key exists (#179:
+    /// config validation, which runs at the top of every CLI command).
+    /// [`Self::load`] is for the process that owns the store. It logs about
+    /// encryption and missing files, and with `ALMS_MASTER_KEY` set it
+    /// rewrites a plaintext file encrypted. None of that belongs in a
+    /// lookup. The key is found the way [`Self::get_key`] finds it, in the
+    /// file only, with no environment fallback. An empty key does not count.
+    /// `ALMS_MASTER_KEY` is read so an encrypted file can still be checked.
+    pub fn peek_key(path: &Path, provider: &str) -> StoredKey {
+        Self::peek_key_with(path, provider, read_master_key().as_deref())
+    }
+
+    fn peek_key_with(path: &Path, provider: &str, master_key: Option<&[u8]>) -> StoredKey {
+        let raw = match std::fs::read(path) {
+            Ok(raw) => raw,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return StoredKey::Absent,
+            Err(_) => return StoredKey::Unknown,
+        };
+        match decode_keys(&raw, master_key) {
+            Ok((keys, _)) if keys.get(provider).is_some_and(|key| !key.is_empty()) => {
+                StoredKey::Present
+            }
+            Ok(_) => StoredKey::Absent,
+            Err(_) => StoredKey::Unknown,
+        }
     }
 
     /// Get an API key for a provider. Returns None if not set.
@@ -1009,5 +1063,112 @@ mod tests {
         assert!(configured, "openrouter should be directly configured");
         assert_eq!(masked, Some("sk-o...5678".into()));
         assert_eq!(source, "secrets");
+    }
+
+    // -- #179: peek_key ------------------------------------------------------
+
+    const PEEK_MASTER_KEY: &[u8] = b"peek-test-master-key-long-enough";
+
+    /// Every outcome, on the file shapes that produce it. `Unknown` is kept
+    /// apart from `Absent`: only a file that was read and decoded can say a
+    /// key is missing.
+    #[test]
+    fn peek_key_reports_present_absent_and_unknown() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("secrets.json");
+        let peek = |mk: Option<&[u8]>| SecretsStore::peek_key_with(&file, "openrouter", mk);
+
+        assert_eq!(peek(None), StoredKey::Absent, "no file");
+
+        std::fs::write(&file, "").unwrap();
+        assert_eq!(peek(None), StoredKey::Absent, "empty file");
+
+        std::fs::write(
+            &file,
+            r#"{"api_keys":{"openrouter":"sk-or-test-key-1234"}}"#,
+        )
+        .unwrap();
+        assert_eq!(peek(None), StoredKey::Present, "plaintext, provider's key");
+
+        std::fs::write(
+            &file,
+            r#"{"api_keys":{"anthropic":"sk-ant-test-key-1234"}}"#,
+        )
+        .unwrap();
+        assert_eq!(peek(None), StoredKey::Absent, "plaintext, another provider");
+
+        std::fs::write(&file, r#"{"api_keys":{"openrouter":""}}"#).unwrap();
+        assert_eq!(peek(None), StoredKey::Absent, "an empty key is no key");
+
+        std::fs::write(&file, "{not json").unwrap();
+        assert_eq!(peek(None), StoredKey::Unknown, "unparseable");
+
+        let json = r#"{"api_keys":{"openrouter":"sk-or-test-key-1234"}}"#;
+        std::fs::write(
+            &file,
+            encrypt_data(json.as_bytes(), PEEK_MASTER_KEY).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(peek(None), StoredKey::Unknown, "encrypted, no master key");
+        assert_eq!(
+            peek(Some(b"a-different-master-key-entirely")),
+            StoredKey::Unknown,
+            "encrypted, wrong master key"
+        );
+        assert_eq!(
+            peek(Some(PEEK_MASTER_KEY)),
+            StoredKey::Present,
+            "encrypted, master key"
+        );
+
+        let not_a_file = dir.path().join("a-directory");
+        std::fs::create_dir(&not_a_file).unwrap();
+        assert_eq!(
+            SecretsStore::peek_key_with(&not_a_file, "openrouter", None),
+            StoredKey::Unknown,
+            "unreadable"
+        );
+    }
+
+    /// The point of `peek_key` over `load`: it logs nothing, creates
+    /// nothing, and does not migrate a plaintext file when a master key is
+    /// present. `load` does all three.
+    #[test]
+    fn peek_key_is_quiet_and_changes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("secrets.json");
+        let missing = dir.path().join("missing").join("secrets.json");
+        let plaintext = r#"{"api_keys":{"openrouter":"sk-or-test-key-1234"}}"#;
+        std::fs::write(&file, plaintext).unwrap();
+
+        let captured = alms_test_support::capture_events(tracing::Level::TRACE, || {
+            assert_eq!(
+                SecretsStore::peek_key_with(&file, "openrouter", Some(PEEK_MASTER_KEY)),
+                StoredKey::Present
+            );
+            assert_eq!(
+                SecretsStore::peek_key_with(&missing, "openrouter", None),
+                StoredKey::Absent
+            );
+        });
+
+        assert!(
+            captured.at_target("alms_core::secrets").next().is_none(),
+            "peek_key must not log; got {captured}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            plaintext,
+            "a plaintext file is not migrated"
+        );
+        assert!(!missing.exists(), "nothing is created");
+
+        // Control: `load` on the same file with the same key does log and
+        // does migrate, so the assertions above are not vacuous.
+        let captured = alms_test_support::capture_events(tracing::Level::TRACE, || {
+            SecretsStore::load_with_key(&file, Some(PEEK_MASTER_KEY.to_vec())).unwrap();
+        });
+        assert!(captured.at_target("alms_core::secrets").next().is_some());
+        assert_ne!(std::fs::read(&file).unwrap(), plaintext.as_bytes());
     }
 }
