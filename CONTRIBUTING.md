@@ -90,6 +90,14 @@ The CI pipeline (`.github/workflows/ci.yml`) runs:
 
 `make ci` runs all of these steps locally for parity.
 
+Two more required checks, `Security audit (Rust)` and `Security audit (frontend)`, check
+`Cargo.lock` and `package-lock.json` against advisory databases. `make ci` does not run
+them; locally, use `cargo audit` (install it with `cargo install --locked cargo-audit`) and
+`npm run ui:audit`. Either can turn a PR red without the PR changing anything, when an
+advisory is published against a dependency already in the tree. What makes the Rust audit
+fail is set in `.cargo/audit.toml`, and every ignore entry there must carry a date, a
+rationale and an exit condition.
+
 ## Licensing
 
 ALMS is Apache-2.0. The repository-level `LICENSE` is the authority, and the `license`
