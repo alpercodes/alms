@@ -1384,6 +1384,12 @@ open (absent otherwise):
 }
 ```
 
+The episode opens when a firing is admitted, which is before its first turn
+starts if the agent is busy with another run (#181). Its clock starts with that
+turn. Until then `started_at` is the admission time, `deadline_remaining_secs`
+reports the full deadline, and no deadline runs. The deadline and the catch-up
+check count from when the turn starts.
+
 Every job object carries `lifecycle_revision`, `retry_count`, and optional
 `last_error`. Status is one of `pending`, `active`, `completed`, `failed`, or
 `cancelled`. Terminal reasons are `completed`, `deadline_reached`,
@@ -1394,7 +1400,7 @@ the retry fields.
 ### 7.2 Cancel a job
 `DELETE /jobs/{job_id}`
 
-Cancels a scheduled job, removes it from the scheduler, and cancels any in-progress runs that were spawned by the job — including episode continuation runs. An open episode is torn down: pending DM conversations are ended with the `user_cancelled` reason (the peer gets the standard ended-notification) and pending background subagents are cancelled (#1198).
+Cancels a scheduled job, removes it from the scheduler, and cancels any in-progress runs that were spawned by the job — including episode continuation runs, and a firing still queued behind the agent's current run (#181). A queued run's cancellation lands when the agent's queue reaches it: it is reported `queued` until then and ends `cancelled` without starting. An open episode is torn down: pending DM conversations are ended with the `user_cancelled` reason (the peer gets the standard ended-notification) and pending background subagents are cancelled (#1198).
 
 **Response 200** — the final persisted cancelled job entity. The response
 includes the authoritative `lifecycle_revision`, `status: "cancelled"`, and
