@@ -83,6 +83,15 @@ Each item below changes behaviour for a deployment that has not set the knob exp
 ### Persistence and durability
 
 - Transactional, versioned SQLite migrations.
+- A fresh install no longer registers an agent nobody created when it is restarted. The
+  gateway writes `.alms/agent_id` on its first boot, and on the next boot the migration for
+  deployments from before the agent registry found that file and, with no agents
+  registered, created `main` as the default ("Auto-migrated default agent"). That also
+  skipped first-run onboarding, which shows only while no agent exists. The migration now
+  runs only when the sidecar's agent ID owns sessions, which a pre-registry deployment has
+  and a fresh install does not; such a deployment still gets `main`. The sidecar file is
+  neither removed nor rewritten, and it is still the gateway's default agent ID at boot. An
+  install that already got an auto-created `main` keeps it.
 - Silent row loss in the persistence layer is now counted and surfaced, and foreign-key
   fallbacks are no longer silent.
 - Durable job recovery and atomic, bounded per-agent run admission.
