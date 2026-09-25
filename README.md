@@ -88,8 +88,9 @@ later session.
   context budget.
 
 New agents inherit the server's default posture, `guarded`, so the first risky tool call
-raises an approval card in the chat and waits for you. `full_control` and `autonomous`
-skip that gate;
+in a run you start raises an approval card in the chat and waits for you. `full_control`
+and `autonomous` skip that gate, and so do a `guarded` agent's runs that no human started
+(see *Before you run this*);
 [`docs/security-model.md` § 2](docs/security-model.md#2-approval-model-human-in-the-loop)
 covers what each one checks.
 
@@ -123,6 +124,12 @@ decisions, and you should know them before deploying:
   run against the real root. Shell permissions and the destructive-command classifier still
   apply. Note that a listed name is matched — case-folded — against the name an
   `invoke_agent` call supplies, so any agent can claim it, registered or not.
+- **Approval covers the runs you start, not what agents do to each other.** A `guarded`
+  agent's runs that no human started — a DM from another agent, a notification, a
+  scheduled job — run tools without approval, and any agent can DM any other by name. So
+  one agent that reads untrusted input can drive every agent in the same gateway: keep
+  such agents in a separate gateway from those holding what you would not hand that input.
+  See [`docs/security-model.md` § 8.1](docs/security-model.md#guarded-is-not-an-agent-boundary).
 - **Prompt injection is not solved.** Tool output enters the model's context; a hostile
   repository or web page can attempt to steer an agent.
 

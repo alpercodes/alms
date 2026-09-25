@@ -79,6 +79,13 @@ Each item below changes behaviour for a deployment that has not set the knob exp
   longer teach agents to poll.
 - Subagent sessions are filed under the agent that ran them, with session-keyed cancel
   controls and a status-only subagent status bar.
+- Docs correction, no behaviour change: `guarded` posture governs the runs a human starts,
+  and is not a boundary between agents. A `guarded` agent's DM, notification and job runs,
+  and its runs as a background subagent, are promoted to `autonomous`, and any agent can
+  DM any other by name — so another agent can have a `guarded` one run tools without
+  approval. The security model used to call this override safe. It now says what it does
+  not protect and what an operator can do about it today
+  (`docs/security-model.md` § 8.1). Whether the override should change is open in #177.
 
 ### Persistence and durability
 

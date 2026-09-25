@@ -100,7 +100,10 @@ agent loop. `full_control` executes tools without approval. `autonomous` also ex
 without approval, and is what a `guarded` agent's system-triggered runs (peer DMs,
 notifications, subagent completions, scheduled jobs) are promoted to, because nobody is
 present to approve. `resolve_posture_for_run` overrides `Guarded` only, so a
-`full_control` agent keeps its own posture on those runs — see § 8. "Safe" above
+`full_control` agent keeps its own posture on those runs — see § 8. `guarded` therefore
+governs the runs a human starts and is not a boundary between agents: an agent that can
+send a `guarded` agent a DM can have it run tools without approval
+([§ 8.1](#guarded-is-not-an-agent-boundary)). "Safe" above
 corresponds to `guarded` and "Developer" to `full_control`;
 "Locked-down" has no posture of its own — the nearest lever is the `[tools].enabled`
 allowlist, which keeps a tool out of the registry altogether.
@@ -1037,8 +1040,30 @@ Default posture recommendations:
 - No `sudo` — **implemented** as a classifier floor: `sudo`, `su`, `doas`, `pkexec`, `runuser` and `gosu` are classified `Destructive` (`PRIV_BINS` in `crates/alms-sandbox/src/shell/classification.rs`) and blocked in every `shell_classification_mode` except `off`. Heuristic, so bypassable like the rest of the classifier (§ 4.3); OS-level restrictions remain the real boundary
 - Network allowlist empty by default — not yet implemented
 - Auto-approved tools skip approval in Guarded posture — **implemented**: `datetime`, `echo`, `list_agents`, `list_my_sessions`, `read_session`, `read_messages`, `read_subagent_session` return `is_auto_approved() = true`; all other tools still require user approval
-- Cronjob creation requires approval — implemented via Guarded posture
-  - **Exception:** When a run is system-triggered — peer-to-peer DMs (via `send_message`), notification runs (e.g., `ConversationEnded`), subagent completions, and scheduled jobs — Guarded posture is automatically overridden to Autonomous via the `is_system_triggered` flag, because there is no human in the loop to approve tool calls (the run would hang indefinitely otherwise). This means a system-triggered run on a Guarded agent can execute tools — including cronjob creation — without approval. The override is safe because `is_system_triggered` is set internally by the gateway's `enqueue_triggered_run` helper and `fire_job_run` function (not controllable via the HTTP `create_run` API), but operators should be aware of this trade-off when configuring agent postures.
+- Cronjob creation requires approval — implemented via Guarded posture, in runs a human starts: an agent creates a job with a `shell` call, which a Guarded user run sends to the approval gate
+  - **Exception:** a `guarded` agent's system-triggered runs — peer-to-peer DMs (via `send_message`), notification runs (e.g., `ConversationEnded`, subagent completions), and scheduled jobs — are promoted to Autonomous, and so is a `guarded` agent run as a background subagent. Those runs execute tools, cronjob creation included, without approval. See [Guarded is not a boundary between agents](#guarded-is-not-an-agent-boundary).
+
+<a id="guarded-is-not-an-agent-boundary"></a>
+### 8.1 Guarded is not a boundary between agents
+
+`guarded` governs the runs a human starts. It is not a boundary between agents.
+
+**Why the promotion exists.** A system-triggered run has nobody to approve its tool calls. The gateway sets `is_system_triggered` on those runs — `enqueue_triggered_run` for DMs, notifications and job-episode continuations, `fire_job_run` for scheduled jobs — and `resolve_posture_for_run` promotes `Guarded` to `Autonomous` for them. The coordinator's `resolve_subagent_posture` does the same for background subagents. Unpromoted, a headless `guarded` run would block on its first gated tool call until the `max_run_duration_secs` backstop (24 hours by default). A foreground subagent keeps `guarded`; nothing routes its approval requests to a human, so they are denied.
+
+**What it does not protect.** An HTTP client cannot set `is_system_triggered` (`create_run` never does), but a peer agent causes it with an ordinary DM, and the DM's text becomes the run's input. `send_message` resolves any registered agent by name — the only sender check is that an agent cannot message itself — and `list_agents` is auto-approved, so every name is discoverable. Any agent that can run `send_message` can therefore have any `guarded` agent run tools without approval:
+
+- A `full_control` or `autonomous` sender, or an agent already in a promoted run, needs no approval to send. A `guarded` agent in a run a human started needs one, and approving that `send_message` lets every DM turn of the conversation, on both sides, run unapproved.
+- A promoted run can `send_message` onward, `invoke_agent` a registered agent in the background, or create a job through `shell` — the call a Guarded user run sends to approval — all without approval. A job's runs are promoted in turn, so a DM can leave behind work that keeps running unapproved.
+- Anything a sender has ingested — an `http_get` of an arbitrary URL, a file or repository it did not write — can reach a `guarded` agent's tools this way (§ 3.3).
+- On macOS and Windows, and on Linux below 5.13, a promoted run's `shell` has no filesystem boundary ([§ 4.4](#filesystem-sandboxing)): it has the daemon OS user's reach.
+
+**What an operator can do today.** Within one gateway, treat every agent as able to run every other agent's tools without approval.
+
+- Keep an agent that reads untrusted input out of a gateway whose agents hold tools or data you would not hand to that input. A separate gateway, with its own data directory and therefore its own agent registry, is the only boundary `send_message` and `invoke_agent` do not cross.
+- `[tools].enabled` can withhold `send_message`, `invoke_agent` or `http_get`, but only from every agent at once; there is no per-agent tool list. Scheduled jobs and notification runs are promoted either way.
+- Where `shell` has no filesystem boundary, run the daemon as an OS user whose access you would give an unapproved run.
+
+Whether a headless `guarded` run should instead fail closed (run auto-approved tools, deny the rest), whether promotion should be a per-agent opt-in, or whether DMs to a `guarded` agent should be restricted is open in [#177](https://github.com/alpercodes/alms/issues/177). [#38](https://github.com/alpercodes/alms/issues/38) asks the same question of `autonomous`: "auto-approve or skip?"
 
 ---
 
