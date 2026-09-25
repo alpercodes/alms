@@ -36,12 +36,19 @@ has workspace files.
 
 When a named agent has no `personality.md` file (detected by
 `AgentWorkspace::needs_bootstrap()`), the gateway replaces the initial system prompt
-with the bootstrap prompt. This happens in two places:
+with the bootstrap prompt on runs a human started. This happens in two places:
 
-1. HTTP runs: `crates/alms-gateway/src/runs.rs` -- `start_run()` checks
-   `workspace.needs_bootstrap()` before creating the runtime.
+1. HTTP runs: `crates/alms-gateway/src/runs/lifecycle.rs` -- `execute_run()` checks
+   `workspace.needs_bootstrap()` before creating the runtime, and only for runs
+   with `is_system_triggered == false` (a `POST /runs`). Peer DM turns, notification
+   runs, scheduled jobs and job-episode continuations keep the agent's normal
+   prompt: the bootstrap prompt asks the agent to interview "the user", and those
+   runs have none (#174).
 2. Telegram runs: `crates/alms-gateway/src/gateway.rs` -- the Telegram polling
-   loop checks the same condition.
+   loop checks the same condition. Every run there answers a Telegram message.
+
+The condition is "no `personality.md`", not "first run": an agent whose interview
+never writes the file gets the bootstrap prompt on every human-started run.
 
 **Code path**: `AgentWorkspace::bootstrap_prompt()` -> `include_str!("../prompts/bootstrap.md")`
 

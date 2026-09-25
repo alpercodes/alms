@@ -79,6 +79,13 @@ Each item below changes behaviour for a deployment that has not set the knob exp
   longer teach agents to poll.
 - Subagent sessions are filed under the agent that ran them, with session-keyed cancel
   controls and a status-only subagent status bar.
+- An agent with no `personality.md` is no longer handed the first-time setup interview
+  ("Ask the user …") on turns no human started. Peer DM turns, notification runs
+  (subagent completions, DM ends) and scheduled job runs now get the agent's normal system
+  prompt. On a DM turn the interview arrived in the same prompt as the addendum saying the
+  counterparty is not a human, and because the condition is "no `personality.md`" rather
+  than "first run", an agent that never finished its interview got it on every such turn.
+  Web chat and Telegram still start the interview.
 
 ### Persistence and durability
 

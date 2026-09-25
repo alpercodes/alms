@@ -336,6 +336,8 @@ On first interaction with an agent that has **empty/missing workspace files**, t
 
 **Bootstrap is one-time** — once `personality.md` exists, it doesn't trigger again. The user can delete workspace files to re-trigger it.
 
+Only runs a human started get the bootstrap prompt (web chat, Telegram). Peer DM turns, notification runs and scheduled jobs keep the agent's normal prompt even while `personality.md` is missing, because there is no user in them to interview (#174).
+
 ---
 
 ## 4) Episodic Memory (Cross-Session Awareness)
