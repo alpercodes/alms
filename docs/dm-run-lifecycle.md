@@ -71,7 +71,7 @@ A's loop keeps running — the tool result (small JSON) goes into A's message hi
 - Emits `run_started` SSE.
 - `mark_run_as_running`.
 - Resolves Bob's config and applies overrides.
-- `resolve_posture_for_run` forces posture to `Autonomous` because `is_system_triggered=true` (Guarded would hang — no human to approve).
+- `resolve_posture_for_run` forces posture to `Autonomous` because `is_system_triggered=true` (Guarded would hang — no human to approve). Bob's tools therefore run without approval even when Bob is configured Guarded; see [`security-model.md` § 8.1](security-model.md#guarded-is-not-an-agent-boundary).
 - Dispatches to `runtime.run_on_session(&session_manager, dm_session_id, dm:alice:bob, &input)` (`lifecycle.rs:930-937`) — uses the already-written DM message as the last user turn instead of double-writing.
 - Bob's agent loop runs. Because `context_id` starts with `dm:`, `is_dm=true` in the loop: Bob's assistant text and tool calls are persisted as `Role::User` with `message_type: reasoning` metadata to preserve the DM invariant (see `loop_impl.rs:509-579`, `dm.rs:159-181`).
 - If Bob's final assistant output calls `send_message` back to Alice, the DM-sender-terminate guard (`dm.rs:53-63`) fires: `should_terminate_after_dm_send` returns `true`, and Bob's loop exits after the batch completes — preventing a second round-trip inside the same run.
