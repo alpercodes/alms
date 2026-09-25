@@ -11,11 +11,19 @@
 //! Each test drives a real `execute_run` against a scripted LLM for an agent
 //! whose workspace is empty, and reads the system prompt off the request the
 //! provider received. That is the prompt the agent was actually given,
-//! whatever happens between the override and the wire. The `RunParams` flags
-//! are the ones the production callers set: `create_run` (a human, over
-//! HTTP) sends `is_system_triggered: false`; `enqueue_triggered_run` (peer
-//! DMs, notification runs, episode continuations) and `fire_job_run` send
-//! `true`.
+//! whatever happens between the override and the wire.
+//!
+//! The guard reads `is_system_triggered`, so the value each caller passes is
+//! part of the fix. Two tests start the run from the production caller
+//! instead of building `RunParams`, which pins that value:
+//! [`peer_dm_turn_gets_the_normal_prompt_not_bootstrap`] goes through
+//! `run_trigger_loop` -> `enqueue_triggered_run` (peer DMs, notification
+//! runs, episode continuations), and
+//! [`scheduled_job_run_gets_the_normal_prompt_not_bootstrap`] through
+//! `fire_job_run`. Both callers pass `true`, which also drives the Guarded ->
+//! Autonomous posture override. The other tests build `RunParams` by hand, to
+//! test the guard itself: with `false` for a human, as `create_run` (HTTP
+//! `POST /runs`) sends it, and with `true` across session types.
 
 use super::seed_alice_bob;
 use crate::server::AppState;
@@ -55,8 +63,10 @@ struct Harness {
     alice: AgentId,
     bob: AgentId,
     shutdown: CancellationToken,
-    // Held so the DM completion gate's reply to alice has somewhere to go.
-    _triggers: mpsc::Receiver<RunTrigger>,
+    // The MessageBus's run triggers. Held so the DM completion gate's reply
+    // to alice has somewhere to go; the peer-DM test takes it and feeds it
+    // to `run_trigger_loop`.
+    triggers: Option<mpsc::Receiver<RunTrigger>>,
     // An empty directory: every agent under it `needs_bootstrap()`.
     _workspace: tempfile::TempDir,
 }
@@ -86,8 +96,24 @@ impl Harness {
             alice,
             bob,
             shutdown,
-            _triggers: triggers,
+            triggers: Some(triggers),
             _workspace: workspace,
+        }
+    }
+
+    /// The first request the scripted LLM receives. Triggered runs go through
+    /// the agent queue, so the test cannot await the run itself.
+    async fn first_request(&self) -> String {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if let Some(body) = self.llm.request_bodies().await.into_iter().next() {
+                return body;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "no run reached the LLM within 10s"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
     }
 
@@ -126,26 +152,32 @@ impl Harness {
         .await;
 
         let bodies = self.llm.request_bodies().await;
-        let body: serde_json::Value = serde_json::from_str(
+        system_prompt_of(
             bodies
                 .last()
                 .unwrap_or_else(|| panic!("[{context_id}] the run never reached the LLM")),
+            context_id,
         )
-        .unwrap();
-        let system = body["messages"]
-            .as_array()
-            .and_then(|messages| messages.iter().find(|m| m["role"] == "system"))
-            .unwrap_or_else(|| panic!("[{context_id}] no system message in {body}"));
-        match &system["content"] {
-            serde_json::Value::String(text) => text.clone(),
-            // Content-part arrays (cache-control shapes): join the text parts.
-            serde_json::Value::Array(parts) => parts
-                .iter()
-                .filter_map(|p| p["text"].as_str())
-                .collect::<Vec<_>>()
-                .join(""),
-            other => panic!("[{context_id}] unexpected system content {other}"),
-        }
+    }
+}
+
+/// The system prompt in one request the provider received. `label` names
+/// the case in panic messages.
+fn system_prompt_of(body: &str, label: &str) -> String {
+    let body: serde_json::Value = serde_json::from_str(body).unwrap();
+    let system = body["messages"]
+        .as_array()
+        .and_then(|messages| messages.iter().find(|m| m["role"] == "system"))
+        .unwrap_or_else(|| panic!("[{label}] no system message in {body}"));
+    match &system["content"] {
+        serde_json::Value::String(text) => text.clone(),
+        // Content-part arrays (cache-control shapes): join the text parts.
+        serde_json::Value::Array(parts) => parts
+            .iter()
+            .filter_map(|p| p["text"].as_str())
+            .collect::<Vec<_>>()
+            .join(""),
+        other => panic!("[{label}] unexpected system content {other}"),
     }
 }
 
@@ -177,26 +209,28 @@ async fn user_started_web_chat_run_still_gets_the_bootstrap_prompt() {
 /// The reported case: alice DMs bob, and bob's peer-triggered turn gets his
 /// normal prompt with the DM addendum, not an instruction to interview a
 /// user in a session the addendum says has none.
+///
+/// End to end: alice's message goes through the MessageBus, and bob's turn
+/// is started by `run_trigger_loop` -> `enqueue_triggered_run`, so this pins
+/// the `is_system_triggered` value that caller passes, not only the guard.
 #[tokio::test]
 async fn peer_dm_turn_gets_the_normal_prompt_not_bootstrap() {
-    let h = Harness::new().await;
-    // Opens the DM the way production does: shared session, depth entry,
-    // and alice's message persisted into it.
+    let mut h = Harness::new().await;
+    let triggers = h.triggers.take().unwrap();
+    let trigger_loop = tokio::spawn(crate::runs::notifications::run_trigger_loop(
+        triggers,
+        h.state.clone(),
+    ));
     h.state
         .message_bus
         .send("alice", h.alice, "bob", h.bob, "ping", None)
         .await
         .unwrap();
-    let dm_context = alms_core::dm_context_id("alice", "bob");
 
-    let prompt = h
-        .bob_system_prompt(
-            SessionId::deterministic_dm("alice", "bob"),
-            &dm_context,
-            true,
-            true,
-        )
-        .await;
+    // bob's turn is the only run until it replies, so the first request is
+    // his. The addendum assertion below confirms it.
+    let prompt = system_prompt_of(&h.first_request().await, "dm:alice:bob");
+    trigger_loop.abort();
 
     assert!(
         !prompt.contains(bootstrap()),
@@ -211,6 +245,34 @@ async fn peer_dm_turn_gets_the_normal_prompt_not_bootstrap() {
             r#"This is a direct message from agent "alice". It is NOT from a human user"#
         ),
         "the DM addendum still arrives; got:\n{prompt}"
+    );
+    h.shutdown.cancel();
+}
+
+/// A scheduled job, started by the real `fire_job_run`, so this pins the
+/// `is_system_triggered` value that caller passes. The `job_` row below
+/// covers the same session type with hand-built `RunParams`.
+#[tokio::test]
+async fn scheduled_job_run_gets_the_normal_prompt_not_bootstrap() {
+    let h = Harness::new().await;
+    let job_id = super::create_recurring_job(&h.state, h.bob, "daily digest");
+
+    crate::runs::notifications::fire_job_run(h.state.clone(), job_id)
+        .await
+        .expect("fire_job_run must succeed");
+
+    let bodies = h.llm.request_bodies().await;
+    let prompt = system_prompt_of(
+        bodies.first().expect("the job run never reached the LLM"),
+        "job",
+    );
+    assert!(
+        !prompt.contains(bootstrap()),
+        "a scheduled job run must not get the bootstrap prompt; got:\n{prompt}"
+    );
+    assert!(
+        prompt.starts_with(NORMAL_PROMPT),
+        "bob's own prompt must lead; got:\n{prompt}"
     );
     h.shutdown.cancel();
 }

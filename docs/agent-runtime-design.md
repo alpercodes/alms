@@ -334,7 +334,7 @@ On first interaction with an agent that has **empty/missing workspace files**, t
 4. The agent writes the workspace files using the `workspace_write` tool
 5. Subsequent sessions use the workspace files normally
 
-**Bootstrap is one-time** — once `personality.md` exists, it doesn't trigger again. The user can delete workspace files to re-trigger it.
+**Bootstrap lasts until `personality.md` exists**, not for one run: an interview that never writes the file repeats on every human-started run. Creating the file ends it; deleting workspace files re-triggers it.
 
 Only runs a human started get the bootstrap prompt (web chat, Telegram). Peer DM turns, notification runs and scheduled jobs keep the agent's normal prompt even while `personality.md` is missing, because there is no user in them to interview (#174).
 
