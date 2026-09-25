@@ -28,6 +28,7 @@ mod cancellation;
 mod config_resolution;
 mod dm_end;
 mod job_episodes;
+mod job_queue_visibility;
 mod notifications;
 mod queue;
 mod read_api;

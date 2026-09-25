@@ -138,8 +138,10 @@ fn spend_one_shot(state: &AppState, job_id: alms_core::JobId) {
 /// complete at turn-1 end exactly like the pre-episode flow — completion
 /// card on the user-facing session, `record_run` + re-arm, episode gone.
 ///
-/// Runs the REAL pipeline end-to-end: `fire_job_run` -> episode open ->
-/// `execute_run` (mock LLM) -> tail hook -> quiescent close.
+/// Runs the REAL pipeline end-to-end: `admit_job_run` (run registered,
+/// episode open) -> `execute_run` (mock LLM) -> tail hook -> quiescent
+/// close. Executes the admitted run inline; the queued path through
+/// `scheduler_fire_loop` is covered in `job_queue_visibility`.
 #[tokio::test]
 async fn episode_job_with_no_async_work_completes_at_turn_end() {
     let (state, shutdown_token, _cr, _tr, _dr) = test_app_state_with_mock_llm();
@@ -150,9 +152,12 @@ async fn episode_job_with_no_async_work_completes_at_turn_end() {
 
     let job_id = create_recurring_job(&state, agent_id, "daily digest");
 
-    crate::runs::notifications::fire_job_run(state.clone(), job_id)
+    crate::runs::notifications::admit_job_run(&state, job_id)
         .await
-        .expect("fire_job_run must succeed");
+        .expect("admission must succeed")
+        .expect("an active job with no open episode is admitted")
+        .execute(state.clone())
+        .await;
 
     // Episode closed at turn end (no pending work).
     assert!(
@@ -234,7 +239,7 @@ async fn episode_precancelled_turn_releases_reservation_and_closes() {
     let web_session_id = state.session_manager.get_or_create(agent_id, "web").id;
     let job_id = create_recurring_job(&state, agent_id, "cancelled before start");
 
-    // Mirror fire_job_run's setup, but cancel the token before execution.
+    // Mirror admit_job_run's setup, but cancel the token before execution.
     let context_id = format!("job_{}", job_id.0);
     let session_id = state
         .session_manager

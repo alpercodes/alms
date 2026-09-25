@@ -42,83 +42,181 @@ pub(crate) async fn scheduler_fire_loop(mut rx: mpsc::UnboundedReceiver<JobId>, 
         if job.status().is_terminal() {
             continue;
         }
-        let state_clone = state.clone();
-        let retry_state = state.clone();
         let Ok(reservation) = state.agent_queue.reserve(job.agent_id).await else {
             break;
         };
-        if let Err(error) = reservation.submit(Box::pin(async move {
-            if let Err(dispatch_error) = fire_job_run(state_clone, job_id).await {
-                error!("Job {} run dispatch failed: {}", job_id, dispatch_error);
-                let Some(job) = retry_state.job_store.get(job_id) else {
-                    return;
-                };
-                if job.status().is_terminal() {
-                    return;
-                }
-                let multiplier = 1u64 << job.retry_count().min(6);
-                let delay_secs = JOB_DISPATCH_RETRY_BASE_SECS.saturating_mul(multiplier);
-                let retry_at = Utc::now()
-                    + chrono::Duration::seconds(delay_secs.try_into().unwrap_or(i64::MAX));
-                match retry_state.job_store.record_dispatch_failure(
-                    job_id,
-                    dispatch_error.to_string(),
-                    retry_at,
-                    JOB_DISPATCH_MAX_ATTEMPTS,
-                ) {
-                    Ok(DispatchFailureOutcome::RetryScheduled { attempt, retry_at }) => {
-                        retry_state
-                            .scheduler
-                            .schedule_once(
-                                job_id,
-                                tokio::time::Instant::now()
-                                    + std::time::Duration::from_secs(delay_secs),
-                            )
-                            .await;
-                        warn!(
-                            %job_id,
-                            attempt,
-                            max_attempts = JOB_DISPATCH_MAX_ATTEMPTS,
-                            %retry_at,
-                            "Scheduled bounded retry after job dispatch failure"
-                        );
-                    }
-                    Ok(DispatchFailureOutcome::Exhausted { attempts }) => {
-                        error!(
-                            %job_id,
-                            attempts,
-                            "Job dispatch retry budget exhausted"
-                        );
-                    }
-                    Ok(
-                        DispatchFailureOutcome::RefusedTerminal | DispatchFailureOutcome::NotFound,
-                    ) => {}
-                    Err(error) => {
-                        error!(%job_id, %error, "Failed to persist job dispatch failure");
-                    }
-                }
-            }
-        })) {
-            warn!(?error, %job_id, "Scheduled job queue closed before dispatch");
+        if dispatch_job_firing(&state, job_id, reservation)
+            .await
+            .is_break()
+        {
             break;
         }
     }
 }
 
-/// Create and execute an agent run triggered by a scheduled job.
+/// Put one job firing on its agent's queue, visibly (#181).
 ///
-/// `pub(super)` so the sibling `integration_tests` module can exercise the
-/// full fire -> episode-open -> turn -> close pipeline end-to-end (#1198).
-#[instrument(level = "info", skip(state), fields(job_id = %job_id))]
-pub(super) async fn fire_job_run(state: AppState, job_id: JobId) -> alms_core::AlmsResult<()> {
-    // Look up the job — it may have been cancelled between scheduling and firing.
+/// The job's `Run` exists, `Queued`, from the moment the firing is admitted,
+/// and `run_created` carries its real queue position. A firing that lands
+/// while the agent is mid-run waits behind that run by design (one run at a
+/// time per agent), and it used to wait invisibly: the `Run` was created
+/// inside the queue work item, so until the agent got to it `GET /runs` had
+/// nothing and the log said only "Scheduled job fired". Two agents read
+/// that as a broken scheduler.
+///
+/// Same shape as [`enqueue_triggered_run`]: reserve first (the caller does),
+/// then register the run under the admission guard and the job cancellation
+/// gate ([`admit_job_run`]), then submit held on a start signal so
+/// `run_created` is published before the run can start. Normal priority, as
+/// before: a firing still yields only to other normal-priority work.
+///
+/// Returns `Break` only when the queue has closed under the firing, which
+/// happens at shutdown.
+#[instrument(level = "info", skip(state, reservation), fields(job_id = %job_id))]
+async fn dispatch_job_firing(
+    state: &AppState,
+    job_id: JobId,
+    reservation: crate::session_queue::Reservation,
+) -> std::ops::ControlFlow<()> {
+    let admitted = match admit_job_run(state, job_id).await {
+        Ok(Some(admitted)) => admitted,
+        Ok(None) => return std::ops::ControlFlow::Continue(()),
+        Err(dispatch_error) => {
+            drop(reservation);
+            record_job_dispatch_failure(state, job_id, dispatch_error).await;
+            return std::ops::ControlFlow::Continue(());
+        }
+    };
+    let (run_id, session_id, agent_id) = (admitted.run_id, admitted.session_id, admitted.agent_id);
+
+    let (start_tx, start_rx) = tokio::sync::oneshot::channel();
+    let work_state = state.clone();
+    let receipt = match reservation.submit(Box::pin(async move {
+        let _ = start_rx.await;
+        admitted.execute(work_state).await;
+    })) {
+        Ok(receipt) => receipt,
+        Err(error) => {
+            abandon_admitted_job_run(state, job_id, run_id, session_id).await;
+            warn!(
+                ?error,
+                run_id = %run_id.0,
+                "Scheduled job queue closed before dispatch"
+            );
+            return std::ops::ControlFlow::Break(());
+        }
+    };
+    // Same count `create_run` reports for a normal-priority run: submitted
+    // normal work ahead of this one, plus the run the agent is on now, which
+    // has already left the pending queue.
+    let agent_running = state.run_manager.agent_has_running_run(agent_id);
+    let queued_behind = receipt.queued_ahead() + usize::from(agent_running);
+    info!(
+        run_id = %run_id.0,
+        queued_behind,
+        "Job fired -> run {} queued",
+        run_id.0
+    );
+
+    let event_state = state.clone();
+    let event_task = tokio::spawn(async move {
+        event_state
+            .run_manager
+            .send_session_event(
+                session_id,
+                run_id,
+                SseEventData::run_created(
+                    run_id,
+                    session_id,
+                    true,
+                    Some("job".to_string()),
+                    queued_behind,
+                ),
+            )
+            .await;
+        let _ = start_tx.send(());
+    });
+    let _ = event_task.await;
+    std::ops::ControlFlow::Continue(())
+}
+
+/// A job firing admitted to its agent's queue: its `Run` is registered
+/// `Queued` with a cancel token, and its episode is open with this run as
+/// turn 1. What remains is to execute it once the agent is free.
+pub(super) struct AdmittedJobRun {
+    run_id: RunId,
+    session_id: SessionId,
+    agent_id: alms_core::AgentId,
+    input: String,
+    context_id: String,
+    cancel_token: CancellationToken,
+}
+
+impl AdmittedJobRun {
+    /// Run the turn. Awaits completion; errors are handled inside
+    /// `execute_run`, whose exit hooks drive the episode from here on.
+    pub(super) async fn execute(self, state: AppState) {
+        execute_run_guarded(
+            state,
+            RunParams {
+                run_id: self.run_id,
+                session_id: self.session_id,
+                agent_id: self.agent_id,
+                input: self.input,
+                context_id: self.context_id,
+                cancel_token: self.cancel_token,
+                is_peer_message: false,
+                is_system_triggered: true,
+                input_pre_persisted: false,
+                dm_ended_peer: None,
+            },
+        )
+        .await;
+    }
+}
+
+/// Register a firing's run before it waits on the agent queue (#181).
+///
+/// `Ok(None)` means the firing is skipped: the job is gone or terminal, or
+/// its episode is still open (the D6 absorb guard). `Err` is a dispatch
+/// failure -- the job session was deleted under the admission guard, or the
+/// run could not be registered durably -- and goes through the bounded
+/// dispatch retry.
+///
+/// The run and the episode are created together under
+/// `job_trigger_cancellation_gate`, the gate `DELETE /jobs` holds while it
+/// records operator intent, removes the episode and sweeps
+/// `cancel_runs_for_job`. The terminal re-check sits under it for the reason
+/// `enqueue_triggered_run`'s operator-cancel check does: a cancellation
+/// either lands first, and the firing is skipped, or lands after and finds
+/// the queued run and the episode to cancel. Before #181 the run was created
+/// after dequeue with no gate, so a `DELETE` landing between the fire path's
+/// status check and its run insert missed the run, which then spent a turn.
+///
+/// The episode opens here rather than at dequeue, so the queued run is turn
+/// 1 from the start:
+/// - an exit of `execute_run` before the turn runs (a queued-then-cancelled
+///   run) releases the reservation and closes the episode like any other
+///   exit;
+/// - a second firing during the wait is absorbed into the D6 catch-up
+///   instead of queueing a second run;
+/// - the D6 missed-tick window starts when the job fired, so a cron tick
+///   that elapses during the wait is caught up at close;
+/// - `GET /jobs` shows the open episode while the firing waits.
+///
+/// The 4-hour deadline also counts from here.
+pub(super) async fn admit_job_run(
+    state: &AppState,
+    job_id: JobId,
+) -> alms_core::AlmsResult<Option<AdmittedJobRun>> {
+    // The job may have been cancelled between scheduling and firing.
     let Some(job) = state.job_store.get(job_id) else {
         info!("Skipping fired job — not found in store");
-        return Ok(());
+        return Ok(None);
     };
     if job.status().is_terminal() {
         info!("Skipping fired job — already cancelled");
-        return Ok(());
+        return Ok(None);
     }
 
     // #1198 D6 defensive guard: a firing that lands while the job's episode
@@ -127,7 +225,7 @@ pub(super) async fn fire_job_run(state: AppState, job_id: JobId) -> alms_core::A
     // absorbed into the episode's coalesced catch-up dirty-bit instead of
     // overlapping on the shared job session.
     if state.job_episodes.absorb_fire_if_open(job_id) {
-        return Ok(());
+        return Ok(None);
     }
 
     // Use a stable context_id so each job accumulates session history across firings.
@@ -140,60 +238,133 @@ pub(super) async fn fire_job_run(state: AppState, job_id: JobId) -> alms_core::A
     let admission_guard =
         super::lifecycle::acquire_run_admission_guard(&state.run_admission_gates, session_id).await;
     state.session_manager.get(session_id)?;
+
     let run = Run::for_job(session_id, job.agent_id, job.prompt.clone(), job_id);
     let run_id = run.run_id;
-    state.run_manager.insert_run(run.clone())?;
-    drop(admission_guard);
-    // Job runs execute inline (not via agent_queue) so queued_behind is 0.
+    let cancel_token = CancellationToken::new();
+    let job_trigger_cancellation_gate = state.job_trigger_cancellation_gate.lock();
+    if state
+        .job_store
+        .get(job_id)
+        .is_none_or(|job| job.status().is_terminal())
+    {
+        info!("Skipping fired job — cancelled during admission");
+        return Ok(None);
+    }
+    // Registered before the insert so the run is cancellable (by
+    // `POST /runs/{id}/cancel` and by `DELETE /jobs`) for its whole queued
+    // life, not only once it starts.
     state
         .run_manager
-        .send_session_event(
-            session_id,
-            run_id,
-            SseEventData::run_created(run_id, session_id, true, Some("job".to_string()), 0),
-        )
-        .await;
-    info!("Job fired -> run {}", run_id.0);
-
-    // #1198: open the job episode BEFORE the first turn executes. From here
-    // on, completion bookkeeping (card + record_run + recurring re-arm) is
+        .register_cancel_token(run_id, cancel_token.clone());
+    if let Err(error) = state.run_manager.insert_run(run.clone()) {
+        state.run_manager.remove_cancel_token(run_id);
+        return Err(error);
+    }
+    // #1198: open the job episode with this run as turn 1. From here on,
+    // completion bookkeeping (card + record_run + recurring re-arm) is
     // owned by `close_episode`, driven by `finish_episode_run` at every
     // `execute_run` exit — the episode stays open across triggered DMs and
     // background subagents until quiescence or the 4-hour deadline.
     state
         .job_episodes
         .open(job_id, session_id, job.agent_id, run_id);
+    drop(job_trigger_cancellation_gate);
+    drop(admission_guard);
 
-    // Execute the run (awaits completion; errors are handled inside execute_run).
-    // Register the token so scheduled job runs are cancellable via POST /runs/{id}/cancel
-    // in addition to the job-level DELETE /jobs/{id} path.
-    let cancel_token = CancellationToken::new();
-    state
+    Ok(Some(AdmittedJobRun {
+        run_id,
+        session_id,
+        agent_id: job.agent_id,
+        input: run.input,
+        context_id,
+        cancel_token,
+    }))
+}
+
+/// Undo an admitted firing whose work item never reached the queue (it
+/// closed under us, which happens at shutdown).
+///
+/// The run is marked failed and the episode is dropped without closing it.
+/// Closing would run the completion block -- card, `record_run`, re-arm --
+/// for a turn that never happened, and would mark a one-shot `Completed`.
+/// Dropped, the job keeps the `next_run_at` it fired on, and the next boot's
+/// catch-up re-fires it (`bootstrap_fire_at`).
+async fn abandon_admitted_job_run(
+    state: &AppState,
+    job_id: JobId,
+    run_id: RunId,
+    session_id: SessionId,
+) {
+    state.job_episodes.remove(job_id);
+    if let Err(persistence_error) = state
         .run_manager
-        .register_cancel_token(run_id, cancel_token.clone());
-    execute_run_guarded(
-        state.clone(),
-        RunParams {
-            run_id,
-            session_id,
-            agent_id: job.agent_id,
-            input: run.input,
-            context_id,
-            cancel_token,
-            is_peer_message: false,
-            is_system_triggered: true,
-            input_pre_persisted: false,
-            dm_ended_peer: None,
-        },
-    )
-    .await;
+        .try_mark_run_as_failed(run_id, "Run queue closed before dispatch".to_string())
+    {
+        state
+            .run_manager
+            .send_event(
+                run_id,
+                session_id,
+                SseEventData::run_error(
+                    run_id,
+                    &format!(
+                        "Scheduled run dispatch failure could not be persisted: {persistence_error}"
+                    ),
+                ),
+            )
+            .await;
+    }
+    state.run_manager.remove_cancel_token(run_id);
+}
 
-    // #1198: the post-run block (completion card + record_run + re-arm)
-    // moved to `close_episode`, invoked by the episode hook inside
-    // `execute_run` when the episode reaches quiescence — which, for a
-    // turn with no async work, is right here at turn-1 end (behavior
-    // identical to the pre-#1198 flow).
-    Ok(())
+/// Bounded retry for a firing that could not be admitted.
+async fn record_job_dispatch_failure(
+    state: &AppState,
+    job_id: JobId,
+    dispatch_error: alms_core::AlmsError,
+) {
+    error!("Job {} run dispatch failed: {}", job_id, dispatch_error);
+    let Some(job) = state.job_store.get(job_id) else {
+        return;
+    };
+    if job.status().is_terminal() {
+        return;
+    }
+    let multiplier = 1u64 << job.retry_count().min(6);
+    let delay_secs = JOB_DISPATCH_RETRY_BASE_SECS.saturating_mul(multiplier);
+    let retry_at =
+        Utc::now() + chrono::Duration::seconds(delay_secs.try_into().unwrap_or(i64::MAX));
+    match state.job_store.record_dispatch_failure(
+        job_id,
+        dispatch_error.to_string(),
+        retry_at,
+        JOB_DISPATCH_MAX_ATTEMPTS,
+    ) {
+        Ok(DispatchFailureOutcome::RetryScheduled { attempt, retry_at }) => {
+            state
+                .scheduler
+                .schedule_once(
+                    job_id,
+                    tokio::time::Instant::now() + std::time::Duration::from_secs(delay_secs),
+                )
+                .await;
+            warn!(
+                %job_id,
+                attempt,
+                max_attempts = JOB_DISPATCH_MAX_ATTEMPTS,
+                %retry_at,
+                "Scheduled bounded retry after job dispatch failure"
+            );
+        }
+        Ok(DispatchFailureOutcome::Exhausted { attempts }) => {
+            error!(%job_id, attempts, "Job dispatch retry budget exhausted");
+        }
+        Ok(DispatchFailureOutcome::RefusedTerminal | DispatchFailureOutcome::NotFound) => {}
+        Err(error) => {
+            error!(%job_id, %error, "Failed to persist job dispatch failure");
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

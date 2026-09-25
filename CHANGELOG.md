@@ -87,6 +87,19 @@ Each item below changes behaviour for a deployment that has not set the knob exp
   fallbacks are no longer silent.
 - Durable job recovery and atomic, bounded per-agent run admission.
 - Scheduled jobs stay active until the agent's full task completes ("job episodes").
+- A scheduled job that fires while its agent is mid-run is visible while it waits. Its run
+  is created `queued` as soon as the firing is admitted: `GET /runs` lists it (trigger
+  `scheduled`), `GET /runs/{id}` reports its `queue_position`, `run_created` carries the
+  real `queued_behind` (it was hardcoded `0`) and `run_queue_position` updates follow, and
+  the log reads `Job fired -> run <id> queued` with `queued_behind`. Before, the run
+  appeared only when the agent got to it, so a wait of a minute or two looked like a
+  stalled scheduler. The job's episode now opens with the firing as well. `GET /jobs`
+  shows it during the wait, the 4-hour episode deadline and the missed-tick catch-up
+  count from the firing, and a second firing during the wait is absorbed into the
+  catch-up rather than queued. `DELETE /jobs` cancels a queued firing; its run ends
+  `cancelled`, without starting, once the agent's queue reaches it. A job run still queued
+  at a hard stop is marked `failed` (`gateway_restarted`) at the next boot, and the job
+  fires again through the boot catch-up.
 
 ### Tools and workspace
 
