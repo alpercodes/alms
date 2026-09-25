@@ -393,13 +393,27 @@ impl Gateway {
             None => Arc::new(SessionManager::new(config.session_config.clone())),
         };
         // Load secrets store — used both for initial key resolution and shared
-        // with AppState so runtime key changes are visible everywhere.
+        // with AppState so runtime key changes are visible everywhere. The
+        // file sits beside the database; `alms auth` resolves the same one
+        // (`ServerConfig::secrets_path`, #170).
         let secrets_path = alms_core::secrets::secrets_path_from_db(config.db_path.as_deref());
         let secrets_store =
             alms_core::secrets::SecretsStore::load(&secrets_path).unwrap_or_else(|e| {
                 warn!("Failed to load secrets: {e}");
                 alms_core::secrets::SecretsStore::empty()
             });
+        if let Some(legacy) = config
+            .data_dir
+            .as_deref()
+            .and_then(|data_dir| alms_core::secrets::unread_legacy_secrets(data_dir, &secrets_path))
+        {
+            warn!(
+                legacy = %legacy.display(),
+                secrets = %secrets_path.display(),
+                "{}",
+                alms_core::secrets::unread_legacy_secrets_message(&legacy, &secrets_path)
+            );
+        }
 
         // Resolve API key. Precedence:
         //   1. SecretsStore (`alms auth set <provider> <key>`) — highest,
@@ -1471,6 +1485,152 @@ mod tests {
             captured.at_target("alms.security").count(),
             0,
             "no WARN must fire when the list is empty: {captured}"
+        );
+    }
+}
+
+/// #170: a gateway upgraded under `ALMS_DB_PATH` keeps the secrets file
+/// beside its database, the one it has always read. A `{data_dir}/secrets.json`
+/// written by an earlier `alms auth` is not read, moved or merged, and the
+/// gateway names it at boot.
+#[cfg(test)]
+mod secrets_path_tests {
+    use super::*;
+    use alms_test_support::capture_events;
+    use std::path::PathBuf;
+
+    /// The data directory and the database in different directories, as
+    /// `ALMS_DB_PATH` makes them.
+    struct Split {
+        _scratch: tempfile::TempDir,
+        data_dir: PathBuf,
+        db_path: PathBuf,
+        /// `{data_dir}/secrets.json`: what the CLI wrote before #170.
+        legacy: PathBuf,
+        /// Beside the database: what the gateway has always used.
+        canonical: PathBuf,
+    }
+
+    fn split() -> Split {
+        let scratch = tempfile::tempdir().unwrap();
+        let data_dir = scratch.path().join("data");
+        let db_dir = scratch.path().join("elsewhere");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        std::fs::create_dir_all(&db_dir).unwrap();
+        Split {
+            legacy: data_dir.join("secrets.json"),
+            canonical: db_dir.join("secrets.json"),
+            db_path: db_dir.join("alms.db"),
+            data_dir,
+            _scratch: scratch,
+        }
+    }
+
+    /// Boot a gateway on `db_path` / `data_dir` and return it with the WARN
+    /// events emitted while it was built.
+    fn boot(db_path: &std::path::Path, data_dir: &std::path::Path) -> (Gateway, Vec<String>) {
+        let mut gateway = None;
+        let captured = capture_events(tracing::Level::WARN, || {
+            gateway = Some(
+                Gateway::new(GatewayConfig {
+                    db_path: Some(db_path.display().to_string()),
+                    data_dir: Some(data_dir.to_path_buf()),
+                    ..GatewayConfig::default()
+                })
+                .unwrap(),
+            );
+        });
+        let messages = captured.iter().map(|e| e.message.clone()).collect();
+        (gateway.unwrap(), messages)
+    }
+
+    fn unread_warning<'a>(messages: &'a [String], legacy: &std::path::Path) -> Option<&'a String> {
+        let legacy = legacy.display().to_string();
+        messages
+            .iter()
+            .find(|m| m.starts_with(&legacy) && m.contains("is not read"))
+    }
+
+    #[test]
+    fn keeps_its_own_secrets_file_and_names_the_one_it_does_not_read() {
+        let s = split();
+        let mut cli_written = alms_core::secrets::SecretsStore::load(&s.legacy).unwrap();
+        cli_written
+            .set_key("openrouter", "sk-or-written-by-old-cli")
+            .unwrap();
+        let mut gateway_written = alms_core::secrets::SecretsStore::load(&s.canonical).unwrap();
+        gateway_written
+            .set_key("anthropic", "sk-ant-set-in-the-ui")
+            .unwrap();
+
+        let (gateway, warnings) = boot(&s.db_path, &s.data_dir);
+
+        let store = gateway.secrets_handle();
+        let store = store.read();
+        assert_eq!(
+            store.path(),
+            s.canonical,
+            "the file beside the database, as before"
+        );
+        assert_eq!(store.get_key("anthropic"), Some("sk-ant-set-in-the-ui"));
+        assert_eq!(
+            store.get_key("openrouter"),
+            None,
+            "a key the gateway never used must not be merged in"
+        );
+        let warning = unread_warning(&warnings, &s.legacy)
+            .unwrap_or_else(|| panic!("no warning names {}: {warnings:?}", s.legacy.display()));
+        assert!(
+            warning.contains(&s.canonical.display().to_string()),
+            "{warning}"
+        );
+        assert!(warning.contains("not merged"), "{warning}");
+    }
+
+    #[test]
+    fn does_not_adopt_a_legacy_file_when_its_own_is_missing() {
+        let s = split();
+        let mut cli_written = alms_core::secrets::SecretsStore::load(&s.legacy).unwrap();
+        cli_written
+            .set_key("openrouter", "sk-or-written-by-old-cli")
+            .unwrap();
+        let legacy_bytes = std::fs::read(&s.legacy).unwrap();
+
+        let (gateway, warnings) = boot(&s.db_path, &s.data_dir);
+
+        let store = gateway.secrets_handle();
+        let store = store.read();
+        assert_eq!(store.path(), s.canonical);
+        assert_eq!(store.get_key("openrouter"), None, "not adopted");
+        assert_eq!(
+            std::fs::read(&s.legacy).unwrap(),
+            legacy_bytes,
+            "left exactly where and as it was"
+        );
+        assert!(!s.canonical.exists(), "nothing was copied into place");
+        let warning = unread_warning(&warnings, &s.legacy)
+            .unwrap_or_else(|| panic!("no warning names {}: {warnings:?}", s.legacy.display()));
+        assert!(
+            warning.contains("mv \""),
+            "the move that adopts it: {warning}"
+        );
+    }
+
+    /// The default layout, database inside the data directory: one file,
+    /// nothing to report.
+    #[test]
+    fn says_nothing_when_the_database_is_in_the_data_dir() {
+        let s = split();
+        let secrets = s.data_dir.join("secrets.json");
+        let mut store = alms_core::secrets::SecretsStore::load(&secrets).unwrap();
+        store.set_key("openrouter", "sk-or-default-layout").unwrap();
+
+        let (gateway, warnings) = boot(&s.data_dir.join("alms.db"), &s.data_dir);
+
+        assert_eq!(gateway.secrets_handle().read().path(), secrets);
+        assert!(
+            unread_warning(&warnings, &secrets).is_none(),
+            "{warnings:?}"
         );
     }
 }

@@ -103,6 +103,8 @@ The `SecretsStore` is loaded once, at boot — so a key written to the file behi
 
 A gateway that answers gets the change over HTTP, so it applies to the next run with no restart; it persists the change to its own secrets file, so the key survives a restart too. When nothing answers, both commands edit the file directly, exactly as before. If something answers but not with a 2xx, the file is written and the command warns that a gateway running there would need a restart.
 
+The secrets file is `secrets.json` beside the SQLite database: `{data_dir}/secrets.json` by default, or in the directory of `ALMS_DB_PATH` when that is set. `alms auth` and the gateway resolve it the same way, so for one configuration they use one file (#170). Before v0.2.4, `alms auth` used `{data_dir}/secrets.json` even with `ALMS_DB_PATH` set — a file the gateway never read. If one is left over, the gateway (at boot) and every `alms auth` command name it. It is not read, moved or merged: if the gateway has no secrets file beside the database yet, move it there; otherwise set any key you still need with `alms auth set` and delete it.
+
 > Note: the `alms auth set <name> <key>` command currently restricts `<name>` to a fixed list (`openai`, `anthropic`, `gemini`, `openrouter`, `telegram`). For any *other* provider you declare in `[llm.providers.<name>]`, use `api_key_env` instead. Extending `alms auth set` to accept arbitrary provider names is tracked separately.
 
 ### Auth schemes
