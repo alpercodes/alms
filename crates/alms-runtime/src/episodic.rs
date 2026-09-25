@@ -25,6 +25,7 @@ use alms_core::config::RunSummaryMode;
 use alms_core::source_label::{derive_source_label, truncate_to_char_boundary};
 use alms_core::{AgentId, RunId, SessionId};
 use alms_session::SessionManager;
+use std::collections::HashSet;
 use tracing::{debug, error, info, instrument, warn};
 
 /// Maximum byte length for the heuristic input snippet.
@@ -177,10 +178,11 @@ pub async fn generate_session_summary(llm: &LlmClient, params: &SummaryParams) -
 /// when there is no accumulated history to protect.
 ///
 /// The LLM path returns `None` when the provider call errored, returned an
-/// empty response, or both `run_input` and `run_output` were empty.  In all
-/// of those cases we'd previously persist nothing, leaving the session
-/// silently summary-less (#832).  The heuristic produces a deterministic
-/// "input -> output" line and is lossy but never silent.
+/// empty response, returned one [`screen_summary_output`] refused (#176), or
+/// both `run_input` and `run_output` were empty.  In all of those cases we'd
+/// previously persist nothing, leaving the session silently summary-less
+/// (#832).  The heuristic produces a deterministic "input -> output" line and
+/// is lossy but never silent.
 ///
 /// **Existing-summary safeguard (PR #884 follow-up):** when
 /// `params.existing_summary` is non-empty, the heuristic is *not* invoked.
@@ -205,12 +207,12 @@ fn apply_llm_fallback(llm_result: Option<String>, params: &SummaryParams) -> Opt
         .is_some_and(|s| !s.is_empty())
     {
         info!(
-            "LLM summary path produced no output -- preserving existing summary (heuristic fallback skipped)"
+            "LLM summary path produced no usable output -- preserving existing summary (heuristic fallback skipped)"
         );
         return None;
     }
     // No accumulated history -- heuristic is strictly an upgrade over silent skip.
-    info!("LLM summary path produced no output -- falling back to heuristic");
+    info!("LLM summary path produced no usable output -- falling back to heuristic");
     generate_heuristic(params)
 }
 
@@ -528,6 +530,103 @@ fn extract_dm_peer(context_id: &str, agent_name: &str) -> Option<String> {
     alms_core::dm_peer(context_id, agent_name).map(|s| s.to_string())
 }
 
+// ---------------------------------------------------------------------------
+// Summarizer output screening (#176)
+// ---------------------------------------------------------------------------
+
+/// The `finish_reason` a completion carries when the provider stopped it at
+/// `max_tokens`. OpenAI-compatible APIs (OpenRouter included) send it
+/// natively; the Anthropic adapter maps `max_tokens` and the Gemini adapter
+/// `MAX_TOKENS` onto it, so one comparison covers every summary provider.
+const FINISH_REASON_LENGTH: &str = "length";
+
+/// Outputs with fewer whitespace-separated tokens than this are never judged
+/// repetitive: too short for a ratio to mean much, and too short to crowd
+/// anything out of a context window if one did slip through.
+const REPETITION_MIN_TOKENS: usize = 20;
+
+/// An output is repetitive when its tokens outnumber its *distinct* tokens
+/// by more than this factor -- a distinct-token ratio below 1/10.
+///
+/// The degenerate output behind #176, `our` repeated to the 1000-token cap,
+/// has a ratio of 1/1000, and a loop on a phrase of `k` words filling a
+/// budget of `n` tokens sits near `k/n` -- about 0.01 for a ten-word phrase
+/// at the default cap. Natural text sits far above the line. Measured over
+/// the ~98k words of this repository's `docs/`, `README.md` and
+/// `CHANGELOG.md`, tokenised as below, no 380- or 750-word window (roughly
+/// what the compaction path's 512-token and the episodic path's default
+/// 1000-token caps allow) falls below 0.48, and the least varied 40-word
+/// window anywhere -- an ASCII dependency graph, not prose -- is 0.225.
+/// 1/10 leaves better than twice that margin and still refuses any loop
+/// that dominates its output. This is defence in depth behind the `length`
+/// check, which is the one that separates the observed failures, so it is
+/// tuned to let a borderline output through rather than refuse it.
+const REPETITION_MAX_TOKENS_PER_DISTINCT: usize = 10;
+
+/// Why [`screen_summary_output`] refused a summarizer completion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SummaryRejection {
+    /// The provider stopped at `max_tokens` (`finish_reason == "length"`).
+    /// The text is cut off, and both summarizer prompts ask for a few
+    /// sentences, far under either cap, so reaching the cap is itself the
+    /// failure.
+    Truncated,
+    /// The text finished but is dominated by repeated tokens.
+    Repetitive,
+}
+
+impl SummaryRejection {
+    /// Value of the `check` field on the rejection `warn!`.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Truncated => "finish_reason_length",
+            Self::Repetitive => "repetition",
+        }
+    }
+}
+
+/// Decide whether a summarizer completion may replace a stored summary
+/// (#176).
+///
+/// Both summary writers replace rather than append: the episodic summarizer
+/// upserts over the session's accumulated summary, and the compaction path
+/// overwrites the rolling summary and advances `messages_covered` in the
+/// same step. One bad generation therefore destroys whatever it replaces,
+/// and is then fed back as the base for the next summary. A refused output
+/// leaves the stored summary as it was; each caller applies that policy.
+///
+/// `text` is the non-empty completion text. Emptiness is the caller's check,
+/// because each path reports it differently.
+pub(crate) fn screen_summary_output(
+    text: &str,
+    finish_reason: Option<&str>,
+) -> Result<(), SummaryRejection> {
+    if finish_reason == Some(FINISH_REASON_LENGTH) {
+        return Err(SummaryRejection::Truncated);
+    }
+    if is_repetitive(text) {
+        return Err(SummaryRejection::Repetitive);
+    }
+    Ok(())
+}
+
+/// Whether `text` is dominated by repeated tokens. Tokens are split on
+/// whitespace with case and punctuation kept, which keeps more of them
+/// distinct and so errs toward accepting. See
+/// [`REPETITION_MAX_TOKENS_PER_DISTINCT`] for the threshold. Text in a script
+/// written without spaces (Chinese, Japanese, Thai) rarely reaches
+/// [`REPETITION_MIN_TOKENS`], so this check effectively never judges it; a
+/// loop there is caught only when it runs to the cap (`length`).
+fn is_repetitive(text: &str) -> bool {
+    let mut distinct = HashSet::new();
+    let mut total = 0usize;
+    for token in text.split_whitespace() {
+        distinct.insert(token);
+        total += 1;
+    }
+    total >= REPETITION_MIN_TOKENS && total > distinct.len() * REPETITION_MAX_TOKENS_PER_DISTINCT
+}
+
 /// Generate a summary via a lightweight LLM call.
 async fn generate_llm(llm: &LlmClient, params: &SummaryParams) -> Option<String> {
     // #1098: strip the extended-thinking trace from the run output before
@@ -618,24 +717,30 @@ async fn generate_llm(llm: &LlmClient, params: &SummaryParams) -> Option<String>
     match llm.complete(request).await {
         Ok(response) => {
             let choice = response.choices.into_iter().next();
-            let text = choice.as_ref().and_then(|c| {
-                // Primary: use `content`.
-                // Fallback: use `reasoning_content` -- reasoning models (e.g.
-                // minimax-m2.5, deepseek-r1) may consume all max_tokens on
-                // thinking before producing output, leaving `content` as null
-                // while `reasoning_content` holds useful text.
-                c.message
-                    .content
-                    .as_deref()
-                    .or(c.message.reasoning_content.as_deref())
-            });
+            let finish_reason = choice.as_ref().and_then(|c| c.finish_reason.as_deref());
+            // The summary is `content`, never `reasoning_content` (#176).
+            // The reasoning fallback that used to sit here was for models
+            // that spend the whole budget thinking and return null content
+            // -- a `length` finish, which `screen_summary_output` refuses
+            // whichever field the text came from. What it salvaged was a
+            // thinking trace cut off mid-thought, the text #1098 keeps out
+            // of summaries on the agent side. With no content this path
+            // yields `None` and `apply_llm_fallback` decides what, if
+            // anything, is written.
+            let text = choice.as_ref().and_then(|c| c.message.content.as_deref());
             match text {
                 Some(t) if !t.trim().is_empty() => {
-                    // If we fell back to reasoning_content, note it in logs.
-                    if choice.as_ref().is_some_and(|c| c.message.content.is_none()) {
-                        info!("Used reasoning_content as summary (model returned null content)");
+                    let t = t.trim();
+                    if let Err(rejection) = screen_summary_output(t, finish_reason) {
+                        warn!(
+                            finish_reason = finish_reason.unwrap_or("unknown"),
+                            output_len = t.len(),
+                            check = rejection.as_str(),
+                            "LLM summarizer output rejected"
+                        );
+                        return None;
                     }
-                    Some(t.trim().to_string())
+                    Some(t.to_string())
                 }
                 _ => {
                     warn!(
@@ -646,10 +751,7 @@ async fn generate_llm(llm: &LlmClient, params: &SummaryParams) -> Option<String>
                         has_tool_calls = choice
                             .as_ref()
                             .is_some_and(|c| c.message.tool_calls.is_some()),
-                        finish_reason = choice
-                            .as_ref()
-                            .and_then(|c| c.finish_reason.as_deref())
-                            .unwrap_or("unknown"),
+                        finish_reason = finish_reason.unwrap_or("unknown"),
                         "LLM summarizer returned empty response"
                     );
                     None
@@ -1551,6 +1653,322 @@ mod tests {
              trim_oldest_lines(_, 500) drops the older line. If this assertion ever fails, the \
              eviction risk is gone and the safeguard above can be reconsidered."
         );
+    }
+
+    // -- #176: summarizer output screening ----------------------------------
+    //
+    // A generation cut off at `max_tokens`, or one looping on a few words,
+    // used to be persisted like a finished summary -- over the session's
+    // accumulated one, since the LLM path replaces rather than appends.
+    // Observed live: the token `our` repeated to the 1000-token cap, upserted
+    // five times over good summaries.
+
+    use alms_test_support::{Canned, ScriptedLlm, capture_events};
+
+    /// The row #176 found in `session_summaries`: `our` x 1000, 3999 bytes.
+    fn degenerate_our() -> String {
+        vec!["our"; 1000].join(" ")
+    }
+
+    const GOOD_SUMMARY: &str =
+        "Helped canary schedule the nightly report job and confirmed its first run succeeded.";
+
+    /// An OpenAI-shaped non-streaming completion -- the wire shape of the
+    /// default `openrouter` provider, and of the summary pair's.
+    fn completion_body(content: Option<&str>, reasoning: Option<&str>, finish: &str) -> String {
+        serde_json::json!({
+            "id": "summary-1",
+            "object": "chat.completion",
+            "created": 0,
+            "model": "summary-model",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": content,
+                    "reasoning_content": reasoning,
+                },
+                "finish_reason": finish,
+            }],
+        })
+        .to_string()
+    }
+
+    fn scripted_client(llm: &ScriptedLlm) -> LlmClient {
+        LlmClient::new(crate::llm_types::LlmConfig {
+            base_url: llm.base_url(),
+            api_key: "test-key".into(),
+            default_model: "summary-model".into(),
+            timeout_secs: 5,
+            ..Default::default()
+        })
+        .unwrap()
+    }
+
+    fn llm_params(existing: Option<&str>) -> SummaryParams {
+        SummaryParams {
+            mode: RunSummaryMode::Llm,
+            agent_id: AgentId::new(),
+            session_id: SessionId::new(),
+            run_id: RunId::new(),
+            run_input: "Schedule the nightly report".into(),
+            run_output: "Scheduled it for 16:00.".into(),
+            run_reasoning: None,
+            context_id: "web-chat-1".into(),
+            existing_summary: existing.map(str::to_string),
+            summary_model: None,
+            agent_name: "canary".into(),
+            summary_max_tokens: 1000,
+        }
+    }
+
+    /// What `generate_heuristic` writes for [`llm_params`]' run.
+    const HEURISTIC_LINE: &str = "\"Schedule the nightly report\" -> \"Scheduled it for 16:00.\"";
+
+    #[test]
+    fn screen_rejects_a_length_finish() {
+        // Refused on the finish alone: a well-formed opening that the cap
+        // cut off is still cut off.
+        assert_eq!(
+            screen_summary_output(
+                "Helped canary schedule the nightly report job and",
+                Some("length")
+            ),
+            Err(SummaryRejection::Truncated)
+        );
+        assert_eq!(
+            screen_summary_output(&degenerate_our(), Some("length")),
+            Err(SummaryRejection::Truncated)
+        );
+    }
+
+    #[test]
+    fn screen_rejects_repetitive_output_that_finishes_normally() {
+        for finish in [Some("stop"), None] {
+            assert_eq!(
+                screen_summary_output(&degenerate_our(), finish),
+                Err(SummaryRejection::Repetitive),
+                "finish={finish:?}"
+            );
+        }
+        // A loop on a phrase, not only on one token.
+        let phrase_loop = "Discussed the deployment plan with jack and ".repeat(30);
+        assert_eq!(
+            screen_summary_output(phrase_loop.trim(), Some("stop")),
+            Err(SummaryRejection::Repetitive)
+        );
+    }
+
+    #[test]
+    fn screen_accepts_a_normal_summary() {
+        for finish in [Some("stop"), None] {
+            assert_eq!(
+                screen_summary_output(GOOD_SUMMARY, finish),
+                Ok(()),
+                "finish={finish:?}"
+            );
+        }
+        // Compaction-length (the prompt asks for 3-7 sentences), with the
+        // names and function words a real summary repeats.
+        let compaction = "The user asked alice to move the gateway config onto the layered \
+            loader. Alice read gateway.rs and config.rs, found that the env overlay was applied \
+            before validation, and moved it after. The user asked for a test, and alice added \
+            one covering an empty ALMS_DB_PATH and ran the suite, which passed. The user then \
+            asked about the summary cap, and alice explained that summary_max_tokens bounds the \
+            summarizer, not the agent. The session ended with the change committed on a \
+            feature branch and a PR opened against develop.";
+        assert_eq!(screen_summary_output(compaction, Some("stop")), Ok(()));
+    }
+
+    /// Pins the two constants: nothing under [`REPETITION_MIN_TOKENS`] is
+    /// judged, and the line is a distinct-token ratio of exactly 1/10.
+    #[test]
+    fn screen_repetition_threshold_is_one_distinct_token_in_ten() {
+        let short = vec!["ok"; REPETITION_MIN_TOKENS - 1].join(" ");
+        assert_eq!(screen_summary_output(&short, Some("stop")), Ok(()));
+        let at_min = vec!["ok"; REPETITION_MIN_TOKENS].join(" ");
+        assert_eq!(
+            screen_summary_output(&at_min, Some("stop")),
+            Err(SummaryRejection::Repetitive)
+        );
+
+        // Ten distinct tokens, ten times each: on the line, accepted.
+        let at_line = (0..100)
+            .map(|i| format!("w{}", i % 10))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert_eq!(screen_summary_output(&at_line, Some("stop")), Ok(()));
+        // One more repeat tips it over.
+        assert_eq!(
+            screen_summary_output(&format!("{at_line} w0"), Some("stop")),
+            Err(SummaryRejection::Repetitive)
+        );
+    }
+
+    /// A store-backed `SessionManager` holding one session on `context_id`.
+    fn manager_with_session(context_id: &str) -> (SessionManager, AgentId, SessionId) {
+        let store = alms_session::SqliteStore::open_in_memory().unwrap();
+        let manager =
+            SessionManager::with_store(alms_session::SessionConfig::default(), store).unwrap();
+        let agent_id = AgentId::new();
+        let session = alms_session::Session::new(agent_id, context_id);
+        manager.store().unwrap().save_session(&session).unwrap();
+        (manager, agent_id, session.id)
+    }
+
+    fn persist_request(
+        agent_id: AgentId,
+        session_id: SessionId,
+        context_id: &str,
+    ) -> PersistSummaryRequest {
+        let params = llm_params(None);
+        PersistSummaryRequest {
+            mode: params.mode,
+            agent_id,
+            session_id,
+            run_id: RunId::new(),
+            run_input: params.run_input,
+            run_output: params.run_output,
+            run_reasoning: None,
+            context_id: context_id.into(),
+            summary_model: None,
+            agent_name: params.agent_name,
+            summary_max_tokens: params.summary_max_tokens,
+        }
+    }
+
+    /// The incident, end to end through the store: a refused generation
+    /// leaves the stored summary exactly as it was -- the text and the
+    /// `last_run_id`, so not even a rewrite of the same text happened.
+    /// Once for each check.
+    #[tokio::test]
+    async fn rejected_generation_keeps_the_existing_summary() {
+        let cut_off = "Helped canary schedule the nightly report job and";
+        for (check, body) in [
+            ("length", completion_body(Some(cut_off), None, "length")),
+            (
+                "repetition",
+                completion_body(Some(&degenerate_our()), None, "stop"),
+            ),
+        ] {
+            let llm = ScriptedLlm::always(Canned::json(200, body)).await;
+            let (manager, agent_id, session_id) = manager_with_session("web-chat-1");
+            let store = manager.store().unwrap();
+            let prior_run = RunId::new();
+            store
+                .upsert_session_summary(
+                    agent_id,
+                    session_id,
+                    GOOD_SUMMARY,
+                    Some(prior_run),
+                    Some("User chat"),
+                )
+                .unwrap();
+
+            generate_and_persist_summary(
+                &manager,
+                &scripted_client(&llm),
+                persist_request(agent_id, session_id, "web-chat-1"),
+            )
+            .await;
+
+            assert_eq!(
+                llm.calls(),
+                1,
+                "[{check}] the summarizer must have been asked, or nothing was refused"
+            );
+            let row = store
+                .load_session_summary(agent_id, session_id)
+                .unwrap()
+                .expect("the existing row must survive");
+            assert_eq!(row.summary, GOOD_SUMMARY, "[{check}]");
+            assert_eq!(row.last_run_id, Some(prior_run), "[{check}]");
+        }
+    }
+
+    /// #176's job session had no summary yet, so nothing was protected and
+    /// the degenerate text became its summary for good: a `once` job's
+    /// session never runs again. With no history to protect,
+    /// `apply_llm_fallback` writes the heuristic line instead.
+    #[tokio::test]
+    async fn rejected_generation_on_a_fresh_session_falls_back_to_the_heuristic() {
+        let llm = ScriptedLlm::always(Canned::json(
+            200,
+            completion_body(Some(&degenerate_our()), None, "length"),
+        ))
+        .await;
+        let context_id = "job_34b1b24f";
+        let (manager, agent_id, session_id) = manager_with_session(context_id);
+
+        generate_and_persist_summary(
+            &manager,
+            &scripted_client(&llm),
+            persist_request(agent_id, session_id, context_id),
+        )
+        .await;
+
+        assert_eq!(llm.calls(), 1);
+        let row = manager
+            .store()
+            .unwrap()
+            .load_session_summary(agent_id, session_id)
+            .unwrap()
+            .expect("the heuristic line must be written");
+        assert_eq!(row.summary, HEURISTIC_LINE);
+    }
+
+    /// The `reasoning_content` fallback is gone. Its budget-exhausted case
+    /// is a `length` finish and would be refused anyway; the `stop` case is
+    /// the one the length check alone would let through. Either way the
+    /// trace is not the summary: the path yields nothing and the fallback
+    /// policy decides, here the heuristic line.
+    #[tokio::test]
+    async fn reasoning_content_is_never_used_as_the_summary() {
+        let trace = "Let me think about this summary. The user wants a report scheduled, \
+            so I should mention the time and";
+        for finish in ["length", "stop"] {
+            let llm = ScriptedLlm::always(Canned::json(
+                200,
+                completion_body(None, Some(trace), finish),
+            ))
+            .await;
+
+            let summary = generate_session_summary(&scripted_client(&llm), &llm_params(None)).await;
+
+            assert_eq!(llm.calls(), 1, "[{finish}]");
+            assert_eq!(summary.as_deref(), Some(HEURISTIC_LINE), "[{finish}]");
+        }
+    }
+
+    /// The refusal is a `warn!` carrying what an operator needs to tell the
+    /// two checks apart from each other and from an empty response.
+    #[test]
+    fn rejection_is_logged_with_finish_reason_output_len_and_check() {
+        for (finish, check) in [("length", "finish_reason_length"), ("stop", "repetition")] {
+            let body = completion_body(Some(&degenerate_our()), None, finish);
+            let captured = capture_events(tracing::Level::WARN, || {
+                // Driven on this thread because the capture is per-thread;
+                // the scripted server runs on wiremock's own thread.
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                rt.block_on(async {
+                    let llm = ScriptedLlm::always(Canned::json(200, body)).await;
+                    let params = llm_params(Some(GOOD_SUMMARY));
+                    let summary = generate_session_summary(&scripted_client(&llm), &params).await;
+                    assert_eq!(summary, None, "existing summary kept, nothing to write");
+                });
+            });
+
+            let event = captured
+                .iter()
+                .find(|e| e.message == "LLM summarizer output rejected")
+                .unwrap_or_else(|| panic!("[{finish}] no rejection warn; got {captured}"));
+            assert_eq!(event.field("finish_reason"), Some(finish));
+            assert_eq!(event.field("output_len"), Some("3999"));
+            assert_eq!(event.field("check"), Some(check));
+        }
     }
 
     // -- format_episodic_for_injection ----------------------------------------
