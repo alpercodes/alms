@@ -613,7 +613,10 @@ pub(crate) fn screen_summary_output(
 /// Whether `text` is dominated by repeated tokens. Tokens are split on
 /// whitespace with case and punctuation kept, which keeps more of them
 /// distinct and so errs toward accepting. See
-/// [`REPETITION_MAX_TOKENS_PER_DISTINCT`] for the threshold.
+/// [`REPETITION_MAX_TOKENS_PER_DISTINCT`] for the threshold. Text in a script
+/// written without spaces (Chinese, Japanese, Thai) rarely reaches
+/// [`REPETITION_MIN_TOKENS`], so this check effectively never judges it; a
+/// loop there is caught only when it runs to the cap (`length`).
 fn is_repetitive(text: &str) -> bool {
     let mut distinct = HashSet::new();
     let mut total = 0usize;

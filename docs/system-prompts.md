@@ -90,7 +90,8 @@ with the summarizer prompt to compress old messages into a rolling summary.
 **Code path**: `maybe_summarize()` in `agent/context.rs` -- builds a separate LLM request
 with the summarizer system prompt and a user message containing the transcript. The
 result goes through the same output screen as the episodic summarizer's (below); a
-refused one leaves the rolling summary and `messages_covered` unchanged (#176).
+refused one, or a reply with no `content` text, leaves the rolling summary and
+`messages_covered` unchanged (#176).
 
 ### `session_summarizer.md` -- Episodic Memory Summaries
 
