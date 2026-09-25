@@ -1796,14 +1796,30 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
     }
     agent_config.posture = posture_resolved;
 
-    // Override system prompt with bootstrap prompt for first-time agents.
+    // Override the system prompt with the bootstrap interview prompt for an
+    // agent with no `personality.md` -- on runs a human started, and only
+    // those (#174). `bootstrap.md` tells the agent to interview "the user".
+    // A system-triggered run (peer DM turn, notification run, scheduled job,
+    // job-episode continuation) has nobody to interview, and on a peer DM
+    // turn `dm_recipient.md` says in the same prompt that the counterparty
+    // is NOT a human. Keyed on `is_system_triggered` for the reason the
+    // posture override above is: it is the flag that says whether a human
+    // sent this turn. `AgentRuntime::is_user_facing_context` answers a
+    // different question -- which session *types* are the user's -- and a
+    // notification run landing on the user's web-chat session passes it
+    // with no human in the turn.
+    //
+    // `needs_bootstrap()` means "no `personality.md`", not "first run": an
+    // agent that never finishes the interview gets this prompt on every
+    // human-started run until the file exists.
+    //
     // Must come after per-agent overrides so bootstrap takes precedence.
     // Only mutates `system_prompt`; the layered fields the snapshot tracks
     // (provider/model/posture/budgets/debug) are unaffected.
     let agent_config =
         if let (Some(workspace_dir), Some(name)) = (&state.workspace_dir, &agent_name) {
             let workspace = alms_runtime::AgentWorkspace::new(workspace_dir, name);
-            if workspace.needs_bootstrap() {
+            if !is_system_triggered && workspace.needs_bootstrap() {
                 info!(
                     "Agent {} ({}) has no personality.md — using bootstrap prompt",
                     name, agent_id.0
