@@ -142,6 +142,16 @@ Each item below changes behaviour for a deployment that has not set the knob exp
   than a silent fall back to the file. `--json` output gains a `target` field
   (`"gateway"` or `"secrets_file"`); `alms auth list` is unchanged and still reads the
   file.
+- `./install.sh` installs into `$CARGO_HOME/bin` when `CARGO_HOME` is set, instead of
+  always `~/.cargo/bin`. An `alms` earlier on `PATH` — such as one a previous run left in
+  `~/.cargo/bin` — is now reported rather than silently shadowing the new install. The
+  binary is replaced by rename instead of overwritten in place: on macOS the in-place copy
+  left an `alms` that was `Killed: 9` on every launch while the script reported success,
+  and the script now runs the installed `alms --version` before saying it worked. It also
+  runs from any directory or through a symlink, honours `CARGO_TARGET_DIR`, stops with a
+  pointer to rustup when `cargo` is missing and warns when there is no `rustup`, writes its
+  errors to stderr, and exits 2 on an unknown argument instead of starting a build
+  (`--help` prints usage).
 
 ### Frontend
 

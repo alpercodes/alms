@@ -25,8 +25,21 @@ if [[ $# -gt 0 ]]; then
 fi
 
 # Build and install paths below are relative, so run from the repo root no
-# matter where the script was invoked from.
-cd -- "$(dirname -- "$0")" || exit 1
+# matter where the script was invoked from, or through which symlink. A loop
+# because `readlink -f` only reached macOS in 12.3. A relative link target is
+# relative to the link's directory, and `cd -P` resolves any `..` in it
+# physically, as the kernel does. SCRIPT_DIR is its own assignment so that a
+# failing `dirname` stops the script (`set -e`) instead of `cd ""` staying put.
+SCRIPT="$0"
+while [[ -L "$SCRIPT" ]]; do
+    LINK="$(readlink -- "$SCRIPT")"
+    case "$LINK" in
+        /*) SCRIPT="$LINK" ;;
+        *) SCRIPT="$(dirname -- "$SCRIPT")/$LINK" ;;
+    esac
+done
+SCRIPT_DIR="$(dirname -- "$SCRIPT")"
+cd -P -- "$SCRIPT_DIR" || exit 1
 
 if ! command -v cargo >/dev/null 2>&1; then
     echo "ERROR: cargo not found on PATH. Install Rust from https://rustup.rs" >&2
