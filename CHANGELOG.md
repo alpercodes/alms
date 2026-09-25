@@ -192,9 +192,10 @@ one.
   defaults, and reqwest selects the platform backend whenever `default-tls` is on and
   `http3` is off — OpenSSL on Linux, Security.framework on macOS, SChannel on Windows —
   while nothing in `crates/` calls `use_rustls_tls`. So this clears the audit gate on code
-  that ships but is never reached; no operator action. Lockfile-only, and it also moved four
-  Windows-only crates' `windows-sys` link 0.52.0 -> 0.60.2 (`errno`, `rustix`, `tempfile`,
-  `winapi-util`), which any update touching `ring` triggers.
+  that ships but is never reached; no operator action. Lockfile-only. The same re-resolve
+  also moved the Windows-only `windows-sys` dependency of `errno`, `rustix`, `tempfile` and
+  `winapi-util` from 0.52.0 to 0.60.2; nothing changes on Linux or macOS, and x86_64
+  Windows builds drop `windows-sys` 0.52.0 (aarch64 Windows keeps it for `ring`).
 
 ## v0.2.3 — released (tag `v0.2.3`)
 
