@@ -300,8 +300,17 @@ pub(crate) fn warn_worktree_and_full_os_access_overlap_at_boot(
 /// The sidecar file is `<data_dir>/agent_id` — a plain-text UUID.
 /// If the file is missing or contains garbage, a new ID is generated and
 /// persisted (self-healing). Write failures are non-fatal warnings.
+///
+/// Still written on a fresh install, although the registry is the source of
+/// truth for agents: this ID is the gateway's boot-time default
+/// (`AppState::default_agent_id`, `GET /settings`' `agent_id`), and the
+/// global-token Telegram fallback files its sessions under it, so it has to
+/// stay the same across restarts even while no agent exists. The file alone
+/// does not trigger a registry migration; see [`migrate_sidecar_agent`].
+///
 /// Whether the agent ID was loaded from an existing sidecar file (true)
-/// or freshly generated (false). Used to skip auto-migration on first run.
+/// or freshly generated (false). Used to skip auto-migration on first run;
+/// not sufficient on its own to mean a pre-registry deployment (#180).
 static SIDECAR_EXISTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 #[instrument]
@@ -381,7 +390,9 @@ impl Gateway {
                     );
                 }
                 // Auto-migrate sidecar agent into the agents registry — only
-                // if a sidecar file existed (actual migration, not first run).
+                // if a sidecar file existed (not first run) and, inside
+                // `migrate_sidecar_agent`, only if its agent owns sessions
+                // (a pre-registry deployment, not a fresh install; #180).
                 if SIDECAR_EXISTED.load(std::sync::atomic::Ordering::Relaxed) {
                     migrate_sidecar_agent(&store, *agent_id.read());
                 }
@@ -1116,13 +1127,52 @@ async fn process_telegram_message(
 /// `./data/agent_id` (a plain-text UUID) before multi-agent support was added.
 /// If the agents table already has entries, this is a no-op.
 ///
+/// **Only when the sidecar agent owns sessions (#180).** A sidecar on disk
+/// does not mean a pre-registry deployment: `resolve_default_agent_id` writes
+/// one on every fresh install's first boot. Gating on the file alone therefore
+/// registered an agent nobody created, `main` as the default, on a fresh
+/// install's second boot, and that also skipped first-run onboarding, which
+/// shows only while the agents table is empty. What a pre-registry deployment
+/// has and a fresh install does not is sessions filed under the sidecar's ID.
+/// Those are the data this migration exists to keep reachable, so a sidecar
+/// agent with none has nothing to migrate.
+///
 /// Uses `create_agent_if_none_exist` to atomically check-and-insert within a
 /// single SQLite transaction, avoiding the TOCTOU race between checking
-/// `list_agents().is_empty()` and `create_agent()`.
+/// `list_agents().is_empty()` and `create_agent()`. The `list_agents` read
+/// below is only there to skip the session scan on every boot of a
+/// deployment that already has agents.
 ///
 /// All errors are non-fatal (`warn!` only) — migration must never block startup.
 #[instrument(skip(store))]
 fn migrate_sidecar_agent(store: &SqliteStore, agent_id: AgentId) {
+    match store.list_agents() {
+        Ok(agents) if !agents.is_empty() => return,
+        Ok(_) => {}
+        Err(e) => {
+            warn!("Could not list agents; skipping sidecar migration: {}", e);
+            return;
+        }
+    }
+    match store.load_sessions_by_agent(agent_id) {
+        Ok(sessions) if sessions.is_empty() => {
+            info!(
+                "Sidecar agent ID {} owns no sessions — not registering it (a fresh \
+                 install's sidecar, not a pre-registry deployment)",
+                agent_id.0
+            );
+            return;
+        }
+        Ok(_) => {}
+        Err(e) => {
+            warn!(
+                "Could not load the sidecar agent's sessions; skipping sidecar migration: {}",
+                e
+            );
+            return;
+        }
+    }
+
     let migration_name = "main";
     if let Err(e) = validate_agent_name(migration_name) {
         warn!(
@@ -1352,10 +1402,20 @@ mod tests {
         assert_eq!(persisted.lifecycle_revision(), run.lifecycle_revision());
     }
 
+    /// A store shaped like a pre-registry deployment: a session filed under
+    /// the sidecar's agent ID, and an empty agents table.
+    fn legacy_store(sidecar_id: AgentId) -> SqliteStore {
+        let store = SqliteStore::open_in_memory().unwrap();
+        store
+            .save_session(&alms_session::Session::new(sidecar_id, "web-chat-1"))
+            .unwrap();
+        store
+    }
+
     #[test]
     fn test_migrate_creates_default_agent() {
-        let store = SqliteStore::open_in_memory().unwrap();
         let agent_id = AgentId::new();
+        let store = legacy_store(agent_id);
         migrate_sidecar_agent(&store, agent_id);
 
         let agents = store.list_agents().unwrap();
@@ -1367,8 +1427,8 @@ mod tests {
 
     #[test]
     fn test_migrate_idempotent() {
-        let store = SqliteStore::open_in_memory().unwrap();
         let agent_id = AgentId::new();
+        let store = legacy_store(agent_id);
         migrate_sidecar_agent(&store, agent_id);
         migrate_sidecar_agent(&store, agent_id);
 
@@ -1376,10 +1436,30 @@ mod tests {
         assert_eq!(agents.len(), 1);
     }
 
+    /// #180: the signal is sessions filed under the *sidecar's* ID. A fresh
+    /// install's store is empty, and sessions owned by some other agent (one
+    /// deleted from the registry, say) are no reason to register the sidecar.
+    #[test]
+    fn test_migrate_skips_sidecar_that_owns_no_sessions() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let sidecar_id = AgentId::new();
+        migrate_sidecar_agent(&store, sidecar_id);
+        assert!(store.list_agents().unwrap().is_empty(), "empty store");
+
+        store
+            .save_session(&alms_session::Session::new(AgentId::new(), "web-chat-1"))
+            .unwrap();
+        migrate_sidecar_agent(&store, sidecar_id);
+        assert!(
+            store.list_agents().unwrap().is_empty(),
+            "sessions owned by another agent"
+        );
+    }
+
     #[test]
     fn test_migrate_preserves_agent_id() {
-        let store = SqliteStore::open_in_memory().unwrap();
         let agent_id = AgentId::new();
+        let store = legacy_store(agent_id);
         migrate_sidecar_agent(&store, agent_id);
 
         let loaded = store.load_agent_by_id(agent_id).unwrap();
@@ -1397,7 +1477,10 @@ mod tests {
 
     #[test]
     fn test_migrate_skips_when_agents_exist() {
-        let store = SqliteStore::open_in_memory().unwrap();
+        // The sidecar agent owns a session, so the existing agent is the
+        // only reason left to skip.
+        let sidecar_id = AgentId::new();
+        let store = legacy_store(sidecar_id);
         // Pre-populate with an agent
         let existing_id = AgentId::new();
         let existing = AgentRecord {
@@ -1408,12 +1491,88 @@ mod tests {
         store.create_agent(&existing).unwrap();
 
         // Migration with a different agent_id should be a no-op
-        let sidecar_id = AgentId::new();
         migrate_sidecar_agent(&store, sidecar_id);
 
         let agents = store.list_agents().unwrap();
         assert_eq!(agents.len(), 1);
         assert_eq!(agents[0].id, existing_id);
+    }
+
+    /// One gateway boot the way `alms gateway` does it: the default agent ID
+    /// resolved from the data dir's sidecar, then `Gateway::new` on the
+    /// database. Returns the registered agents and the resolved ID.
+    fn boot(data_dir: &Path, db_path: &str) -> (Vec<AgentRecord>, AgentId) {
+        let agent_id = resolve_default_agent_id(data_dir);
+        let gateway = Gateway::new(GatewayConfig {
+            db_path: Some(db_path.to_string()),
+            agent_id: Some(agent_id),
+            ..GatewayConfig::default()
+        })
+        .unwrap();
+        let agents = gateway
+            .session_manager
+            .store()
+            .unwrap()
+            .list_agents()
+            .unwrap();
+        (agents, agent_id)
+    }
+
+    /// #180, as reported: a fresh install booted twice with nothing done in
+    /// between. Boot 1 writes the sidecar; before the fix boot 2 found it and
+    /// registered `main` as the default. The sidecar stays and keeps its ID;
+    /// only the registry is left alone, so first-run onboarding still shows.
+    #[test]
+    fn fresh_install_booted_twice_registers_no_agent() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("alms.db");
+        let db_path = db_path.to_str().unwrap();
+
+        let (agents, first_id) = boot(dir.path(), db_path);
+        assert!(agents.is_empty(), "boot 1 registered {agents:?}");
+        let (agents, second_id) = boot(dir.path(), db_path);
+        assert!(agents.is_empty(), "boot 2 registered {agents:?}");
+
+        assert_eq!(first_id, second_id, "the default ID is stable across boots");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("agent_id")).unwrap(),
+            first_id.0.to_string(),
+            "the sidecar is kept, not rewritten or removed"
+        );
+    }
+
+    /// The upgrade the migration exists for: a pre-registry deployment with
+    /// a sidecar and sessions filed under it still gets `main`, the default,
+    /// with the sidecar's ID, so those sessions stay attached to an agent.
+    #[test]
+    fn pre_registry_deployment_still_migrates_its_sidecar_agent() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("alms.db");
+        let db_path = db_path.to_str().unwrap();
+        let legacy_id = AgentId::new();
+        std::fs::write(dir.path().join("agent_id"), legacy_id.0.to_string()).unwrap();
+        let session = alms_session::Session::new(legacy_id, "web-chat-1");
+        SqliteStore::open(db_path)
+            .unwrap()
+            .save_session(&session)
+            .unwrap();
+
+        let (agents, resolved) = boot(dir.path(), db_path);
+
+        assert_eq!(resolved, legacy_id);
+        assert_eq!(agents.len(), 1, "got {agents:?}");
+        assert_eq!(agents[0].id, legacy_id);
+        assert_eq!(agents[0].name, "main");
+        assert!(agents[0].is_default);
+        let sessions = SqliteStore::open(db_path)
+            .unwrap()
+            .load_sessions_by_agent(legacy_id)
+            .unwrap();
+        assert_eq!(
+            sessions.len(),
+            1,
+            "the legacy session is the migrated agent's"
+        );
     }
 
     // ── #947: WARN-log assertions for [security].allow_full_os_access ──
