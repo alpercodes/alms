@@ -1384,6 +1384,12 @@ open (absent otherwise):
 }
 ```
 
+The episode opens when a firing is admitted, which is before its first turn
+starts if the agent is busy with another run (#181). Its clock starts with that
+turn. Until then `started_at` is the admission time, `deadline_remaining_secs`
+reports the full deadline, and no deadline runs. The deadline and the catch-up
+check count from when the turn starts.
+
 Every job object carries `lifecycle_revision`, `retry_count`, and optional
 `last_error`. Status is one of `pending`, `active`, `completed`, `failed`, or
 `cancelled`. Terminal reasons are `completed`, `deadline_reached`,

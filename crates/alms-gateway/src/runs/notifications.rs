@@ -144,6 +144,7 @@ async fn dispatch_job_firing(
 /// `Queued` with a cancel token, and its episode is open with this run as
 /// turn 1. What remains is to execute it once the agent is free.
 pub(super) struct AdmittedJobRun {
+    job_id: JobId,
     run_id: RunId,
     session_id: SessionId,
     agent_id: alms_core::AgentId,
@@ -155,7 +156,13 @@ pub(super) struct AdmittedJobRun {
 impl AdmittedJobRun {
     /// Run the turn. Awaits completion; errors are handled inside
     /// `execute_run`, whose exit hooks drive the episode from here on.
+    ///
+    /// The episode's clock starts here, not at admission: the D6 catch-up
+    /// and the 4-hour deadline measure the episode, and the queue wait
+    /// before this point is not part of it (see
+    /// [`job_episode::JobEpisodeTracker::start_turn_one`]).
     pub(super) async fn execute(self, state: AppState) {
+        state.job_episodes.start_turn_one(self.job_id, self.run_id);
         execute_run_guarded(
             state,
             RunParams {
@@ -195,16 +202,17 @@ impl AdmittedJobRun {
 ///
 /// The episode opens here rather than at dequeue, so the queued run is turn
 /// 1 from the start:
-/// - an exit of `execute_run` before the turn runs (a queued-then-cancelled
-///   run) releases the reservation and closes the episode like any other
-///   exit;
 /// - a second firing during the wait is absorbed into the D6 catch-up
 ///   instead of queueing a second run;
-/// - the D6 missed-tick window starts when the job fired, so a cron tick
-///   that elapses during the wait is caught up at close;
-/// - `GET /jobs` shows the open episode while the firing waits.
+/// - `GET /jobs` shows the open episode while the firing waits;
+/// - a `DELETE /jobs` that lands during the wait finds the episode under the
+///   gate, together with the run.
 ///
-/// The 4-hour deadline also counts from here.
+/// The episode's clock does not start here. The D6 missed-tick window and
+/// the 4-hour deadline both count from when turn 1 starts
+/// ([`AdmittedJobRun::execute`]). The queued turn runs after any tick that
+/// passes during the wait, so that tick is not missed, and the wait is not
+/// part of the episode's time budget.
 pub(super) async fn admit_job_run(
     state: &AppState,
     job_id: JobId,
@@ -273,6 +281,7 @@ pub(super) async fn admit_job_run(
     drop(admission_guard);
 
     Ok(Some(AdmittedJobRun {
+        job_id,
         run_id,
         session_id,
         agent_id: job.agent_id,
@@ -859,7 +868,7 @@ async fn notify_job_completion(
     let (job_name, _) = crate::sse::truncate_chars(&single_line_prompt, JOB_NAME_MAX_CHARS);
 
     // Deep-link handle to the job's hidden session — the same context id
-    // `fire_job_run` uses (`job_{job_id}`) so consumers can resolve the run's
+    // `admit_job_run` uses (`job_{job_id}`) so consumers can resolve the run's
     // originating session.
     let job_session_id = format!("job_{}", job_id.0);
 
@@ -867,7 +876,7 @@ async fn notify_job_completion(
     // (`Path<SessionId>`) can't resolve it, so the card's "Go to job session"
     // button 400s when it navigates by the handle. Resolve the job session's
     // real random `SessionId` here (the same `(agent_id, "job_{id}")` key
-    // `fire_job_run` created it under) and emit THAT so the button navigates
+    // `admit_job_run` creates it under) and emit THAT so the button navigates
     // by a value the session endpoint accepts. `None` if the hidden session
     // isn't resident (e.g. evicted) — the card then just omits the button.
     let job_session_uuid = state
@@ -4006,7 +4015,7 @@ mod tests {
     /// the job session's REAL `SessionId` — a value `GET /session/{id}`
     /// (`Path<SessionId>`) can resolve — not the `job_{id}` context handle
     /// (which 400s). This exercises the RESOLUTION, not just string threading:
-    /// it stands up the hidden job session exactly as `fire_job_run` does
+    /// it stands up the hidden job session exactly as `admit_job_run` does
     /// (`get_or_create(agent_id, "job_{id}")`), fires the notification, and
     /// pins that the emitted `job_session_uuid` equals that session's real id,
     /// parses back to it, and is distinct from the context handle.
@@ -4019,7 +4028,7 @@ mod tests {
         let web_session_id = state.session_manager.get_or_create(agent_id, "web").id;
 
         // The hidden job session — created under the SAME (agent_id, context)
-        // key `fire_job_run` uses, so it carries its own random SessionId.
+        // key `admit_job_run` uses, so it carries its own random SessionId.
         let job_id = JobId::new();
         let job_ctx = format!("job_{}", job_id.0);
         let real_job_session_id = state.session_manager.get_or_create(agent_id, &job_ctx).id;

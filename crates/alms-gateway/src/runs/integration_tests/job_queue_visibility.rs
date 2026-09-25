@@ -315,6 +315,60 @@ async fn a_second_firing_during_the_wait_is_absorbed_not_queued() {
     shutdown_token.cancel();
 }
 
+/// #185 review S1: the queue wait is not episode time. A recurring job fires
+/// behind a busy agent, and the wait spans one of the job's own cron ticks.
+/// Turn 1 then runs after that tick, so it has already covered it: the
+/// close must re-arm for the next tick, not fire a D6 catch-up that would
+/// run the same prompt again straight away.
+///
+/// A real tick cannot be waited out here, so the wait is simulated by
+/// backdating the queued episode's `started_at` by two days (the helper job
+/// is daily at midnight). That is exactly what a long wait did before the
+/// fix, when the clock started at admission.
+#[tokio::test]
+async fn a_firing_that_waits_past_a_tick_is_not_caught_up_at_close() {
+    let (state, shutdown_token, _cr, _tr, _dr) = test_app_state_with_mock_llm();
+    let agent_id = AgentId::new();
+    let web_session_id = state.session_manager.get_or_create(agent_id, "web").id;
+    let job_id = create_recurring_job(&state, agent_id, "nightly digest");
+    let job_session_id = job_session(&state, agent_id, job_id);
+    let mut job_events = subscribe_session(&state, job_session_id);
+    let busy = BusyAgent::start(&state, agent_id, web_session_id).await;
+
+    start_fire_loop(&state).send(job_id).unwrap();
+    let job_run_id = run_id_of(&await_run_created(&mut job_events).await);
+    state
+        .job_episodes
+        .backdate_started_at(job_id, chrono::Duration::days(2));
+
+    busy.finish(&state);
+
+    let finished = eventually("the job run to finish", || {
+        state
+            .run_manager
+            .get_run(job_run_id)
+            .filter(|run| run.status().is_terminal())
+    })
+    .await;
+    assert_eq!(finished.status(), RunStatus::Completed);
+    eventually("the episode to close", || {
+        state.job_episodes.snapshot(job_id).is_none().then_some(())
+    })
+    .await;
+    let job = state.job_store.get(job_id).unwrap();
+    let recorded = job.last_run_at.expect("the episode close recorded the run");
+    // A D6 catch-up records `next_run_at = now`, the close time itself; a
+    // normal re-arm records the next tick after it.
+    assert!(
+        job.next_run_at.is_some_and(|next| next > recorded),
+        "turn 1 ran after the tick, so the close must re-arm for the next one, \
+         not catch up: recorded at {recorded}, next_run_at {:?}",
+        job.next_run_at
+    );
+
+    shutdown_token.cancel();
+}
+
 /// A hard stop while the firing's run is queued: the work item never runs.
 /// The run was persisted `queued` at admission, so the next process's boot
 /// sweep (`mark_stale_runs_failed`, which `Gateway::new` runs before
@@ -374,6 +428,16 @@ async fn a_job_run_queued_at_a_hard_stop_is_failed_at_boot_and_the_job_stays_due
         job.next_run_at.is_some_and(|due| due <= chrono::Utc::now()),
         "still due, so the boot catch-up fires it again; got {:?}",
         job.next_run_at
+    );
+    // And the boot scheduler does fire it: `bootstrap_scheduler` puts the job
+    // in the catch-up cohort, rather than skipping it as spent.
+    assert!(
+        matches!(
+            crate::server::bootstrap_fire_at(&job, chrono::Utc::now()),
+            Some(crate::server::BootstrapFire::CatchUp { due_at }) if Some(due_at) == job.next_run_at
+        ),
+        "the next boot must fire the job once as a catch-up; got {:?}",
+        crate::server::bootstrap_fire_at(&job, chrono::Utc::now())
     );
 
     shutdown_token.cancel();
