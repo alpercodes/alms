@@ -13,17 +13,18 @@
 //! provider received. That is the prompt the agent was actually given,
 //! whatever happens between the override and the wire.
 //!
-//! The guard reads `is_system_triggered`, so the value each caller passes is
-//! part of the fix. Two tests start the run from the production caller
-//! instead of building `RunParams`, which pins that value:
-//! [`peer_dm_turn_gets_the_normal_prompt_not_bootstrap`] goes through
-//! `run_trigger_loop` -> `enqueue_triggered_run` (peer DMs, notification
-//! runs, episode continuations), and
-//! [`scheduled_job_run_gets_the_normal_prompt_not_bootstrap`] through
-//! `fire_job_run`. Both callers pass `true`, which also drives the Guarded ->
-//! Autonomous posture override. The other tests build `RunParams` by hand, to
-//! test the guard itself: with `false` for a human, as `create_run` (HTTP
-//! `POST /runs`) sends it, and with `true` across session types.
+//! The guard reads `is_system_triggered`, so the value each triggered path
+//! passes is part of the fix. Two tests start the run from the loop that
+//! production feeds instead of building `RunParams`, so they pin that value
+//! wherever below the loop it is set:
+//! [`peer_dm_turn_gets_the_normal_prompt_not_bootstrap`] from
+//! `run_trigger_loop` (peer DMs, notification runs, episode continuations),
+//! and [`scheduled_job_run_gets_the_normal_prompt_not_bootstrap`] from
+//! `scheduler_fire_loop` (scheduled jobs). Both paths pass `true`, which also
+//! drives the Guarded -> Autonomous posture override. The other tests build
+//! `RunParams` by hand, to test the guard itself: with `false` for a human,
+//! as `create_run` (HTTP `POST /runs`) sends it, and with `true` across
+//! session types.
 
 use super::seed_alice_bob;
 use crate::server::AppState;
@@ -249,23 +250,24 @@ async fn peer_dm_turn_gets_the_normal_prompt_not_bootstrap() {
     h.shutdown.cancel();
 }
 
-/// A scheduled job, started by the real `fire_job_run`, so this pins the
-/// `is_system_triggered` value that caller passes. The `job_` row below
-/// covers the same session type with hand-built `RunParams`.
+/// A scheduled job, fired through `scheduler_fire_loop` the way the
+/// scheduler fires it, so this pins the `is_system_triggered` value the job
+/// path passes, whichever function under the loop builds the run. The `job_`
+/// row below covers the same session type with hand-built `RunParams`.
 #[tokio::test]
 async fn scheduled_job_run_gets_the_normal_prompt_not_bootstrap() {
     let h = Harness::new().await;
     let job_id = super::create_recurring_job(&h.state, h.bob, "daily digest");
+    let (fire_tx, fire_rx) = mpsc::unbounded_channel();
+    let fire_loop = tokio::spawn(crate::runs::notifications::scheduler_fire_loop(
+        fire_rx,
+        h.state.clone(),
+    ));
+    fire_tx.send(job_id).unwrap();
 
-    crate::runs::notifications::fire_job_run(h.state.clone(), job_id)
-        .await
-        .expect("fire_job_run must succeed");
+    let prompt = system_prompt_of(&h.first_request().await, "job");
+    fire_loop.abort();
 
-    let bodies = h.llm.request_bodies().await;
-    let prompt = system_prompt_of(
-        bodies.first().expect("the job run never reached the LLM"),
-        "job",
-    );
     assert!(
         !prompt.contains(bootstrap()),
         "a scheduled job run must not get the bootstrap prompt; got:\n{prompt}"
