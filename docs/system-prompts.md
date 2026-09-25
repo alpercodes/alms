@@ -88,7 +88,9 @@ accumulated past the summary interval, the `maybe_summarize()` method calls the 
 with the summarizer prompt to compress old messages into a rolling summary.
 
 **Code path**: `maybe_summarize()` in `agent/context.rs` -- builds a separate LLM request
-with the summarizer system prompt and a user message containing the transcript.
+with the summarizer system prompt and a user message containing the transcript. The
+result goes through the same output screen as the episodic summarizer's (below); a
+refused one leaves the rolling summary and `messages_covered` unchanged (#176).
 
 ### `session_summarizer.md` -- Episodic Memory Summaries
 
@@ -106,6 +108,7 @@ on what was accomplished, not internal steps.
 - Uses `summary_model` if configured, otherwise falls back to the agent's default model
 - Errors are logged and swallowed -- summary failure must never fail the run
 - Summarizer input is sanitized: the run's extended-thinking trace is stripped from the assistant output via `strip_reasoning_from_output()` before either mode (heuristic or LLM) consumes it, so reasoning content can never leak into `session_summaries.summary` (#1098)
+- Summarizer output is screened before it is persisted by `screen_summary_output()` (#176): only the response's `content` counts, never `reasoning_content`, and a completion that stopped at the cap (`finish_reason: length`) or is dominated by repeated tokens is refused with a `WARN` carrying `finish_reason`, `output_len` and `check`. The existing summary is kept; a session with none yet gets the heuristic line
 
 ## Prompt Assembly Order
 

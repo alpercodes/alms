@@ -349,7 +349,9 @@ impl AgentRuntime {
     /// call the LLM to extend the rolling summary with the oldest uncovered messages.
     ///
     /// Returns the (possibly updated) `ContextSummary`. On success the updated
-    /// summary is also persisted via `session_manager.update_summary()`.
+    /// summary is also persisted via `session_manager.update_summary()`. A
+    /// summarizer output that `episodic::screen_summary_output` refuses
+    /// (#176) is logged and dropped, and `current` comes back unchanged.
     ///
     /// **#869 redesign.** Compaction is now driven by **token thresholds**
     /// rather than message counts. The pre-#869 shape fired when
@@ -568,16 +570,39 @@ impl AgentRuntime {
 
         let response = summary_client.complete(request).await?;
 
-        let new_text = response
-            .choices
-            .into_iter()
-            .next()
-            .and_then(|c| c.message.effective_content().map(|s| s.to_string()))
+        let choice = response.choices.into_iter().next();
+        let finish_reason = choice.as_ref().and_then(|c| c.finish_reason.clone());
+        // `content` only, never `reasoning_content` -- the same rule as the
+        // episodic summarizer (#176): a reasoning trace is not a summary.
+        let new_text = choice
+            .and_then(|c| c.message.content)
+            .filter(|s| !s.is_empty())
             .ok_or_else(|| {
                 alms_core::AlmsError::Runtime(
                     "Summarization LLM returned empty response".to_string(),
                 )
             })?;
+
+        // #176: this write replaces the rolling summary AND advances
+        // `messages_covered` past the compressed range, so an accepted bad
+        // summary is the only trace those messages keep in the context
+        // window. On a refusal neither field moves, in memory or in the
+        // store, and the next compaction retries the same range. `Ok`
+        // rather than `Err`: the caller treats `Err` as "build this turn
+        // without the rolling summary", and the stored one is still good.
+        if let Err(rejection) =
+            crate::episodic::screen_summary_output(&new_text, finish_reason.as_deref())
+        {
+            warn!(
+                target: "alms.context",
+                finish_reason = finish_reason.as_deref().unwrap_or("unknown"),
+                output_len = new_text.len(),
+                check = rejection.as_str(),
+                covered = current.messages_covered,
+                "Compact strategy: summarizer output rejected -- rolling summary and coverage unchanged"
+            );
+            return Ok(current);
+        }
 
         current.text = new_text;
         current.messages_covered = compress_end;
@@ -613,6 +638,18 @@ mod tests {
     /// `compact_retain_pct = 0.40` → with `overhead_tokens = 0` the trigger
     /// is 800 tokens and the verbatim retain window is 400 tokens.
     fn compact_runtime() -> AgentRuntime {
+        compact_runtime_with(
+            LlmClient::new(LlmConfig {
+                mock: true,
+                ..LlmConfig::default()
+            })
+            .unwrap(),
+        )
+    }
+
+    /// [`compact_runtime`] on the given client, which is also the
+    /// summarizer, since `summary_llm` is `None`.
+    fn compact_runtime_with(llm: LlmClient) -> AgentRuntime {
         let config = crate::agent::AgentConfig {
             context_config: ContextConfig {
                 strategy: "compact".into(),
@@ -625,11 +662,7 @@ mod tests {
         AgentRuntime {
             agent_id: AgentId::new(),
             config,
-            llm: LlmClient::new(LlmConfig {
-                mock: true,
-                ..LlmConfig::default()
-            })
-            .unwrap(),
+            llm,
             summary_llm: None,
             tools: ToolRegistry::new(),
             workspace: None,
@@ -685,8 +718,17 @@ mod tests {
     }
 
     /// ~100 tokens of real content per message (`estimate_tokens` = len/3).
+    ///
+    /// Every filler token is distinct. The mock LLM echoes the transcript
+    /// back as the summary, and a phrase repeated on loop is exactly what
+    /// the #176 repetition screen refuses to store. Each 22-byte chunk
+    /// replaces a 22-byte `"conversation content. "`, so the token math
+    /// below is unchanged.
     fn real_turn(i: usize) -> String {
-        format!("real turn {i} — {}", "conversation content. ".repeat(14))
+        let filler: String = (0..14)
+            .map(|j| format!("topic{i:02}{j:02} detail{i:02}{j:02}. "))
+            .collect();
+        format!("real turn {i} — {filler}")
     }
 
     /// #1204(a): synthetic display-only markers must not count toward the
@@ -766,14 +808,16 @@ mod tests {
                 )
             })
             .collect();
-        // Same ~2000-token bulk, but genuine content.
-        for _ in 0..2 {
+        // Same ~2000-token bulk, but genuine content. Varied for the same
+        // reason as `real_turn`, in chunks the same 18 bytes as the
+        // `"important detail. "` they replace.
+        for n in 0..2 {
+            let filler: String = (0..180)
+                .map(|k| format!("note{n}{k:03} details. "))
+                .collect();
             history.insert(
                 2,
-                make_msg(
-                    Role::User,
-                    &format!("big real message: {}", "important detail. ".repeat(180)),
-                ),
+                make_msg(Role::User, &format!("big real message: {filler}")),
             );
         }
 
@@ -851,5 +895,93 @@ mod tests {
         // The persisted copy must match the returned one.
         let persisted = session_manager.get_summary(session.id).unwrap();
         assert!(!persisted.text.contains("UNIQUE-MARKER-SENTINEL"));
+    }
+
+    /// #176 on the compaction path. An accepted summary replaces the rolling
+    /// summary and advances `messages_covered` in one step, so a bad one
+    /// would push the compressed messages out of the window with only the
+    /// garbage standing in for them. A refused one must move neither field,
+    /// in the returned value or in the session manager. Once for each check.
+    #[tokio::test]
+    async fn rejected_summary_leaves_rolling_summary_and_coverage_untouched() {
+        use alms_test_support::{Canned, ScriptedLlm};
+
+        let cut_off = "The user asked alice to move the gateway config and alice";
+        let degenerate = vec!["our"; 512].join(" ");
+        for (check, content, finish) in [
+            ("length", cut_off.to_string(), "length"),
+            ("repetition", degenerate, "stop"),
+        ] {
+            let body = serde_json::json!({
+                "id": "compact-1",
+                "object": "chat.completion",
+                "created": 0,
+                "model": "summary-model",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": content},
+                    "finish_reason": finish,
+                }],
+            })
+            .to_string();
+            let llm = ScriptedLlm::always(Canned::json(200, body)).await;
+            let runtime = compact_runtime_with(
+                LlmClient::new(LlmConfig {
+                    base_url: llm.base_url(),
+                    api_key: "test-key".into(),
+                    default_model: "summary-model".into(),
+                    timeout_secs: 5,
+                    ..LlmConfig::default()
+                })
+                .unwrap(),
+            );
+            let session_manager = SessionManager::new(SessionConfig::default());
+            let session = session_manager.get_or_create(runtime.agent_id, "test");
+            let seeded = ContextSummary {
+                text: "Earlier, the user and alice agreed on the config layout.".into(),
+                messages_covered: 2,
+                updated_at: Some(Timestamp::now()),
+            };
+            session_manager
+                .update_summary(session.id, seeded.clone())
+                .unwrap();
+
+            // Ten ~100-token turns past the covered two: over the 800 trigger.
+            let history: Vec<Message> = (0..12)
+                .map(|i| {
+                    make_msg(
+                        if i % 2 == 0 {
+                            Role::User
+                        } else {
+                            Role::Assistant
+                        },
+                        &real_turn(i),
+                    )
+                })
+                .collect();
+
+            let result = runtime
+                .maybe_summarize(&session_manager, session.id, &history, seeded.clone(), 0)
+                .await
+                .expect("a refused summary is not an error");
+
+            assert_eq!(
+                llm.calls(),
+                1,
+                "[{check}] compaction must have fired and asked the summarizer"
+            );
+            assert_eq!(result.text, seeded.text, "[{check}]");
+            assert_eq!(
+                result.messages_covered, seeded.messages_covered,
+                "[{check}]"
+            );
+            let persisted = session_manager.get_summary(session.id).unwrap();
+            assert_eq!(persisted.text, seeded.text, "[{check}]");
+            assert_eq!(
+                persisted.messages_covered, seeded.messages_covered,
+                "[{check}]"
+            );
+            assert_eq!(persisted.updated_at, seeded.updated_at, "[{check}]");
+        }
     }
 }
