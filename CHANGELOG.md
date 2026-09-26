@@ -68,6 +68,23 @@ Each item below changes behaviour for a deployment that has not set the knob exp
 
 - **Server-default model and provider are now changeable without a restart.**
 
+- **With `ALMS_DB_PATH` set, `alms auth` now uses the secrets file beside the database.**
+  `secrets.json` lives next to the SQLite database: `{data_dir}/secrets.json` by default,
+  and in the directory of `ALMS_DB_PATH` when that points elsewhere. The gateway has always
+  read it there. `alms auth set` / `remove` with no gateway running, and `alms auth list`,
+  used `{data_dir}/secrets.json` instead, so under `ALMS_DB_PATH` a key set from the CLI
+  went to a file no gateway read, and `list` showed that file rather than the gateway's
+  (#170). The two now resolve one path. Deployments without `ALMS_DB_PATH`, or with it
+  inside the data directory, are unaffected, and no gateway reads a different file than
+  before.
+
+  **After upgrading**, `alms auth list` under such a configuration shows the gateway's keys.
+  A `{data_dir}/secrets.json` left by an earlier `alms auth` is not read, moved or merged —
+  a key no gateway has used would otherwise take precedence over the one it uses. The
+  gateway at boot and every `alms auth` command name the file until it is dealt with:
+  move it beside the database if nothing is there yet, or set any key you still need with
+  `alms auth set` and delete it.
+
 ### Multi-agent and DM
 
 - Two spellings of one subagent name now resolve to a single subagent, and agent names may
@@ -139,7 +156,7 @@ Each item below changes behaviour for a deployment that has not set the knob exp
   key was visibly on disk and the next run still failed to authenticate. With no gateway
   answering, both commands write the file exactly as before. A gateway that answers and
   then *rejects* the change (a missing `ALMS_AUTH_TOKEN`, say) is now an error rather
-  than a silent fall back to the file. `--json` output gains a `target` field
+  than a silent fall back to the file, and the error names that file. `--json` output gains a `target` field
   (`"gateway"` or `"secrets_file"`); `alms auth list` is unchanged and still reads the
   file.
 
