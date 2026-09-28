@@ -24,6 +24,7 @@ use alms_test_support::{Canned, ScriptedLlm};
 use std::time::Duration;
 
 mod activity_feed;
+mod bootstrap_prompt;
 mod cancellation;
 mod config_resolution;
 mod dm_end;
