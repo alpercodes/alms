@@ -1,12 +1,23 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Build and install paths below are relative, so run from the repo root no
+# matter where the script was invoked from.
+cd "$(dirname "$0")"
+
+if ! command -v cargo >/dev/null 2>&1; then
+    echo "ERROR: cargo not found on PATH. Install Rust from https://rustup.rs"
+    echo "The pinned nightly in rust-toolchain.toml installs itself on first build."
+    exit 1
+fi
+
 echo "Building ALMS (release)..."
 cargo build --release
 
-BINARY="target/release/alms"
+TARGET_DIR="${CARGO_TARGET_DIR:-target}"
+BINARY="$TARGET_DIR/release/alms"
 if [[ "$OSTYPE" == "msys" || "$OSTYPE" == "cygwin" || "$OSTYPE" == "win32" ]]; then
-    BINARY="target/release/alms.exe"
+    BINARY="$TARGET_DIR/release/alms.exe"
 fi
 
 if [[ ! -f "$BINARY" ]]; then
