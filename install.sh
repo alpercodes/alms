@@ -49,11 +49,27 @@ fi
 
 # rust-toolchain.toml is honoured by rustup's cargo shim, not by cargo itself.
 # A cargo from a package manager (brew, apt) passes the check above and then
-# builds with whatever compiler it shipped with.
+# builds with whatever compiler it shipped with. Having rustup installed is not
+# enough: another cargo can come first on PATH (`brew shellenv` in ~/.zprofile
+# puts Homebrew's ahead of rustup's ~/.cargo/bin). So ask the cargo that will
+# run the build. Under rustup, this installs the pinned toolchain if it is
+# missing, which the build below would do anyway, a step later. `|| true`
+# keeps a failing `cargo --version` a warning, like the rest of this check.
 if ! command -v rustup >/dev/null 2>&1; then
     echo "WARNING: rustup not found, so the nightly pinned in rust-toolchain.toml is" >&2
     echo "ignored and cargo builds with its own compiler. If the build fails, install" >&2
     echo "Rust from https://rustup.rs instead." >&2
+else
+    case "$(cargo --version || true)" in
+        *nightly*) ;;
+        *)
+            WHICH_CARGO="$(command -v cargo)"
+            WHICH_RUSTUP="$(command -v rustup)"
+            echo "WARNING: $WHICH_CARGO is not the nightly pinned in rust-toolchain.toml," >&2
+            echo "so the pin is not in effect. Is another cargo ahead of rustup's on PATH? If the" >&2
+            echo "build fails, put ${WHICH_RUSTUP%/*} first in PATH." >&2
+            ;;
+    esac
 fi
 
 echo "Building ALMS (release)..."
