@@ -820,10 +820,11 @@ async fn deleted_job_session_cannot_gain_an_orphan_scheduled_run() {
             .await;
     let acquire_barrier = crate::runs::lifecycle::install_admission_acquire_barrier(session.id);
     let fire_state = state.clone();
-    let fire =
-        tokio::spawn(
-            async move { crate::runs::notifications::fire_job_run(fire_state, job.id).await },
-        );
+    let fire = tokio::spawn(async move {
+        crate::runs::notifications::admit_job_run(&fire_state, job.id)
+            .await
+            .map(|admitted| admitted.is_some())
+    });
 
     acquire_barrier.wait().await;
     state.session_manager.delete(agent_id, &context_id).unwrap();
