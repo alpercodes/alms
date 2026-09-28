@@ -11,7 +11,7 @@ files (`personality.md`, `goals.md`, `memories.md`, `user.md`).
 |------|---------|---------|
 | `initial.md` | Base system prompt for all top-level agents. Sets the agent's default behavior and mentions the `alms --help` CLI discovery hint. | `AgentConfig::default()` in `crates/alms-runtime/src/agent/types.rs` |
 | `tool_loop.md` | Continuation prompt appended to the system message after tool results. Tells the LLM to analyze results and decide whether to use more tools or respond. | `SystemPrompts::default()` in `crates/alms-runtime/src/agent/types.rs` |
-| `bootstrap.md` | First-time agent onboarding prompt. Replaces the initial prompt when `personality.md` does not exist. Guides the agent through an interview to populate workspace files. | `AgentWorkspace::bootstrap_prompt()` in `crates/alms-runtime/src/workspace.rs` |
+| `bootstrap.md` | First-time agent onboarding prompt. Replaces the initial prompt on human-started runs when `personality.md` does not exist. Guides the agent through an interview to populate workspace files. | `AgentWorkspace::bootstrap_prompt()` in `crates/alms-runtime/src/workspace.rs` |
 | `dm_recipient.md` | Template appended to the system prompt when the agent receives a direct message. Explains the implicit-reply contract (#1154): the final message text is delivered to the peer automatically. Contains a `{peer}` placeholder replaced at runtime with the sender's name. | `build_context()` in `crates/alms-runtime/src/agent/context.rs` |
 | `subagent.md` | Default system prompt for ephemeral (unnamed) subagents spawned via `invoke_agent`. | `DEFAULT_SUBAGENT_PROMPT` constant in `crates/alms-coordinator/src/lib.rs` |
 | `summarizer.md` | System prompt for the sliding-summary LLM call that compresses old conversation history into a rolling summary. | `maybe_summarize()` in `crates/alms-runtime/src/agent/context.rs` |
@@ -36,12 +36,19 @@ has workspace files.
 
 When a named agent has no `personality.md` file (detected by
 `AgentWorkspace::needs_bootstrap()`), the gateway replaces the initial system prompt
-with the bootstrap prompt. This happens in two places:
+with the bootstrap prompt on runs a human started. This happens in two places:
 
-1. HTTP runs: `crates/alms-gateway/src/runs.rs` -- `start_run()` checks
-   `workspace.needs_bootstrap()` before creating the runtime.
+1. Gateway runs (`execute_run`): `crates/alms-gateway/src/runs/lifecycle.rs` -- `execute_run()` checks
+   `workspace.needs_bootstrap()` before creating the runtime, and only for runs
+   with `is_system_triggered == false` (a `POST /runs`). Peer DM turns, notification
+   runs, scheduled jobs and job-episode continuations keep the agent's normal
+   prompt: the bootstrap prompt asks the agent to interview "the user", and those
+   runs have none (#174).
 2. Telegram runs: `crates/alms-gateway/src/gateway.rs` -- the Telegram polling
-   loop checks the same condition.
+   loop checks the same condition. Every run there answers a Telegram message.
+
+The condition is "no `personality.md`", not "first run": an agent whose interview
+never writes the file gets the bootstrap prompt on every human-started run.
 
 **Code path**: `AgentWorkspace::bootstrap_prompt()` -> `include_str!("../prompts/bootstrap.md")`
 
