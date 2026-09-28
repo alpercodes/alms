@@ -94,6 +94,21 @@ Each item below changes behaviour for a deployment that has not set the knob exp
   fallbacks are no longer silent.
 - Durable job recovery and atomic, bounded per-agent run admission.
 - Scheduled jobs stay active until the agent's full task completes ("job episodes").
+- An LLM-written session summary is no longer saved when the summarizer stopped at
+  `summary_max_tokens` (`finish_reason: length`) or looped on a few words. Either one used
+  to replace the session's accumulated summary outright (one observed case was the word
+  `our` repeated to the 1000-token cap), was then fed back as the base for the next
+  summary, and was injected into the agent's other sessions as episodic memory. Now the
+  existing summary is kept and the refusal is logged at `WARN` with `finish_reason`,
+  `output_len` and `check`, under a message containing `summarizer output rejected`; a
+  session with no summary yet gets the heuristic `"input" -> "output"` line instead. The
+  `compact` strategy's rolling summary is screened the same way, and a refused one neither
+  replaces the summary nor advances past the messages it would have covered. The
+  summarizer's `reasoning_content` is no longer used as a summary. A summarizer model that
+  answers only in its reasoning channel now logs `summarizer returned empty response` at
+  `WARN`, with `has_reasoning` set, and its summaries stop updating: an existing one is
+  kept as it is and a new session keeps the heuristic line, until the model answers in
+  `content`. Summaries saved before upgrading are not repaired.
 
 ### Tools and workspace
 
@@ -193,6 +208,16 @@ one.
   `Registering tool: <name>`), and the worktree drift warnings carry
   `drift=already_present` / `drift=already_absent`. Levels, targets and the rest of the
   fields are unchanged.
+- `rustls` 0.23.36 -> 0.23.45 (with `rustls-webpki` 0.103.13 -> 0.103.15) to clear
+  RUSTSEC-2026-0285, a TLS 1.3 handshake bug. v0.2.3 carries the affected version, but no
+  ALMS connection goes through rustls: `reqwest` is declared with `rustls-tls` *and* its own
+  defaults, and reqwest selects the platform backend whenever `default-tls` is on and
+  `http3` is off — OpenSSL on Linux, Security.framework on macOS, SChannel on Windows —
+  while nothing in `crates/` calls `use_rustls_tls`. So this clears the audit gate on code
+  that ships but is never reached; no operator action. Lockfile-only. The same re-resolve
+  also moved the Windows-only `windows-sys` dependency of `errno`, `rustix`, `tempfile` and
+  `winapi-util` from 0.52.0 to 0.60.2; nothing changes on Linux or macOS, and x86_64
+  Windows builds drop `windows-sys` 0.52.0 (aarch64 Windows keeps it for `ring`).
 
 ## v0.2.3 — released (tag `v0.2.3`)
 
