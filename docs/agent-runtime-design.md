@@ -365,7 +365,7 @@ After each successful run, the gateway spawns a fire-and-forget `tokio::spawn` t
 
 - **`off`** — No summaries generated. No episodic injection.
 - **`heuristic`** — Deterministic, no LLM call. Produces a one-liner from the first ~120 bytes of run input and ~80 bytes of the agent's response (when available). Successive runs in the same session append entries; oldest lines are trimmed when total exceeds ~500 chars.
-- **`llm`** (default) — Lightweight LLM call using `session_summarizer.md` prompt. Receives run input (~2000 chars), agent output (~2000 chars), and existing summary. Produces a concise 1-3 sentence evolving summary. Max 300 output tokens. When the configured model is a reasoning model (e.g. minimax-m2.5, deepseek-r1), the summarizer falls back to `reasoning_content` if `content` is null or empty.
+- **`llm`** (default) — Lightweight LLM call using `session_summarizer.md` prompt. Receives run input (~2000 chars), agent output (~2000 chars), and existing summary. Produces a concise 1-3 sentence evolving summary. Output capped at `summary_max_tokens` (default 1000). Only the response's `content` is used, never `reasoning_content`, and a response that stopped at the cap (`finish_reason: length`) or is dominated by repeated tokens is refused (#176): the existing summary is kept, or, for a session with none yet, the heuristic line is written instead.
 
 **How episodic context is injected:**
 

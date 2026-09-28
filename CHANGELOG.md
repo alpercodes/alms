@@ -87,6 +87,21 @@ Each item below changes behaviour for a deployment that has not set the knob exp
   fallbacks are no longer silent.
 - Durable job recovery and atomic, bounded per-agent run admission.
 - Scheduled jobs stay active until the agent's full task completes ("job episodes").
+- An LLM-written session summary is no longer saved when the summarizer stopped at
+  `summary_max_tokens` (`finish_reason: length`) or looped on a few words. Either one used
+  to replace the session's accumulated summary outright (one observed case was the word
+  `our` repeated to the 1000-token cap), was then fed back as the base for the next
+  summary, and was injected into the agent's other sessions as episodic memory. Now the
+  existing summary is kept and the refusal is logged at `WARN` with `finish_reason`,
+  `output_len` and `check`, under a message containing `summarizer output rejected`; a
+  session with no summary yet gets the heuristic `"input" -> "output"` line instead. The
+  `compact` strategy's rolling summary is screened the same way, and a refused one neither
+  replaces the summary nor advances past the messages it would have covered. The
+  summarizer's `reasoning_content` is no longer used as a summary. A summarizer model that
+  answers only in its reasoning channel now logs `summarizer returned empty response` at
+  `WARN`, with `has_reasoning` set, and its summaries stop updating: an existing one is
+  kept as it is and a new session keeps the heuristic line, until the model answers in
+  `content`. Summaries saved before upgrading are not repaired.
 
 ### Tools and workspace
 
