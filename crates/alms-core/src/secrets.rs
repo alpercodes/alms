@@ -37,17 +37,98 @@ const NONCE_LEN: usize = 12;
 /// Minimum header size: version(1) + salt(32) + nonce(12) = 45 bytes.
 const HEADER_LEN: usize = 1 + SALT_LEN + NONCE_LEN;
 
-/// Resolve the default secrets file path from a data directory.
-pub fn secrets_path(data_dir: &Path) -> PathBuf {
-    data_dir.join("secrets.json")
+/// File name of the secrets store.
+const SECRETS_FILE: &str = "secrets.json";
+
+/// The secrets file for an instance whose SQLite database is at `db_path`:
+/// `secrets.json` in the database's directory. This is the one resolver,
+/// for every process: the CLI reaches it through
+/// [`ServerConfig::secrets_path`](crate::config::ServerConfig::secrets_path),
+/// and the gateway calls it with the same `db_path` (#170).
+///
+/// # Why beside the database, and not in `data_dir`
+///
+/// By default the two are the same directory, since the database is
+/// `{data_dir}/alms.db`. They differ only when `ALMS_DB_PATH` points the
+/// database somewhere else. In that configuration, the gateway has always
+/// read and written this file, beside the database, so every key a gateway
+/// has actually used lives here: keys set in the web UI, over
+/// `PUT /auth/keys`, and, since #168, by `alms auth set` against a running
+/// gateway. Only the CLI's file writes went to `{data_dir}/secrets.json`,
+/// a file no gateway ever read (#170). Keying the path on `data_dir` would
+/// have moved every working key on upgrade. Keying it on the database moves
+/// none: the gateway reads the file it always read, and the CLI now reads
+/// it too.
+///
+/// A `{data_dir}/secrets.json` left over from those CLI writes is not read,
+/// moved or merged. [`unread_legacy_secrets`] finds it so that both the
+/// gateway and `alms auth` can name it.
+///
+/// Relative paths are made absolute against the current directory, as the
+/// database path itself is, so logs and messages name one unambiguous file.
+/// With no `db_path` (an in-memory gateway) the fallback is
+/// `./.alms/secrets.json`.
+pub fn secrets_path_from_db(db_path: Option<&str>) -> PathBuf {
+    let path = db_path
+        .and_then(|p| Path::new(p).parent().map(|d| d.join(SECRETS_FILE)))
+        .unwrap_or_else(|| Path::new("./.alms").join(SECRETS_FILE));
+    std::path::absolute(&path).unwrap_or(path)
 }
 
-/// Resolve secrets path from an optional database file path.
-/// Falls back to the default data directory if no db_path is provided.
-pub fn secrets_path_from_db(db_path: Option<&str>) -> PathBuf {
-    db_path
-        .and_then(|p| Path::new(p).parent().map(|d| d.join("secrets.json")))
-        .unwrap_or_else(|| secrets_path(Path::new("./.alms")))
+/// A `{data_dir}/secrets.json` that exists but is not the file
+/// [`secrets_path_from_db`] resolved, or `None`.
+///
+/// Before #170, `alms auth set` / `remove` with no gateway running wrote
+/// `{data_dir}/secrets.json` even when `ALMS_DB_PATH` put the database, and
+/// so the gateway's secrets file, elsewhere. Keys in such a file were never
+/// used by a gateway. They are deliberately not adopted now: a key the
+/// gateway has never used would take precedence over whatever it uses today
+/// (the secrets store wins over a provider's `api_key_env`), and when both
+/// files exist, merging could bring back a key revoked through the gateway.
+/// Only the operator can tell which one is right, so callers name the file
+/// and leave it where it is.
+///
+/// "Not the same file" is decided on canonical paths, so a data directory
+/// that is a symlink to the database's directory is not reported.
+pub fn unread_legacy_secrets(data_dir: &Path, secrets_path: &Path) -> Option<PathBuf> {
+    let legacy = data_dir.join(SECRETS_FILE);
+    if !legacy.is_file() {
+        return None;
+    }
+    match (
+        std::fs::canonicalize(&legacy),
+        std::fs::canonicalize(secrets_path),
+    ) {
+        (Ok(a), Ok(b)) if a == b => None,
+        _ => Some(legacy),
+    }
+}
+
+/// What to tell an operator about a file [`unread_legacy_secrets`] found.
+/// The gateway logs it at boot and `alms auth` prints it, so both give the
+/// same instructions.
+pub fn unread_legacy_secrets_message(legacy: &Path, secrets_path: &Path) -> String {
+    let what_to_do = if secrets_path.exists() {
+        format!(
+            "Both files exist, and only {} is used; they are not merged. Set any key you still \
+             need from the other with `alms auth set <provider>`, then delete {}.",
+            secrets_path.display(),
+            legacy.display()
+        )
+    } else {
+        format!(
+            "To use its keys, move it: mv \"{}\" \"{}\"",
+            legacy.display(),
+            secrets_path.display()
+        )
+    };
+    format!(
+        "{} is not read: with ALMS_DB_PATH set, secrets.json lives beside the database, at {}. \
+         The file in the data directory was written by `alms auth` in an earlier version, and a \
+         gateway started with this configuration does not use its keys. {what_to_do}",
+        legacy.display(),
+        secrets_path.display()
+    )
 }
 
 /// In-memory secrets store backed by an optionally-encrypted JSON file.
@@ -163,6 +244,12 @@ fn read_master_key() -> Option<Vec<u8>> {
 }
 
 impl SecretsStore {
+    /// The file this store was loaded from and saves to (empty for
+    /// [`Self::empty`]).
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
     /// Create an empty in-memory secrets store with no file backing.
     pub fn empty() -> Self {
         Self {
@@ -437,6 +524,86 @@ impl SecretsStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -- secrets_path_from_db / unread_legacy_secrets (#170) ------------------
+
+    #[test]
+    fn secrets_file_sits_beside_the_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("elsewhere").join("alms.db");
+        assert_eq!(
+            secrets_path_from_db(Some(db.to_str().unwrap())),
+            dir.path().join("elsewhere").join("secrets.json")
+        );
+    }
+
+    #[test]
+    fn a_relative_database_path_gives_an_absolute_secrets_path() {
+        let path = secrets_path_from_db(Some("state/alms.db"));
+        assert!(path.is_absolute(), "{}", path.display());
+        assert_eq!(
+            path,
+            std::env::current_dir()
+                .unwrap()
+                .join("state")
+                .join("secrets.json")
+        );
+    }
+
+    #[test]
+    fn no_database_falls_back_to_the_default_data_dir() {
+        assert_eq!(
+            secrets_path_from_db(None),
+            std::env::current_dir()
+                .unwrap()
+                .join(".alms")
+                .join("secrets.json")
+        );
+    }
+
+    #[test]
+    fn legacy_secrets_in_data_dir_are_reported_when_the_database_is_elsewhere() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let db_dir = tempfile::tempdir().unwrap();
+        let canonical = db_dir.path().join("secrets.json");
+        std::fs::write(data_dir.path().join("secrets.json"), "{}").unwrap();
+
+        // Reported whether or not the canonical file exists yet.
+        assert_eq!(
+            unread_legacy_secrets(data_dir.path(), &canonical),
+            Some(data_dir.path().join("secrets.json"))
+        );
+        std::fs::write(&canonical, "{}").unwrap();
+        assert_eq!(
+            unread_legacy_secrets(data_dir.path(), &canonical),
+            Some(data_dir.path().join("secrets.json"))
+        );
+    }
+
+    #[test]
+    fn the_canonical_file_itself_is_never_reported_as_legacy() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let canonical = data_dir.path().join("secrets.json");
+        // Absent, then present: the default layout, data_dir == db dir.
+        assert_eq!(unread_legacy_secrets(data_dir.path(), &canonical), None);
+        std::fs::write(&canonical, "{}").unwrap();
+        assert_eq!(unread_legacy_secrets(data_dir.path(), &canonical), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_data_dir_symlinked_to_the_database_dir_is_not_reported() {
+        let real = tempfile::tempdir().unwrap();
+        let links = tempfile::tempdir().unwrap();
+        let alias = links.path().join("alias");
+        std::os::unix::fs::symlink(real.path(), &alias).unwrap();
+        std::fs::write(real.path().join("secrets.json"), "{}").unwrap();
+
+        assert_eq!(
+            unread_legacy_secrets(&alias, &real.path().join("secrets.json")),
+            None
+        );
+    }
 
     #[test]
     fn test_set_get_remove() {

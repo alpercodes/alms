@@ -139,6 +139,7 @@ impl ServerConfig {
     /// Return the resolved path to the SQLite database file.
     ///
     /// Precedence: `ALMS_DB_PATH` env var > `{data_dir}/alms.db`.
+    /// `secrets.json` follows the database; see [`Self::secrets_path`].
     ///
     /// Known limitation: `to_string_lossy()` silently replaces non-UTF-8 path
     /// segments with U+FFFD, which could corrupt the path on Linux filesystems
@@ -153,6 +154,19 @@ impl ServerConfig {
                 .to_string_lossy()
                 .into_owned()
         })
+    }
+
+    /// Return the resolved path to `secrets.json`: beside the database, so
+    /// `{data_dir}/secrets.json` by default and next to `ALMS_DB_PATH` when
+    /// that is set.
+    ///
+    /// Every process that reads or writes the secrets file for this
+    /// configuration goes through here, or through
+    /// [`secrets_path_from_db`](crate::secrets::secrets_path_from_db) with the
+    /// same [`Self::db_path`], which is what this calls. That function's doc
+    /// says why the database, not `data_dir`, decides the location (#170).
+    pub fn secrets_path(&self) -> PathBuf {
+        crate::secrets::secrets_path_from_db(Some(&self.db_path()))
     }
 
     /// Return the resolved path to the agents-metadata directory under
