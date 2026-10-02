@@ -35,9 +35,22 @@ impl AgentRuntime {
     /// prefix. This is used for non-user-facing sessions — the contexts
     /// [`Self::is_user_facing_context`] rejects, which is the one place the
     /// list is written down.
+    #[cfg(test)]
     pub(crate) fn assemble_system_prompt(&self, base_prompt: &str, include_user: bool) -> String {
+        let fixed_prompt = self.fixed_system_prompt_for_budget(base_prompt, None);
+        let budget_bytes = self.workspace_prompt_budget_bytes(&fixed_prompt, 0);
+        self.assemble_system_prompt_with_budget(base_prompt, include_user, budget_bytes)
+    }
+
+    pub(crate) fn assemble_system_prompt_with_budget(
+        &self,
+        base_prompt: &str,
+        include_user: bool,
+        workspace_budget_bytes: usize,
+    ) -> String {
         if let Some(ref ws) = self.workspace {
-            let prefix = ws.build_system_prompt_prefix(include_user);
+            let prefix =
+                ws.build_system_prompt_prefix_with_budget(include_user, workspace_budget_bytes);
             if prefix.is_empty() {
                 base_prompt.to_string()
             } else {
@@ -46,6 +59,39 @@ impl AgentRuntime {
         } else {
             base_prompt.to_string()
         }
+    }
+
+    pub(crate) fn fixed_system_prompt_for_budget(
+        &self,
+        base_prompt: &str,
+        dm_peer: Option<&str>,
+    ) -> String {
+        let mut fixed_prompt = base_prompt.to_string();
+        fixed_prompt.push_str("\n\n");
+        fixed_prompt.push_str(&self.config.prompts.tool_loop);
+        if let Some(peer) = dm_peer {
+            fixed_prompt.push_str(&Self::dm_addendum(peer));
+        }
+        fixed_prompt
+    }
+
+    pub(crate) fn workspace_prompt_budget_bytes(
+        &self,
+        fixed_system_prompt: &str,
+        other_context_tokens: usize,
+    ) -> usize {
+        // Keep one reserve for ContextBuilder and one for history itself;
+        // workspace files can use only half of the remaining headroom.
+        let fixed_overhead = estimate_tokens(fixed_system_prompt)
+            .saturating_add(other_context_tokens)
+            .saturating_add(HISTORY_RESERVE.saturating_mul(2));
+        let headroom_tokens = self
+            .config
+            .context_config
+            .max_input_tokens
+            .saturating_sub(fixed_overhead)
+            / 2;
+        headroom_tokens.saturating_mul(3)
     }
 
     /// Returns true if the given context_id represents a user-facing session
@@ -112,32 +158,11 @@ impl AgentRuntime {
             ws.forget_shown_files();
         }
 
-        let mut system_prompt =
-            self.assemble_system_prompt(&self.config.system_prompt, include_user);
-
-        // For peer-triggered DM runs, append the implicit-reply addendum
-        // (`dm_recipient.md`): the agent's final message text is delivered
-        // to the peer automatically by the gateway's DM completion gate
-        // (#1154) — no tool call required.
-        //
-        // Gated on `self.dm_implicit_reply` (#1156 defense-in-depth), which
-        // the gateway sets only for peer-triggered runs (`is_peer_message`).
-        // The completion gate only delivers for peer-triggered runs, so
-        // promising implicit delivery on any other `dm:` run would be a
-        // lie that ends in a silent drop. Option C already rejects non-peer
-        // runs on `dm:` sessions at run creation; this gate keeps the
-        // prompt honest even if a new non-peer `dm:` path is ever added.
-        if self.dm_implicit_reply
-            && context_id.starts_with("dm:")
-            && let Some(peer) = self.dm_peer_name(context_id)
-        {
-            system_prompt.push_str(&Self::dm_addendum(&peer));
-            debug!(
-                peer = %peer,
-                context_id = %context_id,
-                "Injected DM recipient system prompt"
-            );
-        }
+        let dm_peer = if self.dm_implicit_reply && context_id.starts_with("dm:") {
+            self.dm_peer_name(context_id)
+        } else {
+            None
+        };
 
         let history = match session_manager.get_context_history(*session_id) {
             Ok(h) => h,
@@ -192,6 +217,36 @@ impl AgentRuntime {
         } else {
             None
         };
+
+        let fixed_system_prompt =
+            self.fixed_system_prompt_for_budget(&self.config.system_prompt, dm_peer.as_deref());
+        let episodic_tokens = episodic_text
+            .as_deref()
+            .filter(|text| !text.is_empty())
+            .map(|text| estimate_tokens(text) + 4)
+            .unwrap_or(0);
+        let other_context_tokens = estimate_tokens(input).saturating_add(episodic_tokens);
+        let workspace_budget_bytes =
+            self.workspace_prompt_budget_bytes(&fixed_system_prompt, other_context_tokens);
+        let mut system_prompt = self.assemble_system_prompt_with_budget(
+            &self.config.system_prompt,
+            include_user,
+            workspace_budget_bytes,
+        );
+
+        // For peer-triggered DM runs, append the implicit-reply addendum
+        // (`dm_recipient.md`): the agent's final message text is delivered
+        // to the peer automatically by the gateway's DM completion gate
+        // (#1154) — no tool call required. The peer is selected only when the
+        // same defense-in-depth gate used by delivery accepts this run.
+        if let Some(peer) = dm_peer {
+            system_prompt.push_str(&Self::dm_addendum(&peer));
+            debug!(
+                peer = %peer,
+                context_id = %context_id,
+                "Injected DM recipient system prompt"
+            );
+        }
 
         // For the `compact` strategy (formerly `sliding-summary`, #869),
         // attempt to compress old messages before building context. On

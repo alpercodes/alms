@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::context::estimate_llm_message_tokens;
 use crate::llm_types::ToolCall;
 
 use super::AgentRuntime;
@@ -275,7 +276,20 @@ impl AgentRuntime {
         dm_peer: Option<&str>,
     ) {
         if !messages.is_empty() && messages[0].role == "system" {
-            let mut prompt = self.assemble_system_prompt(&self.config.system_prompt, include_user);
+            let fixed_prompt =
+                self.fixed_system_prompt_for_budget(&self.config.system_prompt, dm_peer);
+            let other_context_tokens = messages
+                .iter()
+                .skip(1)
+                .map(|message| estimate_llm_message_tokens(message).saturating_add(4))
+                .sum();
+            let workspace_budget_bytes =
+                self.workspace_prompt_budget_bytes(&fixed_prompt, other_context_tokens);
+            let mut prompt = self.assemble_system_prompt_with_budget(
+                &self.config.system_prompt,
+                include_user,
+                workspace_budget_bytes,
+            );
             prompt.push_str("\n\n");
             prompt.push_str(&self.config.prompts.tool_loop);
             if let Some(peer) = dm_peer {

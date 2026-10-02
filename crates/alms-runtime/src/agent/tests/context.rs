@@ -76,6 +76,117 @@ async fn test_build_context() {
 }
 
 #[tokio::test]
+async fn oversized_workspace_files_do_not_evict_session_history() {
+    use crate::workspace::{AgentWorkspace, WorkspaceFile};
+    use alms_core::config::ContextConfig;
+    use tempfile::tempdir;
+
+    let dir = tempdir().unwrap();
+    let workspace = AgentWorkspace::new(dir.path(), "alice");
+    for (file, start, fill, end) in [
+        (
+            WorkspaceFile::Personality,
+            "PERSONALITY_START",
+            'p',
+            "PERSONALITY_END",
+        ),
+        (WorkspaceFile::Goals, "GOALS_START", 'g', "GOALS_END"),
+        (WorkspaceFile::User, "USER_START", 'u', "USER_END"),
+        (
+            WorkspaceFile::Memories,
+            "MEMORIES_START",
+            'm',
+            "MEMORIES_END",
+        ),
+    ] {
+        workspace
+            .write_file_as_operator(
+                file,
+                &format!(
+                    "{start}\n{}{end}",
+                    format!("{fill}-workspace-entry\n").repeat(10_000)
+                ),
+            )
+            .unwrap();
+    }
+
+    let runtime = AgentRuntime::new(
+        AgentId::new(),
+        AgentConfig {
+            system_prompt: "Test agent.".into(),
+            context_config: ContextConfig {
+                strategy: "truncate".into(),
+                max_input_tokens: 8_000,
+                ..ContextConfig::default()
+            },
+            sandbox_root: "".into(),
+            ..AgentConfig::default()
+        },
+        LlmClient::new(LlmConfig {
+            mock: true,
+            ..LlmConfig::default()
+        })
+        .unwrap(),
+    )
+    .unwrap()
+    .with_workspace(workspace);
+
+    let session_manager = SessionManager::new(SessionConfig::default());
+    let session = session_manager.get_or_create(runtime.agent_id, "web-chat");
+    for index in 0..8 {
+        let role = if index % 2 == 0 {
+            alms_session::Role::User
+        } else {
+            alms_session::Role::Assistant
+        };
+        session_manager
+            .append_message(
+                session.id,
+                alms_session::Message {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    role,
+                    content: alms_session::Content::Text(format!(
+                        "HISTORY_{index}_{}",
+                        "h".repeat(900)
+                    )),
+                    timestamp: alms_core::Timestamp::now(),
+                    metadata: None,
+                },
+            )
+            .unwrap();
+    }
+
+    let messages = runtime
+        .build_context(&session_manager, &session.id, "web-chat", "continue")
+        .await
+        .unwrap();
+    let system_prompt = messages[0].content_str();
+    for file in ["personality.md", "goals.md", "user.md"] {
+        assert!(
+            system_prompt.contains(&format!("{file} truncated:")),
+            "the system prompt should identify its partial {file} view"
+        );
+    }
+    assert!(
+        system_prompt.contains("Older memories truncated:"),
+        "memories should keep their existing tail-window marker"
+    );
+
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.content_str().contains("HISTORY_0_")),
+        "the oldest history should remain when one workspace file is oversized"
+    );
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.content_str().contains("HISTORY_7_")),
+        "the newest history should remain when one workspace file is oversized"
+    );
+}
+
+#[tokio::test]
 async fn test_build_context_dm_perspective_mapping() {
     let runtime = AgentRuntime {
         agent_name: Some("bob".to_string()),
