@@ -1351,6 +1351,21 @@ pub(crate) async fn completion_notification_loop(
             );
         }
 
+        // A direct operator cancel is already visible through the marker and
+        // SSE event above. Starting another parent-session run would turn the
+        // explicit stop action into unrequested work. Parent cancellation
+        // propagation keeps the normal run because it was not a separate
+        // operator action. Job episodes also keep their continuation run so
+        // their pending work can finish the episode.
+        if completion.cancelled_by_operator && episode_route.is_none() {
+            info!(
+                session_id = %session_id.0,
+                task_id = %completion.task_id.0,
+                "Directly cancelled subagent completion delivered without notification run"
+            );
+            continue;
+        }
+
         info!(
             session_id = %session_id.0,
             task_id = %completion.task_id.0,
@@ -3836,6 +3851,7 @@ mod tests {
                 task_id: alms_coordinator::TaskId::new(),
                 subagent_name: Some("researcher".to_string()),
                 status: alms_coordinator::TaskStatus::Completed,
+                cancelled_by_operator: false,
                 summary: "All done.".to_string(),
                 parent_session_id,
                 parent_agent_id,

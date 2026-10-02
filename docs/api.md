@@ -926,6 +926,14 @@ Emitted on the parent's session SSE stream when a background subagent finishes. 
 
 `status` values: `"done"`, `"fail"`, `"cancelled"`. `subagent_name` is omitted on the wire for ephemeral subagents (same shape as `subagent_started`).
 
+When a background subagent is cancelled directly through the session-keyed
+operator endpoint, this event and the persisted `subagent_completion` marker
+still carry its partial summary, but no follow-up notification run is started
+on the parent session. Cancellation propagated from a cancelled parent run is
+not an operator action and keeps the normal notification run. A background
+subagent completing as part of an open job episode still uses that episode's
+continuation run.
+
 #### Reconnect
 Supported via `Last-Event-ID` header (automatic browser reconnect) or `?last_event_id=<n>` query parameter (initial connection after loading history via REST). The query parameter takes precedence when both are present. The server replays events with IDs greater than the supplied value.
 
@@ -1084,6 +1092,12 @@ subagent's own session emits `run_cancelled`, its run record flips to
 `invoke_agent` tool call failing with `"Subagent was cancelled"` (the
 parent run continues and handles the tool error like any other tool
 failure).
+
+For a directly cancelled **background** subagent, the `subagent_completed`
+event and its persisted completion marker remain the delivery channel for any
+partial summary; the parent session does not receive a new notification run.
+If cancellation propagated from the parent run, the existing notification run
+is retained because the operator did not cancel that subagent separately.
 
 ### 5.8 List runs
 `GET /runs?session_id=<uuid>&limit=<n>` — list runs for a session (original behaviour).

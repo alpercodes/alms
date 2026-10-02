@@ -14,7 +14,10 @@ use alms_tools::subagent_self_sink::SubagentSelfEventSink;
 use async_trait::async_trait;
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::Duration;
 
 /// How long (in seconds) a subagent's result is kept in memory after the run
@@ -109,6 +112,12 @@ pub struct SubagentCompletion {
     pub task_id: TaskId,
     pub subagent_name: Option<String>,
     pub status: TaskStatus,
+    /// Whether the operator explicitly cancelled this subagent through the
+    /// session-keyed cancel endpoint. `false` also covers cancellation that
+    /// propagated from a parent run, so consumers can preserve its normal
+    /// notification behavior.
+    #[serde(default)]
+    pub cancelled_by_operator: bool,
     /// Truncated summary of the result (for context efficiency).
     pub summary: String,
     /// Parent session to notify.
@@ -220,6 +229,10 @@ struct SubagentHandle {
     /// [`Coordinator::cancel_subagent_by_session`] / the gateway's
     /// `POST /sessions/{id}/subagent/cancel` endpoint.
     cancel_token: CancellationToken,
+    /// Set only by the direct session-keyed operator cancel path. A parent
+    /// cancellation uses the same child token but must remain distinguishable
+    /// when the completion event is emitted.
+    cancelled_by_operator: Arc<AtomicBool>,
     parent_run_id: Option<RunId>,
     parent_session_id: SessionId,
     parent_agent_id: AgentId,
@@ -619,6 +632,7 @@ impl Coordinator {
             .as_ref()
             .map(|p| p.child_token())
             .unwrap_or_default();
+        let cancelled_by_operator = Arc::new(AtomicBool::new(false));
 
         // The handle is created and inserted BEFORE `subagent_started` is
         // emitted below (Tim S2, PR #1192): the moment the UI learns the
@@ -630,6 +644,7 @@ impl Coordinator {
             task_id,
             status: TaskStatus::Pending,
             cancel_token: child_cancel_token.clone(),
+            cancelled_by_operator: cancelled_by_operator.clone(),
             parent_run_id,
             parent_session_id,
             parent_agent_id,
@@ -744,6 +759,7 @@ impl Coordinator {
                     subagent_prompts,
                     completion_tx,
                     child_cancel_token,
+                    cancelled_by_operator,
                     secrets,
                     run_registrar,
                     subagent_self_sink,
@@ -853,6 +869,7 @@ impl Coordinator {
             if h.subagent_session_id == subagent_session_id
                 && matches!(h.status, TaskStatus::Pending | TaskStatus::Running)
             {
+                h.cancelled_by_operator.store(true, Ordering::Release);
                 h.cancel_token.cancel();
                 info!(
                     target: "coordinator::subagent_cancelled_by_session",
@@ -1132,6 +1149,10 @@ async fn run_subagent(
     // (child of the parent run's token when present) and shared with the
     // `SubagentHandle` so `cancel_subagent_by_session` can fire it.
     child_cancel_token: CancellationToken,
+    // Shared marker set by the direct session-keyed operator cancel path.
+    // Parent cancellation propagates through `child_cancel_token` without
+    // setting this marker.
+    cancelled_by_operator: Arc<AtomicBool>,
     secrets: Option<Arc<parking_lot::RwLock<alms_core::secrets::SecretsStore>>>,
     run_registrar: Option<Arc<dyn RunRegistrar>>,
     subagent_self_sink: Option<Arc<dyn SubagentSelfEventSink>>,
@@ -1173,6 +1194,7 @@ async fn run_subagent(
                 task_id,
                 subagent_name: request.subagent_name.clone(),
                 status: TaskStatus::Failed,
+                cancelled_by_operator: false,
                 summary: "subagent task panicked before emitting a completion".to_string(),
                 parent_session_id: request.parent_session,
                 parent_agent_id: request.parent_agent_id,
@@ -1516,6 +1538,7 @@ async fn run_subagent(
             task_id,
             subagent_name: request.subagent_name.clone(),
             status: new_status,
+            cancelled_by_operator: cancelled_by_operator.load(Ordering::Acquire),
             summary,
             parent_session_id,
             parent_agent_id,
@@ -2658,6 +2681,7 @@ mod tests {
             task_id: TaskId::new(),
             subagent_name: Some("researcher".to_string()),
             status: TaskStatus::Failed,
+            cancelled_by_operator: false,
             summary: "subagent task panicked before emitting a completion".to_string(),
             parent_session_id: SessionId::new(),
             parent_agent_id: AgentId::new(),
@@ -3635,6 +3659,7 @@ mod tests {
                 task_id,
                 status,
                 cancel_token: CancellationToken::new(),
+                cancelled_by_operator: Arc::new(AtomicBool::new(false)),
                 parent_run_id: None,
                 parent_session_id: session,
                 parent_agent_id: parent_agent,
@@ -3982,6 +4007,7 @@ mod tests {
             task_id,
             status,
             cancel_token: token.clone(),
+            cancelled_by_operator: Arc::new(AtomicBool::new(false)),
             parent_run_id: None,
             parent_session_id: SessionId::new(),
             parent_agent_id: AgentId::new(),

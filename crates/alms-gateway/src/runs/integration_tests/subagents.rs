@@ -44,6 +44,7 @@ async fn subagent_completion_propagates_session_id() {
             task_id: TaskId::new(),
             subagent_name: Some("researcher".to_string()),
             status: TaskStatus::Completed,
+            cancelled_by_operator: false,
             summary: "Found 3 relevant papers on the topic.".to_string(),
             parent_session_id,
             parent_agent_id,
@@ -144,6 +145,130 @@ async fn subagent_completion_propagates_session_id() {
     assert_eq!(
         marker_meta.get("status").and_then(|v| v.as_str()),
         Some("done"),
+    );
+
+    shutdown_token.cancel();
+}
+
+/// A direct operator cancel still delivers the cancelled subagent's marker
+/// and SSE summary, but it must not spend a new parent-session turn.
+#[tokio::test]
+async fn directly_cancelled_subagent_delivers_summary_without_notification_run() {
+    let (state, shutdown_token, _cr, _tr, _dr) = test_app_state();
+    let parent_agent_id = AgentId::new();
+    let parent_session = state
+        .session_manager
+        .get_or_create(parent_agent_id, "direct-cancel-summary-test");
+    let parent_session_id = parent_session.id;
+    let mut events = subscribe_session(&state, parent_session_id);
+    let summary = "Partial results gathered before operator cancellation.";
+
+    let (test_tx, test_rx) = mpsc::unbounded_channel();
+    test_tx
+        .send(SubagentCompletion {
+            task_id: TaskId::new(),
+            subagent_name: Some("researcher".to_string()),
+            status: TaskStatus::Cancelled,
+            cancelled_by_operator: true,
+            summary: summary.to_string(),
+            parent_session_id,
+            parent_agent_id,
+            subagent_session_id: SessionId::new(),
+            task_description: Some("Research the topic".to_string()),
+            tool_count: Some(2),
+            duration_ms: Some(1200),
+            token_usage: None,
+            parent_tool_invocation_id: None,
+        })
+        .unwrap();
+    drop(test_tx);
+
+    crate::runs::notifications::completion_notification_loop(test_rx, state.clone()).await;
+
+    assert!(
+        state
+            .run_manager
+            .list_by_session(parent_session_id, 10)
+            .is_empty(),
+        "direct cancellation must not enqueue an unrequested parent run"
+    );
+
+    let history = state
+        .session_manager
+        .get_history(parent_session_id)
+        .unwrap();
+    let marker = history
+        .iter()
+        .find(|message| {
+            message.metadata.as_ref().is_some_and(|metadata| {
+                metadata.get("type").and_then(|value| value.as_str()) == Some("subagent_completion")
+            })
+        })
+        .expect("cancelled completion marker must be persisted");
+    assert_eq!(
+        marker
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.get("summary"))
+            .and_then(|value| value.as_str()),
+        Some(summary)
+    );
+
+    let completion_event = drain_events(&mut events)
+        .into_iter()
+        .find(|event| event.event_type == "subagent_completed")
+        .expect("cancelled completion must still emit SSE");
+    assert_eq!(
+        completion_event
+            .data
+            .get("summary")
+            .and_then(|value| value.as_str()),
+        Some(summary)
+    );
+
+    shutdown_token.cancel();
+}
+
+/// A cancellation propagated from the parent run is not a separate operator
+/// action, so its completion keeps the existing notification-run behavior.
+#[tokio::test]
+async fn propagated_subagent_cancellation_keeps_notification_run() {
+    let (state, shutdown_token, _cr, _tr, _dr) = test_app_state();
+    let parent_agent_id = AgentId::new();
+    let parent_session_id = state
+        .session_manager
+        .get_or_create(parent_agent_id, "propagated-cancel-test")
+        .id;
+
+    let (test_tx, test_rx) = mpsc::unbounded_channel();
+    test_tx
+        .send(SubagentCompletion {
+            task_id: TaskId::new(),
+            subagent_name: Some("researcher".to_string()),
+            status: TaskStatus::Cancelled,
+            cancelled_by_operator: false,
+            summary: "Parent run stopped; partial results remain available.".to_string(),
+            parent_session_id,
+            parent_agent_id,
+            subagent_session_id: SessionId::new(),
+            task_description: Some("Research the topic".to_string()),
+            tool_count: Some(1),
+            duration_ms: Some(500),
+            token_usage: None,
+            parent_tool_invocation_id: None,
+        })
+        .unwrap();
+    drop(test_tx);
+
+    crate::runs::notifications::completion_notification_loop(test_rx, state.clone()).await;
+
+    assert_eq!(
+        state
+            .run_manager
+            .list_by_session(parent_session_id, 10)
+            .len(),
+        1,
+        "propagated cancellation must retain the notification run"
     );
 
     shutdown_token.cancel();
@@ -434,6 +559,7 @@ async fn subagent_completion_with_missing_parent_session_is_skipped() {
             task_id: TaskId::new(),
             subagent_name: Some("ghost".to_string()),
             status: TaskStatus::Completed,
+            cancelled_by_operator: false,
             summary: "This should be skipped".to_string(),
             parent_session_id: missing_session_id,
             parent_agent_id,
@@ -480,6 +606,7 @@ async fn subagent_completion_marker_includes_rich_metadata() {
             task_id: TaskId::new(),
             subagent_name: Some("analyzer".to_string()),
             status: TaskStatus::Failed,
+            cancelled_by_operator: false,
             summary: "OOM after processing large dataset".to_string(),
             parent_session_id,
             parent_agent_id,
@@ -576,6 +703,7 @@ async fn subagent_completion_marker_includes_reasoning_tokens() {
             task_id: TaskId::new(),
             subagent_name: Some("reasoner".to_string()),
             status: TaskStatus::Completed,
+            cancelled_by_operator: false,
             summary: "Deep thought complete".to_string(),
             parent_session_id,
             parent_agent_id,
@@ -841,7 +969,7 @@ async fn cancel_subagent_endpoint_404_when_no_live_subagent() {
 async fn cancel_subagent_endpoint_cancels_live_subagent() {
     use axum::extract::{Path as AxumPath, State as AxumState};
 
-    let (state, shutdown_token, _cr, _tr, _dr) = test_app_state_with_mock_llm();
+    let (state, shutdown_token, mut completion_rx, _tr, _dr) = test_app_state_with_mock_llm();
 
     // Spawn a background subagent directly on the coordinator (the same
     // object the endpoint reaches through `state.coordinator`). Unnamed, so
@@ -885,6 +1013,15 @@ async fn cancel_subagent_endpoint_cancels_live_subagent() {
         task_result.status
     );
 
+    let completion = completion_rx
+        .recv()
+        .await
+        .expect("directly cancelled background subagent must emit a completion");
+    assert!(
+        completion.cancelled_by_operator,
+        "session-keyed cancellation must be distinguishable from parent propagation"
+    );
+
     // Idempotence / double-click: the subagent is now terminal, so a second
     // cancel must report 404 (no live subagent), not 200.
     let second =
@@ -898,6 +1035,47 @@ async fn cancel_subagent_endpoint_cancels_live_subagent() {
         second.unwrap_err().0,
         axum::http::StatusCode::NOT_FOUND,
         "the second cancel must be a 404"
+    );
+
+    shutdown_token.cancel();
+}
+
+/// Parent-run cancellation uses the same child token as direct cancellation,
+/// but its completion must retain the propagated origin marker.
+#[tokio::test]
+async fn parent_cancelled_background_subagent_marks_propagated_completion() {
+    let (state, shutdown_token, mut completion_rx, _tr, _dr) = test_app_state_with_mock_llm();
+    let parent_cancel = CancellationToken::new();
+    let request = alms_coordinator::SubagentRequest {
+        task: "background work cancelled with the parent".to_string(),
+        parent_session: SessionId::new(),
+        parent_agent_id: AgentId::new(),
+        parent_run_id: None,
+        subagent_name: None,
+        parent_tool_invocation_id: None,
+    };
+    let (task_id, _sub_session_id) = state
+        .coordinator
+        .spawn_subagent(request, None, true, Some(parent_cancel.clone()))
+        .await
+        .expect("spawn_subagent should succeed");
+    let result_rx = state
+        .coordinator
+        .take_result_rx(task_id)
+        .expect("result receiver should be available");
+
+    parent_cancel.cancel();
+    let result = result_rx
+        .await
+        .expect("parent cancellation must terminate task");
+    assert_eq!(result.status, TaskStatus::Cancelled);
+    let completion = completion_rx
+        .recv()
+        .await
+        .expect("parent-cancelled background subagent must emit a completion");
+    assert!(
+        !completion.cancelled_by_operator,
+        "parent cancellation must not be labelled as a direct operator cancel"
     );
 
     shutdown_token.cancel();

@@ -24,6 +24,7 @@ fn format_completion_notification_for_failed_subagent() {
         task_id: TaskId::new(),
         subagent_name: Some("researcher".to_string()),
         status: TaskStatus::Failed,
+        cancelled_by_operator: false,
         summary: "Error: API rate limit exceeded after 3 tool calls".to_string(),
         parent_session_id: SessionId::new(),
         parent_agent_id: AgentId::new(),
@@ -62,6 +63,7 @@ fn format_completion_notification_for_cancelled_subagent() {
         task_id: TaskId::new(),
         subagent_name: Some("writer".to_string()),
         status: TaskStatus::Cancelled,
+        cancelled_by_operator: false,
         summary: "Run was cancelled by user".to_string(),
         parent_session_id: SessionId::new(),
         parent_agent_id: AgentId::new(),
@@ -94,6 +96,7 @@ fn format_completion_notification_for_unnamed_subagent_points_at_session_id_read
         task_id: TaskId::new(),
         subagent_name: None, // ephemeral / unnamed
         status: TaskStatus::Completed,
+        cancelled_by_operator: false,
         summary: "Research finished (truncated summary)".to_string(),
         parent_session_id: SessionId::new(),
         parent_agent_id: AgentId::new(),
