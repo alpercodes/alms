@@ -87,12 +87,14 @@ Each item below changes behaviour for a deployment that has not set the knob exp
   than "first run", an agent that never finished its interview got it on every such turn.
   Web chat and Telegram still start the interview.
 - Docs correction, no behaviour change: `guarded` posture governs the runs a human starts,
-  and is not a boundary between agents. A `guarded` agent's DM, notification and job runs,
-  and its runs as a background subagent, are promoted to `autonomous`, and any agent can
-  DM any other by name — so another agent can have a `guarded` one run tools without
-  approval. The security model used to call this override safe. It now says what it does
-  not protect and what an operator can do about it today
-  (`docs/security-model.md` § 8.1). Whether the override should change is open in #177.
+  and is not a boundary between agents. A `guarded` agent's DM, notification and job runs
+  are promoted to `autonomous`. As another agent's subagent, an agent whose record sets no
+  posture (the default) runs `full_control`, foreground or background, and one set to
+  `guarded` is promoted in the background. Any agent can DM any other by name, so another
+  agent can have a `guarded` one run tools without approval. The security model used to
+  call this override safe. It now says what it does not protect and what an operator can
+  do about it today (`docs/security-model.md` § 8.1). Whether the override should change
+  is open in #177.
 
 ### Persistence and durability
 

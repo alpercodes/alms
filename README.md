@@ -88,9 +88,10 @@ later session.
   context budget.
 
 New agents inherit the server's default posture, `guarded`, so the first risky tool call
-in a run you start raises an approval card in the chat and waits for you. `full_control`
-and `autonomous` skip that gate, and so do a `guarded` agent's runs that no human started
-(see *Before you run this*);
+in a run you start raises an approval card in the chat and waits for you. Telegram has no
+approval card: in a run started by a message to the agent's bot, that call fails and the
+agent sees the error. `full_control` and `autonomous` skip that gate, and so do a
+`guarded` agent's runs that no human started (see *Before you run this*);
 [`docs/security-model.md` § 2](docs/security-model.md#2-approval-model-human-in-the-loop)
 covers what each one checks.
 
@@ -126,10 +127,15 @@ decisions, and you should know them before deploying:
   `invoke_agent` call supplies, so any agent can claim it, registered or not.
 - **Approval covers the runs you start, not what agents do to each other.** A `guarded`
   agent's runs that no human started — a DM from another agent, a notification, a
-  scheduled job — run tools without approval, and any agent can DM any other by name. So
-  one agent that reads untrusted input can drive every agent in the same gateway: keep
-  such agents in a separate gateway from those holding what you would not hand that input.
-  See [`docs/security-model.md` § 8.1](docs/security-model.md#guarded-is-not-an-agent-boundary).
+  scheduled job, a run as another agent's subagent — run tools without approval (except a
+  foreground subagent run of an agent whose record sets `guarded` itself: its first gated
+  call is denied), and any agent can DM any other by name. So one agent that reads
+  untrusted input can drive every agent in the same gateway: keep such agents in a separate
+  gateway from those holding what you would not hand that input. That is a boundary only
+  if its tools cannot reach the other gateway — a separate project root, `ALMS_AUTH_TOKEN`
+  set on the gateway you protect, and, where `shell` has no filesystem boundary, a
+  different OS user. See
+  [`docs/security-model.md` § 8.1](docs/security-model.md#guarded-is-not-an-agent-boundary).
 - **Prompt injection is not solved.** Tool output enters the model's context; a hostile
   repository or web page can attempt to steer an agent.
 

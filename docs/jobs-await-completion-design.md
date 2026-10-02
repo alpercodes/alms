@@ -3,6 +3,7 @@
 **Status:** APPROVED — final decisions by Alper (2026-07-06): JobEpisode model, per-turn runs, structural quiescence, job-as-DM-source, **4-hour episode hard deadline with detach-and-complete expiry**, queue-on-overlap coalesced to one catch-up, subagents in phase 1. Phase 1 ships together with this doc in PR #1202 (issue #1198, under the #763 cron-scheduler audit umbrella).
 **Author:** Heph, 2026-07-06.
 **Verified against:** `develop` @ `c4c313b`.
+**Since then:** #185 removed `fire_job_run`, the job fire path this doc names throughout. A firing now goes `scheduler_fire_loop` → `dispatch_job_firing`, which calls `admit_job_run` to create the `Run` and open the episode before the run waits on the agent queue, then submits `AdmittedJobRun::execute` to run it (all in `crates/alms-gateway/src/runs/notifications.rs`). Read `fire_job_run` below, and its line numbers, as the code at `c4c313b`.
 
 ## Problem Statement
 

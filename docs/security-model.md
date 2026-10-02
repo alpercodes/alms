@@ -98,11 +98,14 @@ three values. `guarded` (default) sends every tool call that is not auto-approve
 the approval gate — `needs_approval_gate = posture == Guarded && !auto_approved` in the
 agent loop. `full_control` executes tools without approval. `autonomous` also executes
 without approval, and is what a `guarded` agent's system-triggered runs (peer DMs,
-notifications, subagent completions, scheduled jobs) are promoted to, because nobody is
-present to approve. `resolve_posture_for_run` overrides `Guarded` only, so a
-`full_control` agent keeps its own posture on those runs — see § 8. `guarded` therefore
-governs the runs a human starts and is not a boundary between agents: an agent that can
-send a `guarded` agent a DM can have it run tools without approval
+notifications including subagent completions, scheduled jobs and their job-episode
+continuations) are promoted to, because nobody is present to approve.
+`resolve_posture_for_run` overrides `Guarded` only, so a `full_control` agent keeps its
+own posture on those runs — see § 8. A run as another agent's subagent skips approval
+too, unless the agent's record itself sets `guarded` and the subagent runs in the
+foreground, where its first gated call is denied. `guarded` therefore governs the runs a
+human starts and is not a boundary between agents: an agent that can send a `guarded`
+agent a DM can have it run tools without approval
 ([§ 8.1](#guarded-is-not-an-agent-boundary)). "Safe" above
 corresponds to `guarded` and "Developer" to `full_control`;
 "Locked-down" has no posture of its own — the nearest lever is the `[tools].enabled`
@@ -685,6 +688,7 @@ do that for you:
   the operator believes they granted full OS access and granted nothing.
   Keep entries inside the agent-name class.
 
+<a id="shell-sandboxing-platform-asymmetry"></a>
 #### Shell sandboxing platform asymmetry — be honest about this
 
 The `fs_*` prefix check (the application-layer
@@ -885,6 +889,10 @@ edit the TOML and restart the daemon. The same model is applied to
 
 Cron = persistence. Treat it as privileged.
 
+These rules are proposals. What ships differs: a job runs as the agent that owns it, with
+that agent's tools, and a `guarded` agent's job runs are promoted to `autonomous`. See
+[§ 8.1](#guarded-is-not-an-agent-boundary).
+
 Rules:
 - Creating/modifying jobs should usually require approval.
 - Jobs run with a dedicated principal: `job:<id>`
@@ -1041,25 +1049,26 @@ Default posture recommendations:
 - Network allowlist empty by default — not yet implemented
 - Auto-approved tools skip approval in Guarded posture — **implemented**: `datetime`, `echo`, `list_agents`, `list_my_sessions`, `read_session`, `read_messages`, `read_subagent_session` return `is_auto_approved() = true`; all other tools still require user approval
 - Cronjob creation requires approval — implemented via Guarded posture, in runs a human starts: an agent creates a job with a `shell` call, which a Guarded user run sends to the approval gate
-  - **Exception:** a `guarded` agent's system-triggered runs — peer-to-peer DMs (via `send_message`), notification runs (e.g., `ConversationEnded`, subagent completions), and scheduled jobs — are promoted to Autonomous, and so is a `guarded` agent run as a background subagent. Those runs execute tools, cronjob creation included, without approval. See [Guarded is not a boundary between agents](#guarded-is-not-an-agent-boundary).
+  - **Exception:** a `guarded` agent's system-triggered runs — peer-to-peer DMs (via `send_message`), notification runs (e.g., `ConversationEnded`, subagent completions), and scheduled jobs and their job-episode continuations — are promoted to Autonomous. Its runs as another agent's subagent skip approval too: a subagent takes its posture from its registry record, a record that sets none (the default for a new agent) runs `full_control`, and a record set to `guarded` is promoted to Autonomous in the background. Those runs execute tools, cronjob creation included, without approval. Only a foreground subagent run of a record set to `guarded` does not; its first gated call is denied. See [Guarded is not a boundary between agents](#guarded-is-not-an-agent-boundary).
 
 <a id="guarded-is-not-an-agent-boundary"></a>
 ### 8.1 Guarded is not a boundary between agents
 
 `guarded` governs the runs a human starts. It is not a boundary between agents.
 
-**Why the promotion exists.** A system-triggered run has nobody to approve its tool calls. The gateway sets `is_system_triggered` on those runs — `enqueue_triggered_run` for DMs, notifications and job-episode continuations, `fire_job_run` for scheduled jobs — and `resolve_posture_for_run` promotes `Guarded` to `Autonomous` for them. The coordinator's `resolve_subagent_posture` does the same for background subagents. Unpromoted, a headless `guarded` run would block on its first gated tool call until the `max_run_duration_secs` backstop (24 hours by default). A foreground subagent keeps `guarded`; nothing routes its approval requests to a human, so they are denied.
+**Why the promotion exists.** A system-triggered run has nobody to approve its tool calls. The gateway sets `is_system_triggered` on those runs — `enqueue_triggered_run` for DMs, notifications and job-episode continuations, `AdmittedJobRun::execute` for scheduled jobs — and `resolve_posture_for_run` promotes `Guarded` to `Autonomous` for them. The coordinator's `resolve_subagent_posture` does the same for background subagents. Unpromoted, a headless `guarded` run would stop at its first gated tool call and wait on an approval nobody is watching. Nothing times that wait out: `max_run_duration_secs` is checked only between loop iterations. The run would wait until someone resolved the approval through the approvals API, cancelled the run, or stopped the daemon, holding its agent's queue throughout. A subagent would not wait: the coordinator denies its approval requests, and the denial cancels the subagent's run. A subagent takes its posture from its registry record, and a record that sets none, the default for a new agent, runs `full_control`, foreground or background; so does an unnamed subagent, or one whose name is not registered. Only a record set to `guarded` keeps that posture, and only in the foreground, where its first gated call is denied and cancels the subagent.
 
-**What it does not protect.** An HTTP client cannot set `is_system_triggered` (`create_run` never does), but a peer agent causes it with an ordinary DM, and the DM's text becomes the run's input. `send_message` resolves any registered agent by name — the only sender check is that an agent cannot message itself — and `list_agents` is auto-approved, so every name is discoverable. Any agent that can run `send_message` can therefore have any `guarded` agent run tools without approval:
+**What it does not protect.** An HTTP client cannot set `is_system_triggered` (`create_run` never does), but a peer agent causes it with an ordinary DM, and the DM's text becomes the run's input. `send_message` resolves any registered agent by name. The only sender check is that an agent cannot message itself; the depth cap of 20 ends one conversation but does not limit how many conversations can start. `list_agents` is auto-approved, so every name is discoverable. Any agent that can run `send_message` can therefore have any `guarded` agent run tools without approval:
 
 - A `full_control` or `autonomous` sender, or an agent already in a promoted run, needs no approval to send. A `guarded` agent in a run a human started needs one, and approving that `send_message` lets every DM turn of the conversation, on both sides, run unapproved.
-- A promoted run can `send_message` onward, `invoke_agent` a registered agent in the background, or create a job through `shell` — the call a Guarded user run sends to approval — all without approval. A job's runs are promoted in turn, so a DM can leave behind work that keeps running unapproved.
+- A promoted run can `send_message` onward, `invoke_agent` a registered agent in the background, or create a job through `shell` — the call a Guarded user run sends to approval — all without approval. (`alms job create` goes through the API, so `ALMS_AUTH_TOKEN` blocks that one: `shell` children never see the token.) A job's runs are promoted in turn, so a DM can leave behind work that keeps running unapproved.
 - Anything a sender has ingested — an `http_get` of an arbitrary URL, a file or repository it did not write — can reach a `guarded` agent's tools this way (§ 3.3).
-- On macOS and Windows, and on Linux below 5.13, a promoted run's `shell` has no filesystem boundary ([§ 4.4](#filesystem-sandboxing)): it has the daemon OS user's reach.
+- On macOS and Windows, and on Linux below 5.13, a promoted run's `shell` has no filesystem boundary ([§ 4.4](#shell-sandboxing-platform-asymmetry)): it has the daemon OS user's reach.
+- A promoted run can turn approval off for the runs a human starts, too. The gateway points `shell` at the live database through `ALMS_DATA_DIR`, and `alms agent config <name> --posture full_control` writes the agent registry in SQLite directly, with no API call and so no `ALMS_AUTH_TOKEN` check. Wherever `shell` can reach the data directory, one unapproved `shell` call can make any agent `full_control` until someone sets it back. It can on macOS, Windows and Linux below 5.13 wherever the data directory lives, and on Linux 5.13+ whenever the data directory is inside the shell's sandbox root, as the default `./.alms` is inside the default project root. So "`guarded` governs the runs a human starts" holds only until a promoted run does this.
 
 **What an operator can do today.** Within one gateway, treat every agent as able to run every other agent's tools without approval.
 
-- Keep an agent that reads untrusted input out of a gateway whose agents hold tools or data you would not hand to that input. A separate gateway, with its own data directory and therefore its own agent registry, is the only boundary `send_message` and `invoke_agent` do not cross.
+- Keep an agent that reads untrusted input out of a gateway whose agents hold tools or data you would not hand to that input. A separate gateway, with its own data directory and therefore its own agent registry, is the only boundary `send_message` and `invoke_agent` do not cross. It is a boundary only if the untrusted gateway's tools cannot reach the other: give each gateway its own project root, not containing the other's data directory; set `ALMS_AUTH_TOKEN` on the gateway you are protecting (its API is otherwise open on loopback, and `shell` children never see the token); and where `shell` has no filesystem boundary, run the two daemons as different OS users that cannot read each other's files.
 - `[tools].enabled` can withhold `send_message`, `invoke_agent` or `http_get`, but only from every agent at once; there is no per-agent tool list. Scheduled jobs and notification runs are promoted either way.
 - Where `shell` has no filesystem boundary, run the daemon as an OS user whose access you would give an unapproved run.
 
