@@ -56,7 +56,7 @@ When `invoke_agent(name="reviewer")` is called, the coordinator:
 3. Derives workspace directory: `{workspace_dir}/{name}/`
 4. Creates `AgentWorkspace` pointing at that directory
 5. Calls `runtime.with_workspace(workspace)` before running the agent loop
-6. On first invocation, `needs_bootstrap()` returns true → the agent bootstraps itself
+6. No bootstrap: a subagent run has no user to interview, so a named subagent without `personality.md` runs on its normal prompt. The interview is only for human-started runs (#174).
 
 The workspace is tied to the **name**, not the task ID. Named subagent "reviewer" always uses the same workspace directory and the same session — it accumulates identity across invocations.
 
