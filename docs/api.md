@@ -1791,6 +1791,7 @@ Side effects: creates the agent's workspace directory at `{workspace_dir}/{name}
 Errors:
 - `400 INVALID_NAME` — name fails validation (1–64 chars, ASCII alphanumeric + hyphens, no leading/trailing hyphens, not a reserved name, not UUID-shaped). Uppercase is allowed and preserved verbatim.
 - `409 DUPLICATE_NAME` — name already exists. **Uniqueness is case-insensitive**: `Atlas` and `atlas` are the same name, because an agent's workspace is a directory at `{workspace_dir}/{name}/` and Windows/macOS filesystems are case-insensitive while Linux is not.
+- `409 WORKSPACE_EXISTS` — the name's workspace path already exists and cannot be reused safely (for example, it contains files or is a symlink). Move or remove it before reusing the agent name; the API does not delete existing workspace data.
 
 ### 9.3 Get agent
 `GET /agents/{id_or_name}`

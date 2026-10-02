@@ -532,6 +532,36 @@ pub fn validate_agent_name(name: &str) -> AlmsResult<()> {
 /// Workspace file names created for every new agent.
 pub const WORKSPACE_FILENAMES: &[&str] = &["personality.md", "goals.md", "memories.md", "user.md"];
 
+/// Refuse to reuse an existing agent workspace that contains data.
+///
+/// Workspaces are keyed by agent name, while registry rows are keyed by ID.
+/// A deleted agent can therefore leave files that a newly created agent would
+/// otherwise inherit. Empty directories are safe to reuse; symlinks, files,
+/// and non-empty directories are not.
+pub fn ensure_workspace_dir_available(dir: &Path) -> std::io::Result<()> {
+    let metadata = match std::fs::symlink_metadata(dir) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "agent workspace path already exists",
+        ));
+    }
+
+    match std::fs::read_dir(dir)?.next() {
+        None => Ok(()),
+        Some(Ok(_)) => Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "agent workspace already contains data",
+        )),
+        Some(Err(error)) => Err(error),
+    }
+}
+
 /// Migrate workspace directories from UUID-based to name-based paths.
 ///
 /// For each `(uuid, name)` pair, renames `{workspace_dir}/{uuid}/` to
@@ -845,6 +875,26 @@ mod tests {
             "Keep this"
         );
         // Cleanup
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn workspace_dir_availability_allows_missing_or_empty_and_rejects_data() {
+        let tmp = std::env::temp_dir().join(format!("alms-test-{}", uuid::Uuid::new_v4()));
+        let dir = tmp.join("agent");
+
+        ensure_workspace_dir_available(&dir).unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        ensure_workspace_dir_available(&dir).unwrap();
+
+        std::fs::write(dir.join("memories.md"), "old agent memory").unwrap();
+        let error = ensure_workspace_dir_available(&dir).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(
+            std::fs::read_to_string(dir.join("memories.md")).unwrap(),
+            "old agent memory"
+        );
+
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }

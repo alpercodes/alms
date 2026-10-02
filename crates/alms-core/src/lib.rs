@@ -23,7 +23,8 @@ pub use job::{
 pub use lifecycle::{MAX_LIFECYCLE_REVISION, TransitionOutcome};
 pub use registry::{
     AgentRecord, CreateAgentRequest, UpdateAgentRequest, WORKSPACE_FILENAMES, WorktreeMode,
-    init_workspace_files, migrate_workspace_dirs, validate_agent_name,
+    ensure_workspace_dir_available, init_workspace_files, migrate_workspace_dirs,
+    validate_agent_name,
 };
 pub use run::{
     CreateRunRequest, CreateRunResponse, ResolvedRunConfig, Run, RunId, RunInput, RunRegistrar,
