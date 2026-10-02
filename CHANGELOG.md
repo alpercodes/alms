@@ -95,10 +95,22 @@ Each item below changes behaviour for a deployment that has not set the knob exp
   deployments from before the agent registry found that file and, with no agents
   registered, created `main` as the default ("Auto-migrated default agent"). That also
   skipped first-run onboarding, which shows only while no agent exists. The migration now
-  runs only when the sidecar's agent ID owns sessions, which a pre-registry deployment has
-  and a fresh install does not; such a deployment still gets `main`. The sidecar file is
-  neither removed nor rewritten, and it is still the gateway's default agent ID at boot. An
-  install that already got an auto-created `main` keeps it.
+  runs only when the sidecar's agent ID owns sessions. A pre-registry deployment has them;
+  a fresh install has none unless the global-token Telegram bot received messages before
+  the first agent was created, and such an install still gets `main` on its next restart.
+  An install that already got an auto-created `main` keeps it; if it is deleted, it no
+  longer comes back on the next restart. The sidecar file is neither removed nor rewritten.
+- After a restart, the gateway's default agent ID now comes from the agent registry: the
+  default agent, or the oldest agent if none is marked default. The ID in `.alms/agent_id`
+  (or `ALMS_AGENT_ID`) is used only while no agent is registered. Before, the gateway
+  booted with that ID every time, and creating or setting a default agent moved it only
+  until the next restart. So after a restart `GET /settings` reported it as `agent_id` even
+  when another agent was the default, and the global-token Telegram bot, which serves the
+  default agent when no agent has a token of its own, filed its sessions under it. Unless
+  an auto-created `main` held that ID, no agent did, and the bot's sessions were named
+  `default` (`telegram_default_<chat>`). The bot now serves the default agent under that
+  agent's name, so its context key, and with it the session, changes to
+  `telegram_<name>_<chat>`. Sessions already filed under the sidecar's ID stay there.
 - Silent row loss in the persistence layer is now counted and surfaced, and foreign-key
   fallbacks are no longer silent.
 - Durable job recovery and atomic, bounded per-agent run admission.
