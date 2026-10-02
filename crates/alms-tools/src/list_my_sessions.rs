@@ -452,7 +452,7 @@ mod tests {
     #[tokio::test]
     async fn test_includes_job_sessions() {
         // Regression test for #1214: an agent's own `job_{id}` sessions are
-        // stored under the agent's real id (`fire_job_run` uses
+        // stored under the agent's real id (`admit_job_run` uses
         // `get_or_create(job.agent_id, "job_{id}")`) and are NOT internal
         // per `is_internal_session`, so they must appear in the listing.
         let mgr = Arc::new(make_manager());

@@ -59,10 +59,14 @@ pub(crate) struct JobEpisode {
     /// The `job_{id}` session every episode run executes on.
     pub(crate) session_id: SessionId,
     pub(crate) agent_id: AgentId,
-    /// Wall-clock open time — the basis for the D6 catch-up cron math.
+    /// When turn 1 started: the basis for the D6 catch-up cron math. Until
+    /// then (while the firing waits on its agent's queue, #181) it holds the
+    /// admission time; [`JobEpisodeTracker::start_turn_one`] resets it.
     pub(crate) started_at: DateTime<Utc>,
-    /// Monotonic deadline (`opened + EPISODE_DEADLINE_SECS`).
-    pub(crate) deadline: Instant,
+    /// Monotonic deadline, `EPISODE_DEADLINE_SECS` after turn 1 started.
+    /// `None` while turn 1 is still queued, so the sweep cannot close an
+    /// episode whose turn has not run yet.
+    pub(crate) deadline: Option<Instant>,
     /// Open DM conversations started by episode runs, keyed by the
     /// deterministic DM session id from the `send_message` result.
     pub(crate) pending_dms: HashSet<SessionId>,
@@ -171,6 +175,10 @@ impl JobEpisodeTracker {
 
     /// Open an episode for a firing job, with turn 1 reserved
     /// (`in_flight_runs = 1`).
+    ///
+    /// The episode opens when the firing is admitted, but its clock does not
+    /// start until turn 1 does ([`Self::start_turn_one`]). No deadline is
+    /// armed until then.
     pub(crate) fn open(
         &self,
         job_id: JobId,
@@ -183,7 +191,7 @@ impl JobEpisodeTracker {
             session_id,
             agent_id,
             started_at: Utc::now(),
-            deadline: Instant::now() + self.deadline,
+            deadline: None,
             pending_dms: HashSet::new(),
             pending_subagents: HashMap::new(),
             in_flight_runs: 1,
@@ -198,6 +206,44 @@ impl JobEpisodeTracker {
             previous.is_none(),
             "open() must not clobber a live episode — absorb_fire_if_open guards the fire path"
         );
+    }
+
+    /// Turn 1 (`turn1_run`) is about to execute: start the episode's clock.
+    ///
+    /// The episode opens when the firing is admitted, which is before the
+    /// firing's wait on its agent's queue (#181). Both clocks measure the
+    /// episode's own work, so both start here:
+    /// - `started_at` feeds the D6 catch-up at close
+    ///   (`next_after(cron, started_at) <= now`). Counted from the firing, any
+    ///   wait that spanned a tick read as a missed tick, and the close fired a
+    ///   second run of the same prompt, although turn 1 ran after that tick.
+    /// - `deadline` is armed now. Counted from the firing, a wait longer than
+    ///   the deadline let the sweep close the episode before its turn ran.
+    ///   While turn 1 is queued, the queued run itself ends the wait: the queue
+    ///   either executes it, which calls this, or rejects the submit, which
+    ///   drops the episode.
+    ///
+    /// Only the episode whose turn 1 is `turn1_run` is touched, so a stale
+    /// call after that episode closed (for example after `DELETE /jobs`
+    /// removed it) is a no-op.
+    pub(crate) fn start_turn_one(&self, job_id: JobId, turn1_run: RunId) {
+        let mut eps = self.episodes.lock();
+        if let Some(ep) = eps.get_mut(&job_id)
+            && ep.runs.first() == Some(&turn1_run)
+        {
+            ep.started_at = Utc::now();
+            ep.deadline = Some(Instant::now() + self.deadline);
+        }
+    }
+
+    /// Shift an open episode's `started_at` back by `by`, as a queue wait of
+    /// that length would have left it. Test-only: waiting out a real cron
+    /// tick in a test is not an option.
+    #[cfg(test)]
+    pub(crate) fn backdate_started_at(&self, job_id: JobId, by: chrono::Duration) {
+        if let Some(ep) = self.episodes.lock().get_mut(&job_id) {
+            ep.started_at -= by;
+        }
     }
 
     /// Feed one episode-run exit: decrement the in-flight reservation, add
@@ -367,13 +413,15 @@ impl JobEpisodeTracker {
         self.episodes.lock().remove(&job_id)
     }
 
-    /// Drain every episode whose deadline has passed (the D5 sweep).
+    /// Drain every episode whose deadline has passed (the D5 sweep). An
+    /// episode whose turn 1 is still queued has no deadline yet and is never
+    /// drained.
     pub(crate) fn take_expired(&self) -> Vec<JobEpisode> {
         let now = Instant::now();
         let mut eps = self.episodes.lock();
         let expired: Vec<JobId> = eps
             .iter()
-            .filter(|(_, ep)| ep.deadline <= now)
+            .filter(|(_, ep)| ep.deadline.is_some_and(|deadline| deadline <= now))
             .map(|(id, _)| *id)
             .collect();
         expired
@@ -383,10 +431,14 @@ impl JobEpisodeTracker {
     }
 
     /// Observability snapshot for `GET /jobs` — `None` when no episode is
-    /// open for the job.
+    /// open for the job. While turn 1 is queued the clock has not started,
+    /// so `deadline_remaining_secs` reports the whole deadline.
     pub(crate) fn snapshot(&self, job_id: JobId) -> Option<serde_json::Value> {
         let eps = self.episodes.lock();
         let ep = eps.get(&job_id)?;
+        let remaining = ep.deadline.map_or(self.deadline, |deadline| {
+            deadline.saturating_duration_since(Instant::now())
+        });
         Some(serde_json::json!({
             "started_at": ep.started_at.to_rfc3339(),
             "pending_dms": ep.pending_dms.len(),
@@ -394,8 +446,7 @@ impl JobEpisodeTracker {
             "in_flight_runs": ep.in_flight_runs,
             "runs": ep.runs.len(),
             "catch_up_queued": ep.catch_up_queued,
-            "deadline_remaining_secs":
-                ep.deadline.saturating_duration_since(Instant::now()).as_secs(),
+            "deadline_remaining_secs": remaining.as_secs(),
         }))
     }
 }
@@ -827,6 +878,7 @@ mod tests {
     fn take_expired_drains_past_deadline_episodes_with_pending_work() {
         let t = JobEpisodeTracker::new(Duration::ZERO); // everything expires immediately
         let (job_id, _, _, run1) = open_episode(&t);
+        t.start_turn_one(job_id, run1);
         let dm = SessionId::new();
         assert!(matches!(
             t.on_run_complete(job_id, run1, vec![dm], vec![]),
@@ -849,10 +901,72 @@ mod tests {
     fn take_expired_leaves_live_episodes() {
         let t = tracker(); // 4h deadline
         let (job_id, _, _, run1) = open_episode(&t);
+        t.start_turn_one(job_id, run1);
         let dm = SessionId::new();
         t.on_run_complete(job_id, run1, vec![dm], vec![]);
         assert!(t.take_expired().is_empty());
         assert!(t.snapshot(job_id).is_some());
+    }
+
+    // -- the episode clock starts with turn 1 (#185 review S1) -----------------
+
+    /// A firing admitted behind a busy agent waits with its episode open. No
+    /// deadline runs during that wait, however long it is: the sweep must not
+    /// close an episode whose turn has not run. Once turn 1 starts, the
+    /// deadline is armed and the sweep applies as before.
+    #[test]
+    fn a_queued_turn_one_is_never_swept() {
+        let t = JobEpisodeTracker::new(Duration::ZERO); // armed deadlines expire at once
+        let (job_id, _, _, run1) = open_episode(&t);
+
+        assert!(t.take_expired().is_empty(), "turn 1 is still queued");
+        assert_eq!(
+            t.snapshot(job_id).unwrap()["deadline_remaining_secs"],
+            0,
+            "while queued the whole deadline remains (here, zero)"
+        );
+
+        t.start_turn_one(job_id, run1);
+        let expired = t.take_expired();
+        assert_eq!(expired.len(), 1, "armed when turn 1 starts");
+        assert_eq!(expired[0].job_id, job_id);
+    }
+
+    /// `started_at`, the base of the D6 catch-up, restarts when turn 1 does:
+    /// the time the firing spent queued is not episode time.
+    #[test]
+    fn start_turn_one_restarts_the_episode_clock() {
+        let t = tracker();
+        let (job_id, _, _, run1) = open_episode(&t);
+        t.backdate_started_at(job_id, chrono::Duration::hours(3));
+        let queued_since = t.episodes.lock()[&job_id].started_at;
+
+        let before = Utc::now();
+        t.start_turn_one(job_id, run1);
+
+        let ep = &t.episodes.lock()[&job_id];
+        assert!(
+            ep.started_at >= before,
+            "restarted when turn 1 started, not left at {queued_since}"
+        );
+        assert!(ep.deadline.is_some());
+    }
+
+    /// Only the episode whose turn 1 is this run is restarted. A late call for
+    /// a run that is not turn 1 of the open episode changes nothing.
+    #[test]
+    fn start_turn_one_ignores_a_run_that_is_not_turn_one() {
+        let t = tracker();
+        let (job_id, _, _, _run1) = open_episode(&t);
+        t.backdate_started_at(job_id, chrono::Duration::hours(3));
+        let queued_since = t.episodes.lock()[&job_id].started_at;
+
+        t.start_turn_one(job_id, RunId::new());
+        t.start_turn_one(JobId::new(), RunId::new());
+
+        let ep = &t.episodes.lock()[&job_id];
+        assert_eq!(ep.started_at, queued_since);
+        assert!(ep.deadline.is_none());
     }
 
     // -- fire-path guard (D6) --------------------------------------------------
