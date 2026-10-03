@@ -68,6 +68,24 @@ Each item below changes behaviour for a deployment that has not set the knob exp
 
 - **Server-default model and provider are now changeable without a restart.**
 
+- **The global-token Telegram bot may answer as a different agent after upgrading.** This
+  applies if you use the global Telegram token (`alms auth set telegram`) and no agent has
+  a token of its own. The bot used to serve the ID in `.alms/agent_id` (or
+  `ALMS_AGENT_ID`): the agent registered with that ID, normally an auto-created `main`, if
+  there was one, otherwise an unregistered agent named `default` running on the server
+  defaults. It now serves the default agent, or the oldest agent if none is marked
+  default, with that agent's posture, model, provider, workspace, worktree mode and
+  `[security].allow_full_os_access` entry. Anyone who can message the bot reaches that
+  agent. When the agent changes, so does the bot's context key, `telegram_<name>_<chat>`,
+  and each chat starts a new session. Earlier sessions are not moved: those under the old
+  ID stay there, and unless a registered agent (normally `main`) holds that ID, no agent
+  owns them.
+
+  ⚠️ **Before upgrading**, mark the agent the bot should serve as the default
+  (`alms agent set-default <name>`), or give an agent its own token (`telegram_token` on
+  `PATCH /agents/{id}`). If agents exist but none is marked default, the gateway logs a
+  `WARN` at startup naming the agent the bot serves.
+
 ### Multi-agent and DM
 
 - Two spellings of one subagent name now resolve to a single subagent, and agent names may
@@ -102,15 +120,12 @@ Each item below changes behaviour for a deployment that has not set the knob exp
   longer comes back on the next restart. The sidecar file is neither removed nor rewritten.
 - After a restart, the gateway's default agent ID now comes from the agent registry: the
   default agent, or the oldest agent if none is marked default. The ID in `.alms/agent_id`
-  (or `ALMS_AGENT_ID`) is used only while no agent is registered. Before, the gateway
+  (or `ALMS_AGENT_ID`) is used only while no agent is registered; when `ALMS_AGENT_ID` is
+  set and agents exist, a `WARN` at startup says it was ignored. Before, the gateway
   booted with that ID every time, and creating or setting a default agent moved it only
-  until the next restart. So after a restart `GET /settings` reported it as `agent_id` even
-  when another agent was the default, and the global-token Telegram bot, which serves the
-  default agent when no agent has a token of its own, filed its sessions under it. Unless
-  an auto-created `main` held that ID, no agent did, and the bot's sessions were named
-  `default` (`telegram_default_<chat>`). The bot now serves the default agent under that
-  agent's name, so its context key, and with it the session, changes to
-  `telegram_<name>_<chat>`. Sessions already filed under the sidecar's ID stay there.
+  until the next restart, so after a restart `GET /settings` reported it as `agent_id` even
+  when another agent was the default. This also changes which agent the global-token
+  Telegram bot serves; see the Telegram item under "Default changes" above.
 - Silent row loss in the persistence layer is now counted and surfaced, and foreign-key
   fallbacks are no longer silent.
 - Durable job recovery and atomic, bounded per-agent run admission.

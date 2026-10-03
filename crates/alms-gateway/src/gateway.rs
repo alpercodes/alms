@@ -45,7 +45,14 @@ pub struct GatewayConfig {
     /// flat, sibling to `alms.db` rather than nested under
     /// `<data_dir>/workspace/`.
     pub workspace_dir: Option<std::path::PathBuf>,
-    /// Explicit agent ID (None = resolve from sidecar file or generate new)
+    /// The configured default agent ID. [`Self::from_alms_config_with_env`]
+    /// sets it from `ALMS_AGENT_ID` or the `<data_dir>/agent_id` sidecar
+    /// (see `resolve_default_agent_id`). `None` makes `Gateway::new` generate
+    /// a random ID for this boot; no sidecar is read or written.
+    ///
+    /// With a database (`db_path`), it is the default agent ID only while the
+    /// agent registry is empty or cannot be read. Otherwise `Gateway::new`
+    /// boots with the registry's default agent (see `boot_default_agent_id`).
     pub agent_id: Option<AgentId>,
     /// Bearer token for API authentication (None = auth disabled)
     pub auth_token: Option<String>,
@@ -329,11 +336,11 @@ static SIDECAR_EXISTED: std::sync::atomic::AtomicBool = std::sync::atomic::Atomi
 #[instrument]
 fn resolve_default_agent_id(data_dir: &Path) -> AgentId {
     // 1. Env var override takes highest precedence
+    if let Some(agent_id) = agent_id_from_env() {
+        info!("Using agent ID from ALMS_AGENT_ID: {}", agent_id.0);
+        return agent_id;
+    }
     if let Ok(val) = std::env::var("ALMS_AGENT_ID") {
-        if let Ok(uuid) = Uuid::parse_str(val.trim()) {
-            info!("Using agent ID from ALMS_AGENT_ID: {}", uuid);
-            return AgentId(uuid);
-        }
         warn!("Invalid ALMS_AGENT_ID '{}', ignoring", val);
     }
 
@@ -360,6 +367,12 @@ fn resolve_default_agent_id(data_dir: &Path) -> AgentId {
         info!("Generated and persisted new agent ID: {}", agent_id.0);
     }
     agent_id
+}
+
+/// `ALMS_AGENT_ID`, when it is set to a valid UUID.
+fn agent_id_from_env() -> Option<AgentId> {
+    let val = std::env::var("ALMS_AGENT_ID").ok()?;
+    Uuid::parse_str(val.trim()).ok().map(AgentId)
 }
 
 /// A Telegram bot bound to a specific agent.
@@ -412,7 +425,11 @@ impl Gateway {
                     migrate_sidecar_agent(&store, configured_agent_id);
                 }
                 // After the migration, so a `main` it just created counts.
-                default_agent_id = boot_default_agent_id(&store, configured_agent_id);
+                default_agent_id = boot_default_agent_id(
+                    &store,
+                    configured_agent_id,
+                    agent_id_from_env() == Some(configured_agent_id),
+                );
                 Arc::new(SessionManager::with_store(
                     config.session_config.clone(),
                     store,
@@ -467,15 +484,35 @@ impl Gateway {
     /// registry name, or under `"default"` while no agent with that ID is
     /// registered. The name is part of the session context key,
     /// `telegram_<name>_<chat>`.
+    ///
+    /// WARNs when that agent is registered but not marked default. That is
+    /// the oldest agent, which [`boot_default_agent_id`] falls back to when
+    /// no agent is marked default, and the bot then runs with that agent's
+    /// posture, model, workspace and sandbox settings without anyone having
+    /// chosen it. Called only when the global token is actually used.
     fn global_telegram_target(&self) -> (AgentId, String) {
         let default_id = self.agent_id();
-        let default_name = self
+        let record = self
             .session_manager
             .store()
-            .and_then(|store| store.load_agent_by_id(default_id).ok().flatten())
-            .map(|r| r.name)
-            .unwrap_or_else(|| "default".to_string());
-        (default_id, default_name)
+            .and_then(|store| store.load_agent_by_id(default_id).ok().flatten());
+        match record {
+            Some(agent) => {
+                if !agent.is_default {
+                    warn!(
+                        agent_name = %agent.name,
+                        agent_id = %agent.id,
+                        "No agent is marked default, so the global Telegram token serves \
+                         '{}', the oldest agent, with that agent's posture, model, workspace \
+                         and sandbox settings. To choose the agent it serves, run \
+                         `alms agent set-default <name>` and restart the gateway.",
+                        agent.name,
+                    );
+                }
+                (default_id, agent.name)
+            }
+            None => (default_id, "default".to_string()),
+        }
     }
 
     /// Initialize Telegram channels.
@@ -1262,8 +1299,16 @@ fn migrate_sidecar_agent(store: &SqliteStore, agent_id: AgentId) {
 /// `GET /settings`' `agent_id` and the global-token Telegram fallback went
 /// back to the sidecar's ID, which no agent has unless a migrated `main`
 /// holds it.
+///
+/// `configured_from_env` says `configured` came from `ALMS_AGENT_ID`. Before,
+/// that variable set the boot default even when agents existed, so when the
+/// registry picks a different agent this WARNs that the variable is ignored.
 #[instrument(skip(store))]
-fn boot_default_agent_id(store: &SqliteStore, configured: AgentId) -> AgentId {
+fn boot_default_agent_id(
+    store: &SqliteStore,
+    configured: AgentId,
+    configured_from_env: bool,
+) -> AgentId {
     let agents = match store.list_agents() {
         Ok(agents) => agents,
         Err(e) => {
@@ -1274,24 +1319,31 @@ fn boot_default_agent_id(store: &SqliteStore, configured: AgentId) -> AgentId {
             return configured;
         }
     };
-    if let Some(default) = agents.iter().find(|a| a.is_default) {
+    let chosen = if let Some(default) = agents.iter().find(|a| a.is_default) {
         info!(
             "Default agent from the registry: '{}' ({})",
             default.name, default.id.0
         );
-        return default.id;
+        default
+    } else if let Some(oldest) = agents.first() {
+        info!(
+            "No registered agent is marked default; using the oldest, '{}' ({}), as the \
+             default agent ID",
+            oldest.name, oldest.id.0
+        );
+        oldest
+    } else {
+        return configured;
+    };
+    if configured_from_env && chosen.id != configured {
+        warn!(
+            "ALMS_AGENT_ID is set to {}, but agents are registered, so it is ignored and the \
+             gateway boots with '{}' ({}) from the agent registry. ALMS_AGENT_ID applies only \
+             while no agent is registered.",
+            configured.0, chosen.name, chosen.id.0
+        );
     }
-    match agents.first() {
-        Some(oldest) => {
-            info!(
-                "No registered agent is marked default; using the oldest, '{}' ({}), as the \
-                 default agent ID",
-                oldest.name, oldest.id.0
-            );
-            oldest.id
-        }
-        None => configured,
-    }
+    chosen.id
 }
 
 #[cfg(test)]
@@ -1780,7 +1832,7 @@ mod tests {
     /// boots with. While no agent is registered it is the sidecar's ID, named
     /// `default`. Once `atlas` is the default, the next boot binds it to
     /// atlas under atlas's name, so its sessions land under an agent that
-    /// exists rather than under the sidecar's ID.
+    /// exists rather than under the sidecar's ID. Neither binding WARNs.
     #[test]
     fn global_telegram_fallback_follows_the_registry_default() {
         let dir = tempfile::tempdir().unwrap();
@@ -1788,10 +1840,9 @@ mod tests {
         let db_path = db_path.to_str().unwrap();
 
         let first = boot(dir.path(), db_path);
-        assert_eq!(
-            first.gateway.global_telegram_target(),
-            (first.sidecar_id, "default".to_string())
-        );
+        let (target, captured) = global_telegram_target_logged(&first.gateway);
+        assert_eq!(target, (first.sidecar_id, "default".to_string()));
+        assert!(captured.is_empty(), "empty registry: {captured}");
 
         let store = SqliteStore::open(db_path).unwrap();
         let atlas = AgentRecord::for_test("atlas");
@@ -1799,9 +1850,56 @@ mod tests {
         store.set_default_agent(atlas.id).unwrap();
 
         let second = boot(dir.path(), db_path);
-        assert_eq!(
-            second.gateway.global_telegram_target(),
-            (atlas.id, "atlas".to_string())
+        let (target, captured) = global_telegram_target_logged(&second.gateway);
+        assert_eq!(target, (atlas.id, "atlas".to_string()));
+        assert!(captured.is_empty(), "atlas is marked default: {captured}");
+    }
+
+    /// [`Gateway::global_telegram_target`], with the WARNs it emits.
+    fn global_telegram_target_logged(
+        gateway: &Gateway,
+    ) -> ((AgentId, String), alms_test_support::CapturedEvents) {
+        let mut target = None;
+        let captured = capture_events(tracing::Level::WARN, || {
+            target = Some(gateway.global_telegram_target());
+        });
+        (target.unwrap(), captured)
+    }
+
+    /// The #186 re-review's case: agents created without `--default`, so
+    /// none is marked default, and the global token binds to the oldest one,
+    /// `beta`, which nobody picked for the bot. The binding stays (so the
+    /// bot's sessions land under an agent that exists), but it WARNs once,
+    /// naming the agent and the command that picks another.
+    #[test]
+    fn global_telegram_fallback_warns_when_no_agent_is_marked_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("alms.db");
+        let db_path = db_path.to_str().unwrap();
+        let store = SqliteStore::open(db_path).unwrap();
+        let created = chrono::Utc::now() - chrono::Duration::hours(1);
+        let beta = AgentRecord {
+            created_at: created,
+            last_active: created,
+            ..AgentRecord::for_test("beta")
+        };
+        store.create_agent(&beta).unwrap();
+        store.create_agent(&AgentRecord::for_test("gamma")).unwrap();
+
+        let booted = boot(dir.path(), db_path);
+        let (target, captured) = global_telegram_target_logged(&booted.gateway);
+
+        assert_eq!(target, (beta.id, "beta".to_string()));
+        assert_eq!(captured.len(), 1, "one WARN; got:\n{captured}");
+        let warn = &captured[0];
+        assert_eq!(warn.field("agent_name"), Some("beta"), "{warn}");
+        let beta_id = beta.id.to_string();
+        assert_eq!(warn.field("agent_id"), Some(beta_id.as_str()), "{warn}");
+        assert!(
+            warn.message.contains("No agent is marked default")
+                && warn.message.contains("'beta', the oldest agent")
+                && warn.message.contains("`alms agent set-default <name>`"),
+            "{warn}"
         );
     }
 
@@ -1815,7 +1913,7 @@ mod tests {
         let store = SqliteStore::open_in_memory().unwrap();
         let configured = AgentId::new();
         assert_eq!(
-            boot_default_agent_id(&store, configured),
+            boot_default_agent_id(&store, configured, false),
             configured,
             "empty registry"
         );
@@ -1830,13 +1928,93 @@ mod tests {
         store.create_agent(&newer).unwrap();
         store.create_agent(&oldest).unwrap();
         assert_eq!(
-            boot_default_agent_id(&store, configured),
+            boot_default_agent_id(&store, configured, false),
             oldest.id,
             "no agent marked default"
         );
 
         store.set_default_agent(newer.id).unwrap();
-        assert_eq!(boot_default_agent_id(&store, configured), newer.id);
+        assert_eq!(boot_default_agent_id(&store, configured, false), newer.id);
+    }
+
+    /// [`boot_default_agent_id`], with the WARNs it emits.
+    fn boot_default_agent_id_logged(
+        store: &SqliteStore,
+        configured: AgentId,
+        configured_from_env: bool,
+    ) -> (AgentId, alms_test_support::CapturedEvents) {
+        let mut chosen = None;
+        let captured = capture_events(tracing::Level::WARN, || {
+            chosen = Some(boot_default_agent_id(
+                store,
+                configured,
+                configured_from_env,
+            ));
+        });
+        (chosen.unwrap(), captured)
+    }
+
+    /// `ALMS_AGENT_ID` used to set the boot default even with agents
+    /// registered. Now the registry wins, and the boot WARNs once that the
+    /// variable was ignored. It stays quiet while the registry is empty (the
+    /// variable is used), when the variable names the registry's pick
+    /// anyway, and when the configured ID is the sidecar's.
+    #[test]
+    fn boot_default_agent_id_warns_when_the_registry_overrides_alms_agent_id() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let env_id = AgentId::new();
+
+        let (chosen, captured) = boot_default_agent_id_logged(&store, env_id, true);
+        assert_eq!(chosen, env_id, "empty registry");
+        assert!(captured.is_empty(), "empty registry: {captured}");
+
+        let atlas = AgentRecord::for_test("atlas");
+        store.create_agent(&atlas).unwrap();
+        store.set_default_agent(atlas.id).unwrap();
+
+        let (chosen, captured) = boot_default_agent_id_logged(&store, env_id, true);
+        assert_eq!(chosen, atlas.id, "the registry wins");
+        assert_eq!(captured.len(), 1, "one WARN; got:\n{captured}");
+        let message = &captured[0].message;
+        assert!(
+            message.contains(&format!("ALMS_AGENT_ID is set to {env_id}"))
+                && message.contains(&format!("'atlas' ({})", atlas.id))
+                && message.contains("ALMS_AGENT_ID applies only while no agent is registered"),
+            "{message}"
+        );
+
+        let (chosen, captured) = boot_default_agent_id_logged(&store, atlas.id, true);
+        assert_eq!(chosen, atlas.id);
+        assert!(captured.is_empty(), "it names atlas: {captured}");
+
+        let (chosen, captured) = boot_default_agent_id_logged(&store, env_id, false);
+        assert_eq!(chosen, atlas.id);
+        assert!(captured.is_empty(), "the sidecar's ID: {captured}");
+    }
+
+    /// If the registry can't be read, the boot isn't blocked: the gateway
+    /// boots with the configured ID, here even though the registry had a
+    /// default, and says so at WARN.
+    #[test]
+    fn boot_default_agent_id_falls_back_to_the_configured_id_when_the_registry_is_unreadable() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let atlas = AgentRecord::for_test("atlas");
+        store.create_agent(&atlas).unwrap();
+        store.set_default_agent(atlas.id).unwrap();
+        store.drop_agents_table_for_test().unwrap();
+        let configured = AgentId::new();
+
+        let (chosen, captured) = boot_default_agent_id_logged(&store, configured, true);
+
+        assert_eq!(chosen, configured);
+        assert_eq!(captured.len(), 1, "one WARN; got:\n{captured}");
+        let message = &captured[0].message;
+        assert!(
+            message.contains(&format!(
+                "Could not list agents; booting with the configured default agent ID {configured}"
+            )),
+            "{message}"
+        );
     }
 
     // ── #947: WARN-log assertions for [security].allow_full_os_access ──
