@@ -886,24 +886,27 @@ pub struct ProviderQuirks {
 
 /// Session management configuration.
 ///
-/// Controls how sessions are stored and retained. This is distinct from
-/// [`ContextConfig`], which controls how much of a session's history is sent
-/// to the LLM in a single request.
+/// Meant to control how sessions are stored and retained. **None of these
+/// knobs is enforced yet:** no production code reads them, so nothing caps,
+/// idles, archives or deletes a session on their account (see
+/// `docs/config.md` § Session). This is distinct from [`ContextConfig`],
+/// which controls how much of a session's history is sent to the LLM in a
+/// single request.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SessionConfig {
-    /// Idle timeout before archiving (seconds)
+    /// Idle timeout before archiving (seconds). Not enforced yet.
     pub idle_timeout_secs: u64,
     pub auto_archive: bool,
-    /// Delete archived sessions after this many seconds
+    /// Delete archived sessions after this many seconds. Not enforced yet.
     pub archive_ttl_secs: u64,
     pub max_messages: usize,
-    /// Maximum total tokens to retain in a session's history.
-    ///
-    /// This is a **storage** limit — it caps how much conversation history the
-    /// session keeps on disk/in the database. It should be >= `context.max_input_tokens`
-    /// because the session must store at least as much history as the LLM context
-    /// window can consume per request.
+    /// Meant as a **storage** limit on how much conversation history the
+    /// session keeps on disk/in the database. Not enforced yet: nothing
+    /// caps a session. Its one effect is validation: it must be at least
+    /// `context.max_input_tokens` (checked on TOML load and by
+    /// `PATCH /settings`), because the session must store at least as much
+    /// history as the LLM context window can consume per request.
     ///
     /// Not to be confused with [`ContextConfig::max_input_tokens`], which controls
     /// how many tokens are sent to the LLM in a single request.
@@ -929,8 +932,8 @@ impl Default for SessionConfig {
 /// Context window management configuration.
 ///
 /// Controls how the session's message history is assembled into a prompt for
-/// each LLM request. This is distinct from [`SessionConfig`], which controls
-/// how much history the session retains in storage.
+/// each LLM request. This is distinct from [`SessionConfig`], whose storage and
+/// retention knobs are not enforced yet.
 ///
 /// # Strategy redesign (#869)
 ///
@@ -962,8 +965,8 @@ pub struct ContextConfig {
     /// This is the **per-request** token budget for the context window assembled
     /// by the ContextBuilder. It should match your LLM's context window size.
     ///
-    /// Not to be confused with [`SessionConfig::max_context_tokens`], which is
-    /// the total token storage limit for the session's history on disk.
+    /// Not to be confused with [`SessionConfig::max_context_tokens`], a session
+    /// storage limit that nothing enforces yet (it must still be at least this value).
     pub max_input_tokens: usize,
     /// Trigger compaction when the assembled history exceeds this
     /// fraction of the **effective history budget**
@@ -1357,18 +1360,27 @@ impl ContextConfig {
 #[serde(default)]
 pub struct ToolsConfig {
     pub enabled: Vec<String>,
+    /// Not enforced yet: nothing in the tool-execution path reads it (#112).
     pub timeout_secs: u64,
+    /// Not enforced yet: nothing reads it.
     pub max_output_bytes: usize,
-    /// Filesystem sandbox root. Relative paths are resolved from cwd.
-    /// Default: "." (current directory — safe by default).
-    /// Set to "" for unrestricted filesystem access.
+    /// Legacy filesystem sandbox root. Relative paths are resolved from cwd.
+    /// Default: ".".
+    ///
+    /// Gateway runs never use it as their boundary: each run is re-rooted at
+    /// the project root (or the agent's worktree, or left unrestricted under
+    /// `[security].allow_full_os_access`), so an empty value lifts no
+    /// restriction. `AgentRuntime::new` still canonicalizes a non-empty value
+    /// first, and a value that cannot be resolved fails the run.
     pub sandbox_root: String,
     /// Shell execution policy: "sandboxed" (default) or "unrestricted".
-    /// In sandboxed mode, the shell's persistent cwd is restricted to `sandbox_root`.
-    /// On Linux 5.13+, Landlock filesystem restrictions are also applied so the
-    /// child process can only access files within `sandbox_root` (plus read-only
-    /// system paths like /usr, /bin, /lib). On Windows/macOS, sandboxed mode
-    /// restricts cwd only -- the command can still access files outside the sandbox.
+    /// In sandboxed mode, the shell's persistent cwd is restricted to the run's
+    /// root (the project root in gateway runs, not `sandbox_root`). On Linux 5.13+,
+    /// Landlock filesystem restrictions are also applied so the child process can
+    /// only access files within that root (plus read-only system paths like /usr,
+    /// /bin, /lib); on a Linux kernel without Landlock the command is refused. On
+    /// Windows/macOS, sandboxed mode restricts cwd only -- the command can still
+    /// access files outside the sandbox.
     pub shell_policy: String,
     /// Absolute path to the shell interpreter used by the `shell` tool
     /// (#1121).

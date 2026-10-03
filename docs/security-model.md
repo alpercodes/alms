@@ -411,8 +411,11 @@ immediately after, so the root every run sees is the project root
 unless
 [`[security].allow_full_os_access`](#operator-escape-hatch-allow_full_os_access)
 or the agent's [worktree mode](#opt-in-worktree-mode) overrides it. In
-normal operation `sandbox_root` is inert. **`tools.shell_policy` is
-not.** `with_project_root` re-registers `shell` with the policy
+normal operation `sandbox_root` never moves the boundary, but
+`AgentRuntime::new` still resolves it first, so a non-empty value that
+cannot be resolved fails the run
+([`docs/config.md`](config.md#tools)). **`tools.shell_policy` is not
+inert.** `with_project_root` re-registers `shell` with the policy
 `AgentRuntime::new` read from it, so `"unrestricted"` takes the cwd
 check and the Landlock ruleset off every agent's `shell` (see
 [Shell sandboxing platform asymmetry](#shell-sandboxing-platform-asymmetry)).

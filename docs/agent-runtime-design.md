@@ -33,7 +33,7 @@ max_tokens_per_run = 0
 [session]
 idle_timeout_secs = 86400           # 24 hours
 max_messages = 10000
-max_context_tokens = 256_000        # storage limit (>= context.max_input_tokens)
+max_context_tokens = 256_000        # must be >= context.max_input_tokens
 
 [context]
 # How to manage the context window sent to the LLM

@@ -60,10 +60,9 @@ idle_timeout_secs = 86400            # 24 hours
 auto_archive = true
 archive_ttl_secs = 2592000          # 30 days
 max_messages = 10000
-# SESSION STORAGE limit: max tokens of conversation history to retain on disk.
-# This should be >= context.max_input_tokens (the LLM per-request budget)
-# because the session must store at least as much as the LLM can consume.
-# Typically set 2x the LLM context window to keep some older history around.
+# Meant as a session storage limit (max tokens of history to keep on disk);
+# not enforced yet. It must still be >= context.max_input_tokens (the LLM
+# per-request budget): loading alms.toml rejects a smaller value.
 max_context_tokens = 256_000
 
 [context]

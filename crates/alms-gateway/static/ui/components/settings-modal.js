@@ -582,10 +582,11 @@ export function SettingsModal({ open, onClose }) {
                      per section: a server default that runs read takes effect on
                      the next run, except a Telegram-triggered one, which reads the
                      Gateway's alms.toml + env config and never this modal's values,
-                     even after a restart. API keys are the exception: the secrets
-                     store is shared, so they reach Telegram too (docs/api.md § 10.2). -->
+                     even after a restart. A new or changed API key is the exception:
+                     the secrets store is shared, so it reaches Telegram too
+                     (docs/api.md § 10.2). -->
                 <p class="settings-subtitle">
-                    Applies from the next run. Telegram-triggered runs pick up API keys but none of the server defaults, not even after a restart: they use alms.toml and the environment.
+                    Applies from the next run. Telegram-triggered runs pick up a new or changed API key but none of the server defaults, not even after a restart: they use alms.toml and the environment.
                     Full reference: <code>docs/config.md</code>.
                 </p>
 
