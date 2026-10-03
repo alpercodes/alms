@@ -47,7 +47,7 @@ decision, not a drift — record the reasoning here when you do.
 | `@preact/signals` | 2.9.3 | State primitive. See the 2.x note below. |
 | `htm` | 3.1.1 | Tagged-template JSX alternative; no build step for legacy screens. |
 | `marked` | 18.0.6 | Markdown for assistant message bodies. See the 15 -> 18 note below. |
-| `dompurify` | 3.4.14 | Sanitizes `marked` output. Minor bumps only; security-relevant, keep current. Moved 3.4.12 -> 3.4.14 for GHSA-55q2-fjhq-7xh7 (#1250) — see the note below. |
+| `dompurify` | 3.4.16 | Sanitizes `marked` output. Minor bumps only; security-relevant, keep current. Moved 3.4.12 -> 3.4.14 for GHSA-55q2-fjhq-7xh7 (#1250), then 3.4.14 -> 3.4.16 for GHSA-p98j-92pf-mc4p — see the notes below. |
 | `zod` | 4.4.3 | Schemas for the validated contract boundary. |
 
 ### Why `marked` is on 18.x rather than the 15.0.4 the CDN importmap pinned
@@ -148,6 +148,36 @@ too — `moderate` is a deliberate coverage-versus-noise choice, since `low`
 findings here are overwhelmingly transitive dev-tooling churn and a gate that
 cries wolf gets waved through. The level lives in `package.json`; `ci.yml` calls
 `npm run ui:audit` and deliberately does not name one.
+
+### Why `dompurify` moved 3.4.14 -> 3.4.16
+
+`npm audit` flagged GHSA-p98j-92pf-mc4p (low, CVSS 4.0 score 2.3) against
+`dompurify >= 3.4.13, <= 3.4.15`. It is what GHSA-55q2-fjhq-7xh7's fix left
+open. That fix neutralizes a hook-detached subtree only at the
+`beforeSanitizeElements` and `uponSanitizeElement` sites. So under
+`IN_PLACE: true`, a hook that removes a node from `afterSanitizeElements` or
+`afterSanitizeAttributes` still leaves `on*` handlers armed on the detached
+descendants.
+
+**We are not exposed, for the same structural reason as before.** The advisory
+needs both preconditions. `static/ui/deps.js` does register an
+`afterSanitizeAttributes` hook, one of the two named sites, but the hook only
+sets `target` / `rel` on anchors and detaches nothing. And `sanitize(raw)` runs
+on a string with no config, so there is no `IN_PLACE` and no caller-owned live
+tree. The bump is taken because this is the sanitizer for every rendered
+message and the patch is a drop-in, not because ALMS was reachable. At `low`
+the advisory alone would not have failed the `moderate` gate; it arrived
+alongside dev-only `undici` and `brace-expansion` advisories that did.
+
+**No measured behaviour change.** 3.4.15 adds XML clobbering hardening and
+"several smaller hardening and edge-case improvements". 3.4.16 fixes the
+`IN_PLACE` gaps and moves DOMPurify's own build from rollup to rolldown. An
+86-case differential of the full `renderMarkdown()` pipeline across 3.4.14 and
+3.4.16 was byte-identical. It covered ordinary markdown, allowed raw HTML,
+active tags, raw-text elements, URL schemes, MathML/SVG mutation-XSS, XML
+(CDATA, processing instructions, comments), DOM clobbering, custom elements,
+and deep nesting. The pins in `frontend/markdown-rendering.test.ts` stand
+unchanged.
 
 ### Why `@preact/signals` is on 2.x
 
