@@ -108,9 +108,12 @@ decisions, and you should know them before deploying:
   agents and the operator. Do not expose the gateway to untrusted users.
 - **Agents can read the secrets store.** The sandbox root is the project root, and
   `.alms/` lives inside it — so `.alms/secrets.json` is reachable via `fs_read`. Set
-  `ALMS_MASTER_KEY` to encrypt that file at rest (AES-256-GCM); the daemon's shell children
-  never see that variable, so an agent that reads the file gets ciphertext. Without it,
-  treat any secret an agent can reach as disclosed to your model provider.
+  `ALMS_MASTER_KEY` to encrypt that file at rest (AES-256-GCM); shell children do not
+  inherit that variable, so an agent that reads the file gets ciphertext. Where `shell` has
+  no filesystem boundary (the next two items), an agent can still read the key with the
+  daemon OS user's access: on Linux from the daemon's `/proc/<pid>/environ`, anywhere from
+  a file you keep it in. Without the key, treat any secret an agent can reach as disclosed
+  to your model provider.
 - **Sandboxing is not equal across platforms, and the gap is in `shell`.** The `fs_*` tools
   enforce the project-root boundary identically everywhere. The `shell` tool does not check
   paths in the command at all. On **Linux 5.13+** Landlock gives each shell child a

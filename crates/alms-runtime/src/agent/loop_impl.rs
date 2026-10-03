@@ -58,10 +58,10 @@ pub(crate) enum RunPhase {
     /// exact failure #1150 set out to fix. The subagent governs its own
     /// runtime via the in-loop phase timer it inherits (a hung one
     /// self-terminates and returns an error to the parent), and the parent's
-    /// absolute `max_run_duration_secs` backstop still bounds total runtime —
-    /// so the parent must not *also* wall-clock a blocking subagent call. A
-    /// *background* `invoke_agent` returns immediately and stays in the normal
-    /// `ExecutingTools` phase.
+    /// absolute `max_run_duration_secs` backstop applies once the subagent
+    /// returns — so the parent must not *also* wall-clock a blocking subagent
+    /// call. A *background* `invoke_agent` returns immediately and stays in the
+    /// normal `ExecutingTools` phase.
     ExecutingBlockingSubagent,
     /// P3c — a Guarded-posture tool batch is/was blocked on **human approval**.
     /// Budget is **unbounded** (`0` / disabled).
@@ -534,8 +534,9 @@ impl AgentRuntime {
             }
             RunPhase::BetweenIterations => self.config.between_iterations_secs,
             RunPhase::ExecutingTools => self.config.tool_phase_ceiling_secs,
-            // Unbounded: `0` disables the phase via `stall_error`. The absolute
-            // `max_run_duration_secs` backstop still applies in the loop.
+            // Unbounded: `0` disables the phase via `stall_error`.
+            // `max_run_duration_secs` is checked only between iterations, so
+            // it does not bound an approval wait (P3c).
             RunPhase::ExecutingBlockingSubagent | RunPhase::AwaitingApproval => 0,
         }
     }
