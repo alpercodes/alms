@@ -47,6 +47,18 @@ fn normalize_optional_override(value: Option<&str>) -> Option<String> {
         .map(str::to_owned)
 }
 
+fn workspace_path_for_create_error(
+    workspace: &StdPath,
+    project_root: &StdPath,
+    agent_name: &str,
+) -> String {
+    let relative = workspace
+        .strip_prefix(project_root)
+        .unwrap_or_else(|_| StdPath::new(agent_name));
+    let path = relative.to_string_lossy().replace('\\', "/");
+    format!("{}/", path.trim_end_matches('/'))
+}
+
 /// Validate the per-agent summary provider/model pair (#872).
 ///
 /// Both fields must be set together or both must be unset. When a provider
@@ -228,22 +240,56 @@ pub async fn create_agent(
     // worktree directory. The expensive bit (`git worktree add`)
     // happens on the createside; PATCH-time flips do the same dance.
     //
-    // Name-uniqueness is enforced ahead of the worktree provisioning
-    // step so a duplicate name doesn't even cost us a `git worktree
-    // add`. The race between this lookup and the INSERT below is
-    // handled by the SQLite UNIQUE-name constraint surfacing
-    // `AlmsError::DuplicateName` and the worktree-op compensation
-    // (#1022 — extended from #1019's PATCH path) cleaning up the
-    // freshly-created worktree dir.
+    // Check both the registry and the name-keyed workspace before creating
+    // side effects. A deleted agent can leave identity files behind; refusing
+    // non-scaffold contents prevents a new registry ID from inheriting them.
+    // The SQLite UNIQUE-name constraint arbitrates name races, but a late
+    // named-subagent write can still race this filesystem check.
     let worktree_mode = req.worktree_mode.unwrap_or_default();
-    if worktree_mode == WorktreeMode::Git
-        && let Ok(Some(_)) = store.load_agent_by_name(&req.name)
-    {
-        return Err(api_error(
-            StatusCode::CONFLICT,
-            "DUPLICATE_NAME",
-            format!("Agent name '{}' already exists", req.name),
-        ));
+    match store.load_agent_by_name(&req.name) {
+        Ok(Some(_)) => {
+            return Err(api_error(
+                StatusCode::CONFLICT,
+                "DUPLICATE_NAME",
+                format!("Agent name '{}' already exists", req.name),
+            ));
+        }
+        Ok(None) => {}
+        Err(error) => {
+            return Err(api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "INTERNAL",
+                error,
+            ));
+        }
+    }
+    if let Some(workspace_dir) = &state.workspace_dir {
+        let agent_workspace = workspace_dir.join(&req.name);
+        match alms_core::ensure_workspace_dir_available(&agent_workspace) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                let workspace_path = workspace_path_for_create_error(
+                    &agent_workspace,
+                    &state.project_root,
+                    &req.name,
+                );
+                return Err(api_error(
+                    StatusCode::CONFLICT,
+                    "WORKSPACE_EXISTS",
+                    format!(
+                        "Agent name '{}' is free, but a workspace path for that name already exists at {} and may contain or point to data from another agent. Choose a different name, or move or delete that path and try again.",
+                        req.name, workspace_path
+                    ),
+                ));
+            }
+            Err(error) => {
+                return Err(api_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "INTERNAL",
+                    error,
+                ));
+            }
+        }
     }
 
     let now = Utc::now();
@@ -2211,7 +2257,12 @@ mod tests {
     /// `409 DUPLICATE_NAME`, same as an exact-name clash.
     #[tokio::test]
     async fn post_agents_rejects_a_name_that_differs_only_in_case() {
-        let state = agents_test_app_state_with_sqlite();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let workspace_dir = tmp.path().join("agents");
+        let state = TestAppState::new()
+            .in_memory_sqlite()
+            .workspace_dir(workspace_dir)
+            .build();
         let _ = create_agent(
             axum::extract::State(state.clone()),
             Json(create_req("Atlas")),
@@ -2234,6 +2285,106 @@ mod tests {
         let agents = store.list_agents().unwrap();
         assert_eq!(agents.len(), 1);
         assert_eq!(agents[0].name, "Atlas");
+    }
+
+    #[tokio::test]
+    async fn post_agents_refuses_workspace_left_by_deleted_agent() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let workspace_dir = tmp.path().join("agents");
+        let state = TestAppState::new()
+            .in_memory_sqlite()
+            .workspace_dir(workspace_dir.clone())
+            .build();
+
+        let _ = create_agent(
+            axum::extract::State(state.clone()),
+            Json(create_req("atlas")),
+        )
+        .await
+        .expect("initial agent creation must succeed");
+
+        let memories = workspace_dir.join("atlas").join("memories.md");
+        std::fs::write(&memories, "private notes from the old agent").unwrap();
+
+        let _ = delete_agent(
+            axum::extract::State(state.clone()),
+            axum::extract::Path("atlas".into()),
+            axum::extract::Query(DeleteAgentQuery::default()),
+        )
+        .await
+        .expect("agent deletion must succeed");
+
+        let (status, body) = create_agent_err(state.clone(), create_req("atlas")).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(err_code(&body), "WORKSPACE_EXISTS");
+        let message = body["error"]["message"].as_str().unwrap();
+        assert!(message.contains("at atlas/"));
+        assert!(message.contains("move or delete that path"));
+
+        let store = state.session_manager.store().expect("sqlite store");
+        assert!(store.load_agent_by_name("atlas").unwrap().is_none());
+        assert_eq!(
+            std::fs::read_to_string(memories).unwrap(),
+            "private notes from the old agent"
+        );
+    }
+
+    #[tokio::test]
+    async fn post_agents_reuses_blank_scaffold_left_by_deleted_agent() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let workspace_dir = tmp.path().join("agents");
+        let state = TestAppState::new()
+            .in_memory_sqlite()
+            .workspace_dir(workspace_dir.clone())
+            .build();
+
+        let (status, _) = create_agent(
+            axum::extract::State(state.clone()),
+            Json(create_req("scratch")),
+        )
+        .await
+        .expect("initial agent creation must succeed");
+        assert_eq!(status, StatusCode::CREATED);
+
+        let _ = delete_agent(
+            axum::extract::State(state.clone()),
+            axum::extract::Path("scratch".into()),
+            axum::extract::Query(DeleteAgentQuery::default()),
+        )
+        .await
+        .expect("agent deletion must succeed");
+
+        let recreated = create_agent(
+            axum::extract::State(state.clone()),
+            Json(create_req("scratch")),
+        )
+        .await;
+        assert!(
+            recreated.is_ok(),
+            "a blank seed scaffold must be reusable: {recreated:?}"
+        );
+        assert_eq!(recreated.unwrap().0, StatusCode::CREATED);
+
+        let store = state.session_manager.store().expect("sqlite store");
+        let agents = store.list_agents().unwrap();
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agents[0].name, "scratch");
+    }
+
+    #[test]
+    fn workspace_error_path_is_relative_to_project_root_when_possible() {
+        let project_root = StdPath::new("project");
+        let workspace = project_root.join(".alms").join("agents").join("atlas");
+        assert_eq!(
+            workspace_path_for_create_error(&workspace, project_root, "atlas"),
+            ".alms/agents/atlas/"
+        );
+
+        let external_workspace = StdPath::new("external").join("agents").join("atlas");
+        assert_eq!(
+            workspace_path_for_create_error(&external_workspace, project_root, "atlas"),
+            "atlas/"
+        );
     }
 
     /// #2: `DM` / `Default` / `Workspace` are reserved in any casing.

@@ -321,6 +321,24 @@ pub(crate) fn agent_create(store: &SqliteStore, opts: AgentCreateOpts<'_>) -> an
 
     validate_agent_name(&name)?;
 
+    match store.load_agent_by_name(&name) {
+        Ok(Some(_)) => anyhow::bail!("Agent name '{name}' already exists"),
+        Ok(None) => {}
+        Err(error) => return Err(error.into()),
+    }
+    if let Some(ws_dir) = workspace_dir {
+        match alms_core::ensure_workspace_dir_available(&ws_dir.join(&name)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                anyhow::bail!(
+                    "WORKSPACE_EXISTS: agent name '{name}' is free, but a workspace path for that name already exists at {} and may contain or point to data from another agent. Choose a different name, or move or delete that path and try again.",
+                    ws_dir.join(&name).display()
+                );
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+
     // Worktree-mode (#946). Provision the worktree BEFORE persisting
     // the agent record so a non-git project produces a clean error
     // with NO half-created agent and NO half-created worktree
@@ -340,11 +358,6 @@ pub(crate) fn agent_create(store: &SqliteStore, opts: AgentCreateOpts<'_>) -> an
             )
         })?;
 
-        // Refuse to create a worktree if the agent name is already
-        // taken — same shape as the HTTP path.
-        if let Ok(Some(_)) = store.load_agent_by_name(&name) {
-            anyhow::bail!("Agent name '{name}' already exists");
-        }
         if let Err(e) = alms_core::worktree::create_worktree(project_root, &name) {
             return Err(match e {
                 alms_core::worktree::WorktreeError::NotAGitRepo => anyhow::anyhow!(
@@ -1108,6 +1121,50 @@ mod tests {
                 "Expected workspace file {filename} to exist"
             );
         }
+    }
+
+    #[test]
+    fn test_create_refuses_workspace_left_by_deleted_agent() {
+        let store = new_store();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ws_dir = tmp.path().join("workspace");
+        let agent_dir = ws_dir.join("reviewer");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        std::fs::write(agent_dir.join("personality.md"), "old identity").unwrap();
+
+        let error = agent_create(
+            &store,
+            AgentCreateOpts {
+                name: "reviewer".into(),
+                description: None,
+                model: None,
+                posture: None,
+                provider: None,
+                thinking_budget_tokens: None,
+                reasoning_effort: None,
+                gemini_thinking_budget: None,
+                summary_provider: None,
+                summary_model: None,
+                worktree_mode: WorktreeMode::Off,
+                project_root: None,
+                default: false,
+                json: false,
+                workspace_dir: Some(&ws_dir),
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("WORKSPACE_EXISTS"));
+        assert!(
+            error
+                .to_string()
+                .contains(&ws_dir.join("reviewer").display().to_string())
+        );
+        assert!(store.load_agent_by_name("reviewer").unwrap().is_none());
+        assert_eq!(
+            std::fs::read_to_string(agent_dir.join("personality.md")).unwrap(),
+            "old identity"
+        );
     }
 
     #[test]

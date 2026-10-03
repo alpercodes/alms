@@ -1791,6 +1791,7 @@ Side effects: creates the agent's workspace directory at `{workspace_dir}/{name}
 Errors:
 - `400 INVALID_NAME` — name fails validation (1–64 chars, ASCII alphanumeric + hyphens, no leading/trailing hyphens, not a reserved name, not UUID-shaped). Uppercase is allowed and preserved verbatim.
 - `409 DUPLICATE_NAME` — name already exists. **Uniqueness is case-insensitive**: `Atlas` and `atlas` are the same name, because an agent's workspace is a directory at `{workspace_dir}/{name}/` and Windows/macOS filesystems are case-insensitive while Linux is not.
+- `409 WORKSPACE_EXISTS` — the name's workspace path contains data beyond the blank seed files and their lock sidecars, or the path is a symlink/file. Move or delete it before reusing the agent name; the API does not delete existing workspace data. Named subagents share this `{workspace_dir}/{name}/` path, so they can also leave a folder that blocks creation.
 
 ### 9.3 Get agent
 `GET /agents/{id_or_name}`
@@ -1867,6 +1868,8 @@ context the agent currently being inspected sees on its turn.
 
 **Response 200** — `{ "ok": true, "deleted": "<uuid>" }`
 **Response 409 CANNOT_DELETE_DEFAULT** — cannot delete the default agent; set another default first.
+
+Deleting an agent removes its registry record, sessions, messages, audit events, context summaries, and jobs. It does not remove `{workspace_dir}/{name}/`. While that directory holds anything beyond the blank seed files and their lock sidecars, `POST /agents` with the same name returns `409 WORKSPACE_EXISTS`. The folder may also contain files written by a named subagent. Move or delete it to reuse the name.
 
 ### 9.6 Set default agent
 `POST /agents/{id_or_name}/default`
