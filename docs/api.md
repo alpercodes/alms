@@ -926,6 +926,16 @@ Emitted on the parent's session SSE stream when a background subagent finishes. 
 
 `status` values: `"done"`, `"fail"`, `"cancelled"`. `subagent_name` is omitted on the wire for ephemeral subagents (same shape as `subagent_started`).
 
+For any background subagent that ends with `Cancelled`, this event and the
+persisted `subagent_completion` marker carry its status and session ID. The
+current cancellation path reports the summary as `[no content]` whether the
+subagent had produced nothing or was stopped while working; work already
+written remains in the subagent session. Outside an open job episode, the
+parent history also receives a model-visible `subagent_cancelled` record that
+points to `read_session(session_id: ...)`, and no notification run starts.
+Cancellation origin does not change this behavior. A cancelled completion in
+an open job episode still uses that episode's continuation run.
+
 #### Reconnect
 Supported via `Last-Event-ID` header (automatic browser reconnect) or `?last_event_id=<n>` query parameter (initial connection after loading history via REST). The query parameter takes precedence when both are present. The server replays events with IDs greater than the supplied value.
 
@@ -1064,8 +1074,11 @@ Cancels the live subagent running on the given **subagent** session. Returns
 200 with `{"session_id":"...","status":"cancelling"}` when a live
 (pending/running) subagent was found and its cancellation token fired;
 returns 404 with error code `NO_LIVE_SUBAGENT` when the session has no live
-subagent (unknown session, or the subagent already reached a terminal
-state — e.g. a cancel racing natural completion).
+subagent (unknown session, or the subagent already reached a terminal state).
+A request racing natural completion can also return 200 during the short
+terminal-persistence window, before the handle's status flips. In that case
+the already-selected `Completed` result remains completed and its completion
+notification is still delivered.
 
 Session-keyed rather than run-keyed because the UI's subagent surfaces (the
 status-bar chips and the subagent session view) carry the subagent's session
@@ -1084,6 +1097,16 @@ subagent's own session emits `run_cancelled`, its run record flips to
 `invoke_agent` tool call failing with `"Subagent was cancelled"` (the
 parent run continues and handles the tool error like any other tool
 failure).
+
+For a **background** subagent with `Cancelled` status, no notification run
+starts unless the completion continues an open job episode. This applies to
+direct cancellation, cancellation propagated from a parent run, job teardown,
+and shutdown. The event and lifecycle marker report `[no content]`; partial
+work is not summarized on cancellation, but remains readable from the
+subagent's session. Outside a job episode, a `kind: "error"` record is also
+persisted in the parent history and points the agent to
+`read_session(session_id: "<subagent-session-id>")`. A cancellation before
+any output and one during work have the same status and summary today.
 
 ### 5.8 List runs
 `GET /runs?session_id=<uuid>&limit=<n>` — list runs for a session (original behaviour).

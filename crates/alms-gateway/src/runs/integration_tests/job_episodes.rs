@@ -710,12 +710,20 @@ async fn subagent_completion_resolves_episode_and_stamps_job_id() {
         .session_manager
         .get_or_create(AgentId::new(), "subagent")
         .id;
+    let cancelled_task_id = TaskId::new();
+    let cancelled_subagent_session_id = state
+        .session_manager
+        .get_or_create(AgentId::new(), "cancelled-subagent")
+        .id;
     assert!(matches!(
         state.job_episodes.on_run_complete(
             job_id,
             turn1,
             vec![],
-            vec![(task_id.0, subagent_session_id)]
+            vec![
+                (task_id.0, subagent_session_id),
+                (cancelled_task_id.0, cancelled_subagent_session_id)
+            ]
         ),
         crate::runs::job_episode::RunCompletion::Open
     ));
@@ -737,13 +745,33 @@ async fn subagent_completion_resolves_episode_and_stamps_job_id() {
             parent_tool_invocation_id: None,
         })
         .unwrap();
+    test_tx
+        .send(SubagentCompletion {
+            task_id: cancelled_task_id,
+            subagent_name: Some("cancelled-researcher".to_string()),
+            status: TaskStatus::Cancelled,
+            summary: "[no content]".to_string(),
+            parent_session_id: job_session_id,
+            parent_agent_id: agent_id,
+            subagent_session_id: cancelled_subagent_session_id,
+            task_description: Some("investigate".to_string()),
+            tool_count: None,
+            duration_ms: Some(5),
+            token_usage: None,
+            parent_tool_invocation_id: None,
+        })
+        .unwrap();
     drop(test_tx);
     crate::runs::notifications::completion_notification_loop(test_rx, state.clone()).await;
 
     // The continuation run is on the job session and job-stamped.
     let runs = state.run_manager.list_by_session(job_session_id, 10);
-    assert!(!runs.is_empty(), "continuation run must exist");
-    assert_eq!(runs[0].job_id, Some(job_id));
+    assert_eq!(
+        runs.len(),
+        2,
+        "both normal and cancelled completions in the open episode need continuation runs"
+    );
+    assert!(runs.iter().all(|run| run.job_id == Some(job_id)));
 
     // The pending entry was consumed (episode open with 0 pending, or —
     // if the enqueued continuation already failed fast in the background —
@@ -1111,13 +1139,31 @@ async fn cancel_job_teardown_leaves_no_runs_for_the_job() {
             task_id,
             subagent_name: Some("researcher".to_string()),
             status: TaskStatus::Cancelled,
-            summary: "Cancelled.".to_string(),
+            summary: "[no content]".to_string(),
             parent_session_id: job_session_id,
             parent_agent_id: alice_id,
             subagent_session_id: sub_session_id,
             task_description: Some("investigate".to_string()),
             tool_count: Some(0),
             duration_ms: Some(5),
+            token_usage: None,
+            parent_tool_invocation_id: None,
+        })
+        .unwrap();
+    // A natural result may win while DELETE /jobs is tearing down the job;
+    // it must still be suppressed by the job-context guard.
+    test_tx
+        .send(SubagentCompletion {
+            task_id: TaskId::new(),
+            subagent_name: Some("researcher".to_string()),
+            status: TaskStatus::Completed,
+            summary: "Natural completion racing job teardown.".to_string(),
+            parent_session_id: job_session_id,
+            parent_agent_id: alice_id,
+            subagent_session_id: sub_session_id,
+            task_description: Some("investigate".to_string()),
+            tool_count: Some(1),
+            duration_ms: Some(10),
             token_usage: None,
             parent_tool_invocation_id: None,
         })

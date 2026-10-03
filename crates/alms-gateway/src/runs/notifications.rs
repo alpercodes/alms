@@ -1351,6 +1351,33 @@ pub(crate) async fn completion_notification_loop(
             );
         }
 
+        // Cancellation has the same user-visible effect whether it came from
+        // this subagent's endpoint, its parent run, or job teardown. The
+        // lifecycle marker and SSE update the UI; this error record is the
+        // model-visible trace and points to the persisted subagent session.
+        // An open job episode is the exception: its reserved continuation
+        // still needs to run so the episode can finish.
+        if completion.status == alms_coordinator::TaskStatus::Cancelled && episode_route.is_none() {
+            info!(
+                session_id = %session_id.0,
+                task_id = %completion.task_id.0,
+                "Cancelled subagent completion recorded without notification run"
+            );
+            super::markers::persist_error_marker(
+                &state.session_manager,
+                session_id,
+                "subagent_cancelled",
+                format_cancelled_subagent_record(&completion),
+                serde_json::json!({
+                    "task_id": completion.task_id.0.to_string(),
+                    "subagent_name": completion.subagent_name.as_deref(),
+                    "subagent_session_id": completion.subagent_session_id.0.to_string(),
+                    "status": "cancelled",
+                }),
+            );
+            continue;
+        }
+
         info!(
             session_id = %session_id.0,
             task_id = %completion.task_id.0,
@@ -1720,6 +1747,20 @@ pub(super) fn format_completion_notification(c: &alms_coordinator::SubagentCompl
         .replace("{status}", status)
         .replace("{summary}", &c.summary)
         .replace("{follow_up}", &follow_up)
+}
+
+/// Create the model-visible history record that replaces a notification run
+/// for a cancelled subagent. Its transcript remains in the subagent session.
+pub(super) fn format_cancelled_subagent_record(
+    completion: &alms_coordinator::SubagentCompletion,
+) -> String {
+    let label = completion.subagent_name.as_deref().unwrap_or("subagent");
+    let session_id = completion.subagent_session_id.0;
+    format!(
+        "Background subagent \"{label}\" (session_id: {session_id}) was cancelled before finishing. \
+         No notification turn ran, so this is the only model-visible record. Use \
+         read_session(session_id: \"{session_id}\") to inspect what it did."
+    )
 }
 
 /// Maximum character length for the formatted conversation transcript

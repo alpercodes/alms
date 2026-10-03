@@ -149,6 +149,127 @@ async fn subagent_completion_propagates_session_id() {
     shutdown_token.cancel();
 }
 
+/// A cancelled subagent still delivers its lifecycle marker and SSE event,
+/// but it must not spend a new parent-session turn.
+#[tokio::test]
+async fn cancelled_subagent_delivers_marker_without_notification_run() {
+    let (state, shutdown_token, _cr, _tr, _dr) = test_app_state();
+    let parent_agent_id = AgentId::new();
+    let parent_session = state
+        .session_manager
+        .get_or_create(parent_agent_id, "direct-cancel-summary-test");
+    let parent_session_id = parent_session.id;
+    let mut events = subscribe_session(&state, parent_session_id);
+    let summary = "[no content]";
+
+    let (test_tx, test_rx) = mpsc::unbounded_channel();
+    test_tx
+        .send(SubagentCompletion {
+            task_id: TaskId::new(),
+            subagent_name: Some("researcher".to_string()),
+            status: TaskStatus::Cancelled,
+            summary: summary.to_string(),
+            parent_session_id,
+            parent_agent_id,
+            subagent_session_id: SessionId::new(),
+            task_description: Some("Research the topic".to_string()),
+            tool_count: Some(2),
+            duration_ms: Some(1200),
+            token_usage: None,
+            parent_tool_invocation_id: None,
+        })
+        .unwrap();
+    drop(test_tx);
+
+    crate::runs::notifications::completion_notification_loop(test_rx, state.clone()).await;
+
+    assert!(
+        state
+            .run_manager
+            .list_by_session(parent_session_id, 10)
+            .is_empty(),
+        "direct cancellation must not enqueue an unrequested parent run"
+    );
+
+    let history = state
+        .session_manager
+        .get_history(parent_session_id)
+        .unwrap();
+    let marker = history
+        .iter()
+        .find(|message| {
+            message.metadata.as_ref().is_some_and(|metadata| {
+                metadata.get("type").and_then(|value| value.as_str()) == Some("subagent_completion")
+            })
+        })
+        .expect("cancelled completion marker must be persisted");
+    assert_eq!(
+        marker
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.get("summary"))
+            .and_then(|value| value.as_str()),
+        Some(summary)
+    );
+
+    let completion_event = drain_events(&mut events)
+        .into_iter()
+        .find(|event| event.event_type == "subagent_completed")
+        .expect("cancelled completion must still emit SSE");
+    assert_eq!(
+        completion_event
+            .data
+            .get("summary")
+            .and_then(|value| value.as_str()),
+        Some(summary)
+    );
+
+    shutdown_token.cancel();
+}
+
+/// A cancellation propagated from the parent uses the same no-run policy as
+/// a direct cancellation when it is outside an open job episode.
+#[tokio::test]
+async fn parent_propagated_cancellation_does_not_start_notification_run() {
+    let (state, shutdown_token, _cr, _tr, _dr) = test_app_state();
+    let parent_agent_id = AgentId::new();
+    let parent_session_id = state
+        .session_manager
+        .get_or_create(parent_agent_id, "propagated-cancel-test")
+        .id;
+
+    let (test_tx, test_rx) = mpsc::unbounded_channel();
+    test_tx
+        .send(SubagentCompletion {
+            task_id: TaskId::new(),
+            subagent_name: Some("researcher".to_string()),
+            status: TaskStatus::Cancelled,
+            summary: "[no content]".to_string(),
+            parent_session_id,
+            parent_agent_id,
+            subagent_session_id: SessionId::new(),
+            task_description: Some("Research the topic".to_string()),
+            tool_count: Some(1),
+            duration_ms: Some(500),
+            token_usage: None,
+            parent_tool_invocation_id: None,
+        })
+        .unwrap();
+    drop(test_tx);
+
+    crate::runs::notifications::completion_notification_loop(test_rx, state.clone()).await;
+
+    assert!(
+        state
+            .run_manager
+            .list_by_session(parent_session_id, 10)
+            .is_empty(),
+        "parent-propagated cancellation must not start unrequested work"
+    );
+
+    shutdown_token.cancel();
+}
+
 /// Drive `forward_runtime_events` with a single foreground
 /// `RuntimeEvent::SubagentStarted` and assert it persists a durable
 /// `subagent_started` lifecycle marker to the parent's session history
@@ -839,17 +960,25 @@ async fn cancel_subagent_endpoint_404_when_no_live_subagent() {
 /// the awaited `TaskResult` asserts end-to-end.
 #[tokio::test]
 async fn cancel_subagent_endpoint_cancels_live_subagent() {
-    use axum::extract::{Path as AxumPath, State as AxumState};
+    use axum::body::Body;
+    use axum::http::Request as HttpRequest;
+    use tower::ServiceExt;
 
-    let (state, shutdown_token, _cr, _tr, _dr) = test_app_state_with_mock_llm();
+    let (state, shutdown_token, mut completion_rx, _tr, _dr) = test_app_state_with_mock_llm();
+    let parent_agent_id = AgentId::new();
+    let parent_session_id = state
+        .session_manager
+        .get_or_create(parent_agent_id, "cancelled-subagent-e2e")
+        .id;
+    let mut parent_events = subscribe_session(&state, parent_session_id);
 
     // Spawn a background subagent directly on the coordinator (the same
     // object the endpoint reaches through `state.coordinator`). Unnamed, so
     // no registry entry is needed.
     let request = alms_coordinator::SubagentRequest {
         task: "long-running background research".to_string(),
-        parent_session: SessionId::new(),
-        parent_agent_id: AgentId::new(),
+        parent_session: parent_session_id,
+        parent_agent_id,
         parent_run_id: None,
         subagent_name: None,
         parent_tool_invocation_id: None,
@@ -859,18 +988,31 @@ async fn cancel_subagent_endpoint_cancels_live_subagent() {
         .spawn_subagent(request, None, true, None)
         .await
         .expect("spawn_subagent should succeed");
+    let sub_session_id_text = sub_session_id.0.to_string();
     let result_rx = state
         .coordinator
         .take_result_rx(task_id)
         .expect("result receiver should be available");
 
-    // Cancel through the HTTP handler (session-keyed).
-    let response =
-        crate::runs::lifecycle::cancel_subagent(AxumState(state.clone()), AxumPath(sub_session_id))
-            .await
-            .expect("cancel of a live subagent must return 200");
+    // Cancel through the production HTTP route.
+    let cancel_uri = format!("/sessions/{}/subagent/cancel", sub_session_id.0);
+    let response = crate::server::routes::protected_router()
+        .with_state(state.clone())
+        .oneshot(HttpRequest::post(&cancel_uri).body(Body::empty()).unwrap())
+        .await
+        .expect("router oneshot should not fail");
     assert_eq!(
-        response.0["status"], "cancelling",
+        response.status(),
+        axum::http::StatusCode::OK,
+        "cancelling a live subagent must return 200"
+    );
+    let response_bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+        .await
+        .expect("read cancel response");
+    let response_json: serde_json::Value =
+        serde_json::from_slice(&response_bytes).expect("response should be JSON");
+    assert_eq!(
+        response_json["status"], "cancelling",
         "the 200 body must report status=cancelling"
     );
 
@@ -885,20 +1027,171 @@ async fn cancel_subagent_endpoint_cancels_live_subagent() {
         task_result.status
     );
 
+    let completion = completion_rx
+        .recv()
+        .await
+        .expect("directly cancelled background subagent must emit a completion");
+    assert_eq!(completion.status, TaskStatus::Cancelled);
+    assert_eq!(
+        completion.summary, "[no content]",
+        "the coordinator drops partial output when cancellation wins"
+    );
+    assert_eq!(completion.subagent_session_id, sub_session_id);
+
     // Idempotence / double-click: the subagent is now terminal, so a second
     // cancel must report 404 (no live subagent), not 200.
-    let second =
-        crate::runs::lifecycle::cancel_subagent(AxumState(state.clone()), AxumPath(sub_session_id))
-            .await;
-    assert!(
-        second.is_err(),
-        "a second cancel after termination must be an error (404)"
-    );
+    let second = crate::server::routes::protected_router()
+        .with_state(state.clone())
+        .oneshot(HttpRequest::post(&cancel_uri).body(Body::empty()).unwrap())
+        .await
+        .expect("router oneshot should not fail");
     assert_eq!(
-        second.unwrap_err().0,
+        second.status(),
         axum::http::StatusCode::NOT_FOUND,
         "the second cancel must be a 404"
     );
+    let second_bytes = axum::body::to_bytes(second.into_body(), 64 * 1024)
+        .await
+        .expect("read second cancel response");
+    let second_json: serde_json::Value =
+        serde_json::from_slice(&second_bytes).expect("error body should be JSON");
+    assert_eq!(second_json["error"]["code"], "NO_LIVE_SUBAGENT");
+
+    let (notification_tx, notification_rx) = mpsc::unbounded_channel();
+    notification_tx
+        .send(completion)
+        .expect("forward the coordinator's real completion");
+    drop(notification_tx);
+    crate::runs::notifications::completion_notification_loop(notification_rx, state.clone()).await;
+
+    assert!(
+        state
+            .run_manager
+            .list_by_session(parent_session_id, 10)
+            .is_empty(),
+        "a cancelled subagent must not enqueue a parent notification run"
+    );
+
+    let history = state
+        .session_manager
+        .get_history(parent_session_id)
+        .expect("parent history should contain the cancellation records");
+    let completion_marker = history
+        .iter()
+        .find(|message| {
+            message.metadata.as_ref().is_some_and(|metadata| {
+                metadata.get("type").and_then(|value| value.as_str()) == Some("subagent_completion")
+            })
+        })
+        .expect("cancelled subagent lifecycle marker must be persisted");
+    let completion_metadata = completion_marker.metadata.as_ref().unwrap();
+    assert_eq!(
+        completion_metadata.get("summary").and_then(|v| v.as_str()),
+        Some("[no content]")
+    );
+    assert_eq!(
+        completion_metadata
+            .get("session_id")
+            .and_then(|v| v.as_str()),
+        Some(sub_session_id_text.as_str())
+    );
+
+    let error_record = history
+        .iter()
+        .find(|message| {
+            message.metadata.as_ref().is_some_and(|metadata| {
+                metadata.get("type").and_then(|value| value.as_str()) == Some("subagent_cancelled")
+            })
+        })
+        .expect("parent history must have a model-visible cancellation record");
+    let error_metadata = error_record.metadata.as_ref().unwrap();
+    assert_eq!(
+        error_metadata.get("kind").and_then(|v| v.as_str()),
+        Some("error")
+    );
+    assert_eq!(
+        error_metadata
+            .get("subagent_session_id")
+            .and_then(|v| v.as_str()),
+        Some(sub_session_id_text.as_str())
+    );
+    let error_text = match &error_record.content {
+        alms_session::Content::Text(text) => text.as_str(),
+        _ => panic!("cancellation record must contain readable text"),
+    };
+    assert!(error_text.contains("Background subagent \"subagent\""));
+    assert!(error_text.contains(&format!("session_id: {sub_session_id_text}")));
+    assert!(error_text.contains("cancelled before finishing"));
+    assert!(error_text.contains("No notification turn ran"));
+    assert!(error_text.contains(&format!(
+        "read_session(session_id: \"{sub_session_id_text}\")"
+    )));
+
+    let completion_event = drain_events(&mut parent_events)
+        .into_iter()
+        .find(|event| event.event_type == "subagent_completed")
+        .expect("cancelled completion must still emit SSE to the parent");
+    assert_eq!(
+        completion_event.data.get("status").and_then(|v| v.as_str()),
+        Some("cancelled")
+    );
+    assert_eq!(
+        completion_event
+            .data
+            .get("summary")
+            .and_then(|v| v.as_str()),
+        Some("[no content]")
+    );
+    assert_eq!(
+        completion_event
+            .data
+            .get("subagent_session_id")
+            .and_then(|v| v.as_str()),
+        Some(sub_session_id_text.as_str())
+    );
+    assert!(
+        state.session_manager.get(sub_session_id).is_ok(),
+        "the cancelled subagent's session remains readable"
+    );
+
+    shutdown_token.cancel();
+}
+
+/// Parent-run cancellation uses the same child token as direct cancellation
+/// and emits the same cancelled completion shape.
+#[tokio::test]
+async fn parent_cancelled_background_subagent_emits_cancelled_completion() {
+    let (state, shutdown_token, mut completion_rx, _tr, _dr) = test_app_state_with_mock_llm();
+    let parent_cancel = CancellationToken::new();
+    let request = alms_coordinator::SubagentRequest {
+        task: "background work cancelled with the parent".to_string(),
+        parent_session: SessionId::new(),
+        parent_agent_id: AgentId::new(),
+        parent_run_id: None,
+        subagent_name: None,
+        parent_tool_invocation_id: None,
+    };
+    let (task_id, _sub_session_id) = state
+        .coordinator
+        .spawn_subagent(request, None, true, Some(parent_cancel.clone()))
+        .await
+        .expect("spawn_subagent should succeed");
+    let result_rx = state
+        .coordinator
+        .take_result_rx(task_id)
+        .expect("result receiver should be available");
+
+    parent_cancel.cancel();
+    let result = result_rx
+        .await
+        .expect("parent cancellation must terminate task");
+    assert_eq!(result.status, TaskStatus::Cancelled);
+    let completion = completion_rx
+        .recv()
+        .await
+        .expect("parent-cancelled background subagent must emit a completion");
+    assert_eq!(completion.status, TaskStatus::Cancelled);
+    assert_eq!(completion.summary, "[no content]");
 
     shutdown_token.cancel();
 }

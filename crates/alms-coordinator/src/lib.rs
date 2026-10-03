@@ -619,7 +619,6 @@ impl Coordinator {
             .as_ref()
             .map(|p| p.child_token())
             .unwrap_or_default();
-
         // The handle is created and inserted BEFORE `subagent_started` is
         // emitted below (Tim S2, PR #1192): the moment the UI learns the
         // subagent's session id, a session-keyed cancel must find a live
@@ -2546,6 +2545,25 @@ mod tests {
         Coordinator::new(session_manager, llm)
     }
 
+    #[derive(Debug)]
+    struct BlockingRunRegistrar {
+        entered: std::sync::mpsc::Sender<()>,
+        release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+
+    #[async_trait::async_trait]
+    impl RunRegistrar for BlockingRunRegistrar {
+        async fn register_run(&self, _run: Run) -> AlmsResult<()> {
+            Ok(())
+        }
+
+        fn update_run(&self, _run: Run) -> AlmsResult<()> {
+            let _ = self.entered.send(());
+            let _ = self.release.lock().unwrap().recv();
+            Ok(())
+        }
+    }
+
     // -- #1148: live server-default LLM handle -------------------------------
 
     /// A coordinator built with
@@ -4095,6 +4113,58 @@ mod tests {
             !coord.cancel_subagent_by_session(sub_session_id),
             "a completed subagent's session must report false"
         );
+    }
+
+    /// The terminal status is selected before the registrar persists it, but
+    /// the handle remains Running until that write finishes. A cancel accepted
+    /// in this window must not turn a successful result into a cancelled one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancel_racing_terminal_persistence_keeps_completed_result() {
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let registrar = Arc::new(BlockingRunRegistrar {
+            entered: entered_tx,
+            release: std::sync::Mutex::new(release_rx),
+        });
+        let (completion_tx, mut completion_rx) = mpsc::unbounded_channel();
+        let coord = test_coordinator()
+            .with_run_registrar(registrar)
+            .with_completion_channel(completion_tx);
+        let request = SubagentRequest {
+            task: "Finish successfully before the cancel arrives".to_string(),
+            parent_session: test_session_id(),
+            parent_agent_id: test_parent_agent_id(),
+            parent_run_id: None,
+            subagent_name: None,
+            parent_tool_invocation_id: None,
+        };
+        let (task_id, subagent_session_id) = coord
+            .spawn_subagent(request, None, true, None)
+            .await
+            .expect("spawn_subagent should succeed");
+        let result_rx = coord
+            .take_result_rx(task_id)
+            .expect("result receiver exists");
+
+        tokio::task::spawn_blocking(move || entered_rx.recv_timeout(Duration::from_secs(10)))
+            .await
+            .expect("wait task should not panic")
+            .expect("run persistence should reach the controlled window");
+
+        assert_eq!(coord.get_status(task_id), Some(TaskStatus::Running));
+        assert!(
+            coord.cancel_subagent_by_session(subagent_session_id),
+            "the handle is still Running while terminal persistence is blocked"
+        );
+        release_tx.send(()).expect("release terminal persistence");
+
+        let result = result_rx.await.expect("subagent should return its result");
+        assert_eq!(result.status, TaskStatus::Completed);
+        let completion = completion_rx
+            .recv()
+            .await
+            .expect("background completion should still be emitted");
+        assert_eq!(completion.status, TaskStatus::Completed);
     }
 
     // -- (d3) cancel labelling is poll-order-independent (Tim S1, PR #1192) -----

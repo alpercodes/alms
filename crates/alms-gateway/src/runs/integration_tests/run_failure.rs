@@ -62,7 +62,7 @@ fn format_completion_notification_for_cancelled_subagent() {
         task_id: TaskId::new(),
         subagent_name: Some("writer".to_string()),
         status: TaskStatus::Cancelled,
-        summary: "Run was cancelled by user".to_string(),
+        summary: "[no content]".to_string(),
         parent_session_id: SessionId::new(),
         parent_agent_id: AgentId::new(),
         subagent_session_id: SessionId::new(),

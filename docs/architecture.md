@@ -22,7 +22,7 @@ A Rust-based agent platform with two communication layers: (1) vertical delegati
 
 ### Layer 1 — Parent/subagent delegation
 
-A top-level agent can call the `invoke_agent` tool to spawn a subagent. The subagent executes a full multi-turn agent loop and returns its result as a tool response, or completes in the background and triggers an automatic notification run. Subagent runtimes do not currently register `invoke_agent`, so the live hierarchy is one level deep.
+A top-level agent can call the `invoke_agent` tool to spawn a subagent. The subagent executes a full multi-turn agent loop and returns its result as a tool response, or completes in the background and triggers an automatic notification run. A cancelled background completion outside an open job episode is recorded in the parent history without starting a run. Subagent runtimes do not currently register `invoke_agent`, so the live hierarchy is one level deep.
 
 ```
 [User] ──► [Agent A]
