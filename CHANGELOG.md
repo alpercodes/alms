@@ -238,16 +238,11 @@ one.
   together with a hook that removes a node in `afterSanitizeElements` or
   `afterSanitizeAttributes`. The UI uses neither: it sanitizes a string with no config, and
   its one `afterSanitizeAttributes` hook only sets `target` / `rel` on links. No release is
-  in the affected range (3.4.13–3.4.15): v0.2.3 loads `dompurify` 3.2.4 from esm.sh. An
-  86-case differential of the markdown pipeline across 3.4.14 and 3.4.16 found no output
-  change. No operator action. The committed `static/ui-dist/` bundle is rebuilt.
-- `undici` 7.29.0 -> 7.30.0 and `brace-expansion` 5.0.9 -> 5.0.12, lockfile-only, to clear
-  ten `undici` advisories (GHSA-3wwx-pv8p-q78v, GHSA-pmjh-fq2x-6v4x, GHSA-r53p-7pc4-xj5r,
-  GHSA-rfgv-xxqx-mfg5, GHSA-3xpg-4rpp-hhhm, GHSA-2jfj-6hjv-fm6j, GHSA-2gqq-gqf2-x968,
-  GHSA-w293-vg96-wgc3, GHSA-8436-99hf-9mmv, GHSA-rx4f-c7p8-82vq) and three `brace-expansion`
-  ones (GHSA-6j4f-fj2g-mc7p, GHSA-qhr7-859c-m2p7, GHSA-q2hr-2g5m-vwhr). Both are
-  dev-only: `undici` comes in through `jsdom` for Vitest and `brace-expansion` through
-  `minimatch` for ESLint. Neither reaches the binary or the UI bundle.
+  in the affected range (3.4.13–3.4.15): v0.2.3 loads `dompurify` 3.2.4 from esm.sh. The
+  only output change on the UI's path is fail-closed: a `<form>` containing a form control
+  or image whose `name` or `id` is `removeAttributeNode` or `getAttributeNode` is now
+  dropped from rendered markdown, along with its contents. No operator action. The
+  committed `static/ui-dist/` bundle is rebuilt.
 
 ## v0.2.3 — released (tag `v0.2.3`)
 

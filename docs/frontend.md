@@ -129,7 +129,11 @@ differs: the SVG `pointer-events` and `vector-effect` presentation attributes on
 3.4.14 allow-list addition, and both attributes are presentational — no script
 surface, no URL surface. Every other case, including all the hostile ones, was
 byte-identical, so nothing `utils/code-copy.js` or
-`utils/decorate-code-blocks.js` parses moved.
+`utils/decorate-code-blocks.js` parses moved. Which DOM that differential ran
+under isn't recorded. Under jsdom, its clobbering cases could not reach
+`<form>` named-property clobbering at all (see the 3.4.16 note below). Re-run in
+headless Chromium during the 3.4.16 bump, with form-clobbering cases added,
+3.4.12 -> 3.4.14 still differs only in that SVG case.
 
 **3.4.14 rather than the minimum patch 3.4.13.** 3.4.13 clears the advisory on
 its own; 3.4.14 is latest and avoids a second bump shortly after. Its extra fix
@@ -165,19 +169,27 @@ needs both preconditions. `static/ui/deps.js` does register an
 sets `target` / `rel` on anchors and detaches nothing. And `sanitize(raw)` runs
 on a string with no config, so there is no `IN_PLACE` and no caller-owned live
 tree. The bump is taken because this is the sanitizer for every rendered
-message and the patch is a drop-in, not because ALMS was reachable. At `low`
-the advisory alone would not have failed the `moderate` gate; it arrived
-alongside dev-only `undici` and `brace-expansion` advisories that did.
+message and the patch is a drop-in for how we call it, not because ALMS was
+reachable. At `low` the advisory alone would not have failed the `moderate`
+gate; it arrived alongside dev-only `undici` and `brace-expansion` advisories
+that did.
 
-**No measured behaviour change.** 3.4.15 adds XML clobbering hardening and
-"several smaller hardening and edge-case improvements". 3.4.16 fixes the
-`IN_PLACE` gaps and moves DOMPurify's own build from rollup to rolldown. An
-86-case differential of the full `renderMarkdown()` pipeline across 3.4.14 and
-3.4.16 was byte-identical. It covered ordinary markdown, allowed raw HTML,
-active tags, raw-text elements, URL schemes, MathML/SVG mutation-XSS, XML
-(CDATA, processing instructions, comments), DOM clobbering, custom elements,
-and deep nesting. The pins in `frontend/markdown-rendering.test.ts` stand
-unchanged.
+**One behaviour change, fail-closed, and invisible to jsdom.** 3.4.15's
+clobbering hardening makes `_isClobbered()` also flag a `<form>` whose
+`removeAttributeNode` or `getAttributeNode` is shadowed by a form control or
+`<img>` inside it with that `name` or `id`.
+`<form><input name="removeAttributeNode"></form>` now renders as nothing
+(3.4.14: `<form><input></form>`), and anything inside such a form goes with it.
+Chromium shows this. jsdom doesn't, because it doesn't implement
+`[LegacyOverrideBuiltIns]` on `HTMLFormElement`, so neither the 86-case jsdom
+differential nor the Vitest suite can observe it. Re-run in headless Chromium
+against the committed `deps` chunks, those 86 cases are still byte-identical
+across 3.4.14 and 3.4.16; only added form cases of this shape differ. A Vitest
+pin would pass on both versions, so there isn't one. 3.4.16's hook-detach
+re-checks are no-ops for our hook, which detaches nothing, and its shadow-root
+change only applies to DOM-node input, which we never pass. 3.4.16 also moves
+DOMPurify's build from rollup to rolldown. The pins in
+`frontend/markdown-rendering.test.ts` stand unchanged.
 
 ### Why `@preact/signals` is on 2.x
 
