@@ -63,6 +63,15 @@ Each item below changes behaviour for a deployment that has not set the knob exp
   replacing it. `personality`, `goals` and `user` still default to `write`, and an explicit
   `mode` is still honoured everywhere.
 
+- **Workspace prompt injection is capped at 4000 bytes per file.**
+  `personality.md`, `goals.md` and `user.md` keep the beginning of oversized files;
+  `memories.md` keeps the most recent end. Each partial view is marked in the prompt,
+  and a `workspace_write` replacement based on a partial view is refused until the
+  agent reads the complete file. The cap preserves conversation history when workspace
+  files grow, but it means an existing deployment with an oversized identity file may
+  need `workspace_read` before replacing it. Files above the 12000-byte read cap cannot
+  be replaced by the agent and require appending or operator editing.
+
 - **`fs_read` output caps lowered.** Whole-file reads cap at 256 KiB; passing `offset` or
   `limit` falls back to a 64 KiB output budget. Large reads must paginate.
 

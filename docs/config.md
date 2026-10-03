@@ -238,7 +238,12 @@ Anthropic supports up to four cache breakpoints per request. ALMS uses two:
 1. **Last tool definition** — caches the entire tools array.
 2. **Trailing system content block** — caches the full prefix through system + workspace + (optional episodic summary), because Anthropic caches up to *and including* each marker.
 
-Workspace files (personality / goals / memories) and episodic summaries are already concatenated into the system string by `agent::context::assemble_system_prompt` and `ContextBuilder::build_with_perspective` before the adapter sees them. Splitting them into separate content blocks for independent breakpoints would require a runtime refactor; the single trailing-system marker gives the full prefix a cache entry today with no per-turn churn.
+Workspace files (personality / goals / memories / user) and episodic summaries are already
+assembled into the system string by the budget-aware runtime context builder and
+`ContextBuilder::build_with_perspective` before the adapter sees them. Splitting them into
+separate content blocks for independent breakpoints would require a runtime refactor; the
+single trailing-system marker gives the full prefix a cache entry today, and the fixed
+per-run workspace budget avoids churn while the files are unchanged.
 
 ### Scope
 

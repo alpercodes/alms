@@ -13,6 +13,11 @@ use tracing::{debug, error, info, warn};
 
 use super::AgentRuntime;
 
+pub(crate) struct BuiltContext {
+    pub(crate) messages: Vec<LlmMessage>,
+    pub(crate) workspace_budget_bytes: usize,
+}
+
 impl AgentRuntime {
     /// Assemble the full system prompt for a given stage, appending workspace
     /// files if attached.
@@ -136,6 +141,7 @@ impl AgentRuntime {
     /// For DM sessions (context_id starts with `"dm:"`), perspective mapping is
     /// applied: messages from this agent become `Role::Assistant` so the LLM
     /// sees them as its own previous responses.
+    #[cfg(test)]
     pub(crate) async fn build_context(
         &self,
         session_manager: &SessionManager,
@@ -143,10 +149,22 @@ impl AgentRuntime {
         context_id: &str,
         input: &str,
     ) -> AlmsResult<Vec<LlmMessage>> {
+        self.build_context_with_budget(session_manager, session_id, context_id, input)
+            .await
+            .map(|built| built.messages)
+    }
+
+    pub(crate) async fn build_context_with_budget(
+        &self,
+        session_manager: &SessionManager,
+        session_id: &alms_core::SessionId,
+        context_id: &str,
+        input: &str,
+    ) -> AlmsResult<BuiltContext> {
         let include_user = Self::is_user_facing_context(context_id);
 
         // Start the run with no record of what the agent has been shown of
-        // its workspace (#1310). The `assemble_system_prompt` call below
+        // its workspace (#1310). The budget-aware prompt assembly below
         // immediately refills it for every file it injects, so the effect is
         // to scope the record to this run: a view recorded by a previous run
         // must not authorise a whole-file `workspace_write` in this one,
@@ -332,14 +350,17 @@ impl AgentRuntime {
             None
         };
 
-        Ok(builder.build_with_perspective(
-            &system_prompt,
-            &history,
-            input,
-            summary_text.as_deref(),
-            perspective,
-            episodic_text.as_deref(),
-        ))
+        Ok(BuiltContext {
+            messages: builder.build_with_perspective(
+                &system_prompt,
+                &history,
+                input,
+                summary_text.as_deref(),
+                perspective,
+                episodic_text.as_deref(),
+            ),
+            workspace_budget_bytes,
+        })
     }
 
     /// Load episodic summaries from other sessions and format them for

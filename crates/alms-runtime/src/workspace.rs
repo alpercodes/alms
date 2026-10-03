@@ -285,6 +285,10 @@ pub const WORKSPACE_FILE_INJECTION_CAP: usize = 4000;
 
 /// Maximum content bytes injected from `memories.md` into the system prompt.
 /// Retained as the memory-specific name for callers and tests.
+///
+/// `ContextBuilder` budgets history around the system prompt; it does not trim
+/// the system prompt itself, so this cap is what prevents workspace content
+/// from evicting the conversation.
 pub const MEMORIES_INJECTION_CAP: usize = WORKSPACE_FILE_INJECTION_CAP;
 
 /// The `memories.md` text to inject into the system prompt: the file verbatim
@@ -405,7 +409,12 @@ fn head_window_through_line_end(contents: &str, cap: usize) -> &str {
     if end == contents.len() || raw.ends_with('\n') {
         raw
     } else if let Some(line_end) = raw.rfind('\n') {
-        if raw[..line_end].contains('\n') {
+        let line_aligned_end = line_end + 1;
+        // Keep a complete line only when backing up would discard at most a
+        // quarter of the requested window. A short heading followed by one
+        // long paragraph must retain the paragraph instead of collapsing the
+        // head view to a handful of bytes.
+        if raw[..line_end].contains('\n') && end.saturating_sub(line_aligned_end) <= cap / 4 {
             &raw[..=line_end]
         } else {
             raw
@@ -417,7 +426,7 @@ fn head_window_through_line_end(contents: &str, cap: usize) -> &str {
 
 /// Maximum bytes of one workspace file returned by the `workspace_read` tool.
 ///
-/// Four times [`MEMORIES_INJECTION_CAP`], because this is the *deliberate*
+/// Three times [`WORKSPACE_FILE_INJECTION_CAP`], because this is the *deliberate*
 /// read — the agent asked for the file, usually because it is about to
 /// replace it, and a rewrite composed from a 4000-byte window is the problem
 /// rather than the fix. Two ceilings bound it from above:
@@ -486,7 +495,7 @@ const WORKSPACE_READ_JSON_ENVELOPE: usize = 1024;
 /// at compile time should fail the build, not a test run.
 const _: () = {
     assert!(
-        WORKSPACE_READ_CAP > MEMORIES_INJECTION_CAP,
+        WORKSPACE_READ_CAP > WORKSPACE_FILE_INJECTION_CAP,
         "a deliberate read must return more than the prompt injection already did, \
          or `workspace_read` cannot be the recovery from a windowed view"
     );
@@ -1159,34 +1168,8 @@ impl AgentWorkspace {
         self.read_file(WorkspaceFile::Personality).is_none()
     }
 
-    /// Build system prompt prefix from workspace files.
-    ///
-    /// When `include_user` is false, `user.md` is omitted from the prefix.
-    /// This saves tokens and avoids confusion in non-user-facing contexts —
-    /// `AgentRuntime::is_user_facing_context` is the caller that decides,
-    /// and the one place the context list is written down.
-    ///
-    /// This is also the moment the agent is *shown* its workspace, so each
-    /// read is recorded as the base for [`Self::write_file_checked`] (#1310).
-    /// Two details carry the whole guard:
-    ///
-    /// - A file that is missing or blank is recorded as an empty view rather
-    ///   than skipped. There is nothing to show and nothing to lose, and
-    ///   recording it keeps a fresh agent's first `personality.md` write off
-    ///   the guard for a reason the record states, instead of relying on the
-    ///   empty-target valve alone.
-    /// - `user.md` under `include_user == false` is **not read and not
-    ///   recorded**. It is the one file that can be absent from the prompt
-    ///   while present on disk, and recording it here — "we looked, so call
-    ///   it seen" — would hand a DM-run `workspace_write` permission to
-    ///   delete a file the agent has no copy of. Not looking is what makes
-    ///   that case [`RefusedWrite::NeverShown`].
-    ///
-    /// Called again by `rebuild_system_prompt_for_tool_loop` after every tool
-    /// batch, which is what refreshes the base mid-run: an agent that appends
-    /// in one batch and replaces in the next has been re-shown the file in
-    /// between, and its replacement is judged against what it can actually
-    /// see.
+    /// Append one workspace file to an assembled prompt and record the view
+    /// used by [`Self::write_file_checked`].
     fn append_system_prompt_file(
         &self,
         parts: &mut Vec<String>,
@@ -1207,6 +1190,10 @@ impl AgentWorkspace {
             );
         }
 
+        // A complete read may have happened between prompt rebuilds. Preserve
+        // that whole-file view when the bytes are unchanged; otherwise a
+        // rebuild would downgrade it back to a capped window and make the
+        // advertised read-then-write recovery impossible.
         let already_shown_whole = self
             .shown
             .get(&file)
@@ -1221,16 +1208,37 @@ impl AgentWorkspace {
         }
     }
 
+    /// Build a system-prompt prefix from workspace files without a runtime
+    /// budget. The agent runtime uses the budget-aware variant below.
+    ///
+    /// When `include_user` is false, `user.md` is omitted from the prefix.
+    /// This saves tokens and avoids confusion in non-user-facing contexts —
+    /// `AgentRuntime::is_user_facing_context` is the caller that decides,
+    /// and the one place the context list is written down.
+    ///
+    /// This is also the moment the agent is *shown* its workspace, so each
+    /// read is recorded as the base for [`Self::write_file_checked`] (#1310).
+    /// Missing or blank files are recorded as empty views, while `user.md` is
+    /// not read or recorded when it is excluded from the prompt. The runtime
+    /// calls this again after each tool batch to refresh the view mid-run.
     pub fn build_system_prompt_prefix(&self, include_user: bool) -> String {
         self.build_system_prompt_prefix_with_budget(include_user, usize::MAX)
     }
 
+    /// Build a system-prompt prefix using the run-scoped byte budget.
+    ///
+    /// The budget covers file contents after reserving space for headings and
+    /// truncation markers. The caller keeps it stable for the run so a tool
+    /// loop can refresh files without shrinking the workspace view as history
+    /// grows.
     pub(crate) fn build_system_prompt_prefix_with_budget(
         &self,
         include_user: bool,
         budget_bytes: usize,
     ) -> String {
         // Headers and truncation markers are outside the file-content window.
+        // The caller supplies one run-scoped budget; ContextBuilder trims
+        // history around the resulting system prompt but never trims it.
         const MARKER_AND_HEADING_RESERVE_BYTES: usize = 256;
 
         let mut files = vec![
@@ -1492,15 +1500,19 @@ mod tests {
     #[test]
     fn head_window_respects_utf8_boundaries_and_keeps_complete_lines() {
         let content = format!("first line\nsecond line\n{}\nlast line", "x".repeat(5000));
-        assert_eq!(
-            head_window_through_line_end(&content, 4000),
-            "first line\nsecond line\n"
-        );
+        let window = head_window_through_line_end(&content, 4000);
+        assert_eq!(window.len(), 4000);
+        assert!(window.starts_with("first line\nsecond line\n"));
 
         let long_line = format!("Heading\n{}\n", "x".repeat(5000));
         let window = head_window_through_line_end(&long_line, 4000);
         assert_eq!(window.len(), 4000);
         assert!(window.starts_with("Heading\n"));
+
+        let near_boundary = format!("intro\n{}\n{}", "x".repeat(800), "y".repeat(500));
+        let window = head_window_through_line_end(&near_boundary, 1000);
+        assert!(window.ends_with('\n'));
+        assert_eq!(window.len(), "intro\n".len() + 800 + 1);
 
         let one_line = "é".repeat(3000);
         let window = head_window_through_line_end(&one_line, 4001);
@@ -1577,10 +1589,10 @@ mod tests {
         );
     }
 
-    /// The cap still binds. It is the only bound on this text — `ContextBuilder`
-    /// measures the system prompt and shrinks *history* to pay for it, it never
-    /// trims the prompt itself — so a window that quietly stopped capping would
-    /// evict the conversation instead of the old memories.
+    /// The cap still binds. `ContextBuilder` measures the system prompt and
+    /// shrinks *history* to pay for it, it never trims the prompt itself — so a
+    /// window that quietly stopped capping would evict the conversation instead
+    /// of the old memories.
     #[test]
     fn the_injected_window_stays_within_the_cap() {
         let memories = oversize_memories();

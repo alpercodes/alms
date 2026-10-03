@@ -504,6 +504,13 @@ fn stream_error_is_timeout(err: &AlmsError) -> bool {
         .contains("operation timed out")
 }
 
+pub(super) struct AgentLoopPrompt<'a> {
+    pub(super) is_dm: bool,
+    pub(super) include_user: bool,
+    pub(super) dm_peer: Option<&'a str>,
+    pub(super) workspace_budget_bytes: usize,
+}
+
 impl AgentRuntime {
     /// Inactivity budget, in seconds, for the given run phase (#1150).
     /// `0` means the phase has no inactivity budget (disabled / not bounded by
@@ -536,21 +543,56 @@ impl AgentRuntime {
         }
     }
 
-    /// Main agent loop with tool execution
-    #[instrument(
-        level = "debug",
-        skip(self, session_manager, messages),
-        fields(agent_id = %self.agent_id.0, session_id = %session_id.0)
-    )]
+    /// Main agent loop with tool execution.
+    ///
+    /// Kept as a small compatibility wrapper for tests that construct a
+    /// message vector directly. Production runs use the budget-aware entry
+    /// point below so tool-loop prompt rebuilds reuse the budget from the
+    /// initial context build.
+    #[cfg(test)]
     pub(crate) async fn agent_loop(
         &self,
         session_manager: &SessionManager,
         session_id: alms_core::SessionId,
-        mut messages: Vec<LlmMessage>,
+        messages: Vec<LlmMessage>,
         is_dm: bool,
         include_user: bool,
         dm_peer: Option<&str>,
     ) -> (Vec<alms_core::ToolCallRecord>, AlmsResult<AgentLoopOutput>) {
+        self.agent_loop_with_workspace_budget(
+            session_manager,
+            session_id,
+            messages,
+            AgentLoopPrompt {
+                is_dm,
+                include_user,
+                dm_peer,
+                workspace_budget_bytes: usize::MAX,
+            },
+        )
+        .await
+    }
+
+    /// Main agent loop with tool execution and a stable workspace budget for
+    /// all system-prompt rebuilds in this run.
+    #[instrument(
+        level = "debug",
+        skip(self, session_manager, messages, prompt),
+        fields(agent_id = %self.agent_id.0, session_id = %session_id.0)
+    )]
+    pub(super) async fn agent_loop_with_workspace_budget(
+        &self,
+        session_manager: &SessionManager,
+        session_id: alms_core::SessionId,
+        mut messages: Vec<LlmMessage>,
+        prompt: AgentLoopPrompt<'_>,
+    ) -> (Vec<alms_core::ToolCallRecord>, AlmsResult<AgentLoopOutput>) {
+        let AgentLoopPrompt {
+            is_dm,
+            include_user,
+            dm_peer,
+            workspace_budget_bytes,
+        } = prompt;
         let mut total_usage = TokenUsage::default();
         let mut tool_call_records: Vec<alms_core::ToolCallRecord> = Vec::new();
         let mut tool_seq: u32 = 0;
@@ -1007,7 +1049,12 @@ impl AgentRuntime {
                 // For DM sessions, re-inject the DM recipient addendum so the
                 // agent remembers the implicit-reply contract on every
                 // iteration -- not just the first one (fixes #346).
-                self.rebuild_system_prompt_for_tool_loop(&mut messages, include_user, dm_peer);
+                self.rebuild_system_prompt_for_tool_loop_with_budget(
+                    &mut messages,
+                    include_user,
+                    dm_peer,
+                    workspace_budget_bytes,
+                );
 
                 continue;
             }
@@ -1066,7 +1113,12 @@ impl AgentRuntime {
 
                 // Re-inject the DM addendum into the system prompt so the
                 // agent is reminded of the implicit-reply contract.
-                self.rebuild_system_prompt_for_tool_loop(&mut messages, include_user, dm_peer);
+                self.rebuild_system_prompt_for_tool_loop_with_budget(
+                    &mut messages,
+                    include_user,
+                    dm_peer,
+                    workspace_budget_bytes,
+                );
 
                 continue;
             }

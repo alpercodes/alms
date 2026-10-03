@@ -534,7 +534,7 @@ pub(crate) fn to_anthropic_request(req: &CompletionRequest) -> AnthropicRequest 
     //   `LlmMessage::system` blocks — a refactor outside this PR. See
     //   the PR body for the trade-off.
     // - The adapter sees workspace files already concatenated into the
-    //   first `LlmMessage::system` by `agent::context::assemble_system_prompt`,
+    //   first `LlmMessage::system` by the budget-aware runtime context builder,
     //   and the episodic summary (when present) added as a second
     //   `LlmMessage::system` by `ContextBuilder::build_with_perspective`.
     //   A single marker on the last of those caches all of it.

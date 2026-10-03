@@ -273,16 +273,17 @@ The gateway's run-lifecycle wires these in a deterministic order: spill / tool-o
 
 **How they feed into the system prompt:**
 
-The workspace prefix is assembled by `build_system_prompt_prefix()` in `workspace.rs` and **appended** after the base system prompt. The order is:
+The workspace prefix is assembled by the budget-aware `build_system_prompt_prefix_with_budget()` in `workspace.rs` and **appended** after the base system prompt. The order is:
 
 ```
 System prompt = [
   base_prompt (initial.md or bootstrap.md),
   "\n\n",
-  personality.md contents (raw, if exists),
-  "## Current Goals\n" + goals.md contents (if exists),
-  "## About the User\n" + user.md contents (if exists, user-facing sessions only),
-  "## Memories\n" + memories.md contents (if exists, tail-windowed at 4000 chars)
+  personality.md contents (head-windowed at 4000 bytes when oversized),
+  "## Current Goals\n" + goals.md contents (head-windowed at 4000 bytes when oversized),
+  "## About the User\n" + user.md contents (head-windowed at 4000 bytes when oversized,
+    user-facing sessions only),
+  "## Memories\n" + memories.md contents (tail-windowed at 4000 bytes when oversized)
 ]
 ```
 
@@ -292,15 +293,15 @@ For non-user-facing sessions (DM, subagent, job, notification, episodic), `user.
 
 Tool descriptions are injected separately by the LLM API layer (via `with_tools()` on the completion request), not in the system prompt text.
 
-The workspace files are read at the **start of each run**, and again after every tool batch: `agent_loop` calls `rebuild_system_prompt_for_tool_loop`, which goes back through `assemble_system_prompt` -> `build_system_prompt_prefix` and re-reads the files, replacing `messages[0]` outright. Nothing is cached, so edits take effect immediately — and a memory the agent writes mid-run is back in its prompt on the next turn, not only on the next run. (This corrects the "once per run" framing #1305 and #1310 were written on: the snapshot is fixed only until the first tool call. What a rebuild does *not* cover is a single tool batch that both appends and replaces, or a concurrent writer landing after the last rebuild.)
+The workspace files are read at the **start of each run**, and again after every tool batch: the budget-aware agent loop re-reads the files through `build_system_prompt_prefix_with_budget()` and replaces `messages[0]` outright. The initial workspace budget is fixed for the run, so rebuilds do not progressively squeeze the files as conversation and tool results accumulate. File edits still take effect on the next turn, while a single tool batch that both appends and replaces, or a concurrent writer landing after the last rebuild, remains outside the rebuild boundary.
 
 **Size management:**
-- `memories.md` is capped at `MEMORIES_INJECTION_CAP` (4000 bytes) before injection, by `memories_injection_window` in `workspace.rs`. The window is **tail-anchored** (#1308): past the cap the agent is shown the **last** 4000 bytes, i.e. what it most recently learned, and the oldest entries are the ones dropped. It used to be head-anchored (`truncate_to_char_boundary`, the *oldest* 4000 chars), which was survivable while `workspace_write` replaced the file but became a write-only memory once #1305 made `memories` append by default: the file grows at the tail, so a head window never showed anything written after the cap was reached
+- Every workspace file is capped at `WORKSPACE_FILE_INJECTION_CAP` (4000 bytes) before injection. `personality.md`, `goals.md` and `user.md` use a **head-anchored** window so the settled identity and instructions remain visible; `memories.md` uses a **tail-anchored** window (#1308) so the most recent entries remain visible. Each partial view carries a marker and cannot authorize a whole-file replacement until the agent gets a complete read.
+- `memories.md`'s tail window replaced the old head-anchored (`truncate_to_char_boundary`) behavior, which became a write-only memory once #1305 made `memories` append by default: the file grows at the tail, so a head window never showed anything written after the cap was reached
 - The window carries a **leading** marker — `[Older memories truncated: showing the most recent N of M bytes. This is the end of memories.md, not the whole file -- writing this text back with mode "write" would delete the older entries above the cut.]` followed by `...`. The warning is load-bearing, not decorative: the documented repair for an over-appended file (an explicit `mode: "write"`) is composed from whatever is in the system prompt, so an unannounced window makes that repair a deletion, and tail-anchoring alone would only change which half is deleted. Since #1310 the marker is no longer the *only* thing standing between the model and that deletion — `workspace_write` refuses a replacement built from a window (see **Memory updates**) — but it is still what lets a well-behaved model avoid the refusal in the first place. (The bytes were never unreachable: the workspace lives at `<project_root>/.alms/agents/<name>/`, inside the project-root sandbox, so `fs_read` can reach the file by path, as can the UI, `PUT` and an operator. What was missing was a tool that read a workspace file *by name*, and that nothing handed the model the path. `workspace_read` closes that; `fs_read` remains unsuitable to depend on because `tools.enabled` may not include it.)
 - A partial *leading* line is dropped — **only when the window actually opens mid-entry.** A head window could only ever end mid-entry, which reads as visibly cut off; a tail window begins mid-entry, and half an entry read from its middle can assert the opposite of the entry it came from. When the window start already lands just after a newline it opens on a whole entry and nothing is cut, because cutting there would delete a complete memory for nothing. One declared exception: the cut is skipped when nothing follows the first newline, so a file that is one enormous unbroken line yields a fragment behind the marker rather than a marker and nothing else
-- The cap is the **only** bound on this text. `ContextBuilder` never trims a system prompt: `build_with_perspective` measures it with `estimate_tokens`, pushes it verbatim, and subtracts the result from the *history* budget, flooring that at zero via `saturating_sub`. So an uncapped `memories.md` would evict the conversation rather than being summarised or dropped downstream. (The old code comment on the cap said it "will be properly budgeted by ContextBuilder"; that was never true and has been removed)
-- Other workspace files have no enforced size limit — they contribute to the system prompt token count which reduces the history budget
-- Token budget for the entire system prompt (including workspace prefix) comes from the `max_input_tokens` budget
+- The per-file cap is required because `ContextBuilder` never trims a system prompt: `build_with_perspective` measures it with `estimate_tokens`, pushes it verbatim, and subtracts the result from the *history* budget, flooring that at zero via `saturating_sub`. The runtime computes the workspace byte budget from `max_input_tokens` and reserves headroom for history; rebuilds reuse that same value for the whole run.
+- The cap and its marker apply to all four workspace files. A deliberate `workspace_read` can return up to `WORKSPACE_READ_CAP` (12000 bytes); reads above that remain partial and cannot authorize a replacement.
 
 **Memory updates:**
 - The agent can update workspace files via the `workspace_write` tool, and read them back with `workspace_read`
