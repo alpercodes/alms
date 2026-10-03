@@ -105,6 +105,15 @@ Each item below changes behaviour for a deployment that has not set the knob exp
   counterparty is not a human, and because the condition is "no `personality.md`" rather
   than "first run", an agent that never finished its interview got it on every such turn.
   Web chat and Telegram still start the interview.
+- Docs correction, no behaviour change: `guarded` posture governs the runs a human starts,
+  and is not a boundary between agents. A `guarded` agent's DM, notification and job runs
+  are promoted to `autonomous`. As another agent's subagent, an agent whose record sets no
+  posture (the default) runs `full_control`, foreground or background, and one set to
+  `guarded` is promoted in the background. Any agent can DM any other by name, so another
+  agent can have a `guarded` one run tools without approval. The security model used to
+  call this override safe. It now says what it does not protect and what an operator can
+  do about it today (`docs/security-model.md` § 8.1). Whether the override should change
+  is open in #177.
 
 ### Persistence and durability
 
@@ -179,6 +188,23 @@ Each item below changes behaviour for a deployment that has not set the knob exp
   agent can no longer see — the same rule every other non-user-facing run already has;
   `workspace_read` first, or `mode: "append"`, still works. No production code path
   creates an `episodic:` session today, so this changes what *would* happen, not what does.
+- Docs correction, no behaviour change: on a Linux kernel without Landlock, a sandboxed
+  `shell` refuses every command (each fails to start with
+  `Invalid argument (os error 22)`); it does not run unsandboxed, as the README and
+  `docs/security-model.md` § 4.4 said. `[tools].shell_policy` is not inert:
+  `"unrestricted"` takes Landlock and the cwd check off every agent's `shell`. And
+  `ALMS_MASTER_KEY` is out of an agent's reach only where `shell` has a filesystem boundary.
+- Docs correction, no behaviour change: a Telegram-triggered run never picks up a
+  `PATCH /settings` change or `settings.json`, not even after a restart; it uses the
+  `alms.toml` and environment values the daemon booted with. The Settings modal,
+  `docs/api.md` § 10.2 and `docs/config.md` said a restart would bring it in line. DM,
+  notification, job and subagent runs that start after a PATCH pick it up, as `POST /runs`
+  runs do.
+- Docs correction, no behaviour change: nothing reads the `[session]` knobs or
+  `[tools].max_output_bytes`, so no run enforces them, though the docs and the Settings
+  modal described them as limits. `[tools].sandbox_root` does not set where a gateway run
+  is rooted, and an empty value lifts no restriction; a non-empty value that cannot be
+  resolved makes runs fail.
 
 ### LLM errors
 

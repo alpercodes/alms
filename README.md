@@ -88,8 +88,10 @@ later session.
   context budget.
 
 New agents inherit the server's default posture, `guarded`, so the first risky tool call
-raises an approval card in the chat and waits for you. `full_control` and `autonomous`
-skip that gate;
+in a run you start raises an approval card in the chat and waits for you. Telegram has no
+approval card: in a run started by a message to the agent's bot, that call fails and the
+agent sees the error. `full_control` and `autonomous` skip that gate, and so do a
+`guarded` agent's runs that no human started (see *Before you run this*);
 [`docs/security-model.md` § 2](docs/security-model.md#2-approval-model-human-in-the-loop)
 covers what each one checks.
 
@@ -106,9 +108,13 @@ decisions, and you should know them before deploying:
   agents and the operator. Do not expose the gateway to untrusted users.
 - **Agents can read the secrets store.** The sandbox root is the project root, and
   `.alms/` lives inside it — so `.alms/secrets.json` is reachable via `fs_read`. Set
-  `ALMS_MASTER_KEY` to encrypt that file at rest (AES-256-GCM); the daemon's shell children
-  never see that variable, so an agent that reads the file gets ciphertext. Without it,
-  treat any secret an agent can reach as disclosed to your model provider.
+  `ALMS_MASTER_KEY` to encrypt that file at rest (AES-256-GCM); shell children do not
+  inherit that variable, so an agent that reads the file gets ciphertext. Where `shell` has
+  no filesystem boundary (the next two items), an agent can still read the key with the
+  daemon OS user's access: from the daemon's environment, which any process of that OS user
+  can read on every platform (on Linux, at `/proc/<pid>/environ`), or from any file you keep
+  it in. Without the key, treat any secret an agent can reach as disclosed to your model
+  provider.
 - **Sandboxing is not equal across platforms, and the gap is in `shell`.** The `fs_*` tools
   enforce the project-root boundary identically everywhere. The `shell` tool does not check
   paths in the command at all. On **Linux 5.13+** Landlock gives each shell child a
@@ -116,13 +122,28 @@ decisions, and you should know them before deploying:
   `shell`** — a command can read and write anything the daemon's OS user can. What remains
   there is the `[tools.shell_permissions]` regex list, the destructive-command classifier,
   and a working-directory revert that reports an escape *after* the command has already
-  run. On those platforms — and on Linux below 5.13, where Landlock silently degrades to
-  unsandboxed — run the daemon as a low-privilege OS user with filesystem ACLs.
+  run. On those platforms, run the daemon as a low-privilege OS user with filesystem ACLs.
+  On a Linux kernel without Landlock (older than 5.13, with Landlock not built in or not
+  enabled at boot, or in a container whose seccomp profile blocks the Landlock syscalls), a
+  sandboxed `shell` does not fall back to running unsandboxed: it refuses every command. A
+  `shell` that is not sandboxed (`[tools].shell_policy = "unrestricted"`, or an agent in
+  `allow_full_os_access`) runs without Landlock on every kernel.
 - **`[security].allow_full_os_access` removes the filesystem sandbox for the agents you
   list.** It is a list of agent names, not a boolean: a listed agent's `fs_*` and `shell`
   run against the real root. Shell permissions and the destructive-command classifier still
   apply. Note that a listed name is matched — case-folded — against the name an
   `invoke_agent` call supplies, so any agent can claim it, registered or not.
+- **Approval covers the runs you start, not what agents do to each other.** A `guarded`
+  agent's runs that no human started — a DM from another agent, a notification, a
+  scheduled job, a run as another agent's subagent — run tools without approval (except a
+  foreground subagent run of an agent whose record sets `guarded` itself: its first gated
+  call is denied), and any agent can DM any other by name. So one agent that reads
+  untrusted input can drive every agent in the same gateway: keep such agents in a separate
+  gateway from those holding what you would not hand that input. That is a boundary only
+  if its tools cannot reach the other gateway — a separate project root, `ALMS_AUTH_TOKEN`
+  set on the gateway you protect, and, where `shell` has no filesystem boundary, a
+  different OS user. See
+  [`docs/security-model.md` § 8.1](docs/security-model.md#guarded-is-not-an-agent-boundary).
 - **Prompt injection is not solved.** Tool output enters the model's context; a hostile
   repository or web page can attempt to steer an agent.
 

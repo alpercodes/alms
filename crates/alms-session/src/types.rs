@@ -170,18 +170,22 @@ impl Content {
     }
 }
 
-/// Session configuration
+/// Session configuration.
+///
+/// None of these knobs is enforced yet: no production code reads them (only
+/// the test-only `SessionManager::archive_idle` reads `idle_timeout_secs`).
+/// See `docs/config.md` § Session.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionConfig {
-    /// Idle timeout in seconds (default: 24 hours)
+    /// Idle timeout in seconds (default: 24 hours). Not enforced yet.
     pub idle_timeout_secs: u64,
-    /// Archive after idle timeout (default: true)
+    /// Archive after idle timeout (default: true). Not enforced yet.
     pub auto_archive: bool,
-    /// Delete archived sessions after seconds (default: 30 days)
+    /// Delete archived sessions after seconds (default: 30 days). Not enforced yet.
     pub archive_ttl_secs: u64,
-    /// Maximum messages per session (default: 10000)
+    /// Maximum messages per session (default: 10000). Not enforced yet.
     pub max_messages: usize,
-    /// Maximum total tokens to retain in the session's history (storage limit).
+    /// Meant as the session's history storage limit; not enforced yet.
     /// Must be >= the LLM per-request budget (`ContextConfig::max_input_tokens`).
     pub max_context_tokens: usize,
 }

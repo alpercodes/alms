@@ -1012,10 +1012,11 @@ pub async fn create_run(
 
 /// Resolve the effective posture for a run.
 ///
-/// System-triggered runs (peer DMs, notification runs, subagent completions)
-/// have no human in the loop, so Guarded posture would hang forever waiting
-/// for approval. This function overrides Guarded to Autonomous for those
-/// runs while leaving all other postures unchanged.
+/// System-triggered runs (peer DMs, notification runs, subagent completions,
+/// scheduled jobs and job-episode continuations) have no human in the loop,
+/// so Guarded posture would hang forever waiting for approval. This function
+/// overrides Guarded to Autonomous for those runs while leaving all other
+/// postures unchanged.
 pub(super) fn resolve_posture_for_run(
     posture: alms_runtime::Posture,
     is_system_triggered: bool,
@@ -1784,9 +1785,10 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
         return;
     }
 
-    // System-triggered runs (peer DMs, notifications, subagent completions)
-    // have no human in the loop, so Guarded posture would hang forever
-    // waiting for approval.  Force Autonomous posture for these runs.
+    // System-triggered runs (peer DMs, notifications, subagent completions,
+    // scheduled jobs, job-episode continuations) have no human in the loop,
+    // so Guarded posture would hang forever waiting for approval.  Force
+    // Autonomous posture for these runs.
     let posture_resolved = resolve_posture_for_run(agent_config.posture, is_system_triggered);
     if posture_resolved != agent_config.posture {
         info!(

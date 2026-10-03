@@ -324,14 +324,16 @@ pub struct PatchLlm {
 /// pair to `state.server_llm_default`, rebuilds the shared
 /// `state.llm` client from it, and persists it to `settings.json` for
 /// restart survival. The next run picks the new pair up with no daemon
-/// restart, matching the `context` / `session` / `tools` / `llm`
-/// sections; in-flight runs are unaffected (they resolved their client
-/// at run start).
+/// restart, as it does the `context` and `llm` sections, `tools.shell_policy`
+/// and `tools.sandbox_root` (the `session` section, `tools.timeout_secs` and
+/// `tools.max_output_bytes` have no run-time reader); in-flight runs are
+/// unaffected (they resolved their client at run start).
 ///
-/// Propagation is HTTP-path only, exactly like every other live-mutable
-/// section: Telegram-triggered runs resolve against the `LlmClient` owned
-/// by `Gateway` (a boot-time clone) and keep the boot pair until restart.
-/// See `docs/api.md` § 10.2.
+/// Like every other live-mutable section, this reaches every run path
+/// except Telegram: Telegram-triggered runs resolve against the `LlmClient`
+/// owned by `Gateway`, built from `alms.toml` + env at boot, and never see
+/// a PATCHed or `settings.json` pair, not even after a restart. See
+/// `docs/api.md` § 10.2.
 ///
 /// Per-agent model / provider overrides on the agent registry (`PUT
 /// /agents/{id}`) continue to win over the server default — this surface
@@ -360,7 +362,11 @@ pub struct PatchSettingsRequest {
 ///
 /// The context, session, tools, and llm (#809) sections are mutable at
 /// runtime. Logging requires a restart and is not accepted here.
-/// Changes take effect on the next run (in-flight runs are unaffected).
+/// Changes to the `context` and `llm` sections, `tools.shell_policy`,
+/// `tools.sandbox_root` and the server-default pair take effect on the next
+/// run (in-flight runs are unaffected). The `session` section,
+/// `tools.timeout_secs` and `tools.max_output_bytes` are stored, returned and
+/// persisted, but nothing reads them at run time.
 ///
 /// **Security knobs are rejected up front (#947).** Any payload referencing
 /// `security` (currently `security.allow_full_os_access`) is rejected
@@ -373,15 +379,15 @@ pub struct PatchSettingsRequest {
 /// shape of `classifier_overrides` from #745 — config-file-only knobs
 /// are not exposed via PATCH on principle.
 ///
-/// Live-mutation propagation is **HTTP-path only**: mutations write through
-/// to the shared `Arc<RwLock<AgentConfig>>` referenced by the HTTP `POST
-/// /runs` and Coordinator paths. Telegram-triggered runs read from a
-/// boot-time clone held inside `Gateway` and continue to use the snapshot
-/// until the daemon restarts. See the Telegram loop inside
-/// `gateway.rs::Gateway::run_until_shutdown` for
-/// the inheritance site. This is pre-existing behaviour for the
-/// `context` / `session` / `tools` sections and is documented in
-/// `docs/api.md` § 10.2.
+/// Live-mutation propagation reaches **every run path except Telegram**:
+/// mutations write through to the shared `Arc<RwLock<AgentConfig>>` (and
+/// the shared `LlmClient`) that `execute_run` (HTTP, DM, notification and
+/// job runs) and the Coordinator (subagents) read. Telegram-triggered runs
+/// read the `AgentConfig` and `LlmClient` that `Gateway` built from
+/// `alms.toml` + env at boot, which neither this handler nor
+/// `settings.json` ever reaches, so a restart does not help. See the
+/// Telegram loop inside `gateway.rs::Gateway::run_until_shutdown` for
+/// the inheritance site; documented in `docs/api.md` § 10.2.
 pub async fn patch_settings(
     State(state): State<AppState>,
     Json(raw_body): Json<serde_json::Value>,

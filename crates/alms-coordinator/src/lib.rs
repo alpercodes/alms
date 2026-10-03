@@ -1893,11 +1893,13 @@ fn canonicalize_subagent_name(session_manager: &SessionManager, request: &mut Su
 
 /// Resolve a subagent's effective posture.
 ///
-/// Background subagents have no human in the loop to approve tool calls,
-/// so `Guarded` posture would cause them to hang indefinitely.  This
-/// function overrides `Guarded` to `Autonomous` for background subagents,
-/// matching the pattern used for system-triggered runs in the gateway
-/// (`resolve_posture_for_run`).  All other combinations are returned
+/// Background subagents have no human in the loop to approve tool calls.
+/// A subagent's approval requests cannot be routed, so `run_agent_loop`
+/// auto-denies them, and the first denial cancels the subagent's run: under
+/// `Guarded` posture a background subagent would stop at its first gated
+/// call.  This function overrides `Guarded` to `Autonomous` for background
+/// subagents, matching the pattern used for system-triggered runs in the
+/// gateway (`resolve_posture_for_run`).  All other combinations are returned
 /// unchanged.
 pub fn resolve_subagent_posture(
     is_background: bool,
@@ -2282,10 +2284,11 @@ async fn run_agent_loop(
                 match event {
                     // ApprovalRequired cannot be forwarded through EventForwarder
                     // (it requires a oneshot channel).  Background subagents
-                    // should already have Guarded overridden to Autonomous, so
-                    // this path is a fallback for FullControl subagents (which
-                    // intentionally keep their posture).  Auto-deny the tool
-                    // call immediately so the subagent doesn't hang. Handled
+                    // already have Guarded overridden to Autonomous, and
+                    // FullControl / Autonomous runs never request approval, so
+                    // this path is reached by a foreground subagent whose
+                    // record sets `guarded`.  Auto-deny the tool call
+                    // immediately so the subagent doesn't hang. Handled
                     // here (not in the helper) because sending on the oneshot
                     // consumes `decision_tx`, which requires moving the event.
                     RuntimeEvent::ApprovalRequired {

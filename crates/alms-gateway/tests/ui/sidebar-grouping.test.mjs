@@ -573,7 +573,7 @@ test('#1100: filterChatSessions models the "notification-only agent" boot edge c
 //     "Jobs" sidebar group sourced from `crossAgentSessions`. This
 //     filter is the group's single source; it must keep exactly the
 //     `job`-typed rows and nothing else. One row per JOB (not per
-//     firing) is a backend property — `fire_job_run` keys every firing
+//     firing) is a backend property — `admit_job_run` keys every firing
 //     to the same stable `job_{job_id}` session via `get_or_create` —
 //     so the payload can never carry more than one session per job;
 //     the filter just has to not invent or drop rows.

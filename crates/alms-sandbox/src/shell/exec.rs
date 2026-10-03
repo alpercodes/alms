@@ -758,8 +758,10 @@ fn find_git_exe_dir_on_path() -> Option<PathBuf> {
 /// access files under `sandbox_root`. The restriction is applied using
 /// Linux's Landlock LSM (available since Linux 5.13).
 ///
-/// If Landlock is not supported by the running kernel, a warning is logged
-/// and execution continues without filesystem restrictions.
+/// If Landlock is not supported by the running kernel, the command does not
+/// run: at the crate's default `BestEffort` level the builder calls succeed
+/// and `restrict_self` returns `NotEnforced`, which the closure below turns
+/// into a spawn error (see `docs/security-model.md` § 4.4).
 ///
 /// `extra_exec_paths` are granted the same read+execute access as the
 /// standard system paths. The builtin shell engine (#1143) passes the ALMS
@@ -817,11 +819,15 @@ fn apply_landlock_sandbox(
     let sys_paths = system_read_paths;
 
     // SAFETY: pre_exec runs in the child process after fork() but before
-    // exec(). The Landlock syscalls themselves are async-signal-safe, but
-    // we use eprintln! for diagnostics on error paths, which is technically
-    // not async-signal-safe (it may allocate). In practice this is reliable
-    // after fork() on Linux and only executes on error paths. The trade-off
-    // is accepted for debuggability.
+    // exec(). The Landlock syscalls themselves are async-signal-safe. The
+    // eprintln! calls below are not: they take std's process-wide stderr
+    // lock and may allocate. They do not run only on rare error paths: on a
+    // Linux kernel without Landlock the `NotEnforced` branch runs on every
+    // sandboxed call. If fork() lands while another thread holds the stderr
+    // lock (the daemon's tracing layer writes through stderr), the child
+    // blocks in eprintln! and the parent blocks in spawn() waiting for it;
+    // that is from reading std, not reproduced. Nor do they help debugging:
+    // nothing reads the child's stderr once the spawn has failed.
     unsafe {
         cmd.pre_exec(move || {
             use landlock::{
@@ -852,17 +858,19 @@ fn apply_landlock_sandbox(
             let ruleset = match Ruleset::default().handle_access(AccessFs::from_all(abi)) {
                 Ok(r) => r,
                 Err(e) => {
-                    // handle_access() failure means Landlock is not supported
-                    // by this kernel — gracefully degrade to unsandboxed execution.
+                    // Not reached on a kernel without Landlock: at the default
+                    // `BestEffort` level, landlock 0.4 returns an error here only
+                    // for an empty or unknown access set, and `from_all(ABI::V5)`
+                    // is neither. Such a kernel ends at `NotEnforced` below.
                     eprintln!("[alms] Landlock not supported by kernel, running unsandboxed: {e}");
                     return Ok(());
                 }
             };
 
-            // From this point on, the kernel supports Landlock. Any failure
-            // to create or enforce the ruleset is a hard error — we must NOT
-            // run the command unsandboxed when sandboxing was requested and
-            // the kernel confirmed it can apply rules.
+            // From this point on, any failure to create or enforce the
+            // ruleset is a hard error — we must NOT run the command
+            // unsandboxed when sandboxing was requested. That includes a
+            // kernel without Landlock, which reaches `NotEnforced`.
 
             let ruleset = match ruleset.create() {
                 Ok(r) => r,
