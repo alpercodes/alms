@@ -270,6 +270,17 @@ one.
   also moved the Windows-only `windows-sys` dependency of `errno`, `rustix`, `tempfile` and
   `winapi-util` from 0.52.0 to 0.60.2; nothing changes on Linux or macOS, and x86_64
   Windows builds drop `windows-sys` 0.52.0 (aarch64 Windows keeps it for `ring`).
+- `dompurify` 3.4.14 -> 3.4.16 to clear GHSA-p98j-92pf-mc4p (low). `dompurify` ships in the
+  embedded web UI and sanitizes rendered chat markdown. The advisory needs `IN_PLACE: true`
+  together with a hook that removes a node in `afterSanitizeElements` or
+  `afterSanitizeAttributes`. The UI uses neither: it sanitizes a string with no config, and
+  its one `afterSanitizeAttributes` hook only sets `target` / `rel` on links. No release is
+  in the affected range (3.4.13–3.4.15): v0.2.3 loads `dompurify` 3.2.4 from esm.sh. The
+  only output change on the UI's path is fail-closed: a `<form>` with an `input` (other
+  than `type="image"`), `button`, `select`, `textarea`, `fieldset`, `output`, `object` or
+  `img` whose `name` or `id` is `removeAttributeNode` or `getAttributeNode` is now dropped
+  from rendered markdown, along with its contents. No operator action. The committed
+  `static/ui-dist/` bundle is rebuilt.
 
 ## v0.2.3 — released (tag `v0.2.3`)
 

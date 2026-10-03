@@ -47,7 +47,7 @@ decision, not a drift — record the reasoning here when you do.
 | `@preact/signals` | 2.9.3 | State primitive. See the 2.x note below. |
 | `htm` | 3.1.1 | Tagged-template JSX alternative; no build step for legacy screens. |
 | `marked` | 18.0.6 | Markdown for assistant message bodies. See the 15 -> 18 note below. |
-| `dompurify` | 3.4.14 | Sanitizes `marked` output. Minor bumps only; security-relevant, keep current. Moved 3.4.12 -> 3.4.14 for GHSA-55q2-fjhq-7xh7 (#1250) — see the note below. |
+| `dompurify` | 3.4.16 | Sanitizes `marked` output. Minor bumps only; security-relevant, keep current. Moved 3.4.12 -> 3.4.14 for GHSA-55q2-fjhq-7xh7 (#1250), then 3.4.14 -> 3.4.16 for GHSA-p98j-92pf-mc4p — see the notes below. |
 | `zod` | 4.4.3 | Schemas for the validated contract boundary. |
 
 ### Why `marked` is on 18.x rather than the 15.0.4 the CDN importmap pinned
@@ -129,7 +129,13 @@ differs: the SVG `pointer-events` and `vector-effect` presentation attributes on
 3.4.14 allow-list addition, and both attributes are presentational — no script
 surface, no URL surface. Every other case, including all the hostile ones, was
 byte-identical, so nothing `utils/code-copy.js` or
-`utils/decorate-code-blocks.js` parses moved.
+`utils/decorate-code-blocks.js` parses moved. Which DOM that differential ran
+under isn't recorded. Under jsdom, its clobbering cases could not reach
+`<form>` named-property clobbering at all (see the 3.4.16 note below). Run in
+headless Chromium during the 3.4.16 bump, this bump's 86 cases plus six
+form-clobbering cases still differ between 3.4.12 and 3.4.14 only in that SVG
+case. `_isClobbered()` is identical in the two versions, so there was no form
+change for jsdom to miss.
 
 **3.4.14 rather than the minimum patch 3.4.13.** 3.4.13 clears the advisory on
 its own; 3.4.14 is latest and avoids a second bump shortly after. Its extra fix
@@ -148,6 +154,48 @@ too — `moderate` is a deliberate coverage-versus-noise choice, since `low`
 findings here are overwhelmingly transitive dev-tooling churn and a gate that
 cries wolf gets waved through. The level lives in `package.json`; `ci.yml` calls
 `npm run ui:audit` and deliberately does not name one.
+
+### Why `dompurify` moved 3.4.14 -> 3.4.16
+
+`npm audit` flagged GHSA-p98j-92pf-mc4p (low, CVSS 4.0 score 2.3) against
+`dompurify >= 3.4.13, <= 3.4.15`. It is what GHSA-55q2-fjhq-7xh7's fix left
+open. That fix neutralizes a hook-detached subtree only at the
+`beforeSanitizeElements` and `uponSanitizeElement` sites. So under
+`IN_PLACE: true`, a hook that removes a node from `afterSanitizeElements` or
+`afterSanitizeAttributes` still leaves `on*` handlers armed on the detached
+descendants.
+
+**We are not exposed, for the same structural reason as before.** The advisory
+needs both preconditions. `static/ui/deps.js` does register an
+`afterSanitizeAttributes` hook, one of the two named sites, but the hook only
+sets `target` / `rel` on anchors and detaches nothing. And `sanitize(raw)` runs
+on a string with no config, so there is no `IN_PLACE` and no caller-owned live
+tree. The bump is taken because this is the sanitizer for every rendered
+message and the patch is a drop-in for how we call it, not because ALMS was
+reachable. At `low` the advisory alone would not have failed the `moderate`
+gate; it arrived alongside dev-only `undici` and `brace-expansion` advisories
+that did.
+
+**One behaviour change, fail-closed, and invisible to jsdom.** 3.4.15's
+clobbering hardening makes `_isClobbered()` also flag a `<form>` whose
+`removeAttributeNode` or `getAttributeNode` is shadowed by one of the form's
+named properties. HTML creates those from the form's `<img>` elements and its
+listed elements (`input` other than `type="image"`, `button`, `select`,
+`textarea`, `fieldset`, `output`, `object`), keyed by `name` or `id`. That
+includes an `<object>`, which DOMPurify would strip anyway, because the form is
+checked before its children. It also includes a control after the form that
+joins it with `form="…"`. `<form><input name="removeAttributeNode"></form>` now
+renders as nothing (3.4.14: `<form><input></form>`), and anything inside such a
+form goes with it. Chromium shows this. jsdom doesn't, because it doesn't
+implement `[LegacyOverrideBuiltIns]` on `HTMLFormElement`, so neither the
+86-case jsdom differential nor the Vitest suite can observe it. Re-run in
+headless Chromium against the committed `deps` chunks, those 86 cases are still
+byte-identical across 3.4.14 and 3.4.16; only added form cases of this shape
+differ. A Vitest pin would pass on both versions, so there isn't one. 3.4.16's
+hook-detach re-checks are no-ops for our hook, which detaches nothing. 3.4.15's
+shadow-root change and 3.4.16's `IN_PLACE` fixes only apply to DOM-node input,
+which we never pass. 3.4.16 also moves DOMPurify's build from rollup to
+rolldown. The pins in `frontend/markdown-rendering.test.ts` stand unchanged.
 
 ### Why `@preact/signals` is on 2.x
 
