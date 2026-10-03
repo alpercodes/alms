@@ -60,9 +60,11 @@ initial prompt (not replacing it), so the agent retains its identity while getti
 continuation guidance.
 
 **Code path**: `agent_loop()` in `agent/loop_impl.rs` -- after processing tool results, the
-system message at `messages[0]` is rebuilt as:
+system message at `messages[0]` is rebuilt with the workspace byte budget captured by
+`build_context()`:
 ```
-assemble_system_prompt(initial_prompt) + "\n\n" + tool_loop_prompt
+assemble_system_prompt_with_budget(initial_prompt, run_workspace_budget)
+    + "\n\n" + tool_loop_prompt
 ```
 i.e. the base prompt and workspace prefix are assembled first, then the
 `tool_loop` continuation guidance is appended on top. For DM sessions the
@@ -128,18 +130,18 @@ appended after it:
    setup). This is the foundational role/identity prompt and always comes first.
 
 2. **Workspace prefix** (optional): If the agent has a workspace attached,
-   `build_system_prompt_prefix()` reads workspace files and appends them after
+   `build_system_prompt_prefix_with_budget()` reads workspace files and appends them after
    the base prompt: `{base_prompt}\n\n{workspace_prefix}`. The workspace files
    are concatenated in this internal order:
-   - `personality.md` (raw content)
-   - `goals.md` (prefixed with `## Current Goals`)
-   - `user.md` (prefixed with `## About the User`) — **conditional**: skipped for
-     non-user-facing sessions (DM, subagent, job, notification, and episodic
-     contexts) to save tokens
-   - `memories.md` (prefixed with `## Memories`, tail-windowed at 4000 bytes — past
-     the cap the agent is shown the *most recent* 4000 bytes behind a leading
-     truncation marker, not the oldest; see `agent-runtime-design.md` § "Size
-     management")
+    - `personality.md` (head-windowed at 4000 bytes when oversized)
+    - `goals.md` (prefixed with `## Current Goals`, head-windowed at 4000 bytes when oversized)
+    - `user.md` (prefixed with `## About the User`, head-windowed at 4000 bytes when oversized) — **conditional**: skipped for non-user-facing sessions (DM, subagent, job, notification, and episodic contexts) to save tokens
+    - `memories.md` (prefixed with `## Memories`, tail-windowed at 4000 bytes — past the cap the agent is shown the *most recent* bytes behind a leading truncation marker, not the oldest; see `agent-runtime-design.md` § "Size management")
+
+   The runtime shares one workspace budget across these files for the duration of a run.
+   The budget is computed from `max_input_tokens` and leaves room for history; rebuilding
+   after a tool batch reuses it, so the system block stays byte-stable while files are
+   unchanged.
 
 3. **Tool loop addendum** (after first tool round): On subsequent LLM calls in the
    same agent loop, the system message is rebuilt as:
@@ -153,9 +155,10 @@ appended after it:
    the implicit-reply contract (#1154 — its final message text IS the reply to
    the peer), even after processing tool calls (fixes #346).
 
-The base + workspace assembly is handled by `assemble_system_prompt()`. The
-order matches common LLM prompting practice — role/identity first, personalization
-later — and puts the most specific instructions nearer the end of the system block.
+The base + workspace assembly is handled by the budget-aware context assembly in
+`agent/context.rs`. The order matches common LLM prompting practice — role/identity
+first, personalization later — and puts the most specific instructions nearer the end
+of the system block.
 
 Note: this ordering does **not** in itself improve Anthropic prompt-cache hit rates.
 The cache breakpoint in `anthropic.rs` attaches `cache_control` to the entire trailing

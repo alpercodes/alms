@@ -255,7 +255,7 @@ impl AgentRuntime {
         // then persist the user message so it survives agent loop failures.
         self.emit_status(PHASE_BUILDING_CONTEXT, None);
         let history = self
-            .build_context(session_manager, &session.id, context_id, &input)
+            .build_context_with_budget(session_manager, &session.id, context_id, &input)
             .await;
 
         let user_msg = SessionMessage {
@@ -267,7 +267,7 @@ impl AgentRuntime {
         };
         session_manager.append_message(session.id, user_msg)?;
 
-        self.finish_run(session_manager, session.id, context_id, history)
+        self.finish_run_with_workspace_budget(session_manager, session.id, context_id, history)
             .await
     }
 
@@ -312,27 +312,48 @@ impl AgentRuntime {
         // input to avoid duplicating it in the context window.
         self.emit_status(PHASE_BUILDING_CONTEXT, None);
         let history = self
-            .build_context(session_manager, &session_id, context_id, "")
+            .build_context_with_budget(session_manager, &session_id, context_id, "")
             .await;
 
         // Do NOT persist the input message -- it is already in the session.
 
-        self.finish_run(session_manager, session_id, context_id, history)
+        self.finish_run_with_workspace_budget(session_manager, session_id, context_id, history)
             .await
     }
 
-    /// Shared tail for `run()` and `run_on_session()`: executes the agent loop
-    /// and persists the result (assistant response, cancellation marker, or
-    /// error marker) to the session.
-    ///
-    /// Tool call records are always returned regardless of success or failure,
-    /// so the gateway can persist partial execution history for debugging.
+    #[cfg(test)]
     async fn finish_run(
         &self,
         session_manager: &SessionManager,
         session_id: alms_core::SessionId,
         context_id: &str,
         history: AlmsResult<Vec<LlmMessage>>,
+    ) -> AlmsResult<RunOutput> {
+        self.finish_run_with_workspace_budget(
+            session_manager,
+            session_id,
+            context_id,
+            history.map(|messages| context::BuiltContext {
+                messages,
+                workspace_budget_bytes: usize::MAX,
+            }),
+        )
+        .await
+    }
+
+    /// Shared tail for `run()` and `run_on_session()`: executes the agent loop
+    /// and persists the result (assistant response, cancellation marker, or
+    /// error marker) to the session. The workspace budget captured during
+    /// context construction is carried into every tool-loop rebuild.
+    ///
+    /// Tool call records are always returned regardless of success or failure,
+    /// so the gateway can persist partial execution history for debugging.
+    async fn finish_run_with_workspace_budget(
+        &self,
+        session_manager: &SessionManager,
+        session_id: alms_core::SessionId,
+        context_id: &str,
+        history: AlmsResult<context::BuiltContext>,
     ) -> AlmsResult<RunOutput> {
         let is_dm = context_id.starts_with("dm:");
         let include_user = Self::is_user_facing_context(context_id);
@@ -355,16 +376,19 @@ impl AgentRuntime {
                 // so the UI sees exactly what the LLM will receive on the
                 // first iteration.
                 if self.config.debug_mode {
-                    self.emit_context_debug(&h);
+                    self.emit_context_debug(&h.messages);
                 }
 
-                self.agent_loop(
+                self.agent_loop_with_workspace_budget(
                     session_manager,
                     session_id,
-                    h,
-                    is_dm,
-                    include_user,
-                    dm_peer.as_deref(),
+                    h.messages,
+                    loop_impl::AgentLoopPrompt {
+                        is_dm,
+                        include_user,
+                        dm_peer: dm_peer.as_deref(),
+                        workspace_budget_bytes: h.workspace_budget_bytes,
+                    },
                 )
                 .await
             }

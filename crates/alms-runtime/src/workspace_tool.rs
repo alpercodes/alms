@@ -66,8 +66,8 @@ fn refusal_message(file: WorkspaceFile, refusal: RefusedWrite) -> String {
              would delete text you have never seen."
         ),
         RefusedWrite::ShownPartially => format!(
-            "you have been shown only part of {name} -- the copy in your context is a window \
-             onto the end of the file -- so replacing it would delete everything above the cut."
+            "you have been shown only part of {name} -- the copy in your context is a partial \
+             window onto the file -- so replacing it would delete text outside that window."
         ),
         RefusedWrite::ChangedSinceShown => format!(
             "{name} has changed since the copy in your context was read, so replacing it would \
@@ -255,9 +255,9 @@ impl Tool for WorkspaceReadTool {
     fn description(&self) -> &str {
         "Read one of the agent's own workspace files (personality.md, goals.md, memories.md, \
          user.md) as it is on disk right now. Call this before replacing a file with \
-         workspace_write mode 'write': the copy in your context may be only the end of a long \
-         file, may be missing entirely, or may have changed since it was read, and a \
-         replacement built from it would delete the rest."
+         workspace_write mode 'write': the copy in your context may be only a partial window \
+         onto a long file, may be missing entirely, or may have changed since it was read, and \
+         a replacement built from it would delete the rest."
     }
 
     fn parameters(&self) -> Value {
@@ -951,6 +951,14 @@ mod tests {
             !crate::agent::helpers::tool_result_ok(&result),
             "a refusal must count as a failed tool call, or the run records a success: {result}"
         );
+    }
+
+    #[test]
+    fn a_partial_head_view_gets_anchor_neutral_refusal_guidance() {
+        let message = refusal_message(WorkspaceFile::Personality, RefusedWrite::ShownPartially);
+        assert!(message.contains("partial window"), "{message}");
+        assert!(message.contains("outside that window"), "{message}");
+        assert!(!message.contains("end of the file"), "{message}");
     }
 
     /// The recovery, through both tools, in the order an agent would use
