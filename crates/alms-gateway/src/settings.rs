@@ -324,9 +324,10 @@ pub struct PatchLlm {
 /// pair to `state.server_llm_default`, rebuilds the shared
 /// `state.llm` client from it, and persists it to `settings.json` for
 /// restart survival. The next run picks the new pair up with no daemon
-/// restart, matching the `context` / `session` / `tools` / `llm`
-/// sections; in-flight runs are unaffected (they resolved their client
-/// at run start).
+/// restart, as it does the `context` and `llm` sections, `tools.shell_policy`
+/// and `tools.sandbox_root` (the `session` section, `tools.timeout_secs` and
+/// `tools.max_output_bytes` have no run-time reader); in-flight runs are
+/// unaffected (they resolved their client at run start).
 ///
 /// Like every other live-mutable section, this reaches every run path
 /// except Telegram: Telegram-triggered runs resolve against the `LlmClient`
@@ -361,7 +362,11 @@ pub struct PatchSettingsRequest {
 ///
 /// The context, session, tools, and llm (#809) sections are mutable at
 /// runtime. Logging requires a restart and is not accepted here.
-/// Changes take effect on the next run (in-flight runs are unaffected).
+/// Changes to the `context` and `llm` sections, `tools.shell_policy`,
+/// `tools.sandbox_root` and the server-default pair take effect on the next
+/// run (in-flight runs are unaffected). The `session` section,
+/// `tools.timeout_secs` and `tools.max_output_bytes` are stored, returned and
+/// persisted, but nothing reads them at run time.
 ///
 /// **Security knobs are rejected up front (#947).** Any payload referencing
 /// `security` (currently `security.allow_full_os_access`) is rejected

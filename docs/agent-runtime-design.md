@@ -29,6 +29,7 @@ max_retries = 2
 # Token budget per run (0 = unlimited)
 max_tokens_per_run = 0
 
+# Not enforced yet: nothing reads these values (docs/config.md § Session).
 [session]
 idle_timeout_secs = 86400           # 24 hours
 max_messages = 10000
@@ -56,9 +57,9 @@ compact_retain_pct = 0.40
 [tools]
 # Which builtins to enable
 enabled = ["echo", "math", "http_get"]
-# Default timeout for tool execution
+# Default timeout for tool execution. Not enforced yet: nothing reads this (#112).
 timeout_secs = 30
-# Max output size from a tool (bytes)
+# Max output size from a tool (bytes). Not enforced yet: nothing reads this.
 max_output_bytes = 65536
 
 # Permission-based allow/deny list for the `shell` tool.

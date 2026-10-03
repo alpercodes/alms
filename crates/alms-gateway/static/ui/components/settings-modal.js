@@ -579,12 +579,13 @@ export function SettingsModal({ open, onClose }) {
             <div class="settings-modal">
                 <h2>Settings</h2>
                 <!-- Propagation caveats stated once here rather than repeated
-                     per section: every mutable section takes effect on the
-                     next HTTP-triggered run, and every one of them is read
-                     from a boot-time snapshot on the Telegram path (see
-                     docs/api.md § 10.2). -->
+                     per section: a server default that runs read takes effect on
+                     the next run, except a Telegram-triggered one, which reads the
+                     Gateway's alms.toml + env config and never this modal's values,
+                     even after a restart. API keys are the exception: the secrets
+                     store is shared, so they reach Telegram too (docs/api.md § 10.2). -->
                 <p class="settings-subtitle">
-                    Applies from the next run — Telegram-triggered runs after a daemon restart.
+                    Applies from the next run. Telegram-triggered runs pick up API keys but none of the server defaults, not even after a restart: they use alms.toml and the environment.
                     Full reference: <code>docs/config.md</code>.
                 </p>
 
@@ -745,7 +746,7 @@ export function SettingsModal({ open, onClose }) {
                 <!-- Session (server-level, editable) -->
                 <${Section} key="sess" title="Session" defaultOpen=${false}>
                     <span class="settings-hint settings-section-desc">
-                        How much history is kept on disk, and for how long.
+                        Not enforced yet: nothing reads these values, so no session is capped, archived or deleted because of them.
                     </span>
                     <${EditRow} label="Max messages">
                         <input class="settings-input settings-input-sm" type="number" min="1"
@@ -763,8 +764,7 @@ export function SettingsModal({ open, onClose }) {
                                value=${sessIdleTimeout.value}
                                onInput=${e => { sessIdleTimeout.value = e.target.value; }} />
                     <//>
-                    <${EditRow} label="Auto archive"
-                        desc="Archive sessions once they go idle.">
+                    <${EditRow} label="Auto archive">
                         <label class="settings-toggle">
                             <input type="checkbox"
                                    checked=${sessAutoArchive.value}
@@ -772,8 +772,7 @@ export function SettingsModal({ open, onClose }) {
                             <span>${sessAutoArchive.value ? 'enabled' : 'disabled'}</span>
                         </label>
                     <//>
-                    <${EditRow} label="Archive TTL (seconds)"
-                        desc="Archived sessions are deleted after this.">
+                    <${EditRow} label="Archive TTL (seconds)">
                         <input class="settings-input settings-input-sm" type="number" min="0"
                                value=${sessArchiveTtl.value}
                                onInput=${e => { sessArchiveTtl.value = e.target.value; }} />
@@ -783,7 +782,7 @@ export function SettingsModal({ open, onClose }) {
                 <!-- Tools (server-level, editable) -->
                 <${Section} key="tools" title="Tools" defaultOpen=${false}>
                     <${EditRow} label="Shell policy"
-                        desc="sandboxed pins the shell's working directory to the sandbox root; unrestricted removes the limit.">
+                        desc="sandboxed keeps the shell in the project root and, on Linux, under Landlock; unrestricted removes both, for every agent.">
                         <select class="settings-select settings-input-sm"
                                 value=${toolsShellPolicy.value}
                                 onChange=${e => { toolsShellPolicy.value = e.target.value; }}>
@@ -792,7 +791,7 @@ export function SettingsModal({ open, onClose }) {
                         </select>
                     <//>
                     <${EditRow} label="Sandbox root"
-                        desc="Root directory for the fs_* tools. Empty = unrestricted.">
+                        desc="Gateway runs are rooted at the project root, not here. A path that doesn't exist makes runs fail.">
                         <input class="settings-input settings-input-sm" type="text"
                                value=${toolsSandboxRoot.value}
                                onInput=${e => { toolsSandboxRoot.value = e.target.value; }} />
@@ -808,7 +807,8 @@ export function SettingsModal({ open, onClose }) {
                                value=${toolsTimeout.value}
                                onInput=${e => { toolsTimeout.value = e.target.value; }} />
                     <//>
-                    <${EditRow} label="Max output (bytes)">
+                    <${EditRow} label="Max output (bytes)"
+                        desc="Not enforced yet — setting it has no effect.">
                         <input class="settings-input settings-input-sm" type="number" min="1"
                                value=${toolsMaxOutput.value}
                                onInput=${e => { toolsMaxOutput.value = e.target.value; }} />

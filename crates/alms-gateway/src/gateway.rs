@@ -754,7 +754,8 @@ impl Gateway {
                     // DM, notification and job runs) and Coordinator subagents
                     // — shares the live `Arc<RwLock<AgentConfig>>` and
                     // `Arc<RwLock<LlmClient>>` on `AppState`. So PATCH /settings
-                    // changes to context / tools / llm defaults and to the
+                    // changes to the context and llm sections, to
+                    // `tools.shell_policy` and `tools.sandbox_root`, and to the
                     // server-default model / provider pair reach those runs
                     // immediately and Telegram runs never, not even after a
                     // daemon restart. Documented in `docs/api.md` § 10.2.

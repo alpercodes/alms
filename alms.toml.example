@@ -54,6 +54,7 @@ max_run_duration_secs = 14400
 # NOTE: API key env vars (OPENROUTER_API_KEY, etc.) are NO LONGER used.
 # They are ignored for security — agents can read env vars via shell_exec.
 
+# Not enforced yet: nothing reads these values (docs/config.md § Session).
 [session]
 idle_timeout_secs = 86400            # 24 hours
 auto_archive = true
@@ -134,19 +135,19 @@ run_summary_budget = 2000
 [tools]
 # which builtin tools to enable
 enabled = ["echo", "math", "http_get"]
-# timeout for tool execution
+# timeout for tool execution. Not enforced yet: nothing reads this (#112).
 timeout_secs = 30
-# max output size from a tool (bytes)
+# max output size from a tool (bytes). Not enforced yet: nothing reads this.
 max_output_bytes = 65536
-# Filesystem sandbox root — fs_read/fs_write/fs_list paths must resolve within
-# this directory. Default: "." (safe — restricts to current working directory).
-# Set to "" for unrestricted filesystem access.
+# Legacy: gateway runs are rooted at the project root (--project,
+# ALMS_PROJECT_ROOT or the working directory), not here. A non-empty path
+# that does not exist makes every run fail.
 # Override with: ALMS_SANDBOX_ROOT=/custom/path
 sandbox_root = "."
 # Shell execution policy: "sandboxed" (default) or "unrestricted".
-# "sandboxed" — shell cwd is restricted to sandbox_root. On Linux 5.13+,
+# "sandboxed" — shell cwd is restricted to the project root. On Linux 5.13+,
 #   Landlock filesystem restrictions are also applied so the child process
-#   can only access files within sandbox_root (plus read-only system paths).
+#   can only access files within the project root (plus read-only system paths).
 #   On Windows/macOS, sandboxed mode restricts cwd only — the command itself
 #   can still access files outside the sandbox at the OS level.
 # "unrestricted" — no cwd or filesystem restriction (power-user / full access).

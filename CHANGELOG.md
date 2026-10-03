@@ -159,9 +159,15 @@ Each item below changes behaviour for a deployment that has not set the knob exp
   `ALMS_MASTER_KEY` is out of an agent's reach only where `shell` has a filesystem boundary.
 - Docs correction, no behaviour change: a Telegram-triggered run never picks up a
   `PATCH /settings` change or `settings.json`, not even after a restart; it uses the
-  `alms.toml` and environment values the daemon booted with. `docs/api.md` § 10.2 and
-  `docs/config.md` said a restart would bring it in line. DM, notification, job and
-  subagent runs that start after a PATCH pick it up, as `POST /runs` runs do.
+  `alms.toml` and environment values the daemon booted with. The Settings modal,
+  `docs/api.md` § 10.2 and `docs/config.md` said a restart would bring it in line. DM,
+  notification, job and subagent runs that start after a PATCH pick it up, as `POST /runs`
+  runs do.
+- Docs correction, no behaviour change: nothing reads the `[session]` knobs or
+  `[tools].max_output_bytes`, so no run enforces them, though the docs and the Settings
+  modal described them as limits. `[tools].sandbox_root` does not set where a gateway run
+  is rooted, and an empty value lifts no restriction; a non-empty value that cannot be
+  resolved makes runs fail.
 
 ### LLM errors
 
