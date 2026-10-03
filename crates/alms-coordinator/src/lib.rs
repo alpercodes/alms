@@ -14,10 +14,7 @@ use alms_tools::subagent_self_sink::SubagentSelfEventSink;
 use async_trait::async_trait;
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
-};
+use std::sync::Arc;
 use std::time::Duration;
 
 /// How long (in seconds) a subagent's result is kept in memory after the run
@@ -112,12 +109,6 @@ pub struct SubagentCompletion {
     pub task_id: TaskId,
     pub subagent_name: Option<String>,
     pub status: TaskStatus,
-    /// Whether the operator explicitly cancelled this subagent through the
-    /// session-keyed cancel endpoint. `false` also covers cancellation that
-    /// propagated from a parent run, so consumers can preserve its normal
-    /// notification behavior.
-    #[serde(default)]
-    pub cancelled_by_operator: bool,
     /// Truncated summary of the result (for context efficiency).
     pub summary: String,
     /// Parent session to notify.
@@ -229,10 +220,6 @@ struct SubagentHandle {
     /// [`Coordinator::cancel_subagent_by_session`] / the gateway's
     /// `POST /sessions/{id}/subagent/cancel` endpoint.
     cancel_token: CancellationToken,
-    /// Set only by the direct session-keyed operator cancel path. A parent
-    /// cancellation uses the same child token but must remain distinguishable
-    /// when the completion event is emitted.
-    cancelled_by_operator: Arc<AtomicBool>,
     parent_run_id: Option<RunId>,
     parent_session_id: SessionId,
     parent_agent_id: AgentId,
@@ -632,8 +619,6 @@ impl Coordinator {
             .as_ref()
             .map(|p| p.child_token())
             .unwrap_or_default();
-        let cancelled_by_operator = Arc::new(AtomicBool::new(false));
-
         // The handle is created and inserted BEFORE `subagent_started` is
         // emitted below (Tim S2, PR #1192): the moment the UI learns the
         // subagent's session id, a session-keyed cancel must find a live
@@ -644,7 +629,6 @@ impl Coordinator {
             task_id,
             status: TaskStatus::Pending,
             cancel_token: child_cancel_token.clone(),
-            cancelled_by_operator: cancelled_by_operator.clone(),
             parent_run_id,
             parent_session_id,
             parent_agent_id,
@@ -759,7 +743,6 @@ impl Coordinator {
                     subagent_prompts,
                     completion_tx,
                     child_cancel_token,
-                    cancelled_by_operator,
                     secrets,
                     run_registrar,
                     subagent_self_sink,
@@ -869,7 +852,6 @@ impl Coordinator {
             if h.subagent_session_id == subagent_session_id
                 && matches!(h.status, TaskStatus::Pending | TaskStatus::Running)
             {
-                h.cancelled_by_operator.store(true, Ordering::Release);
                 h.cancel_token.cancel();
                 info!(
                     target: "coordinator::subagent_cancelled_by_session",
@@ -1149,10 +1131,6 @@ async fn run_subagent(
     // (child of the parent run's token when present) and shared with the
     // `SubagentHandle` so `cancel_subagent_by_session` can fire it.
     child_cancel_token: CancellationToken,
-    // Shared marker set by the direct session-keyed operator cancel path.
-    // Parent cancellation propagates through `child_cancel_token` without
-    // setting this marker.
-    cancelled_by_operator: Arc<AtomicBool>,
     secrets: Option<Arc<parking_lot::RwLock<alms_core::secrets::SecretsStore>>>,
     run_registrar: Option<Arc<dyn RunRegistrar>>,
     subagent_self_sink: Option<Arc<dyn SubagentSelfEventSink>>,
@@ -1194,7 +1172,6 @@ async fn run_subagent(
                 task_id,
                 subagent_name: request.subagent_name.clone(),
                 status: TaskStatus::Failed,
-                cancelled_by_operator: false,
                 summary: "subagent task panicked before emitting a completion".to_string(),
                 parent_session_id: request.parent_session,
                 parent_agent_id: request.parent_agent_id,
@@ -1538,7 +1515,6 @@ async fn run_subagent(
             task_id,
             subagent_name: request.subagent_name.clone(),
             status: new_status,
-            cancelled_by_operator: cancelled_by_operator.load(Ordering::Acquire),
             summary,
             parent_session_id,
             parent_agent_id,
@@ -2569,6 +2545,25 @@ mod tests {
         Coordinator::new(session_manager, llm)
     }
 
+    #[derive(Debug)]
+    struct BlockingRunRegistrar {
+        entered: std::sync::mpsc::Sender<()>,
+        release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+
+    #[async_trait::async_trait]
+    impl RunRegistrar for BlockingRunRegistrar {
+        async fn register_run(&self, _run: Run) -> AlmsResult<()> {
+            Ok(())
+        }
+
+        fn update_run(&self, _run: Run) -> AlmsResult<()> {
+            let _ = self.entered.send(());
+            let _ = self.release.lock().unwrap().recv();
+            Ok(())
+        }
+    }
+
     // -- #1148: live server-default LLM handle -------------------------------
 
     /// A coordinator built with
@@ -2681,7 +2676,6 @@ mod tests {
             task_id: TaskId::new(),
             subagent_name: Some("researcher".to_string()),
             status: TaskStatus::Failed,
-            cancelled_by_operator: false,
             summary: "subagent task panicked before emitting a completion".to_string(),
             parent_session_id: SessionId::new(),
             parent_agent_id: AgentId::new(),
@@ -3659,7 +3653,6 @@ mod tests {
                 task_id,
                 status,
                 cancel_token: CancellationToken::new(),
-                cancelled_by_operator: Arc::new(AtomicBool::new(false)),
                 parent_run_id: None,
                 parent_session_id: session,
                 parent_agent_id: parent_agent,
@@ -4007,7 +4000,6 @@ mod tests {
             task_id,
             status,
             cancel_token: token.clone(),
-            cancelled_by_operator: Arc::new(AtomicBool::new(false)),
             parent_run_id: None,
             parent_session_id: SessionId::new(),
             parent_agent_id: AgentId::new(),
@@ -4121,6 +4113,58 @@ mod tests {
             !coord.cancel_subagent_by_session(sub_session_id),
             "a completed subagent's session must report false"
         );
+    }
+
+    /// The terminal status is selected before the registrar persists it, but
+    /// the handle remains Running until that write finishes. A cancel accepted
+    /// in this window must not turn a successful result into a cancelled one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancel_racing_terminal_persistence_keeps_completed_result() {
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let registrar = Arc::new(BlockingRunRegistrar {
+            entered: entered_tx,
+            release: std::sync::Mutex::new(release_rx),
+        });
+        let (completion_tx, mut completion_rx) = mpsc::unbounded_channel();
+        let coord = test_coordinator()
+            .with_run_registrar(registrar)
+            .with_completion_channel(completion_tx);
+        let request = SubagentRequest {
+            task: "Finish successfully before the cancel arrives".to_string(),
+            parent_session: test_session_id(),
+            parent_agent_id: test_parent_agent_id(),
+            parent_run_id: None,
+            subagent_name: None,
+            parent_tool_invocation_id: None,
+        };
+        let (task_id, subagent_session_id) = coord
+            .spawn_subagent(request, None, true, None)
+            .await
+            .expect("spawn_subagent should succeed");
+        let result_rx = coord
+            .take_result_rx(task_id)
+            .expect("result receiver exists");
+
+        tokio::task::spawn_blocking(move || entered_rx.recv_timeout(Duration::from_secs(10)))
+            .await
+            .expect("wait task should not panic")
+            .expect("run persistence should reach the controlled window");
+
+        assert_eq!(coord.get_status(task_id), Some(TaskStatus::Running));
+        assert!(
+            coord.cancel_subagent_by_session(subagent_session_id),
+            "the handle is still Running while terminal persistence is blocked"
+        );
+        release_tx.send(()).expect("release terminal persistence");
+
+        let result = result_rx.await.expect("subagent should return its result");
+        assert_eq!(result.status, TaskStatus::Completed);
+        let completion = completion_rx
+            .recv()
+            .await
+            .expect("background completion should still be emitted");
+        assert_eq!(completion.status, TaskStatus::Completed);
     }
 
     // -- (d3) cancel labelling is poll-order-independent (Tim S1, PR #1192) -----

@@ -400,8 +400,10 @@ pub async fn cancel_run(
 /// its token fired (cancellation completes asynchronously — the terminal
 /// events above follow on the streams), or 404 `NO_LIVE_SUBAGENT` when the
 /// session has no live subagent (unknown session, or the subagent already
-/// reached a terminal state — e.g. a double-click racing natural
-/// completion).
+/// reached a terminal state). A request racing natural completion can still
+/// return 200 after the result was selected but before the handle status flips;
+/// the fired token does not replace that result, so a `Completed` completion
+/// is still delivered.
 #[instrument(level = "info", skip(state), fields(session_id = %session_id.0))]
 pub async fn cancel_subagent(
     State(state): State<AppState>,
