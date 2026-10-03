@@ -136,6 +136,8 @@ fn set_default_agent(&self, id: AgentId) -> AlmsResult<()>;
 
 ## Migration: Single-Agent to Multi-Agent
 
+> **As implemented:** this section is the original plan, and the code differs from it. See `migrate_sidecar_agent` and `boot_default_agent_id` in `crates/alms-gateway/src/gateway.rs`. The migrated agent is named `main`, and it is created only when the agents table is empty, the sidecar `<data_dir>/agent_id` (default `.alms/agent_id`) already exists, and sessions are filed under its ID (#180). Without a sidecar nothing is created; the first agent comes from onboarding or `alms agent create`. The sidecar is still written and read, not dropped: while the registry is empty its ID is the gateway's default agent ID, and once agents exist the registry's default agent (or the oldest agent, if none is marked default) is used instead. `ALMS_AGENT_ID` takes the sidecar's place and skips the migration.
+
 Zero manual steps for existing deployments:
 
 1. **Schema migration** — `SqliteStore::open()` runs `CREATE TABLE IF NOT EXISTS agents`. Existing databases get the table silently.

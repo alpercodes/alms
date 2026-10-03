@@ -423,7 +423,7 @@ pub(crate) fn agent_create(store: &SqliteStore, opts: AgentCreateOpts<'_>) -> an
         summary_provider: summary_provider.map(|s| s.trim().to_string()),
         summary_model: summary_model.map(|s| s.trim().to_string()),
         worktree_mode,
-        // Debug mode (#1003) is operator-flippable via PATCH /agents/{id}
+        // Debug mode (#1003) is operator-flippable via PUT /agents/{id}
         // (or the per-agent edit modal in the web UI) — `alms agent
         // create` lands the record with `false` so existing CLI
         // workflows are unaffected. Operators who want it enabled
@@ -653,16 +653,16 @@ pub(crate) struct AgentConfigOpts<'a> {
     pub description: Option<String>,
     /// Anthropic extended-thinking budget override (tokens). `Some(0)`
     /// explicitly disables thinking; `Some(n)` sets the budget. `None`
-    /// here means "leave unchanged" — mirrors the HTTP `PATCH /agents`
+    /// here means "leave unchanged" — mirrors the HTTP `PUT /agents`
     /// path where a missing field is a no-op.
     pub thinking_budget_tokens: Option<u32>,
     /// OpenAI-compat reasoning effort override (`low`/`medium`/`high`/
     /// `minimal`). `None` leaves the stored value unchanged. Matches
-    /// the HTTP `PATCH /agents` semantics on `reasoning_effort` (#768).
+    /// the HTTP `PUT /agents` semantics on `reasoning_effort` (#768).
     pub reasoning_effort: Option<alms_core::config::ReasoningEffort>,
     /// Gemini extended-thinking budget override (tokens). `Some(0)`
     /// explicitly disables thinking; `Some(n)` sets the budget. `None`
-    /// leaves the stored value unchanged — matches the HTTP `PATCH
+    /// leaves the stored value unchanged — matches the HTTP `PUT
     /// /agents` semantics on `gemini_thinking_budget` (#794).
     pub gemini_thinking_budget: Option<u32>,
     /// Per-agent summary-task provider override (#872, #876).
@@ -721,7 +721,7 @@ pub(crate) fn agent_config(store: &SqliteStore, opts: AgentConfigOpts<'_>) -> an
     } = opts;
 
     // CLEAR_AND_VALUE_CONFLICT for the summary fields (#872, #876).
-    // Mirrors the HTTP `PATCH /agents/{id}` semantics — sending both a
+    // Mirrors the HTTP `PUT /agents/{id}` semantics — sending both a
     // value and a clear flag for the same field is ambiguous and
     // rejected. Surface the same error code at the CLI layer so users
     // who scripted against the HTTP path see consistent diagnostics.
@@ -814,7 +814,7 @@ pub(crate) fn agent_config(store: &SqliteStore, opts: AgentConfigOpts<'_>) -> an
     // Per-agent worktree-mode flip (#946). The side-effecting `git
     // worktree add` / `remove` runs BEFORE the SQLite update so a
     // failure surfaces a clean error without leaving the record
-    // half-changed. Mirrors the HTTP `PATCH /agents/{id}` flow.
+    // half-changed. Mirrors the HTTP `PUT /agents/{id}` flow.
     let prev_worktree_mode = agent.worktree_mode;
     if let Some(new_mode) = worktree_mode {
         agent.worktree_mode = new_mode;

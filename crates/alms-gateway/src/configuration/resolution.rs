@@ -229,7 +229,7 @@ impl std::error::Error for ResolveAgentConfigError {}
 ///
 /// **Two-layer precedence** (per-agent > server default). Per-run
 /// overrides were removed in the #941 pivot — agents are the single
-/// per-tenant config surface. Operators set values via `PATCH
+/// per-tenant config surface. Operators set values via `PUT
 /// /agents/{id}` before starting the run; `POST /runs` carries no
 /// config knobs.
 ///
@@ -319,7 +319,7 @@ pub(crate) fn resolve_agent_config(
             cfg.gemini_thinking_budget = Some(budget);
         }
         // Per-agent summary provider/model overrides (#872). The
-        // validator on `POST /agents` / `PATCH /agents/{id}` enforces
+        // validator on `POST /agents` / `PUT /agents/{id}` enforces
         // the pair-only invariant (both fields set together or both
         // unset) so by the time we get here the per-agent values are
         // guaranteed symmetric. `None` falls through to the
@@ -333,8 +333,8 @@ pub(crate) fn resolve_agent_config(
         // Per-agent debug-mode toggle (#1003). The agent record's
         // `debug_mode` is the single source of truth — it lands on
         // the resolved config so the runtime emits a `ContextDebug`
-        // event on each turn. PATCH-mutable via
-        // `PATCH /agents/{id}` so flipping the flag at run-time
+        // event on each turn. Mutable via
+        // `PUT /agents/{id}` so flipping the flag at run-time
         // takes effect on the next run without a restart. This
         // merge is the ONLY gate: the #546-era notification
         // debug-flip in `lifecycle::execute_run` that used to

@@ -1734,7 +1734,7 @@ fn agent_config_for_subagent(
     // per-agent summary overrides applied via `resolve_agent_config`),
     // then overlay any summary_provider/summary_model the subagent's
     // own registry record carries. The pair-only validator on
-    // `POST /agents` / `PATCH /agents/{id}` guarantees these arrive
+    // `POST /agents` / `PUT /agents/{id}` guarantees these arrive
     // symmetric, so we honour each field independently — `Some` wins
     // over the parent; `None` inherits.
     let mut subagent_context_config = base.context_config.clone();

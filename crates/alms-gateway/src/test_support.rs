@@ -81,6 +81,13 @@ impl TestAppState {
         self
     }
 
+    /// The configured default agent ID, as `alms gateway` passes the
+    /// sidecar's (or `ALMS_AGENT_ID`).
+    pub(crate) fn agent_id(mut self, id: alms_core::AgentId) -> Self {
+        self.config.agent_id = Some(id);
+        self
+    }
+
     /// Build the state and drop the channel receivers.
     pub(crate) fn build(self) -> AppState {
         self.build_with_channels().0

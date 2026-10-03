@@ -245,7 +245,7 @@ export function SettingsModal({ open, onClose }) {
     // for a specific agent's turns, and operators want a single
     // discoverable place to flip it for the agent they're chatting
     // with. The toggle writes through to the active agent's record
-    // via PATCH /agents/{id}; the AgentEditModal exposes the same
+    // via PUT /agents/{id}; the AgentEditModal exposes the same
     // field per-agent for fleets where multiple agents need
     // independent settings.
     //
@@ -520,7 +520,7 @@ export function SettingsModal({ open, onClose }) {
         }
 
         // Debug section (#1003). Per-agent — runs through the
-        // `PATCH /agents/{id}` endpoint instead of `PATCH /settings`.
+        // `PUT /agents/{id}` endpoint instead of `PATCH /settings`.
         // Only fires when the user actually toggled the switch
         // (`debugModeTouched`) AND the diff helper says the value
         // changed, so opening + closing the modal without touching

@@ -613,7 +613,7 @@ mod tests {
 
     /// The canonical #942 leak shape. Agent record carries `provider:
     /// anthropic` and `model: gpt-4o-mini` (a stale openai-namespace
-    /// model — typical operator workflow: swap provider via PATCH /agents,
+    /// model — typical operator workflow: swap provider via PUT /agents,
     /// forget to update the model). Server default is openai with
     /// `gpt-4o-mini`. Pre-fix: the per-agent `with_model("gpt-4o-mini")`
     /// runs after `apply_provider("anthropic")` and the wire request goes

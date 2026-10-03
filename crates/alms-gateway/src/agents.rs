@@ -650,7 +650,7 @@ enum WorktreeOp {
     /// lives in `docs/security-model.md` under "Force-true
     /// reversibility asymmetry" in the worktree-mode section.
     Remove { force: bool },
-    /// PATCH /agents. Forward op depends on the (`prev_mode`,
+    /// PUT /agents. Forward op depends on the (`prev_mode`,
     /// `new_mode`) transition: off→git creates, git→off removes,
     /// same-mode is a no-op. Inverse op on persist failure mirrors
     /// the variant decision. `force_remove` only applies to git→off
@@ -1730,7 +1730,7 @@ mod tests {
 
     #[test]
     fn debug_mode_round_trips_through_sqlite_and_patch_chain() {
-        // End-to-end: insert an agent, simulate `PATCH /agents/{id}
+        // End-to-end: insert an agent, simulate `PUT /agents/{id}
         // { "debug_mode": true }` by deserialising the request body
         // through `UpdateAgentRequest` (the same path the axum handler
         // uses), apply via `apply_update_request`, persist, reload —
@@ -1767,7 +1767,7 @@ mod tests {
         let reloaded = store.load_agent_by_id(agent.id).unwrap().unwrap();
         assert!(
             reloaded.debug_mode,
-            "PATCH /agents/{{id}} {{debug_mode: true}} must round-trip through SQLite"
+            "PUT /agents/{{id}} {{debug_mode: true}} must round-trip through SQLite"
         );
 
         // PATCH back to false — same path.
@@ -1783,7 +1783,7 @@ mod tests {
         let reloaded = store.load_agent_by_id(agent.id).unwrap().unwrap();
         assert!(
             !reloaded.debug_mode,
-            "PATCH /agents/{{id}} {{debug_mode: false}} must round-trip back to false"
+            "PUT /agents/{{id}} {{debug_mode: false}} must round-trip back to false"
         );
 
         // Omitting the field on a subsequent PATCH must leave the
@@ -2703,7 +2703,7 @@ mod tests {
         );
     }
 
-    /// `PATCH /agents/{id}` flipping `Off → Git` provisions the
+    /// `PUT /agents/{id}` flipping `Off → Git` provisions the
     /// worktree on the fly.
     #[tokio::test]
     async fn patch_agents_off_to_git_provisions_worktree() {
@@ -2739,7 +2739,7 @@ mod tests {
         );
     }
 
-    /// `PATCH /agents/{id}` flipping `Git → Off` removes the
+    /// `PUT /agents/{id}` flipping `Git → Off` removes the
     /// worktree and refuses if uncommitted changes are present
     /// (without `force_worktree_remove`).
     #[tokio::test]
@@ -2866,7 +2866,7 @@ mod tests {
         assert!(store.load_agent_by_name("atlas").unwrap().is_none());
     }
 
-    // ── #964: PATCH /agents worktree side-effect must compensate on
+    // ── #964: PUT /agents worktree side-effect must compensate on
     //          SQLite persist failure ────────────────────────────────
 
     /// Captured-log harness, shared with the #947 boot-WARN tests in
