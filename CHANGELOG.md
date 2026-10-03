@@ -151,6 +151,12 @@ Each item below changes behaviour for a deployment that has not set the knob exp
   agent can no longer see — the same rule every other non-user-facing run already has;
   `workspace_read` first, or `mode: "append"`, still works. No production code path
   creates an `episodic:` session today, so this changes what *would* happen, not what does.
+- Docs correction, no behaviour change: on a Linux kernel without Landlock, a sandboxed
+  `shell` refuses every command (each fails to start with
+  `Invalid argument (os error 22)`); it does not run unsandboxed, as the README and
+  `docs/security-model.md` § 4.4 said. `[tools].shell_policy` is not inert:
+  `"unrestricted"` takes Landlock and the cwd check off every agent's `shell`. And
+  `ALMS_MASTER_KEY` is out of an agent's reach only where `shell` has a filesystem boundary.
 
 ### LLM errors
 

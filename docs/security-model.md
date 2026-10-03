@@ -404,17 +404,20 @@ the `starts_with` comparison. **Fail-soft:** if canonicalization fails
 the as-is path is used with a `WARN`; `with_project_root` never
 silently widens the sandbox to "none."
 
-The legacy `tools.sandbox_root` and `tools.shell_policy` config knobs
-are still parsed (they configure the `AgentRuntime::new` initial fs/
-shell registration), but the gateway's run lifecycle calls
-`with_project_root(project_root)` immediately after — so the effective
-sandbox boundary every run sees is always the project root unless
+The legacy `tools.sandbox_root` knob is still parsed (it sets the root
+for the `AgentRuntime::new` initial fs/shell registration), but the
+gateway's run lifecycle calls `with_project_root(project_root)`
+immediately after, so the root every run sees is the project root
+unless
 [`[security].allow_full_os_access`](#operator-escape-hatch-allow_full_os_access)
-or the agent's per-agent
-[worktree mode](#opt-in-worktree-mode) overrides it. In other words,
-in normal operation these two legacy knobs are effectively no-ops:
-whatever value they hold in `alms.toml` is overwritten on every run,
-so an operator scanning their config should treat them as inert.
+or the agent's [worktree mode](#opt-in-worktree-mode) overrides it. In
+normal operation `sandbox_root` is inert. **`tools.shell_policy` is
+not.** `with_project_root` re-registers `shell` with the policy
+`AgentRuntime::new` read from it, so `"unrestricted"` takes the cwd
+check and the Landlock ruleset off every agent's `shell` (see
+[Shell sandboxing platform asymmetry](#shell-sandboxing-platform-asymmetry)).
+It can also be changed at runtime with `PATCH /settings`, which
+persists it to `settings.json`.
 
 **How the prefix check works:**
 1. Relative paths are joined to the project root, absolute paths are checked directly.
@@ -637,10 +640,21 @@ any payload referencing the `security` key (including `{ "security": {} }`
 and `{ "security": null }`) with `400 SECURITY_KNOB_NOT_PATCHABLE`.
 Mixed payloads `{ "llm": {...}, "security": {...} }` reject the entire
 request — no partial application. Operators edit the TOML and restart
-the gateway. PATCH-mutability would let a compromised auth token
-silently widen the blast radius of an existing agent. See
+the gateway. See
 [`docs/api.md` § 10.2](api.md#102-update-server-settings) for the wire
-contract.
+contract. This keeps the list off the API, and that is all it does:
+
+- It does not stop an API caller from widening `shell`'s reach.
+  `tools.shell_policy` is PATCH-mutable, and `"unrestricted"` takes the
+  cwd check and the Landlock ruleset off every agent's `shell` (the
+  `fs_*` tools keep the project root). Without `ALMS_AUTH_TOKEN` that
+  caller can be any local process, a sandboxed `shell` included.
+- It does not keep the list away from agents. Nothing write-protects
+  `alms.toml`, and the gateway reads it from its working directory, the
+  default project root. Wherever `fs_write` or `shell` can reach the
+  file, one unapproved call can add any agent to the list from the next
+  start. See
+  [§ 8.1](#guarded-is-not-an-agent-boundary).
 
 **Audit signal.** A boot-time WARN fires once per listed agent at
 gateway startup, and a per-run WARN fires at every `run_started` for a
@@ -736,7 +750,7 @@ worse than "application-layer instead of kernel-level":
   not path controls. Defeating the classifier is not what gets an agent
   out of the project root; nothing is holding it in.
 
-**On a kernel without Landlock, a sandboxed `shell` refuses to run.**
+**On a Linux kernel without Landlock, a sandboxed `shell` refuses to run.**
 `apply_landlock_sandbox` (`crates/alms-sandbox/src/shell/exec.rs`) builds
 its ruleset inside `pre_exec` with the `landlock` crate (0.4.4 in
 `Cargo.lock`), at the crate's default `BestEffort` compatibility level.
@@ -753,19 +767,34 @@ is taken only if `handle_access` returns an error. At `BestEffort` the
 crate returns one only for an empty or unknown set of access rights, and
 ALMS passes neither (`AccessFs::from_all(ABI::V5)`). This is established
 from the code: no test exercises it, and it has not been run on a kernel
-without Landlock. Three consequences an operator needs:
+without Landlock. A seccomp filter that kills the process instead of
+failing the syscall (systemd's `SystemCallFilter=` without
+`SystemCallErrorNumber=`) also stops the command, with a different
+symptom: the child dies of `SIGSYS` before it can report back, so the
+spawn succeeds and the tool reports exit code `-1` with no output. That
+case is from reading `std`, and is untested. Three consequences an
+operator needs:
 
 - **Without Landlock, a sandboxed `shell` is unusable, not open.** Every
-  call fails.
+  command fails to start. A `run_in_background: true` call is still
+  accepted and returns `"status": "submitted"`; the failure shows up
+  later, through `check_task`.
 - **The failure does not say why.** The `[alms] Landlock: …` line goes to
   the child's stderr before `exec`, and nothing reads it once the spawn
   has failed. `std` passes only an errno back to the parent, and this
-  error has none, so the tool call fails with
-  `Failed to spawn command: Invalid argument (os error 22)`. The reason
-  reaches neither the tool result nor the structured logs. If every
-  `shell` call on a Linux host fails that way, check that `landlock` is
-  listed in `/sys/kernel/security/lsm`, and inside a container that its
-  seccomp profile allows the Landlock syscalls.
+  error has none, so the tool result is
+  `Error: Tool execution failed: IO error: Failed to spawn command: Invalid argument (os error 22)`,
+  and the daemon logs
+  `Tool execution failed: IO error: Failed to spawn command: Invalid argument (os error 22)`
+  at `WARN` (a background call logs `Background task failed` at `WARN`,
+  with the error in its `error` field). The reason reaches neither the
+  tool result nor the structured logs. Every `pre_exec` failure ends in
+  the same EINVAL — a sandbox root the child cannot open, a system-path
+  rule that cannot be added — so Landlock is the first thing to check,
+  not the only cause. If every `shell` call on a Linux host fails that
+  way, check that `landlock` is listed in `/sys/kernel/security/lsm`, and
+  inside a container that its seccomp profile allows the Landlock
+  syscalls.
 - **What runs without Landlock does not depend on the kernel.** A `shell`
   that is not sandboxed (`[tools].shell_policy = "unrestricted"`, or an
   agent in
@@ -1084,6 +1113,7 @@ Default posture recommendations:
 - Anything a sender has ingested — an `http_get` of an arbitrary URL, a file or repository it did not write — can reach a `guarded` agent's tools this way (§ 3.3).
 - On macOS and Windows, a promoted run's `shell` has no filesystem boundary ([§ 4.4](#shell-sandboxing-platform-asymmetry)): it has the daemon OS user's reach. So does a `shell` that is not sandboxed on Linux. On a Linux kernel without Landlock, a sandboxed `shell` refuses every command.
 - A promoted run can turn approval off for the runs a human starts, too. The gateway points `shell` at the live database through `ALMS_DATA_DIR`, and `alms agent config <name> --posture full_control` writes the agent registry in SQLite directly, with no API call and so no `ALMS_AUTH_TOKEN` check. Wherever `shell` can reach the data directory, one unapproved `shell` call can make any agent `full_control` until someone sets it back. It can on macOS and Windows, and from a `shell` that is not sandboxed, wherever the data directory lives, and on Linux with Landlock whenever the data directory is inside the shell's sandbox root, as the default `./.alms` is inside the default project root. So "`guarded` governs the runs a human starts" holds only until a promoted run does this.
+- The same reach turns the `shell` sandbox off for every agent. The gateway applies `{data_dir}/settings.json` at startup, including `tools.shell_policy`, and reads `alms.toml` from its working directory, the default project root. Nothing write-protects either file. Wherever `shell` or `fs_write` can reach either, one unapproved call can set `shell_policy = "unrestricted"` (in `settings.json`, or in `alms.toml` where `settings.json` does not override it), or add an agent to `[security].allow_full_os_access` (in `alms.toml`), from the next start. Without `ALMS_AUTH_TOKEN`, `PATCH /settings` changes `shell_policy` without a restart ([`docs/api.md` § 10.2](api.md#102-update-server-settings) says which runs pick it up): Landlock in ALMS restricts the filesystem, not the network, so a sandboxed `shell` can reach the gateway on loopback. This is established from the code; it has not been run end to end.
 
 **What an operator can do today.** Within one gateway, treat every agent as able to run every other agent's tools without approval.
 

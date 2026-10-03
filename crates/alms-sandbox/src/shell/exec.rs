@@ -819,11 +819,15 @@ fn apply_landlock_sandbox(
     let sys_paths = system_read_paths;
 
     // SAFETY: pre_exec runs in the child process after fork() but before
-    // exec(). The Landlock syscalls themselves are async-signal-safe, but
-    // we use eprintln! for diagnostics on error paths, which is technically
-    // not async-signal-safe (it may allocate). In practice this is reliable
-    // after fork() on Linux and only executes on error paths. The trade-off
-    // is accepted for debuggability.
+    // exec(). The Landlock syscalls themselves are async-signal-safe. The
+    // eprintln! calls below are not: they take std's process-wide stderr
+    // lock and may allocate. They do not run only on rare error paths: on a
+    // Linux kernel without Landlock the `NotEnforced` branch runs on every
+    // sandboxed call. If fork() lands while another thread holds the stderr
+    // lock (the daemon's tracing layer writes through stderr), the child
+    // blocks in eprintln! and the parent blocks in spawn() waiting for it;
+    // that is from reading std, not reproduced. Nor do they help debugging:
+    // nothing reads the child's stderr once the spawn has failed.
     unsafe {
         cmd.pre_exec(move || {
             use landlock::{

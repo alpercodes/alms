@@ -123,11 +123,11 @@ decisions, and you should know them before deploying:
   there is the `[tools.shell_permissions]` regex list, the destructive-command classifier,
   and a working-directory revert that reports an escape *after* the command has already
   run. On those platforms, run the daemon as a low-privilege OS user with filesystem ACLs.
-  On a Linux kernel without Landlock (older than 5.13, or with Landlock not built in or not
-  enabled at boot), a sandboxed `shell` does not fall back to running unsandboxed: it
-  refuses every command. A `shell` that is not sandboxed
-  (`[tools].shell_policy = "unrestricted"`, or an agent in `allow_full_os_access`) runs
-  without Landlock on every kernel.
+  On a Linux kernel without Landlock (older than 5.13, with Landlock not built in or not
+  enabled at boot, or in a container whose seccomp profile blocks the Landlock syscalls), a
+  sandboxed `shell` does not fall back to running unsandboxed: it refuses every command. A
+  `shell` that is not sandboxed (`[tools].shell_policy = "unrestricted"`, or an agent in
+  `allow_full_os_access`) runs without Landlock on every kernel.
 - **`[security].allow_full_os_access` removes the filesystem sandbox for the agents you
   list.** It is a list of agent names, not a boolean: a listed agent's `fs_*` and `shell`
   run against the real root. Shell permissions and the destructive-command classifier still
