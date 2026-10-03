@@ -239,10 +239,11 @@ one.
   `afterSanitizeAttributes`. The UI uses neither: it sanitizes a string with no config, and
   its one `afterSanitizeAttributes` hook only sets `target` / `rel` on links. No release is
   in the affected range (3.4.13–3.4.15): v0.2.3 loads `dompurify` 3.2.4 from esm.sh. The
-  only output change on the UI's path is fail-closed: a `<form>` containing a form control
-  or image whose `name` or `id` is `removeAttributeNode` or `getAttributeNode` is now
-  dropped from rendered markdown, along with its contents. No operator action. The
-  committed `static/ui-dist/` bundle is rebuilt.
+  only output change on the UI's path is fail-closed: a `<form>` with an `input` (other
+  than `type="image"`), `button`, `select`, `textarea`, `fieldset`, `output`, `object` or
+  `img` whose `name` or `id` is `removeAttributeNode` or `getAttributeNode` is now dropped
+  from rendered markdown, along with its contents. No operator action. The committed
+  `static/ui-dist/` bundle is rebuilt.
 
 ## v0.2.3 — released (tag `v0.2.3`)
 

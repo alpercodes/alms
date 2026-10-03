@@ -131,9 +131,11 @@ surface, no URL surface. Every other case, including all the hostile ones, was
 byte-identical, so nothing `utils/code-copy.js` or
 `utils/decorate-code-blocks.js` parses moved. Which DOM that differential ran
 under isn't recorded. Under jsdom, its clobbering cases could not reach
-`<form>` named-property clobbering at all (see the 3.4.16 note below). Re-run in
-headless Chromium during the 3.4.16 bump, with form-clobbering cases added,
-3.4.12 -> 3.4.14 still differs only in that SVG case.
+`<form>` named-property clobbering at all (see the 3.4.16 note below). Run in
+headless Chromium during the 3.4.16 bump, this bump's 86 cases plus six
+form-clobbering cases still differ between 3.4.12 and 3.4.14 only in that SVG
+case. `_isClobbered()` is identical in the two versions, so there was no form
+change for jsdom to miss.
 
 **3.4.14 rather than the minimum patch 3.4.13.** 3.4.13 clears the advisory on
 its own; 3.4.14 is latest and avoids a second bump shortly after. Its extra fix
@@ -176,20 +178,24 @@ that did.
 
 **One behaviour change, fail-closed, and invisible to jsdom.** 3.4.15's
 clobbering hardening makes `_isClobbered()` also flag a `<form>` whose
-`removeAttributeNode` or `getAttributeNode` is shadowed by a form control or
-`<img>` inside it with that `name` or `id`.
-`<form><input name="removeAttributeNode"></form>` now renders as nothing
-(3.4.14: `<form><input></form>`), and anything inside such a form goes with it.
-Chromium shows this. jsdom doesn't, because it doesn't implement
-`[LegacyOverrideBuiltIns]` on `HTMLFormElement`, so neither the 86-case jsdom
-differential nor the Vitest suite can observe it. Re-run in headless Chromium
-against the committed `deps` chunks, those 86 cases are still byte-identical
-across 3.4.14 and 3.4.16; only added form cases of this shape differ. A Vitest
-pin would pass on both versions, so there isn't one. 3.4.16's hook-detach
-re-checks are no-ops for our hook, which detaches nothing, and its shadow-root
-change only applies to DOM-node input, which we never pass. 3.4.16 also moves
-DOMPurify's build from rollup to rolldown. The pins in
-`frontend/markdown-rendering.test.ts` stand unchanged.
+`removeAttributeNode` or `getAttributeNode` is shadowed by one of the form's
+named properties. HTML creates those from the form's `<img>` elements and its
+listed elements (`input` other than `type="image"`, `button`, `select`,
+`textarea`, `fieldset`, `output`, `object`), keyed by `name` or `id`. That
+includes an `<object>`, which DOMPurify would strip anyway, because the form is
+checked before its children. It also includes a control after the form that
+joins it with `form="…"`. `<form><input name="removeAttributeNode"></form>` now
+renders as nothing (3.4.14: `<form><input></form>`), and anything inside such a
+form goes with it. Chromium shows this. jsdom doesn't, because it doesn't
+implement `[LegacyOverrideBuiltIns]` on `HTMLFormElement`, so neither the
+86-case jsdom differential nor the Vitest suite can observe it. Re-run in
+headless Chromium against the committed `deps` chunks, those 86 cases are still
+byte-identical across 3.4.14 and 3.4.16; only added form cases of this shape
+differ. A Vitest pin would pass on both versions, so there isn't one. 3.4.16's
+hook-detach re-checks are no-ops for our hook, which detaches nothing. 3.4.15's
+shadow-root change and 3.4.16's `IN_PLACE` fixes only apply to DOM-node input,
+which we never pass. 3.4.16 also moves DOMPurify's build from rollup to
+rolldown. The pins in `frontend/markdown-rendering.test.ts` stand unchanged.
 
 ### Why `@preact/signals` is on 2.x
 
