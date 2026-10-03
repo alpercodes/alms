@@ -321,15 +321,18 @@ pub(crate) fn agent_create(store: &SqliteStore, opts: AgentCreateOpts<'_>) -> an
 
     validate_agent_name(&name)?;
 
-    if let Ok(Some(_)) = store.load_agent_by_name(&name) {
-        anyhow::bail!("Agent name '{name}' already exists");
+    match store.load_agent_by_name(&name) {
+        Ok(Some(_)) => anyhow::bail!("Agent name '{name}' already exists"),
+        Ok(None) => {}
+        Err(error) => return Err(error.into()),
     }
     if let Some(ws_dir) = workspace_dir {
         match alms_core::ensure_workspace_dir_available(&ws_dir.join(&name)) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
                 anyhow::bail!(
-                    "WORKSPACE_EXISTS: agent '{name}' has an existing workspace; move or remove it before reusing this name"
+                    "WORKSPACE_EXISTS: agent name '{name}' is free, but a workspace path for that name already exists at {} and may contain or point to data from another agent. Choose a different name, or move or delete that path and try again.",
+                    ws_dir.join(&name).display()
                 );
             }
             Err(error) => return Err(error.into()),
@@ -1152,6 +1155,11 @@ mod tests {
         .unwrap_err();
 
         assert!(error.to_string().contains("WORKSPACE_EXISTS"));
+        assert!(
+            error
+                .to_string()
+                .contains(&ws_dir.join("reviewer").display().to_string())
+        );
         assert!(store.load_agent_by_name("reviewer").unwrap().is_none());
         assert_eq!(
             std::fs::read_to_string(agent_dir.join("personality.md")).unwrap(),

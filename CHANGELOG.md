@@ -127,6 +127,7 @@ Each item below changes behaviour for a deployment that has not set the knob exp
 
 ### Tools and workspace
 
+- `POST /agents` and `alms agent create` refuse a name whose workspace path contains or points to data (`409 WORKSPACE_EXISTS`) instead of handing another agent the old personality and memories. `DELETE /agents` leaves `.alms/agents/<name>/` on disk; a folder with only the blank seed files and their lock sidecars remains reusable. After upgrading, a deleted agent whose folder contains anything beyond those blank seeds and lock sidecars stays blocked until the folder is moved or deleted.
 - A replacing `workspace_write` is refused when it would delete text the agent has not
   been shown; a new `workspace_read` tool is how it gets shown.
 - An agent's memories survive a concurrent write to its workspace.

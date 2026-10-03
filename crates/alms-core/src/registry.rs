@@ -532,12 +532,38 @@ pub fn validate_agent_name(name: &str) -> AlmsResult<()> {
 /// Workspace file names created for every new agent.
 pub const WORKSPACE_FILENAMES: &[&str] = &["personality.md", "goals.md", "memories.md", "user.md"];
 
+/// True when a workspace contains only the blank files and lock sidecars
+/// created by a new agent.
+fn is_blank_scaffold(dir: &Path) -> std::io::Result<bool> {
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() {
+            return Ok(false);
+        }
+
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            return Ok(false);
+        };
+        let is_lock = WORKSPACE_FILENAMES.iter().any(|filename| {
+            name.strip_prefix('.')
+                .and_then(|name| name.strip_suffix(".lock"))
+                == Some(*filename)
+        });
+        let is_blank_seed = WORKSPACE_FILENAMES.contains(&name) && entry.metadata()?.len() == 0;
+        if !(is_lock || is_blank_seed) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 /// Refuse to reuse an existing agent workspace that contains data.
 ///
 /// Workspaces are keyed by agent name, while registry rows are keyed by ID.
 /// A deleted agent can therefore leave files that a newly created agent would
-/// otherwise inherit. Empty directories are safe to reuse; symlinks, files,
-/// and non-empty directories are not.
+/// otherwise inherit. Empty directories and untouched seed scaffolds are safe
+/// to reuse; symlinks, files, and other contents are not.
 pub fn ensure_workspace_dir_available(dir: &Path) -> std::io::Result<()> {
     let metadata = match std::fs::symlink_metadata(dir) {
         Ok(metadata) => metadata,
@@ -552,13 +578,13 @@ pub fn ensure_workspace_dir_available(dir: &Path) -> std::io::Result<()> {
         ));
     }
 
-    match std::fs::read_dir(dir)?.next() {
-        None => Ok(()),
-        Some(Ok(_)) => Err(std::io::Error::new(
+    if is_blank_scaffold(dir)? {
+        Ok(())
+    } else {
+        Err(std::io::Error::new(
             std::io::ErrorKind::AlreadyExists,
             "agent workspace already contains data",
-        )),
-        Some(Err(error)) => Err(error),
+        ))
     }
 }
 
@@ -896,5 +922,84 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn workspace_dir_availability_allows_blank_seed_files_and_lock_sidecars() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("agent");
+        init_workspace_files(&dir).unwrap();
+        std::fs::write(dir.join(".memories.md.lock"), "lock metadata").unwrap();
+
+        ensure_workspace_dir_available(&dir).unwrap();
+    }
+
+    #[test]
+    fn workspace_dir_availability_rejects_nonempty_seed_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("agent");
+        init_workspace_files(&dir).unwrap();
+        std::fs::write(dir.join("memories.md"), "old agent memory").unwrap();
+
+        let error = ensure_workspace_dir_available(&dir).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(
+            std::fs::read_to_string(dir.join("memories.md")).unwrap(),
+            "old agent memory"
+        );
+    }
+
+    #[test]
+    fn workspace_dir_availability_rejects_unknown_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("agent");
+        init_workspace_files(&dir).unwrap();
+        std::fs::write(dir.join("notes.md"), "operator data").unwrap();
+
+        let error = ensure_workspace_dir_available(&dir).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+    }
+
+    #[test]
+    fn workspace_dir_availability_rejects_plain_file_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("agent");
+        std::fs::write(&path, "not a directory").unwrap();
+
+        let error = ensure_workspace_dir_available(&path).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_dir_availability_rejects_symlinked_seed_file() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("agent");
+        let target = tmp.path().join("outside.md");
+        init_workspace_files(&dir).unwrap();
+        std::fs::remove_file(dir.join("memories.md")).unwrap();
+        std::fs::write(&target, "outside data").unwrap();
+        symlink(&target, dir.join("memories.md")).unwrap();
+
+        let error = ensure_workspace_dir_available(&dir).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read_to_string(target).unwrap(), "outside data");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_dir_availability_rejects_symlinked_directory() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("target");
+        let link = tmp.path().join("agent");
+        std::fs::create_dir(&target).unwrap();
+        symlink(&target, &link).unwrap();
+
+        let error = ensure_workspace_dir_available(&link).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
     }
 }
