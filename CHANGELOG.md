@@ -82,9 +82,10 @@ Each item below changes behaviour for a deployment that has not set the knob exp
   owns them.
 
   ⚠️ **Before upgrading**, mark the agent the bot should serve as the default
-  (`alms agent set-default <name>`), or give an agent its own token (`telegram_token` on
-  `PATCH /agents/{id}`). If agents exist but none is marked default, the gateway logs a
-  `WARN` at startup naming the agent the bot serves.
+  (`alms agent set-default <name>`), or give an agent its own token (its Telegram token
+  setting in the web UI, or `telegram_token` on `PUT /agents/{id_or_name}`). If agents
+  exist but none is marked default, the gateway logs a `WARN` at startup naming the agent
+  the bot serves.
 
 ### Multi-agent and DM
 
@@ -121,11 +122,11 @@ Each item below changes behaviour for a deployment that has not set the knob exp
 - After a restart, the gateway's default agent ID now comes from the agent registry: the
   default agent, or the oldest agent if none is marked default. The ID in `.alms/agent_id`
   (or `ALMS_AGENT_ID`) is used only while no agent is registered; when `ALMS_AGENT_ID` is
-  set and agents exist, a `WARN` at startup says it was ignored. Before, the gateway
-  booted with that ID every time, and creating or setting a default agent moved it only
-  until the next restart, so after a restart `GET /settings` reported it as `agent_id` even
-  when another agent was the default. This also changes which agent the global-token
-  Telegram bot serves; see the Telegram item under "Default changes" above.
+  set to a different ID and agents exist, a `WARN` at startup says it was ignored. Before,
+  the gateway booted with that ID every time, and creating or setting a default agent
+  moved it only until the next restart, so after a restart `GET /settings` reported it as
+  `agent_id` even when another agent was the default. This also changes which agent the
+  global-token Telegram bot serves; see the Telegram item under "Default changes" above.
 - Silent row loss in the persistence layer is now counted and surfaced, and foreign-key
   fallbacks are no longer silent.
 - Durable job recovery and atomic, bounded per-agent run admission.

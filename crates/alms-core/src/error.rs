@@ -166,7 +166,7 @@ impl AlmsError {
 ///
 /// Real provider names are `[llm.providers.<name>]` keys — a few characters
 /// — but the per-agent `provider` override arrives through `POST /agents` /
-/// `PATCH /agents/{id}` with only trim-and-reject-empty applied, so an
+/// `PUT /agents/{id}` with only trim-and-reject-empty applied, so an
 /// arbitrary string can reach the label. 64 is generous for a real name
 /// and small enough to keep a persisted marker one tractable line.
 const MAX_PROVIDER_LABEL_CHARS: usize = 64;

@@ -333,7 +333,7 @@ pub struct PatchLlm {
 /// by `Gateway` (a boot-time clone) and keep the boot pair until restart.
 /// See `docs/api.md` § 10.2.
 ///
-/// Per-agent model / provider overrides on the agent registry (`PATCH
+/// Per-agent model / provider overrides on the agent registry (`PUT
 /// /agents/{id}`) continue to win over the server default — this surface
 /// only moves the value agents fall back to.
 #[derive(Debug, Serialize, Deserialize, Default)]

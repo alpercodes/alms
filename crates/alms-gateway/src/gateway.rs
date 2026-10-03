@@ -845,7 +845,7 @@ impl Gateway {
                             // #863: per-agent provider override with no model
                             // on any layer. Telegram has no HTTP response
                             // surface, so log + drop the message — operator
-                            // must fix the agent config (PATCH /agents/{id})
+                            // must fix the agent config (PUT /agents/{id})
                             // before further messages are routable.
                             error!(
                                 agent_id = %agent_id,
