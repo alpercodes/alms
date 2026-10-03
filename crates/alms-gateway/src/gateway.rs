@@ -45,7 +45,14 @@ pub struct GatewayConfig {
     /// flat, sibling to `alms.db` rather than nested under
     /// `<data_dir>/workspace/`.
     pub workspace_dir: Option<std::path::PathBuf>,
-    /// Explicit agent ID (None = resolve from sidecar file or generate new)
+    /// The configured default agent ID. [`Self::from_alms_config_with_env`]
+    /// sets it from `ALMS_AGENT_ID` or the `<data_dir>/agent_id` sidecar
+    /// (see `resolve_default_agent_id`). `None` makes `Gateway::new` generate
+    /// a random ID for this boot; no sidecar is read or written.
+    ///
+    /// With a database (`db_path`), it is the default agent ID only while the
+    /// agent registry is empty or cannot be read. Otherwise `Gateway::new`
+    /// boots with the registry's default agent (see `boot_default_agent_id`).
     pub agent_id: Option<AgentId>,
     /// Bearer token for API authentication (None = auth disabled)
     pub auth_token: Option<String>,
@@ -295,23 +302,45 @@ pub(crate) fn warn_worktree_and_full_os_access_overlap_at_boot(
     }
 }
 
-/// Resolve the default agent ID: env var > sidecar file > generate new.
+/// Whether [`resolve_default_agent_id`] loaded the ID from an existing
+/// sidecar file (true), rather than generating it or taking it from
+/// `ALMS_AGENT_ID` (false). `Gateway::new` runs [`migrate_sidecar_agent`]
+/// only when it is set. On a genuine first boot the migration's own session
+/// check would skip it anyway, because a freshly generated ID owns no
+/// sessions; what the flag still decides alone is that a boot with
+/// `ALMS_AGENT_ID` set never migrates.
+static SIDECAR_EXISTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Resolve the configured default agent ID: env var > sidecar file > generate
+/// new.
 ///
 /// The sidecar file is `<data_dir>/agent_id` — a plain-text UUID.
 /// If the file is missing or contains garbage, a new ID is generated and
 /// persisted (self-healing). Write failures are non-fatal warnings.
-/// Whether the agent ID was loaded from an existing sidecar file (true)
-/// or freshly generated (false). Used to skip auto-migration on first run.
-static SIDECAR_EXISTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
+///
+/// This is the gateway's default agent ID (`AppState::default_agent_id`,
+/// `GET /settings`' `agent_id`) only while the agent registry is empty. Once
+/// an agent is registered, `Gateway::new` boots with the registry's default
+/// instead; see [`boot_default_agent_id`].
+///
+/// The sidecar is still written on a fresh install because of what happens
+/// while no agent exists: the global-token Telegram fallback files its
+/// sessions under this ID. Keeping the ID stable across restarts keeps all
+/// of those sessions under one ID, so [`migrate_sidecar_agent`] can hand them
+/// to `main`. That keeps them attached to an agent, but the conversation does
+/// not carry on. Once `main` exists the fallback bot is named `main` rather
+/// than `default`, so its context key changes from `telegram_default_<chat>`
+/// to `telegram_main_<chat>` and the chat gets a new session.
+/// `migrate_telegram_context_ids` only rewrites the older `telegram_<chat>`
+/// keys. The file alone does not trigger the migration.
 #[instrument]
 fn resolve_default_agent_id(data_dir: &Path) -> AgentId {
     // 1. Env var override takes highest precedence
+    if let Some(agent_id) = agent_id_from_env() {
+        info!("Using agent ID from ALMS_AGENT_ID: {}", agent_id.0);
+        return agent_id;
+    }
     if let Ok(val) = std::env::var("ALMS_AGENT_ID") {
-        if let Ok(uuid) = Uuid::parse_str(val.trim()) {
-            info!("Using agent ID from ALMS_AGENT_ID: {}", uuid);
-            return AgentId(uuid);
-        }
         warn!("Invalid ALMS_AGENT_ID '{}', ignoring", val);
     }
 
@@ -338,6 +367,12 @@ fn resolve_default_agent_id(data_dir: &Path) -> AgentId {
         info!("Generated and persisted new agent ID: {}", agent_id.0);
     }
     agent_id
+}
+
+/// `ALMS_AGENT_ID`, when it is set to a valid UUID.
+fn agent_id_from_env() -> Option<AgentId> {
+    let val = std::env::var("ALMS_AGENT_ID").ok()?;
+    Uuid::parse_str(val.trim()).ok().map(AgentId)
 }
 
 /// A Telegram bot bound to a specific agent.
@@ -367,7 +402,9 @@ pub struct Gateway {
 impl Gateway {
     /// Create a new gateway
     pub fn new(config: GatewayConfig) -> AlmsResult<Self> {
-        let agent_id = Arc::new(RwLock::new(config.agent_id.unwrap_or_default()));
+        let configured_agent_id = config.agent_id.unwrap_or_default();
+        // Without a store there is no registry to consult.
+        let mut default_agent_id = configured_agent_id;
 
         let session_manager = match &config.db_path {
             Some(path) => {
@@ -381,10 +418,18 @@ impl Gateway {
                     );
                 }
                 // Auto-migrate sidecar agent into the agents registry — only
-                // if a sidecar file existed (actual migration, not first run).
+                // if a sidecar file existed (not first run) and, inside
+                // `migrate_sidecar_agent`, only if its agent owns sessions
+                // (#180).
                 if SIDECAR_EXISTED.load(std::sync::atomic::Ordering::Relaxed) {
-                    migrate_sidecar_agent(&store, *agent_id.read());
+                    migrate_sidecar_agent(&store, configured_agent_id);
                 }
+                // After the migration, so a `main` it just created counts.
+                default_agent_id = boot_default_agent_id(
+                    &store,
+                    configured_agent_id,
+                    agent_id_from_env() == Some(configured_agent_id),
+                );
                 Arc::new(SessionManager::with_store(
                     config.session_config.clone(),
                     store,
@@ -424,7 +469,7 @@ impl Gateway {
             session_manager,
             telegram_bots: Vec::new(),
             llm,
-            agent_id,
+            agent_id: Arc::new(RwLock::new(default_agent_id)),
             secrets,
         })
     }
@@ -434,12 +479,49 @@ impl Gateway {
         Self::new(GatewayConfig::from_env()?)
     }
 
+    /// The agent the global Telegram token is bound to when no agent has a
+    /// token of its own: the current default agent ID, under that agent's
+    /// registry name, or under `"default"` while no agent with that ID is
+    /// registered. The name is part of the session context key,
+    /// `telegram_<name>_<chat>`.
+    ///
+    /// WARNs when that agent is registered but not marked default. That is
+    /// the oldest agent, which [`boot_default_agent_id`] falls back to when
+    /// no agent is marked default, and the bot then runs with that agent's
+    /// posture, model, workspace and sandbox settings without anyone having
+    /// chosen it. Called only when the global token is actually used.
+    fn global_telegram_target(&self) -> (AgentId, String) {
+        let default_id = self.agent_id();
+        let record = self
+            .session_manager
+            .store()
+            .and_then(|store| store.load_agent_by_id(default_id).ok().flatten());
+        match record {
+            Some(agent) => {
+                if !agent.is_default {
+                    warn!(
+                        agent_name = %agent.name,
+                        agent_id = %agent.id,
+                        "No agent is marked default, so the global Telegram token serves \
+                         '{}', the oldest agent, with that agent's posture, model, workspace \
+                         and sandbox settings. To choose the agent it serves, run \
+                         `alms agent set-default <name>` and restart the gateway.",
+                        agent.name,
+                    );
+                }
+                (default_id, agent.name)
+            }
+            None => (default_id, "default".to_string()),
+        }
+    }
+
     /// Initialize Telegram channels.
     ///
     /// Spawns a dedicated polling loop for each agent that has a `telegram_token`
     /// configured in the registry. Falls back to the global telegram token from
     /// the secrets store (`alms auth set telegram <token>`) for the default
-    /// agent if no per-agent tokens are found.
+    /// agent if no per-agent tokens are found; see
+    /// [`Self::global_telegram_target`].
     pub async fn initialize_channels(&mut self) -> AlmsResult<()> {
         // Phase 1: Collect per-agent Telegram tokens from the agent registry.
         let mut agent_tokens: Vec<(AgentId, String, String)> = Vec::new(); // (id, name, token)
@@ -468,13 +550,7 @@ impl Gateway {
                 .clone()
                 .or_else(|| self.secrets.read().resolve_key("telegram"));
             if let Some(token) = global_token {
-                let default_id = self.agent_id();
-                let default_name = self
-                    .session_manager
-                    .store()
-                    .and_then(|store| store.load_agent_by_id(default_id).ok().flatten())
-                    .map(|r| r.name)
-                    .unwrap_or_else(|| "default".to_string());
+                let (default_id, default_name) = self.global_telegram_target();
                 agent_tokens.push((default_id, default_name, token));
                 info!(
                     "No per-agent Telegram tokens found, using global telegram token from secrets store for default agent"
@@ -769,7 +845,7 @@ impl Gateway {
                             // #863: per-agent provider override with no model
                             // on any layer. Telegram has no HTTP response
                             // surface, so log + drop the message — operator
-                            // must fix the agent config (PATCH /agents/{id})
+                            // must fix the agent config (PUT /agents/{id})
                             // before further messages are routable.
                             error!(
                                 agent_id = %agent_id,
@@ -1116,13 +1192,58 @@ async fn process_telegram_message(
 /// `./data/agent_id` (a plain-text UUID) before multi-agent support was added.
 /// If the agents table already has entries, this is a no-op.
 ///
+/// **Only when the sidecar agent owns sessions (#180).** A sidecar on disk
+/// does not mean a pre-registry deployment: `resolve_default_agent_id` writes
+/// one on every fresh install's first boot. Gating on the file alone therefore
+/// registered an agent nobody created, `main` as the default, on a fresh
+/// install's second boot, and that also skipped first-run onboarding, which
+/// shows only while the agents table is empty. Sessions filed under the
+/// sidecar's ID are the data this migration exists to keep reachable, so a
+/// sidecar agent with none has nothing to migrate.
+///
+/// A pre-registry deployment has such sessions. A fresh install has none
+/// unless the global-token Telegram bot received messages before the first
+/// agent was created: while the registry is empty that bot files its
+/// sessions under the sidecar's ID, so such an install still gets `main` on
+/// its next restart. Deleting the agent deletes its sessions, so a deleted
+/// `main` does not come back on the next restart unless that bot has filed
+/// new ones under the ID in the meantime.
+///
 /// Uses `create_agent_if_none_exist` to atomically check-and-insert within a
 /// single SQLite transaction, avoiding the TOCTOU race between checking
-/// `list_agents().is_empty()` and `create_agent()`.
+/// `list_agents().is_empty()` and `create_agent()`. The `list_agents` read
+/// below is only there to skip the session check on every boot of a
+/// deployment that already has agents.
 ///
 /// All errors are non-fatal (`warn!` only) — migration must never block startup.
 #[instrument(skip(store))]
 fn migrate_sidecar_agent(store: &SqliteStore, agent_id: AgentId) {
+    match store.list_agents() {
+        Ok(agents) if !agents.is_empty() => return,
+        Ok(_) => {}
+        Err(e) => {
+            warn!("Could not list agents; skipping sidecar migration: {}", e);
+            return;
+        }
+    }
+    match store.agent_has_sessions(agent_id) {
+        Ok(false) => {
+            info!(
+                "Sidecar agent ID {} owns no sessions — not registering it (nothing to migrate)",
+                agent_id.0
+            );
+            return;
+        }
+        Ok(true) => {}
+        Err(e) => {
+            warn!(
+                "Could not check the sidecar agent's sessions; skipping sidecar migration: {}",
+                e
+            );
+            return;
+        }
+    }
+
     let migration_name = "main";
     if let Err(e) = validate_agent_name(migration_name) {
         warn!(
@@ -1162,6 +1283,67 @@ fn migrate_sidecar_agent(store: &SqliteStore, agent_id: AgentId) {
         Ok(false) => {} // agents already exist, nothing to migrate
         Err(e) => warn!("Failed to migrate sidecar agent to registry: {}", e),
     }
+}
+
+/// The default agent ID the gateway boots with.
+///
+/// Once the registry has agents it is the source of truth: its default agent,
+/// or the oldest agent if none is marked default (agents created without
+/// `is_default`, or a default removed with `alms agent delete --force`). That
+/// is the same fallback the web UI uses to pick an agent. `configured` (the
+/// sidecar's ID, or `ALMS_AGENT_ID`) is used only while the registry is
+/// empty, or if it cannot be read.
+///
+/// Before, `configured` was used on every boot, and only creating or setting
+/// a default agent moved the live ID, in memory. So after a restart
+/// `GET /settings`' `agent_id` and the global-token Telegram fallback went
+/// back to the sidecar's ID, which no agent has unless a migrated `main`
+/// holds it.
+///
+/// `configured_from_env` says `configured` came from `ALMS_AGENT_ID`. Before,
+/// that variable set the boot default even when agents existed, so when the
+/// registry picks a different agent this WARNs that the variable is ignored.
+#[instrument(skip(store))]
+fn boot_default_agent_id(
+    store: &SqliteStore,
+    configured: AgentId,
+    configured_from_env: bool,
+) -> AgentId {
+    let agents = match store.list_agents() {
+        Ok(agents) => agents,
+        Err(e) => {
+            warn!(
+                "Could not list agents; booting with the configured default agent ID {}: {}",
+                configured.0, e
+            );
+            return configured;
+        }
+    };
+    let chosen = if let Some(default) = agents.iter().find(|a| a.is_default) {
+        info!(
+            "Default agent from the registry: '{}' ({})",
+            default.name, default.id.0
+        );
+        default
+    } else if let Some(oldest) = agents.first() {
+        info!(
+            "No registered agent is marked default; using the oldest, '{}' ({}), as the \
+             default agent ID",
+            oldest.name, oldest.id.0
+        );
+        oldest
+    } else {
+        return configured;
+    };
+    if configured_from_env && chosen.id != configured {
+        warn!(
+            "ALMS_AGENT_ID is set to {}, but agents are registered, so it is ignored and the \
+             gateway boots with '{}' ({}) from the agent registry. ALMS_AGENT_ID applies only \
+             while no agent is registered.",
+            configured.0, chosen.name, chosen.id.0
+        );
+    }
+    chosen.id
 }
 
 #[cfg(test)]
@@ -1352,10 +1534,20 @@ mod tests {
         assert_eq!(persisted.lifecycle_revision(), run.lifecycle_revision());
     }
 
+    /// A store shaped like a pre-registry deployment: a session filed under
+    /// the sidecar's agent ID, and an empty agents table.
+    fn legacy_store(sidecar_id: AgentId) -> SqliteStore {
+        let store = SqliteStore::open_in_memory().unwrap();
+        store
+            .save_session(&alms_session::Session::new(sidecar_id, "web-chat-1"))
+            .unwrap();
+        store
+    }
+
     #[test]
     fn test_migrate_creates_default_agent() {
-        let store = SqliteStore::open_in_memory().unwrap();
         let agent_id = AgentId::new();
+        let store = legacy_store(agent_id);
         migrate_sidecar_agent(&store, agent_id);
 
         let agents = store.list_agents().unwrap();
@@ -1367,8 +1559,8 @@ mod tests {
 
     #[test]
     fn test_migrate_idempotent() {
-        let store = SqliteStore::open_in_memory().unwrap();
         let agent_id = AgentId::new();
+        let store = legacy_store(agent_id);
         migrate_sidecar_agent(&store, agent_id);
         migrate_sidecar_agent(&store, agent_id);
 
@@ -1376,10 +1568,30 @@ mod tests {
         assert_eq!(agents.len(), 1);
     }
 
+    /// #180: the signal is sessions filed under the *sidecar's* ID. A fresh
+    /// install's store is empty, and sessions owned by some other agent (one
+    /// deleted from the registry, say) are no reason to register the sidecar.
+    #[test]
+    fn test_migrate_skips_sidecar_that_owns_no_sessions() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let sidecar_id = AgentId::new();
+        migrate_sidecar_agent(&store, sidecar_id);
+        assert!(store.list_agents().unwrap().is_empty(), "empty store");
+
+        store
+            .save_session(&alms_session::Session::new(AgentId::new(), "web-chat-1"))
+            .unwrap();
+        migrate_sidecar_agent(&store, sidecar_id);
+        assert!(
+            store.list_agents().unwrap().is_empty(),
+            "sessions owned by another agent"
+        );
+    }
+
     #[test]
     fn test_migrate_preserves_agent_id() {
-        let store = SqliteStore::open_in_memory().unwrap();
         let agent_id = AgentId::new();
+        let store = legacy_store(agent_id);
         migrate_sidecar_agent(&store, agent_id);
 
         let loaded = store.load_agent_by_id(agent_id).unwrap();
@@ -1397,7 +1609,10 @@ mod tests {
 
     #[test]
     fn test_migrate_skips_when_agents_exist() {
-        let store = SqliteStore::open_in_memory().unwrap();
+        // The sidecar agent owns a session, so the existing agent is the
+        // only reason left to skip.
+        let sidecar_id = AgentId::new();
+        let store = legacy_store(sidecar_id);
         // Pre-populate with an agent
         let existing_id = AgentId::new();
         let existing = AgentRecord {
@@ -1408,12 +1623,398 @@ mod tests {
         store.create_agent(&existing).unwrap();
 
         // Migration with a different agent_id should be a no-op
-        let sidecar_id = AgentId::new();
         migrate_sidecar_agent(&store, sidecar_id);
 
         let agents = store.list_agents().unwrap();
         assert_eq!(agents.len(), 1);
         assert_eq!(agents[0].id, existing_id);
+    }
+
+    /// Deleting an auto-created `main` sticks. `delete_agent` takes the
+    /// agent's sessions with it, so the sidecar's ID owns none afterwards and
+    /// the next boot's migration has nothing to migrate. Gated on the file
+    /// alone, it registered `main` again.
+    #[test]
+    fn deleted_main_is_not_migrated_again() {
+        let sidecar_id = AgentId::new();
+        let store = legacy_store(sidecar_id);
+        migrate_sidecar_agent(&store, sidecar_id);
+        assert_eq!(store.list_agents().unwrap().len(), 1, "migrated");
+
+        assert!(store.delete_agent(sidecar_id).unwrap());
+        migrate_sidecar_agent(&store, sidecar_id);
+
+        let agents = store.list_agents().unwrap();
+        assert!(agents.is_empty(), "`main` came back: {agents:?}");
+    }
+
+    /// One gateway boot the way `alms gateway` does it: the configured
+    /// default agent ID resolved from the data dir's sidecar, then
+    /// `Gateway::new` on the database.
+    struct Booted {
+        gateway: Gateway,
+        /// What `resolve_default_agent_id` returned.
+        sidecar_id: AgentId,
+    }
+
+    impl Booted {
+        fn agents(&self) -> Vec<AgentRecord> {
+            self.gateway
+                .session_manager
+                .store()
+                .unwrap()
+                .list_agents()
+                .unwrap()
+        }
+    }
+
+    fn boot(data_dir: &Path, db_path: &str) -> Booted {
+        let sidecar_id = resolve_default_agent_id(data_dir);
+        let gateway = Gateway::new(GatewayConfig {
+            db_path: Some(db_path.to_string()),
+            agent_id: Some(sidecar_id),
+            ..GatewayConfig::default()
+        })
+        .unwrap();
+        Booted {
+            gateway,
+            sidecar_id,
+        }
+    }
+
+    /// [`boot`] as a server, for the HTTP handlers.
+    fn boot_server(data_dir: &Path, db_path: &str) -> crate::server::AppState {
+        crate::test_support::TestAppState::new()
+            .db_path(db_path)
+            .agent_id(resolve_default_agent_id(data_dir))
+            .build()
+    }
+
+    async fn settings_agent_id(state: &crate::server::AppState) -> String {
+        use axum::response::IntoResponse;
+        let response = crate::settings::get_settings(axum::extract::State(state.clone()))
+            .await
+            .into_response();
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let settings: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        settings["agent_id"].as_str().unwrap().to_string()
+    }
+
+    /// #180, as reported: a fresh install booted twice with nothing done in
+    /// between. Boot 1 writes the sidecar; before the fix boot 2 found it and
+    /// registered `main` as the default. The sidecar stays and keeps its ID;
+    /// only the registry is left alone, so first-run onboarding still shows.
+    #[test]
+    fn fresh_install_booted_twice_registers_no_agent() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("alms.db");
+        let db_path = db_path.to_str().unwrap();
+
+        let first = boot(dir.path(), db_path);
+        assert!(first.agents().is_empty(), "boot 1 registered an agent");
+        let second = boot(dir.path(), db_path);
+        let agents = second.agents();
+        assert!(agents.is_empty(), "boot 2 registered {agents:?}");
+
+        assert_eq!(
+            first.sidecar_id, second.sidecar_id,
+            "the sidecar's ID is stable across boots"
+        );
+        assert_eq!(
+            second.gateway.agent_id(),
+            second.sidecar_id,
+            "with no agent registered, the sidecar's ID is the default"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("agent_id")).unwrap(),
+            first.sidecar_id.0.to_string(),
+            "the sidecar is kept, not rewritten or removed"
+        );
+    }
+
+    /// The upgrade the migration exists for: a sidecar, a session filed
+    /// under its ID and an empty registry still get `main`, the default,
+    /// with the sidecar's ID, so the session stays attached to an agent.
+    /// The database is created with the current schema, not an actual
+    /// pre-registry one; what this pins is the state the migration checks.
+    #[test]
+    fn pre_registry_deployment_still_migrates_its_sidecar_agent() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("alms.db");
+        let db_path = db_path.to_str().unwrap();
+        let legacy_id = AgentId::new();
+        std::fs::write(dir.path().join("agent_id"), legacy_id.0.to_string()).unwrap();
+        let session = alms_session::Session::new(legacy_id, "web-chat-1");
+        SqliteStore::open(db_path)
+            .unwrap()
+            .save_session(&session)
+            .unwrap();
+
+        let booted = boot(dir.path(), db_path);
+        let agents = booted.agents();
+
+        assert_eq!(booted.sidecar_id, legacy_id);
+        assert_eq!(agents.len(), 1, "got {agents:?}");
+        assert_eq!(agents[0].id, legacy_id);
+        assert_eq!(agents[0].name, "main");
+        assert!(agents[0].is_default);
+        assert_eq!(
+            booted.gateway.agent_id(),
+            legacy_id,
+            "`main` is the default"
+        );
+        let sessions = SqliteStore::open(db_path)
+            .unwrap()
+            .load_sessions_by_agent(legacy_id)
+            .unwrap();
+        assert_eq!(
+            sessions.len(),
+            1,
+            "the legacy session is the migrated agent's"
+        );
+    }
+
+    /// The scenario from the #186 review: a fresh install restarted before
+    /// its first agent, then onboarding's `POST /agents` with
+    /// `is_default: true`, then a restart. The registry names `atlas` the
+    /// default, so the gateway boots with atlas's ID. Before, `GET /settings`
+    /// went back to the sidecar's ID after the restart, and no agent has it.
+    #[tokio::test]
+    async fn restart_after_onboarding_boots_with_the_registry_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("alms.db");
+        let db_path = db_path.to_str().unwrap();
+        let sidecar_id = boot(dir.path(), db_path).sidecar_id;
+        assert!(boot(dir.path(), db_path).agents().is_empty());
+
+        let state = boot_server(dir.path(), db_path);
+        assert_eq!(
+            settings_agent_id(&state).await,
+            sidecar_id.0.to_string(),
+            "no agent yet"
+        );
+        let onboarding: alms_core::CreateAgentRequest =
+            serde_json::from_value(serde_json::json!({ "name": "atlas", "is_default": true }))
+                .unwrap();
+        let (status, _) = crate::agents::create_agent(
+            axum::extract::State(state.clone()),
+            axum::Json(onboarding),
+        )
+        .await
+        .expect("POST /agents");
+        assert_eq!(status, axum::http::StatusCode::CREATED);
+        let atlas = state
+            .session_manager
+            .store()
+            .unwrap()
+            .load_agent_by_name("atlas")
+            .unwrap()
+            .unwrap();
+        assert!(atlas.is_default);
+        drop(state);
+
+        let state = boot_server(dir.path(), db_path);
+        assert_eq!(
+            settings_agent_id(&state).await,
+            atlas.id.0.to_string(),
+            "after the restart"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("agent_id")).unwrap(),
+            sidecar_id.0.to_string(),
+            "the sidecar is left alone"
+        );
+    }
+
+    /// The global-token Telegram fallback follows the default the gateway
+    /// boots with. While no agent is registered it is the sidecar's ID, named
+    /// `default`. Once `atlas` is the default, the next boot binds it to
+    /// atlas under atlas's name, so its sessions land under an agent that
+    /// exists rather than under the sidecar's ID. Neither binding WARNs.
+    #[test]
+    fn global_telegram_fallback_follows_the_registry_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("alms.db");
+        let db_path = db_path.to_str().unwrap();
+
+        let first = boot(dir.path(), db_path);
+        let (target, captured) = global_telegram_target_logged(&first.gateway);
+        assert_eq!(target, (first.sidecar_id, "default".to_string()));
+        assert!(captured.is_empty(), "empty registry: {captured}");
+
+        let store = SqliteStore::open(db_path).unwrap();
+        let atlas = AgentRecord::for_test("atlas");
+        store.create_agent(&atlas).unwrap();
+        store.set_default_agent(atlas.id).unwrap();
+
+        let second = boot(dir.path(), db_path);
+        let (target, captured) = global_telegram_target_logged(&second.gateway);
+        assert_eq!(target, (atlas.id, "atlas".to_string()));
+        assert!(captured.is_empty(), "atlas is marked default: {captured}");
+    }
+
+    /// [`Gateway::global_telegram_target`], with the WARNs it emits.
+    fn global_telegram_target_logged(
+        gateway: &Gateway,
+    ) -> ((AgentId, String), alms_test_support::CapturedEvents) {
+        let mut target = None;
+        let captured = capture_events(tracing::Level::WARN, || {
+            target = Some(gateway.global_telegram_target());
+        });
+        (target.unwrap(), captured)
+    }
+
+    /// The #186 re-review's case: agents created without `--default`, so
+    /// none is marked default, and the global token binds to the oldest one,
+    /// `beta`, which nobody picked for the bot. The binding stays (so the
+    /// bot's sessions land under an agent that exists), but it WARNs once,
+    /// naming the agent and the command that picks another.
+    #[test]
+    fn global_telegram_fallback_warns_when_no_agent_is_marked_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("alms.db");
+        let db_path = db_path.to_str().unwrap();
+        let store = SqliteStore::open(db_path).unwrap();
+        let created = chrono::Utc::now() - chrono::Duration::hours(1);
+        let beta = AgentRecord {
+            created_at: created,
+            last_active: created,
+            ..AgentRecord::for_test("beta")
+        };
+        store.create_agent(&beta).unwrap();
+        store.create_agent(&AgentRecord::for_test("gamma")).unwrap();
+
+        let booted = boot(dir.path(), db_path);
+        let (target, captured) = global_telegram_target_logged(&booted.gateway);
+
+        assert_eq!(target, (beta.id, "beta".to_string()));
+        assert_eq!(captured.len(), 1, "one WARN; got:\n{captured}");
+        let warn = &captured[0];
+        assert_eq!(warn.field("agent_name"), Some("beta"), "{warn}");
+        let beta_id = beta.id.to_string();
+        assert_eq!(warn.field("agent_id"), Some(beta_id.as_str()), "{warn}");
+        assert!(
+            warn.message.contains("No agent is marked default")
+                && warn.message.contains("'beta', the oldest agent")
+                && warn.message.contains("`alms agent set-default <name>`"),
+            "{warn}"
+        );
+    }
+
+    /// Agents registered but none marked default (created without
+    /// `is_default`, or the default deleted with `--force`): the gateway
+    /// boots with the oldest agent, the one the web UI falls back to, rather
+    /// than the configured ID, which no agent has. A marked default wins,
+    /// and the configured ID is used only while the registry is empty.
+    #[test]
+    fn boot_default_agent_id_prefers_the_registry() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let configured = AgentId::new();
+        assert_eq!(
+            boot_default_agent_id(&store, configured, false),
+            configured,
+            "empty registry"
+        );
+
+        let created = chrono::Utc::now() - chrono::Duration::hours(1);
+        let oldest = AgentRecord {
+            created_at: created,
+            last_active: created,
+            ..AgentRecord::for_test("oldest")
+        };
+        let newer = AgentRecord::for_test("newer");
+        store.create_agent(&newer).unwrap();
+        store.create_agent(&oldest).unwrap();
+        assert_eq!(
+            boot_default_agent_id(&store, configured, false),
+            oldest.id,
+            "no agent marked default"
+        );
+
+        store.set_default_agent(newer.id).unwrap();
+        assert_eq!(boot_default_agent_id(&store, configured, false), newer.id);
+    }
+
+    /// [`boot_default_agent_id`], with the WARNs it emits.
+    fn boot_default_agent_id_logged(
+        store: &SqliteStore,
+        configured: AgentId,
+        configured_from_env: bool,
+    ) -> (AgentId, alms_test_support::CapturedEvents) {
+        let mut chosen = None;
+        let captured = capture_events(tracing::Level::WARN, || {
+            chosen = Some(boot_default_agent_id(
+                store,
+                configured,
+                configured_from_env,
+            ));
+        });
+        (chosen.unwrap(), captured)
+    }
+
+    /// `ALMS_AGENT_ID` used to set the boot default even with agents
+    /// registered. Now the registry wins, and the boot WARNs once that the
+    /// variable was ignored. It stays quiet while the registry is empty (the
+    /// variable is used), when the variable names the registry's pick
+    /// anyway, and when the configured ID is the sidecar's.
+    #[test]
+    fn boot_default_agent_id_warns_when_the_registry_overrides_alms_agent_id() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let env_id = AgentId::new();
+
+        let (chosen, captured) = boot_default_agent_id_logged(&store, env_id, true);
+        assert_eq!(chosen, env_id, "empty registry");
+        assert!(captured.is_empty(), "empty registry: {captured}");
+
+        let atlas = AgentRecord::for_test("atlas");
+        store.create_agent(&atlas).unwrap();
+        store.set_default_agent(atlas.id).unwrap();
+
+        let (chosen, captured) = boot_default_agent_id_logged(&store, env_id, true);
+        assert_eq!(chosen, atlas.id, "the registry wins");
+        assert_eq!(captured.len(), 1, "one WARN; got:\n{captured}");
+        let message = &captured[0].message;
+        assert!(
+            message.contains(&format!("ALMS_AGENT_ID is set to {env_id}"))
+                && message.contains(&format!("'atlas' ({})", atlas.id))
+                && message.contains("ALMS_AGENT_ID applies only while no agent is registered"),
+            "{message}"
+        );
+
+        let (chosen, captured) = boot_default_agent_id_logged(&store, atlas.id, true);
+        assert_eq!(chosen, atlas.id);
+        assert!(captured.is_empty(), "it names atlas: {captured}");
+
+        let (chosen, captured) = boot_default_agent_id_logged(&store, env_id, false);
+        assert_eq!(chosen, atlas.id);
+        assert!(captured.is_empty(), "the sidecar's ID: {captured}");
+    }
+
+    /// If the registry can't be read, the boot isn't blocked: the gateway
+    /// boots with the configured ID, here even though the registry had a
+    /// default, and says so at WARN.
+    #[test]
+    fn boot_default_agent_id_falls_back_to_the_configured_id_when_the_registry_is_unreadable() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let atlas = AgentRecord::for_test("atlas");
+        store.create_agent(&atlas).unwrap();
+        store.set_default_agent(atlas.id).unwrap();
+        store.drop_agents_table_for_test().unwrap();
+        let configured = AgentId::new();
+
+        let (chosen, captured) = boot_default_agent_id_logged(&store, configured, true);
+
+        assert_eq!(chosen, configured);
+        assert_eq!(captured.len(), 1, "one WARN; got:\n{captured}");
+        let message = &captured[0].message;
+        assert!(
+            message.contains(&format!(
+                "Could not list agents; booting with the configured default agent ID {configured}"
+            )),
+            "{message}"
+        );
     }
 
     // ── #947: WARN-log assertions for [security].allow_full_os_access ──

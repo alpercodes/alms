@@ -513,7 +513,7 @@ fn evaluate_pre_flight_token_budget(
 /// queued / non-HTTP path runs the same `evaluate_pre_flight_token_budget`
 /// check inline inside `execute_run` (peer-DM, scheduler, notification,
 /// subagent-completion runs, and HTTP runs whose effective budget was
-/// mutated by `PATCH /settings` or `PATCH /agents` while they sat in the
+/// mutated by `PATCH /settings` or `PUT /agents` while they sat in the
 /// queue) and emits a `run_error` SSE event with the same
 /// `INVALID_TOKEN_BUDGET_FOR_PROVIDER` code instead of a synchronous 400,
 /// then marks the run `Failed` and broadcasts queue advance — same shape
@@ -1559,7 +1559,7 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
     //
     // Per-run config overrides were removed in the #941 pivot — the run
     // config is determined entirely by `resolve_agent_config` (per-agent
-    // > server default). Operators change agent config via `PATCH
+    // > server default). Operators change agent config via `PUT
     // /agents/{id}` (or server defaults via `PATCH /settings`) before
     // starting the run; `POST /runs` carries no config knobs. Removing
     // the per-run path closes the leak family at #833 / #860 / #863 /
@@ -1695,7 +1695,7 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
     // DMs, scheduler triggers, notification runs, subagent completion runs)
     // skip that path entirely and land here. We also re-validate HTTP runs
     // that were created earlier and sat in the queue while `PATCH /settings`
-    // or `PATCH /agents/{id}` mutated their effective budget — the
+    // or `PUT /agents/{id}` mutated their effective budget — the
     // create-time pre-flight is no longer authoritative by the time
     // `execute_run` resolves the live snapshot, and without this second
     // check we would still reach the provider with an over-budget request
