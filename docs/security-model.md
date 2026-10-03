@@ -736,31 +736,50 @@ worse than "application-layer instead of kernel-level":
   not path controls. Defeating the classifier is not what gets an agent
   out of the project root; nothing is holding it in.
 
-**Landlock degrades open on an unsupported kernel.**
+**On a kernel without Landlock, a sandboxed `shell` refuses to run.**
 `apply_landlock_sandbox` (`crates/alms-sandbox/src/shell/exec.rs`) builds
-its ruleset inside `pre_exec`. If the first step,
-`Ruleset::default().handle_access(...)`, fails — an older kernel, or a
-container/seccomp profile that blocks the Landlock syscalls — it prints
-`[alms] Landlock not supported by kernel, running unsandboxed` and
-returns `Ok(())`, and the command runs with no filesystem restriction.
-Every *later* failure (ruleset creation, adding a rule, `restrict_self`,
-a `NotEnforced` status) is a hard error that refuses to run the command,
-so the degrade-open window is exactly "this kernel cannot do Landlock at
-all". Two consequences an operator needs:
+its ruleset inside `pre_exec` with the `landlock` crate (0.4.4 in
+`Cargo.lock`), at the crate's default `BestEffort` compatibility level.
+When the kernel has no Landlock (older than 5.13, built without it, not
+enabled at boot, or behind a seccomp filter that makes the Landlock
+syscalls fail), the crate reports no error. `handle_access`, `create` and
+`add_rule` succeed on a ruleset that never reaches the kernel, and
+`restrict_self` returns `Ok` with the status `NotEnforced`. ALMS treats
+`NotEnforced` as a hard error, as it does every other failure (creating
+the ruleset, opening the sandbox root, adding a rule, `restrict_self`), so
+the child exits before `exec` and the command does not run. The branch
+that prints `[alms] Landlock not supported by kernel, running unsandboxed`
+is taken only if `handle_access` returns an error. At `BestEffort` the
+crate returns one only for an empty or unknown set of access rights, and
+ALMS passes neither (`AccessFs::from_all(ABI::V5)`). This is established
+from the code: no test exercises it, and it has not been run on a kernel
+without Landlock. Three consequences an operator needs:
 
-- **The 5.13+ floor is load-bearing.** On an older kernel, or in a
-  container that blocks the syscall, a Linux deployment has
-  Windows-grade shell containment — not a degraded version of the Linux
-  one.
-- **The notice is an `eprintln!` to the child's stderr, not a
-  `tracing::warn!`.** It does not reach structured logs, so a log
-  scanner will never see it. Verify Landlock by hand on an unfamiliar
-  kernel or inside a container.
+- **Without Landlock, a sandboxed `shell` is unusable, not open.** Every
+  call fails.
+- **The failure does not say why.** The `[alms] Landlock: …` line goes to
+  the child's stderr before `exec`, and nothing reads it once the spawn
+  has failed. `std` passes only an errno back to the parent, and this
+  error has none, so the tool call fails with
+  `Failed to spawn command: Invalid argument (os error 22)`. The reason
+  reaches neither the tool result nor the structured logs. If every
+  `shell` call on a Linux host fails that way, check that `landlock` is
+  listed in `/sys/kernel/security/lsm`, and inside a container that its
+  seccomp profile allows the Landlock syscalls.
+- **What runs without Landlock does not depend on the kernel.** A `shell`
+  that is not sandboxed (`[tools].shell_policy = "unrestricted"`, or an
+  agent in
+  [`allow_full_os_access`](#operator-escape-hatch-allow_full_os_access))
+  gets no Landlock ruleset on any kernel, so it has the daemon OS user's
+  reach everywhere. The `fs_*` tools check paths in the daemon and do not
+  use Landlock, so they enforce the project root the same way on every
+  kernel.
 
-For real shell isolation on Windows / macOS — and on Linux below 5.13 —
-run the daemon as a **low-privilege OS user with filesystem ACLs** that
-limit it to the project root. That is currently the only containment
-available for `shell` on those platforms. See
+For real shell isolation on Windows / macOS — and for a `shell` that is
+not sandboxed, the only kind that runs on a Linux kernel without
+Landlock — run the daemon as a **low-privilege OS user with filesystem
+ACLs** that limit it to the project root. That is currently the only
+containment available for `shell` in those cases. See
 [§ 4.5 Isolation roadmap](#45-isolation-roadmap) for the longer-term
 plan (`bubblewrap`/`nsjail` on Linux, OS-user-based isolation as the
 universal answer).
@@ -870,7 +889,7 @@ edit the TOML and restart the daemon. The same model is applied to
 <a id="45-isolation-roadmap"></a>
 ### 4.5 Isolation roadmap
 
-**Current:** `bash -c` command strings + `env_clear()` + best-effort command denylist + project-root path prefix enforcement for fs tools (the [single sandbox root](#filesystem-sandboxing) pinned by `with_project_root`) + persistent cwd restriction for shell (validated against the same root on each invocation) + **Landlock filesystem sandboxing on Linux 5.13+** (fail-closed: if Landlock is supported but enforcement fails, the command is aborted; only gracefully degrades on kernels without Landlock support).
+**Current:** `bash -c` command strings + `env_clear()` + best-effort command denylist + project-root path prefix enforcement for fs tools (the [single sandbox root](#filesystem-sandboxing) pinned by `with_project_root`) + persistent cwd restriction for shell (validated against the same root on each invocation) + **Landlock filesystem sandboxing on Linux 5.13+** (fail-closed: if the ruleset is not enforced, including on a kernel without Landlock support, the command is aborted; see [§ 4.4](#shell-sandboxing-platform-asymmetry)).
 
 **Landlock read set — `/etc/passwd` excluded (#743 / #734 item 2):** The Linux Landlock policy grants the child process read access to a small allow-list of system paths (`/usr`, `/bin`, `/lib`, `/lib64`, the dynamic linker config under `/etc/ld.so.*`, `/etc/nsswitch.conf`, `/etc/resolv.conf`, `/etc/localtime`, `/dev/{null,urandom,zero}`, `/proc/self`). `/etc/passwd` is intentionally **not** in the read set: granting it would let a sandboxed agent enumerate every local user on a shared host, which is a valuable reconnaissance step for an attacker who has subverted the agent. The trade-off is that bash's `~user` tilde expansion to *other* users' homes no longer resolves (bash needs `getpwnam` to translate the name to a path), and `ls -l`/`whoami` may print numeric UIDs instead of names. `~/path` for the **current** user still works because bash uses the `$HOME` env var, which doesn't read `/etc/passwd`. Agents that legitimately need user enumeration (rare) can be listed under `[security].allow_full_os_access` (the operator escape hatch in § 4.4): an unrestricted shell skips the Landlock ruleset along with the rest of the sandbox. There is no `tools.shell_unrestricted` knob.
 
@@ -1061,10 +1080,10 @@ Default posture recommendations:
 **What it does not protect.** An HTTP client cannot set `is_system_triggered` (`create_run` never does), but a peer agent causes it with an ordinary DM, and the DM's text becomes the run's input. `send_message` resolves any registered agent by name. The only sender check is that an agent cannot message itself; the depth cap of 20 ends one conversation but does not limit how many conversations can start. `list_agents` is auto-approved, so every name is discoverable. Any agent that can run `send_message` can therefore have any `guarded` agent run tools without approval:
 
 - A `full_control` or `autonomous` sender, or an agent already in a promoted run, needs no approval to send. A `guarded` agent in a run a human started needs one, and approving that `send_message` lets every DM turn of the conversation, on both sides, run unapproved.
-- A promoted run can `send_message` onward, `invoke_agent` a registered agent in the background, or create a job through `shell` — the call a Guarded user run sends to approval — all without approval. (`ALMS_AUTH_TOKEN` stops `alms job create`, which goes through the API; `shell` children do not inherit the token. It does not stop a job written straight into the database, which the gateway schedules at its next start, wherever `shell` can reach the data directory: see the last bullet below.) A job's runs are promoted in turn, so a DM can leave behind work that keeps running unapproved.
+- A promoted run can `send_message` onward, `invoke_agent` a registered agent in the background, or create a job through `shell` — the call a Guarded user run sends to approval — all without approval. (`ALMS_AUTH_TOKEN` stops `alms job create`, which goes through the API, only while an agent cannot read the token. `shell` children do not inherit it, but where `shell` has no filesystem boundary they can read it from the daemon's environment. The token does not stop a job written straight into the database either: the gateway schedules that at its next start, wherever `shell` can reach the data directory (see the last bullet below).) A job's runs are promoted in turn, so a DM can leave behind work that keeps running unapproved.
 - Anything a sender has ingested — an `http_get` of an arbitrary URL, a file or repository it did not write — can reach a `guarded` agent's tools this way (§ 3.3).
-- On macOS and Windows, and on Linux below 5.13, a promoted run's `shell` has no filesystem boundary ([§ 4.4](#shell-sandboxing-platform-asymmetry)): it has the daemon OS user's reach.
-- A promoted run can turn approval off for the runs a human starts, too. The gateway points `shell` at the live database through `ALMS_DATA_DIR`, and `alms agent config <name> --posture full_control` writes the agent registry in SQLite directly, with no API call and so no `ALMS_AUTH_TOKEN` check. Wherever `shell` can reach the data directory, one unapproved `shell` call can make any agent `full_control` until someone sets it back. It can on macOS, Windows and Linux below 5.13 wherever the data directory lives, and on Linux 5.13+ whenever the data directory is inside the shell's sandbox root, as the default `./.alms` is inside the default project root. So "`guarded` governs the runs a human starts" holds only until a promoted run does this.
+- On macOS and Windows, a promoted run's `shell` has no filesystem boundary ([§ 4.4](#shell-sandboxing-platform-asymmetry)): it has the daemon OS user's reach. So does a `shell` that is not sandboxed on Linux. On a Linux kernel without Landlock, a sandboxed `shell` refuses every command.
+- A promoted run can turn approval off for the runs a human starts, too. The gateway points `shell` at the live database through `ALMS_DATA_DIR`, and `alms agent config <name> --posture full_control` writes the agent registry in SQLite directly, with no API call and so no `ALMS_AUTH_TOKEN` check. Wherever `shell` can reach the data directory, one unapproved `shell` call can make any agent `full_control` until someone sets it back. It can on macOS and Windows, and from a `shell` that is not sandboxed, wherever the data directory lives, and on Linux with Landlock whenever the data directory is inside the shell's sandbox root, as the default `./.alms` is inside the default project root. So "`guarded` governs the runs a human starts" holds only until a promoted run does this.
 
 **What an operator can do today.** Within one gateway, treat every agent as able to run every other agent's tools without approval.
 
