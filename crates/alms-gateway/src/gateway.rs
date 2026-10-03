@@ -745,16 +745,19 @@ impl Gateway {
                 Some((agent_id, agent_name, telegram, msg)) = merged_rx.recv() => {
                     // Route the message to the owning agent (not the default).
                     //
-                    // NOTE: `self.config.agent_config` is a boot-time snapshot
-                    // — `Gateway` holds `GatewayConfig` by value and never sees
-                    // PATCH /settings mutations. HTTP-triggered runs (and the
-                    // Coordinator) share the live `Arc<RwLock<AgentConfig>>` on
-                    // `AppState`, so this is a known asymmetry: PATCH /settings
-                    // updates to context / session / tools / llm provider
-                    // defaults take effect for HTTP runs immediately and for
-                    // Telegram runs only after a daemon restart. This is
-                    // pre-existing behaviour for the context / session / tools
-                    // sections and is documented in `docs/api.md` § 10.2.
+                    // NOTE: `self.config.agent_config` and `self.llm` are
+                    // built from `AlmsConfig` (alms.toml + env) at boot and
+                    // never change — `Gateway` holds `GatewayConfig` by value,
+                    // and neither PATCH /settings nor `settings.json` reaches
+                    // it (`AppState::new` applies `settings.json` only to its
+                    // own clones). Every other run path — `execute_run` (HTTP,
+                    // DM, notification and job runs) and Coordinator subagents
+                    // — shares the live `Arc<RwLock<AgentConfig>>` and
+                    // `Arc<RwLock<LlmClient>>` on `AppState`. So PATCH /settings
+                    // changes to context / tools / llm defaults and to the
+                    // server-default model / provider pair reach those runs
+                    // immediately and Telegram runs never, not even after a
+                    // daemon restart. Documented in `docs/api.md` § 10.2.
                     let resolved = {
                         let secrets_guard = self.secrets.read();
                         match crate::configuration::resolve_agent_config(

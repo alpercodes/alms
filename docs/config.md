@@ -18,8 +18,8 @@ The Settings modal in the web UI edits the runtime-mutable slice of this config 
 
 Two behaviours apply to **every** section of the modal:
 
-- **Propagation.** An accepted PATCH takes effect on the next HTTP-triggered run, with no restart. Telegram-triggered runs read a boot-time snapshot and keep using it until the daemon restarts.
-- **Persistence.** The whole mutable surface is written to `{data_dir}/settings.json`, which wins over `alms.toml` on the next boot. To go back to a TOML- or env-driven value, edit or delete `settings.json` before restarting.
+- **Propagation.** An accepted PATCH takes effect, with no restart, on every run that starts afterwards except a Telegram-triggered one; [`docs/api.md` § 10.2](api.md#102-update-server-settings) lists the run paths and the values they read. Telegram-triggered runs never pick up a PATCH or `settings.json`, not even after a restart: they read the `alms.toml` and environment values the daemon booted with.
+- **Persistence.** The whole mutable surface is written to `{data_dir}/settings.json`, which wins over `alms.toml` on the next boot for every run except a Telegram-triggered one. To go back to a TOML- or env-driven value, edit or delete `settings.json` before restarting.
 
 See [`docs/api.md`](api.md) § 10.2 for the wire shapes, validation rules and error envelopes.
 

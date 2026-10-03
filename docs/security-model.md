@@ -646,8 +646,9 @@ contract. This keeps the list off the API, and that is all it does:
 
 - It does not stop an API caller from widening `shell`'s reach.
   `tools.shell_policy` is PATCH-mutable, and `"unrestricted"` takes the
-  cwd check and the Landlock ruleset off every agent's `shell` (the
-  `fs_*` tools keep the project root). Without `ALMS_AUTH_TOKEN` that
+  cwd check and the Landlock ruleset off the `shell` of every run that
+  starts afterwards, except Telegram-triggered ones (the `fs_*` tools
+  keep the project root). Without `ALMS_AUTH_TOKEN` that
   caller can be any local process, a sandboxed `shell` included.
 - It does not keep the list away from agents. Nothing write-protects
   `alms.toml`, and the gateway reads it from its working directory, the
@@ -1113,7 +1114,7 @@ Default posture recommendations:
 - Anything a sender has ingested — an `http_get` of an arbitrary URL, a file or repository it did not write — can reach a `guarded` agent's tools this way (§ 3.3).
 - On macOS and Windows, a promoted run's `shell` has no filesystem boundary ([§ 4.4](#shell-sandboxing-platform-asymmetry)): it has the daemon OS user's reach. So does a `shell` that is not sandboxed on Linux. On a Linux kernel without Landlock, a sandboxed `shell` refuses every command.
 - A promoted run can turn approval off for the runs a human starts, too. The gateway points `shell` at the live database through `ALMS_DATA_DIR`, and `alms agent config <name> --posture full_control` writes the agent registry in SQLite directly, with no API call and so no `ALMS_AUTH_TOKEN` check. Wherever `shell` can reach the data directory, one unapproved `shell` call can make any agent `full_control` until someone sets it back. It can on macOS and Windows, and from a `shell` that is not sandboxed, wherever the data directory lives, and on Linux with Landlock whenever the data directory is inside the shell's sandbox root, as the default `./.alms` is inside the default project root. So "`guarded` governs the runs a human starts" holds only until a promoted run does this.
-- The same reach turns the `shell` sandbox off for every agent. The gateway applies `{data_dir}/settings.json` at startup, including `tools.shell_policy`, and reads `alms.toml` from its working directory, the default project root. Nothing write-protects either file. Wherever `shell` or `fs_write` can reach either, one unapproved call can set `shell_policy = "unrestricted"` (in `settings.json`, or in `alms.toml` where `settings.json` does not override it), or add an agent to `[security].allow_full_os_access` (in `alms.toml`), from the next start. Without `ALMS_AUTH_TOKEN`, `PATCH /settings` changes `shell_policy` without a restart ([`docs/api.md` § 10.2](api.md#102-update-server-settings) says which runs pick it up): Landlock in ALMS restricts the filesystem, not the network, so a sandboxed `shell` can reach the gateway on loopback. This is established from the code; it has not been run end to end.
+- The same reach turns the `shell` sandbox off for every agent. The gateway applies `{data_dir}/settings.json` at startup, including `tools.shell_policy`, and reads `alms.toml` from its working directory, the default project root. Nothing write-protects either file. Wherever `shell` or `fs_write` can reach either, one unapproved call can set `shell_policy = "unrestricted"`, or add an agent to `[security].allow_full_os_access` (in `alms.toml`), from the next start. `settings.json` outranks `alms.toml` and `ALMS_SHELL_POLICY` for every run except a Telegram-triggered one, which never reads `settings.json`. Without `ALMS_AUTH_TOKEN`, `PATCH /settings` changes `shell_policy` for every run that starts afterwards except Telegram-triggered ones: Landlock in ALMS restricts the filesystem, not the network, so a sandboxed `shell` can reach the gateway on loopback. This is established from the code; it has not been run end to end.
 
 **What an operator can do today.** Within one gateway, treat every agent as able to run every other agent's tools without approval.
 
