@@ -264,10 +264,10 @@ impl AppState {
     /// switch: `SecretsStore` first, then the provider entry's
     /// `api_key_env` / `api_key`. **That choice of call is load-bearing
     /// and pinned here, at the call site.** `with_provider` would compile,
-    /// read almost identically, and hand `apply_provider` a `|_| None`
-    /// resolver — which on a provider *change* takes the "clearing stale
-    /// key" branch and leaves the shared client with an empty API key, so
-    /// every subsequent default-agent run 401s with nothing tying the
+    /// read almost identically, and call `apply_provider` with no secrets
+    /// store (`None`) — which on a provider *change* takes the "clearing
+    /// stale key" branch and leaves the shared client with an empty API
+    /// key, so every subsequent default-agent run 401s with nothing tying the
     /// failure back to the PATCH. That bug shipped once already on the
     /// sibling boot path (#1081). A test of `with_provider_and_secrets`
     /// cannot catch it — the mutation is here, not in the callee — so

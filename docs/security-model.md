@@ -801,10 +801,13 @@ operator needs:
   with the error in its `error` field). Before v0.2.4 this case read
   `Invalid argument (os error 22)`. The closure's other failures (a
   sandbox root the child cannot open, a rule that cannot be added,
-  creating the ruleset or `restrict_self` failing) return an error that
-  carries no errno, which `std` reports as `Invalid argument (os error 22)`;
-  which of them it was reaches neither the tool result nor the structured
-  logs. If every `shell` call on a Linux host fails with
+  creating the ruleset or `restrict_self` failing) report the errno of the
+  system call that failed: a sandbox root that does not exist reads
+  `No such file or directory (os error 2)`. A failure the `landlock` crate
+  catches before making any system call has no errno and reads
+  `Invalid argument (os error 22)`. Only the errno reaches the tool result
+  and the structured logs; which step failed does not. If every `shell`
+  call on a Linux host fails with
   `Operation not supported (os error 95)`, check that `landlock` is listed
   in `/sys/kernel/security/lsm`, and inside a container that its seccomp
   profile allows the Landlock syscalls.

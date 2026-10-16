@@ -89,19 +89,24 @@ Each item below changes behaviour for a deployment that has not set the knob exp
 
 ### Security
 
-- **Removing an API key now takes effect on the next run.** `DELETE /auth/keys/{provider}`
-  (which the Settings modal's remove button and `alms auth remove` against a running
-  gateway both call) took the key out of the secrets store, but runs went on sending it
-  until a restart. The gateway builds its LLM client with the store's key at boot, and
-  again when `PATCH /settings` changes the server-default model or provider. Each run
-  re-resolved the key from the store but kept the client's key when the store had none.
-  That covered every run on the server-default provider: `POST /runs`, DM, notification,
-  job and subagent runs, and Telegram, plus per-agent and summary overrides that name the
-  same provider. Each run now takes the key from the store, then from the provider entry's
-  `api_key_env` / `api_key`, and sends none if neither has one. **After upgrading**, a
-  provider whose stored key was removed while the gateway kept running authenticates with
-  the entry's key on its next run, or fails with an authentication error if the entry has
-  none, until a key is set again.
+- **Removing an LLM provider's API key now takes effect on the next run.**
+  `DELETE /auth/keys/{provider}` (which the Settings modal's remove button and
+  `alms auth remove` against a running gateway both call) took the key out of the secrets
+  store, but runs went on sending it until a restart. The gateway builds its LLM client
+  with the store's key at boot, and again when `PATCH /settings` changes the
+  server-default model or provider. Each run re-resolved the key from the store but kept
+  the client's key when the store had none. That covered every run on the server-default
+  provider: `POST /runs`, DM, notification, job and subagent runs, and Telegram, plus
+  per-agent and summary overrides that name the same provider. Each run now takes the key
+  from the store, then from the provider entry's `api_key_env` / `api_key`, and sends none
+  if neither has one. This applies to the LLM provider keys. The `telegram` bot token is
+  read once, when the gateway starts its Telegram channel, so setting or removing it takes
+  effect at the next restart. **After upgrading**, removing a stored key from a running
+  gateway switches that provider to the entry's `api_key_env` / `api_key` from its next
+  run, or to no key (the provider then rejects the request), until a key is set again. A
+  run already in progress keeps the key it started with for the rest of its turns and its
+  post-run summary, as does a background subagent already running. Cancel them to stop
+  sooner, and revoke a leaked key at the provider.
 
 ### Multi-agent and DM
 
@@ -214,7 +219,10 @@ Each item below changes behaviour for a deployment that has not set the knob exp
   `Operation not supported (os error 95)` instead of `Invalid argument (os error 22)`, so
   the error points at the missing Landlock. Update any alert or grep keyed on
   `os error 22` for this case. The sandbox's other setup failures (a sandbox root the child
-  cannot open, a rule that cannot be added) still read `Invalid argument (os error 22)`.
+  cannot open, a rule that cannot be added) now report the errno of the system call that
+  failed, such as `No such file or directory (os error 2)` for a sandbox root that does not
+  exist; only a failure with no system call behind it still reads
+  `Invalid argument (os error 22)`.
   The child also no longer writes a line to stderr before it exits. Nothing read that line,
   and the write took std's process-wide stderr lock after `fork`: had another thread held
   that lock at that moment (the daemon logs through stderr), the child, and the `spawn()`
@@ -233,7 +241,8 @@ Each item below changes behaviour for a deployment that has not set the knob exp
   is rooted, and an empty value lifts no restriction; a non-empty value that cannot be
   resolved makes runs fail. That run error no longer calls `sandbox_root = ""` a way "to
   explicitly opt out of sandboxing"; it now says to fix the path or set
-  `sandbox_root = ""`, and that gateway runs are rooted at the project root either way.
+  `sandbox_root = ""`, and that in gateway runs `sandbox_root` never moves the filesystem
+  boundary, empty or not.
 
 ### LLM errors
 
@@ -270,7 +279,10 @@ Each item below changes behaviour for a deployment that has not set the knob exp
   then *rejects* the change (a missing `ALMS_AUTH_TOKEN`, say) is now an error rather
   than a silent fall back to the file. `--json` output gains a `target` field
   (`"gateway"` or `"secrets_file"`); `alms auth list` is unchanged and still reads the
-  file.
+  file. The `telegram` bot token is the exception: the gateway reads it once, when it
+  starts its Telegram channel, so a `telegram` change sent to a running gateway is stored
+  but takes effect at its next restart. Both commands now say so for `telegram` instead of
+  "no restart needed".
 
 ### Frontend
 

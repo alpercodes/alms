@@ -18,8 +18,10 @@
 //!   (pre-#866 behaviour, byte-identical wire shape).
 //! - `summary_provider = Some(p)` → re-target the cloned client at `p` via
 //!   `with_provider_and_secrets` (or `with_provider` when no secrets are
-//!   available, preserving the existing key — this matches the coordinator's
-//!   pre-extraction branch).
+//!   available — this matches the coordinator's pre-extraction branch).
+//!   `with_provider` keeps the existing key only when `p` is the agent's own
+//!   provider; on a switch, which is what a `summary_provider` usually is,
+//!   it clears the key.
 //! - If `summary_model = Some(m)`, apply it last so the explicit override
 //!   wins regardless of any `[llm.providers.<p>].model` field.
 //! - **#871 leak guard**: if `summary_model = None` AND `apply_provider`
@@ -51,9 +53,10 @@ use tracing::warn;
 /// - `Some(s)` — re-target via `with_provider_and_secrets(provider, s)` so the
 ///   API key is re-resolved from the secrets store (with `[llm.providers.<p>]`
 ///   `api_key_env` / `api_key` fallback inside `with_provider_and_secrets`).
-/// - `None` — re-target via `with_provider(provider)`, preserving the existing
-///   key. Currently only the coordinator subagent path can hit this branch
-///   (when no `Arc<RwLock<SecretsStore>>` was threaded down).
+/// - `None` — re-target via `with_provider(provider)`, which keeps the
+///   existing key on the same provider and clears it on a switch. Currently
+///   only the coordinator subagent path can hit this branch (when no
+///   `Arc<RwLock<SecretsStore>>` was threaded down).
 pub fn build_summary_client(
     llm: &LlmClient,
     summary_provider: Option<&str>,

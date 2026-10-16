@@ -62,6 +62,18 @@ impl Harness {
     /// `openrouter` provider pointed at a scripted LLM. `entry_key` is the
     /// `api_key` on the provider entry, if `alms.toml` declares one.
     async fn boot(entry_key: Option<&str>) -> Self {
+        let h = Self::boot_with_summaries(entry_key).await;
+        // One provider request per run: the post-run episodic summary is
+        // fire-and-forget on a client resolved at run start, so its request
+        // could land after the DELETE and carry the key legitimately.
+        h.state.agent_config.write().context_config.run_summary_mode =
+            alms_core::config::RunSummaryMode::Off;
+        h
+    }
+
+    /// [`boot`](Self::boot) with the post-run episodic summary left on, as
+    /// the compiled defaults have it, so each run makes a second request.
+    async fn boot_with_summaries(entry_key: Option<&str>) -> Self {
         let llm = ScriptedLlm::always(Canned::sse(text_turn("ok"))).await;
         let dir = tempfile::tempdir().unwrap();
         // `secrets_path_from_db` puts the store next to the database.
@@ -98,11 +110,6 @@ impl Harness {
                     ..alms_runtime::LlmConfig::default()
                 })
                 .build_with_channels();
-        // One provider request per run: the post-run episodic summary is
-        // fire-and-forget on a client resolved at run start, so its request
-        // could land after the DELETE and carry the key legitimately.
-        state.agent_config.write().context_config.run_summary_mode =
-            alms_core::config::RunSummaryMode::Off;
 
         assert!(
             state.llm.read().has_api_key(),
@@ -189,6 +196,34 @@ impl Harness {
     async fn authorization(&self) -> Vec<Option<String>> {
         self.llm.request_headers("authorization").await
     }
+
+    /// Wait until the scripted provider has answered `n` requests. A run's
+    /// summary is spawned when the run completes, so a terminal run does
+    /// not mean its summary request has been sent.
+    async fn wait_for_requests(&self, n: usize) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        while self.llm.calls() < n {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the provider saw {} of {n} requests within 20s",
+                self.llm.calls()
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// The `model` of every provider request so far.
+    async fn models(&self) -> Vec<String> {
+        self.llm
+            .request_bodies()
+            .await
+            .iter()
+            .map(|body| {
+                let body: serde_json::Value = serde_json::from_str(body).unwrap();
+                body["model"].as_str().unwrap_or_default().to_owned()
+            })
+            .collect()
+    }
 }
 
 fn bearer(key: &str) -> Option<String> {
@@ -213,6 +248,64 @@ async fn a_removed_key_is_not_sent_by_the_next_post_runs_run() {
         vec![bearer(STORE_KEY), None],
         "the run after `DELETE /auth/keys/openrouter` must send no key: \
          neither the store nor the provider entry has one"
+    );
+}
+
+/// The post-run episodic summary on the compiled defaults
+/// (`run_summary_mode = "llm"`, `summary_provider = "openrouter"`, here the
+/// agent's own provider) goes through `build_summary_client`'s
+/// `with_provider_and_secrets` on the run's client. The summary of a run
+/// that starts after the `DELETE` must send no key either (Tim S4 on
+/// #194). `ScriptedLlm::always` answers the non-streaming summary call with
+/// SSE, so the summary fails to parse and falls back to the heuristic; its
+/// request and header are recorded all the same.
+#[tokio::test]
+async fn a_removed_key_is_not_sent_by_the_next_runs_summary() {
+    let h = Harness::boot_with_summaries(None).await;
+    let summary_model = {
+        let config = h.state.agent_config.read();
+        let context = &config.context_config;
+        assert_eq!(
+            context.run_summary_mode,
+            alms_core::config::RunSummaryMode::Llm,
+            "precondition: the compiled default summarises every run"
+        );
+        assert_eq!(
+            context.summary_provider.as_deref(),
+            Some("openrouter"),
+            "precondition: the compiled default summary provider"
+        );
+        context.summary_model.clone().expect("compiled default")
+    };
+    let agent = seed_agent(&h.state, "keyholder");
+    let session = h.state.session_manager.get_or_create(agent, "web-chat");
+
+    // The run's turn, then its summary: both before the DELETE.
+    h.run_to_completion(session.id).await;
+    h.wait_for_requests(2).await;
+    assert_eq!(
+        h.authorization().await,
+        vec![bearer(STORE_KEY), bearer(STORE_KEY)]
+    );
+
+    h.delete_key("openrouter").await;
+    h.run_to_completion(session.id).await;
+    h.wait_for_requests(4).await;
+    assert_eq!(
+        h.models().await,
+        vec![
+            "test-model".to_string(),
+            summary_model.clone(),
+            "test-model".to_string(),
+            summary_model,
+        ],
+        "each run makes one turn request, then one summary request"
+    );
+    assert_eq!(
+        h.authorization().await,
+        vec![bearer(STORE_KEY), bearer(STORE_KEY), None, None],
+        "the run after `DELETE /auth/keys/openrouter`, and its summary, must \
+         send no key"
     );
 }
 

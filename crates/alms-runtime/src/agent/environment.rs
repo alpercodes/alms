@@ -25,7 +25,8 @@ impl AgentRuntime {
                 AlmsError::InvalidConfig(format!(
                     "tools.sandbox_root '{}' cannot be resolved: {}. \
                      Fix the path, or set sandbox_root = \"\". \
-                     Gateway runs are rooted at the project root either way.",
+                     In gateway runs sandbox_root never moves the filesystem boundary, \
+                     empty or not.",
                     path.display(),
                     e,
                 ))
