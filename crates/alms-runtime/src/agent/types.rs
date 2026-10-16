@@ -125,7 +125,10 @@ pub struct AgentConfig {
     pub context_config: ContextConfig,
     /// Execution posture (full_control, guarded, or autonomous)
     pub posture: Posture,
-    /// Filesystem sandbox root (default "."). Empty string = unrestricted.
+    /// Filesystem sandbox root (default "."). Empty string = unrestricted
+    /// until the gateway re-roots the runtime, as it does for every run
+    /// (`with_project_root`, or `with_unrestricted_filesystem` under
+    /// `[security].allow_full_os_access`).
     pub sandbox_root: String,
     /// Shell execution policy: "sandboxed" or "unrestricted".
     pub shell_policy: String,
