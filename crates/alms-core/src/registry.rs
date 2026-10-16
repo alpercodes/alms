@@ -545,6 +545,9 @@ fn is_blank_scaffold(dir: &Path) -> std::io::Result<bool> {
         let Some(name) = name.to_str() else {
             return Ok(false);
         };
+        // `.{file}.lock` must match the sidecar name that
+        // `alms_runtime::workspace::AgentWorkspace::lock_path` creates; keep
+        // the two in step (alms-core cannot depend on alms-runtime).
         let is_lock = WORKSPACE_FILENAMES.iter().any(|filename| {
             name.strip_prefix('.')
                 .and_then(|name| name.strip_suffix(".lock"))
