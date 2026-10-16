@@ -988,6 +988,28 @@ mod tests {
         assert_eq!(std::fs::read_to_string(target).unwrap(), "outside data");
     }
 
+    /// Pins the `is_file` guard in `is_blank_scaffold`. A lock sidecar is
+    /// accepted by name alone, so without that guard a symlinked
+    /// `.memories.md.lock` would pass. (A symlinked seed file is refused by
+    /// the zero-length check too, since a symlink's length is its target
+    /// path's.)
+    #[cfg(unix)]
+    #[test]
+    fn workspace_dir_availability_rejects_symlinked_lock_sidecar() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("agent");
+        let target = tmp.path().join("outside.md");
+        init_workspace_files(&dir).unwrap();
+        std::fs::write(&target, "outside data").unwrap();
+        symlink(&target, dir.join(".memories.md.lock")).unwrap();
+
+        let error = ensure_workspace_dir_available(&dir).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read_to_string(target).unwrap(), "outside data");
+    }
+
     #[cfg(unix)]
     #[test]
     fn workspace_dir_availability_rejects_symlinked_directory() {
