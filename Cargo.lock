@@ -231,6 +231,7 @@ dependencies = [
  "globset",
  "iana-time-zone",
  "landlock",
+ "libc",
  "parking_lot",
  "regex",
  "reqwest",

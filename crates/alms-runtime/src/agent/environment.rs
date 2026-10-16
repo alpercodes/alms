@@ -24,7 +24,9 @@ impl AgentRuntime {
             let canonical = std::fs::canonicalize(&path).map_err(|e| {
                 AlmsError::InvalidConfig(format!(
                     "tools.sandbox_root '{}' cannot be resolved: {}. \
-                     Set sandbox_root = \"\" to explicitly opt out of sandboxing.",
+                     Fix the path, or set sandbox_root = \"\". \
+                     In gateway runs sandbox_root never moves the filesystem boundary, \
+                     empty or not.",
                     path.display(),
                     e,
                 ))

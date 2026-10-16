@@ -433,7 +433,9 @@ pub(crate) fn resolve_agent_config(
     // api_key), then ALWAYS re-resolve the API key from secrets for the
     // effective provider. This ensures keys set at runtime (via UI or
     // CLI) are picked up even for the default agent which has no
-    // per-agent provider field.
+    // per-agent provider field, and that a key removed at runtime is
+    // dropped: both calls clear the key `llm` carries from boot when
+    // neither the store nor the provider entry has one.
     let mut llm = llm.clone();
     if let Some(ref record) = agent_record
         && let Some(ref provider) = record.provider
