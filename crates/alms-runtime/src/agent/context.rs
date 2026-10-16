@@ -13,12 +13,35 @@ use tracing::{debug, error, info, warn};
 
 use super::AgentRuntime;
 
+/// Granularity of the workspace prompt budget, in bytes.
+///
+/// The budget is rounded down to a whole step so that, under budget pressure,
+/// a truncated file is cut in the same place from one run to the next. Without
+/// it, every turn's input length moved the cut by a few bytes, and an agent
+/// whose files were being cut missed the system-block prompt cache on every
+/// message. Each byte of input moves the unrounded budget by about half a
+/// byte, so inputs within about 2 KB of each other usually land on the same
+/// step; two that straddle a step boundary still differ.
+const WORKSPACE_BUDGET_STEP_BYTES: usize = 1024;
+
+/// The first request of a run, and the workspace budget every system-prompt
+/// rebuild in that run must reuse.
 pub(crate) struct BuiltContext {
     pub(crate) messages: Vec<LlmMessage>,
     pub(crate) workspace_budget_bytes: usize,
 }
 
 impl AgentRuntime {
+    /// [`Self::assemble_system_prompt_with_budget`] at the budget a run with
+    /// no input, history or episodic block would get. Test-only: the runtime
+    /// always passes the budget [`Self::build_context_with_budget`] computed.
+    #[cfg(test)]
+    pub(crate) fn assemble_system_prompt(&self, base_prompt: &str, include_user: bool) -> String {
+        let fixed_prompt = self.fixed_system_prompt_for_budget(base_prompt, None);
+        let budget_bytes = self.workspace_prompt_budget_bytes(&fixed_prompt, 0);
+        self.assemble_system_prompt_with_budget(base_prompt, include_user, budget_bytes)
+    }
+
     /// Assemble the full system prompt for a given stage, appending workspace
     /// files if attached.
     ///
@@ -40,13 +63,13 @@ impl AgentRuntime {
     /// prefix. This is used for non-user-facing sessions — the contexts
     /// [`Self::is_user_facing_context`] rejects, which is the one place the
     /// list is written down.
-    #[cfg(test)]
-    pub(crate) fn assemble_system_prompt(&self, base_prompt: &str, include_user: bool) -> String {
-        let fixed_prompt = self.fixed_system_prompt_for_budget(base_prompt, None);
-        let budget_bytes = self.workspace_prompt_budget_bytes(&fixed_prompt, 0);
-        self.assemble_system_prompt_with_budget(base_prompt, include_user, budget_bytes)
-    }
-
+    ///
+    /// `workspace_budget_bytes` is the run's budget from
+    /// [`Self::build_context_with_budget`]. Every call in a run passes the same
+    /// value, so unchanged files produce the same bytes on the first request
+    /// and on every tool-loop rebuild. A file that does not fit whole is
+    /// windowed, and reported once per run as a `WORKSPACE_PROMPT_TRUNCATED`
+    /// warning.
     pub(crate) fn assemble_system_prompt_with_budget(
         &self,
         base_prompt: &str,
@@ -81,7 +104,7 @@ impl AgentRuntime {
 
             let agent_name = self.agent_name.as_deref().unwrap_or("unnamed agent");
             let message = format!(
-                "Workspace file {} for agent {agent_name} contains {} bytes and exceeds its {}-byte prompt limit. A partial window is included to preserve conversation history, and whole-file writes are refused until a complete view is available.",
+                "Workspace file {} for agent {agent_name} contains {} bytes and exceeds the {} bytes available to it in this run's prompt budget. A partial window is included to preserve conversation history, and whole-file writes are refused until a complete view is available.",
                 truncation.file.filename(),
                 truncation.total_bytes,
                 truncation.injection_limit_bytes,
@@ -104,6 +127,9 @@ impl AgentRuntime {
         }
     }
 
+    /// The non-workspace part of the largest system prompt this run can send:
+    /// the base prompt, the `tool_loop` guidance every rebuild adds, and the
+    /// DM addendum when there is one. Only measured, never sent.
     pub(crate) fn fixed_system_prompt_for_budget(
         &self,
         base_prompt: &str,
@@ -120,6 +146,10 @@ impl AgentRuntime {
         fixed_prompt
     }
 
+    /// The byte budget for workspace file contents in one run's system prompt:
+    /// half of what `max_input_tokens` leaves after `fixed_system_prompt`,
+    /// `other_context_tokens` and two history reserves, rounded down to a
+    /// whole [`WORKSPACE_BUDGET_STEP_BYTES`].
     pub(crate) fn workspace_prompt_budget_bytes(
         &self,
         fixed_system_prompt: &str,
@@ -136,7 +166,8 @@ impl AgentRuntime {
             .max_input_tokens
             .saturating_sub(fixed_overhead)
             / 2;
-        headroom_tokens.saturating_mul(ESTIMATED_BYTES_PER_TOKEN)
+        let budget_bytes = headroom_tokens.saturating_mul(ESTIMATED_BYTES_PER_TOKEN);
+        budget_bytes - budget_bytes % WORKSPACE_BUDGET_STEP_BYTES
     }
 
     /// Returns true if the given context_id represents a user-facing session
@@ -172,15 +203,8 @@ impl AgentRuntime {
             || context_id.starts_with("episodic:"))
     }
 
-    /// Build context window for LLM using ContextBuilder.
-    ///
-    /// For the `compact` strategy (renamed from `sliding-summary` in
-    /// #869) this is async because it may call the LLM to compress
-    /// old messages into a rolling summary.
-    ///
-    /// For DM sessions (context_id starts with `"dm:"`), perspective mapping is
-    /// applied: messages from this agent become `Role::Assistant` so the LLM
-    /// sees them as its own previous responses.
+    /// [`Self::build_context_with_budget`] without the workspace budget, for
+    /// tests that only inspect the first request.
     #[cfg(test)]
     pub(crate) async fn build_context(
         &self,
@@ -194,6 +218,21 @@ impl AgentRuntime {
             .map(|built| built.messages)
     }
 
+    /// Build context window for LLM using ContextBuilder.
+    ///
+    /// For the `compact` strategy (renamed from `sliding-summary` in
+    /// #869) this is async because it may call the LLM to compress
+    /// old messages into a rolling summary.
+    ///
+    /// For DM sessions (context_id starts with `"dm:"`), perspective mapping is
+    /// applied: messages from this agent become `Role::Assistant` so the LLM
+    /// sees them as its own previous responses.
+    ///
+    /// This is also where the run's workspace budget is computed, once, and
+    /// returned in [`BuiltContext`] so every tool-loop rebuild reuses it. It
+    /// depends on the configuration, the input and whether the run has an
+    /// episodic block, but not on history, so a long session does not
+    /// squeeze the workspace files.
     pub(crate) async fn build_context_with_budget(
         &self,
         session_manager: &SessionManager,
@@ -278,11 +317,19 @@ impl AgentRuntime {
 
         let fixed_system_prompt =
             self.fixed_system_prompt_for_budget(&self.config.system_prompt, dm_peer.as_deref());
-        let episodic_tokens = episodic_text
+        // Charge an episodic block at its ceiling, `run_summary_budget`, not
+        // at its length. The block is rebuilt from the other sessions'
+        // summaries on every run, so its length changes from turn to turn,
+        // and charging that would move a truncated file's cut with it. The
+        // formatter fits the block within the ceiling, framing included.
+        let episodic_tokens = if episodic_text
             .as_deref()
-            .filter(|text| !text.is_empty())
-            .map(|text| estimate_tokens(text) + 4)
-            .unwrap_or(0);
+            .is_some_and(|text| !text.is_empty())
+        {
+            self.config.context_config.run_summary_budget
+        } else {
+            0
+        };
         let other_context_tokens = estimate_tokens(input).saturating_add(episodic_tokens);
         let workspace_budget_bytes =
             self.workspace_prompt_budget_bytes(&fixed_system_prompt, other_context_tokens);

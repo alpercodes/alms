@@ -400,11 +400,12 @@ impl ContextBuilder {
     }
 }
 
+/// Bytes per token assumed by [`estimate_tokens`].
+pub(crate) const ESTIMATED_BYTES_PER_TOKEN: usize = 3;
+
 /// Rough token estimate for mixed content (natural language, JSON, code).
 /// ~3 chars/token is a safer approximation than 4 for JSON-heavy tool output.
 /// A proper tokenizer (tiktoken) can be added later without changing the interface.
-pub(crate) const ESTIMATED_BYTES_PER_TOKEN: usize = 3;
-
 pub fn estimate_tokens(text: &str) -> usize {
     // ~3 chars per token: slightly overestimates for pure English (~4 chars/token)
     // but more accurate for JSON/code (~2-3 chars/token). Overestimating is safer

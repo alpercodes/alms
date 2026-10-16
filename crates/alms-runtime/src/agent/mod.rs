@@ -321,6 +321,11 @@ impl AgentRuntime {
             .await
     }
 
+    /// [`Self::finish_run_with_workspace_budget`] for tests that hand in a
+    /// prebuilt message array: rebuilds get no workspace budget
+    /// (`usize::MAX`). `run()` and `run_on_session()` never come through
+    /// here; `run_carries_the_initial_workspace_budget_into_tool_loop_rebuilds`
+    /// pins that they pass the budget their context was built with.
     #[cfg(test)]
     async fn finish_run(
         &self,
@@ -358,11 +363,11 @@ impl AgentRuntime {
         let is_dm = context_id.starts_with("dm:");
         let include_user = Self::is_user_facing_context(context_id);
         // `dm_peer` drives the in-loop re-injection of the implicit-reply
-        // addendum (`rebuild_system_prompt_for_tool_loop`). Gated on
-        // `dm_implicit_reply` (#1156 defense-in-depth) so the loop-rebuild
-        // path follows the same invariant as `build_context`: the addendum
-        // is only injected for peer-triggered DM runs, where the gateway's
-        // completion gate actually delivers the final text.
+        // addendum (`rebuild_system_prompt_for_tool_loop_with_budget`). Gated
+        // on `dm_implicit_reply` (#1156 defense-in-depth) so the loop-rebuild
+        // path follows the same invariant as `build_context_with_budget`: the
+        // addendum is only injected for peer-triggered DM runs, where the
+        // gateway's completion gate actually delivers the final text.
         let dm_peer = if is_dm && self.dm_implicit_reply {
             self.dm_peer_name(context_id)
         } else {

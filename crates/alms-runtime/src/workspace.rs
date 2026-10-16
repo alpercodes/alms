@@ -50,12 +50,13 @@ pub struct AgentWorkspace {
 /// later replacement can be compared against the file byte for byte.
 ///
 /// `whole` says whether what the model actually received was that content in
-/// full. It is false when the injection was a tail window
-/// ([`memories_injection_window`]) and when a `workspace_read` was capped at
-/// [`WORKSPACE_READ_CAP`]. The two fields answer different questions and both
-/// are needed: `content` catches a file that moved under the agent, `whole`
-/// catches a file the agent only ever saw the end of. Neither implies the
-/// other.
+/// full. It is false when the injection was a window — the `memories.md` tail
+/// window ([`memories_injection_window`]), or the head window an identity file
+/// gets when the run's prompt budget cannot hold it whole — and when a
+/// `workspace_read` was capped at [`WORKSPACE_READ_CAP`]. The two fields answer
+/// different questions and both are needed: `content` catches a file that
+/// moved under the agent, `whole` catches a file the agent only ever saw part
+/// of. Neither implies the other.
 #[derive(Debug, Clone)]
 struct ShownView {
     content: String,
@@ -199,21 +200,21 @@ impl WorkspaceFile {
     /// memories is the context build, which `AgentRuntime` runs before
     /// `agent_loop`. The assembled prompt is *not* carried unchanged through
     /// every tool iteration, as this comment used to say — `agent_loop` calls
-    /// `rebuild_system_prompt_for_tool_loop` after each tool batch, which
-    /// re-reads the workspace and replaces `messages[0]` — but it is carried
-    /// through the first one, and a whole tool batch executes between two
-    /// rebuilds. So the snapshot a `workspace_write` replaces is at best a
-    /// batch old and at worst a run old. Anything appended inside that — by
-    /// another live instance of the same named agent, which the coordinator's
-    /// `active_named` guard deliberately permits, **or by this very run's own
-    /// earlier `workspace_write` calls** — is not in the snapshot the model is
-    /// editing, so a whole-file replacement silently erases it. No lock can
-    /// bracket that; there is no critical section, only a stale snapshot
-    /// (#1305, the residual #1280/#1294 structurally could not reach). What
-    /// *can* be changed is where an omitted `mode` lands. The three identity
-    /// files each describe one settled thing and are meant to be restated;
-    /// `memories.md` is a list of learned facts that accumulates, so an
-    /// omitted `mode` there almost always means "add this", and the
+    /// `rebuild_system_prompt_for_tool_loop_with_budget` after each tool
+    /// batch, which re-reads the workspace and replaces `messages[0]` — but it
+    /// is carried through the first one, and a whole tool batch executes
+    /// between two rebuilds. So the snapshot a `workspace_write` replaces is
+    /// at best a batch old and at worst a run old. Anything appended inside
+    /// that — by another live instance of the same named agent, which the
+    /// coordinator's `active_named` guard deliberately permits, **or by this
+    /// very run's own earlier `workspace_write` calls** — is not in the
+    /// snapshot the model is editing, so a whole-file replacement silently
+    /// erases it. No lock can bracket that; there is no critical section, only
+    /// a stale snapshot (#1305, the residual #1280/#1294 structurally could
+    /// not reach). What *can* be changed is where an omitted `mode` lands. The
+    /// three identity files each describe one settled thing and are meant to
+    /// be restated; `memories.md` is a list of learned facts that accumulates,
+    /// so an omitted `mode` there almost always means "add this", and the
     /// destructive reading is the wrong one to guess.
     ///
     /// **The cost, accepted deliberately.** A model that omits `mode` while
@@ -291,16 +292,12 @@ impl WorkspaceFile {
     }
 }
 
-/// Legacy name for the fixed `memories.md` prompt window. Identity files are
-/// limited only by the run-scoped workspace budget.
-pub const WORKSPACE_FILE_INJECTION_CAP: usize = 4000;
-
 /// Maximum content bytes injected from `memories.md` into the system prompt.
 ///
 /// `ContextBuilder` budgets history around the system prompt; it does not trim
 /// the system prompt itself, so the run-scoped budget and this cap prevent
 /// workspace content from evicting the conversation.
-pub const MEMORIES_INJECTION_CAP: usize = WORKSPACE_FILE_INJECTION_CAP;
+pub const MEMORIES_INJECTION_CAP: usize = 4000;
 
 /// The `memories.md` text to inject into the system prompt: the file verbatim
 /// while it fits [`MEMORIES_INJECTION_CAP`], otherwise the **last**
@@ -1265,29 +1262,19 @@ impl AgentWorkspace {
         })
     }
 
-    /// Build a system-prompt prefix from workspace files without a runtime
-    /// budget. The agent runtime uses the budget-aware variant below.
-    ///
-    /// When `include_user` is false, `user.md` is omitted from the prefix.
-    /// This saves tokens and avoids confusion in non-user-facing contexts —
-    /// `AgentRuntime::is_user_facing_context` is the caller that decides,
-    /// and the one place the context list is written down.
-    ///
-    /// This is also the moment the agent is *shown* its workspace, so each
-    /// read is recorded as the base for [`Self::write_file_checked`] (#1310).
-    /// Missing or blank files are recorded as empty views, while `user.md` is
-    /// not read or recorded when it is excluded from the prompt. The runtime
-    /// calls this again after each tool batch to refresh the view mid-run.
+    /// `build_system_prompt_prefix_with_budget_and_truncations` with no
+    /// budget: every identity file whole, `memories.md` at its fixed
+    /// [`MEMORIES_INJECTION_CAP`] window. Records the shown views the same way.
+    /// The agent runtime never calls this; it always passes the run's budget.
+    // A code span rather than an intra-doc link: the target is `pub(crate)`,
+    // and linking to it from this `pub` item would trip rustdoc's
+    // `private_intra_doc_links` lint.
     pub fn build_system_prompt_prefix(&self, include_user: bool) -> String {
         self.build_system_prompt_prefix_with_budget(include_user, usize::MAX)
     }
 
-    /// Build a system-prompt prefix using the run-scoped byte budget.
-    ///
-    /// The budget covers file contents after reserving space for headings and
-    /// truncation markers. The caller keeps it stable for the run so a tool
-    /// loop can refresh files without shrinking the workspace view as history
-    /// grows.
+    /// [`Self::build_system_prompt_prefix_with_budget_and_truncations`]
+    /// without the truncation list.
     pub(crate) fn build_system_prompt_prefix_with_budget(
         &self,
         include_user: bool,
@@ -1297,6 +1284,47 @@ impl AgentWorkspace {
             .0
     }
 
+    /// Build the system-prompt prefix from workspace files within the run's
+    /// byte budget, and list the files that did not fit whole.
+    ///
+    /// This is what the agent runtime calls, on the run's first request and
+    /// again after every tool batch (through
+    /// `AgentRuntime::assemble_system_prompt_with_budget`). The caller passes
+    /// the same `budget_bytes` each time, so a rebuild refreshes the files
+    /// without shrinking the view as history and tool results accumulate.
+    ///
+    /// The budget covers file contents after a fixed reserve per populated
+    /// file for its heading and truncation marker. It is water-filled across
+    /// the populated files: short files take only what they need and the rest
+    /// is shared among the larger ones. `memories.md` never takes more than
+    /// [`MEMORIES_INJECTION_CAP`] and keeps its tail; an identity file that
+    /// gets less than its length keeps its head.
+    ///
+    /// When `include_user` is false, `user.md` is omitted from the prefix.
+    /// This saves tokens and avoids confusion in non-user-facing contexts —
+    /// `AgentRuntime::is_user_facing_context` is the caller that decides,
+    /// and the one place the context list is written down.
+    ///
+    /// This is also the moment the agent is *shown* its workspace, so each
+    /// read is recorded as the base for [`Self::write_file_checked`] (#1310).
+    /// Two details carry the whole guard:
+    ///
+    /// - A file that is missing or blank is recorded as an empty view rather
+    ///   than skipped. There is nothing to show and nothing to lose, and
+    ///   recording it keeps a fresh agent's first `personality.md` write off
+    ///   the guard for a reason the record states, instead of relying on the
+    ///   empty-target valve alone.
+    /// - `user.md` under `include_user == false` is **not read and not
+    ///   recorded**. It is the one file that can be absent from the prompt
+    ///   while present on disk, and recording it here — "we looked, so call
+    ///   it seen" — would hand a DM-run `workspace_write` permission to
+    ///   delete a file the agent has no copy of. Not looking is what makes
+    ///   that case [`RefusedWrite::NeverShown`].
+    ///
+    /// Because the runtime calls this after every tool batch, it is also what
+    /// refreshes the base mid-run: an agent that appends in one batch and
+    /// replaces in the next has been re-shown the file in between, and its
+    /// replacement is judged against what it can actually see.
     pub(crate) fn build_system_prompt_prefix_with_budget_and_truncations(
         &self,
         include_user: bool,
@@ -1626,6 +1654,36 @@ mod tests {
             allocate_workspace_content_budget(&[100, 100, 100, 100], 5),
             [2, 1, 1, 1]
         );
+    }
+
+    /// The water-fill, pinned where it matters: through the prefix builder,
+    /// not only the allocator. Four populated files reserve 1024 bytes of an
+    /// 8000-byte budget for headings and markers, leaving 6976 for content.
+    /// The three 2-byte files need 6 of them, so the 3534-byte personality
+    /// fits whole. An equal split would give each file 1744 bytes and cut it.
+    #[test]
+    fn small_files_leave_their_unused_share_to_a_large_identity_file() {
+        let (_dir, ws) = test_workspace();
+        let personality = format!("PERSONALITY_START\n{}\nPERSONALITY_END", "p".repeat(3500));
+        assert_eq!(personality.len(), 3534);
+        ws.write_file_as_operator(WorkspaceFile::Personality, &personality)
+            .unwrap();
+        for file in [
+            WorkspaceFile::Goals,
+            WorkspaceFile::User,
+            WorkspaceFile::Memories,
+        ] {
+            ws.write_file_as_operator(file, "ok").unwrap();
+        }
+
+        let (prefix, truncations) =
+            ws.build_system_prompt_prefix_with_budget_and_truncations(true, 8000);
+        assert!(
+            prefix.starts_with(&format!("{personality}\n\n## Current Goals\nok")),
+            "the personality must come through whole: {prefix}"
+        );
+        assert!(!prefix.contains("truncated"), "{prefix}");
+        assert!(truncations.is_empty());
     }
 
     #[test]

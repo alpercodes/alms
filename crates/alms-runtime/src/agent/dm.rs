@@ -1,7 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 
-#[cfg(test)]
-use crate::context::estimate_llm_message_tokens;
 use crate::llm_types::ToolCall;
 
 use super::AgentRuntime;
@@ -268,33 +266,14 @@ impl AgentRuntime {
     /// Layer order is `base -> workspace -> tool_loop -> dm_addendum`, matching
     /// the assembly order documented in `docs/system-prompts.md`.
     ///
-    /// This is extracted as a helper to avoid three copies of the same pattern
-    /// (initial tool-loop rebuild, DM empty-reply retry rebuild).
-    #[cfg(test)]
-    pub(crate) fn rebuild_system_prompt_for_tool_loop(
-        &self,
-        messages: &mut [crate::llm_types::LlmMessage],
-        include_user: bool,
-        dm_peer: Option<&str>,
-    ) {
-        let fixed_prompt = self.fixed_system_prompt_for_budget(&self.config.system_prompt, dm_peer);
-        let other_context_tokens = messages
-            .iter()
-            .skip(1)
-            .map(|message| estimate_llm_message_tokens(message).saturating_add(4))
-            .sum();
-        let workspace_budget_bytes =
-            self.workspace_prompt_budget_bytes(&fixed_prompt, other_context_tokens);
-        self.rebuild_system_prompt_for_tool_loop_with_budget(
-            messages,
-            include_user,
-            dm_peer,
-            workspace_budget_bytes,
-        );
-    }
-
-    /// Rebuild a tool-loop system prompt using the workspace budget captured
-    /// when the run's initial context was built.
+    /// `workspace_budget_bytes` must be the budget the run's initial context
+    /// was built with (`BuiltContext::workspace_budget_bytes`), not one
+    /// recomputed from the growing message array: reusing it is what keeps
+    /// unchanged workspace files byte-identical across tool batches.
+    ///
+    /// This is extracted as a helper so the two rebuilds in `agent_loop`
+    /// (after a tool batch, and before the DM empty-reply retry) share one
+    /// copy of the pattern.
     pub(crate) fn rebuild_system_prompt_for_tool_loop_with_budget(
         &self,
         messages: &mut [crate::llm_types::LlmMessage],

@@ -12,7 +12,7 @@ files (`personality.md`, `goals.md`, `memories.md`, `user.md`).
 | `initial.md` | Base system prompt for all top-level agents. Sets the agent's default behavior and mentions the `alms --help` CLI discovery hint. | `AgentConfig::default()` in `crates/alms-runtime/src/agent/types.rs` |
 | `tool_loop.md` | Continuation prompt appended to the system message after tool results. Tells the LLM to analyze results and decide whether to use more tools or respond. | `SystemPrompts::default()` in `crates/alms-runtime/src/agent/types.rs` |
 | `bootstrap.md` | First-time agent onboarding prompt. Replaces the initial prompt on human-started runs when `personality.md` does not exist. Guides the agent through an interview to populate workspace files. | `AgentWorkspace::bootstrap_prompt()` in `crates/alms-runtime/src/workspace.rs` |
-| `dm_recipient.md` | Template appended to the system prompt when the agent receives a direct message. Explains the implicit-reply contract (#1154): the final message text is delivered to the peer automatically. Contains a `{peer}` placeholder replaced at runtime with the sender's name. | `build_context()` in `crates/alms-runtime/src/agent/context.rs` |
+| `dm_recipient.md` | Template appended to the system prompt when the agent receives a direct message. Explains the implicit-reply contract (#1154): the final message text is delivered to the peer automatically. Contains a `{peer}` placeholder replaced at runtime with the sender's name. | `build_context_with_budget()` in `crates/alms-runtime/src/agent/context.rs` |
 | `subagent.md` | Default system prompt for ephemeral (unnamed) subagents spawned via `invoke_agent`. | `DEFAULT_SUBAGENT_PROMPT` constant in `crates/alms-coordinator/src/lib.rs` |
 | `summarizer.md` | System prompt for the sliding-summary LLM call that compresses old conversation history into a rolling summary. | `maybe_summarize()` in `crates/alms-runtime/src/agent/context.rs` |
 | `session_summarizer.md` | System prompt for the episodic memory LLM call that generates cross-session summaries after each run. Focus on *what was accomplished*, not how. 1-3 sentences, past tense. | `generate_llm()` in `crates/alms-runtime/src/episodic.rs` |
@@ -60,8 +60,8 @@ initial prompt (not replacing it), so the agent retains its identity while getti
 continuation guidance.
 
 **Code path**: `agent_loop()` in `agent/loop_impl.rs` -- after processing tool results, the
-system message at `messages[0]` is rebuilt with the workspace byte budget captured by
-`build_context()`:
+system message at `messages[0]` is rebuilt by `rebuild_system_prompt_for_tool_loop_with_budget()`
+with the workspace byte budget captured by `build_context_with_budget()`:
 ```
 assemble_system_prompt_with_budget(initial_prompt, run_workspace_budget)
     + "\n\n" + tool_loop_prompt
@@ -72,11 +72,11 @@ DM addendum is appended last (see § "Prompt Assembly Order").
 
 ### `dm_recipient.md` -- Direct Message Sessions
 
-When the context ID starts with `"dm:"`, the `build_context()` method extracts the
+When the context ID starts with `"dm:"`, the `build_context_with_budget()` method extracts the
 peer agent's name and appends the DM addendum to the system prompt. The `{peer}`
 placeholder in the template is replaced with the actual peer name.
 
-**Code path**: `build_context()` in `agent/context.rs` -- after assembling the base system
+**Code path**: `build_context_with_budget()` in `agent/context.rs` -- after assembling the base system
 prompt with workspace prefix, if the context is a DM session. Additionally,
 `agent_loop()` in `agent/loop_impl.rs` re-injects the addendum via the `dm_addendum()` helper on every
 tool-loop system prompt rebuild, so the agent retains DM awareness across
@@ -130,20 +130,23 @@ appended after it:
    setup). This is the foundational role/identity prompt and always comes first.
 
 2. **Workspace prefix** (optional): If the agent has a workspace attached,
-   `build_system_prompt_prefix_with_budget()` reads workspace files and appends them after
+   `build_system_prompt_prefix_with_budget_and_truncations()` reads workspace files and appends them after
    the base prompt: `{base_prompt}\n\n{workspace_prefix}`. The workspace files
    are concatenated in this internal order:
     - `personality.md` (head-windowed only when the run budget requires it)
     - `goals.md` (prefixed with `## Current Goals`, head-windowed only when the run budget requires it)
     - `user.md` (prefixed with `## About the User`, head-windowed only when the run budget requires it) — **conditional**: skipped for non-user-facing sessions (DM, subagent, job, notification, and episodic contexts) to save tokens
-    - `memories.md` (prefixed with `## Memories`, tail-windowed at 4000 bytes — past the cap the agent is shown the *most recent* bytes behind a leading truncation marker, not the oldest; see `agent-runtime-design.md` § "Size management")
+    - `memories.md` (prefixed with `## Memories`, a tail window of up to 4000 bytes — past the window the agent is shown the *most recent* bytes behind a leading truncation marker, not the oldest; see `agent-runtime-design.md` § "Size management")
 
    The runtime shares one workspace budget across these files for the duration of a run.
    It water-fills the available bytes across populated files, so short files use only
    what they need and identity files stay whole unless history headroom requires a window.
-   `memories.md` retains its fixed 4000-byte cap. A partial file carries a marker and
-   emits one `run_warning` per file per run. Rebuilds reuse the original budget, so
-   unchanged files do not shrink as tool results accumulate.
+   `memories.md` gets a tail window of up to 4000 bytes. A partial file carries a marker
+   and emits one `WORKSPACE_PROMPT_TRUNCATED` `run_warning` per file per run. Rebuilds
+   reuse the original budget, so unchanged files do not shrink as tool results
+   accumulate. The budget is rounded down to a whole KiB, and an episodic block is
+   charged at `run_summary_budget` rather than its length, so a windowed file usually
+   keeps the same cut from one run to the next as well.
 
 3. **Tool loop addendum** (after first tool round): On subsequent LLM calls in the
    same agent loop, the system message is rebuilt as:

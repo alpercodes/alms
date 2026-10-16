@@ -35,11 +35,12 @@ fn runtime_with_workspace(workspace: &crate::workspace::AgentWorkspace) -> Agent
 /// This is a correction to the premise #1305 and #1310 were both written on
 /// — "`build_context` runs once per run, so the memories snapshot in the
 /// system prompt is fixed at run start". It is fixed only until the first
-/// tool call: `agent_loop` calls `rebuild_system_prompt_for_tool_loop` after
-/// every batch, which goes through `assemble_system_prompt` ->
-/// `build_system_prompt_prefix` and reads the files again, replacing
-/// `messages[0]` outright so the stale copy is not even in the array any
-/// more.
+/// tool call: `agent_loop` calls
+/// `rebuild_system_prompt_for_tool_loop_with_budget` after every batch, which
+/// goes through `assemble_system_prompt_with_budget` ->
+/// `build_system_prompt_prefix_with_budget_and_truncations` and reads the
+/// files again, replacing `messages[0]` outright so the stale copy is not
+/// even in the array any more.
 ///
 /// It matters here because it decides how far the guard should reach. The
 /// window between the rebuild and the next replacement is a real one — a
@@ -85,9 +86,10 @@ async fn the_tool_loop_rebuild_re_shows_the_workspace_and_unblocks_the_next_repl
         "before any rebuild, the agent's only copy of the file predates its own append"
     );
 
-    // The rebuild `agent_loop` performs after a tool batch.
+    // The rebuild `agent_loop` performs after a tool batch. The two-line
+    // memories file fits any budget, so none is imposed.
     let mut messages = vec![LlmMessage::system(initial)];
-    runtime.rebuild_system_prompt_for_tool_loop(&mut messages, true, None);
+    runtime.rebuild_system_prompt_for_tool_loop_with_budget(&mut messages, true, None, usize::MAX);
     let rebuilt = messages[0].content.as_deref().unwrap();
     assert!(
         rebuilt.contains("- M3"),
