@@ -227,8 +227,9 @@ Each item below changes behaviour for a deployment that has not set the knob exp
   and the write took std's process-wide stderr lock after `fork`: had another thread held
   that lock at that moment (the daemon logs through stderr), the child, and the `spawn()`
   waiting for it, could have blocked for good. That hang is from reading `std` and was not
-  reproduced; the errno is pinned by a unit test, but the not-enforced branch itself has
-  not been run on a kernel without Landlock.
+  reproduced. A Linux test reaches the not-enforced branch through a seccomp filter that
+  fails the Landlock system calls as a kernel without Landlock does; it has not been run on
+  a kernel that lacks Landlock.
 - Docs correction, no behaviour change: a Telegram-triggered run never picks up a
   `PATCH /settings` change or `settings.json`, not even after a restart; it uses the
   `alms.toml` and environment values the daemon booted with. The Settings modal,

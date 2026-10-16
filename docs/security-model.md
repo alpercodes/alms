@@ -770,12 +770,18 @@ the child exits before `exec` and the command does not run. An error from
 one only for an empty or unknown set of access rights, and ALMS passes
 neither (`AccessFs::from_all(ABI::V5)`), so that branch is not reached
 today; refusing there keeps the command from running unsandboxed if the
-crate's behaviour changes. This is established from the code: it has not
-been run on a kernel without Landlock, and no test reaches the
-`NotEnforced` branch. A unit test in `exec.rs`
-(`landlock_not_enforced_error_reaches_the_parent_as_eopnotsupp`, Linux
-only) pins what the parent receives for that branch's error, by returning
-it from a `pre_exec` of its own. A seccomp filter that kills the process
+crate's behaviour changes. A Linux test in `exec.rs`
+(`sandboxed_spawn_without_landlock_fails_with_eopnotsupp`) reaches the
+`NotEnforced` branch on CI's kernel, which has Landlock: a `pre_exec`
+registered before the sandbox's installs a seccomp filter that fails the
+three Landlock system calls with `ENOSYS`, as a kernel built without
+Landlock does, and the spawn must fail with `EOPNOTSUPP`. The
+`handle_access` refusal returns the same error, so the test does not tell
+the two apart; by the crate's code the exit it reaches is `NotEnforced`. A
+kernel with Landlock built in but not enabled at boot answers `EOPNOTSUPP`
+instead of `ENOSYS`, which the crate treats the same way (from reading the
+crate). The test has not run on either kind of kernel. A seccomp filter
+that kills the process
 instead of failing the syscall (systemd's `SystemCallFilter=` without
 `SystemCallErrorNumber=`) also stops the command, with a different
 symptom: the child dies of `SIGSYS` before it can report back, so the

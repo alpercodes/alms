@@ -1260,7 +1260,9 @@ mod tests {
     /// a kernel built without Landlock does. The crate's ABI probe then
     /// reports Landlock as unsupported; at `BestEffort` the builder calls
     /// succeed on a ruleset that never reaches the kernel, `restrict_self`
-    /// returns `NotEnforced`, and the closure must fail the spawn.
+    /// returns `NotEnforced`, and the closure must fail the spawn. (The
+    /// closure's `handle_access` refusal returns the same error, so this
+    /// cannot tell the two apart; by the crate's code it is not reached.)
     ///
     /// The filter does not check `seccomp_data.arch`. That check is what
     /// keeps a filter used as a boundary from being bypassed through a
