@@ -202,7 +202,7 @@ pub struct AgentRecord {
     /// sends them). The event is ephemeral — it is not persisted to
     /// the in-memory event log and is not replayed on SSE reconnect.
     ///
-    /// PATCH-mutable via `PATCH /agents/{id}` — flipping the flag at
+    /// Mutable via `PUT /agents/{id}` — flipping the flag at
     /// run-time takes effect on the next run without restart. Subagents
     /// do NOT inherit the flag: the coordinator hardcodes
     /// `debug_mode: false` on the resolved config it constructs for each

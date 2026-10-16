@@ -71,9 +71,11 @@ struct RunParams {
     is_peer_message: bool,
     /// When true, the run was created by the system (not a user-initiated HTTP
     /// request). All runs from `enqueue_triggered_run` are system-triggered:
-    /// peer DM messages, notification runs, subagent completions. These runs
-    /// have no human watching, so Guarded posture would hang forever waiting
-    /// for approval -- the posture is overridden to Autonomous.
+    /// peer DM messages, notification runs, subagent completions and
+    /// job-episode continuations. Scheduled jobs set it too, in
+    /// `AdmittedJobRun::execute`. These runs have no human watching, so
+    /// Guarded posture would hang forever waiting for approval -- the posture
+    /// is overridden to Autonomous.
     is_system_triggered: bool,
     /// When true, the input message has already been persisted to the session
     /// by the HTTP handler (before enqueue). The agent loop uses
@@ -611,7 +613,7 @@ mod tests {
 
     /// The canonical #942 leak shape. Agent record carries `provider:
     /// anthropic` and `model: gpt-4o-mini` (a stale openai-namespace
-    /// model — typical operator workflow: swap provider via PATCH /agents,
+    /// model — typical operator workflow: swap provider via PUT /agents,
     /// forget to update the model). Server default is openai with
     /// `gpt-4o-mini`. Pre-fix: the per-agent `with_model("gpt-4o-mini")`
     /// runs after `apply_provider("anthropic")` and the wire request goes

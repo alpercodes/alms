@@ -5,7 +5,7 @@
 //     swept out in #941 alongside the per-run config-override path.
 //     The frontend portion of #1003 lives on two surfaces — the
 //     AgentEditModal and the Settings modal Debug section — both of
-//     which compute the PATCH /agents/{id} delta the same way:
+//     which compute the PUT /agents/{id} delta the same way:
 //     "send `debug_mode: <new>` only when the form value differs from
 //     the stored value, otherwise omit the field entirely so opening
 //     and closing the modal without touching anything never PATCHes".
