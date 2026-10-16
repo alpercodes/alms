@@ -909,8 +909,8 @@ mod tests {
 
     #[test]
     fn workspace_dir_availability_allows_missing_or_empty_and_rejects_data() {
-        let tmp = std::env::temp_dir().join(format!("alms-test-{}", uuid::Uuid::new_v4()));
-        let dir = tmp.join("agent");
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("agent");
 
         ensure_workspace_dir_available(&dir).unwrap();
         std::fs::create_dir_all(&dir).unwrap();
@@ -923,8 +923,6 @@ mod tests {
             std::fs::read_to_string(dir.join("memories.md")).unwrap(),
             "old agent memory"
         );
-
-        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
