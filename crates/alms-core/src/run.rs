@@ -25,7 +25,7 @@ use uuid::Uuid;
 ///
 /// Per-run overrides were removed in the #941 pivot — agents are now the
 /// single per-tenant config surface. Operators change agent config via
-/// `PATCH /agents/{id}` (or server defaults via `PATCH /settings`) before
+/// `PUT /agents/{id}` (or server defaults via `PATCH /settings`) before
 /// starting a run, never per-run.
 ///
 /// All fields snapshot the **effective** value: the post-layering result,
@@ -631,7 +631,7 @@ impl Run {
 ///
 /// Per-run config overrides were removed in the #941 pivot. The agent
 /// is now the single per-tenant config surface — operators set
-/// model/provider/posture/budgets via `PATCH /agents/{id}` before starting
+/// model/provider/posture/budgets via `PUT /agents/{id}` before starting
 /// the run. Stale per-run override fields sent by older clients are
 /// silently ignored on the wire (no `#[serde(deny_unknown_fields)]`) so
 /// in-flight UI bundles on stale builds keep working with no migration.

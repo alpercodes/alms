@@ -598,7 +598,7 @@ impl AlmsConfig {
     /// (it lives in [`crate::registry::AgentRecord`] and only flows in at
     /// run-create time), so the load-time check uses the runtime's default
     /// of 32K. The gateway re-runs the same validator at per-run
-    /// model-resolve time with the resolved per-agent value so a `PATCH
+    /// model-resolve time with the resolved per-agent value so a `PUT
     /// /agents/{id}` that lowers `max_tokens` below the load-time default
     /// is still caught downstream.
     ///

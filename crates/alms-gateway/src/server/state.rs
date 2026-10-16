@@ -162,9 +162,11 @@ pub struct AppState {
     pub server_llm_default: Arc<parking_lot::RwLock<ServerLlmDefault>>,
     /// Agent config — mutable via PATCH /settings (context, llm provider
     /// defaults, and the `sandbox_root` / `shell_policy` mirrors of the
-    /// tools section). Shared with the Coordinator (`Arc::clone`) so all
-    /// HTTP-triggered run paths observe the same live config; the
-    /// Telegram path inherits a boot-time snapshot — see the Telegram
+    /// tools section). Shared with the Coordinator (`Arc::clone`) so every
+    /// `execute_run` path (HTTP, DM, notification, job) and every subagent
+    /// observes the same live config; the Telegram path reads `Gateway`'s
+    /// own config, built from `alms.toml` + env at boot, which neither
+    /// PATCH /settings nor `settings.json` reaches — see the Telegram
     /// loop inside `gateway.rs::Gateway::run_until_shutdown` and
     /// `docs/api.md` § 10.2.
     pub agent_config: Arc<parking_lot::RwLock<alms_runtime::AgentConfig>>,
@@ -185,10 +187,11 @@ pub struct AppState {
     /// any `.await`: the lock is a `parking_lot::RwLock` and must never be
     /// held across a suspension point.
     ///
-    /// Propagation is HTTP-path only, like every other live-mutable
-    /// setting: Telegram-triggered runs resolve against the `LlmClient`
-    /// owned by `Gateway` (a boot-time clone) and keep the boot pair until
-    /// the daemon restarts. See the Telegram loop inside
+    /// Like every other live-mutable setting, this reaches every run path
+    /// except Telegram: Telegram-triggered runs resolve against the
+    /// `LlmClient` owned by `Gateway`, built from `alms.toml` + env at boot,
+    /// and never see a PATCHed or `settings.json` pair, not even after a
+    /// restart. See the Telegram loop inside
     /// `gateway.rs::Gateway::run_until_shutdown` and `docs/api.md` § 10.2.
     pub llm: Arc<parking_lot::RwLock<alms_runtime::LlmClient>>,
     /// Serialises `PATCH /settings` handler bodies end to end (#1148).

@@ -180,6 +180,21 @@ impl SqliteStore {
         Ok(rows)
     }
 
+    /// Whether any session is filed under `agent_id`, without loading one.
+    ///
+    /// Unlike [`Self::load_sessions_by_agent`], nothing is parsed: a row that
+    /// would fail to parse still counts and is not tallied as skipped.
+    pub fn agent_has_sessions(&self, agent_id: AgentId) -> AlmsResult<bool> {
+        self.conn
+            .lock()
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sessions WHERE agent_id = ?1)",
+                params![agent_id.0.to_string()],
+                |row| row.get(0),
+            )
+            .map_err(|e| AlmsError::Runtime(format!("SQLite agent_has_sessions: {e}")))
+    }
+
     /// List all sessions, ordered by last activity (newest first).
     pub fn list_sessions(&self) -> AlmsResult<Vec<Session>> {
         let conn = self.conn.lock();
@@ -391,6 +406,37 @@ mod tests {
         let agent2_sessions = store.load_sessions_by_agent(agent2).unwrap();
         assert_eq!(agent2_sessions.len(), 1);
         assert_eq!(agent2_sessions[0].context_id, "ctx-c");
+    }
+
+    #[test]
+    fn agent_has_sessions_asks_only_about_that_agent() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let owner = AgentId::new();
+        assert!(!store.agent_has_sessions(owner).unwrap(), "empty store");
+
+        store
+            .save_session(&Session::new(AgentId::new(), "ctx-other"))
+            .unwrap();
+        assert!(
+            !store.agent_has_sessions(owner).unwrap(),
+            "another agent's session"
+        );
+
+        store.save_session(&Session::new(owner, "ctx-own")).unwrap();
+        assert!(store.agent_has_sessions(owner).unwrap());
+    }
+
+    /// Only `agent_id` is read, so a row the loaders would drop still
+    /// answers "yes" and is not counted as skipped.
+    #[test]
+    fn agent_has_sessions_counts_a_row_the_loaders_would_drop() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let session = new_session();
+        store.save_session(&session).unwrap();
+        corrupt_with_sql(&store, "UPDATE sessions SET id = 'not-a-uuid'");
+
+        assert!(store.agent_has_sessions(session.agent_id).unwrap());
+        assert_eq!(store.rows_skipped_total(), 0);
     }
 
     #[test]
