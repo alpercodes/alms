@@ -1213,7 +1213,12 @@ async fn notify_dm_status_to_webchat(
 ///   queued on the parent agent's queue instead
 ///   ([`queue_cancelled_subagent_record`]).
 ///
-/// Inside an open job episode, either kind keeps its continuation run.
+/// Inside an open job episode, either kind keeps its continuation run. A
+/// direct cancel's continuation run gets the same input as the notification
+/// run outside an episode, with its warning against unrequested rework. A
+/// job's runs have no approval gate (a `guarded` agent runs them promoted to
+/// Autonomous), which is where that rework costs the most. A stopped
+/// subagent's continuation run gets the plain completion notification.
 pub(crate) async fn completion_notification_loop(
     mut rx: mpsc::UnboundedReceiver<alms_coordinator::SubagentCompletion>,
     state: AppState,
@@ -1370,7 +1375,8 @@ pub(crate) async fn completion_notification_loop(
         // the coordinator, so a natural result that raced a direct cancel
         // keeps its normal notification (Tim's B1 on PR #190). An open
         // episode keeps its reserved continuation run either way, so the
-        // episode can finish.
+        // episode can finish; a direct cancel's input carries the warning
+        // against rework there too.
         let cancelled = completion.status == alms_coordinator::TaskStatus::Cancelled;
         let cancelled_directly = cancelled && completion.cancelled_directly;
         if cancelled && !cancelled_directly && episode_route.is_none() {
@@ -1383,7 +1389,7 @@ pub(crate) async fn completion_notification_loop(
             continue;
         }
 
-        let notification = if cancelled_directly && episode_route.is_none() {
+        let notification = if cancelled_directly {
             format_directly_cancelled_notification(&completion)
         } else {
             format_completion_notification(&completion)
@@ -1845,13 +1851,15 @@ const SUBAGENT_CANCELLED_TEMPLATE: &str =
     include_str!("../../../alms-runtime/prompts/subagent_cancelled.md");
 
 /// Format the input of the notification run a directly cancelled subagent
-/// starts (#121, PR #190).
+/// starts, or of its continuation run inside an open job episode (#121,
+/// PR #190).
 ///
 /// The run is system-triggered, so a `guarded` parent runs it promoted to
-/// Autonomous, with no approval gate. The template's wording is the guard
-/// against unrequested rework: it says the operator cancelled the subagent
-/// on purpose, and that the parent should not re-run it or redo its work
-/// unless the operator asks.
+/// Autonomous, with no approval gate. A job's continuation run is
+/// system-triggered too. The template's wording is the guard against
+/// unrequested rework: it says the operator cancelled the subagent on
+/// purpose, and that the parent should not re-run it or redo its work unless
+/// the operator asks.
 pub(super) fn format_directly_cancelled_notification(
     c: &alms_coordinator::SubagentCompletion,
 ) -> String {

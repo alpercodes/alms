@@ -953,9 +953,16 @@ In both cases this event and the persisted `subagent_completion` marker carry
 the status and the subagent's session ID, and report the summary as
 `[no content]`: cancellation keeps no partial output, whether the subagent had
 produced nothing or was stopped mid-work. Work it already wrote stays in its
-session. A cancelled completion inside an open job episode, from either
-source, still gets the episode's continuation run, with the ordinary
-completion notification as its input.
+session.
+
+A cancelled completion inside an open job episode, from either source, still
+gets the episode's continuation run on the job session, stamped with the job
+ID like any other continuation. Only the run's input differs by source. A
+direct cancel's input is the same as the notification run's input above,
+warning the agent not to redo the work unless the operator asks. A job's runs
+have no approval gate either, so that warning matters most there. A stopped
+subagent's continuation run gets the ordinary completion notification, and no
+`subagent_cancelled` record is added.
 
 #### Reconnect
 Supported via `Last-Event-ID` header (automatic browser reconnect) or `?last_event_id=<n>` query parameter (initial connection after loading history via REST). The query parameter takes precedence when both are present. The server replays events with IDs greater than the supplied value.
@@ -1122,9 +1129,13 @@ failure).
 For a **background** subagent, this endpoint is the operator's direct
 cancel: its `Cancelled` completion starts one notification run on the parent
 session, telling the agent the cancel was deliberate and not to redo the work
-unless the operator asks (see `subagent_completed` in § 5.3). Stopping the
-subagent another way, by cancelling its parent run or with `DELETE /jobs`,
-starts no run; the parent history gets a `subagent_cancelled` record instead.
+unless the operator asks (see `subagent_completed` in § 5.3). Inside an open
+job episode, that run is the episode's continuation run, and it carries the
+same warning. Stopping the subagent another way, by cancelling its parent run
+or with `DELETE /jobs`, starts no run; the parent history gets a
+`subagent_cancelled` record instead. The exception is a stop inside an open
+episode, which still gets the continuation run, with the ordinary completion
+notification as its input.
 The event and lifecycle marker report `[no content]` either way; partial work
 is not summarized on cancellation, but stays readable in the subagent's
 session. A cancellation before any output and one during work have the same

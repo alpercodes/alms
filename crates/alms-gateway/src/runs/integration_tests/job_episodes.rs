@@ -693,8 +693,10 @@ async fn conversation_ended_for_peer_does_not_touch_episode() {
 ///
 /// #121 / PR #190: a cancelled completion inside the open episode keeps that
 /// behaviour whether it was stopped or cancelled directly — its reserved
-/// continuation run starts, with the plain completion notification as its
-/// input, and no `subagent_cancelled` record is queued.
+/// continuation run starts, job-stamped, and no `subagent_cancelled` record is
+/// queued. Only the input differs: a stopped completion's is the plain
+/// completion notification, and a direct cancel's carries the warning against
+/// redoing the work (a job's runs have no approval gate).
 #[tokio::test]
 async fn subagent_completion_resolves_episode_and_stamps_job_id() {
     let (state, shutdown_token, _cr, _tr, _dr) = test_app_state();
@@ -739,15 +741,7 @@ async fn subagent_completion_resolves_episode_and_stamps_job_id() {
         crate::runs::job_episode::RunCompletion::Open
     ));
 
-    let mut expected_inputs = Vec::new();
-    let (test_tx, test_rx) = mpsc::unbounded_channel();
-    let mut send = |completion: SubagentCompletion| {
-        expected_inputs.push(crate::runs::notifications::format_completion_notification(
-            &completion,
-        ));
-        test_tx.send(completion).unwrap();
-    };
-    send(SubagentCompletion {
+    let normal = SubagentCompletion {
         task_id,
         subagent_name: Some("researcher".to_string()),
         status: TaskStatus::Completed,
@@ -761,9 +755,9 @@ async fn subagent_completion_resolves_episode_and_stamps_job_id() {
         duration_ms: Some(10),
         token_usage: None,
         parent_tool_invocation_id: None,
-    });
+    };
     // Stopped (its parent run's token fired).
-    send(SubagentCompletion {
+    let stopped = SubagentCompletion {
         task_id: cancelled_task_id,
         subagent_name: Some("cancelled-researcher".to_string()),
         status: TaskStatus::Cancelled,
@@ -777,9 +771,9 @@ async fn subagent_completion_resolves_episode_and_stamps_job_id() {
         duration_ms: Some(5),
         token_usage: None,
         parent_tool_invocation_id: None,
-    });
+    };
     // Cancelled directly from its chip while the episode is open.
-    send(SubagentCompletion {
+    let direct = SubagentCompletion {
         task_id: direct_task_id,
         subagent_name: Some("direct-researcher".to_string()),
         status: TaskStatus::Cancelled,
@@ -793,12 +787,23 @@ async fn subagent_completion_resolves_episode_and_stamps_job_id() {
         duration_ms: Some(5),
         token_usage: None,
         parent_tool_invocation_id: None,
-    });
+    };
+    // The normal and stopped completions keep the plain completion
+    // notification; the direct cancel's input carries the safeguard.
+    let mut expected_inputs = vec![
+        crate::runs::notifications::format_completion_notification(&normal),
+        crate::runs::notifications::format_completion_notification(&stopped),
+        crate::runs::notifications::format_directly_cancelled_notification(&direct),
+    ];
+    let (test_tx, test_rx) = mpsc::unbounded_channel();
+    for completion in [normal, stopped, direct] {
+        test_tx.send(completion).unwrap();
+    }
     drop(test_tx);
     crate::runs::notifications::completion_notification_loop(test_rx, state.clone()).await;
 
     // Each completion gets its continuation run, on the job session and
-    // job-stamped, with the unchanged completion notification as input.
+    // job-stamped, with the input chosen above.
     let runs = state.run_manager.list_by_session(job_session_id, 10);
     assert_eq!(
         runs.len(),
@@ -811,6 +816,25 @@ async fn subagent_completion_resolves_episode_and_stamps_job_id() {
     inputs.sort();
     expected_inputs.sort();
     assert_eq!(inputs, expected_inputs);
+    // Pin the safeguard text itself, not only the formatter choice: exactly
+    // the direct cancel's continuation run carries it.
+    const SAFEGUARD: &str = "The operator cancelled this subagent deliberately. Don't re-run \
+                             it or redo its work unless the operator asks; decide whether your \
+                             current plan needs to change, and tell the operator.";
+    let with_safeguard: Vec<_> = inputs
+        .iter()
+        .filter(|input| input.contains(SAFEGUARD))
+        .collect();
+    assert_eq!(
+        with_safeguard.len(),
+        1,
+        "only the direct cancel's continuation run may carry the safeguard; got {inputs:?}"
+    );
+    assert!(
+        with_safeguard[0].contains("\"direct-researcher\""),
+        "the safeguard must be on the direct cancel's run; got {:?}",
+        with_safeguard[0]
+    );
     let history = state.session_manager.get_history(job_session_id).unwrap();
     assert!(
         !history.iter().any(|m| {
