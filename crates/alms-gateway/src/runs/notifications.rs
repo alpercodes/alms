@@ -1211,7 +1211,8 @@ async fn notify_dm_status_to_webchat(
 ///   cancel, `DELETE /jobs`, shutdown — or `DELETE /jobs` teardown stopped
 ///   it): no run starts. A model-visible `subagent_cancelled` record is
 ///   queued on the parent agent's queue instead
-///   ([`queue_cancelled_subagent_record`]).
+///   ([`queue_cancelled_subagent_record`]). If the queue is already closed
+///   for shutdown, the record is dropped.
 ///
 /// Inside an open job episode, either kind keeps its continuation run. A
 /// direct cancel's continuation run gets the same input as the notification
@@ -1441,8 +1442,13 @@ pub(crate) async fn completion_notification_loop(
 /// one item at a time, so the record lands after any active run, in the
 /// position the notification run's input used to take, without an LLM turn.
 ///
-/// When the queue is closed (shutdown), no later run can start in this
-/// process, so a direct append is the fallback.
+/// When the queue is closed (shutdown), the record is dropped with a WARN,
+/// the way [`enqueue_triggered_run`] drops its run. Appending it directly
+/// instead is not safe: the stopped parent run may still be saving tool
+/// results from inside its work item, and history outlives the process, so
+/// the next process's runs would send the split tool pair (Tim's R2 on
+/// PR #190). This matches the behaviour before PR #190, when the parent's
+/// notification run was dropped at shutdown.
 ///
 /// Waits for queue capacity like [`enqueue_triggered_run`]; call it only from
 /// a dedicated producer task, never from inside a queue work item.
@@ -1460,38 +1466,37 @@ async fn queue_cancelled_subagent_record(
         "status": "cancelled",
     });
 
-    let closed = match state.agent_queue.reserve(agent_id).await {
-        Ok(reservation) => {
-            let session_manager = state.session_manager.clone();
-            let (queued_record, queued_meta) = (record.clone(), meta.clone());
-            reservation
-                .submit_low(Box::pin(async move {
-                    super::markers::persist_error_marker(
-                        &session_manager,
-                        session_id,
-                        SUBAGENT_CANCELLED_MARKER_TYPE,
-                        queued_record,
-                        queued_meta,
-                    );
-                }))
-                .err()
+    let reservation = match state.agent_queue.reserve(agent_id).await {
+        Ok(reservation) => reservation,
+        Err(error) => {
+            // Shutting down. The stopped parent run may still be saving tool
+            // results, and history outlives this process, so appending here
+            // could split a tool pair (Tim's R2 on PR #190).
+            warn!(
+                ?error,
+                agent_id = %agent_id.0,
+                session_id = %session_id.0,
+                "Agent queue closed; cancelled-subagent record dropped"
+            );
+            return;
         }
-        Err(error) => Some(error),
     };
-
-    if let Some(error) = closed {
-        warn!(
-            ?error,
-            agent_id = %agent_id.0,
-            session_id = %session_id.0,
-            "Agent queue closed; appending the cancelled-subagent record directly"
-        );
+    let session_manager = state.session_manager.clone();
+    if let Err(error) = reservation.submit_low(Box::pin(async move {
         super::markers::persist_error_marker(
-            &state.session_manager,
+            &session_manager,
             session_id,
             SUBAGENT_CANCELLED_MARKER_TYPE,
             record,
             meta,
+        );
+    })) {
+        // The same shutdown race, after admission.
+        warn!(
+            ?error,
+            agent_id = %agent_id.0,
+            session_id = %session_id.0,
+            "Agent queue closed; cancelled-subagent record dropped"
         );
     }
 }
@@ -1856,10 +1861,10 @@ const SUBAGENT_CANCELLED_TEMPLATE: &str =
 ///
 /// The run is system-triggered, so a `guarded` parent runs it promoted to
 /// Autonomous, with no approval gate. A job's continuation run is
-/// system-triggered too. The template's wording is the guard against
-/// unrequested rework: it says the operator cancelled the subagent on
-/// purpose, and that the parent should not re-run it or redo its work unless
-/// the operator asks.
+/// system-triggered too. The template says the operator cancelled the
+/// subagent on purpose, and that the parent should not re-run it or redo its
+/// work unless the operator asks. Nothing enforces this; the wording is the
+/// only thing discouraging unrequested rework.
 pub(super) fn format_directly_cancelled_notification(
     c: &alms_coordinator::SubagentCompletion,
 ) -> String {

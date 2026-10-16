@@ -100,8 +100,10 @@ Each item below changes behaviour for a deployment that has not set the knob exp
   controls and a status-only subagent status bar.
 - Stopping a parent run, or deleting a job, no longer starts a notification run for the
   background subagents it cancels; the parent's history gets a record pointing to each
-  subagent's session instead. Cancelling one subagent directly still starts a run, which
-  now tells the agent the cancel was deliberate and not to redo the work unless asked.
+  subagent's session instead. Inside a scheduled job's open episode, a stopped subagent
+  still gets the episode's continuation run. Cancelling one subagent directly still starts
+  a run, which now tells the agent the cancel was deliberate and not to redo the work
+  unless asked.
 - An agent with no `personality.md` is no longer handed the first-time setup interview
   ("Ask the user …") on turns no human started. Peer DM turns, notification runs
   (subagent completions, DM ends) and scheduled job runs now get the agent's normal system

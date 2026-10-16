@@ -163,9 +163,10 @@ async fn subagent_completion_propagates_session_id() {
 // queue instead.
 // ---------------------------------------------------------------------------
 
-/// The maintainer's safeguard for the direct-cancel notification run: the
-/// run is system-triggered and promoted from Guarded, so this wording is what
-/// stands between a deliberate cancel and unrequested rework.
+/// The maintainer's safeguard for the direct-cancel notification run. The
+/// run is system-triggered and promoted from Guarded, and nothing enforces
+/// the safeguard; its wording is the only thing discouraging unrequested
+/// rework.
 const DIRECT_CANCEL_SAFEGUARD: &str = "The operator cancelled this subagent deliberately. \
      Don't re-run it or redo its work unless the operator asks; decide whether \
      your current plan needs to change, and tell the operator.";
@@ -309,67 +310,151 @@ async fn natural_completion_racing_a_direct_cancel_keeps_its_notification() {
     shutdown_token.cancel();
 }
 
+/// Append one message to a session's history.
+fn append_message(
+    state: &crate::server::AppState,
+    session_id: SessionId,
+    role: alms_session::Role,
+    content: alms_session::Content,
+    metadata: Option<serde_json::Value>,
+) {
+    state
+        .session_manager
+        .append_message(
+            session_id,
+            alms_session::Message {
+                id: uuid::Uuid::new_v4().to_string(),
+                role,
+                content,
+                timestamp: alms_core::Timestamp::now(),
+                metadata,
+            },
+        )
+        .unwrap();
+}
+
+/// A parent turn stopped mid-tool, for the record-placement tests (Tim's R1
+/// and R2 on PR #190). The tool call `call_1` is persisted, as the runtime
+/// persists it before it executes the tool, and the parent agent's queue is
+/// held by a started work item, as the run executing the tool holds it.
+struct ParentTurnMidTool {
+    release: oneshot::Sender<()>,
+    returned: oneshot::Receiver<()>,
+}
+
+impl ParentTurnMidTool {
+    async fn start(
+        state: &crate::server::AppState,
+        agent_id: AgentId,
+        session_id: SessionId,
+    ) -> Self {
+        append_message(
+            state,
+            session_id,
+            alms_session::Role::User,
+            alms_session::Content::Text("run the long script".to_string()),
+            None,
+        );
+        append_message(
+            state,
+            session_id,
+            alms_session::Role::Assistant,
+            alms_session::Content::ToolCall {
+                name: "shell".to_string(),
+                params: serde_json::json!({"command": "./long-script.sh"}),
+            },
+            Some(serde_json::json!({"tool_call_id": "call_1"})),
+        );
+
+        // That run's work item has started on the parent agent's queue and
+        // has not returned: it is executing the tool.
+        let (started_tx, started_rx) = oneshot::channel();
+        let (release, release_rx) = oneshot::channel::<()>();
+        let (returned_tx, returned) = oneshot::channel();
+        state
+            .agent_queue
+            .try_reserve(agent_id)
+            .expect("queue admission")
+            .submit(Box::pin(async move {
+                let _ = started_tx.send(());
+                let _ = release_rx.await;
+                let _ = returned_tx.send(());
+            }))
+            .expect("queue dispatch");
+        started_rx.await.expect("the parent turn is running");
+        Self { release, returned }
+    }
+
+    /// The parent run saves the tool's result, as its cancel arm does, and
+    /// its work item returns.
+    async fn finish(self, state: &crate::server::AppState, session_id: SessionId) {
+        append_message(
+            state,
+            session_id,
+            alms_session::Role::Tool,
+            alms_session::Content::ToolResult {
+                tool_id: "call_1".to_string(),
+                result: serde_json::json!("cancelled"),
+            },
+            None,
+        );
+        self.release.send(()).unwrap();
+        self.returned.await.expect("the parent turn returns");
+    }
+}
+
+/// Build the parent's next context and assert that `call_1`'s result follows
+/// the call directly. Returns the context and the call's index in it.
+fn context_with_intact_tool_pair(
+    state: &crate::server::AppState,
+    session_id: SessionId,
+) -> (Vec<alms_runtime::LlmMessage>, usize) {
+    use alms_core::config::ContextConfig;
+    use alms_runtime::context::ContextBuilder;
+
+    let history = state
+        .session_manager
+        .get_context_history(session_id)
+        .unwrap();
+    let messages = ContextBuilder::new(ContextConfig {
+        strategy: "truncate".into(),
+        max_input_tokens: 32000,
+        summary_model: None,
+        ..Default::default()
+    })
+    .build("You are the parent.", &history, "what happened?", None);
+
+    let call = messages
+        .iter()
+        .position(|message| {
+            message
+                .tool_calls
+                .as_ref()
+                .is_some_and(|calls| calls.iter().any(|call| call.id == "call_1"))
+        })
+        .expect("the tool call reaches the context");
+    let next = &messages[call + 1];
+    assert_eq!(
+        (next.role.as_str(), next.tool_call_id.as_deref()),
+        ("tool", Some("call_1")),
+        "the tool call's result must follow it directly; got {messages:#?}"
+    );
+    (messages, call)
+}
+
 /// Tim's R1 on PR #190: a stopped subagent's record must not land between a
 /// parent run's tool call and that call's result. The parent agent's queue
 /// is held busy the way the run executing the tool holds it; the record must
 /// wait, and the next context build must have no user turn inside the pair.
 #[tokio::test]
 async fn stopped_subagent_record_waits_for_the_parent_turn() {
-    use alms_core::config::ContextConfig;
-    use alms_runtime::context::ContextBuilder;
-
     let (state, shutdown_token, _cr, _tr, _dr) = test_app_state();
     let parent_agent_id = AgentId::new();
     let parent_session_id = state
         .session_manager
         .get_or_create(parent_agent_id, "stopped-mid-tool")
         .id;
-    let append = |role, content, metadata| {
-        state
-            .session_manager
-            .append_message(
-                parent_session_id,
-                alms_session::Message {
-                    id: uuid::Uuid::new_v4().to_string(),
-                    role,
-                    content,
-                    timestamp: alms_core::Timestamp::now(),
-                    metadata,
-                },
-            )
-            .unwrap();
-    };
-
-    // The parent's turn so far: the operator's input, and the tool call the
-    // runtime persists before it executes the tool.
-    append(
-        alms_session::Role::User,
-        alms_session::Content::Text("run the long script".to_string()),
-        None,
-    );
-    append(
-        alms_session::Role::Assistant,
-        alms_session::Content::ToolCall {
-            name: "shell".to_string(),
-            params: serde_json::json!({"command": "./long-script.sh"}),
-        },
-        Some(serde_json::json!({"tool_call_id": "call_1"})),
-    );
-
-    // That run's work item has started on the parent agent's queue and has
-    // not returned: it is executing the tool.
-    let (started_tx, started_rx) = oneshot::channel();
-    let (release_tx, release_rx) = oneshot::channel::<()>();
-    state
-        .agent_queue
-        .try_reserve(parent_agent_id)
-        .expect("queue admission")
-        .submit(Box::pin(async move {
-            let _ = started_tx.send(());
-            let _ = release_rx.await;
-        }))
-        .expect("queue dispatch");
-    started_rx.await.expect("the parent turn is running");
+    let parent_turn = ParentTurnMidTool::start(&state, parent_agent_id, parent_session_id).await;
 
     // The parent is stopped mid-tool; its background subagent's cancellation
     // arrives before the tool's result is saved.
@@ -397,45 +482,10 @@ async fn stopped_subagent_record_waits_for_the_parent_turn() {
         "the record must wait for the parent's turn, not be appended mid-tool"
     );
 
-    // The parent run saves the tool's result and its work item returns.
-    append(
-        alms_session::Role::Tool,
-        alms_session::Content::ToolResult {
-            tool_id: "call_1".to_string(),
-            result: serde_json::json!("cancelled"),
-        },
-        None,
-    );
-    release_tx.send(()).unwrap();
+    parent_turn.finish(&state, parent_session_id).await;
     wait_for_cancelled_record(&state, parent_session_id).await;
 
-    let history = state
-        .session_manager
-        .get_context_history(parent_session_id)
-        .unwrap();
-    let messages = ContextBuilder::new(ContextConfig {
-        strategy: "truncate".into(),
-        max_input_tokens: 32000,
-        summary_model: None,
-        ..Default::default()
-    })
-    .build("You are the parent.", &history, "what happened?", None);
-
-    let call = messages
-        .iter()
-        .position(|message| {
-            message
-                .tool_calls
-                .as_ref()
-                .is_some_and(|calls| calls.iter().any(|call| call.id == "call_1"))
-        })
-        .expect("the tool call reaches the context");
-    let next = &messages[call + 1];
-    assert_eq!(
-        (next.role.as_str(), next.tool_call_id.as_deref()),
-        ("tool", Some("call_1")),
-        "the tool call's result must follow it directly; got {messages:#?}"
-    );
+    let (messages, call) = context_with_intact_tool_pair(&state, parent_session_id);
     let record = messages
         .iter()
         .position(|message| {
@@ -449,6 +499,53 @@ async fn stopped_subagent_record_waits_for_the_parent_turn() {
     assert!(record > call + 1, "the record lands after the tool pair");
 
     shutdown_token.cancel();
+}
+
+/// Tim's R2 on PR #190: graceful shutdown closes the agent queue before it
+/// cancels in-flight runs, and a stopped parent run can still save tool
+/// results from inside its work item. The record must not be appended
+/// directly then. It is dropped, as the notification run was before
+/// PR #190, and the tool call is still directly followed by its result.
+#[tokio::test]
+async fn stopped_subagent_record_at_shutdown_never_splits_the_tool_pair() {
+    let (state, shutdown_token, _cr, _tr, _dr) = test_app_state();
+    let parent_agent_id = AgentId::new();
+    let parent_session_id = state
+        .session_manager
+        .get_or_create(parent_agent_id, "stopped-mid-tool-at-shutdown")
+        .id;
+    let parent_turn = ParentTurnMidTool::start(&state, parent_agent_id, parent_session_id).await;
+
+    // Shutdown closes the queue while the parent's work item keeps running.
+    // The stopped subagent's cancellation arrives before the tool's result
+    // is saved.
+    shutdown_token.cancel();
+    let (test_tx, test_rx) = mpsc::unbounded_channel();
+    test_tx
+        .send(cancelled_completion(
+            parent_session_id,
+            parent_agent_id,
+            SessionId::new(),
+            false,
+        ))
+        .unwrap();
+    drop(test_tx);
+    crate::runs::notifications::completion_notification_loop(test_rx, state.clone()).await;
+
+    parent_turn.finish(&state, parent_session_id).await;
+
+    context_with_intact_tool_pair(&state, parent_session_id);
+    assert!(
+        state
+            .run_manager
+            .list_by_session(parent_session_id, 10)
+            .is_empty(),
+        "a stopped subagent starts no notification run"
+    );
+    assert!(
+        marker_of_type(&state, parent_session_id, "subagent_cancelled").is_none(),
+        "with the queue closed, the record is dropped"
+    );
 }
 
 /// Drive `forward_runtime_events` with a single foreground

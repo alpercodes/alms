@@ -936,8 +936,9 @@ the cancel came from (#121):
   should decide whether its plan needs to change and tell the operator. The
   run is system-triggered, so a `guarded` parent runs it promoted to
   Autonomous, with no approval gate
-  ([`security-model.md` § 8.1](security-model.md#guarded-is-not-an-agent-boundary));
-  that wording is the guard against unrequested rework.
+  ([`security-model.md` § 8.1](security-model.md#guarded-is-not-an-agent-boundary)).
+  Nothing enforces that instruction; the wording is the only thing
+  discouraging unrequested rework.
 - **Stopped**: the parent run's cancellation propagated to the subagent
   (`POST /runs/{run_id}/cancel` from the Stop button, an approval deny, DM
   cancel, `DELETE /jobs`, shutdown), or `DELETE /jobs` stopped it while
@@ -947,7 +948,9 @@ the cancel came from (#121):
   `read_session(session_id: "<subagent-session-id>")`. It is queued on the
   parent agent's run queue, so it lands after any run in progress rather than
   between that run's tool call and its result. The web UI renders it as an
-  error block.
+  error block. During shutdown the record is dropped, as the notification
+  run was before #121: the run queue is already closed, and the stopped run
+  may still be saving its tool results.
 
 In both cases this event and the persisted `subagent_completion` marker carry
 the status and the subagent's session ID, and report the summary as
