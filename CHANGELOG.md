@@ -98,12 +98,10 @@ Each item below changes behaviour for a deployment that has not set the knob exp
   longer teach agents to poll.
 - Subagent sessions are filed under the agent that ran them, with session-keyed cancel
   controls and a status-only subagent status bar.
-- Cancelled background subagents outside an open job episode no longer start a
-  notification run, regardless of whether cancellation was direct, propagated from a
-  parent run, caused by job teardown, or caused by shutdown. The parent history gets a
-  model-visible record pointing to the subagent session; partial work remains readable
-  there, while the cancelled completion itself reports no summary. Open job episodes
-  keep their continuation run.
+- Stopping a parent run, or deleting a job, no longer starts a notification run for the
+  background subagents it cancels; the parent's history gets a record pointing to each
+  subagent's session instead. Cancelling one subagent directly still starts a run, which
+  now tells the agent the cancel was deliberate and not to redo the work unless asked.
 - An agent with no `personality.md` is no longer handed the first-time setup interview
   ("Ask the user …") on turns no human started. Peer DM turns, notification runs
   (subagent completions, DM ends) and scheduled job runs now get the agent's normal system

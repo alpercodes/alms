@@ -4,7 +4,7 @@
 
 use super::{
     create_recurring_job, seed_alice_bob, test_app_state, test_app_state_with_mock_llm,
-    test_app_state_with_sqlite,
+    test_app_state_with_sqlite, wait_for_cancelled_record,
 };
 use crate::server::AppState;
 use alms_coordinator::message_bus::{MessageSource, RunTrigger};
@@ -690,6 +690,11 @@ async fn conversation_ended_for_peer_does_not_touch_episode() {
 /// pending on an open episode resolves it — the notification run (already
 /// routed to the parent == job session) is stamped with the job id, and the
 /// #1041 marker-before-SSE ordering is preserved.
+///
+/// #121 / PR #190: a cancelled completion inside the open episode keeps that
+/// behaviour whether it was stopped or cancelled directly — its reserved
+/// continuation run starts, with the plain completion notification as its
+/// input, and no `subagent_cancelled` record is queued.
 #[tokio::test]
 async fn subagent_completion_resolves_episode_and_stamps_job_id() {
     let (state, shutdown_token, _cr, _tr, _dr) = test_app_state();
@@ -715,6 +720,11 @@ async fn subagent_completion_resolves_episode_and_stamps_job_id() {
         .session_manager
         .get_or_create(AgentId::new(), "cancelled-subagent")
         .id;
+    let direct_task_id = TaskId::new();
+    let direct_subagent_session_id = state
+        .session_manager
+        .get_or_create(AgentId::new(), "directly-cancelled-subagent")
+        .id;
     assert!(matches!(
         state.job_episodes.on_run_complete(
             job_id,
@@ -722,56 +732,96 @@ async fn subagent_completion_resolves_episode_and_stamps_job_id() {
             vec![],
             vec![
                 (task_id.0, subagent_session_id),
-                (cancelled_task_id.0, cancelled_subagent_session_id)
+                (cancelled_task_id.0, cancelled_subagent_session_id),
+                (direct_task_id.0, direct_subagent_session_id),
             ]
         ),
         crate::runs::job_episode::RunCompletion::Open
     ));
 
+    let mut expected_inputs = Vec::new();
     let (test_tx, test_rx) = mpsc::unbounded_channel();
-    test_tx
-        .send(SubagentCompletion {
-            task_id,
-            subagent_name: Some("researcher".to_string()),
-            status: TaskStatus::Completed,
-            summary: "Done.".to_string(),
-            parent_session_id: job_session_id,
-            parent_agent_id: agent_id,
-            subagent_session_id,
-            task_description: Some("investigate".to_string()),
-            tool_count: Some(1),
-            duration_ms: Some(10),
-            token_usage: None,
-            parent_tool_invocation_id: None,
-        })
-        .unwrap();
-    test_tx
-        .send(SubagentCompletion {
-            task_id: cancelled_task_id,
-            subagent_name: Some("cancelled-researcher".to_string()),
-            status: TaskStatus::Cancelled,
-            summary: "[no content]".to_string(),
-            parent_session_id: job_session_id,
-            parent_agent_id: agent_id,
-            subagent_session_id: cancelled_subagent_session_id,
-            task_description: Some("investigate".to_string()),
-            tool_count: None,
-            duration_ms: Some(5),
-            token_usage: None,
-            parent_tool_invocation_id: None,
-        })
-        .unwrap();
+    let mut send = |completion: SubagentCompletion| {
+        expected_inputs.push(crate::runs::notifications::format_completion_notification(
+            &completion,
+        ));
+        test_tx.send(completion).unwrap();
+    };
+    send(SubagentCompletion {
+        task_id,
+        subagent_name: Some("researcher".to_string()),
+        status: TaskStatus::Completed,
+        cancelled_directly: false,
+        summary: "Done.".to_string(),
+        parent_session_id: job_session_id,
+        parent_agent_id: agent_id,
+        subagent_session_id,
+        task_description: Some("investigate".to_string()),
+        tool_count: Some(1),
+        duration_ms: Some(10),
+        token_usage: None,
+        parent_tool_invocation_id: None,
+    });
+    // Stopped (its parent run's token fired).
+    send(SubagentCompletion {
+        task_id: cancelled_task_id,
+        subagent_name: Some("cancelled-researcher".to_string()),
+        status: TaskStatus::Cancelled,
+        cancelled_directly: false,
+        summary: "[no content]".to_string(),
+        parent_session_id: job_session_id,
+        parent_agent_id: agent_id,
+        subagent_session_id: cancelled_subagent_session_id,
+        task_description: Some("investigate".to_string()),
+        tool_count: None,
+        duration_ms: Some(5),
+        token_usage: None,
+        parent_tool_invocation_id: None,
+    });
+    // Cancelled directly from its chip while the episode is open.
+    send(SubagentCompletion {
+        task_id: direct_task_id,
+        subagent_name: Some("direct-researcher".to_string()),
+        status: TaskStatus::Cancelled,
+        cancelled_directly: true,
+        summary: "[no content]".to_string(),
+        parent_session_id: job_session_id,
+        parent_agent_id: agent_id,
+        subagent_session_id: direct_subagent_session_id,
+        task_description: Some("investigate".to_string()),
+        tool_count: None,
+        duration_ms: Some(5),
+        token_usage: None,
+        parent_tool_invocation_id: None,
+    });
     drop(test_tx);
     crate::runs::notifications::completion_notification_loop(test_rx, state.clone()).await;
 
-    // The continuation run is on the job session and job-stamped.
+    // Each completion gets its continuation run, on the job session and
+    // job-stamped, with the unchanged completion notification as input.
     let runs = state.run_manager.list_by_session(job_session_id, 10);
     assert_eq!(
         runs.len(),
-        2,
-        "both normal and cancelled completions in the open episode need continuation runs"
+        3,
+        "normal, stopped and directly cancelled completions in the open episode \
+         all need continuation runs"
     );
     assert!(runs.iter().all(|run| run.job_id == Some(job_id)));
+    let mut inputs: Vec<_> = runs.iter().map(|run| run.input.clone()).collect();
+    inputs.sort();
+    expected_inputs.sort();
+    assert_eq!(inputs, expected_inputs);
+    let history = state.session_manager.get_history(job_session_id).unwrap();
+    assert!(
+        !history.iter().any(|m| {
+            m.metadata
+                .as_ref()
+                .and_then(|meta| meta.get("type"))
+                .and_then(|v| v.as_str())
+                == Some("subagent_cancelled")
+        }),
+        "an episode continuation replaces the stop record"
+    );
 
     // The pending entry was consumed (episode open with 0 pending, or —
     // if the enqueued continuation already failed fast in the background —
@@ -1132,19 +1182,43 @@ async fn cancel_job_teardown_leaves_no_runs_for_the_job() {
     crate::runs::notifications::run_trigger_loop(replay_rx, state.clone()).await;
 
     // Process the SubagentCompletion(Cancelled) the teardown's subagent
-    // cancel produces, exactly as production's completion loop would.
+    // stop produces, exactly as production's completion loop would. Teardown
+    // counts as a stop, so the completion is not marked `cancelled_directly`
+    // (pinned against the real coordinator by
+    // `delete_job_stops_a_live_subagent_without_a_run`).
     let (test_tx, test_rx) = mpsc::unbounded_channel();
     test_tx
         .send(SubagentCompletion {
             task_id,
             subagent_name: Some("researcher".to_string()),
             status: TaskStatus::Cancelled,
+            cancelled_directly: false,
             summary: "[no content]".to_string(),
             parent_session_id: job_session_id,
             parent_agent_id: alice_id,
             subagent_session_id: sub_session_id,
             task_description: Some("investigate".to_string()),
-            tool_count: Some(0),
+            tool_count: None,
+            duration_ms: Some(5),
+            token_usage: None,
+            parent_tool_invocation_id: None,
+        })
+        .unwrap();
+    // The operator cancelled another of the job's subagents from its chip
+    // just before deleting the job. A direct cancel asks for a notification
+    // run, and the job-context guard must suppress it.
+    test_tx
+        .send(SubagentCompletion {
+            task_id: TaskId::new(),
+            subagent_name: Some("writer".to_string()),
+            status: TaskStatus::Cancelled,
+            cancelled_directly: true,
+            summary: "[no content]".to_string(),
+            parent_session_id: job_session_id,
+            parent_agent_id: alice_id,
+            subagent_session_id: sub_session_id,
+            task_description: Some("draft".to_string()),
+            tool_count: None,
             duration_ms: Some(5),
             token_usage: None,
             parent_tool_invocation_id: None,
@@ -1157,6 +1231,7 @@ async fn cancel_job_teardown_leaves_no_runs_for_the_job() {
             task_id: TaskId::new(),
             subagent_name: Some("researcher".to_string()),
             status: TaskStatus::Completed,
+            cancelled_directly: false,
             summary: "Natural completion racing job teardown.".to_string(),
             parent_session_id: job_session_id,
             parent_agent_id: alice_id,
@@ -1178,6 +1253,13 @@ async fn cancel_job_teardown_leaves_no_runs_for_the_job() {
         job_runs.is_empty(),
         "no run may be spawned on the cancelled job's session by teardown \
          signals; got {job_runs:?}"
+    );
+    // The stopped subagent is still recorded: its queued record lands on the
+    // job session, next to the lifecycle marker.
+    let record = wait_for_cancelled_record(&state, job_session_id).await;
+    assert_eq!(
+        record.metadata.as_ref().unwrap()["task_id"],
+        task_id.0.to_string().as_str()
     );
 
     // #1258: teardown ends the DM with `UserCancelled` — an INTERRUPTED end,
@@ -1298,6 +1380,111 @@ async fn cancel_job_cancels_unstamped_run_on_its_job_session() {
     shutdown_token.cancel();
 }
 
+/// #121 / PR #190: `DELETE /jobs` stops a LIVE pending subagent as a stop,
+/// not a direct cancel. The operator deleted the whole job, so the real
+/// completion the coordinator emits is not marked `cancelled_directly`, no
+/// notification run starts on the job session, and the stop record is
+/// queued there instead. Without this, teardown going through
+/// `cancel_subagent_by_session` would mark the completion direct, and only
+/// the job-context guard would stand between it and a run.
+#[tokio::test]
+async fn delete_job_stops_a_live_subagent_without_a_run() {
+    use alms_test_support::{Canned, ScriptedLlm};
+    use axum::response::IntoResponse as _;
+    use std::time::Duration;
+
+    // The subagent's LLM call never answers, so it is still running when the
+    // job is deleted however the runtime interleaves the two tasks.
+    let llm = ScriptedLlm::always(Canned::json(200, "{}").after(Duration::from_secs(3600))).await;
+    let (state, shutdown_token, mut completion_rx, _tr, _dr) =
+        crate::test_support::TestAppState::new()
+            .llm_config(alms_runtime::LlmConfig {
+                base_url: llm.base_url(),
+                api_key: "fake-key-for-test".to_string(),
+                timeout_secs: 600,
+                stream_chunk_timeout_secs: 600,
+                ..alms_runtime::LlmConfig::default()
+            })
+            .build_with_channels();
+    let agent_id = AgentId::new();
+    let job_id = create_recurring_job(&state, agent_id, "spawn researcher");
+    let job_session_id = state
+        .session_manager
+        .get_or_create(agent_id, format!("job_{}", job_id.0))
+        .id;
+
+    // Turn 1 dispatched a background subagent; the episode stays open on it.
+    let (task_id, sub_session_id) = state
+        .coordinator
+        .spawn_subagent(
+            alms_coordinator::SubagentRequest {
+                task: "long research".to_string(),
+                parent_session: job_session_id,
+                parent_agent_id: agent_id,
+                parent_run_id: None,
+                subagent_name: None,
+                parent_tool_invocation_id: None,
+            },
+            None,
+            true,
+            None,
+        )
+        .await
+        .expect("spawn_subagent should succeed");
+    let turn1 = RunId::new();
+    state
+        .job_episodes
+        .open(job_id, job_session_id, agent_id, turn1);
+    assert!(matches!(
+        state.job_episodes.on_run_complete(
+            job_id,
+            turn1,
+            vec![],
+            vec![(task_id.0, sub_session_id)]
+        ),
+        crate::runs::job_episode::RunCompletion::Open
+    ));
+
+    let response = crate::jobs::cancel_job(
+        axum::extract::State(state.clone()),
+        axum::extract::Path(job_id),
+    )
+    .await;
+    assert_eq!(
+        response.into_response().status(),
+        axum::http::StatusCode::OK
+    );
+
+    let completion = tokio::time::timeout(Duration::from_secs(10), completion_rx.recv())
+        .await
+        .expect("teardown must end the live subagent")
+        .expect("the subagent emits its completion");
+    assert_eq!(completion.task_id, task_id);
+    assert_eq!(completion.status, TaskStatus::Cancelled);
+    assert!(
+        !completion.cancelled_directly,
+        "deleting the job stops its subagents; it is not a direct cancel"
+    );
+
+    let (test_tx, test_rx) = mpsc::unbounded_channel();
+    test_tx.send(completion).unwrap();
+    drop(test_tx);
+    crate::runs::notifications::completion_notification_loop(test_rx, state.clone()).await;
+
+    let job_runs = state.run_manager.list_by_session(job_session_id, 10);
+    assert!(
+        job_runs.is_empty(),
+        "teardown must not start a run on the deleted job's session; got {job_runs:?}"
+    );
+    let record = wait_for_cancelled_record(&state, job_session_id).await;
+    assert_eq!(
+        record.metadata.as_ref().unwrap()["subagent_session_id"],
+        sub_session_id.0.to_string().as_str()
+    );
+
+    shutdown_token.cancel();
+}
+
 /// The #1206 suppression must key on explicit operator-cancel intent. Scenario:
 /// a one-shot dispatches a background subagent, hits the four-hour deadline,
 /// and closes as `Completed`; the subagent keeps running and later completes.
@@ -1326,6 +1513,7 @@ async fn spent_one_shot_detached_subagent_completion_not_suppressed() {
             task_id: TaskId::new(),
             subagent_name: Some("researcher".to_string()),
             status: TaskStatus::Completed,
+            cancelled_directly: false,
             summary: "Late detached result.".to_string(),
             parent_session_id: job_session_id,
             parent_agent_id: agent_id,

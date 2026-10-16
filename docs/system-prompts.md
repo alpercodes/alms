@@ -21,6 +21,7 @@ files (`personality.md`, `goals.md`, `memories.md`, `user.md`).
 | `dm_ended_with_history.md` | DM conversation ended notification template with embedded transcript. Contains `{reason}` and `{history}` placeholders. | `format_dm_ended_notification()` in `crates/alms-gateway/src/runs.rs` |
 | `dm_ended_no_history.md` | Fallback DM conversation ended notification when history is unavailable. Contains `{reason}` and `{from}` placeholders. Points agent to `read_messages`. | `format_dm_ended_notification()` in `crates/alms-gateway/src/runs.rs` |
 | `subagent_completed.md` | Background subagent completion notification template. Contains `{label}`, `{status}`, `{summary}`, and `{follow_up}` placeholders. | `format_completion_notification()` in `crates/alms-gateway/src/runs.rs` |
+| `subagent_cancelled.md` | Notification for a background subagent the operator cancelled directly (#121). Says the cancel was deliberate and that the parent should not re-run it or redo its work unless the operator asks. Contains `{label}` and `{session_id}` placeholders. | `format_directly_cancelled_notification()` in `crates/alms-gateway/src/runs/notifications.rs` |
 
 ## When Each Prompt Is Used
 

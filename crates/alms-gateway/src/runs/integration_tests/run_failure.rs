@@ -24,6 +24,7 @@ fn format_completion_notification_for_failed_subagent() {
         task_id: TaskId::new(),
         subagent_name: Some("researcher".to_string()),
         status: TaskStatus::Failed,
+        cancelled_directly: false,
         summary: "Error: API rate limit exceeded after 3 tool calls".to_string(),
         parent_session_id: SessionId::new(),
         parent_agent_id: AgentId::new(),
@@ -62,12 +63,13 @@ fn format_completion_notification_for_cancelled_subagent() {
         task_id: TaskId::new(),
         subagent_name: Some("writer".to_string()),
         status: TaskStatus::Cancelled,
+        cancelled_directly: false,
         summary: "[no content]".to_string(),
         parent_session_id: SessionId::new(),
         parent_agent_id: AgentId::new(),
         subagent_session_id: SessionId::new(),
         task_description: None,
-        tool_count: Some(1),
+        tool_count: None,
         duration_ms: Some(1500),
         token_usage: None,
         parent_tool_invocation_id: None,
@@ -77,6 +79,85 @@ fn format_completion_notification_for_cancelled_subagent() {
     assert!(
         notification.contains("cancelled"),
         "notification should indicate the subagent was cancelled"
+    );
+}
+
+/// #121 / PR #190: the direct-cancel notification for an unnamed subagent
+/// labels it by task id, as the completion notification does, and points at
+/// the subagent's session.
+#[test]
+fn format_directly_cancelled_notification_for_unnamed_subagent() {
+    let task_id = TaskId::new();
+    let subagent_session_id = SessionId::new();
+    let completion = SubagentCompletion {
+        task_id,
+        subagent_name: None,
+        status: TaskStatus::Cancelled,
+        cancelled_directly: true,
+        summary: "[no content]".to_string(),
+        parent_session_id: SessionId::new(),
+        parent_agent_id: AgentId::new(),
+        subagent_session_id,
+        task_description: None,
+        tool_count: None,
+        duration_ms: Some(1500),
+        token_usage: None,
+        parent_tool_invocation_id: None,
+    };
+
+    let notification =
+        crate::runs::notifications::format_directly_cancelled_notification(&completion);
+    assert!(
+        notification.starts_with(&format!(
+            "[Subagent notification] The operator cancelled background subagent \
+             (task {}) before it finished.",
+            task_id.0
+        )),
+        "{notification}"
+    );
+    assert!(
+        notification.contains(&format!(
+            "read_session(session_id: \"{}\")",
+            subagent_session_id.0
+        )),
+        "{notification}"
+    );
+    assert!(
+        !notification.contains('{'),
+        "every placeholder is filled: {notification}"
+    );
+}
+
+/// #121 / PR #190 (Tim's S3): the stop record names a named subagent and
+/// reads as a plain account for the operator, who sees it rendered as an
+/// error block on reload.
+#[test]
+fn format_cancelled_subagent_record_for_named_subagent() {
+    let subagent_session_id = SessionId::new();
+    let completion = SubagentCompletion {
+        task_id: TaskId::new(),
+        subagent_name: Some("researcher".to_string()),
+        status: TaskStatus::Cancelled,
+        cancelled_directly: false,
+        summary: "[no content]".to_string(),
+        parent_session_id: SessionId::new(),
+        parent_agent_id: AgentId::new(),
+        subagent_session_id,
+        task_description: None,
+        tool_count: None,
+        duration_ms: Some(1500),
+        token_usage: None,
+        parent_tool_invocation_id: None,
+    };
+
+    assert_eq!(
+        crate::runs::notifications::format_cancelled_subagent_record(&completion),
+        format!(
+            "Background subagent \"researcher\" (session_id: {id}) was cancelled before it \
+             finished and returned no result. Its session keeps whatever it did: \
+             read_session(session_id: \"{id}\").",
+            id = subagent_session_id.0
+        )
     );
 }
 
@@ -94,6 +175,7 @@ fn format_completion_notification_for_unnamed_subagent_points_at_session_id_read
         task_id: TaskId::new(),
         subagent_name: None, // ephemeral / unnamed
         status: TaskStatus::Completed,
+        cancelled_directly: false,
         summary: "Research finished (truncated summary)".to_string(),
         parent_session_id: SessionId::new(),
         parent_agent_id: AgentId::new(),
