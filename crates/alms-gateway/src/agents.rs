@@ -244,7 +244,9 @@ pub async fn create_agent(
     // side effects. A deleted agent can leave identity files behind; refusing
     // non-scaffold contents prevents a new registry ID from inheriting them.
     // The SQLite UNIQUE-name constraint arbitrates name races, but a late
-    // named-subagent write can still race this filesystem check.
+    // write from a named subagent, or from a run of the just-deleted agent
+    // still in flight (`DELETE /agents` does not cancel its runs), can still
+    // race this filesystem check.
     let worktree_mode = req.worktree_mode.unwrap_or_default();
     match store.load_agent_by_name(&req.name) {
         Ok(Some(_)) => {
