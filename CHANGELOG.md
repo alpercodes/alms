@@ -309,9 +309,11 @@ one.
   `static/ui-dist/` bundle is rebuilt.
 - `quinn-proto` 0.11.15 -> 0.11.19 to clear RUSTSEC-2026-0338, RUSTSEC-2026-0339,
   RUSTSEC-2026-0340, RUSTSEC-2026-0341 and RUSTSEC-2026-0342 (QUIC frame handling: two
-  remote panics and three unbounded-memory bugs; 0340 and 0341 are high), and `rustls`
-  0.23.45 -> 0.23.46 to clear RUSTSEC-2026-0346, RUSTSEC-2026-0347, RUSTSEC-2026-0348 and
-  RUSTSEC-2026-0349 (low to medium). Neither is reached. QUIC is not compiled into any ALMS
+  remote panics and three unbounded-memory bugs; 0340 and 0341 are high; 0.11.19 also fixes
+  GHSA-53rm-773f-4q8c and GHSA-wppq-2f6r-wfvm (high), which RustSec has not imported yet),
+  and `rustls` 0.23.45 -> 0.23.46 to clear RUSTSEC-2026-0346, RUSTSEC-2026-0347,
+  RUSTSEC-2026-0348 and RUSTSEC-2026-0349 (low to medium). v0.2.3 carries quinn-proto
+  0.11.13 and rustls 0.23.36, in range for all but 0341 and 0347. Neither is reached. QUIC is not compiled into any ALMS
   build: `quinn` is in `Cargo.lock` only because reqwest's `rustls-tls` feature names it as
   a weak dependency (`quinn?/ring`), and cargo locks optional dependencies named that way
   (rust-lang/cargo#10801). Only reqwest's `http3` feature would build it, and ALMS does not
