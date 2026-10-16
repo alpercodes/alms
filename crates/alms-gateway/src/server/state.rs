@@ -391,12 +391,13 @@ impl AppState {
             // provider switches). With the old `with_provider`-only
             // call, `apply_provider` would clear the previous provider's
             // key and never repopulate from the env-based provider entry
-            // — and later `resolve_agent_config` only re-checks
-            // `SecretsStore` via `with_secrets`, never the provider
-            // entry's env/static fields. Deployments configuring keys
-            // exclusively via `[llm.providers.<name>].api_key_env` (no
-            // `alms auth set`) would silently boot with an empty key
-            // after a persisted provider switch.
+            // — and `resolve_agent_config`'s `with_secrets` then
+            // re-checked only `SecretsStore`, never the provider entry's
+            // env/static fields (it falls back to them too now).
+            // Deployments configuring keys exclusively via
+            // `[llm.providers.<name>].api_key_env` (no `alms auth set`)
+            // would silently boot with an empty key after a persisted
+            // provider switch.
             //
             // Codex follow-up on #1081 (P1, Finding 6): an operator who
             // PATCH-switched the server-default provider to `anthropic`

@@ -240,6 +240,27 @@ mod tests {
         assert_ne!(summary.default_model(), agent_model);
     }
 
+    /// A `summary_provider` naming the agent's own provider re-resolves the
+    /// key, so a key removed from the store is not sent on the summary
+    /// call either. The fixture's client carries `sk-ant-runtime`, as the
+    /// gateway's shared client carries the key it booted with.
+    #[test]
+    fn same_provider_summary_drops_a_key_removed_from_the_store() {
+        let (llm, mut secrets) = fixtures(None, None);
+        let with_key =
+            build_summary_client(&llm, Some("anthropic"), Some("claude-x"), Some(&secrets));
+        assert!(with_key.has_api_key());
+
+        assert!(secrets.remove_key("anthropic").unwrap());
+        let summary =
+            build_summary_client(&llm, Some("anthropic"), Some("claude-x"), Some(&secrets));
+        assert_eq!(summary.provider(), "anthropic");
+        assert!(
+            !summary.has_api_key(),
+            "the summary client must not carry a key the store no longer has"
+        );
+    }
+
     /// `secrets = None` happy path: with explicit `summary_model`, the model
     /// reaches the wire and the leak guard does not fire.
     #[test]

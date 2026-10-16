@@ -761,7 +761,8 @@ fn find_git_exe_dir_on_path() -> Option<PathBuf> {
 /// If Landlock is not supported by the running kernel, the command does not
 /// run: at the crate's default `BestEffort` level the builder calls succeed
 /// and `restrict_self` returns `NotEnforced`, which the closure below turns
-/// into a spawn error (see `docs/security-model.md` § 4.4).
+/// into a spawn error, [`landlock_not_enforced_error`] (see
+/// `docs/security-model.md` § 4.4).
 ///
 /// `extra_exec_paths` are granted the same read+execute access as the
 /// standard system paths. The builtin shell engine (#1143) passes the ALMS
@@ -819,15 +820,27 @@ fn apply_landlock_sandbox(
     let sys_paths = system_read_paths;
 
     // SAFETY: pre_exec runs in the child process after fork() but before
-    // exec(). The Landlock syscalls themselves are async-signal-safe. The
-    // eprintln! calls below are not: they take std's process-wide stderr
-    // lock and may allocate. They do not run only on rare error paths: on a
-    // Linux kernel without Landlock the `NotEnforced` branch runs on every
-    // sandboxed call. If fork() lands while another thread holds the stderr
-    // lock (the daemon's tracing layer writes through stderr), the child
-    // blocks in eprintln! and the parent blocks in spawn() waiting for it;
-    // that is from reading std, not reproduced. Nor do they help debugging:
-    // nothing reads the child's stderr once the spawn has failed.
+    // exec(). The parent is multi-threaded, and the child has only the
+    // forking thread: a lock another thread held at fork() stays held in
+    // the child forever. So the closure must not take one. It does not
+    // print: std's stderr is behind a process-wide lock that the daemon's
+    // tracing layer takes for every line it writes, and the closure used to
+    // `eprintln!` on its failure paths, including the `NotEnforced` path
+    // that runs on every sandboxed call on a kernel without Landlock, so a
+    // fork() landing while a log line was being written could leave the
+    // child blocked and the parent blocked in spawn(). (That is from
+    // reading std; it was not reproduced.) What the closure does run is
+    // system calls: the Landlock ones and prctl(PR_SET_NO_NEW_PRIVS)
+    // inside the `landlock` crate, and stat()/fstat()/open(O_PATH) on the
+    // granted paths. std passes each path to the kernel as a C string
+    // built on the stack when it is shorter than 384 bytes, and allocates
+    // for a longer one. Both kernel-without-Landlock exits return
+    // [`landlock_not_enforced_error`], which does not allocate. The other
+    // error paths (ruleset creation, opening the sandbox root, adding a
+    // rule, restrict_self failing) still format a message, which
+    // allocates; they run only when setting up the ruleset actually fails,
+    // and the message never reaches the parent, which gets only an errno
+    // (EINVAL for these, as they carry none).
     unsafe {
         cmd.pre_exec(move || {
             use landlock::{
@@ -855,27 +868,25 @@ fn apply_landlock_sandbox(
                 | AccessFs::RemoveDir
                 | AccessFs::Truncate;
 
+            // Any failure to build or enforce the ruleset is a hard error:
+            // the command must NOT run unsandboxed when sandboxing was
+            // requested. Nothing below writes to stderr (see SAFETY above).
             let ruleset = match Ruleset::default().handle_access(AccessFs::from_all(abi)) {
                 Ok(r) => r,
-                Err(e) => {
-                    // Not reached on a kernel without Landlock: at the default
-                    // `BestEffort` level, landlock 0.4 returns an error here only
-                    // for an empty or unknown access set, and `from_all(ABI::V5)`
-                    // is neither. Such a kernel ends at `NotEnforced` below.
-                    eprintln!("[alms] Landlock not supported by kernel, running unsandboxed: {e}");
-                    return Ok(());
+                Err(_) => {
+                    // Not reached today: at the default `BestEffort` level,
+                    // landlock 0.4 returns an error here only for an empty or
+                    // unknown access set, and `from_all(ABI::V5)` is neither;
+                    // a kernel without Landlock ends at `NotEnforced` below.
+                    // Refusing here too keeps the command from running
+                    // unsandboxed should that ever change.
+                    return Err(landlock_not_enforced_error());
                 }
             };
-
-            // From this point on, any failure to create or enforce the
-            // ruleset is a hard error — we must NOT run the command
-            // unsandboxed when sandboxing was requested. That includes a
-            // kernel without Landlock, which reaches `NotEnforced`.
 
             let ruleset = match ruleset.create() {
                 Ok(r) => r,
                 Err(e) => {
-                    eprintln!("[alms] Landlock ruleset create failed: {e}");
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::PermissionDenied,
                         format!("Landlock ruleset creation failed: {e}"),
@@ -887,10 +898,6 @@ fn apply_landlock_sandbox(
             let fd = match PathFd::new(&root_for_closure) {
                 Ok(fd) => fd,
                 Err(e) => {
-                    eprintln!(
-                        "[alms] Landlock: cannot open sandbox root '{}': {e}",
-                        root_for_closure.display()
-                    );
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::PermissionDenied,
                         format!(
@@ -904,7 +911,6 @@ fn apply_landlock_sandbox(
             let ruleset = match ruleset.add_rule(rule) {
                 Ok(r) => r,
                 Err(e) => {
-                    eprintln!("[alms] Landlock: failed to add sandbox root rule: {e}");
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::PermissionDenied,
                         format!("Landlock: failed to add sandbox root rule: {e}"),
@@ -925,10 +931,6 @@ fn apply_landlock_sandbox(
                     ruleset = match ruleset.add_rule(rule) {
                         Ok(r) => r,
                         Err(e) => {
-                            eprintln!(
-                                "[alms] Landlock: failed to add system path rule for {}: {e}",
-                                sys_path.display()
-                            );
                             return Err(std::io::Error::new(
                                 std::io::ErrorKind::PermissionDenied,
                                 format!("Landlock: failed to add system path rule: {e}"),
@@ -940,16 +942,13 @@ fn apply_landlock_sandbox(
 
             match ruleset.restrict_self() {
                 Ok(status) => {
+                    // A kernel without Landlock (or with the syscalls
+                    // blocked) ends here on every sandboxed call.
                     if matches!(status.ruleset, RulesetStatus::NotEnforced) {
-                        eprintln!("[alms] Landlock: ruleset was not enforced by kernel");
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::PermissionDenied,
-                            "Landlock ruleset was not enforced by kernel",
-                        ));
+                        return Err(landlock_not_enforced_error());
                     }
                 }
                 Err(e) => {
-                    eprintln!("[alms] Landlock restrict_self failed: {e}");
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::PermissionDenied,
                         format!("Landlock restrict_self failed: {e}"),
@@ -965,6 +964,20 @@ fn apply_landlock_sandbox(
         sandbox_root = %canonical_root.display(),
         "Landlock filesystem sandbox configured for child process"
     );
+}
+
+/// The error the Landlock `pre_exec` closure fails a sandboxed spawn with
+/// when the kernel will not enforce the ruleset: `EOPNOTSUPP`, which the
+/// parent's `spawn()` reports as `Operation not supported (os error 95)`.
+///
+/// Built from a raw errno for two reasons. It is constructed after `fork`,
+/// and `from_raw_os_error` does not allocate. And std sends the parent
+/// only the errno of the closure's error (`EINVAL` for an error that has
+/// none, which is what this path returned before), so `EOPNOTSUPP` is what
+/// tells this failure apart from the closure's other ones.
+#[cfg(target_os = "linux")]
+fn landlock_not_enforced_error() -> std::io::Error {
+    std::io::Error::from_raw_os_error(libc::EOPNOTSUPP)
 }
 
 /// Wrap a command string with a pwd marker so we can detect cwd changes.
@@ -1203,6 +1216,45 @@ mod tests {
     fn test_extract_cwd_no_marker() {
         let output = "file1.txt\nfile2.txt\n";
         assert_eq!(extract_cwd_from_output(output, TEST_MARKER), None);
+    }
+
+    /// What a sandboxed spawn on a kernel without Landlock fails with, as
+    /// the parent sees it.
+    ///
+    /// No CI kernel lacks Landlock, so this does not reach the closure's
+    /// `NotEnforced` branch. It returns the same error from a `pre_exec` of
+    /// its own, through std's real fork/exec, which is the part that
+    /// decides what the parent gets: the child's errno, or `EINVAL` when
+    /// the error carries none.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn landlock_not_enforced_error_reaches_the_parent_as_eopnotsupp() {
+        use std::os::unix::process::CommandExt;
+
+        fn spawn_failing_with(make: fn() -> std::io::Error) -> std::io::Error {
+            let mut cmd = std::process::Command::new("/bin/true");
+            // SAFETY: the closure only calls `make`, and both `make`s below
+            // build an `io::Error` without allocating or taking a lock.
+            unsafe {
+                cmd.pre_exec(move || Err(make()));
+            }
+            cmd.spawn()
+                .expect_err("the pre_exec closure failed, so spawn must too")
+        }
+
+        let err = spawn_failing_with(landlock_not_enforced_error);
+        assert_eq!(err.raw_os_error(), Some(libc::EOPNOTSUPP));
+        assert_eq!(err.kind(), std::io::ErrorKind::Unsupported);
+        assert!(
+            err.to_string().contains("Operation not supported"),
+            "unexpected rendering: {err}"
+        );
+
+        // Contrast: an error with no errno, as this path returned before
+        // (and the closure's other failure paths still do), reaches the
+        // parent as EINVAL.
+        let err = spawn_failing_with(|| std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+        assert_eq!(err.raw_os_error(), Some(libc::EINVAL));
     }
 
     #[test]

@@ -30,6 +30,7 @@ mod config_resolution;
 mod dm_end;
 mod job_episodes;
 mod job_queue_visibility;
+mod key_revocation;
 mod notifications;
 mod queue;
 mod read_api;

@@ -25,6 +25,17 @@ fn test_invalid_sandbox_root_fails_closed() {
         err.contains("sandbox_root"),
         "Error should mention sandbox_root: {err}"
     );
+    // The empty value is offered as a way past the error, not as an opt-out:
+    // the gateway re-roots every run at the project root regardless.
+    assert!(
+        err.contains("Fix the path, or set sandbox_root = \"\"")
+            && err.contains("Gateway runs are rooted at the project root either way"),
+        "unexpected remedy text: {err}"
+    );
+    assert!(
+        !err.contains("opt out of sandboxing"),
+        "an empty sandbox_root opts out of nothing in gateway runs: {err}"
+    );
 }
 
 #[test]

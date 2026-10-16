@@ -91,13 +91,13 @@ tool_gap_fill      = false
 drop_empty_content = false
 ```
 
-API key precedence at gateway startup:
+API key precedence, at gateway startup and again as each run starts:
 
 1. `SecretsStore` — the value last written by `alms auth set <name> <key>`.
 2. The provider entry's `api_key_env` (read from the named environment variable).
 3. The provider entry's literal `api_key`.
 
-When resolution fails, the gateway logs a warning and continues; the first outgoing request will surface an auth error from the upstream.
+When resolution fails, the gateway logs a warning and continues; the first outgoing request will surface an auth error from the upstream. Because each run resolves again, removing a stored key (`alms auth remove <name>` against a running gateway, or `DELETE /auth/keys/{provider}`) applies to the next run on every run path, Telegram's included: it falls back to `api_key_env` / `api_key`, or sends no key.
 
 The `SecretsStore` is loaded once, at boot — so a key written to the file behind a running gateway's back is invisible to it until a restart. `alms auth set <name> <key>` and `alms auth remove <name>` therefore probe `GET /health` at `--url` (default `http://127.0.0.1:8080`, or `ALMS_GATEWAY_URL`) before deciding where the change goes.
 
