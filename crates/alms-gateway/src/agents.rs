@@ -2287,6 +2287,36 @@ mod tests {
         assert_eq!(agents[0].name, "Atlas");
     }
 
+    /// A live agent's name reports `DUPLICATE_NAME`, not `WORKSPACE_EXISTS`.
+    ///
+    /// The registry lookup must run before the workspace check on every create,
+    /// not only in worktree mode: the `WORKSPACE_EXISTS` message says the name
+    /// "is free". The live agent's folder must hold data for this to pin the
+    /// order — a blank scaffold passes the workspace check, and the SQLite
+    /// UNIQUE constraint would then report `DUPLICATE_NAME` either way.
+    #[tokio::test]
+    async fn post_agents_reports_duplicate_name_before_workspace_conflict() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let workspace_dir = tmp.path().join("agents");
+        let state = TestAppState::new()
+            .in_memory_sqlite()
+            .workspace_dir(workspace_dir.clone())
+            .build();
+        let _ = create_agent(
+            axum::extract::State(state.clone()),
+            Json(create_req("atlas")),
+        )
+        .await
+        .expect("first create must succeed");
+        let memories = workspace_dir.join("atlas").join("memories.md");
+        std::fs::write(&memories, "live data").unwrap();
+
+        let (status, body) = create_agent_err(state.clone(), create_req("atlas")).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(err_code(&body), "DUPLICATE_NAME");
+        assert_eq!(std::fs::read_to_string(memories).unwrap(), "live data");
+    }
+
     #[tokio::test]
     async fn post_agents_refuses_workspace_left_by_deleted_agent() {
         let tmp = tempfile::TempDir::new().unwrap();

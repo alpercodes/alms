@@ -1167,6 +1167,42 @@ mod tests {
         );
     }
 
+    /// A live agent's name reports a duplicate name, not `WORKSPACE_EXISTS`,
+    /// whose message would say the name "is free". The live agent's folder
+    /// holds data so the workspace check would refuse it if it ran first.
+    #[test]
+    fn test_create_reports_duplicate_name_before_workspace_conflict() {
+        let store = new_store();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ws_dir = tmp.path().join("workspace");
+        let opts = || AgentCreateOpts {
+            name: "reviewer".into(),
+            description: None,
+            model: None,
+            posture: None,
+            provider: None,
+            thinking_budget_tokens: None,
+            reasoning_effort: None,
+            gemini_thinking_budget: None,
+            summary_provider: None,
+            summary_model: None,
+            worktree_mode: WorktreeMode::Off,
+            project_root: None,
+            default: false,
+            json: false,
+            workspace_dir: Some(&ws_dir),
+        };
+        agent_create(&store, opts()).unwrap();
+        let memories = ws_dir.join("reviewer").join("memories.md");
+        std::fs::write(&memories, "live data").unwrap();
+
+        let error = agent_create(&store, opts()).unwrap_err().to_string();
+
+        assert_eq!(error, "Agent name 'reviewer' already exists");
+        assert_eq!(store.list_agents().unwrap().len(), 1);
+        assert_eq!(std::fs::read_to_string(memories).unwrap(), "live data");
+    }
+
     #[test]
     fn test_set_default() {
         let store = new_store();
