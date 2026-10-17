@@ -773,7 +773,7 @@ Transient phase indicator emitted at key moments during the agent loop so the UI
 { "run_id": "<uuid>", "warning": {"code":"DM_EMPTY_REPLY_RETRY","message":"..."} }
 ```
 
-Emitted for non-fatal conditions that the frontend should display distinctly (yellow warning styling). Warning codes: `DM_EMPTY_REPLY_RETRY` (peer-triggered DM run produced no deliverable reply text -- nudging once to reply with text or use `ignore_message`; #1154), `DM_EMPTY_REPLY` (the nudge was exhausted -- the gateway ends the DM conversation with an `errored` reason so the peer is notified). When the warning originates from a subagent, the payload includes a `source_agent` field identifying which subagent emitted it.
+Emitted for non-fatal conditions that the frontend should display distinctly (yellow warning styling). Warning codes: `DM_EMPTY_REPLY_RETRY` (peer-triggered DM run produced no deliverable reply text -- nudging once to reply with text or use `ignore_message`; #1154), `DM_EMPTY_REPLY` (the nudge was exhausted -- the gateway ends the DM conversation with an `errored` reason so the peer is notified), `WORKSPACE_PROMPT_TRUNCATED` (a workspace file did not fit the bytes this run's prompt budget left it, so the system prompt carries a partial window of it and a whole-file `workspace_write` replacement is refused until the agent has seen the whole file; emitted at most once per file per run, and the message names the agent, the file, its size and the bytes it was given). When the warning originates from a subagent, the payload includes a `source_agent` field identifying which subagent emitted it.
 
 `run_cancelled`
 ```json

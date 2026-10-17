@@ -266,16 +266,27 @@ impl AgentRuntime {
     /// Layer order is `base -> workspace -> tool_loop -> dm_addendum`, matching
     /// the assembly order documented in `docs/system-prompts.md`.
     ///
-    /// This is extracted as a helper to avoid three copies of the same pattern
-    /// (initial tool-loop rebuild, DM empty-reply retry rebuild).
-    pub(crate) fn rebuild_system_prompt_for_tool_loop(
+    /// `workspace_budget_bytes` must be the budget the run's initial context
+    /// was built with (`BuiltContext::workspace_budget_bytes`), not one
+    /// recomputed from the growing message array: reusing it is what keeps
+    /// an unchanged workspace byte-identical across tool batches.
+    ///
+    /// This is extracted as a helper so the two rebuilds in `agent_loop`
+    /// (after a tool batch, and before the DM empty-reply retry) share one
+    /// copy of the pattern.
+    pub(crate) fn rebuild_system_prompt_for_tool_loop_with_budget(
         &self,
         messages: &mut [crate::llm_types::LlmMessage],
         include_user: bool,
         dm_peer: Option<&str>,
+        workspace_budget_bytes: usize,
     ) {
         if !messages.is_empty() && messages[0].role == "system" {
-            let mut prompt = self.assemble_system_prompt(&self.config.system_prompt, include_user);
+            let mut prompt = self.assemble_system_prompt_with_budget(
+                &self.config.system_prompt,
+                include_user,
+                workspace_budget_bytes,
+            );
             prompt.push_str("\n\n");
             prompt.push_str(&self.config.prompts.tool_loop);
             if let Some(peer) = dm_peer {
