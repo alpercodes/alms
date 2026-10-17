@@ -611,9 +611,10 @@ mod tests {
     /// `workspace_write` lands.
     ///
     /// Every step is a real call on the real path — `build_system_prompt_prefix`
-    /// is the read the context build performs, `append_file` is what another
-    /// live instance of the same named agent does, and `execute` with no
-    /// `mode` is what an LLM that did not think to ask for one sends.
+    /// is the context build's read without a budget (the same bytes when every
+    /// file fits), `append_file` is what another live instance of the same
+    /// named agent does, and `execute` with no `mode` is what an LLM that did
+    /// not think to ask for one sends.
     ///
     /// **No seam is armed, and the test is still airtight.** The #1292/#1302
     /// seams exist to place a competitor *inside* a critical section, and the
@@ -748,12 +749,12 @@ mod tests {
     /// agent appends three memories during a run and then tidies up with an
     /// explicit `mode: "write"` built from the snapshot it was given.
     ///
-    /// Every step is a real call. `build_system_prompt_prefix` is the read
-    /// the context build performs; the three appends are `workspace_write`
-    /// calls the model made itself; the replacement is the model editing the
-    /// only copy of the file it holds. Before #1310 the result was a
-    /// well-formed `memories.md` with `- M3`, `- M4` and `- M5` silently
-    /// gone.
+    /// Every step is a real call. `build_system_prompt_prefix` is the context
+    /// build's read without a budget (the same bytes when every file fits);
+    /// the three appends are `workspace_write` calls the model made itself;
+    /// the replacement is the model editing the only copy of the file it
+    /// holds. Before #1310 the result was a well-formed `memories.md` with
+    /// `- M3`, `- M4` and `- M5` silently gone.
     ///
     /// No seam is armed and nothing races. The staleness is structural:
     /// `snapshot` is an immutable `String` captured before the appends and

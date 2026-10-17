@@ -242,8 +242,9 @@ Workspace files (personality / goals / memories / user) and episodic summaries a
 assembled into the system string by the budget-aware runtime context builder and
 `ContextBuilder::build_with_perspective` before the adapter sees them. Personality, goals
 and user files stay whole unless the run budget requires head windows; memories keeps a
-tail window of up to 4000 bytes. Truncation emits a `WORKSPACE_PROMPT_TRUNCATED` run
-warning. Within a run, every tool-loop rebuild reuses the run's workspace budget, so
+tail window of up to 4000 bytes. A window the run budget forces emits a
+`WORKSPACE_PROMPT_TRUNCATED` run warning; the fixed memories window alone does not.
+Within a run, every tool-loop rebuild reuses the run's workspace budget, so
 unchanged files are byte-identical on every request. Across runs, the budget is rounded
 down to a whole KiB and charges an episodic block at `run_summary_budget` rather than
 its length. It changes only when a turn's input moves it across a 1 KiB step (a step is

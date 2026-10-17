@@ -66,16 +66,15 @@ Each item below changes behaviour for a deployment that has not set the knob exp
 - **Workspace prompt content now shares a run-scoped context budget.**
   `personality.md`, `goals.md` and `user.md` remain whole unless the available budget
   requires a head window; `memories.md` keeps a tail window of up to 4000 bytes. When a
-  file is partial, its prompt marker explains the window, a `run_warning` with code
-  `WORKSPACE_PROMPT_TRUNCATED` names the agent and the file (once per file per run), and
-  a `workspace_write` replacement is refused until the agent has seen the whole file. A
-  `memories.md` past 4000 bytes, which was windowed silently before, now raises that
-  warning on every run. The same budget is reused after each tool batch, preserving
-  history space without shrinking unchanged workspace views, and it is rounded down to a
-  whole KiB so a windowed file usually keeps the same cut from one turn to the next.
-  `workspace_read` returns up to 12000 bytes, so an oversized file that is only partially
-  injected may still need operator editing or append-only changes before a complete
-  rewrite is possible.
+  file is partial, its prompt marker explains the window and a `workspace_write`
+  replacement is refused until the agent has seen the whole file. When the budget is what
+  cut it, a `run_warning` with code `WORKSPACE_PROMPT_TRUNCATED` also names the agent and
+  the file (once per file per run). The same budget is reused after each tool batch,
+  preserving history space without shrinking unchanged workspace views, and it is rounded
+  down to a whole KiB so a windowed file usually keeps the same cut from one turn to the
+  next. `workspace_read` returns up to 12000 bytes, so an oversized file that is only
+  partially injected may still need operator editing or append-only changes before a
+  complete rewrite is possible.
 
 - **`fs_read` output caps lowered.** Whole-file reads cap at 256 KiB; passing `offset` or
   `limit` falls back to a 64 KiB output budget. Large reads must paginate.

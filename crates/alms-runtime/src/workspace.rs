@@ -1251,14 +1251,17 @@ impl AgentWorkspace {
             });
         }
 
-        (!shown_whole_here).then_some(WorkspacePromptTruncation {
+        // Report only a cut the run budget made. A `memories.md` past its
+        // fixed `MEMORIES_INJECTION_CAP` window is the normal state of a
+        // long-lived agent and no setting changes it, so it is not reported
+        // unless the budget cut it below that window. It is still recorded
+        // as a partial view above.
+        let cut_by_run_budget =
+            file != WorkspaceFile::Memories || cap_bytes < MEMORIES_INJECTION_CAP;
+        (!shown_whole_here && cut_by_run_budget).then_some(WorkspacePromptTruncation {
             file,
             total_bytes,
-            injection_limit_bytes: if file == WorkspaceFile::Memories {
-                cap_bytes.min(MEMORIES_INJECTION_CAP)
-            } else {
-                cap_bytes
-            },
+            injection_limit_bytes: cap_bytes,
         })
     }
 
@@ -1285,7 +1288,8 @@ impl AgentWorkspace {
     }
 
     /// Build the system-prompt prefix from workspace files within the run's
-    /// byte budget, and list the files that did not fit whole.
+    /// byte budget, and list the files the budget cut to a partial view. A
+    /// `memories.md` shown through its full fixed window is not listed.
     ///
     /// This is what the agent runtime calls, on the run's first request and
     /// again after every tool batch (through
@@ -1686,17 +1690,37 @@ mod tests {
         assert!(truncations.is_empty());
     }
 
+    /// B5 (#192 review): a `memories.md` past its fixed window is the normal
+    /// state of a long-lived agent, so it is reported only when the run budget
+    /// cut it below [`MEMORIES_INJECTION_CAP`]. Either way the view is partial
+    /// and a whole-file replacement is refused.
     #[test]
-    fn memories_truncation_reports_its_fixed_injection_limit() {
+    fn memories_truncation_is_reported_only_when_the_run_budget_cuts_it() {
         let (_dir, ws) = test_workspace();
         ws.write_file_as_operator(WorkspaceFile::Memories, &"m".repeat(5000))
             .unwrap();
 
-        let (_, truncations) =
+        let (prefix, truncations) =
             ws.build_system_prompt_prefix_with_budget_and_truncations(false, 100_000);
+        assert!(prefix.contains("[Older memories truncated:"), "{prefix}");
+        assert!(
+            truncations.is_empty(),
+            "the fixed window alone is not a budget cut: {truncations:?}"
+        );
+        assert_eq!(
+            ws.write_file_checked(WorkspaceFile::Memories, "replacement")
+                .unwrap(),
+            CheckedWrite::Refused(RefusedWrite::ShownPartially)
+        );
+
+        // One populated file reserves 256 bytes of the 2000 for its heading
+        // and marker, leaving 1744 for content.
+        let (_, truncations) =
+            ws.build_system_prompt_prefix_with_budget_and_truncations(false, 2000);
         assert_eq!(truncations.len(), 1);
         assert_eq!(truncations[0].file, WorkspaceFile::Memories);
-        assert_eq!(truncations[0].injection_limit_bytes, MEMORIES_INJECTION_CAP);
+        assert_eq!(truncations[0].total_bytes, 5000);
+        assert_eq!(truncations[0].injection_limit_bytes, 1744);
     }
 
     #[test]
@@ -1802,8 +1826,9 @@ mod tests {
         );
     }
 
-    /// The same property through the real read path an agent actually gets,
-    /// not just the helper: file on disk -> `build_system_prompt_prefix`.
+    /// The same property through the prompt builder, not just the helper:
+    /// file on disk -> `build_system_prompt_prefix`, the context build's read
+    /// without a budget (the same bytes when every file fits).
     #[test]
     fn build_system_prompt_prefix_injects_the_recent_end_of_over_cap_memories() {
         let (_dir, ws) = test_workspace();

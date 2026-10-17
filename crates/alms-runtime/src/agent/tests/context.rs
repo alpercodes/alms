@@ -420,6 +420,20 @@ fn budget_pressure_runtime(agent_id: AgentId, llm: LlmConfig) -> (tempfile::Temp
     (dir, runtime)
 }
 
+/// The system prompt of every request `llm` received, in order.
+async fn system_prompts(llm: &alms_test_support::ScriptedLlm) -> Vec<String> {
+    llm.request_bodies()
+        .await
+        .iter()
+        .map(|body| {
+            serde_json::from_str::<serde_json::Value>(body).unwrap()["messages"][0]["content"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        })
+        .collect()
+}
+
 /// S8 (#192 review): `run()` must carry the budget its context was built
 /// with into every tool-loop rebuild. The rebuild tests above call
 /// `rebuild_system_prompt_for_tool_loop_with_budget` directly, so none of
@@ -455,17 +469,7 @@ async fn run_carries_the_initial_workspace_budget_into_tool_loop_rebuilds() {
         .unwrap();
     assert_eq!(output.response, "done");
 
-    let systems: Vec<String> = llm
-        .request_bodies()
-        .await
-        .iter()
-        .map(|body| {
-            serde_json::from_str::<serde_json::Value>(body).unwrap()["messages"][0]["content"]
-                .as_str()
-                .unwrap()
-                .to_string()
-        })
-        .collect();
+    let systems = system_prompts(&llm).await;
     assert_eq!(systems.len(), 3, "two tool batches, then the final turn");
     assert!(
         systems[0].contains("personality.md truncated"),
@@ -480,6 +484,65 @@ async fn run_carries_the_initial_workspace_budget_into_tool_loop_rebuilds() {
             batch + 1
         );
     }
+}
+
+/// S13 (#192 review): the DM empty-reply retry is the loop's other system
+/// prompt rebuild, and it must reuse the run's workspace budget too. With
+/// `usize::MAX` passed there instead, the nudged retry injects the whole
+/// 20 KB personality and overflows the window the first request was budgeted
+/// for.
+#[tokio::test]
+async fn dm_empty_reply_retry_reuses_the_run_workspace_budget() {
+    use alms_test_support::{Canned, ScriptedLlm};
+
+    let llm = ScriptedLlm::in_order(vec![
+        Canned::sse(final_text_sse("")),
+        Canned::sse(final_text_sse("Hello alice.")),
+    ])
+    .await;
+    let (_dir, runtime) = budget_pressure_runtime(
+        AgentId::new(),
+        LlmConfig {
+            base_url: llm.base_url(),
+            api_key: "test-key".to_string(),
+            default_model: "test-model".to_string(),
+            timeout_secs: 5,
+            stream_chunk_timeout_secs: 5,
+            ..LlmConfig::default()
+        },
+    );
+    let runtime = runtime
+        .with_agent_name("bob".to_string())
+        .with_dm_implicit_reply();
+    let session_manager = SessionManager::new(SessionConfig::default());
+    let session_id = alms_core::SessionId::deterministic_dm("alice", "bob");
+    let _ = session_manager.get_or_create_shared(session_id, "dm:alice:bob");
+
+    let output = runtime
+        .run_on_session(&session_manager, session_id, "dm:alice:bob", "")
+        .await
+        .unwrap();
+    assert_eq!(output.response, "Hello alice.");
+
+    let systems = system_prompts(&llm).await;
+    assert_eq!(systems.len(), 2, "the empty reply, then the nudged retry");
+    assert!(
+        systems[0].contains("personality.md truncated"),
+        "precondition: the first request is under budget pressure: {}",
+        systems[0]
+    );
+    let addendum = AgentRuntime::dm_addendum("alice");
+    let workspace_prompt = systems[0]
+        .strip_suffix(&addendum)
+        .expect("precondition: the first request ends with the DM addendum");
+    assert_eq!(
+        systems[1],
+        format!(
+            "{workspace_prompt}\n\n{}{addendum}",
+            runtime.config.prompts.tool_loop
+        ),
+        "the retry rebuild must reuse the first request's workspace budget"
+    );
 }
 
 /// S10 (#192 review): under budget pressure, a turn's input length no longer
