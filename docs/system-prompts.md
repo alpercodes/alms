@@ -145,10 +145,10 @@ appended after it:
    `memories.md` gets a tail window of up to 4000 bytes. A partial file carries a marker.
    A partial view the budget forced also emits one `WORKSPACE_PROMPT_TRUNCATED`
    `run_warning` per file per run; a `memories.md` that is only past its fixed window
-   does not. Rebuilds reuse the original budget, so unchanged files do not shrink as
-   tool results accumulate. The budget is rounded down to a whole KiB, and an episodic
-   block is charged at `run_summary_budget` rather than its length, so a windowed file
-   usually keeps the same cut from one run to the next as well.
+   does not. Rebuilds reuse the original budget, so an unchanged workspace does not
+   shrink as tool results accumulate. The budget is rounded down to a whole KiB, and an
+   episodic block is charged at `run_summary_budget` rather than its length, so a
+   windowed file usually keeps the same cut from one run to the next as well.
 
 3. **Tool loop addendum** (after first tool round): On subsequent LLM calls in the
    same agent loop, the system message is rebuilt as:

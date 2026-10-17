@@ -269,7 +269,7 @@ impl AgentRuntime {
     /// `workspace_budget_bytes` must be the budget the run's initial context
     /// was built with (`BuiltContext::workspace_budget_bytes`), not one
     /// recomputed from the growing message array: reusing it is what keeps
-    /// unchanged workspace files byte-identical across tool batches.
+    /// an unchanged workspace byte-identical across tool batches.
     ///
     /// This is extracted as a helper so the two rebuilds in `agent_loop`
     /// (after a tool batch, and before the DM empty-reply retry) share one

@@ -16,12 +16,13 @@ use super::AgentRuntime;
 /// Granularity of the workspace prompt budget, in bytes.
 ///
 /// The budget is rounded down to a whole step so that, under budget pressure,
-/// a truncated file is cut in the same place from one run to the next. Without
-/// it, every turn's input length moved the cut by a few bytes, and an agent
-/// whose files were being cut missed the system-block prompt cache on every
-/// message. Each byte of input moves the unrounded budget by about half a
-/// byte, so two inputs d bytes apart land on different steps about d / 2 KiB
-/// of the time: a few hundred bytes rarely matters, 2 KB always does.
+/// a truncated file in an unchanged workspace is cut in the same place from
+/// one run to the next. Without it, every turn's input length moved the cut
+/// by a few bytes, and an agent whose files were being cut missed the
+/// system-block prompt cache on every message. Each byte of input moves the
+/// unrounded budget by about half a byte, so two inputs d bytes apart land on
+/// different steps about d / 2 KiB of the time: a few hundred bytes rarely
+/// matters, 2 KiB always does.
 const WORKSPACE_BUDGET_STEP_BYTES: usize = 1024;
 
 /// The first request of a run, and the workspace budget every system-prompt
@@ -66,8 +67,8 @@ impl AgentRuntime {
     ///
     /// `workspace_budget_bytes` is the run's budget from
     /// [`Self::build_context_with_budget`]. Every call in a run passes the same
-    /// value, so unchanged files produce the same bytes on the first request
-    /// and on every tool-loop rebuild. A file that does not fit whole is
+    /// value, so an unchanged workspace produces the same bytes on the first
+    /// request and on every tool-loop rebuild. A file that does not fit whole is
     /// windowed. A file the budget cut is reported once per run as a
     /// `WORKSPACE_PROMPT_TRUNCATED` warning; a `memories.md` that is only past
     /// its fixed window is not.

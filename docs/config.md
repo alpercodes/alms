@@ -244,14 +244,14 @@ assembled into the system string by the budget-aware runtime context builder and
 and user files stay whole unless the run budget requires head windows; memories keeps a
 tail window of up to 4000 bytes. A window the run budget forces emits a
 `WORKSPACE_PROMPT_TRUNCATED` run warning; the fixed memories window alone does not.
-Within a run, every tool-loop rebuild reuses the run's workspace budget, so
-unchanged files are byte-identical on every request. Across runs, the budget is rounded
+Within a run, every tool-loop rebuild reuses the run's workspace budget, so an
+unchanged workspace is byte-identical on every request. Across runs, the budget is rounded
 down to a whole KiB and charges an episodic block at `run_summary_budget` rather than
 its length. It changes only when a turn's input moves it across a 1 KiB step (a step is
 roughly 2 KB of input), when the episodic block appears or disappears (the first time
 the agent has a summary of another session, say), or when the configuration changes.
-While it stays on the same step, unchanged files, windowed or not, are byte-identical
-from run to run. At the default `max_input_tokens` the budget is well over 100 KB, so
+While it stays on the same step, an unchanged workspace is byte-identical from run to
+run. At the default `max_input_tokens` the budget is well over 100 KB, so
 files of a normal size are injected whole on every run. Splitting these values into
 separate content blocks for independent breakpoints would require a runtime refactor;
 the single trailing-system marker gives the full prefix a cache entry today.
