@@ -15,6 +15,7 @@ use async_trait::async_trait;
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 /// How long (in seconds) a subagent's result is kept in memory after the run
@@ -109,6 +110,20 @@ pub struct SubagentCompletion {
     pub task_id: TaskId,
     pub subagent_name: Option<String>,
     pub status: TaskStatus,
+    /// `true` only when `status` is `Cancelled` and the operator cancelled
+    /// this one subagent through [`Coordinator::cancel_subagent_by_session`]
+    /// (the gateway's `POST /sessions/{id}/subagent/cancel`). The gateway
+    /// then starts a notification run that tells the parent the cancel was
+    /// deliberate.
+    ///
+    /// `false` for every other completion: a natural finish or a failure
+    /// (including one that raced a direct cancel), a cancellation propagated
+    /// from the parent run's token (Stop, an approval deny, DM cancel,
+    /// `DELETE /jobs`, shutdown), and [`Coordinator::stop_subagent_by_session`]
+    /// (`DELETE /jobs` episode teardown). For those cancellations the gateway
+    /// starts no run.
+    #[serde(default)]
+    pub cancelled_directly: bool,
     /// Truncated summary of the result (for context efficiency).
     pub summary: String,
     /// Parent session to notify.
@@ -218,8 +233,17 @@ struct SubagentHandle {
     /// subagent's own session, `subagent_completed` notification for
     /// background subagents) runs unchanged. Powers
     /// [`Coordinator::cancel_subagent_by_session`] / the gateway's
-    /// `POST /sessions/{id}/subagent/cancel` endpoint.
+    /// `POST /sessions/{id}/subagent/cancel` endpoint, and
+    /// [`Coordinator::stop_subagent_by_session`] for `DELETE /jobs` teardown.
     cancel_token: CancellationToken,
+    /// Set only by [`Coordinator::cancel_subagent_by_session`], before it
+    /// fires `cancel_token`, so the completion can tell the operator's direct
+    /// cancel of this subagent apart from a parent-run stop or a teardown,
+    /// which fire the same token. Written under the map shard's read guard
+    /// and read by `run_subagent` under the same shard's write guard when it
+    /// flips the terminal status, so every cancel accepted before the flip
+    /// is visible to the completion.
+    cancelled_directly: AtomicBool,
     parent_run_id: Option<RunId>,
     parent_session_id: SessionId,
     parent_agent_id: AgentId,
@@ -630,6 +654,7 @@ impl Coordinator {
             task_id,
             status: TaskStatus::Pending,
             cancel_token: child_cancel_token.clone(),
+            cancelled_directly: AtomicBool::new(false),
             parent_run_id,
             parent_session_id,
             parent_agent_id,
@@ -843,21 +868,52 @@ impl Coordinator {
     /// same-named spawns; unnamed subagents get a fresh session per
     /// dispatch), so the first live match is the only live match.
     ///
+    /// This is the operator's **direct** cancel of one subagent: it marks
+    /// the handle so a `Cancelled` background completion carries
+    /// [`SubagentCompletion::cancelled_directly`], and the gateway starts a
+    /// notification run telling the parent the cancel was deliberate. Use
+    /// [`Self::stop_subagent_by_session`] when the subagent is stopped as
+    /// part of stopping the work above it.
+    ///
     /// Returns `true` when a live subagent was found and its token fired;
     /// `false` when no live subagent exists for that session (unknown
     /// session, or the subagent already reached a terminal state). Callers
     /// map `false` to an HTTP 404.
     pub fn cancel_subagent_by_session(&self, subagent_session_id: SessionId) -> bool {
+        self.fire_subagent_cancel(subagent_session_id, true)
+    }
+
+    /// Cancel the live subagent on the given SUBAGENT session as part of
+    /// stopping the work above it, rather than as a direct cancel of this
+    /// subagent. Used by `DELETE /jobs` episode teardown: the operator
+    /// deleted the whole job, so — like a parent-run stop — the completion is
+    /// not marked [`SubagentCompletion::cancelled_directly`] and the gateway
+    /// starts no notification run for it.
+    ///
+    /// Same matching and return value as [`Self::cancel_subagent_by_session`].
+    pub fn stop_subagent_by_session(&self, subagent_session_id: SessionId) -> bool {
+        self.fire_subagent_cancel(subagent_session_id, false)
+    }
+
+    fn fire_subagent_cancel(&self, subagent_session_id: SessionId, directly: bool) -> bool {
         for entry in self.subagents.iter() {
             let h = entry.value();
             if h.subagent_session_id == subagent_session_id
                 && matches!(h.status, TaskStatus::Pending | TaskStatus::Running)
             {
+                // Before firing, so the flag is set by the time the task can
+                // observe the token. `run_subagent` reads it only for a
+                // `Cancelled` outcome, so a natural result that wins the race
+                // keeps its status.
+                if directly {
+                    h.cancelled_directly.store(true, Ordering::Release);
+                }
                 h.cancel_token.cancel();
                 info!(
                     target: "coordinator::subagent_cancelled_by_session",
                     task_id = %h.task_id.0,
                     subagent_session = %subagent_session_id.0,
+                    directly,
                     "Subagent cancellation requested by session id"
                 );
                 return true;
@@ -1173,6 +1229,7 @@ async fn run_subagent(
                 task_id,
                 subagent_name: request.subagent_name.clone(),
                 status: TaskStatus::Failed,
+                cancelled_directly: false,
                 summary: "subagent task panicked before emitting a completion".to_string(),
                 parent_session_id: request.parent_session,
                 parent_agent_id: request.parent_agent_id,
@@ -1203,8 +1260,8 @@ async fn run_subagent(
     // SubagentHandle) fires when either:
     //   1. The parent run's CancellationToken is cancelled (it is a child
     //      token of the parent's when one exists), or
-    //   2. `cancel_subagent_by_session()` or the test-only `cancel_subagent()`
-    //      fires the handle's stored clone.
+    //   2. `cancel_subagent_by_session()`, `stop_subagent_by_session()` or
+    //      the test-only `cancel_subagent()` fires the handle's stored clone.
     // The same token is attached to the subagent's AgentRuntime.
 
     // Identity and session are already resolved by `spawn_subagent` and
@@ -1469,10 +1526,19 @@ async fn run_subagent(
         handle.status = new_status;
         handle.completed_result = Some(task_result.clone());
         if handle.is_background {
+            // Read under the write guard that flips the status: a direct
+            // cancel accepted before the flip has stored the flag by now, and
+            // one arriving after it sees a terminal status and is refused.
+            // Only a `Cancelled` outcome counts — a natural result that won
+            // the race against the cancel keeps its status and its normal
+            // notification (Tim's B1 on PR #190).
+            let cancelled_directly = new_status == TaskStatus::Cancelled
+                && handle.cancelled_directly.load(Ordering::Acquire);
             Some((
                 handle.parent_session_id,
                 handle.parent_agent_id,
                 handle.subagent_session_id,
+                cancelled_directly,
             ))
         } else {
             None
@@ -1483,7 +1549,8 @@ async fn run_subagent(
 
     // Fire completion notification for background subagents so the gateway
     // can auto-create a follow-up run on the parent session.
-    if let Some((parent_session_id, parent_agent_id, subagent_session_id)) = background_info
+    if let Some((parent_session_id, parent_agent_id, subagent_session_id, cancelled_directly)) =
+        background_info
         && let Some(ref tx) = completion_tx
     {
         let summary = truncate_for_notification(&task_result.result);
@@ -1516,6 +1583,7 @@ async fn run_subagent(
             task_id,
             subagent_name: request.subagent_name.clone(),
             status: new_status,
+            cancelled_directly,
             summary,
             parent_session_id,
             parent_agent_id,
@@ -2549,6 +2617,25 @@ mod tests {
         Coordinator::new(session_manager, llm)
     }
 
+    #[derive(Debug)]
+    struct BlockingRunRegistrar {
+        entered: std::sync::mpsc::Sender<()>,
+        release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+
+    #[async_trait::async_trait]
+    impl RunRegistrar for BlockingRunRegistrar {
+        async fn register_run(&self, _run: Run) -> AlmsResult<()> {
+            Ok(())
+        }
+
+        fn update_run(&self, _run: Run) -> AlmsResult<()> {
+            let _ = self.entered.send(());
+            let _ = self.release.lock().unwrap().recv();
+            Ok(())
+        }
+    }
+
     // -- #1148: live server-default LLM handle -------------------------------
 
     /// A coordinator built with
@@ -2661,6 +2748,7 @@ mod tests {
             task_id: TaskId::new(),
             subagent_name: Some("researcher".to_string()),
             status: TaskStatus::Failed,
+            cancelled_directly: false,
             summary: "subagent task panicked before emitting a completion".to_string(),
             parent_session_id: SessionId::new(),
             parent_agent_id: AgentId::new(),
@@ -3638,6 +3726,7 @@ mod tests {
                 task_id,
                 status,
                 cancel_token: CancellationToken::new(),
+                cancelled_directly: AtomicBool::new(false),
                 parent_run_id: None,
                 parent_session_id: session,
                 parent_agent_id: parent_agent,
@@ -3985,6 +4074,7 @@ mod tests {
             task_id,
             status,
             cancel_token: token.clone(),
+            cancelled_directly: AtomicBool::new(false),
             parent_run_id: None,
             parent_session_id: SessionId::new(),
             parent_agent_id: AgentId::new(),
@@ -4097,6 +4187,125 @@ mod tests {
         assert!(
             !coord.cancel_subagent_by_session(sub_session_id),
             "a completed subagent's session must report false"
+        );
+    }
+
+    /// The terminal status is selected before the registrar persists it, but
+    /// the handle remains Running until that write finishes. A direct cancel
+    /// accepted in this window sets the handle's flag, but must not turn a
+    /// successful result into a cancelled one, nor mark the completion as
+    /// directly cancelled (Tim's B1 on PR #190).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancel_racing_terminal_persistence_keeps_completed_result() {
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let registrar = Arc::new(BlockingRunRegistrar {
+            entered: entered_tx,
+            release: std::sync::Mutex::new(release_rx),
+        });
+        let (completion_tx, mut completion_rx) = mpsc::unbounded_channel();
+        let coord = test_coordinator()
+            .with_run_registrar(registrar)
+            .with_completion_channel(completion_tx);
+        let request = SubagentRequest {
+            task: "Finish successfully before the cancel arrives".to_string(),
+            parent_session: test_session_id(),
+            parent_agent_id: test_parent_agent_id(),
+            parent_run_id: None,
+            subagent_name: None,
+            parent_tool_invocation_id: None,
+        };
+        let (task_id, subagent_session_id) = coord
+            .spawn_subagent(request, None, true, None)
+            .await
+            .expect("spawn_subagent should succeed");
+        let result_rx = coord
+            .take_result_rx(task_id)
+            .expect("result receiver exists");
+
+        tokio::task::spawn_blocking(move || entered_rx.recv_timeout(Duration::from_secs(10)))
+            .await
+            .expect("wait task should not panic")
+            .expect("run persistence should reach the controlled window");
+
+        assert_eq!(coord.get_status(task_id), Some(TaskStatus::Running));
+        assert!(
+            coord.cancel_subagent_by_session(subagent_session_id),
+            "the handle is still Running while terminal persistence is blocked"
+        );
+        release_tx.send(()).expect("release terminal persistence");
+
+        let result = result_rx.await.expect("subagent should return its result");
+        assert_eq!(result.status, TaskStatus::Completed);
+        let completion = completion_rx
+            .recv()
+            .await
+            .expect("background completion should still be emitted");
+        assert_eq!(completion.status, TaskStatus::Completed);
+        assert!(
+            !completion.cancelled_directly,
+            "a natural result that won the race must not be marked directly \
+             cancelled, or the gateway would replace its notification"
+        );
+    }
+
+    /// Only the session-keyed direct cancel marks a completion
+    /// `cancelled_directly`. A teardown stop and a parent-run cancel fire the
+    /// same child token and land `Cancelled` too, but stay unmarked, so the
+    /// gateway starts no notification run for them.
+    ///
+    /// Deterministic on the current-thread runtime: `spawn_subagent` returns
+    /// right after `tokio::spawn`, so each cancel below fires before the
+    /// subagent task is first polled, and the biased `select!` takes the
+    /// cancellation arm.
+    #[tokio::test]
+    async fn only_the_direct_cancel_marks_the_completion() {
+        let (completion_tx, mut completion_rx) = mpsc::unbounded_channel();
+        let coord = test_coordinator().with_completion_channel(completion_tx);
+        let request = || SubagentRequest {
+            task: "background work".to_string(),
+            parent_session: test_session_id(),
+            parent_agent_id: test_parent_agent_id(),
+            parent_run_id: None,
+            subagent_name: None,
+            parent_tool_invocation_id: None,
+        };
+
+        let (_, direct_session) = coord
+            .spawn_subagent(request(), None, true, None)
+            .await
+            .unwrap();
+        assert!(coord.cancel_subagent_by_session(direct_session));
+        let direct = completion_rx.recv().await.expect("direct completion");
+        assert_eq!(direct.status, TaskStatus::Cancelled);
+        assert!(
+            direct.cancelled_directly,
+            "cancel_subagent_by_session is the operator's direct cancel"
+        );
+
+        let (_, stopped_session) = coord
+            .spawn_subagent(request(), None, true, None)
+            .await
+            .unwrap();
+        assert!(coord.stop_subagent_by_session(stopped_session));
+        let stopped = completion_rx.recv().await.expect("stopped completion");
+        assert_eq!(stopped.status, TaskStatus::Cancelled);
+        assert!(
+            !stopped.cancelled_directly,
+            "stop_subagent_by_session (DELETE /jobs teardown) counts as a stop"
+        );
+
+        let parent_token = CancellationToken::new();
+        coord
+            .spawn_subagent(request(), None, true, Some(parent_token.clone()))
+            .await
+            .unwrap();
+        parent_token.cancel();
+        let propagated = completion_rx.recv().await.expect("propagated completion");
+        assert_eq!(propagated.status, TaskStatus::Cancelled);
+        assert!(
+            !propagated.cancelled_directly,
+            "a cancel propagated from the parent run is a stop"
         );
     }
 

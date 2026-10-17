@@ -1198,6 +1198,28 @@ async fn notify_dm_status_to_webchat(
 ///
 /// This mirrors `scheduler_fire_loop`: each notification is enqueued via
 /// `SessionQueue` to respect per-session FIFO ordering.
+///
+/// A `Cancelled` completion outside an open job episode depends on where the
+/// cancel came from (#121, PR #190):
+///
+/// - **Cancelled directly** (`POST /sessions/{id}/subagent/cancel`,
+///   [`alms_coordinator::SubagentCompletion::cancelled_directly`]): a
+///   notification run starts, and its input tells the parent the operator
+///   cancelled the subagent deliberately and not to redo its work unprompted
+///   ([`format_directly_cancelled_notification`]).
+/// - **Stopped** (the parent run's token fired — Stop, an approval deny, DM
+///   cancel, `DELETE /jobs`, shutdown — or `DELETE /jobs` teardown stopped
+///   it): no run starts. A model-visible `subagent_cancelled` record is
+///   queued on the parent agent's queue instead
+///   ([`queue_cancelled_subagent_record`]). If the queue is already closed
+///   for shutdown, the record is dropped.
+///
+/// Inside an open job episode, either kind keeps its continuation run. A
+/// direct cancel's continuation run gets the same input as the notification
+/// run outside an episode, with its warning against unrequested rework. A
+/// job's runs have no approval gate (a `guarded` agent runs them promoted to
+/// Autonomous), which is where that rework costs the most. A stopped
+/// subagent's continuation run gets the plain completion notification.
 pub(crate) async fn completion_notification_loop(
     mut rx: mpsc::UnboundedReceiver<alms_coordinator::SubagentCompletion>,
     state: AppState,
@@ -1333,8 +1355,6 @@ pub(crate) async fn completion_notification_loop(
             )
             .await;
 
-        let notification = format_completion_notification(&completion);
-
         // #1198 step 5: resolve this completion against open job episodes.
         // A hit removes the pending `Subagent` entry and RESERVES the
         // continuation run in the same atomic step (no quiescence can fire
@@ -1350,6 +1370,31 @@ pub(crate) async fn completion_notification_loop(
                 "Subagent completion resolved to open job episode — continuation run"
             );
         }
+
+        // A cancellation outside an open job episode depends on its origin
+        // (see the function docs). The status is checked here as well as in
+        // the coordinator, so a natural result that raced a direct cancel
+        // keeps its normal notification (Tim's B1 on PR #190). An open
+        // episode keeps its reserved continuation run either way, so the
+        // episode can finish; a direct cancel's input carries the warning
+        // against rework there too.
+        let cancelled = completion.status == alms_coordinator::TaskStatus::Cancelled;
+        let cancelled_directly = cancelled && completion.cancelled_directly;
+        if cancelled && !cancelled_directly && episode_route.is_none() {
+            info!(
+                session_id = %session_id.0,
+                task_id = %completion.task_id.0,
+                "Stopped subagent: cancellation record queued, no notification run"
+            );
+            queue_cancelled_subagent_record(&state, agent_id, session_id, &completion).await;
+            continue;
+        }
+
+        let notification = if cancelled_directly {
+            format_directly_cancelled_notification(&completion)
+        } else {
+            format_completion_notification(&completion)
+        };
 
         info!(
             session_id = %session_id.0,
@@ -1371,8 +1416,9 @@ pub(crate) async fn completion_notification_loop(
         )
         .await
         else {
-            // #1206: cancelled-job teardown — the completion is recorded in
-            // history (marker + SSE above) but burns no LLM turn.
+            // #1206: an operator-cancelled job's session (a natural result or
+            // a direct cancel racing `DELETE /jobs`) — the completion is
+            // recorded in history (marker + SSE above) but burns no LLM turn.
             continue;
         };
 
@@ -1384,6 +1430,80 @@ pub(crate) async fn completion_notification_loop(
         );
     }
 }
+
+/// Queue the model-visible `subagent_cancelled` record for a stopped
+/// subagent on the parent agent's queue, at low priority.
+///
+/// Appending it straight away could put it between a parent run's persisted
+/// tool call and that call's result (background subagents run alongside
+/// their parent, and the parent may be mid-tool when it is stopped). Every
+/// later context build would then carry a user turn inside the tool pair,
+/// which providers reject (Tim's R1 on PR #190). The per-agent worker runs
+/// one item at a time, so the record lands after any active run, in the
+/// position the notification run's input used to take, without an LLM turn.
+///
+/// When the queue is closed (shutdown), the record is dropped with a WARN,
+/// the way [`enqueue_triggered_run`] drops its run. Appending it directly
+/// instead is not safe: the stopped parent run may still be saving tool
+/// results from inside its work item, and history outlives the process, so
+/// the next process's runs would send the split tool pair (Tim's R2 on
+/// PR #190). This matches the behaviour before PR #190, when the parent's
+/// notification run was dropped at shutdown.
+///
+/// Waits for queue capacity like [`enqueue_triggered_run`]; call it only from
+/// a dedicated producer task, never from inside a queue work item.
+async fn queue_cancelled_subagent_record(
+    state: &AppState,
+    agent_id: alms_core::AgentId,
+    session_id: SessionId,
+    completion: &alms_coordinator::SubagentCompletion,
+) {
+    let record = format_cancelled_subagent_record(completion);
+    let meta = serde_json::json!({
+        "task_id": completion.task_id.0.to_string(),
+        "subagent_name": completion.subagent_name.as_deref(),
+        "subagent_session_id": completion.subagent_session_id.0.to_string(),
+        "status": "cancelled",
+    });
+
+    let reservation = match state.agent_queue.reserve(agent_id).await {
+        Ok(reservation) => reservation,
+        Err(error) => {
+            // Shutting down. The stopped parent run may still be saving tool
+            // results, and history outlives this process, so appending here
+            // could split a tool pair (Tim's R2 on PR #190).
+            warn!(
+                ?error,
+                agent_id = %agent_id.0,
+                session_id = %session_id.0,
+                "Agent queue closed; cancelled-subagent record dropped"
+            );
+            return;
+        }
+    };
+    let session_manager = state.session_manager.clone();
+    if let Err(error) = reservation.submit_low(Box::pin(async move {
+        super::markers::persist_error_marker(
+            &session_manager,
+            session_id,
+            SUBAGENT_CANCELLED_MARKER_TYPE,
+            record,
+            meta,
+        );
+    })) {
+        // The same shutdown race, after admission.
+        warn!(
+            ?error,
+            agent_id = %agent_id.0,
+            session_id = %session_id.0,
+            "Agent queue closed; cancelled-subagent record dropped"
+        );
+    }
+}
+
+/// `type` of the model-visible record a stopped subagent leaves in its
+/// parent's history.
+const SUBAGENT_CANCELLED_MARKER_TYPE: &str = "subagent_cancelled";
 
 /// Returns the job id when `context_id` addresses a job session
 /// (`job_{uuid}`) whose job the operator cancelled via `DELETE /jobs/{id}`
@@ -1518,11 +1638,18 @@ pub(super) async fn enqueue_triggered_run(
     // #1206 (Tim's S3 on PR #1202): suppress post-teardown orphan runs.
     // `DELETE /jobs` tears down an open episode by ending its pending DMs
     // (the DM-sender self-notification trigger routes back onto the job
-    // session via D3) and cancelling its pending subagents (the
-    // `SubagentCompletion(Cancelled)` notification's parent session IS the
-    // job session). Both notification runs are created HERE, asynchronously,
-    // AFTER `cancel_runs_for_job` already swept — so merely stamping them
-    // with the job id could not stop them from burning a turn post-kill.
+    // session via D3) and stopping its pending subagents. Their notification
+    // runs would be created HERE, asynchronously, AFTER `cancel_runs_for_job`
+    // already swept — so merely stamping them with the job id could not stop
+    // them from burning a turn post-kill.
+    //
+    // For subagents this check is now the second line: teardown stops them
+    // with `stop_subagent_by_session`, so their `Cancelled` completion is
+    // handled as a stop in `completion_notification_loop` (a queued record,
+    // no run) and never reaches this function (#121, PR #190). What still
+    // arrives here for a job session is a result that raced the teardown —
+    // a natural completion, or a direct cancel the operator made just
+    // before deleting the job — and this check suppresses its run.
     //
     // The suppression keys on OPERATOR-CANCEL INTENT (the
     // `operator_cancelled_jobs` set populated only by `DELETE /jobs`), not
@@ -1720,6 +1847,55 @@ pub(super) fn format_completion_notification(c: &alms_coordinator::SubagentCompl
         .replace("{status}", status)
         .replace("{summary}", &c.summary)
         .replace("{follow_up}", &follow_up)
+}
+
+/// Template for the notification run a directly cancelled subagent starts,
+/// loaded at compile time from
+/// `crates/alms-runtime/prompts/subagent_cancelled.md`.
+const SUBAGENT_CANCELLED_TEMPLATE: &str =
+    include_str!("../../../alms-runtime/prompts/subagent_cancelled.md");
+
+/// Format the input of the notification run a directly cancelled subagent
+/// starts, or of its continuation run inside an open job episode (#121,
+/// PR #190).
+///
+/// The run is system-triggered, so a `guarded` parent runs it promoted to
+/// Autonomous, with no approval gate. A job's continuation run is
+/// system-triggered too. The template says the operator cancelled the
+/// subagent on purpose, and that the parent should not re-run it or redo its
+/// work unless the operator asks. Nothing enforces this; the wording is the
+/// only thing discouraging unrequested rework.
+pub(super) fn format_directly_cancelled_notification(
+    c: &alms_coordinator::SubagentCompletion,
+) -> String {
+    let label = match &c.subagent_name {
+        Some(name) => format!("\"{name}\""),
+        None => format!("(task {})", c.task_id.0),
+    };
+    SUBAGENT_CANCELLED_TEMPLATE
+        .replace("{label}", &label)
+        .replace("{session_id}", &c.subagent_session_id.0.to_string())
+}
+
+/// Create the model-visible history record a stopped subagent leaves in its
+/// parent's history in place of a notification run. Its transcript remains in
+/// the subagent session.
+///
+/// The UI renders this record as an error block on reload, so the text is
+/// written to read well for the operator as well as the model.
+pub(super) fn format_cancelled_subagent_record(
+    completion: &alms_coordinator::SubagentCompletion,
+) -> String {
+    let session_id = completion.subagent_session_id.0;
+    let label = match completion.subagent_name.as_deref() {
+        Some(name) => format!("Background subagent \"{name}\""),
+        None => "An unnamed background subagent".to_string(),
+    };
+    format!(
+        "{label} (session_id: {session_id}) was cancelled before it finished and returned \
+         no result. Its session keeps whatever it did: \
+         read_session(session_id: \"{session_id}\")."
+    )
 }
 
 /// Maximum character length for the formatted conversation transcript
@@ -3836,6 +4012,7 @@ mod tests {
                 task_id: alms_coordinator::TaskId::new(),
                 subagent_name: Some("researcher".to_string()),
                 status: alms_coordinator::TaskStatus::Completed,
+                cancelled_directly: false,
                 summary: "All done.".to_string(),
                 parent_session_id,
                 parent_agent_id,
