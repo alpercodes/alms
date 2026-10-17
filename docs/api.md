@@ -926,6 +926,47 @@ Emitted on the parent's session SSE stream when a background subagent finishes. 
 
 `status` values: `"done"`, `"fail"`, `"cancelled"`. `subagent_name` is omitted on the wire for ephemeral subagents (same shape as `subagent_started`).
 
+What follows a background subagent that ends `Cancelled` depends on where
+the cancel came from (#121):
+
+- **Cancelled directly**, through `POST /sessions/{session_id}/subagent/cancel`
+  (§ 5.7.1): a notification run starts on the parent session. Its input tells
+  the agent that the operator cancelled the subagent deliberately, that it
+  should not re-run it or redo its work unless the operator asks, and that it
+  should decide whether its plan needs to change and tell the operator. The
+  run is system-triggered, so a `guarded` parent runs it promoted to
+  Autonomous, with no approval gate
+  ([`security-model.md` § 8.1](security-model.md#guarded-is-not-an-agent-boundary)).
+  Nothing enforces that instruction; the wording is the only thing
+  discouraging unrequested rework.
+- **Stopped**: the parent run's cancellation propagated to the subagent
+  (`POST /runs/{run_id}/cancel` from the Stop button, an approval deny, DM
+  cancel, `DELETE /jobs`, shutdown), or `DELETE /jobs` stopped it while
+  tearing down the job's episode. No notification run starts. A model-visible
+  `kind: "error"` record with `type: "subagent_cancelled"` is added to the
+  parent history instead, pointing to
+  `read_session(session_id: "<subagent-session-id>")`. It is queued on the
+  parent agent's run queue, so it lands after any run in progress rather than
+  between that run's tool call and its result. The web UI renders it as an
+  error block. During shutdown the record is dropped, as the notification
+  run was before #121: the run queue is already closed, and the stopped run
+  may still be saving its tool results.
+
+In both cases this event and the persisted `subagent_completion` marker carry
+the status and the subagent's session ID, and report the summary as
+`[no content]`: cancellation keeps no partial output, whether the subagent had
+produced nothing or was stopped mid-work. Work it already wrote stays in its
+session.
+
+A cancelled completion inside an open job episode, from either source, still
+gets the episode's continuation run on the job session, stamped with the job
+ID like any other continuation. Only the run's input differs by source. A
+direct cancel's input is the same as the notification run's input above,
+warning the agent not to redo the work unless the operator asks. A job's runs
+have no approval gate either, so that warning matters most there. A stopped
+subagent's continuation run gets the ordinary completion notification, and no
+`subagent_cancelled` record is added.
+
 #### Reconnect
 Supported via `Last-Event-ID` header (automatic browser reconnect) or `?last_event_id=<n>` query parameter (initial connection after loading history via REST). The query parameter takes precedence when both are present. The server replays events with IDs greater than the supplied value.
 
@@ -1064,8 +1105,11 @@ Cancels the live subagent running on the given **subagent** session. Returns
 200 with `{"session_id":"...","status":"cancelling"}` when a live
 (pending/running) subagent was found and its cancellation token fired;
 returns 404 with error code `NO_LIVE_SUBAGENT` when the session has no live
-subagent (unknown session, or the subagent already reached a terminal
-state — e.g. a cancel racing natural completion).
+subagent (unknown session, or the subagent already reached a terminal state).
+A request racing the subagent's own finish can also return 200 during the
+short terminal-persistence window, before the handle's status flips. In that
+case the result already selected (Completed or Failed) stands; for a
+background subagent, its normal notification run still starts.
 
 Session-keyed rather than run-keyed because the UI's subagent surfaces (the
 status-bar chips and the subagent session view) carry the subagent's session
@@ -1084,6 +1128,21 @@ subagent's own session emits `run_cancelled`, its run record flips to
 `invoke_agent` tool call failing with `"Subagent was cancelled"` (the
 parent run continues and handles the tool error like any other tool
 failure).
+
+For a **background** subagent, this endpoint is the operator's direct
+cancel: its `Cancelled` completion starts one notification run on the parent
+session, telling the agent the cancel was deliberate and not to redo the work
+unless the operator asks (see `subagent_completed` in § 5.3). Inside an open
+job episode, that run is the episode's continuation run, and it carries the
+same warning. Stopping the subagent another way, by cancelling its parent run
+or with `DELETE /jobs`, starts no run; the parent history gets a
+`subagent_cancelled` record instead. The exception is a stop inside an open
+episode, which still gets the continuation run, with the ordinary completion
+notification as its input.
+The event and lifecycle marker report `[no content]` either way; partial work
+is not summarized on cancellation, but stays readable in the subagent's
+session. A cancellation before any output and one during work have the same
+status and summary today.
 
 ### 5.8 List runs
 `GET /runs?session_id=<uuid>&limit=<n>` — list runs for a session (original behaviour).
@@ -1400,7 +1459,7 @@ the retry fields.
 ### 7.2 Cancel a job
 `DELETE /jobs/{job_id}`
 
-Cancels a scheduled job, removes it from the scheduler, and cancels any in-progress runs that were spawned by the job — including episode continuation runs, and a firing still queued behind the agent's current run (#181). A queued run's cancellation lands when the agent's queue reaches it: it is reported `queued` until then and ends `cancelled` without starting. An open episode is torn down: pending DM conversations are ended with the `user_cancelled` reason (the peer gets the standard ended-notification) and pending background subagents are cancelled (#1198).
+Cancels a scheduled job, removes it from the scheduler, and cancels any in-progress runs that were spawned by the job — including episode continuation runs, and a firing still queued behind the agent's current run (#181). A queued run's cancellation lands when the agent's queue reaches it: it is reported `queued` until then and ends `cancelled` without starting. An open episode is torn down: pending DM conversations are ended with the `user_cancelled` reason (the peer gets the standard ended-notification) and pending background subagents are cancelled (#1198). Deleting the job counts as stopping those subagents, not as a direct cancel of each: no notification run starts for them, and the job session gets a `subagent_cancelled` record per subagent (#121).
 
 **Response 200** — the final persisted cancelled job entity. The response
 includes the authoritative `lifecycle_revision`, `status: "cancelled"`, and
