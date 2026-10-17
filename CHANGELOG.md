@@ -70,9 +70,9 @@ Each item below changes behaviour for a deployment that has not set the knob exp
   replacement is refused until the agent has seen the whole file. When the budget is what
   cut it, a `run_warning` with code `WORKSPACE_PROMPT_TRUNCATED` also names the agent and
   the file (once per file per run). The same budget is reused after each tool batch,
-  preserving history space without shrinking an unchanged workspace, and it is rounded
-  down to a whole KiB so a windowed file usually keeps the same cut from one turn to the
-  next. `workspace_read` returns up to 12000 bytes, so an oversized file that is only
+  preserving history space without shrinking an unchanged workspace's view, and it is
+  rounded down to a whole KiB so a windowed file usually keeps the same cut from one turn
+  to the next. `workspace_read` returns up to 12000 bytes, so an oversized file that is only
   partially injected may still need operator editing or append-only changes before a
   complete rewrite is possible.
 
