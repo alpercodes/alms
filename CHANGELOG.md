@@ -132,8 +132,11 @@ Each item below changes behaviour for a deployment that has not set the knob exp
   runs only when the sidecar's agent ID owns sessions. A pre-registry deployment has them;
   a fresh install has none unless the global-token Telegram bot received messages before
   the first agent was created, and such an install still gets `main` on its next restart.
-  An install that already got an auto-created `main` keeps it; if it is deleted, it no
-  longer comes back on the next restart. The sidecar file is neither removed nor rewritten.
+  An install that already got an auto-created `main` keeps it. A deleted `main` does not
+  come back unless the global-token Telegram bot files new sessions under the sidecar ID
+  while the registry is empty. The sidecar file is neither removed nor rewritten. On boot,
+  the migration also refuses to register `main` over a workspace that may contain another
+  agent's data; move that folder and restart to retry the migration.
 - After a restart, the gateway's default agent ID now comes from the agent registry: the
   default agent, or the oldest agent if none is marked default. The ID in `.alms/agent_id`
   (or `ALMS_AGENT_ID`) is used only while no agent is registered; when `ALMS_AGENT_ID` is
@@ -181,10 +184,13 @@ Each item below changes behaviour for a deployment that has not set the knob exp
 
 - `POST /agents` and `alms agent create` refuse a name whose workspace path contains or
   points to data (`409 WORKSPACE_EXISTS`) instead of handing another agent the old
-  personality and memories. `DELETE /agents` leaves `.alms/agents/<name>/` on disk; a
-  folder with only the blank seed files and their lock sidecars remains reusable.
-  **After upgrading**, the name of a deleted agent whose folder contains anything beyond
-  those blank seeds and lock sidecars stays blocked until the folder is moved or deleted.
+  personality and memories. `DELETE /agents` and `alms agent delete` move an existing
+  `.alms/agents/<name>/` to `.alms/agents/.deleted/<name>-<timestamp>-<agent-id>/` before
+  removing the registry record. The archive keeps the workspace text and frees the name
+  path; if it cannot be moved, deletion fails and the agent record remains. Named
+  subagents can still leave data at an unregistered name, so the create check remains
+  necessary. **After upgrading**, folders left by agents deleted before this change stay
+  in place and continue to block that name until moved or deleted.
 - A replacing `workspace_write` is refused when it would delete text the agent has not
   been shown; a new `workspace_read` tool is how it gets shown.
 - An agent's memories survive a concurrent write to its workspace.

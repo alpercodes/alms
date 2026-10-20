@@ -591,6 +591,89 @@ pub fn ensure_workspace_dir_available(dir: &Path) -> std::io::Result<()> {
     }
 }
 
+/// Move an agent workspace out of its name-based path before deleting its
+/// registry record, so named subagents cannot keep reading its old identity.
+pub fn archive_agent_workspace(
+    workspace_dir: &Path,
+    name: &str,
+    agent_id: AgentId,
+) -> std::io::Result<Option<std::path::PathBuf>> {
+    let source = workspace_dir.join(name);
+    match std::fs::symlink_metadata(&source) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    }
+
+    let archive_root = workspace_dir.join(".deleted");
+    match std::fs::symlink_metadata(&archive_root) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "workspace archive path must be a directory, not a file or symlink",
+            ));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            match std::fs::create_dir(&archive_root) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    let metadata = std::fs::symlink_metadata(&archive_root)?;
+                    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::AlreadyExists,
+                            "workspace archive path must be a directory, not a file or symlink",
+                        ));
+                    }
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err(error) => return Err(error),
+    }
+
+    let safe_name: String = name
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || character == '-' {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let timestamp = Utc::now().format("%Y%m%dT%H%M%S%.9fZ");
+    let destination = archive_root.join(format!("{safe_name}-{timestamp}-{agent_id}"));
+    if std::fs::symlink_metadata(&destination).is_ok() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "workspace archive destination already exists",
+        ));
+    }
+    std::fs::rename(&source, &destination)?;
+    Ok(Some(destination))
+}
+
+/// Restore a workspace moved by [`archive_agent_workspace`] if deletion fails.
+pub fn restore_agent_workspace(
+    workspace_dir: &Path,
+    name: &str,
+    archive_path: &Path,
+) -> std::io::Result<()> {
+    let source = workspace_dir.join(name);
+    match std::fs::symlink_metadata(&source) {
+        Ok(_) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "cannot restore archived workspace because its original path exists",
+            ));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    std::fs::rename(archive_path, source)
+}
+
 /// Migrate workspace directories from UUID-based to name-based paths.
 ///
 /// For each `(uuid, name)` pair, renames `{workspace_dir}/{uuid}/` to
@@ -922,6 +1005,93 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(dir.join("memories.md")).unwrap(),
             "old agent memory"
+        );
+    }
+
+    #[test]
+    fn archive_agent_workspace_moves_data_out_of_the_name_path_and_can_restore() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace_dir = tmp.path().join("agents");
+        let source = workspace_dir.join("atlas");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join("memories.md"), "private notes").unwrap();
+        let agent_id = AgentId::new();
+
+        let archive = archive_agent_workspace(&workspace_dir, "atlas", agent_id)
+            .unwrap()
+            .expect("existing workspace must be archived");
+
+        assert!(
+            !source.exists(),
+            "named subagents must not see the old path"
+        );
+        assert_eq!(
+            archive.parent(),
+            Some(workspace_dir.join(".deleted").as_path())
+        );
+        assert_eq!(
+            std::fs::read_to_string(archive.join("memories.md")).unwrap(),
+            "private notes"
+        );
+
+        restore_agent_workspace(&workspace_dir, "atlas", &archive).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(source.join("memories.md")).unwrap(),
+            "private notes"
+        );
+        assert!(!archive.exists());
+    }
+
+    #[test]
+    fn archive_agent_workspace_is_a_no_op_when_workspace_is_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace_dir = tmp.path().join("agents");
+
+        assert_eq!(
+            archive_agent_workspace(&workspace_dir, "atlas", AgentId::new()).unwrap(),
+            None
+        );
+        assert!(!workspace_dir.join(".deleted").exists());
+    }
+
+    #[test]
+    fn archive_agent_workspace_rejects_a_file_archive_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace_dir = tmp.path().join("agents");
+        let source = workspace_dir.join("atlas");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join("memories.md"), "private notes").unwrap();
+        std::fs::write(workspace_dir.join(".deleted"), "not a directory").unwrap();
+
+        let error = archive_agent_workspace(&workspace_dir, "atlas", AgentId::new()).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(
+            std::fs::read_to_string(source.join("memories.md")).unwrap(),
+            "private notes"
+        );
+    }
+
+    #[test]
+    fn restore_agent_workspace_does_not_replace_a_new_workspace() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace_dir = tmp.path().join("agents");
+        let source = workspace_dir.join("atlas");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join("memories.md"), "new workspace").unwrap();
+        let archive = workspace_dir.join(".deleted").join("atlas-old");
+        std::fs::create_dir_all(&archive).unwrap();
+        std::fs::write(archive.join("memories.md"), "old workspace").unwrap();
+
+        let error = restore_agent_workspace(&workspace_dir, "atlas", &archive).unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(
+            std::fs::read_to_string(source.join("memories.md")).unwrap(),
+            "new workspace"
+        );
+        assert_eq!(
+            std::fs::read_to_string(archive.join("memories.md")).unwrap(),
+            "old workspace"
         );
     }
 

@@ -591,6 +591,7 @@ pub(crate) fn agent_delete(
     force: bool,
     json: bool,
     project_root: Option<&std::path::Path>,
+    workspace_dir: Option<&std::path::Path>,
 ) -> anyhow::Result<()> {
     let agent = resolve_agent(store, name_or_id)?;
     if agent.is_default && !force {
@@ -599,6 +600,24 @@ pub(crate) fn agent_delete(
             agent.name
         );
     }
+    let project_root = if agent.worktree_mode == WorktreeMode::Git {
+        Some(project_root.ok_or_else(|| {
+            anyhow::anyhow!(
+                "Agent '{}' has worktree_mode=git but no project root was provided. \
+                 Run from inside the project directory or set ALMS_PROJECT_ROOT.",
+                agent.name
+            )
+        })?)
+    } else {
+        None
+    };
+    let archived_workspace = workspace_dir
+        .map(|workspace_dir| {
+            alms_core::archive_agent_workspace(workspace_dir, &agent.name, agent.id)
+        })
+        .transpose()?
+        .flatten();
+
     // Worktree teardown (#946). Runs BEFORE the SQLite delete so an
     // uncommitted-changes refusal surfaces a clean error without
     // orphaning the registry record. `--force` drives both the
@@ -606,15 +625,9 @@ pub(crate) fn agent_delete(
     // because the user's intent is "I really want this gone" and
     // splitting the flag would be more friction than safety.
     if agent.worktree_mode == WorktreeMode::Git {
-        let project_root = project_root.ok_or_else(|| {
-            anyhow::anyhow!(
-                "Agent '{}' has worktree_mode=git but no project root was provided. \
-                 Run from inside the project directory or set ALMS_PROJECT_ROOT.",
-                agent.name
-            )
-        })?;
+        let project_root = project_root.expect("git agents require a project root");
         if let Err(e) = alms_core::worktree::remove_worktree(project_root, &agent.name, force) {
-            return Err(match e {
+            let delete_error = match e {
                 alms_core::worktree::WorktreeError::UncommittedChanges => anyhow::anyhow!(
                     "WORKTREE_HAS_UNCOMMITTED_CHANGES: agent '{}' has uncommitted changes \
                      in its worktree. Commit / stash them, or pass --force to delete \
@@ -624,17 +637,54 @@ pub(crate) fn agent_delete(
                     agent.name
                 ),
                 other => anyhow::anyhow!("WORKTREE_GIT_FAILED: {other}"),
-            });
+            };
+            if let (Some(workspace_dir), Some(archive_path)) =
+                (workspace_dir, archived_workspace.as_deref())
+                && let Err(restore_error) =
+                    alms_core::restore_agent_workspace(workspace_dir, &agent.name, archive_path)
+            {
+                return Err(delete_error.context(format!(
+                    "archived workspace remains at {} because restoration failed: {restore_error}",
+                    archive_path.display()
+                )));
+            }
+            return Err(delete_error);
         }
     }
-    store.delete_agent(agent.id)?;
+
+    if let Err(delete_error) = store.delete_agent(agent.id) {
+        if let (Some(workspace_dir), Some(archive_path)) =
+            (workspace_dir, archived_workspace.as_deref())
+            && let Err(restore_error) =
+                alms_core::restore_agent_workspace(workspace_dir, &agent.name, archive_path)
+        {
+            return Err(anyhow::Error::from(delete_error).context(format!(
+                "archived workspace remains at {} because restoration failed: {restore_error}",
+                archive_path.display()
+            )));
+        }
+        return Err(delete_error.into());
+    }
+
+    let archive_path = archived_workspace
+        .as_deref()
+        .zip(workspace_dir)
+        .and_then(|(archive_path, workspace_dir)| archive_path.strip_prefix(workspace_dir).ok())
+        .map(|path| path.to_string_lossy().replace('\\', "/"));
     if json {
         println!(
             "{}",
-            serde_json::json!({ "ok": true, "deleted": agent.name })
+            serde_json::json!({
+                "ok": true,
+                "deleted": agent.name,
+                "workspace_archive": archive_path,
+            })
         );
     } else {
         println!("Deleted agent '{}'", agent.name);
+        if let Some(archive_path) = archive_path {
+            println!("  Workspace archived at {archive_path}");
+        }
     }
     Ok(())
 }
@@ -963,7 +1013,7 @@ mod tests {
         assert_eq!(agent.description, "desc");
 
         // Delete
-        agent_delete(&store, "test-agent", false, false, None).unwrap();
+        agent_delete(&store, "test-agent", false, false, None, None).unwrap();
         assert!(store.list_agents().unwrap().is_empty());
     }
 
@@ -1229,7 +1279,7 @@ mod tests {
         let agent = make_agent(&store, "main");
         store.set_default_agent(agent.id).unwrap();
 
-        let err = agent_delete(&store, "main", false, false, None).unwrap_err();
+        let err = agent_delete(&store, "main", false, false, None, None).unwrap_err();
         assert!(err.to_string().contains("Cannot delete the default"));
     }
 
@@ -1239,8 +1289,34 @@ mod tests {
         let agent = make_agent(&store, "main");
         store.set_default_agent(agent.id).unwrap();
 
-        agent_delete(&store, "main", true, false, None).unwrap();
+        agent_delete(&store, "main", true, false, None, None).unwrap();
         assert!(store.list_agents().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_delete_archives_agent_workspace() {
+        let store = new_store();
+        let agent = make_agent(&store, "atlas");
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace_dir = tmp.path().join("agents");
+        let workspace = workspace_dir.join("atlas");
+        alms_core::init_workspace_files(&workspace).unwrap();
+        std::fs::write(workspace.join("memories.md"), "private notes").unwrap();
+
+        agent_delete(&store, "atlas", false, true, None, Some(&workspace_dir)).unwrap();
+
+        assert!(store.load_agent_by_id(agent.id).unwrap().is_none());
+        assert!(!workspace.exists());
+        let mut archived = std::fs::read_dir(workspace_dir.join(".deleted"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path());
+        let archive = archived.next().expect("workspace archive exists");
+        assert!(archived.next().is_none(), "one workspace was archived");
+        assert_eq!(
+            std::fs::read_to_string(archive.join("memories.md")).unwrap(),
+            "private notes"
+        );
+        alms_core::ensure_workspace_dir_available(&workspace).unwrap();
     }
 
     #[test]

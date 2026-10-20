@@ -1222,6 +1222,25 @@ pub async fn delete_agent(
         ));
     }
 
+    // Move the workspace out of the name-based path before deleting the
+    // record. Named subagents attach that path even when the name is no
+    // longer registered.
+    let workspace_dir = state.workspace_dir.as_deref();
+    let archived_workspace = match workspace_dir {
+        Some(workspace_dir) => {
+            alms_core::archive_agent_workspace(workspace_dir, &agent.name, agent.id).map_err(
+                |error| {
+                    api_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "INTERNAL",
+                        format!("archive agent workspace before deletion: {error}"),
+                    )
+                },
+            )?
+        }
+        None => None,
+    };
+
     // Worktree teardown (#946). Runs BEFORE the SQLite delete so an
     // uncommitted-changes refusal surfaces a 4xx without orphaning
     // the agent record. `force` from the query string overrides the
@@ -1236,7 +1255,7 @@ pub async fn delete_agent(
     // but the worktree gone — operator hit a silent half-deleted
     // state. The helper's branch-SHA snapshot preserves agent commit
     // history across the round trip.
-    if agent.worktree_mode == WorktreeMode::Git {
+    let delete_result = if agent.worktree_mode == WorktreeMode::Git {
         let agent_name = agent.name.clone();
         let agent_id = agent.id;
         let project_root = state.project_root.clone();
@@ -1246,19 +1265,45 @@ pub async fn delete_agent(
             &agent_name,
             WorktreeOp::Remove { force: query.force },
             || store_ref.delete_agent(agent_id).map(|_| ()),
-        )?;
+        )
     } else {
         // worktree_mode = Off — no on-disk side-effect to compose
         // around, delete directly. Preserves pre-#1022 wire shape
         // for the (overwhelmingly common) non-worktree delete path.
         store
             .delete_agent(agent.id)
-            .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL", e))?;
+            .map(|_| ())
+            .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL", error))
+    };
+
+    if let Err(delete_error) = delete_result {
+        if let (Some(workspace_dir), Some(archive_path)) =
+            (workspace_dir, archived_workspace.as_deref())
+            && let Err(restore_error) =
+                alms_core::restore_agent_workspace(workspace_dir, &agent.name, archive_path)
+        {
+            return Err(api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "INTERNAL",
+                format!(
+                    "{delete_error:?}; archived workspace remains at {} because restoration failed: {restore_error}",
+                    archive_path.display()
+                ),
+            ));
+        }
+        return Err(delete_error);
     }
 
-    Ok(Json(
-        serde_json::json!({ "ok": true, "deleted": agent.id.to_string() }),
-    ))
+    let archive_path = archived_workspace
+        .as_deref()
+        .zip(workspace_dir)
+        .and_then(|(archive_path, workspace_dir)| archive_path.strip_prefix(workspace_dir).ok())
+        .map(|path| path.to_string_lossy().replace('\\', "/"));
+    Ok(Json(serde_json::json!({
+        "ok": true,
+        "deleted": agent.id.to_string(),
+        "workspace_archive": archive_path,
+    })))
 }
 
 /// POST /agents/{id_or_name}/default — set agent as default.
@@ -2320,7 +2365,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn post_agents_refuses_workspace_left_by_deleted_agent() {
+    async fn post_agents_archives_deleted_agent_workspace_before_name_reuse() {
         let tmp = tempfile::TempDir::new().unwrap();
         let workspace_dir = tmp.path().join("agents");
         let state = TestAppState::new()
@@ -2338,7 +2383,7 @@ mod tests {
         let memories = workspace_dir.join("atlas").join("memories.md");
         std::fs::write(&memories, "private notes from the old agent").unwrap();
 
-        let _ = delete_agent(
+        let deleted = delete_agent(
             axum::extract::State(state.clone()),
             axum::extract::Path("atlas".into()),
             axum::extract::Query(DeleteAgentQuery::default()),
@@ -2346,19 +2391,61 @@ mod tests {
         .await
         .expect("agent deletion must succeed");
 
-        let (status, body) = create_agent_err(state.clone(), create_req("atlas")).await;
-        assert_eq!(status, StatusCode::CONFLICT);
-        assert_eq!(err_code(&body), "WORKSPACE_EXISTS");
-        let message = body["error"]["message"].as_str().unwrap();
-        assert!(message.contains("at atlas/"));
-        assert!(message.contains("move or delete that path"));
-
-        let store = state.session_manager.store().expect("sqlite store");
-        assert!(store.load_agent_by_name("atlas").unwrap().is_none());
+        let archive_relative = deleted.0["workspace_archive"]
+            .as_str()
+            .expect("API returns the archive path");
+        assert!(archive_relative.starts_with(".deleted/"));
+        let archived_memories = workspace_dir.join(archive_relative).join("memories.md");
+        assert!(!memories.exists(), "old data must leave the named path");
         assert_eq!(
-            std::fs::read_to_string(memories).unwrap(),
+            std::fs::read_to_string(&archived_memories).unwrap(),
             "private notes from the old agent"
         );
+
+        let (status, _) = create_agent(
+            axum::extract::State(state.clone()),
+            Json(create_req("atlas")),
+        )
+        .await
+        .expect("archived name must be reusable");
+        assert_eq!(status, StatusCode::CREATED);
+
+        let store = state.session_manager.store().expect("sqlite store");
+        assert!(store.load_agent_by_name("atlas").unwrap().is_some());
+        assert_eq!(std::fs::read_to_string(memories).unwrap(), "");
+    }
+
+    #[tokio::test]
+    async fn delete_agents_keeps_registry_when_workspace_cannot_be_archived() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let workspace_dir = tmp.path().join("agents");
+        let state = TestAppState::new()
+            .in_memory_sqlite()
+            .workspace_dir(workspace_dir.clone())
+            .build();
+        let _ = create_agent(
+            axum::extract::State(state.clone()),
+            Json(create_req("atlas")),
+        )
+        .await
+        .expect("agent creation must succeed");
+
+        let memories = workspace_dir.join("atlas").join("memories.md");
+        std::fs::write(&memories, "private notes").unwrap();
+        std::fs::write(workspace_dir.join(".deleted"), "not a directory").unwrap();
+
+        let error = delete_agent(
+            axum::extract::State(state.clone()),
+            axum::extract::Path("atlas".into()),
+            axum::extract::Query(DeleteAgentQuery::default()),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.0, StatusCode::INTERNAL_SERVER_ERROR);
+
+        let store = state.session_manager.store().expect("sqlite store");
+        assert!(store.load_agent_by_name("atlas").unwrap().is_some());
+        assert_eq!(std::fs::read_to_string(memories).unwrap(), "private notes");
     }
 
     #[tokio::test]
@@ -2884,6 +2971,52 @@ mod tests {
                 .exists(),
             "non-git project must not leave a half-created worktree dir"
         );
+    }
+
+    #[tokio::test]
+    async fn post_agents_refused_workspace_provisions_no_worktree() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut state = agents_test_state_with_git_project(tmp.path());
+        let workspace_dir = tmp.path().join(".alms").join("agents");
+        state.workspace_dir = Some(workspace_dir.clone());
+        let existing_workspace = workspace_dir.join("atlas");
+        std::fs::create_dir_all(&existing_workspace).unwrap();
+        std::fs::write(existing_workspace.join("memories.md"), "old data").unwrap();
+
+        let req = alms_core::CreateAgentRequest {
+            name: "atlas".into(),
+            description: None,
+            model: None,
+            posture: None,
+            provider: None,
+            telegram_token: None,
+            thinking_budget_tokens: None,
+            reasoning_effort: None,
+            gemini_thinking_budget: None,
+            summary_provider: None,
+            summary_model: None,
+            worktree_mode: Some(WorktreeMode::Git),
+            debug_mode: None,
+            is_default: None,
+        };
+
+        let (status, body) = create_agent_err(state.clone(), req).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(err_code(&body), "WORKSPACE_EXISTS");
+        assert_eq!(
+            std::fs::read_to_string(existing_workspace.join("memories.md")).unwrap(),
+            "old data"
+        );
+
+        let store = state.session_manager.store().expect("sqlite store");
+        assert!(store.load_agent_by_name("atlas").unwrap().is_none());
+        assert!(!tmp.path().join(".alms/worktrees/atlas").exists());
+        let branch = std::process::Command::new("git")
+            .args(["branch", "--list", "alms/atlas"])
+            .current_dir(tmp.path())
+            .output()
+            .unwrap();
+        assert!(String::from_utf8_lossy(&branch.stdout).trim().is_empty());
     }
 
     /// `PUT /agents/{id}` flipping `Off → Git` provisions the
