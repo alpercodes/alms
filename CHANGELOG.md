@@ -200,10 +200,14 @@ Each item below changes behaviour for a deployment that has not set the knob exp
   personality and memories. `DELETE /agents` and `alms agent delete` move an existing
   `.alms/agents/<name>/` to `.alms/agents/.deleted/<name>-<timestamp>-<agent-id>/` before
   removing the registry record. The archive keeps the workspace text and frees the name
-  path; if it cannot be moved, deletion fails and the agent record remains. Named
-  subagents can still leave data at an unregistered name, so the create check remains
-  necessary. **After upgrading**, folders left by agents deleted before this change stay
-  in place and continue to block that name until moved or deleted.
+  path; if it cannot be moved, deletion fails and the agent record remains. The
+  `DELETE /agents` response and `alms agent delete --json` gain a `workspace_archive`
+  field (additive): the archive path relative to `.alms/agents/`, or `null` when there
+  was nothing to archive. `DELETE /agents` now cancels the deleted agent's queued and
+  running runs. Named subagents can still leave data at an unregistered name, so the
+  create check remains necessary. **After upgrading**, folders left by agents deleted
+  before this change stay in place and continue to block that name until moved or
+  deleted.
 - A replacing `workspace_write` is refused when it would delete text the agent has not
   been shown; a new `workspace_read` tool is how it gets shown.
 - An agent's memories survive a concurrent write to its workspace.

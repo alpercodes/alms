@@ -243,10 +243,13 @@ pub async fn create_agent(
     // Check both the registry and the name-keyed workspace before creating
     // side effects. A deleted agent can leave identity files behind; refusing
     // non-scaffold contents prevents a new registry ID from inheriting them.
-    // The SQLite UNIQUE-name constraint arbitrates name races, but a late
-    // write from a named subagent, or from a run of the just-deleted agent
-    // still in flight (`DELETE /agents` does not cancel its runs), can still
-    // race this filesystem check.
+    // The SQLite UNIQUE-name constraint arbitrates name races. `DELETE
+    // /agents` cancels the deleted agent's runs, but three writers can still
+    // recreate the folder and race this filesystem check: a tool call already
+    // executing when that cancel lands; a gateway run of an agent deleted
+    // with `alms agent delete`, which runs in another process and cannot
+    // cancel it; and a named subagent with this name spawned by another
+    // agent.
     let worktree_mode = req.worktree_mode.unwrap_or_default();
     match store.load_agent_by_name(&req.name) {
         Ok(Some(_)) => {
@@ -1288,6 +1291,15 @@ pub async fn delete_agent(
         // for the (overwhelmingly common) non-worktree delete path.
         archive_and_delete()
             .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL", error))?;
+    }
+
+    // Stop the deleted agent's runs. They would otherwise keep writing to
+    // the name path for the rest of the run, and so into a re-created
+    // agent. Only after the delete has committed, so a refused delete
+    // never stops a live agent.
+    let cancelled = state.run_manager.cancel_runs_for_agent(agent.id);
+    if cancelled > 0 {
+        tracing::info!(agent_id = %agent.id, cancelled, "Cancelled the deleted agent's runs");
     }
 
     let archive_path = archived_workspace
@@ -2471,6 +2483,56 @@ mod tests {
         assert_eq!(std::fs::read_to_string(memories).unwrap(), "private notes");
     }
 
+    /// Register a running run of `agent_id` with the run manager and return
+    /// its cancellation token.
+    fn register_running_run(
+        state: &crate::server::AppState,
+        agent_id: AgentId,
+    ) -> tokio_util::sync::CancellationToken {
+        let mut run = alms_core::Run::new(alms_core::SessionId::new(), agent_id, "work".into());
+        let run_id = run.run_id;
+        run.mark_running();
+        let _ = state.run_manager.insert_run(run);
+        let token = tokio_util::sync::CancellationToken::new();
+        state
+            .run_manager
+            .register_cancel_token(run_id, token.clone());
+        token
+    }
+
+    /// Deleting an agent stops its runs, so none keeps writing to its old path.
+    #[tokio::test]
+    async fn delete_agents_cancels_the_deleted_agents_runs() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ws = tmp.path().join("agents");
+        let state = TestAppState::new()
+            .in_memory_sqlite()
+            .workspace_dir(ws)
+            .build();
+        let _ = create_agent(
+            axum::extract::State(state.clone()),
+            Json(create_req("atlas")),
+        )
+        .await
+        .expect("create");
+        let store = state.session_manager.store().expect("sqlite store");
+        let agent = store.load_agent_by_name("atlas").unwrap().unwrap();
+        let token = register_running_run(&state, agent.id);
+
+        let _ = delete_agent(
+            axum::extract::State(state.clone()),
+            axum::extract::Path("atlas".into()),
+            axum::extract::Query(DeleteAgentQuery::default()),
+        )
+        .await
+        .expect("delete");
+
+        assert!(
+            token.is_cancelled(),
+            "the deleted agent's run must be cancelled"
+        );
+    }
+
     #[tokio::test]
     async fn post_agents_reuses_blank_scaffold_left_by_deleted_agent() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -3281,6 +3343,38 @@ mod tests {
         assert!(
             wt_dir.exists(),
             "compensation must restore the removed worktree"
+        );
+    }
+
+    /// The run cancellation happens only after the delete commits: a delete
+    /// refused by the worktree guard leaves the live agent's runs running.
+    #[tokio::test]
+    async fn delete_agents_refused_by_worktree_keeps_the_agents_runs() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = agents_test_state_with_git_project(tmp.path());
+        let mut req = create_req("atlas");
+        req.worktree_mode = Some(WorktreeMode::Git);
+        let _ = create_agent(axum::extract::State(state.clone()), Json(req))
+            .await
+            .expect("create");
+        let wt_dir = tmp.path().join(".alms").join("worktrees").join("atlas");
+        std::fs::write(wt_dir.join("dirty.txt"), "wip").unwrap();
+        let store = state.session_manager.store().expect("sqlite store");
+        let agent = store.load_agent_by_name("atlas").unwrap().unwrap();
+        let token = register_running_run(&state, agent.id);
+
+        let (status, _) = delete_agent(
+            axum::extract::State(state.clone()),
+            axum::extract::Path("atlas".into()),
+            axum::extract::Query(DeleteAgentQuery { force: false }),
+        )
+        .await
+        .expect_err("delete must refuse on uncommitted changes");
+
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(
+            !token.is_cancelled(),
+            "a refused delete must not stop the agent's runs"
         );
     }
 
