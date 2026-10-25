@@ -76,6 +76,643 @@ async fn test_build_context() {
 }
 
 #[tokio::test]
+async fn oversized_workspace_files_do_not_evict_session_history() {
+    use crate::workspace::{AgentWorkspace, WorkspaceFile};
+    use alms_core::config::ContextConfig;
+    use tempfile::tempdir;
+
+    let dir = tempdir().unwrap();
+    let workspace = AgentWorkspace::new(dir.path(), "alice");
+    for (file, start, fill, end) in [
+        (
+            WorkspaceFile::Personality,
+            "PERSONALITY_START",
+            'p',
+            "PERSONALITY_END",
+        ),
+        (WorkspaceFile::Goals, "GOALS_START", 'g', "GOALS_END"),
+        (WorkspaceFile::User, "USER_START", 'u', "USER_END"),
+        (
+            WorkspaceFile::Memories,
+            "MEMORIES_START",
+            'm',
+            "MEMORIES_END",
+        ),
+    ] {
+        workspace
+            .write_file_as_operator(
+                file,
+                &format!(
+                    "{start}\n{}{end}",
+                    format!("{fill}-workspace-entry\n").repeat(10_000)
+                ),
+            )
+            .unwrap();
+    }
+
+    let runtime = AgentRuntime::new(
+        AgentId::new(),
+        AgentConfig {
+            system_prompt: "Test agent.".into(),
+            context_config: ContextConfig {
+                strategy: "truncate".into(),
+                max_input_tokens: 8_000,
+                ..ContextConfig::default()
+            },
+            sandbox_root: "".into(),
+            ..AgentConfig::default()
+        },
+        LlmClient::new(LlmConfig {
+            mock: true,
+            ..LlmConfig::default()
+        })
+        .unwrap(),
+    )
+    .unwrap()
+    .with_workspace(workspace);
+
+    let session_manager = SessionManager::new(SessionConfig::default());
+    let session = session_manager.get_or_create(runtime.agent_id, "web-chat");
+    for index in 0..8 {
+        let role = if index % 2 == 0 {
+            alms_session::Role::User
+        } else {
+            alms_session::Role::Assistant
+        };
+        session_manager
+            .append_message(
+                session.id,
+                alms_session::Message {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    role,
+                    content: alms_session::Content::Text(format!(
+                        "HISTORY_{index}_{}",
+                        "h".repeat(900)
+                    )),
+                    timestamp: alms_core::Timestamp::now(),
+                    metadata: None,
+                },
+            )
+            .unwrap();
+    }
+
+    let messages = runtime
+        .build_context(&session_manager, &session.id, "web-chat", "continue")
+        .await
+        .unwrap();
+    let system_prompt = messages[0].content_str();
+    for file in ["personality.md", "goals.md", "user.md"] {
+        assert!(
+            system_prompt.contains(&format!("{file} truncated:")),
+            "the system prompt should identify its partial {file} view"
+        );
+    }
+    assert!(
+        system_prompt.contains("Older memories truncated:"),
+        "memories should keep their existing tail-window marker"
+    );
+
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.content_str().contains("HISTORY_0_")),
+        "the oldest history should remain when one workspace file is oversized"
+    );
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.content_str().contains("HISTORY_7_")),
+        "the newest history should remain when one workspace file is oversized"
+    );
+}
+
+#[tokio::test]
+async fn tool_loop_rebuild_reuses_the_initial_workspace_budget() {
+    use crate::workspace::{AgentWorkspace, WorkspaceFile};
+    use tempfile::tempdir;
+
+    let dir = tempdir().unwrap();
+    let workspace = AgentWorkspace::new(dir.path(), "alice");
+    workspace
+        .write_file_as_operator(
+            WorkspaceFile::Personality,
+            &format!("PERSONALITY_START\n{}\nPERSONALITY_END", "p".repeat(1600)),
+        )
+        .unwrap();
+    workspace
+        .write_file_as_operator(
+            WorkspaceFile::Goals,
+            "GOALS_START\nship the feature\nGOALS_END",
+        )
+        .unwrap();
+    workspace
+        .write_file_as_operator(
+            WorkspaceFile::Memories,
+            &format!("MEMORIES_START\n{}\nMEMORIES_END", "m".repeat(900)),
+        )
+        .unwrap();
+
+    let runtime = AgentRuntime::new(
+        AgentId::new(),
+        AgentConfig {
+            sandbox_root: "".into(),
+            ..AgentConfig::default()
+        },
+        LlmClient::new(LlmConfig {
+            mock: true,
+            ..LlmConfig::default()
+        })
+        .unwrap(),
+    )
+    .unwrap()
+    .with_workspace(workspace);
+
+    let session_manager = SessionManager::new(SessionConfig::default());
+    let session = session_manager.get_or_create(runtime.agent_id, "web-chat");
+    for index in 0..300 {
+        session_manager
+            .append_message(
+                session.id,
+                alms_session::Message {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    role: if index % 2 == 0 {
+                        alms_session::Role::User
+                    } else {
+                        alms_session::Role::Assistant
+                    },
+                    content: alms_session::Content::Text(format!(
+                        "HISTORY_{index}_{}",
+                        "h".repeat(1500)
+                    )),
+                    timestamp: alms_core::Timestamp::now(),
+                    metadata: None,
+                },
+            )
+            .unwrap();
+    }
+
+    let built = runtime
+        .build_context_with_budget(&session_manager, &session.id, "web-chat", "continue")
+        .await
+        .unwrap();
+    let workspace_budget_bytes = built.workspace_budget_bytes;
+    let mut messages = built.messages;
+    let mut previous = None;
+
+    for batch in 1..=3 {
+        messages.push(LlmMessage::assistant(format!("tool batch {batch}")));
+        messages.push(LlmMessage::tool_result(
+            format!("call_{batch}"),
+            "r".repeat(3000),
+        ));
+        runtime.rebuild_system_prompt_for_tool_loop_with_budget(
+            &mut messages,
+            true,
+            None,
+            workspace_budget_bytes,
+        );
+
+        let system_prompt = messages[0].content_str().to_string();
+        for marker in ["PERSONALITY_END", "GOALS_END", "MEMORIES_END"] {
+            assert!(
+                system_prompt.contains(marker),
+                "the stable workspace view must contain {marker}"
+            );
+        }
+        if let Some(previous) = previous.replace(system_prompt.clone()) {
+            assert_eq!(
+                previous, system_prompt,
+                "the system block must remain stable across tool batches"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn normal_workspace_files_are_byte_stable_across_build_and_rebuild() {
+    use crate::workspace::{AgentWorkspace, WorkspaceFile};
+    use tempfile::tempdir;
+
+    let dir = tempdir().unwrap();
+    let workspace = AgentWorkspace::new(dir.path(), "alice");
+    let personality = "p".repeat(1684);
+    let goals = "g".repeat(39);
+    let memories = "m".repeat(963);
+    workspace
+        .write_file_as_operator(WorkspaceFile::Personality, &personality)
+        .unwrap();
+    workspace
+        .write_file_as_operator(WorkspaceFile::Goals, &goals)
+        .unwrap();
+    workspace
+        .write_file_as_operator(WorkspaceFile::Memories, &memories)
+        .unwrap();
+
+    let runtime = AgentRuntime::new(
+        AgentId::new(),
+        AgentConfig {
+            sandbox_root: "".into(),
+            ..AgentConfig::default()
+        },
+        LlmClient::new(LlmConfig {
+            mock: true,
+            ..LlmConfig::default()
+        })
+        .unwrap(),
+    )
+    .unwrap()
+    .with_workspace(workspace);
+    let session_manager = SessionManager::new(SessionConfig::default());
+    let session = session_manager.get_or_create(runtime.agent_id, "web-chat");
+    let built = runtime
+        .build_context_with_budget(&session_manager, &session.id, "web-chat", "continue")
+        .await
+        .unwrap();
+    let expected_initial = format!(
+        "{}\n\n{}\n\n## Current Goals\n{}\n\n## Memories\n{}",
+        runtime.config.system_prompt, personality, goals, memories
+    );
+    assert_eq!(built.messages[0].content_str(), expected_initial);
+
+    let mut messages = built.messages;
+    for batch in 1..=2 {
+        messages.push(LlmMessage::assistant(format!("tool batch {batch}")));
+        messages.push(LlmMessage::tool_result(format!("call_{batch}"), "ok"));
+        runtime.rebuild_system_prompt_for_tool_loop_with_budget(
+            &mut messages,
+            true,
+            None,
+            built.workspace_budget_bytes,
+        );
+        assert_eq!(
+            messages[0].content_str(),
+            format!("{expected_initial}\n\n{}", runtime.config.prompts.tool_loop),
+            "unchanged normal-size files should retain the same bytes on every rebuild"
+        );
+    }
+}
+
+/// One streamed OpenAI-style completion that calls `echo` once.
+fn echo_tool_call_sse(call_id: &str) -> String {
+    let chunk = serde_json::json!({
+        "id": call_id, "object": "chat.completion.chunk", "created": 1, "model": "test-model",
+        "choices": [{
+            "index": 0,
+            "delta": {
+                "role": "assistant",
+                "tool_calls": [{
+                    "index": 0, "id": call_id, "type": "function",
+                    "function": { "name": "echo", "arguments": "{\"message\":\"ok\"}" }
+                }]
+            },
+            "finish_reason": "tool_calls"
+        }]
+    });
+    format!("data: {chunk}\n\ndata: [DONE]\n\n")
+}
+
+/// One streamed OpenAI-style completion that ends the run with `text`.
+fn final_text_sse(text: &str) -> String {
+    let chunk = serde_json::json!({
+        "id": "final", "object": "chat.completion.chunk", "created": 2, "model": "test-model",
+        "choices": [{
+            "index": 0,
+            "delta": { "role": "assistant", "content": text },
+            "finish_reason": "stop"
+        }]
+    });
+    format!("data: {chunk}\n\ndata: [DONE]\n\n")
+}
+
+/// An agent under budget pressure: an 8,000-token window and a 20 KB
+/// one-line personality that cannot fit whole. The base and `tool_loop`
+/// prompts are fixed here so the budget arithmetic does not move when the
+/// shipped prompt files are edited. Keep the returned directory alive for as
+/// long as the runtime is used.
+fn budget_pressure_runtime(agent_id: AgentId, llm: LlmConfig) -> (tempfile::TempDir, AgentRuntime) {
+    use crate::workspace::{AgentWorkspace, WorkspaceFile};
+    use alms_core::config::ContextConfig;
+
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = AgentWorkspace::new(dir.path(), "alice");
+    workspace
+        .write_file_as_operator(WorkspaceFile::Personality, &"p".repeat(20_000))
+        .unwrap();
+
+    let runtime = AgentRuntime::new(
+        agent_id,
+        AgentConfig {
+            system_prompt: "Budget-pressure base prompt.".into(),
+            prompts: SystemPrompts {
+                tool_loop: "Continue.".into(),
+            },
+            context_config: ContextConfig {
+                max_input_tokens: 8_000,
+                ..ContextConfig::default()
+            },
+            sandbox_root: "".into(),
+            ..AgentConfig::default()
+        },
+        LlmClient::new(llm).unwrap(),
+    )
+    .unwrap()
+    .with_workspace(workspace);
+    (dir, runtime)
+}
+
+/// The system prompt of every request `llm` received, in order.
+async fn system_prompts(llm: &alms_test_support::ScriptedLlm) -> Vec<String> {
+    llm.request_bodies()
+        .await
+        .iter()
+        .map(|body| {
+            serde_json::from_str::<serde_json::Value>(body).unwrap()["messages"][0]["content"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        })
+        .collect()
+}
+
+/// S8 (#192 review): `run()` must carry the budget its context was built
+/// with into every tool-loop rebuild. The rebuild tests above call
+/// `rebuild_system_prompt_for_tool_loop_with_budget` directly, so none of
+/// them sees `finish_run_with_workspace_budget` drop the budget; with
+/// `usize::MAX` passed there instead, every rebuild injects the whole 20 KB
+/// personality and overflows the window the first request was budgeted for.
+#[tokio::test]
+async fn run_carries_the_initial_workspace_budget_into_tool_loop_rebuilds() {
+    use alms_test_support::{Canned, ScriptedLlm};
+
+    let llm = ScriptedLlm::in_order(vec![
+        Canned::sse(echo_tool_call_sse("c1")),
+        Canned::sse(echo_tool_call_sse("c2")),
+        Canned::sse(final_text_sse("done")),
+    ])
+    .await;
+    let (_dir, runtime) = budget_pressure_runtime(
+        AgentId::new(),
+        LlmConfig {
+            base_url: llm.base_url(),
+            api_key: "test-key".to_string(),
+            default_model: "test-model".to_string(),
+            timeout_secs: 5,
+            stream_chunk_timeout_secs: 5,
+            ..LlmConfig::default()
+        },
+    );
+    let session_manager = SessionManager::new(SessionConfig::default());
+
+    let output = runtime
+        .run(&session_manager, "web-chat", "continue")
+        .await
+        .unwrap();
+    assert_eq!(output.response, "done");
+
+    let systems = system_prompts(&llm).await;
+    assert_eq!(systems.len(), 3, "two tool batches, then the final turn");
+    assert!(
+        systems[0].contains("personality.md truncated"),
+        "precondition: the first request is under budget pressure: {}",
+        systems[0]
+    );
+    for (batch, rebuilt) in systems[1..].iter().enumerate() {
+        assert_eq!(
+            *rebuilt,
+            format!("{}\n\n{}", systems[0], runtime.config.prompts.tool_loop),
+            "rebuild after batch {} must reuse the first request's workspace budget",
+            batch + 1
+        );
+    }
+}
+
+/// S13 (#192 review): the DM empty-reply retry is the loop's other system
+/// prompt rebuild, and it must reuse the run's workspace budget too. With
+/// `usize::MAX` passed there instead, the nudged retry injects the whole
+/// 20 KB personality and overflows the window the first request was budgeted
+/// for.
+#[tokio::test]
+async fn dm_empty_reply_retry_reuses_the_run_workspace_budget() {
+    use alms_test_support::{Canned, ScriptedLlm};
+
+    let llm = ScriptedLlm::in_order(vec![
+        Canned::sse(final_text_sse("")),
+        Canned::sse(final_text_sse("Hello alice.")),
+    ])
+    .await;
+    let (_dir, runtime) = budget_pressure_runtime(
+        AgentId::new(),
+        LlmConfig {
+            base_url: llm.base_url(),
+            api_key: "test-key".to_string(),
+            default_model: "test-model".to_string(),
+            timeout_secs: 5,
+            stream_chunk_timeout_secs: 5,
+            ..LlmConfig::default()
+        },
+    );
+    let runtime = runtime
+        .with_agent_name("bob".to_string())
+        .with_dm_implicit_reply();
+    let session_manager = SessionManager::new(SessionConfig::default());
+    let session_id = alms_core::SessionId::deterministic_dm("alice", "bob");
+    let _ = session_manager.get_or_create_shared(session_id, "dm:alice:bob");
+
+    let output = runtime
+        .run_on_session(&session_manager, session_id, "dm:alice:bob", "")
+        .await
+        .unwrap();
+    assert_eq!(output.response, "Hello alice.");
+
+    let systems = system_prompts(&llm).await;
+    assert_eq!(systems.len(), 2, "the empty reply, then the nudged retry");
+    assert!(
+        systems[0].contains("personality.md truncated"),
+        "precondition: the first request is under budget pressure: {}",
+        systems[0]
+    );
+    let addendum = AgentRuntime::dm_addendum("alice");
+    let workspace_prompt = systems[0]
+        .strip_suffix(&addendum)
+        .expect("precondition: the first request ends with the DM addendum");
+    assert_eq!(
+        systems[1],
+        format!(
+            "{workspace_prompt}\n\n{}{addendum}",
+            runtime.config.prompts.tool_loop
+        ),
+        "the retry rebuild must reuse the first request's workspace budget"
+    );
+}
+
+/// S10 (#192 review): under budget pressure, a turn's input length no longer
+/// moves a truncated file's cut, so consecutive turns of a session send the
+/// same system block and can hit the prompt cache. The personality is one
+/// unbroken line, so without the 1 KiB rounding the cut would follow the
+/// budget byte for byte: these two inputs differ by 37 tokens, which moves
+/// the unrounded budget by 57 bytes.
+#[tokio::test]
+async fn different_input_lengths_get_a_byte_identical_system_prompt_under_pressure() {
+    let (_dir, runtime) = budget_pressure_runtime(
+        AgentId::new(),
+        LlmConfig {
+            mock: true,
+            ..LlmConfig::default()
+        },
+    );
+    let session_manager = SessionManager::new(SessionConfig::default());
+    let session = session_manager.get_or_create(runtime.agent_id, "web-chat");
+
+    let short_input = "hi";
+    let long_input = "Please pick the review back up where you left it, and walk me through \
+                      what still must change before it can land.";
+    assert_eq!((short_input.len(), long_input.len()), (2, 112));
+
+    let mut systems = Vec::new();
+    for input in [short_input, long_input] {
+        let built = runtime
+            .build_context_with_budget(&session_manager, &session.id, "web-chat", input)
+            .await
+            .unwrap();
+        systems.push(built.messages[0].content_str().to_string());
+    }
+
+    assert!(
+        systems[0].contains("personality.md truncated"),
+        "precondition: the personality is under budget pressure: {}",
+        systems[0]
+    );
+    assert_eq!(
+        systems[0], systems[1],
+        "a 2-byte and a 112-byte input must cut the personality in the same place"
+    );
+}
+
+/// S10, second half: an episodic block is charged at `run_summary_budget`,
+/// not at its length. The block is rebuilt from the other sessions'
+/// summaries on every run, so it grows and shrinks between turns; charged at
+/// its length, a ~1,000-token difference here would move the budget across
+/// a 1 KiB step and the personality's cut with it.
+#[tokio::test]
+async fn episodic_block_length_does_not_move_the_workspace_cut() {
+    use alms_session::Session;
+    use alms_session::sqlite::SqliteStore;
+
+    let agent_id = AgentId::new();
+    let (_dir, runtime) = budget_pressure_runtime(
+        agent_id,
+        LlmConfig {
+            mock: true,
+            ..LlmConfig::default()
+        },
+    );
+
+    let short_summary = "Discussed the release checklist.".to_string();
+    let long_summary = format!(
+        "Discussed the release checklist. {}",
+        "Details. ".repeat(330)
+    );
+    let mut built_rows = Vec::new();
+    for summary in [&short_summary, &long_summary] {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let other = Session::new(agent_id, "web-chat-other");
+        let current = Session::new(agent_id, "web-chat");
+        store.save_session(&other).unwrap();
+        store.save_session(&current).unwrap();
+        store
+            .upsert_session_summary(agent_id, other.id, summary, None, Some("User chat"))
+            .unwrap();
+        let manager = SessionManager::with_store(SessionConfig::default(), store).unwrap();
+
+        let built = runtime
+            .build_context_with_budget(&manager, &current.id, "web-chat", "hi")
+            .await
+            .unwrap();
+        assert!(
+            built
+                .messages
+                .iter()
+                .any(|m| m.content_str().contains(summary.as_str())),
+            "precondition: the episodic block carries this row's summary"
+        );
+        built_rows.push((
+            built.workspace_budget_bytes,
+            built.messages[0].content_str().to_string(),
+        ));
+    }
+
+    assert!(
+        built_rows[0].1.contains("personality.md truncated"),
+        "precondition: the personality is under budget pressure: {}",
+        built_rows[0].1
+    );
+    assert_eq!(
+        built_rows[0], built_rows[1],
+        "a short and a long episodic block must leave the workspace budget and cut unchanged"
+    );
+}
+
+#[test]
+fn workspace_truncation_warning_is_reported_once_per_run() {
+    use crate::workspace::{AgentWorkspace, WorkspaceFile};
+    use tempfile::tempdir;
+
+    let dir = tempdir().unwrap();
+    let workspace = AgentWorkspace::new(dir.path(), "alice");
+    workspace
+        .write_file_as_operator(WorkspaceFile::Personality, &"p".repeat(5000))
+        .unwrap();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let runtime = AgentRuntime {
+        event_sender: Some(tx),
+        agent_name: Some("alice".to_string()),
+        ..AgentRuntime::new(
+            AgentId::new(),
+            AgentConfig {
+                system_prompt: "base".into(),
+                sandbox_root: "".into(),
+                ..AgentConfig::default()
+            },
+            LlmClient::new(LlmConfig {
+                mock: true,
+                ..LlmConfig::default()
+            })
+            .unwrap(),
+        )
+        .unwrap()
+        .with_workspace(workspace)
+    };
+
+    for _ in 0..3 {
+        let prompt = runtime.assemble_system_prompt_with_budget("base", true, 1000);
+        assert!(prompt.contains("personality.md truncated:"));
+    }
+
+    let RuntimeEvent::Warning {
+        code,
+        message,
+        source_agent,
+    } = rx
+        .try_recv()
+        .expect("the first partial view emits a warning")
+    else {
+        panic!("expected a workspace warning event");
+    };
+    assert_eq!(code, "WORKSPACE_PROMPT_TRUNCATED");
+    assert!(message.contains("alice"));
+    assert!(message.contains("personality.md"));
+    assert!(source_agent.is_none());
+    assert!(rx.try_recv().is_err(), "rebuilds do not repeat the warning");
+
+    runtime.workspace.as_ref().unwrap().forget_shown_files();
+    let _ = runtime.assemble_system_prompt_with_budget("base", true, 1000);
+    assert!(matches!(
+        rx.try_recv(),
+        Ok(RuntimeEvent::Warning { code, .. }) if code == "WORKSPACE_PROMPT_TRUNCATED"
+    ));
+}
+
+#[tokio::test]
 async fn test_build_context_dm_perspective_mapping() {
     let runtime = AgentRuntime {
         agent_name: Some("bob".to_string()),
@@ -256,8 +893,9 @@ async fn test_system_prompt_order_base_before_workspace() {
 
 /// DM session, tool-loop iteration: the order must be
 /// `base -> workspace -> tool_loop -> dm_addendum`. This pins the full
-/// four-layer assembly and guards `rebuild_system_prompt_for_tool_loop`
-/// against accidental reordering.
+/// four-layer assembly and guards
+/// `rebuild_system_prompt_for_tool_loop_with_budget` against accidental
+/// reordering.
 #[tokio::test]
 async fn test_system_prompt_order_dm_tool_loop_layers() {
     use crate::workspace::AgentWorkspace;
@@ -294,7 +932,13 @@ async fn test_system_prompt_order_dm_tool_loop_layers() {
     // Simulate the tool-loop rebuild path with a DM peer.
     let mut messages = vec![LlmMessage::system("placeholder".to_string())];
     // Non-user-facing context: `user.md` is omitted but personality is included.
-    runtime.rebuild_system_prompt_for_tool_loop(&mut messages, false, Some("alice"));
+    // The one-line personality fits any budget, so none is imposed.
+    runtime.rebuild_system_prompt_for_tool_loop_with_budget(
+        &mut messages,
+        false,
+        Some("alice"),
+        usize::MAX,
+    );
     let assembled = messages[0].content.as_deref().unwrap_or("");
 
     let base_pos = assembled

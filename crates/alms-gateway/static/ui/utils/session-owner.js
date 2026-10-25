@@ -17,7 +17,7 @@
 //      `(subagent)` marker when the subagent is ephemeral — #1277).
 //   2. `agent_id` — resolved against the in-memory agents list. This arm
 //      covers chat sessions and JOB sessions, which are stored under the
-//      owning agent's real id (`fire_job_run` uses
+//      owning agent's real id (`admit_job_run` uses
 //      `get_or_create(job.agent_id, "job_{id}")`). Since #1278 it also
 //      resolves for a NAMED subagent session, which is filed under the
 //      invoked agent's registry id — and it agrees with arm 1, because

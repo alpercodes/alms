@@ -250,9 +250,12 @@ pub async fn cancel_job(
 ///   ended-notification. Unlike the D5 deadline (detach-and-complete),
 ///   ending the DM here is unambiguously right — the operator explicitly
 ///   killed the job.
-/// - **Pending subagents**: fire the session-keyed cancel; the resulting
-///   `SubagentCompletion(Cancelled)` finds no episode (already removed)
-///   and degrades to a plain notification run on the job session.
+/// - **Pending subagents**: stop each one with
+///   `Coordinator::stop_subagent_by_session`. Deleting the job counts as
+///   stopping the work above the subagent, not as a direct cancel of it, so
+///   the resulting `SubagentCompletion(Cancelled)` — which finds no episode
+///   (already removed) — starts no notification run; the job session gets a
+///   queued `subagent_cancelled` record instead (#121, PR #190).
 ///
 /// Best-effort throughout: resolution failures are logged and skipped —
 /// the depth-expiry sweep remains the eventual fallback for a DM whose
@@ -329,12 +332,12 @@ async fn teardown_episode(state: &AppState, episode: crate::runs::job_episode::J
     for (task_id, subagent_session) in &episode.pending_subagents {
         let fired = state
             .coordinator
-            .cancel_subagent_by_session(*subagent_session);
+            .stop_subagent_by_session(*subagent_session);
         info!(
             task_id = %task_id,
             subagent_session = %subagent_session.0,
             fired,
-            "Cancelled pending background subagent during job-episode teardown"
+            "Stopped pending background subagent during job-episode teardown"
         );
     }
 }

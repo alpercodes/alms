@@ -773,7 +773,7 @@ Transient phase indicator emitted at key moments during the agent loop so the UI
 { "run_id": "<uuid>", "warning": {"code":"DM_EMPTY_REPLY_RETRY","message":"..."} }
 ```
 
-Emitted for non-fatal conditions that the frontend should display distinctly (yellow warning styling). Warning codes: `DM_EMPTY_REPLY_RETRY` (peer-triggered DM run produced no deliverable reply text -- nudging once to reply with text or use `ignore_message`; #1154), `DM_EMPTY_REPLY` (the nudge was exhausted -- the gateway ends the DM conversation with an `errored` reason so the peer is notified). When the warning originates from a subagent, the payload includes a `source_agent` field identifying which subagent emitted it.
+Emitted for non-fatal conditions that the frontend should display distinctly (yellow warning styling). Warning codes: `DM_EMPTY_REPLY_RETRY` (peer-triggered DM run produced no deliverable reply text -- nudging once to reply with text or use `ignore_message`; #1154), `DM_EMPTY_REPLY` (the nudge was exhausted -- the gateway ends the DM conversation with an `errored` reason so the peer is notified), `WORKSPACE_PROMPT_TRUNCATED` (a workspace file did not fit the bytes this run's prompt budget left it, so the system prompt carries a partial window of it and a whole-file `workspace_write` replacement is refused until the agent has seen the whole file; emitted at most once per file per run, and the message names the agent, the file, its size and the bytes it was given). When the warning originates from a subagent, the payload includes a `source_agent` field identifying which subagent emitted it.
 
 `run_cancelled`
 ```json
@@ -926,6 +926,47 @@ Emitted on the parent's session SSE stream when a background subagent finishes. 
 
 `status` values: `"done"`, `"fail"`, `"cancelled"`. `subagent_name` is omitted on the wire for ephemeral subagents (same shape as `subagent_started`).
 
+What follows a background subagent that ends `Cancelled` depends on where
+the cancel came from (#121):
+
+- **Cancelled directly**, through `POST /sessions/{session_id}/subagent/cancel`
+  (§ 5.7.1): a notification run starts on the parent session. Its input tells
+  the agent that the operator cancelled the subagent deliberately, that it
+  should not re-run it or redo its work unless the operator asks, and that it
+  should decide whether its plan needs to change and tell the operator. The
+  run is system-triggered, so a `guarded` parent runs it promoted to
+  Autonomous, with no approval gate
+  ([`security-model.md` § 8.1](security-model.md#guarded-is-not-an-agent-boundary)).
+  Nothing enforces that instruction; the wording is the only thing
+  discouraging unrequested rework.
+- **Stopped**: the parent run's cancellation propagated to the subagent
+  (`POST /runs/{run_id}/cancel` from the Stop button, an approval deny, DM
+  cancel, `DELETE /jobs`, shutdown), or `DELETE /jobs` stopped it while
+  tearing down the job's episode. No notification run starts. A model-visible
+  `kind: "error"` record with `type: "subagent_cancelled"` is added to the
+  parent history instead, pointing to
+  `read_session(session_id: "<subagent-session-id>")`. It is queued on the
+  parent agent's run queue, so it lands after any run in progress rather than
+  between that run's tool call and its result. The web UI renders it as an
+  error block. During shutdown the record is dropped, as the notification
+  run was before #121: the run queue is already closed, and the stopped run
+  may still be saving its tool results.
+
+In both cases this event and the persisted `subagent_completion` marker carry
+the status and the subagent's session ID, and report the summary as
+`[no content]`: cancellation keeps no partial output, whether the subagent had
+produced nothing or was stopped mid-work. Work it already wrote stays in its
+session.
+
+A cancelled completion inside an open job episode, from either source, still
+gets the episode's continuation run on the job session, stamped with the job
+ID like any other continuation. Only the run's input differs by source. A
+direct cancel's input is the same as the notification run's input above,
+warning the agent not to redo the work unless the operator asks. A job's runs
+have no approval gate either, so that warning matters most there. A stopped
+subagent's continuation run gets the ordinary completion notification, and no
+`subagent_cancelled` record is added.
+
 #### Reconnect
 Supported via `Last-Event-ID` header (automatic browser reconnect) or `?last_event_id=<n>` query parameter (initial connection after loading history via REST). The query parameter takes precedence when both are present. The server replays events with IDs greater than the supplied value.
 
@@ -1064,8 +1105,11 @@ Cancels the live subagent running on the given **subagent** session. Returns
 200 with `{"session_id":"...","status":"cancelling"}` when a live
 (pending/running) subagent was found and its cancellation token fired;
 returns 404 with error code `NO_LIVE_SUBAGENT` when the session has no live
-subagent (unknown session, or the subagent already reached a terminal
-state — e.g. a cancel racing natural completion).
+subagent (unknown session, or the subagent already reached a terminal state).
+A request racing the subagent's own finish can also return 200 during the
+short terminal-persistence window, before the handle's status flips. In that
+case the result already selected (Completed or Failed) stands; for a
+background subagent, its normal notification run still starts.
 
 Session-keyed rather than run-keyed because the UI's subagent surfaces (the
 status-bar chips and the subagent session view) carry the subagent's session
@@ -1084,6 +1128,21 @@ subagent's own session emits `run_cancelled`, its run record flips to
 `invoke_agent` tool call failing with `"Subagent was cancelled"` (the
 parent run continues and handles the tool error like any other tool
 failure).
+
+For a **background** subagent, this endpoint is the operator's direct
+cancel: its `Cancelled` completion starts one notification run on the parent
+session, telling the agent the cancel was deliberate and not to redo the work
+unless the operator asks (see `subagent_completed` in § 5.3). Inside an open
+job episode, that run is the episode's continuation run, and it carries the
+same warning. Stopping the subagent another way, by cancelling its parent run
+or with `DELETE /jobs`, starts no run; the parent history gets a
+`subagent_cancelled` record instead. The exception is a stop inside an open
+episode, which still gets the continuation run, with the ordinary completion
+notification as its input.
+The event and lifecycle marker report `[no content]` either way; partial work
+is not summarized on cancellation, but stays readable in the subagent's
+session. A cancellation before any output and one during work have the same
+status and summary today.
 
 ### 5.8 List runs
 `GET /runs?session_id=<uuid>&limit=<n>` — list runs for a session (original behaviour).
@@ -1384,6 +1443,12 @@ open (absent otherwise):
 }
 ```
 
+The episode opens when a firing is admitted, which is before its first turn
+starts if the agent is busy with another run (#181). Its clock starts with that
+turn. Until then `started_at` is the admission time, `deadline_remaining_secs`
+reports the full deadline, and no deadline runs. The deadline and the catch-up
+check count from when the turn starts.
+
 Every job object carries `lifecycle_revision`, `retry_count`, and optional
 `last_error`. Status is one of `pending`, `active`, `completed`, `failed`, or
 `cancelled`. Terminal reasons are `completed`, `deadline_reached`,
@@ -1394,7 +1459,7 @@ the retry fields.
 ### 7.2 Cancel a job
 `DELETE /jobs/{job_id}`
 
-Cancels a scheduled job, removes it from the scheduler, and cancels any in-progress runs that were spawned by the job — including episode continuation runs. An open episode is torn down: pending DM conversations are ended with the `user_cancelled` reason (the peer gets the standard ended-notification) and pending background subagents are cancelled (#1198).
+Cancels a scheduled job, removes it from the scheduler, and cancels any in-progress runs that were spawned by the job — including episode continuation runs, and a firing still queued behind the agent's current run (#181). A queued run's cancellation lands when the agent's queue reaches it: it is reported `queued` until then and ends `cancelled` without starting. An open episode is torn down: pending DM conversations are ended with the `user_cancelled` reason (the peer gets the standard ended-notification) and pending background subagents are cancelled (#1198). Deleting the job counts as stopping those subagents, not as a direct cancel of each: no notification run starts for them, and the job session gets a `subagent_cancelled` record per subagent (#121).
 
 **Response 200** — the final persisted cancelled job entity. The response
 includes the authoritative `lifecycle_revision`, `status: "cancelled"`, and
@@ -1809,7 +1874,7 @@ Path parameter accepts either a UUID or a name. UUID is tried first. **Name look
 
 Valid `posture` values: `"guarded"` (default — requires approval for risky tools), `"full_control"` (no approvals), `"autonomous"` (no approvals, no human-in-the-loop expected — for background agents, scheduled jobs, and subagents).
 
-> **Note:** When a run is system-triggered (peer-to-peer DMs via `send_message`, notification runs, subagent completions, and scheduled jobs), Guarded posture is automatically overridden to Autonomous for that run via the `is_system_triggered` flag, since there is no human in the loop to approve tool calls. Without this override the run would hang indefinitely waiting for approval that can never arrive. User-initiated runs (via the HTTP API) are never affected — Guarded posture is preserved as configured.
+> **Note:** When a run is system-triggered (peer-to-peer DMs via `send_message`, notification runs, subagent completions, and scheduled jobs), Guarded posture is automatically overridden to Autonomous for that run via the `is_system_triggered` flag, since there is no human in the loop to approve tool calls. Without this override the run would wait on its first gated tool call indefinitely (the `max_run_duration_secs` backstop is checked only between iterations), until the approval is resolved or the run is cancelled. User-initiated runs (via the HTTP API) are never affected — Guarded posture is preserved as configured. A subagent takes its posture from its registry record instead: a record with no `posture`, the default for a new agent, runs `full_control` as a subagent, foreground or background, and so does an unnamed subagent or one whose name is not registered. A record set to `"guarded"` is overridden to Autonomous in the background, and keeps Guarded in the foreground, where its first gated call is denied and cancels the subagent. Guarded therefore governs the runs a human starts and is not a boundary between agents: an agent that can send a Guarded agent a DM can have it run tools without approval. See [`security-model.md` § 8.1](security-model.md#guarded-is-not-an-agent-boundary); the behaviour is under discussion in [#177](https://github.com/alpercodes/alms/issues/177).
 
 To clear a string override (`model`, `posture`, `provider`, `telegram_token`), pass an empty string: `"model": ""`.
 
@@ -1949,11 +2014,11 @@ Note: Top-level flat keys (`context_strategy`, `enabled_tools`) are preserved fo
 ### 10.2 Update server settings
 `PATCH /settings`
 
-Partially update server-level configuration at runtime. The `context`, `session`, `tools`, and `llm` (#809) sections are mutable, as are the top-level `model` / `provider` keys (#1148). Changes take effect on the next run; in-flight runs are unaffected. Logging requires a restart and is not accepted here.
+Partially update server-level configuration at runtime. The `context`, `session`, `tools`, and `llm` (#809) sections are mutable, as are the top-level `model` / `provider` keys (#1148). Changes to the values runs read (listed below) take effect on the next run, except a Telegram-triggered one; in-flight runs are unaffected. The `session` section, `tools.timeout_secs` and `tools.max_output_bytes` are accepted, returned and persisted, but nothing reads them yet, so changing them has no effect ([`docs/config.md`](config.md#session)). Logging requires a restart and is not accepted here.
 
-> **Live-mutation propagation — HTTP path only.** `PATCH /settings` mutations to all four mutable sections (`context`, `session`, `tools`, `llm`) and to the top-level `model` / `provider` pair propagate to the **next `POST /runs` immediately**, with no daemon restart required. Telegram-triggered runs read from a boot-time snapshot of the `AgentConfig` and `LlmClient` held inside the `Gateway` and continue to use that snapshot until the daemon is restarted. This is pre-existing behaviour for the `context` / `session` / `tools` sections; the `llm` block (#809) and the server-default pair (#1148) inherit the same limitation. Tooling and frontends building on `PATCH /settings` should treat HTTP and Telegram as separate propagation domains.
+> **Live-mutation propagation — every run path except Telegram.** `PATCH /settings` writes the live server-default `AgentConfig` and `LlmClient`. `execute_run` reads both for every run it starts: `POST /runs`, peer-to-peer DMs, notification runs, scheduled jobs and their job-episode continuations. The coordinator reads both for every subagent it spawns. So a PATCH to what those runs take from the two (the `context` and `llm` sections, `tools.shell_policy`, `tools.sandbox_root`, and the top-level `model` / `provider` pair) reaches every one of them that starts afterwards, with no daemon restart. Telegram-triggered runs never pick it up, not even after a restart. They resolve from the `AgentConfig` and `LlmClient` the `Gateway` builds from `alms.toml` and environment variables at boot, and `settings.json` is applied only to the copy the other run paths share. Tooling and frontends building on `PATCH /settings` should treat Telegram as a separate propagation domain: its server defaults change only through `alms.toml` or the environment, and a restart.
 >
-> **Persistence — `settings.json` wins over `alms.toml` on restart.** Once any field has been PATCHed, the entire mutable surface is written to `{data_dir}/settings.json` and that file is the source of truth on the next boot. Subsequent edits to the corresponding sections of `alms.toml` are silently overwritten by the persisted snapshot. To revert a PATCHed value to a TOML- or env-var-driven configuration, edit `settings.json` directly (or remove it) before restart.
+> **Persistence — `settings.json` wins over `alms.toml` on restart.** Once any field has been PATCHed, the entire mutable surface is written to `{data_dir}/settings.json` and that file is the source of truth on the next boot for every run path except Telegram, which keeps reading `alms.toml` (above). Subsequent edits to the corresponding sections of `alms.toml` are silently overwritten by the persisted snapshot. To revert a PATCHed value to a TOML- or env-var-driven configuration, edit `settings.json` directly (or remove it) before restart.
 
 Within `tools`, only `shell_policy`, `sandbox_root`, `timeout_secs`, and `max_output_bytes` are dynamically mutable. **`tools.shell_permissions` is configured in `alms.toml` only** — its allow/deny regex patterns are compiled once at startup and baked into each `ShellTool` instance (see `docs/agent-runtime-design.md` for the config schema and `docs/security-model.md` § 4.3 for the policy semantics). This applies to every field in the block: `allowed_commands`, `denied_commands`, and `classifier_overrides` are all config-file-only and are **not** PATCH-mutable. Sending `shell_permissions` in a `PATCH /settings` body is ignored; restart the gateway to pick up new patterns.
 

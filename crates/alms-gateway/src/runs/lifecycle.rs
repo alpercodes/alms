@@ -396,12 +396,20 @@ pub async fn cancel_run(
 /// call and its chip renders *Failed* rather than *Cancelled* — the parent
 /// run itself is NOT cancelled either way.
 ///
+/// This is the operator's direct cancel, so a background subagent's
+/// `Cancelled` completion is marked `cancelled_directly` and the parent gets
+/// a notification run saying the cancel was deliberate and not to redo the
+/// work unprompted (#121, PR #190). A subagent stopped by its parent run, or
+/// by `DELETE /jobs` teardown, starts no run.
+///
 /// Returns 200 `{"status":"cancelling"}` when a live subagent was found and
 /// its token fired (cancellation completes asynchronously — the terminal
 /// events above follow on the streams), or 404 `NO_LIVE_SUBAGENT` when the
 /// session has no live subagent (unknown session, or the subagent already
-/// reached a terminal state — e.g. a double-click racing natural
-/// completion).
+/// reached a terminal state). A request racing the subagent's own finish can
+/// still return 200 after its result was selected but before the handle
+/// status flips; the result already selected (Completed or Failed) stands,
+/// and for a background subagent its normal notification run still starts.
 #[instrument(level = "info", skip(state), fields(session_id = %session_id.0))]
 pub async fn cancel_subagent(
     State(state): State<AppState>,
@@ -513,7 +521,7 @@ fn evaluate_pre_flight_token_budget(
 /// queued / non-HTTP path runs the same `evaluate_pre_flight_token_budget`
 /// check inline inside `execute_run` (peer-DM, scheduler, notification,
 /// subagent-completion runs, and HTTP runs whose effective budget was
-/// mutated by `PATCH /settings` or `PATCH /agents` while they sat in the
+/// mutated by `PATCH /settings` or `PUT /agents` while they sat in the
 /// queue) and emits a `run_error` SSE event with the same
 /// `INVALID_TOKEN_BUDGET_FOR_PROVIDER` code instead of a synchronous 400,
 /// then marks the run `Failed` and broadcasts queue advance — same shape
@@ -1012,10 +1020,11 @@ pub async fn create_run(
 
 /// Resolve the effective posture for a run.
 ///
-/// System-triggered runs (peer DMs, notification runs, subagent completions)
-/// have no human in the loop, so Guarded posture would hang forever waiting
-/// for approval. This function overrides Guarded to Autonomous for those
-/// runs while leaving all other postures unchanged.
+/// System-triggered runs (peer DMs, notification runs, subagent completions,
+/// scheduled jobs and job-episode continuations) have no human in the loop,
+/// so Guarded posture would hang forever waiting for approval. This function
+/// overrides Guarded to Autonomous for those runs while leaving all other
+/// postures unchanged.
 pub(super) fn resolve_posture_for_run(
     posture: alms_runtime::Posture,
     is_system_triggered: bool,
@@ -1559,7 +1568,7 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
     //
     // Per-run config overrides were removed in the #941 pivot — the run
     // config is determined entirely by `resolve_agent_config` (per-agent
-    // > server default). Operators change agent config via `PATCH
+    // > server default). Operators change agent config via `PUT
     // /agents/{id}` (or server defaults via `PATCH /settings`) before
     // starting the run; `POST /runs` carries no config knobs. Removing
     // the per-run path closes the leak family at #833 / #860 / #863 /
@@ -1695,7 +1704,7 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
     // DMs, scheduler triggers, notification runs, subagent completion runs)
     // skip that path entirely and land here. We also re-validate HTTP runs
     // that were created earlier and sat in the queue while `PATCH /settings`
-    // or `PATCH /agents/{id}` mutated their effective budget — the
+    // or `PUT /agents/{id}` mutated their effective budget — the
     // create-time pre-flight is no longer authoritative by the time
     // `execute_run` resolves the live snapshot, and without this second
     // check we would still reach the provider with an over-budget request
@@ -1784,9 +1793,10 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
         return;
     }
 
-    // System-triggered runs (peer DMs, notifications, subagent completions)
-    // have no human in the loop, so Guarded posture would hang forever
-    // waiting for approval.  Force Autonomous posture for these runs.
+    // System-triggered runs (peer DMs, notifications, subagent completions,
+    // scheduled jobs, job-episode continuations) have no human in the loop,
+    // so Guarded posture would hang forever waiting for approval.  Force
+    // Autonomous posture for these runs.
     let posture_resolved = resolve_posture_for_run(agent_config.posture, is_system_triggered);
     if posture_resolved != agent_config.posture {
         info!(
@@ -1796,14 +1806,30 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
     }
     agent_config.posture = posture_resolved;
 
-    // Override system prompt with bootstrap prompt for first-time agents.
+    // Override the system prompt with the bootstrap interview prompt for an
+    // agent with no `personality.md` -- on runs a human started, and only
+    // those (#174). `bootstrap.md` tells the agent to interview "the user".
+    // A system-triggered run (peer DM turn, notification run, scheduled job,
+    // job-episode continuation) has nobody to interview, and on a peer DM
+    // turn `dm_recipient.md` says in the same prompt that the counterparty
+    // is NOT a human. Keyed on `is_system_triggered` for the reason the
+    // posture override above is: it is the flag that says whether a human
+    // sent this turn. `AgentRuntime::is_user_facing_context` answers a
+    // different question -- which session *types* are the user's -- and a
+    // notification run landing on the user's web-chat session passes it
+    // with no human in the turn.
+    //
+    // `needs_bootstrap()` means "no `personality.md`", not "first run": an
+    // agent that never finishes the interview gets this prompt on every
+    // human-started run until the file exists.
+    //
     // Must come after per-agent overrides so bootstrap takes precedence.
     // Only mutates `system_prompt`; the layered fields the snapshot tracks
     // (provider/model/posture/budgets/debug) are unaffected.
     let agent_config =
         if let (Some(workspace_dir), Some(name)) = (&state.workspace_dir, &agent_name) {
             let workspace = alms_runtime::AgentWorkspace::new(workspace_dir, name);
-            if workspace.needs_bootstrap() {
+            if !is_system_triggered && workspace.needs_bootstrap() {
                 info!(
                     "Agent {} ({}) has no personality.md — using bootstrap prompt",
                     name, agent_id.0

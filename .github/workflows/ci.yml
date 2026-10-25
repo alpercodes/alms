@@ -118,8 +118,7 @@ jobs:
     runs-on: ubuntu-latest
     # Installs `cargo-audit` with `--locked` and runs it. The ignore set lives in
     # `.cargo/audit.toml` so local runs and CI cannot silently disagree (#1248),
-    # and the verdict is cargo-audit's own: non-zero on vulnerabilities, not on
-    # informational advisories.
+    # and the verdict is cargo-audit's own, as configured in that file.
     #
     # `contents: read` is restated because a job-level `permissions:` block
     # replaces the defaults wholesale. It is kept rather than dropped so this job

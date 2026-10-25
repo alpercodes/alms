@@ -29,10 +29,11 @@ max_retries = 2
 # Token budget per run (0 = unlimited)
 max_tokens_per_run = 0
 
+# Not enforced yet: nothing reads these values (docs/config.md § Session).
 [session]
 idle_timeout_secs = 86400           # 24 hours
 max_messages = 10000
-max_context_tokens = 256_000        # storage limit (>= context.max_input_tokens)
+max_context_tokens = 256_000        # must be >= context.max_input_tokens
 
 [context]
 # How to manage the context window sent to the LLM
@@ -56,9 +57,9 @@ compact_retain_pct = 0.40
 [tools]
 # Which builtins to enable
 enabled = ["echo", "math", "http_get"]
-# Default timeout for tool execution
+# Default timeout for tool execution. Not enforced yet: nothing reads this (#112).
 timeout_secs = 30
-# Max output size from a tool (bytes)
+# Max output size from a tool (bytes). Not enforced yet: nothing reads this.
 max_output_bytes = 65536
 
 # Permission-based allow/deny list for the `shell` tool.
@@ -273,16 +274,17 @@ The gateway's run-lifecycle wires these in a deterministic order: spill / tool-o
 
 **How they feed into the system prompt:**
 
-The workspace prefix is assembled by `build_system_prompt_prefix()` in `workspace.rs` and **appended** after the base system prompt. The order is:
+The workspace prefix is assembled by the budget-aware `build_system_prompt_prefix_with_budget_and_truncations()` in `workspace.rs` and **appended** after the base system prompt. The order is:
 
 ```
 System prompt = [
   base_prompt (initial.md or bootstrap.md),
   "\n\n",
-  personality.md contents (raw, if exists),
-  "## Current Goals\n" + goals.md contents (if exists),
-  "## About the User\n" + user.md contents (if exists, user-facing sessions only),
-  "## Memories\n" + memories.md contents (if exists, tail-windowed at 4000 chars)
+  personality.md contents (head-windowed only when the run budget requires it),
+  "## Current Goals\n" + goals.md contents (head-windowed only when the run budget requires it),
+  "## About the User\n" + user.md contents (head-windowed only when the run budget requires it,
+    user-facing sessions only),
+  "## Memories\n" + memories.md contents (a tail window of up to 4000 bytes)
 ]
 ```
 
@@ -292,27 +294,27 @@ For non-user-facing sessions (DM, subagent, job, notification, episodic), `user.
 
 Tool descriptions are injected separately by the LLM API layer (via `with_tools()` on the completion request), not in the system prompt text.
 
-The workspace files are read at the **start of each run**, and again after every tool batch: `agent_loop` calls `rebuild_system_prompt_for_tool_loop`, which goes back through `assemble_system_prompt` -> `build_system_prompt_prefix` and re-reads the files, replacing `messages[0]` outright. Nothing is cached, so edits take effect immediately — and a memory the agent writes mid-run is back in its prompt on the next turn, not only on the next run. (This corrects the "once per run" framing #1305 and #1310 were written on: the snapshot is fixed only until the first tool call. What a rebuild does *not* cover is a single tool batch that both appends and replaces, or a concurrent writer landing after the last rebuild.)
+The workspace files are read at the **start of each run**, and again after every tool batch: the agent loop calls `rebuild_system_prompt_for_tool_loop_with_budget()`, which re-reads the files through `build_system_prompt_prefix_with_budget_and_truncations()` and replaces `messages[0]` outright. The initial workspace budget is fixed for the run, so rebuilds do not progressively squeeze the files as conversation and tool results accumulate. File edits still take effect on the next turn, while a single tool batch that both appends and replaces, or a concurrent writer landing after the last rebuild, remains outside the rebuild boundary.
 
 **Size management:**
-- `memories.md` is capped at `MEMORIES_INJECTION_CAP` (4000 bytes) before injection, by `memories_injection_window` in `workspace.rs`. The window is **tail-anchored** (#1308): past the cap the agent is shown the **last** 4000 bytes, i.e. what it most recently learned, and the oldest entries are the ones dropped. It used to be head-anchored (`truncate_to_char_boundary`, the *oldest* 4000 chars), which was survivable while `workspace_write` replaced the file but became a write-only memory once #1305 made `memories` append by default: the file grows at the tail, so a head window never showed anything written after the cap was reached
+- `personality.md`, `goals.md` and `user.md` are injected whole while the run-scoped workspace budget allows it. Under budget pressure, their available bytes are water-filled across populated files and any partial view is **head-anchored** so settled identity and instructions remain visible. `memories.md` gets a **tail-anchored** window (#1308) of up to `MEMORIES_INJECTION_CAP` (4000 bytes) so the most recent entries remain visible; under budget pressure it can get less, like the other files. Each partial view carries a marker and cannot authorize a whole-file replacement until the agent gets a complete read. A partial view the budget forced also emits one `WORKSPACE_PROMPT_TRUNCATED` operator warning per file per run; a `memories.md` that is only past its fixed 4000-byte window does not, because that is the normal state of a long-lived agent and no setting changes it.
+- `memories.md`'s tail window replaced the old head-anchored (`truncate_to_char_boundary`) behavior, which became a write-only memory once #1305 made `memories` append by default: the file grows at the tail, so a head window never showed anything written after the cap was reached
 - The window carries a **leading** marker — `[Older memories truncated: showing the most recent N of M bytes. This is the end of memories.md, not the whole file -- writing this text back with mode "write" would delete the older entries above the cut.]` followed by `...`. The warning is load-bearing, not decorative: the documented repair for an over-appended file (an explicit `mode: "write"`) is composed from whatever is in the system prompt, so an unannounced window makes that repair a deletion, and tail-anchoring alone would only change which half is deleted. Since #1310 the marker is no longer the *only* thing standing between the model and that deletion — `workspace_write` refuses a replacement built from a window (see **Memory updates**) — but it is still what lets a well-behaved model avoid the refusal in the first place. (The bytes were never unreachable: the workspace lives at `<project_root>/.alms/agents/<name>/`, inside the project-root sandbox, so `fs_read` can reach the file by path, as can the UI, `PUT` and an operator. What was missing was a tool that read a workspace file *by name*, and that nothing handed the model the path. `workspace_read` closes that; `fs_read` remains unsuitable to depend on because `tools.enabled` may not include it.)
 - A partial *leading* line is dropped — **only when the window actually opens mid-entry.** A head window could only ever end mid-entry, which reads as visibly cut off; a tail window begins mid-entry, and half an entry read from its middle can assert the opposite of the entry it came from. When the window start already lands just after a newline it opens on a whole entry and nothing is cut, because cutting there would delete a complete memory for nothing. One declared exception: the cut is skipped when nothing follows the first newline, so a file that is one enormous unbroken line yields a fragment behind the marker rather than a marker and nothing else
-- The cap is the **only** bound on this text. `ContextBuilder` never trims a system prompt: `build_with_perspective` measures it with `estimate_tokens`, pushes it verbatim, and subtracts the result from the *history* budget, flooring that at zero via `saturating_sub`. So an uncapped `memories.md` would evict the conversation rather than being summarised or dropped downstream. (The old code comment on the cap said it "will be properly budgeted by ContextBuilder"; that was never true and has been removed)
-- Other workspace files have no enforced size limit — they contribute to the system prompt token count which reduces the history budget
-- Token budget for the entire system prompt (including workspace prefix) comes from the `max_input_tokens` budget
+- `ContextBuilder` never trims a system prompt: `build_with_perspective` measures it with `estimate_tokens`, pushes it verbatim, and subtracts the result from the *history* budget, flooring that at zero via `saturating_sub`. The runtime computes a workspace byte budget from `max_input_tokens`, reserves headroom for history, and reuses that value for the whole run. The budget is rounded down to a whole KiB, and an episodic block is charged at `run_summary_budget` rather than its length, so a windowed file keeps the same cut from one run to the next unless a turn's input moves the budget across a step, the episodic block appears or disappears (the first time the agent has a summary of another session, say), another workspace file changes length (the water-fill gives a short file's unused share to the windowed one), or the configuration changes.
+- A deliberate `workspace_read` can return up to `WORKSPACE_READ_CAP` (12000 bytes), three times the fixed memories window. Identity files are budgeted separately and may be injected whole above that size; if a larger identity file is only partially injected, one capped read cannot authorize a replacement. A file that was injected whole can still be replaced from that complete prompt view.
 
 **Memory updates:**
 - The agent can update workspace files via the `workspace_write` tool, and read them back with `workspace_read`
 - `workspace_write` takes `{file: "memories", content: "..."}`, with an optional `mode` of `"write"` or `"append"`. `file` is the bare name — `"personality"`, `"goals"`, `"memories"`, `"user"` — without the `.md` extension
-- **An omitted `mode` defaults per file** (`WorkspaceFile::default_write_mode`, #1305): `"append"` for `memories`, `"write"` for `personality` / `goals` / `user`. The split is not a convenience — it is the only lever that reaches the lost update the workspace locks cannot. An agent's *read* of its memories is the prompt build, and the snapshot a `workspace_write` replaces is at best a tool batch old and at worst a whole run old. (This bullet used to say the prompt was assembled once and "carried through every tool iteration". It is not — `rebuild_system_prompt_for_tool_loop` re-reads the files after each batch, see above — but a whole batch executes between two rebuilds, and the first batch of a run runs against the context build's snapshot.) Anything appended inside that window — by another live instance of the same named agent, which the coordinator permits, **or by the same run's own earlier `workspace_write` calls** — is absent from what the model is editing, and a whole-file replacement erases it silently. There is no critical section for a lock to bracket, so #1292/#1294 structurally cannot close it. The three identity files each describe one settled thing and are meant to be restated, so `"write"` stays right for them. The accepted cost on the memories side is duplication when a model omits `mode` while genuinely intending a wholesale rewrite — preferred over an invisible loss either way, and visible in the next context build and repairable with an explicit `mode: "write"`. Before #1308 both halves of that lapsed past the injection cap — the duplicate landed in the truncated tail, unseen, and the "repair" could only resend the head, which was itself destructive. The tail-anchored window (see Size management above) puts a fresh duplicate inside the injected end either way, and its marker tells the model that a `mode: "write"` built on the window deletes what the window omits. The tool result echoes the *effective* mode so the model can see which branch an omitted parameter took
+- **An omitted `mode` defaults per file** (`WorkspaceFile::default_write_mode`, #1305): `"append"` for `memories`, `"write"` for `personality` / `goals` / `user`. The split is not a convenience — it is the only lever that reaches the lost update the workspace locks cannot. An agent's *read* of its memories is the prompt build, and the snapshot a `workspace_write` replaces is at best a tool batch old and at worst a whole run old. (This bullet used to say the prompt was assembled once and "carried through every tool iteration". It is not — `rebuild_system_prompt_for_tool_loop_with_budget` re-reads the files after each batch, see above — but a whole batch executes between two rebuilds, and the first batch of a run runs against the context build's snapshot.) Anything appended inside that window — by another live instance of the same named agent, which the coordinator permits, **or by the same run's own earlier `workspace_write` calls** — is absent from what the model is editing, and a whole-file replacement erases it silently. There is no critical section for a lock to bracket, so #1292/#1294 structurally cannot close it. The three identity files each describe one settled thing and are meant to be restated, so `"write"` stays right for them. The accepted cost on the memories side is duplication when a model omits `mode` while genuinely intending a wholesale rewrite — preferred over an invisible loss either way, and visible in the next context build and repairable with an explicit `mode: "write"`. Before #1308 both halves of that lapsed past the injection cap — the duplicate landed in the truncated tail, unseen, and the "repair" could only resend the head, which was itself destructive. The tail-anchored window (see Size management above) puts a fresh duplicate inside the injected end either way, and its marker tells the model that a `mode: "write"` built on the window deletes what the window omits. The tool result echoes the *effective* mode so the model can see which branch an omitted parameter took
 - **A replacing `workspace_write` is refused when it would delete text the agent has not been shown (#1310).** `AgentWorkspace` records what it hands the agent — the prompt injection, a `workspace_read` result, and the agent's own successful replacement — and `write_file_checked` compares that record against the file, under the file's sidecar lock, before staging anything. Three refusals, each an in-band `{"ok": false, "refused": "…", "error": "…"}` result rather than a hard tool error, so the model gets a structured reason and the loop continues:
   - `never_shown` — nothing put the file in this run's context. The everyday case is `user.md` in a non-user-facing run (every context `AgentRuntime::is_user_facing_context` rejects), where the prefix omits it *and* the file defaults to `"write"`, so the default call is a blind whole-file erasure — and this is what refuses it
-  - `shown_partially` — the agent saw a window. This is the steady state of any `memories.md` past the injection cap, and needs no concurrency, no second agent and no unusual sequence
+  - `shown_partially` — the agent saw a window. This is the steady state of any `memories.md` past its fixed cap, and can also follow budget pressure on an identity file or a capped `workspace_read`; a partial identity file larger than the read cap cannot be recovered in one read
   - `changed_since_shown` — the file moved after it was shown: another live instance of the same named agent, an operator edit through `PUT`, or this run's own earlier `workspace_write` calls in the same tool batch
 - **The guard is exactly co-extensive with "this would have destroyed something".** A missing, empty or blank target is replaced unconditionally, so a fresh agent's first `personality.md` never meets it; `mode: "append"` is never checked, because an append cannot delete; and an operator's `PUT` goes through `write_file_as_operator`, which skips the guard by the same authority that skips `agent_writable`
-- **The record is scoped to one run.** `build_context` calls `forget_shown_files()` before assembling the prompt, so a view recorded by a previous run cannot authorise a replacement in a later one whose context does not contain it
-- **`workspace_read` (#1310) is the recovery for a genuine whole-file rewrite.** `{file: "memories"}` returns the file as it is on disk, capped at `WORKSPACE_READ_CAP` (12000 bytes — three times the injection cap, and sized so the *serialised* result fits inside `tool_output_truncate`'s 32 KB default; the truncator measures `value.to_string()`, so the raw cap has to leave room for JSON escaping, which two `const` assertions at the definition enforce). A capped read reports `complete: false` and a note saying which end it kept, and does **not** unblock the replacement: a read that laundered a 12 KB window into permission to replace a 40 KB file would reintroduce the defect through the fix. The refusal message names `mode: "append"` first, because that is the same tool the model is already calling and is therefore reachable whenever the message is; `workspace_read` is subject to `tools.enabled` like everything else
+- **The record is scoped to one run.** `build_context_with_budget` calls `forget_shown_files()` before assembling the prompt, so a view recorded by a previous run cannot authorise a replacement in a later one whose context does not contain it
+- **`workspace_read` (#1310) is the recovery for a genuine whole-file rewrite.** `{file: "memories"}` returns the file as it is on disk, capped at `WORKSPACE_READ_CAP` (12000 bytes — three times the fixed memories injection cap, and sized so the *serialised* result fits inside `tool_output_truncate`'s 32 KB default; the truncator measures `value.to_string()`, so the raw cap has to leave room for JSON escaping, which two `const` assertions at the definition enforce). Identity files use the run-scoped prompt budget instead and can be injected whole above this read cap; when a larger identity file is only partially injected, a capped read cannot unblock the replacement. Any capped read reports `complete: false` and a note saying which end it kept, and does **not** unblock the replacement: a read that laundered a 12 KB window into permission to replace a 40 KB file would reintroduce the defect through the fix. The refusal message names `mode: "append"` first, because that is the same tool the model is already calling and is therefore reachable whenever the message is; `workspace_read` is subject to `tools.enabled` like everything else
 - All four workspace files are agent-writable (personality, goals, memories, user) — this is needed for the bootstrap interview to populate `personality.md`
 - Memory writes are audited
 
@@ -334,7 +336,9 @@ On first interaction with an agent that has **empty/missing workspace files**, t
 4. The agent writes the workspace files using the `workspace_write` tool
 5. Subsequent sessions use the workspace files normally
 
-**Bootstrap is one-time** — once `personality.md` exists, it doesn't trigger again. The user can delete workspace files to re-trigger it.
+**Bootstrap lasts until `personality.md` exists**, not for one run: an interview that never writes the file repeats on every human-started run. Creating the file ends it; deleting workspace files re-triggers it.
+
+Only runs a human started get the bootstrap prompt (web chat, Telegram). Peer DM turns, notification runs and scheduled jobs keep the agent's normal prompt even while `personality.md` is missing, because there is no user in them to interview (#174).
 
 ---
 
@@ -365,11 +369,11 @@ After each successful run, the gateway spawns a fire-and-forget `tokio::spawn` t
 
 - **`off`** — No summaries generated. No episodic injection.
 - **`heuristic`** — Deterministic, no LLM call. Produces a one-liner from the first ~120 bytes of run input and ~80 bytes of the agent's response (when available). Successive runs in the same session append entries; oldest lines are trimmed when total exceeds ~500 chars.
-- **`llm`** (default) — Lightweight LLM call using `session_summarizer.md` prompt. Receives run input (~2000 chars), agent output (~2000 chars), and existing summary. Produces a concise 1-3 sentence evolving summary. Max 300 output tokens. When the configured model is a reasoning model (e.g. minimax-m2.5, deepseek-r1), the summarizer falls back to `reasoning_content` if `content` is null or empty.
+- **`llm`** (default) — Lightweight LLM call using `session_summarizer.md` prompt. Receives run input (~2000 chars), agent output (~2000 chars), and existing summary. Produces a concise 1-3 sentence evolving summary. Output capped at `summary_max_tokens` (default 1000). Only the response's `content` is used, never `reasoning_content`, and a response that stopped at the cap (`finish_reason: length`) or is dominated by repeated tokens is refused (#176): the existing summary is kept, or, for a session with none yet, the heuristic line is written instead.
 
 **How episodic context is injected:**
 
-At the start of each run (in `build_context`), when `run_summary_mode != off`:
+At the start of each run (in `build_context_with_budget`), when `run_summary_mode != off`:
 1. Load all session summaries for this agent (excluding the current session) from SQLite
 2. Format them into a token-budgeted block with header and source-labelled entries (most recent first)
 3. Pass the formatted text to `build_with_perspective()` which injects it as a system message
@@ -431,7 +435,7 @@ Agent Workspace (per agent)
     ├─→ personality.md ──→ system prompt prefix (raw)
     ├─→ goals.md ────────→ system prompt prefix (## Current Goals)
     ├─→ user.md ─────────→ system prompt prefix (## About the User, user-facing only)
-    └─→ memories.md ─────→ system prompt prefix (## Memories, tail-windowed at 4000 chars)
+    └─→ memories.md ─────→ system prompt prefix (## Memories, a tail window of up to 4000 bytes)
 
 ContextBuilder (per run)
     │

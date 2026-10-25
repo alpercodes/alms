@@ -984,7 +984,8 @@ mod tests {
     /// (a one-entry `["secrets.json"]`) was removed from `fs_read`.
     /// Reading a file whose basename is `secrets.json` must no longer
     /// be rejected for that reason alone — file access is now governed
-    /// only by the sandbox root (and, on Linux 5.13+, by Landlock).
+    /// only by the sandbox root, which `fs_read` checks in the daemon
+    /// (Landlock applies only to `shell` children, not to `fs_*`).
     #[tokio::test]
     async fn test_fs_read_no_hardcoded_secrets_json_deny() {
         let dir = tempfile::tempdir().unwrap();

@@ -63,10 +63,42 @@ Each item below changes behaviour for a deployment that has not set the knob exp
   replacing it. `personality`, `goals` and `user` still default to `write`, and an explicit
   `mode` is still honoured everywhere.
 
+- **Workspace prompt content now shares a run-scoped context budget.**
+  `personality.md`, `goals.md` and `user.md` remain whole unless the available budget
+  requires a head window; `memories.md` keeps a tail window of up to 4000 bytes. When a
+  file is partial, its prompt marker explains the window and a `workspace_write`
+  replacement is refused until the agent has seen the whole file. When the budget is what
+  cut it, a `run_warning` with code `WORKSPACE_PROMPT_TRUNCATED` also names the agent and
+  the file (once per file per run). The same budget is reused after each tool batch,
+  preserving history space without shrinking an unchanged workspace's view, and it is
+  rounded down to a whole KiB so a windowed file usually keeps the same cut from one turn
+  to the next. `workspace_read` returns up to 12000 bytes, so an oversized file that is only
+  partially injected may still need operator editing or append-only changes before a
+  complete rewrite is possible.
+
 - **`fs_read` output caps lowered.** Whole-file reads cap at 256 KiB; passing `offset` or
   `limit` falls back to a 64 KiB output budget. Large reads must paginate.
 
 - **Server-default model and provider are now changeable without a restart.**
+
+- **The global-token Telegram bot may answer as a different agent after upgrading.** This
+  applies if you use the global Telegram token (`alms auth set telegram`) and no agent has
+  a token of its own. The bot used to serve the ID in `.alms/agent_id` (or
+  `ALMS_AGENT_ID`): the agent registered with that ID, normally an auto-created `main`, if
+  there was one, otherwise an unregistered agent named `default` running on the server
+  defaults. It now serves the default agent, or the oldest agent if none is marked
+  default, with that agent's posture, model, provider, workspace, worktree mode and
+  `[security].allow_full_os_access` entry. Anyone who can message the bot reaches that
+  agent. When the agent changes, so does the bot's context key, `telegram_<name>_<chat>`,
+  and each chat starts a new session. Earlier sessions are not moved: those under the old
+  ID stay there, and unless a registered agent (normally `main`) holds that ID, no agent
+  owns them.
+
+  ⚠️ **Before upgrading**, mark the agent the bot should serve as the default
+  (`alms agent set-default <name>`), or give an agent its own token (its Telegram token
+  setting in the web UI, or `telegram_token` on `PUT /agents/{id_or_name}`). If agents
+  exist but none is marked default, the gateway logs a `WARN` at startup naming the agent
+  the bot serves.
 
 - **With `ALMS_DB_PATH` set, `alms auth` now uses the secrets file beside the database.**
   `secrets.json` lives next to the SQLite database: `{data_dir}/secrets.json` by default,
@@ -96,14 +128,84 @@ Each item below changes behaviour for a deployment that has not set the knob exp
   longer teach agents to poll.
 - Subagent sessions are filed under the agent that ran them, with session-keyed cancel
   controls and a status-only subagent status bar.
+- Stopping a parent run, or deleting a job, no longer starts a notification run for the
+  background subagents it cancels; the parent's history gets a record pointing to each
+  subagent's session instead. Inside a scheduled job's open episode, a stopped subagent
+  still gets the episode's continuation run. Cancelling one subagent directly still starts
+  a run, which now tells the agent the cancel was deliberate and not to redo the work
+  unless asked.
+- An agent with no `personality.md` is no longer handed the first-time setup interview
+  ("Ask the user …") on turns no human started. Peer DM turns, notification runs
+  (subagent completions, DM ends) and scheduled job runs now get the agent's normal system
+  prompt. On a DM turn the interview arrived in the same prompt as the addendum saying the
+  counterparty is not a human, and because the condition is "no `personality.md`" rather
+  than "first run", an agent that never finished its interview got it on every such turn.
+  Web chat and Telegram still start the interview.
+- Docs correction, no behaviour change: `guarded` posture governs the runs a human starts,
+  and is not a boundary between agents. A `guarded` agent's DM, notification and job runs
+  are promoted to `autonomous`. As another agent's subagent, an agent whose record sets no
+  posture (the default) runs `full_control`, foreground or background, and one set to
+  `guarded` is promoted in the background. Any agent can DM any other by name, so another
+  agent can have a `guarded` one run tools without approval. The security model used to
+  call this override safe. It now says what it does not protect and what an operator can
+  do about it today (`docs/security-model.md` § 8.1). Whether the override should change
+  is open in #177.
 
 ### Persistence and durability
 
 - Transactional, versioned SQLite migrations.
+- A fresh install no longer registers an agent nobody created when it is restarted. The
+  gateway writes `.alms/agent_id` on its first boot, and on the next boot the migration for
+  deployments from before the agent registry found that file and, with no agents
+  registered, created `main` as the default ("Auto-migrated default agent"). That also
+  skipped first-run onboarding, which shows only while no agent exists. The migration now
+  runs only when the sidecar's agent ID owns sessions. A pre-registry deployment has them;
+  a fresh install has none unless the global-token Telegram bot received messages before
+  the first agent was created, and such an install still gets `main` on its next restart.
+  An install that already got an auto-created `main` keeps it; if it is deleted, it no
+  longer comes back on the next restart. The sidecar file is neither removed nor rewritten.
+- After a restart, the gateway's default agent ID now comes from the agent registry: the
+  default agent, or the oldest agent if none is marked default. The ID in `.alms/agent_id`
+  (or `ALMS_AGENT_ID`) is used only while no agent is registered; when `ALMS_AGENT_ID` is
+  set to a different ID and agents exist, a `WARN` at startup says it was ignored. Before,
+  the gateway booted with that ID every time, and creating or setting a default agent
+  moved it only until the next restart, so after a restart `GET /settings` reported it as
+  `agent_id` even when another agent was the default. This also changes which agent the
+  global-token Telegram bot serves; see the Telegram item under "Default changes" above.
 - Silent row loss in the persistence layer is now counted and surfaced, and foreign-key
   fallbacks are no longer silent.
 - Durable job recovery and atomic, bounded per-agent run admission.
 - Scheduled jobs stay active until the agent's full task completes ("job episodes").
+- An LLM-written session summary is no longer saved when the summarizer stopped at
+  `summary_max_tokens` (`finish_reason: length`) or looped on a few words. Either one used
+  to replace the session's accumulated summary outright (one observed case was the word
+  `our` repeated to the 1000-token cap), was then fed back as the base for the next
+  summary, and was injected into the agent's other sessions as episodic memory. Now the
+  existing summary is kept and the refusal is logged at `WARN` with `finish_reason`,
+  `output_len` and `check`, under a message containing `summarizer output rejected`; a
+  session with no summary yet gets the heuristic `"input" -> "output"` line instead. The
+  `compact` strategy's rolling summary is screened the same way, and a refused one neither
+  replaces the summary nor advances past the messages it would have covered. The
+  summarizer's `reasoning_content` is no longer used as a summary. A summarizer model that
+  answers only in its reasoning channel now logs `summarizer returned empty response` at
+  `WARN`, with `has_reasoning` set, and its summaries stop updating: an existing one is
+  kept as it is and a new session keeps the heuristic line, until the model answers in
+  `content`. Summaries saved before upgrading are not repaired.
+- A scheduled job that fires while its agent is mid-run is visible while it waits. Its run
+  is created `queued` as soon as the firing is admitted: `GET /runs` lists it (trigger
+  `scheduled`), `GET /runs/{id}` reports its `queue_position`, `run_created` carries the
+  real `queued_behind` (it was hardcoded `0`) and `run_queue_position` updates follow, and
+  the log reads `Job fired -> run <id> queued` with `queued_behind`. Before, the run
+  appeared only when the agent got to it, so a wait of a minute or two looked like a
+  stalled scheduler. The job's episode now opens with the firing as well: `GET /jobs`
+  shows it during the wait, and a second firing during the wait is absorbed into the
+  catch-up rather than queued. The episode's clock still starts with its first turn, so
+  neither the 4-hour episode deadline nor the missed-tick catch-up counts the wait — a
+  tick that passes while the firing waits is covered by the turn that runs after it, and
+  does not trigger a second run. `DELETE /jobs` cancels a queued firing; its run ends
+  `cancelled`, without starting, once the agent's queue reaches it. A job run still queued
+  at a hard stop is marked `failed` (`gateway_restarted`) at the next boot, and the job
+  fires again through the boot catch-up.
 
 ### Tools and workspace
 
@@ -122,6 +224,23 @@ Each item below changes behaviour for a deployment that has not set the knob exp
   agent can no longer see — the same rule every other non-user-facing run already has;
   `workspace_read` first, or `mode: "append"`, still works. No production code path
   creates an `episodic:` session today, so this changes what *would* happen, not what does.
+- Docs correction, no behaviour change: on a Linux kernel without Landlock, a sandboxed
+  `shell` refuses every command (each fails to start with
+  `Invalid argument (os error 22)`); it does not run unsandboxed, as the README and
+  `docs/security-model.md` § 4.4 said. `[tools].shell_policy` is not inert:
+  `"unrestricted"` takes Landlock and the cwd check off every agent's `shell`. And
+  `ALMS_MASTER_KEY` is out of an agent's reach only where `shell` has a filesystem boundary.
+- Docs correction, no behaviour change: a Telegram-triggered run never picks up a
+  `PATCH /settings` change or `settings.json`, not even after a restart; it uses the
+  `alms.toml` and environment values the daemon booted with. The Settings modal,
+  `docs/api.md` § 10.2 and `docs/config.md` said a restart would bring it in line. DM,
+  notification, job and subagent runs that start after a PATCH pick it up, as `POST /runs`
+  runs do.
+- Docs correction, no behaviour change: nothing reads the `[session]` knobs or
+  `[tools].max_output_bytes`, so no run enforces them, though the docs and the Settings
+  modal described them as limits. `[tools].sandbox_root` does not set where a gateway run
+  is rooted, and an empty value lifts no restriction; a non-empty value that cannot be
+  resolved makes runs fail.
 
 ### LLM errors
 
@@ -203,6 +322,43 @@ one.
   `Registering tool: <name>`), and the worktree drift warnings carry
   `drift=already_present` / `drift=already_absent`. Levels, targets and the rest of the
   fields are unchanged.
+- `rustls` 0.23.36 -> 0.23.45 (with `rustls-webpki` 0.103.13 -> 0.103.15) to clear
+  RUSTSEC-2026-0285, a TLS 1.3 handshake bug. v0.2.3 carries the affected version, but no
+  ALMS connection goes through rustls: `reqwest` is declared with `rustls-tls` *and* its own
+  defaults, and reqwest selects the platform backend whenever `default-tls` is on and
+  `http3` is off — OpenSSL on Linux, Security.framework on macOS, SChannel on Windows —
+  while nothing in `crates/` calls `use_rustls_tls`. So this clears the audit gate on code
+  that ships but is never reached; no operator action. Lockfile-only. The same re-resolve
+  also moved the Windows-only `windows-sys` dependency of `errno`, `rustix`, `tempfile` and
+  `winapi-util` from 0.52.0 to 0.60.2; nothing changes on Linux or macOS, and x86_64
+  Windows builds drop `windows-sys` 0.52.0 (aarch64 Windows keeps it for `ring`).
+- `dompurify` 3.4.14 -> 3.4.16 to clear GHSA-p98j-92pf-mc4p (low). `dompurify` ships in the
+  embedded web UI and sanitizes rendered chat markdown. The advisory needs `IN_PLACE: true`
+  together with a hook that removes a node in `afterSanitizeElements` or
+  `afterSanitizeAttributes`. The UI uses neither: it sanitizes a string with no config, and
+  its one `afterSanitizeAttributes` hook only sets `target` / `rel` on links. No release is
+  in the affected range (3.4.13–3.4.15): v0.2.3 loads `dompurify` 3.2.4 from esm.sh. The
+  only output change on the UI's path is fail-closed: a `<form>` with an `input` (other
+  than `type="image"`), `button`, `select`, `textarea`, `fieldset`, `output`, `object` or
+  `img` whose `name` or `id` is `removeAttributeNode` or `getAttributeNode` is now dropped
+  from rendered markdown, along with its contents. No operator action. The committed
+  `static/ui-dist/` bundle is rebuilt.
+- `quinn-proto` 0.11.15 -> 0.11.19 to clear RUSTSEC-2026-0338, RUSTSEC-2026-0339,
+  RUSTSEC-2026-0340, RUSTSEC-2026-0341 and RUSTSEC-2026-0342 (QUIC frame handling: two
+  remote panics and three unbounded-memory bugs; 0340 and 0341 are high; 0.11.19 also fixes
+  GHSA-53rm-773f-4q8c and GHSA-wppq-2f6r-wfvm (high), which RustSec has not imported yet),
+  and `rustls` 0.23.45 -> 0.23.46 to clear RUSTSEC-2026-0346, RUSTSEC-2026-0347,
+  RUSTSEC-2026-0348 and RUSTSEC-2026-0349 (low to medium). v0.2.3 carries quinn-proto
+  0.11.13 and rustls 0.23.36, in range for all but 0341 and 0347. Neither crate is reached.
+  QUIC is not compiled into any ALMS build: `quinn` is in `Cargo.lock` only because
+  reqwest's `rustls-tls` feature names it as a weak dependency (`quinn?/ring`), and cargo
+  locks optional dependencies named that way (rust-lang/cargo#10801). Only reqwest's
+  `http3` feature would build it, and ALMS does not enable it. rustls is compiled in but
+  carries no connection, as in the 0.23.45 entry above. No operator action. Lockfile-only.
+  quinn-proto 0.11.19 also moves to `rand` 0.10 and adds `rand_pcg` 0.10.2 (no other
+  dependent), and `getrandom` 0.3.4 loses its wasm-only `js-sys` / `wasm-bindgen` edges
+  because quinn-proto's wasm dependency moved to `getrandom` 0.4. None of these edges is
+  built.
 
 ## v0.2.3 — released (tag `v0.2.3`)
 
