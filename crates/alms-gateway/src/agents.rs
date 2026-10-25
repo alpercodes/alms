@@ -3261,9 +3261,11 @@ mod tests {
     }
 
     /// A delete refused by the worktree guard must leave the workspace at
-    /// its name path.
+    /// its name path. The archive runs only once the worktree is removed,
+    /// so a refusal never moves it; archiving first without a restore fails
+    /// this test.
     #[tokio::test]
-    async fn delete_agents_refused_by_worktree_restores_archived_workspace() {
+    async fn delete_agents_refused_by_worktree_leaves_workspace_in_place() {
         let tmp = tempfile::TempDir::new().unwrap();
         let mut state = agents_test_state_with_git_project(tmp.path());
         let workspace_dir = tmp.path().join(".alms").join("agents");
