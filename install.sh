@@ -53,8 +53,12 @@ fi
 # enough: another cargo can come first on PATH (`brew shellenv` in ~/.zprofile
 # puts Homebrew's ahead of rustup's ~/.cargo/bin). So ask the cargo that will
 # run the build. Under rustup, this installs the pinned toolchain if it is
-# missing, which the build below would do anyway, a step later. `|| true`
-# keeps a failing `cargo --version` a warning, like the rest of this check.
+# missing, which the build below would do anyway, a step later. A failing
+# `cargo --version` reports no nightly, so it gets the warning too; `|| true`
+# only makes it explicit that its exit status is ignored here (a `case` word
+# cannot trip `set -e`), and its error still shows on stderr. Only *a* nightly
+# is checked, not the pinned one: a different nightly from `RUSTUP_TOOLCHAIN`,
+# a `rustup override`, or a non-rustup cargo passes.
 if ! command -v rustup >/dev/null 2>&1; then
     echo "WARNING: rustup not found, so the nightly pinned in rust-toolchain.toml is" >&2
     echo "ignored and cargo builds with its own compiler. If the build fails, install" >&2
@@ -65,9 +69,16 @@ else
         *)
             WHICH_CARGO="$(command -v cargo)"
             WHICH_RUSTUP="$(command -v rustup)"
-            echo "WARNING: $WHICH_CARGO is not the nightly pinned in rust-toolchain.toml," >&2
-            echo "so the pin is not in effect. Is another cargo ahead of rustup's on PATH? If the" >&2
-            echo "build fails, put ${WHICH_RUSTUP%/*} first in PATH." >&2
+            # rustup's own cargo: PATH is not the cause, so don't blame it.
+            if [[ "${WHICH_CARGO%/*}" -ef "${WHICH_RUSTUP%/*}" ]]; then
+                echo "WARNING: rustup's cargo did not report the nightly pinned in rust-toolchain.toml." >&2
+                echo "See rustup's message above, if any. RUSTUP_TOOLCHAIN, or a \`rustup override\`" >&2
+                echo "for this directory, also takes precedence over the file." >&2
+            else
+                echo "WARNING: $WHICH_CARGO is not the nightly pinned in rust-toolchain.toml," >&2
+                echo "so the pin is not in effect. Is another cargo ahead of rustup's on PATH? If the" >&2
+                echo "build fails, put ${WHICH_RUSTUP%/*} first in PATH." >&2
+            fi
             ;;
     esac
 fi
