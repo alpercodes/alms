@@ -47,8 +47,8 @@ decision, not a drift — record the reasoning here when you do.
 | `@preact/signals` | 2.9.3 | State primitive. See the 2.x note below. |
 | `htm` | 3.1.1 | Tagged-template JSX alternative; no build step for legacy screens. |
 | `marked` | 18.0.6 | Markdown for assistant message bodies. See the 15 -> 18 note below. |
-| `dompurify` | 3.4.16 | Sanitizes `marked` output. Minor bumps only; security-relevant, keep current. Moved 3.4.12 -> 3.4.14 for GHSA-55q2-fjhq-7xh7 (#1250), then 3.4.14 -> 3.4.16 for GHSA-p98j-92pf-mc4p — see the notes below. |
-| `zod` | 4.4.3 | Schemas for the validated contract boundary. |
+| `dompurify` | 3.4.17 | Sanitizes `marked` output. Minor bumps only; security-relevant, keep current. Moved 3.4.12 -> 3.4.14 for GHSA-55q2-fjhq-7xh7 (#1250), then 3.4.14 -> 3.4.16 for GHSA-p98j-92pf-mc4p, then 3.4.16 -> 3.4.17 for GHSA-cg2g-xh64-v4q7, GHSA-mrv2-3pqr-j5jr and GHSA-c6gr-qvv4-5v3f — see the notes below. |
+| `zod` | 4.6.6 | Schemas for the validated contract boundary. Moved 4.4.3 -> 4.6.6 for GHSA-mrhx-c7xc-m3w5 — see the note below. |
 
 ### Why `marked` is on 18.x rather than the 15.0.4 the CDN importmap pinned
 
@@ -196,6 +196,120 @@ hook-detach re-checks are no-ops for our hook, which detaches nothing. 3.4.15's
 shadow-root change and 3.4.16's `IN_PLACE` fixes only apply to DOM-node input,
 which we never pass. 3.4.16 also moves DOMPurify's build from rollup to
 rolldown. The pins in `frontend/markdown-rendering.test.ts` stand unchanged.
+
+### Why `dompurify` moved 3.4.16 -> 3.4.17
+
+`npm audit` flagged three advisories against `dompurify <= 3.4.16`, all
+published 2026-10-22 and all fixed in 3.4.17:
+
+- GHSA-cg2g-xh64-v4q7 (critical, CVSS 4.0 score 9.2; `>= 3.4.4`). With
+  `SAFE_FOR_TEMPLATES: true` and a DOM-returning mode (`RETURN_DOM`,
+  `RETURN_DOM_FRAGMENT` or `IN_PLACE`), a template expression split across text
+  nodes inside an attached shadow root survives, because the post-walk re-scrub
+  never enters shadow roots.
+- GHSA-mrv2-3pqr-j5jr (high, 7.6). What the 3.4.16 fix for GHSA-p98j-92pf-mc4p
+  left open: under `IN_PLACE: true`, a hook that removes the current node's
+  parent, or a sibling not yet visited, leaves that subtree's `on*` handlers
+  armed.
+- GHSA-c6gr-qvv4-5v3f (low). With `PARSER_MEDIA_TYPE: 'application/xhtml+xml'`,
+  the guard that drops `attributeName="href"` from SMIL `<animate>` / `<set>`
+  compares a case-preserved name against `attributename` and never fires.
+
+**We are not exposed to any of them.** Each needs non-default configuration, and
+`static/ui/deps.js` still calls `DOMPurify.sanitize(raw)` on a string with no
+config object. So there is no `SAFE_FOR_TEMPLATES`, no `RETURN_DOM*`, no
+`IN_PLACE`, and no `PARSER_MEDIA_TYPE`. The default `text/html` parser
+lowercases `attributeName`, so that guard works. The one hook sets `target` /
+`rel` on anchors and removes nothing. v0.2.3 loads 3.2.4 from esm.sh with the
+same call shape, so it is in range for the second and third advisories but not
+exposed to them either. The bump is taken because this is the sanitizer for
+every rendered message and the patch is a drop-in for how we call it.
+
+**No measured behaviour change.** 3.4.17 also "hardened several smaller edge
+cases (namespaces, literal-text elements, `isValidAttribute()`)". Two of those
+reach our path. The namespace check now reads `namespaceURI` and `nodeName`
+through cached prototype getters instead of the element's own, clobberable,
+properties. And `SAFE_FOR_XML`, on by default, now drops an HTML literal-text
+element whose text holds `<` followed by `/`, `!` or a word character, not only
+its own closing tag. `<style>` is the only such element the default allow-list
+keeps, and 3.4.16 already drops it in exactly those cases: its generic check
+removes a text-only element whose `textContent` and `innerHTML` both hold
+markup, and a raw-text element's `innerHTML` is its text. A 42-case
+differential of the `renderMarkdown()` pipeline (same `marked` options, same
+hook) was run in headless Chromium, where `<form>` named-property clobbering is
+live, against the npm `dist/purify.js` builds of both versions. It covered
+ordinary markdown, task lists and fenced code, `<style>` blocks with and without
+markup-like text, `onerror` / `<script>` / `javascript:` vectors, SVG and
+MathML mutation-XSS shapes, SMIL `attributeName`, `<template>`, custom elements
+and `is=`, and `<form>` controls named after every getter the namespace change
+touches (`namespaceURI`, `tagName`, `nodeName`, `parentNode`, `nodeType`,
+`childNodes`, `attributes`), including a control joined with `form="…"` and
+forms inside `<svg>` and `<math>`. All 42 are byte-identical across 3.4.16 and
+3.4.17. So are the 21 non-form cases under jsdom. The `IN_PLACE`, shadow-root
+and `isValidAttribute()` changes apply only to DOM-node input or to an API we
+don't call. The pins in `frontend/markdown-rendering.test.ts` stand unchanged.
+
+### Why `zod` moved 4.4.3 -> 4.6.6
+
+`npm audit` flagged GHSA-mrhx-c7xc-m3w5 (high, CVSS 4.0 score 8.2;
+CVE-2023-54404) against `zod < 4.6.6`. An array, set or map with an upper size
+bound (`.max()`, `.length()`, `.size()`) checked that bound only after parsing
+every element. An oversized input whose elements fail therefore built one issue
+per element before the bound was reported, enough to exhaust memory. 4.6.6
+(colinhacks/zod#6652) checks leading size bounds before walking the elements.
+The advisory's description also mentions an array with no length constraint,
+but the fix adds the pre-check only for bounded collections. An unbounded array
+with many bad elements reports one issue per element, before and after.
+
+**We are not exposed.** zod runs in the browser, at the contract boundary in
+`frontend/contracts.ts`, against JSON from the gateway that served the page.
+None of its 15 `z.array()` schemas declares a size bound, and it has no
+`z.set()` or `z.map()`, so the gated path doesn't exist in our schemas. For
+unbounded collections, 4.6.6 parses exactly as 4.4.3 did. The bump is taken
+because zod is in the shipped bundle and the gate is a required check.
+
+**4.6.6 is the minimum, two minors up.** No 4.4.x or 4.5.x release carries the
+fix. 4.5.0 and 4.6.0 list soundness fixes as potentially breaking, so each one
+was checked against the schemas:
+
+- String `.min()` / `.max()` / `.length()` count code points instead of UTF-16
+  code units (4.5). Our only string bound is `.min(1)`, which any non-empty
+  string meets either way.
+- Stricter formats: `z.iso.datetime()` requires seconds (4.5), and `z.ipv6()`,
+  `z.ulid()`, `z.httpUrl()` and `z.emoji()` tighten (4.5, 4.6). We use none of
+  them. Our only format is `z.string().uuid()`, which is unchanged.
+- A `__proto__` key is always stripped from object and record input (4.5). For
+  our shapes — `z.json()` payloads such as tool-call `params` / `result`, both
+  records, and the `.passthrough()` objects — 4.4.3 already dropped it. The
+  cases 4.5 closes (a schema that declares `__proto__`, a record key transform)
+  don't occur here.
+- A record's key schema governs only the keys it matches (4.5). Both our records
+  use `z.string()` keys, which match every key.
+- `safeParse()` builds its error lazily and without a stack trace, and error
+  maps run on the first read of `error` (4.5, 4.6). `parseAtBoundary()` reads
+  `result.error.issues` straight away and uses only each issue's `path` and
+  `message`. No error map or `z.config()` is set.
+- Schema methods are memoized on the prototype instead of bound per instance
+  (4.5). Nothing detaches a method from a schema.
+- Numeric-enum `.options`, the base64 and email patterns, JSON Schema output and
+  the metadata getters (4.6). None of them is used.
+- 4.6.6's own type fix declares a record's input and output as members
+  (colinhacks/zod#6645). Both `tsc` projects in `ui:typecheck` pass.
+
+A 22-case differential of the contract schemas' shapes across 4.4.3 and 4.6.6
+was identical in `data` and in every issue's `path`, `code` and `message`. It
+covered `__proto__` keys at the top level and nested inside `z.json()`, astral
+and lone-surrogate strings against `.min(1)`, UUID variants, integer bounds, the
+participants tuple, a discriminated union, and an array with failing elements.
+
+zod 4.6.6 is published with npm provenance (`npm audit signatures` verifies
+it). Its release notes say six malicious commits pushed to zod's `main` on
+2026-09-21 were reverted the same day and never published, and that 4.6.6's
+provenance names a pre-rewrite commit with identical contents.
+
+In the rebuilt `static/ui-dist/`, two chunks change content: `index`, which
+bundles zod, and `deps`, which bundles dompurify. The other chunks and
+`index.html` change, if at all, only in the hashed file names they reference.
 
 ### Why `@preact/signals` is on 2.x
 
