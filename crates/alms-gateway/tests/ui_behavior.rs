@@ -547,7 +547,7 @@ fn agent_events_global_feed_js_behaviour() {
 
 /// Pinned regression for issue #1003: the per-agent Debug-mode toggle, swept
 /// out in #941. Both surfaces that can set it (AgentEditModal and the Settings
-/// modal's Debug section) compute the `PATCH /agents/{id}` delta the same way
+/// modal's Debug section) compute the `PUT /agents/{id}` delta the same way
 /// — send `debug_mode` only when the form value differs from the stored one —
 /// and both must treat a pre-#1003 record's absent `debug_mode` as `false`.
 /// Without that, opening the modal on a legacy record and pressing Apply

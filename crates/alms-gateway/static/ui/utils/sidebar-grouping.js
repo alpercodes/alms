@@ -255,7 +255,7 @@ export function filterChatSessions(sessions) {
  *
  * One row per JOB, not per firing: the backend keys each scheduled
  * job to a single stable `job_{job_id}` session that accumulates
- * history across firings (`fire_job_run` uses `get_or_create`), so
+ * history across firings (`admit_job_run` uses `get_or_create`), so
  * this filter cannot blow up the sidebar however often a recurring
  * job fires.
  *

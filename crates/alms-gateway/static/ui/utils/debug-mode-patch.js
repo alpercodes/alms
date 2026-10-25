@@ -4,7 +4,7 @@
  * Lifted out of `agents-tab.js` into a standalone pure-JS module so
  * unit tests can import it under Node without dragging in the preact
  * `deps.js` chain. Used by both the `AgentEditModal` and the
- * `SettingsModal` Debug section to produce a `PATCH /agents/{id}`
+ * `SettingsModal` Debug section to produce a `PUT /agents/{id}`
  * partial body with `debug_mode` included only when the form value
  * differs from the live record.
  *

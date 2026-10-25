@@ -237,8 +237,9 @@ pub async fn serve_with_gateway(bind_addr: &str, gateway: Gateway) -> AlmsResult
     // Phase 3: Abort the fire loop. The scheduler is stopped so no new
     // job IDs will arrive. The fire_tx is kept alive by Arc inside the
     // fire loop's AppState clone, so rx.recv() would hang — abort instead.
-    // Any in-flight runs spawned by fire_job_run are tracked by the
-    // in-flight counter and will be drained in phase 5.
+    // A firing the loop already admitted is agent-queue work like any other
+    // run: once it executes it is tracked by the in-flight counter and
+    // drained in phase 5.
     fire_handle.abort();
     fire_handle.await.ok();
     info!("Scheduler fire loop stopped");
@@ -466,7 +467,7 @@ async fn bootstrap_scheduler(state: &AppState) -> AlmsResult<()> {
 
 /// How one persisted job should be re-registered at startup.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum BootstrapFire {
+pub(crate) enum BootstrapFire {
     /// A future intent — fire at exactly this time, unstaggered.
     Scheduled(chrono::DateTime<chrono::Utc>),
     /// A missed tick. Carries the original due time so the catch-up cohort
@@ -482,7 +483,7 @@ enum BootstrapFire {
 /// projection. It therefore wins for every schedule type, not only retries.
 /// The cron expression is consulted only for legacy/new rows that have no
 /// persisted intent yet.
-fn bootstrap_fire_at(
+pub(crate) fn bootstrap_fire_at(
     job: &alms_core::job::Job,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Option<BootstrapFire> {
