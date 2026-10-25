@@ -128,7 +128,7 @@ pub(crate) enum AgentCommands {
         /// Agent name slug or UUID
         name_or_id: String,
     },
-    /// Delete an agent
+    /// Delete an agent and archive its workspace to .alms/agents/.deleted/
     Delete {
         /// Agent name slug or UUID
         name_or_id: String,
@@ -682,8 +682,10 @@ pub(crate) fn agent_delete(
         );
     } else {
         println!("Deleted agent '{}'", agent.name);
-        if let Some(archive_path) = archive_path {
-            println!("  Workspace archived at {archive_path}");
+        // Print the full path: one relative to the agents dir would read as
+        // relative to the cwd. JSON keeps the relative form, matching the API.
+        if let Some(archive) = archived_workspace.as_deref() {
+            println!("  Workspace archived at {}", archive.display());
         }
     }
     Ok(())

@@ -1217,6 +1217,13 @@ async fn process_telegram_message(
 /// `main` does not come back on the next restart unless that bot has filed
 /// new ones under the ID in the meantime.
 ///
+/// **Only when `{workspace_dir}/main/` is available (#191).** Workspaces are
+/// keyed by name, so a folder there holding more than the blank seed scaffold
+/// may be another agent's data, for example from a deletion before workspaces
+/// were archived, or a named subagent's writes. Registering `main` over it
+/// would hand that data to the migrated agent, so the migration logs a WARN
+/// and skips; move the folder and restart to migrate.
+///
 /// Uses `create_agent_if_none_exist` to atomically check-and-insert within a
 /// single SQLite transaction, avoiding the TOCTOU race between checking
 /// `list_agents().is_empty()` and `create_agent()`. The `list_agents` read
@@ -1270,7 +1277,7 @@ fn migrate_sidecar_agent(
         if let Err(error) = alms_core::ensure_workspace_dir_available(&path) {
             warn!(
                 path = %path.display(),
-                "Not registering the sidecar agent as '{}': its workspace may contain data from a deleted agent: {}",
+                "Not registering the sidecar agent as '{}': its workspace may contain data from a deleted agent: {}; move it and restart to migrate",
                 migration_name,
                 error
             );

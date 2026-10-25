@@ -606,12 +606,19 @@ pub fn archive_agent_workspace(
     }
 
     let archive_root = workspace_dir.join(".deleted");
+    // Name the path, so the operator knows what to remove.
+    let not_a_directory = || {
+        std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            format!(
+                "workspace archive path {} must be a directory, not a file or symlink",
+                archive_root.display()
+            ),
+        )
+    };
     match std::fs::symlink_metadata(&archive_root) {
         Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::AlreadyExists,
-                "workspace archive path must be a directory, not a file or symlink",
-            ));
+            return Err(not_a_directory());
         }
         Ok(_) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -620,10 +627,7 @@ pub fn archive_agent_workspace(
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
                     let metadata = std::fs::symlink_metadata(&archive_root)?;
                     if metadata.file_type().is_symlink() || !metadata.is_dir() {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::AlreadyExists,
-                            "workspace archive path must be a directory, not a file or symlink",
-                        ));
+                        return Err(not_a_directory());
                     }
                 }
                 Err(error) => return Err(error),
@@ -1065,6 +1069,12 @@ mod tests {
 
         let error = archive_agent_workspace(&workspace_dir, "atlas", AgentId::new()).unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert!(
+            error
+                .to_string()
+                .contains(&workspace_dir.join(".deleted").display().to_string()),
+            "the error must name the path to remove: {error}"
+        );
         assert_eq!(
             std::fs::read_to_string(source.join("memories.md")).unwrap(),
             "private notes"

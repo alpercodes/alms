@@ -2533,30 +2533,23 @@ mod tests {
         );
     }
 
+    /// A blank seed scaffold at the name path (the four empty files and a
+    /// lock sidecar, as an unused agent deleted before workspaces were
+    /// archived leaves it) is reused, not refused.
+    ///
+    /// The scaffold is planted directly: a delete now archives it, so a
+    /// create-delete-create sequence would find no folder at all.
     #[tokio::test]
-    async fn post_agents_reuses_blank_scaffold_left_by_deleted_agent() {
+    async fn post_agents_reuses_blank_scaffold_left_at_the_name_path() {
         let tmp = tempfile::TempDir::new().unwrap();
         let workspace_dir = tmp.path().join("agents");
         let state = TestAppState::new()
             .in_memory_sqlite()
             .workspace_dir(workspace_dir.clone())
             .build();
-
-        let (status, _) = create_agent(
-            axum::extract::State(state.clone()),
-            Json(create_req("scratch")),
-        )
-        .await
-        .expect("initial agent creation must succeed");
-        assert_eq!(status, StatusCode::CREATED);
-
-        let _ = delete_agent(
-            axum::extract::State(state.clone()),
-            axum::extract::Path("scratch".into()),
-            axum::extract::Query(DeleteAgentQuery::default()),
-        )
-        .await
-        .expect("agent deletion must succeed");
+        let scaffold = workspace_dir.join("scratch");
+        alms_core::init_workspace_files(&scaffold).unwrap();
+        std::fs::write(scaffold.join(".memories.md.lock"), "").unwrap();
 
         let recreated = create_agent(
             axum::extract::State(state.clone()),

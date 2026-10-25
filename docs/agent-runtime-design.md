@@ -260,7 +260,7 @@ Agents have no persistent identity. Every session starts from the same hardcoded
 
 These are plain text files that the user can edit directly, or that the agent can update through the workspace tool. Per-agent config overrides (model, posture, etc.) are stored in the agent registry (SQLite), not in workspace files.
 
-The directory is keyed by agent name and is shared by registered agents and named subagents. Deleting a registered agent moves an existing directory into `.deleted/` so a later subagent using the same name cannot inherit its identity. Folders left by pre-upgrade deletions or unregistered named subagents remain at the name path and can block agent creation; see [API §9.2 and §9.5](api.md#9-agents).
+The directory is keyed by agent name and is shared by registered agents and named subagents. Deleting a registered agent moves an existing directory into `.deleted/` so a later subagent using the same name cannot inherit its identity. Folders left by pre-upgrade deletions or unregistered named subagents remain at the name path and can block agent creation; see [API §9.2](api.md#92-create-agent) and [§9.5](api.md#95-delete-agent).
 
 **Workspace attachment (post-#945):** `AgentRuntime::with_workspace(workspace)` is now scoped down. It binds the `WorkspaceWriteTool` and the `WorkspaceReadTool` (so `workspace_write` and `workspace_read` know which agent's metadata directory they address) and ensures the metadata directory exists. It **no longer touches the filesystem sandbox** — the sandbox root is set independently by `with_project_root(project_root)`, which is the single source of truth for the `fs_*` and `shell` boundary. See [`docs/security-model.md` § 4.4](security-model.md#filesystem-sandboxing) for the full sandbox model.
 
