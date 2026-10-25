@@ -2415,6 +2415,33 @@ mod tests {
         assert_eq!(std::fs::read_to_string(memories).unwrap(), "");
     }
 
+    /// A folder the archive never saw (a pre-upgrade deletion, or a named
+    /// subagent's writes) is still refused on the default, non-worktree path,
+    /// and nothing is registered over it.
+    #[tokio::test]
+    async fn post_agents_refuses_unarchived_workspace_with_data() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let workspace_dir = tmp.path().join("agents");
+        let state = TestAppState::new()
+            .in_memory_sqlite()
+            .workspace_dir(workspace_dir.clone())
+            .build();
+        let memories = workspace_dir.join("atlas").join("memories.md");
+        std::fs::create_dir_all(memories.parent().unwrap()).unwrap();
+        std::fs::write(&memories, "left by a named subagent").unwrap();
+
+        let (status, body) = create_agent_err(state.clone(), create_req("atlas")).await;
+
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(err_code(&body), "WORKSPACE_EXISTS");
+        let store = state.session_manager.store().expect("sqlite store");
+        assert!(store.load_agent_by_name("atlas").unwrap().is_none());
+        assert_eq!(
+            std::fs::read_to_string(&memories).unwrap(),
+            "left by a named subagent"
+        );
+    }
+
     #[tokio::test]
     async fn delete_agents_keeps_registry_when_workspace_cannot_be_archived() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -3180,6 +3207,46 @@ mod tests {
             "force delete must remove the worktree"
         );
         assert!(store.load_agent_by_name("atlas").unwrap().is_none());
+    }
+
+    /// A delete refused by the worktree guard must leave the workspace at
+    /// its name path.
+    #[tokio::test]
+    async fn delete_agents_refused_by_worktree_restores_archived_workspace() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut state = agents_test_state_with_git_project(tmp.path());
+        let workspace_dir = tmp.path().join(".alms").join("agents");
+        state.workspace_dir = Some(workspace_dir.clone());
+        let mut req = create_req("atlas");
+        req.worktree_mode = Some(WorktreeMode::Git);
+        let _ = create_agent(axum::extract::State(state.clone()), Json(req))
+            .await
+            .expect("create");
+        let memories = workspace_dir.join("atlas").join("memories.md");
+        std::fs::write(&memories, "private notes").unwrap();
+        let wt_dir = tmp.path().join(".alms").join("worktrees").join("atlas");
+        std::fs::write(wt_dir.join("dirty.txt"), "wip").unwrap();
+
+        let (status, body) = delete_agent(
+            axum::extract::State(state.clone()),
+            axum::extract::Path("atlas".into()),
+            axum::extract::Query(DeleteAgentQuery { force: false }),
+        )
+        .await
+        .expect_err("delete must refuse on uncommitted changes");
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(err_code(&body.0), "WORKTREE_HAS_UNCOMMITTED_CHANGES");
+
+        let store = state.session_manager.store().expect("sqlite store");
+        assert!(store.load_agent_by_name("atlas").unwrap().is_some());
+        assert_eq!(std::fs::read_to_string(&memories).unwrap(), "private notes");
+        let archived = std::fs::read_dir(workspace_dir.join(".deleted"))
+            .map(Iterator::count)
+            .unwrap_or(0);
+        assert_eq!(
+            archived, 0,
+            "a refused delete must leave nothing in .deleted/"
+        );
     }
 
     // ── #964: PUT /agents worktree side-effect must compensate on

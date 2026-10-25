@@ -1319,6 +1319,48 @@ mod tests {
         alms_core::ensure_workspace_dir_available(&workspace).unwrap();
     }
 
+    /// A delete refused by the worktree guard must leave the workspace at its
+    /// name path, not in `.deleted/`.
+    #[test]
+    fn test_delete_refused_by_worktree_restores_workspace() {
+        let store = new_store();
+        let mut agent = alms_core::AgentRecord::for_test("atlas");
+        agent.worktree_mode = WorktreeMode::Git;
+        store.create_agent(&agent).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace_dir = tmp.path().join(".alms").join("agents");
+        let workspace = workspace_dir.join("atlas");
+        alms_core::init_workspace_files(&workspace).unwrap();
+        std::fs::write(workspace.join("memories.md"), "private notes").unwrap();
+        // A plain directory, not a worktree: the uncommitted-changes probe
+        // fails closed and refuses the delete.
+        std::fs::create_dir_all(alms_core::worktree::worktree_path(tmp.path(), "atlas")).unwrap();
+
+        let err = agent_delete(
+            &store,
+            "atlas",
+            false,
+            true,
+            Some(tmp.path()),
+            Some(&workspace_dir),
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("WORKTREE_HAS_UNCOMMITTED_CHANGES"));
+        assert!(store.load_agent_by_id(agent.id).unwrap().is_some());
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("memories.md")).unwrap(),
+            "private notes"
+        );
+        let archived = std::fs::read_dir(workspace_dir.join(".deleted"))
+            .map(Iterator::count)
+            .unwrap_or(0);
+        assert_eq!(
+            archived, 0,
+            "a refused delete must leave nothing in .deleted/"
+        );
+    }
+
     #[test]
     fn test_config_update() {
         let store = new_store();
