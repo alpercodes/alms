@@ -275,9 +275,9 @@ Each item below changes behaviour for a deployment that has not set the knob exp
   key was visibly on disk and the next run still failed to authenticate. With no gateway
   answering, both commands write the file exactly as before. A gateway that answers and
   then *rejects* the change (a missing `ALMS_AUTH_TOKEN`, say) is now an error rather
-  than a silent fall back to the file, and the error names that file. `--json` output gains a `target` field
-  (`"gateway"` or `"secrets_file"`); `alms auth list` is unchanged and still reads the
-  file.
+  than a silent fall back to the file, and the error names that file. `--json` output
+  gains a `target` field (`"gateway"` or `"secrets_file"`); `alms auth list` is unchanged
+  and still reads the file.
 
 ### Frontend
 

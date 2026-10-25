@@ -259,7 +259,11 @@ impl SecretsStore {
         }
     }
 
-    /// Load secrets from a file path, creating it if it doesn't exist.
+    /// Load secrets from a file path.
+    ///
+    /// A missing file loads as an empty store and is not created: the first
+    /// [`Self::set_key`] creates it, and its parent directory. The only write
+    /// `load` makes is the in-place encryption of a plain-text file below.
     ///
     /// Reads `ALMS_MASTER_KEY` from the environment to determine encryption.
     ///
