@@ -1222,76 +1222,72 @@ pub async fn delete_agent(
         ));
     }
 
-    // Move the workspace out of the name-based path before deleting the
-    // record. Named subagents attach that path even when the name is no
-    // longer registered.
-    let workspace_dir = state.workspace_dir.as_deref();
-    let archived_workspace = match workspace_dir {
-        Some(workspace_dir) => {
-            alms_core::archive_agent_workspace(workspace_dir, &agent.name, agent.id).map_err(
-                |error| {
-                    api_error(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "INTERNAL",
-                        format!("archive agent workspace before deletion: {error}"),
-                    )
-                },
-            )?
-        }
-        None => None,
-    };
-
-    // Worktree teardown (#946). Runs BEFORE the SQLite delete so an
+    // Worktree teardown (#946). Runs BEFORE the persist step so an
     // uncommitted-changes refusal surfaces a 4xx without orphaning
     // the agent record. `force` from the query string overrides the
     // uncommitted-changes guard inside `remove_worktree`.
     //
+    // The persist step archives the workspace, then deletes the SQLite
+    // record. The archive moves `{workspace_dir}/{name}/` out of the name
+    // path, because named subagents attach that path even when the name is
+    // no longer registered. Running it inside the persist step, after the
+    // worktree removal, means a refused delete never moves the workspace,
+    // and a failed archive gets the same worktree compensation as a failed
+    // SQLite delete.
+    //
     // Routed through `apply_worktree_op_and_persist` (#1022 — extended
     // from #1019's PATCH compensation framework) so any
-    // post-side-effect SQLite-delete failure (db locked, disk full,
-    // fs perm) gets the just-removed worktree restored at its
+    // post-side-effect persist failure (archive failure, db locked,
+    // disk full, fs perm) gets the just-removed worktree restored at its
     // pre-call SHA before the error surfaces to the client. Pre-#1022
     // a `delete_agent` SQLite failure left the agent record in place
     // but the worktree gone — operator hit a silent half-deleted
     // state. The helper's branch-SHA snapshot preserves agent commit
     // history across the round trip.
-    let delete_result = if agent.worktree_mode == WorktreeMode::Git {
-        let agent_name = agent.name.clone();
-        let agent_id = agent.id;
-        let project_root = state.project_root.clone();
-        let store_ref = store.clone();
+    let workspace_dir = state.workspace_dir.as_deref();
+    let mut archived_workspace: Option<std::path::PathBuf> = None;
+    let mut archive_and_delete = || -> AlmsResult<()> {
+        if let Some(dir) = workspace_dir {
+            archived_workspace = alms_core::archive_agent_workspace(dir, &agent.name, agent.id)
+                .map_err(|error| {
+                    alms_core::AlmsError::Runtime(format!(
+                        "archive agent workspace before deletion: {error}"
+                    ))
+                })?;
+        }
+        let Err(delete_error) = store.delete_agent(agent.id) else {
+            return Ok(());
+        };
+        // The record stays, so put its workspace back.
+        if let (Some(dir), Some(path)) = (workspace_dir, archived_workspace.as_deref())
+            && let Err(restore_error) = alms_core::restore_agent_workspace(dir, &agent.name, path)
+        {
+            tracing::error!(
+                agent_id = %agent.id,
+                archive = %path.display(),
+                error = %restore_error,
+                "Could not restore the archived workspace after a failed delete"
+            );
+            return Err(alms_core::AlmsError::Runtime(format!(
+                "{delete_error}; archived workspace remains at {} because restoration failed: {restore_error}",
+                path.display()
+            )));
+        }
+        Err(delete_error)
+    };
+    if agent.worktree_mode == WorktreeMode::Git {
         apply_worktree_op_and_persist(
-            &project_root,
-            &agent_name,
+            &state.project_root,
+            &agent.name,
             WorktreeOp::Remove { force: query.force },
-            || store_ref.delete_agent(agent_id).map(|_| ()),
-        )
+            archive_and_delete,
+        )?;
     } else {
         // worktree_mode = Off — no on-disk side-effect to compose
-        // around, delete directly. Preserves pre-#1022 wire shape
+        // around, persist directly. Preserves pre-#1022 wire shape
         // for the (overwhelmingly common) non-worktree delete path.
-        store
-            .delete_agent(agent.id)
-            .map(|_| ())
-            .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL", error))
-    };
-
-    if let Err(delete_error) = delete_result {
-        if let (Some(workspace_dir), Some(archive_path)) =
-            (workspace_dir, archived_workspace.as_deref())
-            && let Err(restore_error) =
-                alms_core::restore_agent_workspace(workspace_dir, &agent.name, archive_path)
-        {
-            return Err(api_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "INTERNAL",
-                format!(
-                    "{delete_error:?}; archived workspace remains at {} because restoration failed: {restore_error}",
-                    archive_path.display()
-                ),
-            ));
-        }
-        return Err(delete_error);
+        archive_and_delete()
+            .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL", error))?;
     }
 
     let archive_path = archived_workspace
@@ -3246,6 +3242,45 @@ mod tests {
         assert_eq!(
             archived, 0,
             "a refused delete must leave nothing in .deleted/"
+        );
+    }
+
+    /// The archive runs inside the persist step, after the worktree is
+    /// removed, so an archive failure gets the same compensation as a failed
+    /// SQLite delete: the worktree comes back and the record and workspace
+    /// stay.
+    #[tokio::test]
+    async fn delete_agents_with_worktree_restores_worktree_when_workspace_cannot_be_archived() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut state = agents_test_state_with_git_project(tmp.path());
+        let workspace_dir = tmp.path().join(".alms").join("agents");
+        state.workspace_dir = Some(workspace_dir.clone());
+        let mut req = create_req("atlas");
+        req.worktree_mode = Some(WorktreeMode::Git);
+        let _ = create_agent(axum::extract::State(state.clone()), Json(req))
+            .await
+            .expect("create");
+        let memories = workspace_dir.join("atlas").join("memories.md");
+        std::fs::write(&memories, "private notes").unwrap();
+        std::fs::write(workspace_dir.join(".deleted"), "not a directory").unwrap();
+
+        let (status, body) = delete_agent(
+            axum::extract::State(state.clone()),
+            axum::extract::Path("atlas".into()),
+            axum::extract::Query(DeleteAgentQuery { force: false }),
+        )
+        .await
+        .expect_err("delete must fail when the workspace cannot be archived");
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(err_code(&body.0), "INTERNAL");
+
+        let store = state.session_manager.store().expect("sqlite store");
+        assert!(store.load_agent_by_name("atlas").unwrap().is_some());
+        assert_eq!(std::fs::read_to_string(&memories).unwrap(), "private notes");
+        let wt_dir = tmp.path().join(".alms").join("worktrees").join("atlas");
+        assert!(
+            wt_dir.exists(),
+            "compensation must restore the removed worktree"
         );
     }
 
