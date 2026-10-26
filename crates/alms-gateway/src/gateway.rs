@@ -447,11 +447,13 @@ impl Gateway {
                 warn!("Failed to load secrets: {e}");
                 alms_core::secrets::SecretsStore::empty()
             });
-        if let Some(legacy) = config
-            .data_dir
-            .as_deref()
-            .and_then(|data_dir| alms_core::secrets::unread_legacy_secrets(data_dir, &secrets_path))
-        {
+        if let Some(legacy) = config.data_dir.as_deref().and_then(|data_dir| {
+            alms_core::secrets::unread_legacy_secrets(
+                data_dir,
+                config.db_path.as_deref(),
+                &secrets_path,
+            )
+        }) {
             warn!(
                 legacy = %legacy.display(),
                 secrets = %secrets_path.display(),
@@ -2218,6 +2220,29 @@ mod secrets_path_tests {
         assert!(
             warning.contains("mv \""),
             "the move that adopts it: {warning}"
+        );
+        assert!(
+            warning.contains("stop the gateway, then move it"),
+            "moving the file under a running gateway loses keys (Tim B1 on #188): {warning}"
+        );
+    }
+
+    /// `ALMS_DB_PATH=:memory:` has no database directory, so the secrets
+    /// file resolves into the working directory; a normal data-dir file must
+    /// not be reported as one to move there (Tim S1 on #188).
+    #[test]
+    fn says_nothing_under_an_in_memory_database() {
+        let s = split();
+        let mut store = alms_core::secrets::SecretsStore::load(&s.legacy).unwrap();
+        store
+            .set_key("openrouter", "sk-or-in-the-data-dir")
+            .unwrap();
+
+        let (_gateway, warnings) = boot(std::path::Path::new(":memory:"), &s.data_dir);
+
+        assert!(
+            unread_warning(&warnings, &s.legacy).is_none(),
+            "{warnings:?}"
         );
     }
 

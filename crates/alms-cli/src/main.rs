@@ -365,30 +365,18 @@ async fn main() -> anyhow::Result<()> {
         Commands::Auth { cmd, json, url } => {
             let config = alms_core::AlmsConfig::load_or_default();
             let secrets_path = cmd_auth::secrets_file(&config);
-            cmd_auth::warn_unread_legacy_secrets(&config, &secrets_path, &mut std::io::stderr());
             let client = api_client()?;
-            let mut out = std::io::stdout();
-            match cmd {
-                AuthCommands::Set { provider, key } => {
-                    cmd_auth::auth_set(
-                        &client,
-                        &url,
-                        &secrets_path,
-                        &provider,
-                        key,
-                        json,
-                        &mut out,
-                    )
-                    .await?;
-                }
-                AuthCommands::List => {
-                    cmd_auth::auth_list(&secrets_path, json)?;
-                }
-                AuthCommands::Remove { provider } => {
-                    cmd_auth::auth_remove(&client, &url, &secrets_path, &provider, json, &mut out)
-                        .await?;
-                }
-            }
+            cmd_auth::run(
+                cmd,
+                json,
+                &url,
+                &config,
+                &secrets_path,
+                &client,
+                &mut std::io::stdout(),
+                &mut std::io::stderr(),
+            )
+            .await?;
         }
         Commands::Agent { cmd, json } => {
             let (store, config) = helpers::open_db_with_config()?;

@@ -2,7 +2,8 @@
 
 //! Secure API key storage with optional encryption at rest.
 //!
-//! Keys are stored in a JSON file (`.alms/secrets.json`). When the
+//! Keys are stored in a JSON file beside the database (`.alms/secrets.json`
+//! by default; see [`secrets_path_from_db`]). When the
 //! `ALMS_MASTER_KEY` environment variable is set, the file is encrypted
 //! using AES-256-GCM with an HKDF-SHA256 derived key. Without the env var
 //! the file is stored as plain text (with a warning log).
@@ -40,6 +41,9 @@ const HEADER_LEN: usize = 1 + SALT_LEN + NONCE_LEN;
 /// File name of the secrets store.
 const SECRETS_FILE: &str = "secrets.json";
 
+/// The SQLite path that opens an in-memory database.
+const IN_MEMORY_DB: &str = ":memory:";
+
 /// The secrets file for an instance whose SQLite database is at `db_path`:
 /// `secrets.json` in the database's directory. This is the one resolver,
 /// for every process: the CLI reaches it through
@@ -67,7 +71,9 @@ const SECRETS_FILE: &str = "secrets.json";
 /// Relative paths are made absolute against the current directory, as the
 /// database path itself is, so logs and messages name one unambiguous file.
 /// With no `db_path` (an in-memory gateway) the fallback is
-/// `./.alms/secrets.json`.
+/// `./.alms/secrets.json`. `ALMS_DB_PATH=:memory:` is a path whose parent
+/// is the working directory, so that gives `./secrets.json`, for the CLI
+/// and the gateway alike.
 pub fn secrets_path_from_db(db_path: Option<&str>) -> PathBuf {
     let path = db_path
         .and_then(|p| Path::new(p).parent().map(|d| d.join(SECRETS_FILE)))
@@ -76,7 +82,16 @@ pub fn secrets_path_from_db(db_path: Option<&str>) -> PathBuf {
 }
 
 /// A `{data_dir}/secrets.json` that exists but is not the file
-/// [`secrets_path_from_db`] resolved, or `None`.
+/// [`secrets_path_from_db`] resolved for `db_path`, or `None`.
+///
+/// The gateway and `alms auth` both call this with the database path they
+/// resolved, so they report the same files.
+///
+/// Under an in-memory database (`db_path` is `:memory:`) nothing is
+/// reported. There is no database directory for the file to sit beside, so
+/// [`secrets_path_from_db`] lands on `./secrets.json` in the working
+/// directory, and telling the operator to move a normal `.alms/secrets.json`
+/// there would put their keys loose in the project root (Tim S1 on #188).
 ///
 /// Before #170, `alms auth set` / `remove` with no gateway running wrote
 /// `{data_dir}/secrets.json` even when `ALMS_DB_PATH` put the database, and
@@ -90,7 +105,14 @@ pub fn secrets_path_from_db(db_path: Option<&str>) -> PathBuf {
 ///
 /// "Not the same file" is decided on canonical paths, so a data directory
 /// that is a symlink to the database's directory is not reported.
-pub fn unread_legacy_secrets(data_dir: &Path, secrets_path: &Path) -> Option<PathBuf> {
+pub fn unread_legacy_secrets(
+    data_dir: &Path,
+    db_path: Option<&str>,
+    secrets_path: &Path,
+) -> Option<PathBuf> {
+    if db_path == Some(IN_MEMORY_DB) {
+        return None;
+    }
     let legacy = data_dir.join(SECRETS_FILE);
     if !legacy.is_file() {
         return None;
@@ -100,7 +122,9 @@ pub fn unread_legacy_secrets(data_dir: &Path, secrets_path: &Path) -> Option<Pat
         std::fs::canonicalize(secrets_path),
     ) {
         (Ok(a), Ok(b)) if a == b => None,
-        _ => Some(legacy),
+        // Absolute, like `secrets_path`, so the notice names both files
+        // the same way under the default relative `./.alms`.
+        _ => Some(std::path::absolute(&legacy).unwrap_or(legacy)),
     }
 }
 
@@ -116,16 +140,20 @@ pub fn unread_legacy_secrets_message(legacy: &Path, secrets_path: &Path) -> Stri
             legacy.display()
         )
     } else {
+        // `mv` is POSIX; cmd.exe calls it `move`. Fine for now: the paths
+        // are what the operator needs, whatever their shell.
         format!(
-            "To use its keys, move it: mv \"{}\" \"{}\"",
+            "To use its keys, stop the gateway, then move it: mv \"{}\" \"{}\". A running \
+             gateway reads the file only at boot, and its next key change overwrites the file.",
             legacy.display(),
             secrets_path.display()
         )
     };
     format!(
         "{} is not read: with ALMS_DB_PATH set, secrets.json lives beside the database, at {}. \
-         The file in the data directory was written by `alms auth` in an earlier version, and a \
-         gateway started with this configuration does not use its keys. {what_to_do}",
+         It is the file a configuration without ALMS_DB_PATH uses, and `alms auth` before \
+         v0.2.4 also wrote it under ALMS_DB_PATH; a gateway started with this configuration \
+         does not read it. {what_to_do}",
         legacy.display(),
         secrets_path.display()
     )
@@ -574,12 +602,12 @@ mod tests {
 
         // Reported whether or not the canonical file exists yet.
         assert_eq!(
-            unread_legacy_secrets(data_dir.path(), &canonical),
+            unread_legacy_secrets(data_dir.path(), None, &canonical),
             Some(data_dir.path().join("secrets.json"))
         );
         std::fs::write(&canonical, "{}").unwrap();
         assert_eq!(
-            unread_legacy_secrets(data_dir.path(), &canonical),
+            unread_legacy_secrets(data_dir.path(), None, &canonical),
             Some(data_dir.path().join("secrets.json"))
         );
     }
@@ -589,9 +617,32 @@ mod tests {
         let data_dir = tempfile::tempdir().unwrap();
         let canonical = data_dir.path().join("secrets.json");
         // Absent, then present: the default layout, data_dir == db dir.
-        assert_eq!(unread_legacy_secrets(data_dir.path(), &canonical), None);
+        assert_eq!(
+            unread_legacy_secrets(data_dir.path(), None, &canonical),
+            None
+        );
         std::fs::write(&canonical, "{}").unwrap();
-        assert_eq!(unread_legacy_secrets(data_dir.path(), &canonical), None);
+        assert_eq!(
+            unread_legacy_secrets(data_dir.path(), None, &canonical),
+            None
+        );
+    }
+
+    /// An in-memory database has no directory for secrets to sit beside, so
+    /// a data-dir file is not "left behind" and must not be sent to the cwd.
+    #[test]
+    fn nothing_is_reported_under_an_in_memory_database() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        std::fs::write(data_dir.path().join("secrets.json"), "{}").unwrap();
+        let canonical = cwd.path().join("secrets.json");
+
+        assert_eq!(
+            unread_legacy_secrets(data_dir.path(), Some(":memory:"), &canonical),
+            None
+        );
+        // The same layout with a file database is reported.
+        assert!(unread_legacy_secrets(data_dir.path(), Some("x/alms.db"), &canonical).is_some());
     }
 
     #[cfg(unix)]
@@ -604,7 +655,7 @@ mod tests {
         std::fs::write(real.path().join("secrets.json"), "{}").unwrap();
 
         assert_eq!(
-            unread_legacy_secrets(&alias, &real.path().join("secrets.json")),
+            unread_legacy_secrets(&alias, None, &real.path().join("secrets.json")),
             None
         );
     }

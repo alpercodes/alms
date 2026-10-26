@@ -15,7 +15,8 @@
 //!
 //! # Where a key change lands (#145)
 //!
-//! A gateway loads `.alms/secrets.json` **once, at boot** and every key
+//! A gateway loads its secrets file (beside the database,
+//! `.alms/secrets.json` by default) **once, at boot** and every key
 //! lookup afterwards reads that in-memory store. So a `set` that only
 //! writes the file leaves an already-running daemon unaware of a key the
 //! operator can plainly see on disk, and the next run still fails to
@@ -120,18 +121,49 @@ pub(crate) fn secrets_file(config: &AlmsConfig) -> PathBuf {
     config.server.secrets_path()
 }
 
+/// Run one `alms auth` subcommand against `secrets_path` (from
+/// [`secrets_file`]), then name a `{data_dir}/secrets.json` this
+/// configuration does not read.
+///
+/// The notice comes *after* the command, whether it succeeded or not, so it
+/// describes the files as the command left them. Printed first, it told an
+/// operator with only the old file to `mv` it into place, and then `set`
+/// created the canonical file: the `mv` would have overwritten the key just
+/// set (Tim B1 on #188).
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run(
+    cmd: AuthCommands,
+    json: bool,
+    url: &str,
+    config: &AlmsConfig,
+    secrets_path: &Path,
+    client: &reqwest::Client,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> anyhow::Result<()> {
+    let result = match cmd {
+        AuthCommands::Set { provider, key } => {
+            auth_set(client, url, secrets_path, &provider, key, json, out).await
+        }
+        AuthCommands::List => auth_list(secrets_path, json),
+        AuthCommands::Remove { provider } => {
+            auth_remove(client, url, secrets_path, &provider, json, out).await
+        }
+    };
+    warn_unread_legacy_secrets(config, secrets_path, err);
+    result
+}
+
 /// Name a `{data_dir}/secrets.json` that this configuration no longer reads
 /// (#170), on every `alms auth` command until the operator moves or deletes
 /// it. It is never read or merged here; see
 /// [`secrets::unread_legacy_secrets`] for why.
-pub(crate) fn warn_unread_legacy_secrets(
-    config: &AlmsConfig,
-    secrets_path: &Path,
-    err: &mut dyn Write,
-) {
-    if let Some(legacy) =
-        secrets::unread_legacy_secrets(Path::new(&config.server.data_dir), secrets_path)
-    {
+fn warn_unread_legacy_secrets(config: &AlmsConfig, secrets_path: &Path, err: &mut dyn Write) {
+    if let Some(legacy) = secrets::unread_legacy_secrets(
+        Path::new(&config.server.data_dir),
+        Some(&config.server.db_path()),
+        secrets_path,
+    ) {
         let _ = writeln!(
             err,
             "Warning: {}",
@@ -717,6 +749,50 @@ mod tests {
         assert!(err.to_string().contains("Unknown provider"));
     }
 
+    /// The removal twin of
+    /// [`test_auth_set_fails_loudly_when_the_gateway_rejects_the_key`]: the
+    /// refusal names the file, and the file keeps the key.
+    #[tokio::test]
+    async fn test_auth_remove_fails_loudly_when_the_gateway_rejects_the_removal() {
+        let server = MockServer::start().await;
+        health_ok().mount(&server).await;
+        Mock::given(method("DELETE"))
+            .and(path("/auth/keys/openrouter"))
+            .respond_with(ResponseTemplate::new(401).set_body_json(serde_json::json!({
+                "error": { "code": "UNAUTHORIZED", "message": "Missing or invalid Bearer token" },
+            })))
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        secrets_of(&file_in(&dir))
+            .set_key("openrouter", TEST_KEY)
+            .unwrap();
+        let err = auth_remove(
+            &api_client().unwrap(),
+            &server.uri(),
+            &file_in(&dir),
+            "openrouter",
+            false,
+            &mut std::io::sink(),
+        )
+        .await
+        .expect_err("a rejected removal must not be reported as done");
+
+        let msg = err.to_string();
+        assert!(msg.contains("401"), "got {msg:?}");
+        assert!(msg.contains("ALMS_AUTH_TOKEN"), "got {msg:?}");
+        assert!(
+            msg.contains(&file_in(&dir).display().to_string()),
+            "the refusal must name the file this command would edit; got {msg:?}"
+        );
+        assert_eq!(
+            secrets_of(&file_in(&dir)).get_key("openrouter"),
+            Some(TEST_KEY),
+            "a rejected removal must leave the file alone"
+        );
+    }
+
     // -- #170: one secrets file for the CLI and the gateway -------------------
 
     /// A `{data_dir}/secrets.json` that an earlier `alms auth` wrote while
@@ -755,6 +831,10 @@ mod tests {
             "{warning}"
         );
         assert!(warning.contains("mv \""), "{warning}");
+        assert!(
+            warning.contains("stop the gateway, then move it"),
+            "{warning}"
+        );
 
         // Both exist: no merge, and no move that would overwrite the live file.
         secrets_of(&canonical)
@@ -766,6 +846,89 @@ mod tests {
 
         // The default layout: the data dir's file *is* the canonical one.
         assert_eq!(warning_for(&legacy), "");
+    }
+
+    /// The notice describes the files as the command left them (Tim B1 on
+    /// #188). With only the old file on disk, `set` creates the canonical
+    /// one; a notice printed first would say `mv` the old file into place,
+    /// which would overwrite the key just set.
+    #[tokio::test]
+    async fn the_notice_follows_the_command_so_it_never_says_mv_over_a_key_just_set() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let db_dir = tempfile::tempdir().unwrap();
+        let legacy = data_dir.path().join("secrets.json");
+        let canonical = file_in(&db_dir);
+        secrets_of(&legacy)
+            .set_key("openrouter", "sk-written-by-an-old-cli")
+            .unwrap();
+        let config = AlmsConfig {
+            server: alms_core::config::ServerConfig {
+                data_dir: data_dir.path().display().to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        run(
+            AuthCommands::Set {
+                provider: "anthropic".into(),
+                key: Some(TEST_KEY.into()),
+            },
+            false,
+            &dead_url(),
+            &config,
+            &canonical,
+            &api_client().unwrap(),
+            &mut out,
+            &mut err,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(secrets_of(&canonical).get_key("anthropic"), Some(TEST_KEY));
+        let notice = String::from_utf8(err).unwrap();
+        assert!(notice.contains(&legacy.display().to_string()), "{notice}");
+        assert!(notice.contains("not merged"), "{notice}");
+        assert!(!notice.contains("mv \""), "{notice}");
+    }
+
+    /// A failed command still gets the notice: the operator is most likely
+    /// to be looking for a missing key then.
+    #[tokio::test]
+    async fn the_notice_is_printed_when_the_command_fails() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let db_dir = tempfile::tempdir().unwrap();
+        let legacy = data_dir.path().join("secrets.json");
+        secrets_of(&legacy)
+            .set_key("openrouter", "sk-written-by-an-old-cli")
+            .unwrap();
+        let config = AlmsConfig {
+            server: alms_core::config::ServerConfig {
+                data_dir: data_dir.path().display().to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let mut err = Vec::new();
+        run(
+            AuthCommands::Remove {
+                provider: "not-a-provider".into(),
+            },
+            false,
+            &dead_url(),
+            &config,
+            &file_in(&db_dir),
+            &api_client().unwrap(),
+            &mut std::io::sink(),
+            &mut err,
+        )
+        .await
+        .expect_err("unknown providers must be rejected");
+
+        let notice = String::from_utf8(err).unwrap();
+        assert!(notice.contains(&legacy.display().to_string()), "{notice}");
     }
 
     /// Set by [`cli_and_gateway_resolve_the_same_secrets_file`] for its
@@ -792,9 +955,15 @@ mod tests {
         )
         .expect("a gateway must build from this config");
         let gateway_file = gateway.secrets_handle().read().path().to_path_buf();
+        let mut notice = Vec::new();
+        warn_unread_legacy_secrets(&config, &cli, &mut notice);
         println!(
             "{PARITY_LINE}{}",
-            serde_json::json!({ "cli": cli, "gateway": gateway_file })
+            serde_json::json!({
+                "cli": cli,
+                "gateway": gateway_file,
+                "notice": String::from_utf8(notice).unwrap(),
+            })
         );
     }
 
@@ -815,6 +984,9 @@ mod tests {
             env: Vec<(&'static str, String)>,
             toml: Option<String>,
             expected: PathBuf,
+            /// `Some(reported)`: write `{data_dir}/secrets.json` first, and
+            /// expect the `alms auth` notice to name it (or not).
+            legacy: Option<bool>,
         }
 
         let scratch = tempfile::tempdir().unwrap();
@@ -831,18 +1003,22 @@ mod tests {
                 env: vec![],
                 toml: None,
                 expected: PathBuf::from(".alms/secrets.json"),
+                legacy: None,
             },
             Case {
                 name: "ALMS_DB_PATH outside the data dir",
                 env: vec![("ALMS_DB_PATH", db_elsewhere.clone())],
                 toml: None,
                 expected: elsewhere.join("secrets.json"),
+                // The configuration the notice is for.
+                legacy: Some(true),
             },
             Case {
                 name: "ALMS_DATA_DIR",
                 env: vec![("ALMS_DATA_DIR", data.display().to_string())],
                 toml: None,
                 expected: data.join("secrets.json"),
+                legacy: None,
             },
             Case {
                 name: "ALMS_DATA_DIR and ALMS_DB_PATH",
@@ -852,6 +1028,7 @@ mod tests {
                 ],
                 toml: None,
                 expected: elsewhere.join("secrets.json"),
+                legacy: None,
             },
             Case {
                 name: "data_dir in alms.toml",
@@ -861,12 +1038,24 @@ mod tests {
                     data.display().to_string()
                 )),
                 expected: data.join("secrets.json"),
+                legacy: None,
             },
             Case {
                 name: "relative ALMS_DB_PATH",
                 env: vec![("ALMS_DB_PATH", "state/alms.db".to_string())],
                 toml: None,
                 expected: PathBuf::from("state/secrets.json"),
+                legacy: None,
+            },
+            // No database directory, so the file lands in the cwd for both
+            // processes (`docs/config.md`). The usual `.alms/secrets.json`
+            // is not reported as one to move there (Tim S1 on #188).
+            Case {
+                name: "in-memory ALMS_DB_PATH",
+                env: vec![("ALMS_DB_PATH", ":memory:".to_string())],
+                toml: None,
+                expected: PathBuf::from("secrets.json"),
+                legacy: Some(false),
             },
         ];
 
@@ -880,6 +1069,12 @@ mod tests {
             if let Some(toml) = &case.toml {
                 std::fs::write(cwd.join("alms.toml"), toml).unwrap();
             }
+            // Every case with a legacy file uses the default data dir.
+            let legacy_file = cwd.join(".alms").join("secrets.json");
+            if case.legacy.is_some() {
+                std::fs::create_dir_all(cwd.join(".alms")).unwrap();
+                std::fs::write(&legacy_file, r#"{"api_keys":{}}"#).unwrap();
+            }
 
             let mut child = std::process::Command::new(std::env::current_exe().unwrap());
             child
@@ -891,6 +1086,9 @@ mod tests {
                     "--test-threads=1",
                 ])
                 .current_dir(&cwd)
+                // On Windows this also drops `SystemRoot`, which some
+                // system calls need. Unverified (CI is Linux): pass it
+                // through under `cfg(windows)` if a Windows run fails here.
                 .env_clear()
                 // No `~/.config/alms/config.toml` from the real home.
                 .env("HOME", &root)
@@ -926,6 +1124,17 @@ mod tests {
                 cwd.join(&case.expected),
                 "[{name}] the secrets file lives beside the database"
             );
+            let notice = resolved["notice"].as_str().unwrap();
+            let names_legacy = notice.contains(&legacy_file.display().to_string());
+            match case.legacy {
+                Some(reported) => assert_eq!(
+                    names_legacy,
+                    reported,
+                    "[{name}] notice for {}: {notice:?}",
+                    legacy_file.display()
+                ),
+                None => assert_eq!(notice, "", "[{name}] no legacy file to report"),
+            }
         }
     }
 }

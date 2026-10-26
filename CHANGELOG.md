@@ -107,15 +107,17 @@ Each item below changes behaviour for a deployment that has not set the knob exp
   used `{data_dir}/secrets.json` instead, so under `ALMS_DB_PATH` a key set from the CLI
   went to a file no gateway read, and `list` showed that file rather than the gateway's
   (#170). The two now resolve one path. Deployments without `ALMS_DB_PATH`, or with it
-  inside the data directory, are unaffected, and no gateway reads a different file than
-  before.
+  pointing directly into the data directory, are unaffected, and no gateway reads a
+  different file than before.
 
   **After upgrading**, `alms auth list` under such a configuration shows the gateway's keys.
   A `{data_dir}/secrets.json` left by an earlier `alms auth` is not read, moved or merged —
   a key no gateway has used would otherwise take precedence over the one it uses. The
-  gateway at boot and every `alms auth` command name the file until it is dealt with:
-  move it beside the database if nothing is there yet, or set any key you still need with
-  `alms auth set` and delete it.
+  gateway at boot and every `alms auth` command (after it runs) name the file until it is
+  dealt with: if nothing is beside the database yet, stop the gateway and move it there (a
+  running gateway reads the file only at boot, and its next key change overwrites it);
+  otherwise set any key you still need with `alms auth set` and delete it. Under
+  `ALMS_DB_PATH=:memory:` nothing is reported.
 
 ### Multi-agent and DM
 
