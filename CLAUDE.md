@@ -7,7 +7,7 @@ ALMS (Agent Loop Management System) is a Rust-based multi-agent coordination pla
 ## Build & Run
 
 ```bash
-# Requires Rust nightly (auto-installed from rust-toolchain.toml)
+# Builds on stable; the nightly pinned in rust-toolchain.toml (auto-installed by rustup) is for reproducible fmt/clippy
 # On Windows, cargo is at ~/.cargo/bin/cargo — use `export PATH="$HOME/.cargo/bin:$PATH"` if needed
 # Frontend requires the exact Node/npm versions in .node-version and package.json
 npm ci

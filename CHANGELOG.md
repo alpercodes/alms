@@ -272,6 +272,9 @@ Each item below changes behaviour for a deployment that has not set the knob exp
   `rust-toolchain.toml` will not be used (no `rustup`, or a `cargo` that does not report a
   nightly, such as another one ahead of rustup's on `PATH`), writes its errors to stderr,
   and exits 2 on an unknown argument instead of starting a build (`--help` prints usage).
+- `README.md`, `CONTRIBUTING.md` and `CLAUDE.md` no longer say ALMS requires Rust nightly:
+  it builds on current stable, and the nightly in `rust-toolchain.toml` is pinned for
+  development, to keep `cargo fmt` and `cargo clippy` reproducible.
 
 ### Frontend
 

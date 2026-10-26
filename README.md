@@ -39,9 +39,11 @@ collects the review threads it produced.
 
 ## Quick start
 
-Requires Rust nightly, installed automatically from `rust-toolchain.toml` by
-[rustup](https://rustup.rs). A `cargo` from a package manager (`brew install rust`, apt)
-ignores that file and builds with whatever compiler it ships.
+ALMS builds on stable Rust. The repo pins a dated nightly in `rust-toolchain.toml` for
+development, so `cargo fmt` and `cargo clippy` give the same verdict locally as in CI;
+[rustup](https://rustup.rs) installs it automatically. A `cargo` from a package manager
+(`brew install rust`, apt) ignores that file and builds with whatever compiler it ships: a
+current stable works, an older one may be too old for this workspace.
 
 Three commands. Everything else — the provider key, agents, sessions, the first message —
 happens in the browser.
