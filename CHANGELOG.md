@@ -106,6 +106,9 @@ Each item below changes behaviour for a deployment that has not set the knob exp
   contain capital letters (resolved case-insensitively).
 - An interrupted DM end is recorded rather than left invisible to the agent, and the turn
   after a DM ends can no longer message the peer whose conversation just closed.
+  The record waits on the agent's run queue, so it can no longer land between a running
+  turn's tool call and its result. A history split that way was rejected by providers on
+  every later turn. During shutdown the record is dropped.
 - A cancelled or failed DM no longer starts a run on the recipient's session.
 - Agent-to-agent tool descriptions now state which relationship each tool creates and no
   longer teach agents to poll.

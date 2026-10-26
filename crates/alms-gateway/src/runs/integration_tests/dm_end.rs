@@ -2886,3 +2886,120 @@ async fn peer_dm_turn_still_folds_its_current_peer() {
 
     shutdown_token.cancel();
 }
+
+// ---------------------------------------------------------------------------
+// Interrupted-end record placement (#190's R1, applied to the #1300 record)
+// ---------------------------------------------------------------------------
+
+/// A `ConversationEnded` trigger for an interrupted end, routed to bob's
+/// web-chat: alice's DM run died, and bob started the DM from that chat.
+fn interrupted_end_trigger(bob_id: AgentId, web_session_id: SessionId) -> RunTrigger {
+    RunTrigger {
+        agent_id: bob_id,
+        session_id: web_session_id,
+        input: "[DM conversation ended] Agent alice ended the conversation.".to_string(),
+        source: MessageSource::ConversationEnded {
+            from_agent: AgentId::new(),
+            from_name: "alice".to_string(),
+            reason: ConversationEndReason::Errored {
+                message: "LLM rate limited".to_string(),
+                interrupted: true,
+            },
+            self_notification: false,
+            source_session_id: Some(web_session_id),
+        },
+        context_id: "web".to_string(),
+    }
+}
+
+/// The #1300 record is model-visible (`kind: "error"`). It targets the
+/// session bob started the DM from, and bob can still be mid-tool there,
+/// because `send_message` does not wait for the peer. Appending the record
+/// straight away put a user turn between bob's tool call and its result,
+/// which providers reject. It must wait for bob's turn, as #190's
+/// `subagent_cancelled` record does, and the next context build must keep
+/// the tool pair intact.
+#[tokio::test]
+async fn interrupted_end_record_waits_for_the_target_turn() {
+    use super::subagents::{ParentTurnMidTool, context_with_intact_tool_pair};
+
+    let (state, shutdown_token, _cr, _tr, _dr) = test_app_state();
+    let bob_id = AgentId::new();
+    let web_session_id = state.session_manager.get_or_create(bob_id, "web").id;
+    let bob_turn = ParentTurnMidTool::start(&state, bob_id, web_session_id).await;
+
+    let (test_tx, test_rx) = mpsc::channel(8);
+    test_tx
+        .send(interrupted_end_trigger(bob_id, web_session_id))
+        .await
+        .unwrap();
+    drop(test_tx);
+    crate::runs::notifications::run_trigger_loop(test_rx, state.clone()).await;
+
+    assert!(
+        state
+            .run_manager
+            .list_by_session(web_session_id, 10)
+            .is_empty(),
+        "#1258: an interrupted end starts no run"
+    );
+    assert!(
+        super::marker_of_type(&state, web_session_id, "dm_end_interrupted").is_none(),
+        "the record must wait for bob's turn, not be appended mid-tool"
+    );
+
+    bob_turn.finish(&state, web_session_id).await;
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while super::marker_of_type(&state, web_session_id, "dm_end_interrupted").is_none() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the queued interrupted-end record must land after bob's turn");
+
+    let (messages, call) = context_with_intact_tool_pair(&state, web_session_id);
+    let record = messages
+        .iter()
+        .position(|message| {
+            message.role == "user"
+                && message
+                    .content
+                    .as_deref()
+                    .is_some_and(|content| content.contains("[Error] Your DM conversation"))
+        })
+        .expect("the record reaches the model");
+    assert!(record > call + 1, "the record lands after the tool pair");
+
+    shutdown_token.cancel();
+}
+
+/// Shutdown closes the agent queue while in-flight runs may still be saving
+/// tool results, so the record can't be appended directly then either. It
+/// is dropped, as the run it stands in for would be, and the tool call is
+/// still directly followed by its result.
+#[tokio::test]
+async fn interrupted_end_record_at_shutdown_never_splits_the_tool_pair() {
+    use super::subagents::{ParentTurnMidTool, context_with_intact_tool_pair};
+
+    let (state, shutdown_token, _cr, _tr, _dr) = test_app_state();
+    let bob_id = AgentId::new();
+    let web_session_id = state.session_manager.get_or_create(bob_id, "web").id;
+    let bob_turn = ParentTurnMidTool::start(&state, bob_id, web_session_id).await;
+
+    shutdown_token.cancel();
+    let (test_tx, test_rx) = mpsc::channel(8);
+    test_tx
+        .send(interrupted_end_trigger(bob_id, web_session_id))
+        .await
+        .unwrap();
+    drop(test_tx);
+    crate::runs::notifications::run_trigger_loop(test_rx, state.clone()).await;
+
+    bob_turn.finish(&state, web_session_id).await;
+
+    context_with_intact_tool_pair(&state, web_session_id);
+    assert!(
+        super::marker_of_type(&state, web_session_id, "dm_end_interrupted").is_none(),
+        "with the queue closed, the record is dropped"
+    );
+}
