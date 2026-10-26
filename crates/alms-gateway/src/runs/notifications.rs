@@ -2526,6 +2526,58 @@ fn persist_interrupted_end_marker(
     );
 }
 
+/// Queue [`persist_interrupted_end_marker`] on the target agent's queue, at
+/// low priority, as the suppressed run would have been queued.
+///
+/// The record is model-visible, and its target can have a live run: it is
+/// the session the agent started the DM from, and `send_message` does not
+/// wait for the peer, so the agent may be mid-tool there when the peer's DM
+/// run dies. Appended straight away, the record would sit between that
+/// run's persisted tool call and the call's result, and every later context
+/// build would carry a user turn inside the tool pair, which providers
+/// reject. This is the shape of Tim's R1 on PR #190, fixed the same way as
+/// [`queue_cancelled_subagent_record`]: the per-agent worker runs one item
+/// at a time, so the record lands after any active run.
+///
+/// When the queue is closed (shutdown), the record is dropped with a WARN,
+/// the way [`enqueue_triggered_run`] drops its run. Appending it directly
+/// then is not safe either, because the active run may still be saving tool
+/// results from inside its work item (Tim's R2 on PR #190).
+///
+/// Waits for queue capacity like [`enqueue_triggered_run`]; call it only from
+/// a dedicated producer task, never from inside a queue work item.
+async fn queue_interrupted_end_marker(
+    state: &AppState,
+    agent_id: alms_core::AgentId,
+    record: InterruptedEndRecord,
+) {
+    let session_id = record.session_id;
+    let reservation = match state.agent_queue.reserve(agent_id).await {
+        Ok(reservation) => reservation,
+        Err(error) => {
+            warn!(
+                ?error,
+                agent_id = %agent_id.0,
+                session_id = %session_id.0,
+                "Agent queue closed; interrupted-end record dropped (#1300)"
+            );
+            return;
+        }
+    };
+    let state_clone = state.clone();
+    if let Err(error) = reservation.submit_low(Box::pin(async move {
+        persist_interrupted_end_marker(&state_clone, agent_id, &record);
+    })) {
+        // The same shutdown race, after admission.
+        warn!(
+            ?error,
+            agent_id = %agent_id.0,
+            session_id = %session_id.0,
+            "Agent queue closed; interrupted-end record dropped (#1300)"
+        );
+    }
+}
+
 /// Processes `RunTrigger` events from the `MessageBus`.
 ///
 /// Each trigger creates a run on the target agent's session, reusing the
@@ -2873,9 +2925,11 @@ pub(crate) async fn run_trigger_loop(
         // copy on the session the run would have used. Written after the
         // web-chat forward above so that, on the routings where both land in
         // the same chat, the operator's banner reads first and this record
-        // reads as its follow-up rather than the other way round.
+        // reads as its follow-up rather than the other way round. Queued, not
+        // written in place: the target may be mid-tool (see
+        // `queue_interrupted_end_marker`).
         if let Some(record) = interrupted_end {
-            persist_interrupted_end_marker(&state, agent_id, &record);
+            queue_interrupted_end_marker(&state, agent_id, record).await;
         }
 
         for target in run_targets {
@@ -3596,7 +3650,19 @@ mod tests {
             "#1258: an interrupted end must still start no run"
         );
 
-        let history = state.session_manager.get_history(notif_session_id).unwrap();
+        // The record is queued on the agent's queue, not written in place.
+        let history = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let Ok(history) = state.session_manager.get_history(notif_session_id)
+                    && !history.is_empty()
+                {
+                    return history;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the queued interrupted-end record must land");
         assert_eq!(
             history.len(),
             1,
@@ -3829,6 +3895,23 @@ mod tests {
                 .is_empty(),
             "a completed end keeps its notification run"
         );
+        // An interrupted-end record is queued at low priority, not written
+        // in place, so drain the agent's low-priority work first; otherwise
+        // the row below could pass before a wrongly queued record lands.
+        let (drained_tx, drained_rx) = tokio::sync::oneshot::channel();
+        state
+            .agent_queue
+            .reserve(agent_id)
+            .await
+            .expect("queue admission")
+            .submit_low(Box::pin(async move {
+                let _ = drained_tx.send(());
+            }))
+            .expect("queue dispatch");
+        tokio::time::timeout(std::time::Duration::from_secs(10), drained_rx)
+            .await
+            .expect("the agent's queued work drains")
+            .expect("the barrier runs");
         let recorded = state
             .session_manager
             .get_history(notif_session_id)

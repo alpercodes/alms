@@ -337,13 +337,13 @@ fn append_message(
 /// and R2 on PR #190). The tool call `call_1` is persisted, as the runtime
 /// persists it before it executes the tool, and the parent agent's queue is
 /// held by a started work item, as the run executing the tool holds it.
-struct ParentTurnMidTool {
+pub(super) struct ParentTurnMidTool {
     release: oneshot::Sender<()>,
     returned: oneshot::Receiver<()>,
 }
 
 impl ParentTurnMidTool {
-    async fn start(
+    pub(super) async fn start(
         state: &crate::server::AppState,
         agent_id: AgentId,
         session_id: SessionId,
@@ -387,7 +387,7 @@ impl ParentTurnMidTool {
 
     /// The parent run saves the tool's result, as its cancel arm does, and
     /// its work item returns.
-    async fn finish(self, state: &crate::server::AppState, session_id: SessionId) {
+    pub(super) async fn finish(self, state: &crate::server::AppState, session_id: SessionId) {
         append_message(
             state,
             session_id,
@@ -405,7 +405,7 @@ impl ParentTurnMidTool {
 
 /// Build the parent's next context and assert that `call_1`'s result follows
 /// the call directly. Returns the context and the call's index in it.
-fn context_with_intact_tool_pair(
+pub(super) fn context_with_intact_tool_pair(
     state: &crate::server::AppState,
     session_id: SessionId,
 ) -> (Vec<alms_runtime::LlmMessage>, usize) {
