@@ -101,7 +101,7 @@ alms-cli → alms-gateway → alms-runtime      → alms-core
 
 - **Formatting**: `cargo fmt` — enforced in CI, zero tolerance
 - **Linting**: `cargo clippy -- -D warnings` — all warnings are errors
-- **Edition**: Rust 2024 (nightly)
+- **Edition**: Rust 2024 (stable since 1.85); the toolchain is the nightly pinned in `rust-toolchain.toml`
 - **Error handling**: `thiserror` for library errors, `anyhow` in CLI/binary code
 - **Logging**: `tracing` with structured fields and `#[instrument]` macros
 - **Concurrency**: `tokio` async runtime, `DashMap` for concurrent maps, `parking_lot` for locks
