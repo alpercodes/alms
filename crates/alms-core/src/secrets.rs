@@ -423,9 +423,9 @@ impl SecretsStore {
 
     /// Resolve an API key for a provider from the secrets store only.
     ///
-    /// The store only. The caller consults `[llm.providers.<p>].api_key_env`
-    /// / `api_key` after it (`LlmClient::resolve_key_from` per run,
-    /// `Gateway::new` at boot).
+    /// The caller consults `[llm.providers.<p>].api_key_env` / `api_key`
+    /// after it (`LlmClient::resolve_key_from` per run, `Gateway::new` at
+    /// boot).
     ///
     /// Each provider is independent — no cross-provider alias fallback.
     /// OpenAI and OpenRouter are separate services with incompatible keys.
