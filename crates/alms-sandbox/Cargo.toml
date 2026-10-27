@@ -28,6 +28,8 @@ uuid.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 landlock = "0.4"
+# `EOPNOTSUPP` for the Landlock `pre_exec` closure's not-enforced error.
+libc = "0.2"
 
 [dev-dependencies]
 # Pulls tokio's `test-util` feature (paused-clock test helpers) — see #1158.

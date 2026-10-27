@@ -18,8 +18,10 @@
 //!   (pre-#866 behaviour, byte-identical wire shape).
 //! - `summary_provider = Some(p)` → re-target the cloned client at `p` via
 //!   `with_provider_and_secrets` (or `with_provider` when no secrets are
-//!   available, preserving the existing key — this matches the coordinator's
-//!   pre-extraction branch).
+//!   available — this matches the coordinator's pre-extraction branch).
+//!   `with_provider` keeps the existing key only when `p` is the agent's own
+//!   provider; on a switch, which is what a `summary_provider` usually is,
+//!   it clears the key.
 //! - If `summary_model = Some(m)`, apply it last so the explicit override
 //!   wins regardless of any `[llm.providers.<p>].model` field.
 //! - **#871 leak guard**: if `summary_model = None` AND `apply_provider`
@@ -51,9 +53,10 @@ use tracing::warn;
 /// - `Some(s)` — re-target via `with_provider_and_secrets(provider, s)` so the
 ///   API key is re-resolved from the secrets store (with `[llm.providers.<p>]`
 ///   `api_key_env` / `api_key` fallback inside `with_provider_and_secrets`).
-/// - `None` — re-target via `with_provider(provider)`, preserving the existing
-///   key. Currently only the coordinator subagent path can hit this branch
-///   (when no `Arc<RwLock<SecretsStore>>` was threaded down).
+/// - `None` — re-target via `with_provider(provider)`, which keeps the
+///   existing key on the same provider and clears it on a switch. Currently
+///   only the coordinator subagent path can hit this branch (when no
+///   `Arc<RwLock<SecretsStore>>` was threaded down).
 pub fn build_summary_client(
     llm: &LlmClient,
     summary_provider: Option<&str>,
@@ -238,6 +241,27 @@ mod tests {
             "leak guard must fire on the no-secrets branch too"
         );
         assert_ne!(summary.default_model(), agent_model);
+    }
+
+    /// A `summary_provider` naming the agent's own provider re-resolves the
+    /// key, so a key removed from the store is not sent on the summary
+    /// call either. The fixture's client carries `sk-ant-runtime`, as the
+    /// gateway's shared client carries the key it booted with.
+    #[test]
+    fn same_provider_summary_drops_a_key_removed_from_the_store() {
+        let (llm, mut secrets) = fixtures(None, None);
+        let with_key =
+            build_summary_client(&llm, Some("anthropic"), Some("claude-x"), Some(&secrets));
+        assert!(with_key.has_api_key());
+
+        assert!(secrets.remove_key("anthropic").unwrap());
+        let summary =
+            build_summary_client(&llm, Some("anthropic"), Some("claude-x"), Some(&secrets));
+        assert_eq!(summary.provider(), "anthropic");
+        assert!(
+            !summary.has_api_key(),
+            "the summary client must not carry a key the store no longer has"
+        );
     }
 
     /// `secrets = None` happy path: with explicit `summary_model`, the model

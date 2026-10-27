@@ -846,18 +846,53 @@ impl LlmClient {
         self
     }
 
+    /// Resolve `provider`'s API key from the sources a key lives in while
+    /// the gateway runs: the `SecretsStore` first (`alms auth set`,
+    /// `PUT /auth/keys`), then the `[llm.providers.<provider>]` entry's
+    /// `api_key_env` / `api_key`. `None` means the provider has no key.
+    ///
+    /// The one resolver behind [`Self::with_secrets`] and
+    /// [`Self::with_provider_and_secrets`], so the two cannot disagree
+    /// about where a key comes from.
+    fn resolve_key_from(
+        &self,
+        provider: &str,
+        secrets: &alms_core::secrets::SecretsStore,
+    ) -> Option<String> {
+        secrets.resolve_key(provider).or_else(|| {
+            self.config
+                .providers
+                .get(provider)
+                .and_then(|e| e.resolve_api_key())
+        })
+    }
+
     /// Internal: switch provider, base_url, and resolve API key.
     ///
-    /// When switching to a new provider and no key is found, the existing
-    /// (wrong-provider) key is cleared to prevent silent 401 errors from
-    /// sending one provider's key to another.
+    /// With a secrets store, the key is whatever [`Self::resolve_key_from`]
+    /// finds for `provider` now. A miss clears the key, on the same
+    /// provider as well as on a switch. On a switch that keeps one
+    /// provider's key from going to another (a confusing 401); on the
+    /// same provider it is how a key removed with `DELETE
+    /// /auth/keys/{provider}` stops being sent. The client this is called
+    /// on is a clone of a shared base that resolved its key earlier (at
+    /// boot or on a `PATCH /settings`), so keeping the key it carries
+    /// would keep sending a removed key until a restart.
+    ///
+    /// Without one (`secrets` is `None`, from [`Self::with_provider`])
+    /// nothing is resolved: the existing key is kept on the same provider
+    /// and cleared on a switch.
     ///
     /// The provider's `base_url` / `auth_scheme` / `quirks` are sourced
     /// from the `providers` map if an entry is present (the normal path
     /// for configs loaded via `AlmsConfig::load`), falling back to the
     /// hardcoded sugar-name defaults otherwise (used by standalone tests
     /// that construct a bare `LlmConfig`).
-    fn apply_provider(&mut self, provider: &str, resolve_key: impl FnOnce(&str) -> Option<String>) {
+    fn apply_provider(
+        &mut self,
+        provider: &str,
+        secrets: Option<&alms_core::secrets::SecretsStore>,
+    ) {
         let old_provider = self.config.provider.clone();
 
         if let Some(entry) = self.config.providers.get(provider).cloned() {
@@ -906,23 +941,51 @@ impl LlmClient {
             self.config.quirks = alms_core::config::ProviderQuirks::default();
         }
 
-        if let Some(key) = resolve_key(provider) {
-            self.config.api_key = key;
-        } else if old_provider != provider && !self.config.api_key.is_empty() {
-            // Switching providers but no key found for the new one.
-            // Clear the old key to avoid sending the wrong provider's
-            // credentials (which would cause confusing 401 errors).
-            warn!(
-                old_provider = %old_provider,
-                new_provider = %provider,
-                "Provider changed but no API key found — clearing stale key"
-            );
-            self.config.api_key.clear();
-        } else if self.config.api_key.is_empty() {
-            warn!(
-                "No API key found for provider '{}' — requests will fail",
-                provider
-            );
+        let resolved = secrets.map(|s| self.resolve_key_from(provider, s));
+        match resolved {
+            Some(Some(key)) => self.config.api_key = key,
+            Some(None) => {
+                if self.config.api_key.is_empty() {
+                    warn!(
+                        "No API key found for provider '{}' — requests will fail",
+                        provider
+                    );
+                } else if old_provider != provider {
+                    warn!(
+                        old_provider = %old_provider,
+                        new_provider = %provider,
+                        "Provider changed but no API key found — clearing stale key"
+                    );
+                } else {
+                    info!(
+                        provider = %provider,
+                        "No API key in the secrets store or the provider entry — \
+                         clearing the key this client carried, so a removed key \
+                         is not sent"
+                    );
+                }
+                self.config.api_key.clear();
+            }
+            None if old_provider != provider && !self.config.api_key.is_empty() => {
+                // Switching providers with nothing to resolve the new
+                // provider's key from. Clear the old key to avoid sending
+                // the wrong provider's credentials (which would cause
+                // confusing 401 errors).
+                warn!(
+                    old_provider = %old_provider,
+                    new_provider = %provider,
+                    "Provider changed but no API key found — clearing stale key"
+                );
+                self.config.api_key.clear();
+            }
+            None => {
+                if self.config.api_key.is_empty() {
+                    warn!(
+                        "No API key found for provider '{}' — requests will fail",
+                        provider
+                    );
+                }
+            }
         }
 
         self.config.provider = provider.to_string();
@@ -930,12 +993,11 @@ impl LlmClient {
 
     /// Override the LLM provider without resolving a new API key.
     ///
-    /// The existing API key is preserved. Callers should prefer
-    /// `with_provider_and_secrets` when a secrets store is available.
+    /// The existing API key is kept on the same provider and cleared on a
+    /// switch. Callers should prefer `with_provider_and_secrets` when a
+    /// secrets store is available.
     pub fn with_provider(mut self, provider: &str) -> Self {
-        // No key resolver — keeps the existing key. Callers should prefer
-        // `with_provider_and_secrets` when a secrets store is available.
-        self.apply_provider(provider, |_| None);
+        self.apply_provider(provider, None);
         self
     }
 
@@ -944,39 +1006,61 @@ impl LlmClient {
     /// Key resolution consults the secrets store first, then the
     /// `[llm.providers.<provider>]` entry's `api_key_env` / `api_key`
     /// fields as a fallback. This lets configs declare an env-var-backed
-    /// key inline without also running `alms auth set`.
+    /// key inline without also running `alms auth set`. When neither has
+    /// a key the client ends up with none, even when `provider` is the
+    /// provider it is already on (see [`Self::apply_provider`]).
     pub fn with_provider_and_secrets(
         mut self,
         provider: &str,
         secrets: &alms_core::secrets::SecretsStore,
     ) -> Self {
-        let entry_key = self
-            .config
-            .providers
-            .get(provider)
-            .and_then(|e| e.resolve_api_key());
-        self.apply_provider(provider, |p| secrets.resolve_key(p).or(entry_key));
+        self.apply_provider(provider, Some(secrets));
         self
     }
 
-    /// Re-resolve the API key from a `SecretsStore` for the current provider.
+    /// Re-resolve the API key for the current provider.
     ///
-    /// Unlike `with_provider_and_secrets`, this does NOT change the provider or
-    /// base URL — it only refreshes the API key from the secrets store.
+    /// Unlike `with_provider_and_secrets`, this does NOT change the provider
+    /// or base URL. The key comes from the same sources, in the same order:
+    /// the secrets store, then the `[llm.providers.<provider>]` entry's
+    /// `api_key_env` / `api_key`. When neither has one, the key this client
+    /// carries is cleared rather than kept.
+    ///
+    /// Every run path calls this (or `with_provider_and_secrets`) on a
+    /// clone of a shared base client whose key was resolved earlier: at
+    /// boot, on a `PATCH /settings` of the server-default pair, or on a
+    /// persisted provider switch at boot. Keeping that key on a miss is
+    /// what let a key removed with `DELETE /auth/keys/{provider}` go on
+    /// being sent until a restart. In the gateway a key the client carries
+    /// can only have come from one of these two sources (core
+    /// `LlmConfig.api_key` is `#[serde(skip)]` and nothing assigns it), so
+    /// clearing on a miss drops nothing an operator still has configured.
     pub fn with_secrets(mut self, secrets: &alms_core::secrets::SecretsStore) -> Self {
-        if let Some(key) = secrets.resolve_key(&self.config.provider) {
-            debug!(
-                provider = %self.config.provider,
-                key_len = key.len(),
-                "API key resolved from secrets store"
-            );
-            self.config.api_key = key;
-        } else {
-            debug!(
-                provider = %self.config.provider,
-                existing_key_empty = self.config.api_key.is_empty(),
-                "No key found in secrets store for provider, keeping existing"
-            );
+        let provider = self.config.provider.clone();
+        match self.resolve_key_from(&provider, secrets) {
+            Some(key) => {
+                debug!(
+                    provider = %provider,
+                    key_len = key.len(),
+                    "API key resolved for provider"
+                );
+                self.config.api_key = key;
+            }
+            None if self.config.api_key.is_empty() => {
+                debug!(
+                    provider = %provider,
+                    "No API key in the secrets store or the provider entry"
+                );
+            }
+            None => {
+                info!(
+                    provider = %provider,
+                    "No API key in the secrets store or the provider entry — \
+                     clearing the key this client carried, so a removed key \
+                     is not sent"
+                );
+                self.config.api_key.clear();
+            }
         }
         self
     }
@@ -1302,8 +1386,11 @@ mod tests {
         assert_eq!(updated.api_key(), "new-runtime-key");
     }
 
+    /// A key the store no longer has, and no provider entry supplies, is
+    /// not kept. The client here stands in for the gateway's shared base
+    /// client, which carries whatever key was resolved at boot.
     #[test]
-    fn test_with_secrets_no_key_keeps_existing() {
+    fn test_with_secrets_no_key_clears_existing() {
         let config = LlmConfig {
             provider: "openrouter".into(),
             api_key: "original-key".into(),
@@ -1316,8 +1403,132 @@ mod tests {
         let updated = client.with_secrets(&secrets);
         // Provider unchanged
         assert_eq!(updated.provider(), "openrouter");
-        // Key must remain the original value when secrets store has nothing
-        assert_eq!(updated.api_key(), "original-key");
+        assert_eq!(
+            updated.api_key(),
+            "",
+            "with no key in the store or the provider entry, the key the \
+             client carried must be cleared, not sent"
+        );
+        assert!(!updated.has_api_key());
+    }
+
+    /// The revocation sequence the gateway runs: a base client is built
+    /// with the store's key (`Gateway::new`), the key is removed from the
+    /// store (`DELETE /auth/keys/{provider}`), and the next run clones the
+    /// same base client and re-resolves.
+    #[test]
+    fn test_with_secrets_drops_a_key_removed_from_the_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut secrets =
+            alms_core::secrets::SecretsStore::load(dir.path().join("secrets.json")).unwrap();
+        secrets.set_key("openrouter", "sk-or-revoked").unwrap();
+
+        let base = LlmClient::new(LlmConfig {
+            provider: "openrouter".into(),
+            api_key: secrets.resolve_key("openrouter").unwrap(),
+            ..LlmConfig::default()
+        })
+        .unwrap();
+        assert_eq!(
+            base.clone().with_secrets(&secrets).api_key(),
+            "sk-or-revoked"
+        );
+
+        assert!(secrets.remove_key("openrouter").unwrap());
+        assert_eq!(
+            base.api_key(),
+            "sk-or-revoked",
+            "precondition: the shared base client still carries the key"
+        );
+        assert_eq!(base.with_secrets(&secrets).api_key(), "");
+    }
+
+    /// `with_secrets` falls back to the provider entry the way
+    /// `with_provider_and_secrets` does, so removing a store key falls back
+    /// to an `alms.toml` key instead of to nothing.
+    #[test]
+    fn test_with_secrets_falls_back_to_provider_entry_api_key() {
+        let mut providers = std::collections::BTreeMap::new();
+        providers.insert(
+            "openrouter".into(),
+            alms_core::config::ProviderEntry {
+                kind: alms_core::config::ProviderKind::OpenAiCompatible,
+                base_url: "https://openrouter.ai/api/v1".into(),
+                api_key_env: None,
+                api_key: Some("sk-or-from-entry".into()),
+                model: None,
+                auth_scheme: AuthScheme::Bearer,
+                quirks: alms_core::config::ProviderQuirks::default(),
+            },
+        );
+        let client = LlmClient::new(LlmConfig {
+            provider: "openrouter".into(),
+            api_key: "sk-or-stale-store-key".into(),
+            providers,
+            ..LlmConfig::default()
+        })
+        .unwrap();
+
+        let empty = alms_core::secrets::SecretsStore::empty();
+        assert_eq!(
+            client.clone().with_secrets(&empty).api_key(),
+            "sk-or-from-entry"
+        );
+
+        // A store key still wins over the entry.
+        let dir = tempfile::tempdir().unwrap();
+        let mut secrets =
+            alms_core::secrets::SecretsStore::load(dir.path().join("secrets.json")).unwrap();
+        secrets.set_key("openrouter", "sk-or-from-store").unwrap();
+        assert_eq!(client.with_secrets(&secrets).api_key(), "sk-or-from-store");
+    }
+
+    /// `api_key_env` variant of the fallback above.
+    #[test]
+    fn test_with_secrets_falls_back_to_provider_entry_api_key_env() {
+        const ENV_VAR: &str = "ALMS_TEST_WITH_SECRETS_OPENROUTER_KEY";
+        // Serialised against every other env-touching test in this mod;
+        // see `test_with_provider_and_secrets_resolves_provider_entry_api_key_env`.
+        let _env_guard = ENV_LOCK.lock().unwrap();
+        // SAFETY: the lock above serialises the write against every other
+        // test in this mod that touches the process env.
+        unsafe { std::env::set_var(ENV_VAR, "sk-or-from-env") };
+
+        let mut providers = std::collections::BTreeMap::new();
+        providers.insert(
+            "openrouter".into(),
+            alms_core::config::ProviderEntry {
+                kind: alms_core::config::ProviderKind::OpenAiCompatible,
+                base_url: "https://openrouter.ai/api/v1".into(),
+                api_key_env: Some(ENV_VAR.into()),
+                api_key: None,
+                model: None,
+                auth_scheme: AuthScheme::Bearer,
+                quirks: alms_core::config::ProviderQuirks::default(),
+            },
+        );
+        let client = LlmClient::new(LlmConfig {
+            provider: "openrouter".into(),
+            api_key: "sk-or-stale-store-key".into(),
+            providers,
+            ..LlmConfig::default()
+        })
+        .unwrap();
+
+        let updated = client
+            .clone()
+            .with_secrets(&alms_core::secrets::SecretsStore::empty());
+
+        // A store key still wins over `api_key_env` (docs/config.md order):
+        // a key set through `PUT /auth/keys` must beat an env-configured one.
+        let dir = tempfile::tempdir().unwrap();
+        let mut secrets =
+            alms_core::secrets::SecretsStore::load(dir.path().join("secrets.json")).unwrap();
+        secrets.set_key("openrouter", "sk-or-from-store").unwrap();
+        let from_store = client.with_secrets(&secrets);
+        unsafe { std::env::remove_var(ENV_VAR) };
+        assert_eq!(updated.api_key(), "sk-or-from-env");
+        assert_eq!(from_store.api_key(), "sk-or-from-store");
     }
 
     #[test]
@@ -1392,10 +1603,12 @@ mod tests {
         assert_eq!(switched.api_key(), "");
     }
 
+    /// Re-applying the SAME provider with a resolver that finds no key
+    /// clears the key the client carried. This is the path a per-agent or
+    /// summary override naming the server-default provider takes, so it
+    /// must drop a removed key just as `with_secrets` does.
     #[test]
-    fn test_same_provider_no_key_keeps_existing() {
-        // When re-applying the SAME provider and no key is found,
-        // the existing key should be preserved (not cleared).
+    fn test_same_provider_no_key_clears_existing() {
         let config = LlmConfig {
             provider: "openrouter".into(),
             api_key: "sk-or-existing".into(),
@@ -1407,7 +1620,53 @@ mod tests {
         let secrets = alms_core::secrets::SecretsStore::empty();
         let same = client.with_provider_and_secrets("openrouter", &secrets);
         assert_eq!(same.provider(), "openrouter");
-        // Same provider, no new key found -- existing key preserved
+        assert_eq!(same.api_key(), "");
+    }
+
+    /// Same-provider miss in the store with a key in the provider entry:
+    /// the entry key, not the one the client carried.
+    #[test]
+    fn test_same_provider_no_store_key_resolves_provider_entry_api_key() {
+        let mut providers = std::collections::BTreeMap::new();
+        providers.insert(
+            "openrouter".into(),
+            alms_core::config::ProviderEntry {
+                kind: alms_core::config::ProviderKind::OpenAiCompatible,
+                base_url: "https://openrouter.ai/api/v1".into(),
+                api_key_env: None,
+                api_key: Some("sk-or-from-entry".into()),
+                model: None,
+                auth_scheme: AuthScheme::Bearer,
+                quirks: alms_core::config::ProviderQuirks::default(),
+            },
+        );
+        let client = LlmClient::new(LlmConfig {
+            provider: "openrouter".into(),
+            api_key: "sk-or-stale-store-key".into(),
+            providers,
+            ..LlmConfig::default()
+        })
+        .unwrap();
+
+        let same = client
+            .with_provider_and_secrets("openrouter", &alms_core::secrets::SecretsStore::empty());
+        assert_eq!(same.api_key(), "sk-or-from-entry");
+    }
+
+    /// `with_provider` has no resolver, so it has nothing to say a key was
+    /// removed: it keeps the key on the same provider. Only the resolver
+    /// paths changed.
+    #[test]
+    fn test_with_provider_same_provider_keeps_existing_key() {
+        let client = LlmClient::new(LlmConfig {
+            provider: "openrouter".into(),
+            api_key: "sk-or-existing".into(),
+            base_url: "https://openrouter.ai/api/v1".into(),
+            ..LlmConfig::default()
+        })
+        .unwrap();
+
+        let same = client.with_provider("openrouter");
         assert_eq!(same.api_key(), "sk-or-existing");
     }
 

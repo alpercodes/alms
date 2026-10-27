@@ -756,9 +756,9 @@ impl ProviderEntry {
     ///    unset values fall through to the next source.
     /// 2. `api_key` — the literal key baked into the entry.
     ///
-    /// Returns `None` if no source produced a value. The gateway is
-    /// expected to consult its `SecretsStore` as a final fallback, since
-    /// key material stored via `alms auth set` lives there.
+    /// Returns `None` if no source produced a value. The gateway consults
+    /// its `SecretsStore` before this, so a key stored with `alms auth set`
+    /// or `PUT /auth/keys` wins over both sources here (`docs/config.md`).
     pub fn resolve_api_key(&self) -> Option<String> {
         if let Some(var) = &self.api_key_env
             && let Ok(val) = std::env::var(var)

@@ -119,6 +119,27 @@ Each item below changes behaviour for a deployment that has not set the knob exp
   otherwise set any key you still need with `alms auth set` and delete it. Under
   `ALMS_DB_PATH=:memory:` nothing is reported.
 
+### Security
+
+- **Removing an LLM provider's API key now takes effect on the next run.**
+  `DELETE /auth/keys/{provider}` (which the Settings modal's remove button and
+  `alms auth remove` against a running gateway both call) took the key out of the secrets
+  store, but runs went on sending it until a restart. The gateway builds its LLM client
+  with the store's key at boot, and again when `PATCH /settings` changes the
+  server-default model or provider. Each run re-resolved the key from the store but kept
+  the client's key when the store had none. That covered every run on the server-default
+  provider: `POST /runs`, DM, notification, job and subagent runs, and Telegram, plus
+  per-agent and summary overrides that name the same provider. Each run now takes the key
+  from the store, then from the provider entry's `api_key_env` / `api_key`, and sends none
+  if neither has one. This applies to the LLM provider keys. The `telegram` bot token is
+  read once, when the gateway starts its Telegram channel, so setting or removing it takes
+  effect at the next restart. **After upgrading**, removing a stored key from a running
+  gateway switches that provider to the entry's `api_key_env` / `api_key` from its next
+  run, or to no key (the provider then rejects the request), until a key is set again. A
+  run already in progress keeps the key it started with for the rest of its turns and its
+  post-run summary, as does a background subagent already running. Cancel them to stop
+  sooner, and revoke a leaked key at the provider.
+
 ### Multi-agent and DM
 
 - Two spellings of one subagent name now resolve to a single subagent, and agent names may
@@ -243,11 +264,26 @@ Each item below changes behaviour for a deployment that has not set the knob exp
   `workspace_read` first, or `mode: "append"`, still works. No production code path
   creates an `episodic:` session today, so this changes what *would* happen, not what does.
 - Docs correction, no behaviour change: on a Linux kernel without Landlock, a sandboxed
-  `shell` refuses every command (each fails to start with
-  `Invalid argument (os error 22)`); it does not run unsandboxed, as the README and
-  `docs/security-model.md` § 4.4 said. `[tools].shell_policy` is not inert:
-  `"unrestricted"` takes Landlock and the cwd check off every agent's `shell`. And
-  `ALMS_MASTER_KEY` is out of an agent's reach only where `shell` has a filesystem boundary.
+  `shell` refuses every command (each fails to start; the error is in the next entry); it
+  does not run unsandboxed, as the README and `docs/security-model.md` § 4.4 said.
+  `[tools].shell_policy` is not inert: `"unrestricted"` takes Landlock and the cwd check
+  off every agent's `shell`. And `ALMS_MASTER_KEY` is out of an agent's reach only where
+  `shell` has a filesystem boundary.
+- On a Linux kernel without Landlock, a sandboxed `shell` command now fails to start with
+  `Operation not supported (os error 95)` instead of `Invalid argument (os error 22)`, so
+  the error points at the missing Landlock. Update any alert or grep keyed on
+  `os error 22` for this case. The sandbox's other setup failures (a sandbox root the child
+  cannot open, a rule that cannot be added) now report the errno of the system call that
+  failed, such as `No such file or directory (os error 2)` for a sandbox root that does not
+  exist; only a failure with no system call behind it still reads
+  `Invalid argument (os error 22)`.
+  The child also no longer writes a line to stderr before it exits. Nothing read that line,
+  and the write took std's process-wide stderr lock after `fork`: had another thread held
+  that lock at that moment (the daemon logs through stderr), the child, and the `spawn()`
+  waiting for it, could have blocked for good. That hang is from reading `std` and was not
+  reproduced. A Linux test reaches the not-enforced branch through a seccomp filter that
+  fails the Landlock system calls as a kernel without Landlock does; it has not been run on
+  a kernel that lacks Landlock.
 - Docs correction, no behaviour change: a Telegram-triggered run never picks up a
   `PATCH /settings` change or `settings.json`, not even after a restart; it uses the
   `alms.toml` and environment values the daemon booted with. The Settings modal,
@@ -258,7 +294,10 @@ Each item below changes behaviour for a deployment that has not set the knob exp
   `[tools].max_output_bytes`, so no run enforces them, though the docs and the Settings
   modal described them as limits. `[tools].sandbox_root` does not set where a gateway run
   is rooted, and an empty value lifts no restriction; a non-empty value that cannot be
-  resolved makes runs fail.
+  resolved makes runs fail. That run error no longer calls `sandbox_root = ""` a way "to
+  explicitly opt out of sandboxing"; it now says to fix the path or set
+  `sandbox_root = ""`, and that in gateway runs `sandbox_root` never moves the filesystem
+  boundary, empty or not.
 
 ### LLM errors
 
@@ -295,7 +334,10 @@ Each item below changes behaviour for a deployment that has not set the knob exp
   then *rejects* the change (a missing `ALMS_AUTH_TOKEN`, say) is now an error rather
   than a silent fall back to the file, and the error names that file. `--json` output
   gains a `target` field (`"gateway"` or `"secrets_file"`); `alms auth list` is unchanged
-  and still reads the file.
+  and still reads the file. The `telegram` bot token is the exception: the gateway reads it
+  once, when it starts its Telegram channel, so a `telegram` change sent to a running
+  gateway is stored but takes effect at its next restart. Both commands now say so for
+  `telegram` instead of "no restart needed".
 - `./install.sh` installs into `$CARGO_HOME/bin` when `CARGO_HOME` is set, instead of
   always `~/.cargo/bin`. An `alms` earlier on `PATH` — such as one a previous run left in
   `~/.cargo/bin` — is now reported rather than silently shadowing the new install. The

@@ -855,15 +855,7 @@ impl Gateway {
                     // server-default model / provider pair reach those runs
                     // immediately and Telegram runs never, not even after a
                     // daemon restart. Documented in `docs/api.md` § 10.2.
-                    let resolved = {
-                        let secrets_guard = self.secrets.read();
-                        match crate::configuration::resolve_agent_config(
-                            agent_id,
-                            &self.session_manager,
-                            &self.config.agent_config,
-                            &self.llm,
-                            Some(&secrets_guard),
-                        ) {
+                    let resolved = match self.resolve_telegram_run_config(agent_id) {
                         Ok(r) => r,
                         Err(e) => {
                             // #863: per-agent provider override with no model
@@ -877,7 +869,6 @@ impl Gateway {
                                 e
                             );
                             continue;
-                        }
                         }
                     };
                     // Bootstrap detection: first-time agents get the
@@ -1155,6 +1146,32 @@ impl Gateway {
     /// handler, so updates made through AppState's copy are visible here too.
     pub fn secrets_handle(&self) -> Arc<RwLock<alms_core::secrets::SecretsStore>> {
         Arc::clone(&self.secrets)
+    }
+
+    /// Resolve the config a Telegram-triggered run of `agent_id` uses: this
+    /// `Gateway`'s own boot-time `AgentConfig` and `LlmClient` (not
+    /// `AppState`'s live ones; see the loop in
+    /// [`Self::run_until_shutdown`]), with the API key re-resolved from the
+    /// secrets store `AppState` shares. A key set or removed through
+    /// `/auth/keys` therefore applies to the next Telegram run.
+    ///
+    /// A method rather than inline in the loop so the call can be tested
+    /// without a Telegram bot.
+    pub(crate) fn resolve_telegram_run_config(
+        &self,
+        agent_id: AgentId,
+    ) -> Result<
+        crate::configuration::ResolvedAgentConfig,
+        crate::configuration::ResolveAgentConfigError,
+    > {
+        let secrets_guard = self.secrets.read();
+        crate::configuration::resolve_agent_config(
+            agent_id,
+            &self.session_manager,
+            &self.config.agent_config,
+            &self.llm,
+            Some(&secrets_guard),
+        )
     }
 }
 

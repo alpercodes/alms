@@ -264,10 +264,10 @@ impl AppState {
     /// switch: `SecretsStore` first, then the provider entry's
     /// `api_key_env` / `api_key`. **That choice of call is load-bearing
     /// and pinned here, at the call site.** `with_provider` would compile,
-    /// read almost identically, and hand `apply_provider` a `|_| None`
-    /// resolver — which on a provider *change* takes the "clearing stale
-    /// key" branch and leaves the shared client with an empty API key, so
-    /// every subsequent default-agent run 401s with nothing tying the
+    /// read almost identically, and call `apply_provider` with no secrets
+    /// store (`None`) — which on a provider *change* takes the "clearing
+    /// stale key" branch and leaves the shared client with an empty API
+    /// key, so every subsequent default-agent run 401s with nothing tying the
     /// failure back to the PATCH. That bug shipped once already on the
     /// sibling boot path (#1081). A test of `with_provider_and_secrets`
     /// cannot catch it — the mutation is here, not in the callee — so
@@ -391,12 +391,13 @@ impl AppState {
             // provider switches). With the old `with_provider`-only
             // call, `apply_provider` would clear the previous provider's
             // key and never repopulate from the env-based provider entry
-            // — and later `resolve_agent_config` only re-checks
-            // `SecretsStore` via `with_secrets`, never the provider
-            // entry's env/static fields. Deployments configuring keys
-            // exclusively via `[llm.providers.<name>].api_key_env` (no
-            // `alms auth set`) would silently boot with an empty key
-            // after a persisted provider switch.
+            // — and `resolve_agent_config`'s `with_secrets` then
+            // re-checked only `SecretsStore`, never the provider entry's
+            // env/static fields (it falls back to them too now).
+            // Deployments configuring keys exclusively via
+            // `[llm.providers.<name>].api_key_env` (no `alms auth set`)
+            // would silently boot with an empty key after a persisted
+            // provider switch.
             //
             // Codex follow-up on #1081 (P1, Finding 6): an operator who
             // PATCH-switched the server-default provider to `anthropic`
