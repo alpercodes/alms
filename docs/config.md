@@ -103,6 +103,10 @@ The `SecretsStore` is loaded once, at boot — so a key written to the file behi
 
 A gateway that answers gets the change over HTTP, so it applies to the next run with no restart (except `telegram`, whose bot token takes effect at the next restart, as above); it persists the change to its own secrets file, so the key survives a restart too. When nothing answers, both commands edit the file directly, exactly as before. If something answers but not with a 2xx, the file is written and the command warns that a gateway running there would need a restart.
 
+The secrets file is `secrets.json` beside the SQLite database: `{data_dir}/secrets.json` by default, or in the directory of `ALMS_DB_PATH` when that is set. `alms auth` and the gateway resolve it the same way, so for one configuration they use one file (#170). Before v0.2.4, `alms auth` used `{data_dir}/secrets.json` even with `ALMS_DB_PATH` set — a file the gateway never read. If one is left over, the gateway (at boot) and every `alms auth` command (after it runs, so the notice reflects what the command did) name it. It is not read, moved or merged: if the gateway has no secrets file beside the database yet, stop the gateway and move it there (a running gateway reads the file only at boot, and its next key change overwrites the file); otherwise set any key you still need with `alms auth set` and delete it.
+
+With `ALMS_DB_PATH=:memory:` there is no database directory, so the secrets file is `./secrets.json` in the current working directory: `alms auth set` with no gateway running writes it there, and nothing is reported about `{data_dir}/secrets.json`. Keep it out of version control.
+
 > Note: the `alms auth set <name> <key>` command currently restricts `<name>` to a fixed list (`openai`, `anthropic`, `gemini`, `openrouter`, `telegram`). For any *other* provider you declare in `[llm.providers.<name>]`, use `api_key_env` instead. Extending `alms auth set` to accept arbitrary provider names is tracked separately.
 
 ### Auth schemes
@@ -238,7 +242,23 @@ Anthropic supports up to four cache breakpoints per request. ALMS uses two:
 1. **Last tool definition** — caches the entire tools array.
 2. **Trailing system content block** — caches the full prefix through system + workspace + (optional episodic summary), because Anthropic caches up to *and including* each marker.
 
-Workspace files (personality / goals / memories) and episodic summaries are already concatenated into the system string by `agent::context::assemble_system_prompt` and `ContextBuilder::build_with_perspective` before the adapter sees them. Splitting them into separate content blocks for independent breakpoints would require a runtime refactor; the single trailing-system marker gives the full prefix a cache entry today with no per-turn churn.
+Workspace files (personality / goals / memories / user) and episodic summaries are already
+assembled into the system string by the budget-aware runtime context builder and
+`ContextBuilder::build_with_perspective` before the adapter sees them. Personality, goals
+and user files stay whole unless the run budget requires head windows; memories keeps a
+tail window of up to 4000 bytes. A window the run budget forces emits a
+`WORKSPACE_PROMPT_TRUNCATED` run warning; the fixed memories window alone does not.
+Within a run, every tool-loop rebuild reuses the run's workspace budget, so an
+unchanged workspace is byte-identical on every request. Across runs, the budget is rounded
+down to a whole KiB and charges an episodic block at `run_summary_budget` rather than
+its length. It changes only when a turn's input moves it across a 1 KiB step (a step is
+roughly 2 KB of input), when the episodic block appears or disappears (the first time
+the agent has a summary of another session, say), or when the configuration changes.
+While it stays on the same step, an unchanged workspace is byte-identical from run to
+run. At the default `max_input_tokens` the budget is well over 100 KB, so
+files of a normal size are injected whole on every run. Splitting these values into
+separate content blocks for independent breakpoints would require a runtime refactor;
+the single trailing-system marker gives the full prefix a cache entry today.
 
 ### Scope
 

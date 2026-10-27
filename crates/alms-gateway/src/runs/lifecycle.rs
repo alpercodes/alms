@@ -396,12 +396,20 @@ pub async fn cancel_run(
 /// call and its chip renders *Failed* rather than *Cancelled* — the parent
 /// run itself is NOT cancelled either way.
 ///
+/// This is the operator's direct cancel, so a background subagent's
+/// `Cancelled` completion is marked `cancelled_directly` and the parent gets
+/// a notification run saying the cancel was deliberate and not to redo the
+/// work unprompted (#121, PR #190). A subagent stopped by its parent run, or
+/// by `DELETE /jobs` teardown, starts no run.
+///
 /// Returns 200 `{"status":"cancelling"}` when a live subagent was found and
 /// its token fired (cancellation completes asynchronously — the terminal
 /// events above follow on the streams), or 404 `NO_LIVE_SUBAGENT` when the
 /// session has no live subagent (unknown session, or the subagent already
-/// reached a terminal state — e.g. a double-click racing natural
-/// completion).
+/// reached a terminal state). A request racing the subagent's own finish can
+/// still return 200 after its result was selected but before the handle
+/// status flips; the result already selected (Completed or Failed) stands,
+/// and for a background subagent its normal notification run still starts.
 #[instrument(level = "info", skip(state), fields(session_id = %session_id.0))]
 pub async fn cancel_subagent(
     State(state): State<AppState>,

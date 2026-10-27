@@ -15,7 +15,8 @@
 //!
 //! # Where a key change lands (#145)
 //!
-//! A gateway loads `.alms/secrets.json` **once, at boot** and every key
+//! A gateway loads its secrets file (beside the database,
+//! `.alms/secrets.json` by default) **once, at boot** and every key
 //! lookup afterwards reads that in-memory store. So a `set` that only
 //! writes the file leaves an already-running daemon unaware of a key the
 //! operator can plainly see on disk, and the next run still fails to
@@ -34,12 +35,21 @@
 //! script reads to tell a live change from a file write — is asserted by
 //! tests rather than merely exercised. `list` is untouched by #145 and
 //! still prints directly.
+//!
+//! # Which file (#170)
+//!
+//! The file these commands read and write is [`secrets_file`], the same one
+//! a gateway started with the same configuration loads: beside the
+//! database, so it follows `ALMS_DB_PATH`. Before #170 this module used
+//! `{data_dir}/secrets.json` while the gateway used the database's
+//! directory, and `ALMS_DB_PATH` split them.
 
 use crate::helpers::{GatewayProbe, api_delete_json, api_put, probe_gateway};
+use alms_core::AlmsConfig;
 use alms_core::secrets::{self, SecretsStore, VALID_PROVIDERS};
 use clap::Subcommand;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[derive(Subcommand, Debug)]
 pub(crate) enum AuthCommands {
@@ -122,22 +132,86 @@ fn running_gateway_outcome(provider: &str, url: &str) -> String {
     }
 }
 
+/// The secrets file `alms auth` reads and writes for `config`.
+///
+/// `main` resolves it here, and the #170 parity test compares it with the
+/// file a gateway built from the same config loads. It is
+/// [`ServerConfig::secrets_path`](alms_core::config::ServerConfig::secrets_path):
+/// beside the database.
+pub(crate) fn secrets_file(config: &AlmsConfig) -> PathBuf {
+    config.server.secrets_path()
+}
+
+/// Run one `alms auth` subcommand against `secrets_path` (from
+/// [`secrets_file`]), then name a `{data_dir}/secrets.json` this
+/// configuration does not read.
+///
+/// The notice comes *after* the command, whether it succeeded or not, so it
+/// describes the files as the command left them. Printed first, it told an
+/// operator with only the old file to `mv` it into place, and then `set`
+/// created the canonical file: the `mv` would have overwritten the key just
+/// set (Tim B1 on #188).
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run(
+    cmd: AuthCommands,
+    json: bool,
+    url: &str,
+    config: &AlmsConfig,
+    secrets_path: &Path,
+    client: &reqwest::Client,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> anyhow::Result<()> {
+    let result = match cmd {
+        AuthCommands::Set { provider, key } => {
+            auth_set(client, url, secrets_path, &provider, key, json, out).await
+        }
+        AuthCommands::List => auth_list(secrets_path, json),
+        AuthCommands::Remove { provider } => {
+            auth_remove(client, url, secrets_path, &provider, json, out).await
+        }
+    };
+    warn_unread_legacy_secrets(config, secrets_path, err);
+    result
+}
+
+/// Name a `{data_dir}/secrets.json` that this configuration no longer reads
+/// (#170), on every `alms auth` command until the operator moves or deletes
+/// it. It is never read or merged here; see
+/// [`secrets::unread_legacy_secrets`] for why.
+fn warn_unread_legacy_secrets(config: &AlmsConfig, secrets_path: &Path, err: &mut dyn Write) {
+    if let Some(legacy) = secrets::unread_legacy_secrets(
+        Path::new(&config.server.data_dir),
+        Some(&config.server.db_path()),
+        secrets_path,
+    ) {
+        let _ = writeln!(
+            err,
+            "Warning: {}",
+            secrets::unread_legacy_secrets_message(&legacy, secrets_path)
+        );
+    }
+}
+
 /// Refusing to fall back to the file after a running gateway rejects the
 /// change: writing it then would restore exactly the silent failure #145
 /// is about.
 ///
-/// Deliberately names no path. The CLI resolves the secrets file from
-/// `data_dir` while the gateway resolves it from its `db_path`
-/// (`secrets_path_from_db`), and `ALMS_DB_PATH` can point those at
-/// different files — so "the file the gateway reads" is a claim this
-/// command is not in a position to make (Tim S1 on #168).
-fn gateway_refused(url: &str, err: &anyhow::Error) -> anyhow::Error {
+/// Names `secrets_path`, the file this command would have written. #168 left
+/// the path out because the CLI and the gateway resolved the file from
+/// different inputs, which `ALMS_DB_PATH` could split (Tim S1 on #168). Both
+/// now use `ServerConfig::secrets_path` (#170), so the path printed is the
+/// one a gateway started with this same configuration reads. The message
+/// says "this same configuration" on purpose: the gateway at `url` may have
+/// been started from somewhere else.
+fn gateway_refused(url: &str, err: &anyhow::Error, secrets_path: &Path) -> anyhow::Error {
     anyhow::anyhow!(
         "The gateway at {url} rejected the change: {err}\n\
-         Nothing was written: a gateway reads its secrets file once, at boot, so writing that \
-         file now would look like success and change nothing while this one runs.\n\
+         Nothing was written to {path}: a gateway reads its secrets file once, at boot, so \
+         writing that file now would look like success and change nothing while this one runs.\n\
          Set ALMS_AUTH_TOKEN if the gateway requires a token, or stop the gateway and run this \
-         again."
+         again to write {path}, the file a gateway started with this same configuration reads.",
+        path = secrets_path.display()
     )
 }
 
@@ -155,7 +229,7 @@ fn reject_unknown_provider(provider: &str) -> anyhow::Result<()> {
 pub(crate) async fn auth_set(
     client: &reqwest::Client,
     url: &str,
-    data_dir: &Path,
+    secrets_path: &Path,
     provider: &str,
     key: Option<String>,
     json: bool,
@@ -188,13 +262,13 @@ pub(crate) async fn auth_set(
             let body = serde_json::json!({ "provider": provider, "key": key });
             api_put(client, url, "auth/keys", &body)
                 .await
-                .map_err(|e| gateway_refused(url, &e))?;
+                .map_err(|e| gateway_refused(url, &e, secrets_path))?;
         }
         KeyTarget::SecretsFile { warning } => {
             if let Some(warning) = warning {
                 eprintln!("{warning}");
             }
-            let mut store = SecretsStore::load(secrets::secrets_path(data_dir))?;
+            let mut store = SecretsStore::load(secrets_path)?;
             store.set_key(provider, &key)?;
         }
     }
@@ -225,8 +299,8 @@ pub(crate) async fn auth_set(
     Ok(())
 }
 
-pub(crate) fn auth_list(data_dir: &Path, json: bool) -> anyhow::Result<()> {
-    let store = SecretsStore::load(secrets::secrets_path(data_dir))?;
+pub(crate) fn auth_list(secrets_path: &Path, json: bool) -> anyhow::Result<()> {
+    let store = SecretsStore::load(secrets_path)?;
 
     if json {
         let entries: Vec<serde_json::Value> = VALID_PROVIDERS
@@ -262,7 +336,7 @@ pub(crate) fn auth_list(data_dir: &Path, json: bool) -> anyhow::Result<()> {
 pub(crate) async fn auth_remove(
     client: &reqwest::Client,
     url: &str,
-    data_dir: &Path,
+    secrets_path: &Path,
     provider: &str,
     json: bool,
     out: &mut dyn Write,
@@ -278,7 +352,7 @@ pub(crate) async fn auth_remove(
         KeyTarget::RunningGateway => {
             let resp = api_delete_json(client, url, &format!("auth/keys/{provider}"))
                 .await
-                .map_err(|e| gateway_refused(url, &e))?;
+                .map_err(|e| gateway_refused(url, &e, secrets_path))?;
             // The handler always sends `removed`, so this default is
             // defensive only — and of the two, `false` under-claims where
             // `true` would report a revocation nothing confirmed. On a
@@ -292,7 +366,7 @@ pub(crate) async fn auth_remove(
             if let Some(warning) = warning {
                 eprintln!("{warning}");
             }
-            let mut store = SecretsStore::load(secrets::secrets_path(data_dir))?;
+            let mut store = SecretsStore::load(secrets_path)?;
             store.remove_key(provider)?
         }
     };
@@ -364,8 +438,13 @@ mod tests {
         format!("http://127.0.0.1:{port}")
     }
 
-    fn secrets_of(dir: &Path) -> SecretsStore {
-        SecretsStore::load(secrets::secrets_path(dir)).unwrap()
+    /// The secrets file inside a test's temp dir.
+    fn file_in(dir: &tempfile::TempDir) -> PathBuf {
+        dir.path().join("secrets.json")
+    }
+
+    fn secrets_of(file: &Path) -> SecretsStore {
+        SecretsStore::load(file).unwrap()
     }
 
     fn as_json(out: Vec<u8>) -> serde_json::Value {
@@ -422,7 +501,7 @@ mod tests {
         auth_set(
             &api_client().unwrap(),
             &server.uri(),
-            dir.path(),
+            &file_in(&dir),
             "openrouter",
             Some(TEST_KEY.into()),
             false,
@@ -442,7 +521,7 @@ mod tests {
         assert_eq!(body["key"], TEST_KEY);
 
         assert!(
-            !secrets::secrets_path(dir.path()).exists(),
+            !file_in(&dir).exists(),
             "the daemon persists the key itself; a second writer would race its next save"
         );
     }
@@ -454,7 +533,7 @@ mod tests {
         auth_set(
             &api_client().unwrap(),
             &dead_url(),
-            dir.path(),
+            &file_in(&dir),
             "openrouter",
             Some(TEST_KEY.into()),
             false,
@@ -463,7 +542,10 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(secrets_of(dir.path()).get_key("openrouter"), Some(TEST_KEY));
+        assert_eq!(
+            secrets_of(&file_in(&dir)).get_key("openrouter"),
+            Some(TEST_KEY)
+        );
     }
 
     /// `target` is the one field a script needs to tell a live change from
@@ -479,7 +561,7 @@ mod tests {
         auth_set(
             &api_client().unwrap(),
             &server.uri(),
-            dir.path(),
+            &file_in(&dir),
             "openrouter",
             Some(TEST_KEY.into()),
             true,
@@ -501,7 +583,7 @@ mod tests {
         auth_set(
             &api_client().unwrap(),
             &dead_url(),
-            dir.path(),
+            &file_in(&dir),
             "openrouter",
             Some(TEST_KEY.into()),
             true,
@@ -525,7 +607,7 @@ mod tests {
         auth_set(
             &api_client().unwrap(),
             &server.uri(),
-            dir.path(),
+            &file_in(&dir),
             "openrouter",
             Some(TEST_KEY.into()),
             false,
@@ -540,7 +622,7 @@ mod tests {
         auth_set(
             &api_client().unwrap(),
             &server.uri(),
-            dir.path(),
+            &file_in(&dir),
             "telegram",
             Some(TEST_KEY.into()),
             false,
@@ -553,6 +635,10 @@ mod tests {
         assert!(
             text.contains("Restart the gateway to apply it"),
             "got {text:?}"
+        );
+        assert!(
+            !file_in(&dir).exists(),
+            "the running gateway persists a telegram change itself; the CLI writes no file"
         );
     }
 
@@ -573,7 +659,7 @@ mod tests {
         auth_remove(
             &api_client().unwrap(),
             &server.uri(),
-            dir.path(),
+            &file_in(&dir),
             "telegram",
             false,
             &mut out,
@@ -590,6 +676,10 @@ mod tests {
         assert!(
             text.contains("Restart the gateway to apply it"),
             "got {text:?}"
+        );
+        assert!(
+            !file_in(&dir).exists(),
+            "the running gateway persists a telegram change itself; the CLI writes no file"
         );
     }
 
@@ -613,7 +703,7 @@ mod tests {
         let err = auth_set(
             &api_client().unwrap(),
             &server.uri(),
-            dir.path(),
+            &file_in(&dir),
             "openrouter",
             Some(TEST_KEY.into()),
             false,
@@ -625,8 +715,14 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("401"), "got {msg:?}");
         assert!(msg.contains("ALMS_AUTH_TOKEN"), "got {msg:?}");
+        // #170: with one resolver the file can be named again; #168 left it
+        // out because the CLI and the gateway could disagree about it.
         assert!(
-            !secrets::secrets_path(dir.path()).exists(),
+            msg.contains(&file_in(&dir).display().to_string()),
+            "the refusal must name the file this command would write; got {msg:?}"
+        );
+        assert!(
+            !file_in(&dir).exists(),
             "a rejected key must not be written to a file nothing will re-read"
         );
     }
@@ -648,7 +744,7 @@ mod tests {
 
         // The daemon owns the file in this state; the CLI must not touch it.
         let dir = tempfile::tempdir().unwrap();
-        secrets_of(dir.path())
+        secrets_of(&file_in(&dir))
             .set_key("openrouter", "sk-daemon-owned-key")
             .unwrap();
 
@@ -656,7 +752,7 @@ mod tests {
         auth_remove(
             &api_client().unwrap(),
             &server.uri(),
-            dir.path(),
+            &file_in(&dir),
             "openrouter",
             true,
             &mut out,
@@ -676,7 +772,7 @@ mod tests {
         assert_eq!(body["target"], "gateway");
         assert_eq!(body["removed"], true);
         assert_eq!(
-            secrets_of(dir.path()).get_key("openrouter"),
+            secrets_of(&file_in(&dir)).get_key("openrouter"),
             Some("sk-daemon-owned-key"),
             "the gateway rewrites the file from its own map; the CLI must not race it"
         );
@@ -703,7 +799,7 @@ mod tests {
         auth_remove(
             &api_client().unwrap(),
             &server.uri(),
-            dir.path(),
+            &file_in(&dir),
             "openrouter",
             true,
             &mut out,
@@ -721,7 +817,7 @@ mod tests {
     #[tokio::test]
     async fn test_auth_remove_edits_the_file_when_no_gateway_answers() {
         let dir = tempfile::tempdir().unwrap();
-        secrets_of(dir.path())
+        secrets_of(&file_in(&dir))
             .set_key("openrouter", TEST_KEY)
             .unwrap();
 
@@ -729,7 +825,7 @@ mod tests {
         auth_remove(
             &api_client().unwrap(),
             &dead_url(),
-            dir.path(),
+            &file_in(&dir),
             "openrouter",
             true,
             &mut out,
@@ -740,7 +836,7 @@ mod tests {
         let body = as_json(out);
         assert_eq!(body["target"], "secrets_file");
         assert_eq!(body["removed"], true);
-        assert_eq!(secrets_of(dir.path()).get_key("openrouter"), None);
+        assert_eq!(secrets_of(&file_in(&dir)).get_key("openrouter"), None);
     }
 
     /// An unknown provider is rejected before any probe, so a typo never
@@ -751,7 +847,7 @@ mod tests {
         let err = auth_set(
             &api_client().unwrap(),
             &dead_url(),
-            dir.path(),
+            &file_in(&dir),
             "not-a-provider",
             Some(TEST_KEY.into()),
             false,
@@ -760,5 +856,394 @@ mod tests {
         .await
         .expect_err("unknown providers must be rejected");
         assert!(err.to_string().contains("Unknown provider"));
+    }
+
+    /// The removal twin of
+    /// [`test_auth_set_fails_loudly_when_the_gateway_rejects_the_key`]: the
+    /// refusal names the file, and the file keeps the key.
+    #[tokio::test]
+    async fn test_auth_remove_fails_loudly_when_the_gateway_rejects_the_removal() {
+        let server = MockServer::start().await;
+        health_ok().mount(&server).await;
+        Mock::given(method("DELETE"))
+            .and(path("/auth/keys/openrouter"))
+            .respond_with(ResponseTemplate::new(401).set_body_json(serde_json::json!({
+                "error": { "code": "UNAUTHORIZED", "message": "Missing or invalid Bearer token" },
+            })))
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        secrets_of(&file_in(&dir))
+            .set_key("openrouter", TEST_KEY)
+            .unwrap();
+        let err = auth_remove(
+            &api_client().unwrap(),
+            &server.uri(),
+            &file_in(&dir),
+            "openrouter",
+            false,
+            &mut std::io::sink(),
+        )
+        .await
+        .expect_err("a rejected removal must not be reported as done");
+
+        let msg = err.to_string();
+        assert!(msg.contains("401"), "got {msg:?}");
+        assert!(msg.contains("ALMS_AUTH_TOKEN"), "got {msg:?}");
+        assert!(
+            msg.contains(&file_in(&dir).display().to_string()),
+            "the refusal must name the file this command would edit; got {msg:?}"
+        );
+        assert_eq!(
+            secrets_of(&file_in(&dir)).get_key("openrouter"),
+            Some(TEST_KEY),
+            "a rejected removal must leave the file alone"
+        );
+    }
+
+    // -- #170: one secrets file for the CLI and the gateway -------------------
+
+    /// A `{data_dir}/secrets.json` that an earlier `alms auth` wrote while
+    /// `ALMS_DB_PATH` put the database elsewhere is named on every command,
+    /// with what to do about it, and never read.
+    #[test]
+    fn a_data_dir_secrets_file_this_configuration_does_not_read_is_named() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let db_dir = tempfile::tempdir().unwrap();
+        let legacy = data_dir.path().join("secrets.json");
+        let canonical = db_dir.path().join("secrets.json");
+        let config = AlmsConfig {
+            server: alms_core::config::ServerConfig {
+                data_dir: data_dir.path().display().to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let warning_for = |secrets_path: &Path| {
+            let mut err = Vec::new();
+            warn_unread_legacy_secrets(&config, secrets_path, &mut err);
+            String::from_utf8(err).unwrap()
+        };
+
+        // No legacy file: nothing to say.
+        assert_eq!(warning_for(&canonical), "");
+
+        secrets_of(&legacy)
+            .set_key("openrouter", "sk-written-by-an-old-cli")
+            .unwrap();
+        // Only the legacy file exists: name both, and the move that adopts it.
+        let warning = warning_for(&canonical);
+        assert!(warning.contains(&legacy.display().to_string()), "{warning}");
+        assert!(
+            warning.contains(&canonical.display().to_string()),
+            "{warning}"
+        );
+        assert!(warning.contains("mv \""), "{warning}");
+        assert!(
+            warning.contains("stop the gateway, then move it"),
+            "{warning}"
+        );
+
+        // Both exist: no merge, and no move that would overwrite the live file.
+        secrets_of(&canonical)
+            .set_key("anthropic", "sk-the-gateways-key")
+            .unwrap();
+        let warning = warning_for(&canonical);
+        assert!(warning.contains("not merged"), "{warning}");
+        assert!(!warning.contains("mv \""), "{warning}");
+
+        // The default layout: the data dir's file *is* the canonical one.
+        assert_eq!(warning_for(&legacy), "");
+    }
+
+    /// The notice describes the files as the command left them (Tim B1 on
+    /// #188). With only the old file on disk, `set` creates the canonical
+    /// one; a notice printed first would say `mv` the old file into place,
+    /// which would overwrite the key just set.
+    #[tokio::test]
+    async fn the_notice_follows_the_command_so_it_never_says_mv_over_a_key_just_set() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let db_dir = tempfile::tempdir().unwrap();
+        let legacy = data_dir.path().join("secrets.json");
+        let canonical = file_in(&db_dir);
+        secrets_of(&legacy)
+            .set_key("openrouter", "sk-written-by-an-old-cli")
+            .unwrap();
+        let config = AlmsConfig {
+            server: alms_core::config::ServerConfig {
+                data_dir: data_dir.path().display().to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        run(
+            AuthCommands::Set {
+                provider: "anthropic".into(),
+                key: Some(TEST_KEY.into()),
+            },
+            false,
+            &dead_url(),
+            &config,
+            &canonical,
+            &api_client().unwrap(),
+            &mut out,
+            &mut err,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(secrets_of(&canonical).get_key("anthropic"), Some(TEST_KEY));
+        let notice = String::from_utf8(err).unwrap();
+        assert!(notice.contains(&legacy.display().to_string()), "{notice}");
+        assert!(notice.contains("not merged"), "{notice}");
+        assert!(!notice.contains("mv \""), "{notice}");
+    }
+
+    /// A failed command still gets the notice: the operator is most likely
+    /// to be looking for a missing key then.
+    #[tokio::test]
+    async fn the_notice_is_printed_when_the_command_fails() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let db_dir = tempfile::tempdir().unwrap();
+        let legacy = data_dir.path().join("secrets.json");
+        secrets_of(&legacy)
+            .set_key("openrouter", "sk-written-by-an-old-cli")
+            .unwrap();
+        let config = AlmsConfig {
+            server: alms_core::config::ServerConfig {
+                data_dir: data_dir.path().display().to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let mut err = Vec::new();
+        run(
+            AuthCommands::Remove {
+                provider: "not-a-provider".into(),
+            },
+            false,
+            &dead_url(),
+            &config,
+            &file_in(&db_dir),
+            &api_client().unwrap(),
+            &mut std::io::sink(),
+            &mut err,
+        )
+        .await
+        .expect_err("unknown providers must be rejected");
+
+        let notice = String::from_utf8(err).unwrap();
+        assert!(notice.contains(&legacy.display().to_string()), "{notice}");
+    }
+
+    /// Set by [`cli_and_gateway_resolve_the_same_secrets_file`] for its
+    /// children; [`secrets_parity_child`] does nothing without it.
+    const PARITY_CHILD_ENV: &str = "ALMS_TEST_SECRETS_PARITY_CHILD";
+    /// Marker before the child's JSON result.
+    const PARITY_LINE: &str = "SECRETS-PARITY ";
+
+    /// Child half of the #170 parity test. It resolves the secrets file from
+    /// its own environment, working directory and config file, as `alms
+    /// auth` does and as a gateway built from the same config does, and
+    /// prints both. It only does anything when the parent spawns it, in a
+    /// scratch directory with a controlled environment.
+    #[test]
+    #[ignore = "spawned by cli_and_gateway_resolve_the_same_secrets_file"]
+    fn secrets_parity_child() {
+        if std::env::var_os(PARITY_CHILD_ENV).is_none() {
+            return;
+        }
+        let config = AlmsConfig::load_or_default();
+        let cli = secrets_file(&config);
+        let gateway = alms_gateway::Gateway::new(
+            alms_gateway::GatewayConfig::from_alms_config_with_env(&config),
+        )
+        .expect("a gateway must build from this config");
+        let gateway_file = gateway.secrets_handle().read().path().to_path_buf();
+        let mut notice = Vec::new();
+        warn_unread_legacy_secrets(&config, &cli, &mut notice);
+        println!(
+            "{PARITY_LINE}{}",
+            serde_json::json!({
+                "cli": cli,
+                "gateway": gateway_file,
+                "notice": String::from_utf8(notice).unwrap(),
+            })
+        );
+    }
+
+    /// The invariant #170 is about: for any configuration, `alms auth` and a
+    /// gateway started with that configuration use one secrets file. That
+    /// includes `ALMS_DB_PATH`, which before #170 sent the CLI to
+    /// `{data_dir}/secrets.json` and the gateway to the database's directory.
+    ///
+    /// `ALMS_DB_PATH` is read from the process environment when the path is
+    /// resolved, so each configuration runs in a child process of this test
+    /// binary. Nothing here mutates this process's environment, which other
+    /// tests read concurrently. Each case also pins where the file is:
+    /// beside the database.
+    #[test]
+    fn cli_and_gateway_resolve_the_same_secrets_file() {
+        struct Case {
+            name: &'static str,
+            env: Vec<(&'static str, String)>,
+            toml: Option<String>,
+            expected: PathBuf,
+            /// `Some(reported)`: write `{data_dir}/secrets.json` first, and
+            /// expect the `alms auth` notice to name it (or not).
+            legacy: Option<bool>,
+        }
+
+        let scratch = tempfile::tempdir().unwrap();
+        // Canonical, because the child's working directory comes back
+        // canonical (macOS puts temp dirs behind /var -> /private/var).
+        let root = scratch.path().canonicalize().unwrap();
+        let elsewhere = root.join("elsewhere");
+        let db_elsewhere = elsewhere.join("alms.db").display().to_string();
+        let data = root.join("data");
+
+        let cases = [
+            Case {
+                name: "defaults",
+                env: vec![],
+                toml: None,
+                expected: PathBuf::from(".alms/secrets.json"),
+                legacy: None,
+            },
+            Case {
+                name: "ALMS_DB_PATH outside the data dir",
+                env: vec![("ALMS_DB_PATH", db_elsewhere.clone())],
+                toml: None,
+                expected: elsewhere.join("secrets.json"),
+                // The configuration the notice is for.
+                legacy: Some(true),
+            },
+            Case {
+                name: "ALMS_DATA_DIR",
+                env: vec![("ALMS_DATA_DIR", data.display().to_string())],
+                toml: None,
+                expected: data.join("secrets.json"),
+                legacy: None,
+            },
+            Case {
+                name: "ALMS_DATA_DIR and ALMS_DB_PATH",
+                env: vec![
+                    ("ALMS_DATA_DIR", data.display().to_string()),
+                    ("ALMS_DB_PATH", db_elsewhere.clone()),
+                ],
+                toml: None,
+                expected: elsewhere.join("secrets.json"),
+                legacy: None,
+            },
+            Case {
+                name: "data_dir in alms.toml",
+                env: vec![],
+                toml: Some(format!(
+                    "[server]\ndata_dir = {:?}\n",
+                    data.display().to_string()
+                )),
+                expected: data.join("secrets.json"),
+                legacy: None,
+            },
+            Case {
+                name: "relative ALMS_DB_PATH",
+                env: vec![("ALMS_DB_PATH", "state/alms.db".to_string())],
+                toml: None,
+                expected: PathBuf::from("state/secrets.json"),
+                legacy: None,
+            },
+            // No database directory, so the file lands in the cwd for both
+            // processes (`docs/config.md`). The usual `.alms/secrets.json`
+            // is not reported as one to move there (Tim S1 on #188).
+            Case {
+                name: "in-memory ALMS_DB_PATH",
+                env: vec![("ALMS_DB_PATH", ":memory:".to_string())],
+                toml: None,
+                expected: PathBuf::from("secrets.json"),
+                legacy: Some(false),
+            },
+        ];
+
+        for case in cases {
+            let name = case.name;
+            let cwd = root.join(name.replace(' ', "-"));
+            // The database's directory must exist for SQLite to create the
+            // file; the gateway creates only the data dir itself.
+            std::fs::create_dir_all(cwd.join("state")).unwrap();
+            std::fs::create_dir_all(&elsewhere).unwrap();
+            if let Some(toml) = &case.toml {
+                std::fs::write(cwd.join("alms.toml"), toml).unwrap();
+            }
+            // Every case with a legacy file uses the default data dir.
+            let legacy_file = cwd.join(".alms").join("secrets.json");
+            if case.legacy.is_some() {
+                std::fs::create_dir_all(cwd.join(".alms")).unwrap();
+                std::fs::write(&legacy_file, r#"{"api_keys":{}}"#).unwrap();
+            }
+
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+            child
+                .args([
+                    "cmd_auth::tests::secrets_parity_child",
+                    "--exact",
+                    "--ignored",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .current_dir(&cwd)
+                // On Windows this also drops `SystemRoot`, which some
+                // system calls need. Unverified (CI is Linux): pass it
+                // through under `cfg(windows)` if a Windows run fails here.
+                .env_clear()
+                // No `~/.config/alms/config.toml` from the real home.
+                .env("HOME", &root)
+                .env("ALMS_LLM_MOCK", "1")
+                .env(PARITY_CHILD_ENV, "1");
+            for (key, value) in &case.env {
+                child.env(key, value);
+            }
+            let output = child.output().unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success(),
+                "[{name}] child failed:\n{stdout}\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            // libtest prints "test <name> ... " on the same line first.
+            let line = stdout
+                .lines()
+                .find_map(|l| l.split_once(PARITY_LINE).map(|(_, json)| json))
+                .unwrap_or_else(|| panic!("[{name}] the child printed no result:\n{stdout}"));
+            let resolved: serde_json::Value = serde_json::from_str(line).unwrap();
+            let (cli, gateway) = (
+                PathBuf::from(resolved["cli"].as_str().unwrap()),
+                PathBuf::from(resolved["gateway"].as_str().unwrap()),
+            );
+
+            assert_eq!(
+                cli, gateway,
+                "[{name}] `alms auth` and the gateway must use the same secrets file"
+            );
+            assert_eq!(
+                cli,
+                cwd.join(&case.expected),
+                "[{name}] the secrets file lives beside the database"
+            );
+            let notice = resolved["notice"].as_str().unwrap();
+            let names_legacy = notice.contains(&legacy_file.display().to_string());
+            match case.legacy {
+                Some(reported) => assert_eq!(
+                    names_legacy,
+                    reported,
+                    "[{name}] notice for {}: {notice:?}",
+                    legacy_file.display()
+                ),
+                None => assert_eq!(notice, "", "[{name}] no legacy file to report"),
+            }
+        }
     }
 }

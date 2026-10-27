@@ -180,6 +180,46 @@ fn seed_agent(state: &AppState, name: &str) -> AgentId {
     record.id
 }
 
+/// The first persisted message in `session_id` whose metadata `type` is
+/// `marker_type`.
+fn marker_of_type(
+    state: &AppState,
+    session_id: SessionId,
+    marker_type: &str,
+) -> Option<alms_session::Message> {
+    state
+        .session_manager
+        .get_history(session_id)
+        .ok()?
+        .into_iter()
+        .find(|message| {
+            message
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("type"))
+                .and_then(|value| value.as_str())
+                == Some(marker_type)
+        })
+}
+
+/// Wait for the `subagent_cancelled` record, which a stop queues on the
+/// parent agent's queue rather than appending in place.
+async fn wait_for_cancelled_record(
+    state: &AppState,
+    session_id: SessionId,
+) -> alms_session::Message {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(record) = marker_of_type(state, session_id, "subagent_cancelled") {
+                return record;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the queued subagent_cancelled record must land in the parent history")
+}
+
 /// Subscribe to SSE events on a session and return the receiver.
 ///
 /// Events sent via `run_manager.send_session_event()` will be received

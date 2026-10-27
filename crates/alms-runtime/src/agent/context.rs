@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::context::{
-    ContextBuilder, HISTORY_RESERVE, estimate_session_message_tokens, estimate_tokens,
-    is_stripped_display_marker,
+    ContextBuilder, ESTIMATED_BYTES_PER_TOKEN, HISTORY_RESERVE, estimate_session_message_tokens,
+    estimate_tokens, is_stripped_display_marker,
 };
 use crate::events::PHASE_SUMMARIZING;
 use crate::llm_types::*;
@@ -13,7 +13,36 @@ use tracing::{debug, error, info, warn};
 
 use super::AgentRuntime;
 
+/// Granularity of the workspace prompt budget, in bytes.
+///
+/// The budget is rounded down to a whole step so that, under budget pressure,
+/// a truncated file in an unchanged workspace is cut in the same place from
+/// one run to the next. Without it, every turn's input length moved the cut
+/// by a few bytes, and an agent whose files were being cut missed the
+/// system-block prompt cache on every message. Each byte of input moves the
+/// unrounded budget by about half a byte, so two inputs d bytes apart land on
+/// different steps about d / 2 KiB of the time: a few hundred bytes rarely
+/// matters, 2 KiB always does.
+const WORKSPACE_BUDGET_STEP_BYTES: usize = 1024;
+
+/// The first request of a run, and the workspace budget every system-prompt
+/// rebuild in that run must reuse.
+pub(crate) struct BuiltContext {
+    pub(crate) messages: Vec<LlmMessage>,
+    pub(crate) workspace_budget_bytes: usize,
+}
+
 impl AgentRuntime {
+    /// [`Self::assemble_system_prompt_with_budget`] at the budget a run with
+    /// no input, history or episodic block would get. Test-only: the runtime
+    /// always passes the budget [`Self::build_context_with_budget`] computed.
+    #[cfg(test)]
+    pub(crate) fn assemble_system_prompt(&self, base_prompt: &str, include_user: bool) -> String {
+        let fixed_prompt = self.fixed_system_prompt_for_budget(base_prompt, None);
+        let budget_bytes = self.workspace_prompt_budget_bytes(&fixed_prompt, 0);
+        self.assemble_system_prompt_with_budget(base_prompt, include_user, budget_bytes)
+    }
+
     /// Assemble the full system prompt for a given stage, appending workspace
     /// files if attached.
     ///
@@ -35,9 +64,26 @@ impl AgentRuntime {
     /// prefix. This is used for non-user-facing sessions — the contexts
     /// [`Self::is_user_facing_context`] rejects, which is the one place the
     /// list is written down.
-    pub(crate) fn assemble_system_prompt(&self, base_prompt: &str, include_user: bool) -> String {
+    ///
+    /// `workspace_budget_bytes` is the run's budget from
+    /// [`Self::build_context_with_budget`]. Every call in a run passes the same
+    /// value, so an unchanged workspace produces the same bytes on the first
+    /// request and on every tool-loop rebuild. A file that does not fit whole is
+    /// windowed. A file the budget cut is reported once per run as a
+    /// `WORKSPACE_PROMPT_TRUNCATED` warning; a `memories.md` that is only past
+    /// its fixed window is not.
+    pub(crate) fn assemble_system_prompt_with_budget(
+        &self,
+        base_prompt: &str,
+        include_user: bool,
+        workspace_budget_bytes: usize,
+    ) -> String {
         if let Some(ref ws) = self.workspace {
-            let prefix = ws.build_system_prompt_prefix(include_user);
+            let (prefix, truncations) = ws.build_system_prompt_prefix_with_budget_and_truncations(
+                include_user,
+                workspace_budget_bytes,
+            );
+            self.emit_workspace_prompt_truncations(ws, truncations);
             if prefix.is_empty() {
                 base_prompt.to_string()
             } else {
@@ -46,6 +92,84 @@ impl AgentRuntime {
         } else {
             base_prompt.to_string()
         }
+    }
+
+    fn emit_workspace_prompt_truncations(
+        &self,
+        workspace: &crate::workspace::AgentWorkspace,
+        truncations: Vec<crate::workspace::WorkspacePromptTruncation>,
+    ) {
+        for truncation in truncations {
+            if !workspace.mark_truncation_warning_reported(truncation.file) {
+                continue;
+            }
+
+            let agent_name = self.agent_name.as_deref().unwrap_or("unnamed agent");
+            let message = format!(
+                "Workspace file {} for agent {agent_name} contains {} bytes and exceeds the {} bytes available to it in this run's prompt budget. A partial window is included to preserve conversation history, and whole-file writes are refused until a complete view is available.",
+                truncation.file.filename(),
+                truncation.total_bytes,
+                truncation.injection_limit_bytes,
+            );
+            warn!(
+                agent_id = %self.agent_id.0,
+                agent_name = %agent_name,
+                file = truncation.file.filename(),
+                total_bytes = truncation.total_bytes,
+                injection_limit_bytes = truncation.injection_limit_bytes,
+                "Truncated workspace file in system prompt to preserve conversation history"
+            );
+            if let Some(sender) = &self.event_sender {
+                let _ = sender.send(crate::events::RuntimeEvent::Warning {
+                    code: "WORKSPACE_PROMPT_TRUNCATED".to_string(),
+                    message,
+                    source_agent: None,
+                });
+            }
+        }
+    }
+
+    /// The non-workspace part of the largest system prompt this run can send:
+    /// the base prompt, the `tool_loop` guidance every rebuild adds, and the
+    /// DM addendum when there is one. Only measured, never sent.
+    pub(crate) fn fixed_system_prompt_for_budget(
+        &self,
+        base_prompt: &str,
+        dm_peer: Option<&str>,
+    ) -> String {
+        let mut fixed_prompt = base_prompt.to_string();
+        fixed_prompt.push_str("\n\n");
+        // Reserve continuation guidance now so rebuilds can keep the same
+        // workspace allocation when they add it after the first tool batch.
+        fixed_prompt.push_str(&self.config.prompts.tool_loop);
+        if let Some(peer) = dm_peer {
+            fixed_prompt.push_str(&Self::dm_addendum(peer));
+        }
+        fixed_prompt
+    }
+
+    /// The byte budget for workspace file contents in one run's system prompt:
+    /// half of what `max_input_tokens` leaves after `fixed_system_prompt`,
+    /// `other_context_tokens` and two history reserves, rounded down to a
+    /// whole [`WORKSPACE_BUDGET_STEP_BYTES`].
+    pub(crate) fn workspace_prompt_budget_bytes(
+        &self,
+        fixed_system_prompt: &str,
+        other_context_tokens: usize,
+    ) -> usize {
+        // Keep one reserve for ContextBuilder and one for history itself;
+        // workspace files can use only half of the remaining headroom.
+        let fixed_overhead = estimate_tokens(fixed_system_prompt)
+            .saturating_add(other_context_tokens)
+            .saturating_add(HISTORY_RESERVE.saturating_mul(2));
+        let headroom_tokens = self
+            .config
+            .context_config
+            .max_input_tokens
+            .saturating_sub(fixed_overhead)
+            / 2;
+        let budget_bytes = headroom_tokens.saturating_mul(ESTIMATED_BYTES_PER_TOKEN);
+        budget_bytes - budget_bytes % WORKSPACE_BUDGET_STEP_BYTES
     }
 
     /// Returns true if the given context_id represents a user-facing session
@@ -81,6 +205,21 @@ impl AgentRuntime {
             || context_id.starts_with("episodic:"))
     }
 
+    /// [`Self::build_context_with_budget`] without the workspace budget, for
+    /// tests that only inspect the first request.
+    #[cfg(test)]
+    pub(crate) async fn build_context(
+        &self,
+        session_manager: &SessionManager,
+        session_id: &alms_core::SessionId,
+        context_id: &str,
+        input: &str,
+    ) -> AlmsResult<Vec<LlmMessage>> {
+        self.build_context_with_budget(session_manager, session_id, context_id, input)
+            .await
+            .map(|built| built.messages)
+    }
+
     /// Build context window for LLM using ContextBuilder.
     ///
     /// For the `compact` strategy (renamed from `sliding-summary` in
@@ -90,17 +229,23 @@ impl AgentRuntime {
     /// For DM sessions (context_id starts with `"dm:"`), perspective mapping is
     /// applied: messages from this agent become `Role::Assistant` so the LLM
     /// sees them as its own previous responses.
-    pub(crate) async fn build_context(
+    ///
+    /// This is also where the run's workspace budget is computed, once, and
+    /// returned in [`BuiltContext`] so every tool-loop rebuild reuses it. It
+    /// depends on the configuration, the input and whether the run has an
+    /// episodic block, but not on history, so a long session does not
+    /// squeeze the workspace files.
+    pub(crate) async fn build_context_with_budget(
         &self,
         session_manager: &SessionManager,
         session_id: &alms_core::SessionId,
         context_id: &str,
         input: &str,
-    ) -> AlmsResult<Vec<LlmMessage>> {
+    ) -> AlmsResult<BuiltContext> {
         let include_user = Self::is_user_facing_context(context_id);
 
         // Start the run with no record of what the agent has been shown of
-        // its workspace (#1310). The `assemble_system_prompt` call below
+        // its workspace (#1310). The budget-aware prompt assembly below
         // immediately refills it for every file it injects, so the effect is
         // to scope the record to this run: a view recorded by a previous run
         // must not authorise a whole-file `workspace_write` in this one,
@@ -112,32 +257,11 @@ impl AgentRuntime {
             ws.forget_shown_files();
         }
 
-        let mut system_prompt =
-            self.assemble_system_prompt(&self.config.system_prompt, include_user);
-
-        // For peer-triggered DM runs, append the implicit-reply addendum
-        // (`dm_recipient.md`): the agent's final message text is delivered
-        // to the peer automatically by the gateway's DM completion gate
-        // (#1154) — no tool call required.
-        //
-        // Gated on `self.dm_implicit_reply` (#1156 defense-in-depth), which
-        // the gateway sets only for peer-triggered runs (`is_peer_message`).
-        // The completion gate only delivers for peer-triggered runs, so
-        // promising implicit delivery on any other `dm:` run would be a
-        // lie that ends in a silent drop. Option C already rejects non-peer
-        // runs on `dm:` sessions at run creation; this gate keeps the
-        // prompt honest even if a new non-peer `dm:` path is ever added.
-        if self.dm_implicit_reply
-            && context_id.starts_with("dm:")
-            && let Some(peer) = self.dm_peer_name(context_id)
-        {
-            system_prompt.push_str(&Self::dm_addendum(&peer));
-            debug!(
-                peer = %peer,
-                context_id = %context_id,
-                "Injected DM recipient system prompt"
-            );
-        }
+        let dm_peer = if self.dm_implicit_reply && context_id.starts_with("dm:") {
+            self.dm_peer_name(context_id)
+        } else {
+            None
+        };
 
         let history = match session_manager.get_context_history(*session_id) {
             Ok(h) => h,
@@ -192,6 +316,44 @@ impl AgentRuntime {
         } else {
             None
         };
+
+        let fixed_system_prompt =
+            self.fixed_system_prompt_for_budget(&self.config.system_prompt, dm_peer.as_deref());
+        // Charge an episodic block at its ceiling, `run_summary_budget`, not
+        // at its length. The block is rebuilt from the other sessions'
+        // summaries on every run, so its length changes from turn to turn,
+        // and charging that would move a truncated file's cut with it. The
+        // formatter fits the block within the ceiling, framing included.
+        let episodic_tokens = if episodic_text
+            .as_deref()
+            .is_some_and(|text| !text.is_empty())
+        {
+            self.config.context_config.run_summary_budget
+        } else {
+            0
+        };
+        let other_context_tokens = estimate_tokens(input).saturating_add(episodic_tokens);
+        let workspace_budget_bytes =
+            self.workspace_prompt_budget_bytes(&fixed_system_prompt, other_context_tokens);
+        let mut system_prompt = self.assemble_system_prompt_with_budget(
+            &self.config.system_prompt,
+            include_user,
+            workspace_budget_bytes,
+        );
+
+        // For peer-triggered DM runs, append the implicit-reply addendum
+        // (`dm_recipient.md`): the agent's final message text is delivered
+        // to the peer automatically by the gateway's DM completion gate
+        // (#1154) — no tool call required. The peer is selected only when the
+        // same defense-in-depth gate used by delivery accepts this run.
+        if let Some(peer) = dm_peer {
+            system_prompt.push_str(&Self::dm_addendum(&peer));
+            debug!(
+                peer = %peer,
+                context_id = %context_id,
+                "Injected DM recipient system prompt"
+            );
+        }
 
         // For the `compact` strategy (formerly `sliding-summary`, #869),
         // attempt to compress old messages before building context. On
@@ -277,14 +439,17 @@ impl AgentRuntime {
             None
         };
 
-        Ok(builder.build_with_perspective(
-            &system_prompt,
-            &history,
-            input,
-            summary_text.as_deref(),
-            perspective,
-            episodic_text.as_deref(),
-        ))
+        Ok(BuiltContext {
+            messages: builder.build_with_perspective(
+                &system_prompt,
+                &history,
+                input,
+                summary_text.as_deref(),
+                perspective,
+                episodic_text.as_deref(),
+            ),
+            workspace_budget_bytes,
+        })
     }
 
     /// Load episodic summaries from other sessions and format them for

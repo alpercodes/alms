@@ -63,6 +63,19 @@ Each item below changes behaviour for a deployment that has not set the knob exp
   replacing it. `personality`, `goals` and `user` still default to `write`, and an explicit
   `mode` is still honoured everywhere.
 
+- **Workspace prompt content now shares a run-scoped context budget.**
+  `personality.md`, `goals.md` and `user.md` remain whole unless the available budget
+  requires a head window; `memories.md` keeps a tail window of up to 4000 bytes. When a
+  file is partial, its prompt marker explains the window and a `workspace_write`
+  replacement is refused until the agent has seen the whole file. When the budget is what
+  cut it, a `run_warning` with code `WORKSPACE_PROMPT_TRUNCATED` also names the agent and
+  the file (once per file per run). The same budget is reused after each tool batch,
+  preserving history space without shrinking an unchanged workspace's view, and it is
+  rounded down to a whole KiB so a windowed file usually keeps the same cut from one turn
+  to the next. `workspace_read` returns up to 12000 bytes, so an oversized file that is only
+  partially injected may still need operator editing or append-only changes before a
+  complete rewrite is possible.
+
 - **`fs_read` output caps lowered.** Whole-file reads cap at 256 KiB; passing `offset` or
   `limit` falls back to a 64 KiB output budget. Large reads must paginate.
 
@@ -86,6 +99,25 @@ Each item below changes behaviour for a deployment that has not set the knob exp
   setting in the web UI, or `telegram_token` on `PUT /agents/{id_or_name}`). If agents
   exist but none is marked default, the gateway logs a `WARN` at startup naming the agent
   the bot serves.
+
+- **With `ALMS_DB_PATH` set, `alms auth` now uses the secrets file beside the database.**
+  `secrets.json` lives next to the SQLite database: `{data_dir}/secrets.json` by default,
+  and in the directory of `ALMS_DB_PATH` when that points elsewhere. The gateway has always
+  read it there. `alms auth set` / `remove` with no gateway running, and `alms auth list`,
+  used `{data_dir}/secrets.json` instead, so under `ALMS_DB_PATH` a key set from the CLI
+  went to a file no gateway read, and `list` showed that file rather than the gateway's
+  (#170). The two now resolve one path. Deployments without `ALMS_DB_PATH`, or with it
+  pointing directly into the data directory, are unaffected, and no gateway reads a
+  different file than before.
+
+  **After upgrading**, `alms auth list` under such a configuration shows the gateway's keys.
+  A `{data_dir}/secrets.json` left by an earlier `alms auth` is not read, moved or merged —
+  a key no gateway has used would otherwise take precedence over the one it uses. The
+  gateway at boot and every `alms auth` command (after it runs) name the file until it is
+  dealt with: if nothing is beside the database yet, stop the gateway and move it there (a
+  running gateway reads the file only at boot, and its next key change overwrites it);
+  otherwise set any key you still need with `alms auth set` and delete it. Under
+  `ALMS_DB_PATH=:memory:` nothing is reported.
 
 ### Security
 
@@ -119,6 +151,12 @@ Each item below changes behaviour for a deployment that has not set the knob exp
   longer teach agents to poll.
 - Subagent sessions are filed under the agent that ran them, with session-keyed cancel
   controls and a status-only subagent status bar.
+- Stopping a parent run, or deleting a job, no longer starts a notification run for the
+  background subagents it cancels; the parent's history gets a record pointing to each
+  subagent's session instead. Inside a scheduled job's open episode, a stopped subagent
+  still gets the episode's continuation run. Cancelling one subagent directly still starts
+  a run, which now tells the agent the cancel was deliberate and not to redo the work
+  unless asked.
 - An agent with no `personality.md` is no longer handed the first-time setup interview
   ("Ask the user …") on turns no human started. Peer DM turns, notification runs
   (subagent completions, DM ends) and scheduled job runs now get the agent's normal system
@@ -278,12 +316,26 @@ Each item below changes behaviour for a deployment that has not set the knob exp
   key was visibly on disk and the next run still failed to authenticate. With no gateway
   answering, both commands write the file exactly as before. A gateway that answers and
   then *rejects* the change (a missing `ALMS_AUTH_TOKEN`, say) is now an error rather
-  than a silent fall back to the file. `--json` output gains a `target` field
-  (`"gateway"` or `"secrets_file"`); `alms auth list` is unchanged and still reads the
-  file. The `telegram` bot token is the exception: the gateway reads it once, when it
-  starts its Telegram channel, so a `telegram` change sent to a running gateway is stored
-  but takes effect at its next restart. Both commands now say so for `telegram` instead of
-  "no restart needed".
+  than a silent fall back to the file, and the error names that file. `--json` output
+  gains a `target` field (`"gateway"` or `"secrets_file"`); `alms auth list` is unchanged
+  and still reads the file. The `telegram` bot token is the exception: the gateway reads it
+  once, when it starts its Telegram channel, so a `telegram` change sent to a running
+  gateway is stored but takes effect at its next restart. Both commands now say so for
+  `telegram` instead of "no restart needed".
+- `./install.sh` installs into `$CARGO_HOME/bin` when `CARGO_HOME` is set, instead of
+  always `~/.cargo/bin`. An `alms` earlier on `PATH` — such as one a previous run left in
+  `~/.cargo/bin` — is now reported rather than silently shadowing the new install. The
+  binary is replaced by rename instead of overwritten in place: on macOS the in-place copy
+  left an `alms` that was `Killed: 9` on every launch while the script reported success,
+  and the script now runs the installed `alms --version` before saying it worked. It also
+  runs from any directory or through a symlink, honours `CARGO_TARGET_DIR`, stops with a
+  pointer to rustup when `cargo` is missing, warns when the nightly pinned in
+  `rust-toolchain.toml` will not be used (no `rustup`, or a `cargo` that does not report a
+  nightly, such as another one ahead of rustup's on `PATH`), writes its errors to stderr,
+  and exits 2 on an unknown argument instead of starting a build (`--help` prints usage).
+- `README.md`, `CONTRIBUTING.md` and `CLAUDE.md` no longer say ALMS requires Rust nightly:
+  it builds on current stable, and the nightly in `rust-toolchain.toml` is pinned for
+  development, to keep `cargo fmt` and `cargo clippy` reproducible.
 
 ### Frontend
 
@@ -365,6 +417,41 @@ one.
   dependent), and `getrandom` 0.3.4 loses its wasm-only `js-sys` / `wasm-bindgen` edges
   because quinn-proto's wasm dependency moved to `getrandom` 0.4. None of these edges is
   built.
+- `rustls-webpki` 0.103.15 -> 0.103.16 and `webpki-roots` 1.0.6 -> 1.0.10 to clear
+  RUSTSEC-2026-0382 and RUSTSEC-2026-0381 (one issue, CVE-2026-111943: certificate paths
+  through distrusted emSign intermediates whose private keys are public; 0.103.16 rejects
+  those keys, 1.0.10 drops `emSign ECC Root CA - G3`), and `tokio` 1.52.3 -> 1.53.3 to
+  clear RUSTSEC-2026-0386 (unsound: the safe `AsyncFd::new`, `with_interest`, `try_new`
+  and `try_with_interest` accept any `AsRawFd`, so a closed or reused descriptor can reach
+  a use-after-free in the I/O driver; 1.53.3 deprecates them for the `unsafe`
+  `AsyncFd::register`). v0.2.3 carries rustls-webpki 0.103.9, webpki-roots 1.0.6 and tokio
+  1.49.0, all in range. None of the affected code is reached. Both TLS crates are built
+  only for reqwest's `rustls-tls` feature, and as in the 0.23.45 entry above, no ALMS
+  connection goes through rustls. tokio is in every binary, but nothing in the dependency
+  graph calls an `AsyncFd` constructor: no ALMS crate, no other locked crate, and not tokio
+  outside `AsyncFd` itself. 1.52.x has no fixed release (the fixes are 1.51.6 and 1.53.3).
+  Through 1.53.3 the 1.53 line adds APIs and fixes bugs. The changes to existing behaviour
+  are the deprecation above (no ALMS call site, so no new warning) and an `mpsc` receiver
+  that now drops its waker on drop. No operator action. Lockfile-only: only these three
+  packages' versions and checksums change.
+- `dompurify` 3.4.16 -> 3.4.17 to clear GHSA-cg2g-xh64-v4q7 (critical),
+  GHSA-mrv2-3pqr-j5jr (high) and GHSA-c6gr-qvv4-5v3f (low). Each needs non-default
+  configuration: `SAFE_FOR_TEMPLATES` with a DOM-returning mode, `IN_PLACE` with a hook
+  that removes another node, or `PARSER_MEDIA_TYPE: 'application/xhtml+xml'`. The UI
+  sanitizes a string with no config, and its one hook removes nothing. v0.2.3 loads
+  `dompurify` 3.2.4 from esm.sh, in range for the last two, with the same call. There is no
+  output change on the UI's path. A 42-case differential in headless Chromium, including
+  `<form>` clobbering of every getter 3.4.17 changes, and 21 cases under jsdom are
+  byte-identical across the two versions (see `docs/frontend.md`). No operator action. The
+  committed `static/ui-dist/` bundle is rebuilt.
+- `zod` 4.4.3 -> 4.6.6 to clear GHSA-mrhx-c7xc-m3w5 (high; CVE-2023-54404). A
+  size-bounded array, set or map parsed every element before checking its bound, so an
+  oversized input could exhaust memory building issues. `zod` ships in the web UI and
+  validates every REST and SSE payload from the gateway. None of its collection schemas
+  declares a size bound, so the fixed path is not used. 4.6.6 is the first fixed release,
+  two minors up. The 4.5 and 4.6 soundness changes were checked against the schemas, and a
+  22-case differential is identical across the two versions (see `docs/frontend.md`).
+  v0.2.3 has no `zod`. No operator action. Rebuilt into the same `static/ui-dist/` bundle.
 
 ## v0.2.3 — released (tag `v0.2.3`)
 

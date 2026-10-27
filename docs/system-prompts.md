@@ -12,15 +12,16 @@ files (`personality.md`, `goals.md`, `memories.md`, `user.md`).
 | `initial.md` | Base system prompt for all top-level agents. Sets the agent's default behavior and mentions the `alms --help` CLI discovery hint. | `AgentConfig::default()` in `crates/alms-runtime/src/agent/types.rs` |
 | `tool_loop.md` | Continuation prompt appended to the system message after tool results. Tells the LLM to analyze results and decide whether to use more tools or respond. | `SystemPrompts::default()` in `crates/alms-runtime/src/agent/types.rs` |
 | `bootstrap.md` | First-time agent onboarding prompt. Replaces the initial prompt on human-started runs when `personality.md` does not exist. Guides the agent through an interview to populate workspace files. | `AgentWorkspace::bootstrap_prompt()` in `crates/alms-runtime/src/workspace.rs` |
-| `dm_recipient.md` | Template appended to the system prompt when the agent receives a direct message. Explains the implicit-reply contract (#1154): the final message text is delivered to the peer automatically. Contains a `{peer}` placeholder replaced at runtime with the sender's name. | `build_context()` in `crates/alms-runtime/src/agent/context.rs` |
+| `dm_recipient.md` | Template appended to the system prompt when the agent receives a direct message. Explains the implicit-reply contract (#1154): the final message text is delivered to the peer automatically. Contains a `{peer}` placeholder replaced at runtime with the sender's name. | `build_context_with_budget()` in `crates/alms-runtime/src/agent/context.rs` |
 | `subagent.md` | Default system prompt for ephemeral (unnamed) subagents spawned via `invoke_agent`. | `DEFAULT_SUBAGENT_PROMPT` constant in `crates/alms-coordinator/src/lib.rs` |
 | `summarizer.md` | System prompt for the sliding-summary LLM call that compresses old conversation history into a rolling summary. | `maybe_summarize()` in `crates/alms-runtime/src/agent/context.rs` |
 | `session_summarizer.md` | System prompt for the episodic memory LLM call that generates cross-session summaries after each run. Focus on *what was accomplished*, not how. 1-3 sentences, past tense. | `generate_llm()` in `crates/alms-runtime/src/episodic.rs` |
 | `dm_summarizer.md` | DM-specific instruction prepended to the summarizer transcript. Tells the LLM to preserve per-agent attribution. Contains a `{transcript}` placeholder. | `maybe_summarize()` in `crates/alms-runtime/src/agent/context.rs` |
 | `dm_empty_reply_retry.md` | Nudge injected when a peer-triggered DM run is about to end with no deliverable reply text (#1154 implicit replies). Tells the agent its final message text IS the reply, or to use `ignore_message` to end. | `DM_EMPTY_REPLY_RETRY_MSG` in `crates/alms-runtime/src/agent/dm.rs` |
-| `dm_ended_with_history.md` | DM conversation ended notification template with embedded transcript. Contains `{reason}` and `{history}` placeholders. | `format_dm_ended_notification()` in `crates/alms-gateway/src/runs.rs` |
-| `dm_ended_no_history.md` | Fallback DM conversation ended notification when history is unavailable. Contains `{reason}` and `{from}` placeholders. Points agent to `read_messages`. | `format_dm_ended_notification()` in `crates/alms-gateway/src/runs.rs` |
-| `subagent_completed.md` | Background subagent completion notification template. Contains `{label}`, `{status}`, `{summary}`, and `{follow_up}` placeholders. | `format_completion_notification()` in `crates/alms-gateway/src/runs.rs` |
+| `dm_ended_with_history.md` | DM conversation ended notification template with embedded transcript. Contains `{reason}` and `{history}` placeholders. | `format_dm_ended_notification()` in `crates/alms-gateway/src/runs/notifications.rs` |
+| `dm_ended_no_history.md` | Fallback DM conversation ended notification when history is unavailable. Contains `{reason}` and `{from}` placeholders. Points agent to `read_messages`. | `format_dm_ended_notification()` in `crates/alms-gateway/src/runs/notifications.rs` |
+| `subagent_completed.md` | Background subagent completion notification template. Contains `{label}`, `{status}`, `{summary}`, and `{follow_up}` placeholders. | `format_completion_notification()` in `crates/alms-gateway/src/runs/notifications.rs` |
+| `subagent_cancelled.md` | Notification for a background subagent the operator cancelled directly (#121). Says the cancel was deliberate and that the parent should not re-run it or redo its work unless the operator asks. Contains `{label}` and `{session_id}` placeholders. | `format_directly_cancelled_notification()` in `crates/alms-gateway/src/runs/notifications.rs` |
 
 ## When Each Prompt Is Used
 
@@ -60,9 +61,11 @@ initial prompt (not replacing it), so the agent retains its identity while getti
 continuation guidance.
 
 **Code path**: `agent_loop()` in `agent/loop_impl.rs` -- after processing tool results, the
-system message at `messages[0]` is rebuilt as:
+system message at `messages[0]` is rebuilt by `rebuild_system_prompt_for_tool_loop_with_budget()`
+with the workspace byte budget captured by `build_context_with_budget()`:
 ```
-assemble_system_prompt(initial_prompt) + "\n\n" + tool_loop_prompt
+assemble_system_prompt_with_budget(initial_prompt, run_workspace_budget)
+    + "\n\n" + tool_loop_prompt
 ```
 i.e. the base prompt and workspace prefix are assembled first, then the
 `tool_loop` continuation guidance is appended on top. For DM sessions the
@@ -70,11 +73,11 @@ DM addendum is appended last (see § "Prompt Assembly Order").
 
 ### `dm_recipient.md` -- Direct Message Sessions
 
-When the context ID starts with `"dm:"`, the `build_context()` method extracts the
+When the context ID starts with `"dm:"`, the `build_context_with_budget()` method extracts the
 peer agent's name and appends the DM addendum to the system prompt. The `{peer}`
 placeholder in the template is replaced with the actual peer name.
 
-**Code path**: `build_context()` in `agent/context.rs` -- after assembling the base system
+**Code path**: `build_context_with_budget()` in `agent/context.rs` -- after assembling the base system
 prompt with workspace prefix, if the context is a DM session. Additionally,
 `agent_loop()` in `agent/loop_impl.rs` re-injects the addendum via the `dm_addendum()` helper on every
 tool-loop system prompt rebuild, so the agent retains DM awareness across
@@ -128,18 +131,24 @@ appended after it:
    setup). This is the foundational role/identity prompt and always comes first.
 
 2. **Workspace prefix** (optional): If the agent has a workspace attached,
-   `build_system_prompt_prefix()` reads workspace files and appends them after
+   `build_system_prompt_prefix_with_budget_and_truncations()` reads workspace files and appends them after
    the base prompt: `{base_prompt}\n\n{workspace_prefix}`. The workspace files
    are concatenated in this internal order:
-   - `personality.md` (raw content)
-   - `goals.md` (prefixed with `## Current Goals`)
-   - `user.md` (prefixed with `## About the User`) — **conditional**: skipped for
-     non-user-facing sessions (DM, subagent, job, notification, and episodic
-     contexts) to save tokens
-   - `memories.md` (prefixed with `## Memories`, tail-windowed at 4000 bytes — past
-     the cap the agent is shown the *most recent* 4000 bytes behind a leading
-     truncation marker, not the oldest; see `agent-runtime-design.md` § "Size
-     management")
+    - `personality.md` (head-windowed only when the run budget requires it)
+    - `goals.md` (prefixed with `## Current Goals`, head-windowed only when the run budget requires it)
+    - `user.md` (prefixed with `## About the User`, head-windowed only when the run budget requires it) — **conditional**: skipped for non-user-facing sessions (DM, subagent, job, notification, and episodic contexts) to save tokens
+    - `memories.md` (prefixed with `## Memories`, a tail window of up to 4000 bytes — past the window the agent is shown the *most recent* bytes behind a leading truncation marker, not the oldest; see `agent-runtime-design.md` § "Size management")
+
+   The runtime shares one workspace budget across these files for the duration of a run.
+   It water-fills the available bytes across populated files, so short files use only
+   what they need and identity files stay whole unless history headroom requires a window.
+   `memories.md` gets a tail window of up to 4000 bytes. A partial file carries a marker.
+   A partial view the budget forced also emits one `WORKSPACE_PROMPT_TRUNCATED`
+   `run_warning` per file per run; a `memories.md` that is only past its fixed window
+   does not. Rebuilds reuse the original budget, so an unchanged workspace's view does
+   not shrink as tool results accumulate. The budget is rounded down to a whole KiB, and an
+   episodic block is charged at `run_summary_budget` rather than its length, so a
+   windowed file usually keeps the same cut from one run to the next as well.
 
 3. **Tool loop addendum** (after first tool round): On subsequent LLM calls in the
    same agent loop, the system message is rebuilt as:
@@ -153,9 +162,10 @@ appended after it:
    the implicit-reply contract (#1154 — its final message text IS the reply to
    the peer), even after processing tool calls (fixes #346).
 
-The base + workspace assembly is handled by `assemble_system_prompt()`. The
-order matches common LLM prompting practice — role/identity first, personalization
-later — and puts the most specific instructions nearer the end of the system block.
+The base + workspace assembly is handled by the budget-aware context assembly in
+`agent/context.rs`. The order matches common LLM prompting practice — role/identity
+first, personalization later — and puts the most specific instructions nearer the end
+of the system block.
 
 Note: this ordering does **not** in itself improve Anthropic prompt-cache hit rates.
 The cache breakpoint in `anthropic.rs` attaches `cache_control` to the entire trailing

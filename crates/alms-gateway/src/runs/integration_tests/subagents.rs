@@ -2,14 +2,17 @@
 
 //! Subagent completion propagation, transcript reads (#1045), session-keyed cancel, and the status snapshot on reattach (#1189).
 
-use super::{drain_events, subscribe_session, test_app_state, test_app_state_with_mock_llm};
+use super::{
+    drain_events, marker_of_type, subscribe_session, test_app_state, test_app_state_with_mock_llm,
+    wait_for_cancelled_record,
+};
 use crate::test_support::{AppStateWithChannels, TestAppState};
 use alms_coordinator::{SubagentCompletion, TaskId, TaskStatus};
 use alms_core::{AgentId, RunId, SessionId, TokenUsage};
 use alms_test_support::RawServer;
 use alms_tools::SubagentDispatcher;
 use std::sync::Arc;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 // ---------------------------------------------------------------------------
@@ -44,6 +47,7 @@ async fn subagent_completion_propagates_session_id() {
             task_id: TaskId::new(),
             subagent_name: Some("researcher".to_string()),
             status: TaskStatus::Completed,
+            cancelled_directly: false,
             summary: "Found 3 relevant papers on the topic.".to_string(),
             parent_session_id,
             parent_agent_id,
@@ -147,6 +151,401 @@ async fn subagent_completion_propagates_session_id() {
     );
 
     shutdown_token.cancel();
+}
+
+// ---------------------------------------------------------------------------
+// Cancelled background subagents (#121, PR #190)
+//
+// A direct cancel (`POST /sessions/{id}/subagent/cancel`) starts one
+// notification run whose input carries the safeguard below. A stop (the
+// parent run's token fired, or `DELETE /jobs` teardown) starts no run and
+// queues a model-visible `subagent_cancelled` record on the parent agent's
+// queue instead.
+// ---------------------------------------------------------------------------
+
+/// The maintainer's safeguard for the direct-cancel notification run. The
+/// run is system-triggered and promoted from Guarded, and nothing enforces
+/// the safeguard; its wording is the only thing discouraging unrequested
+/// rework.
+const DIRECT_CANCEL_SAFEGUARD: &str = "The operator cancelled this subagent deliberately. \
+     Don't re-run it or redo its work unless the operator asks; decide whether \
+     your current plan needs to change, and tell the operator.";
+
+/// A cancelled completion shaped like the coordinator's real output: both
+/// cancel arms in `run_subagent` leave no result and no run output, so the
+/// summary is `[no content]` and there is no tool count or token usage
+/// (Tim's S1 on PR #190). `duration_ms` is always set.
+fn cancelled_completion(
+    parent_session_id: SessionId,
+    parent_agent_id: AgentId,
+    subagent_session_id: SessionId,
+    cancelled_directly: bool,
+) -> SubagentCompletion {
+    SubagentCompletion {
+        task_id: TaskId::new(),
+        subagent_name: Some("researcher".to_string()),
+        status: TaskStatus::Cancelled,
+        cancelled_directly,
+        summary: "[no content]".to_string(),
+        parent_session_id,
+        parent_agent_id,
+        subagent_session_id,
+        task_description: Some("Research the topic".to_string()),
+        tool_count: None,
+        duration_ms: Some(1200),
+        token_usage: None,
+        parent_tool_invocation_id: None,
+    }
+}
+
+fn text_of(message: &alms_session::Message) -> &str {
+    match &message.content {
+        alms_session::Content::Text(text) => text,
+        other => panic!("expected text content, got {other:?}"),
+    }
+}
+
+/// A direct cancel starts exactly one notification run, its input carries
+/// the safeguard, and the lifecycle marker and SSE event still report the
+/// cancellation. No separate record is written: the run's input is the
+/// model-visible trace.
+#[tokio::test]
+async fn directly_cancelled_subagent_starts_one_notification_run_with_safeguard() {
+    let (state, shutdown_token, _cr, _tr, _dr) = test_app_state();
+    let parent_agent_id = AgentId::new();
+    let parent_session_id = state
+        .session_manager
+        .get_or_create(parent_agent_id, "direct-cancel-test")
+        .id;
+    let subagent_session_id = SessionId::new();
+    let mut events = subscribe_session(&state, parent_session_id);
+
+    let (test_tx, test_rx) = mpsc::unbounded_channel();
+    test_tx
+        .send(cancelled_completion(
+            parent_session_id,
+            parent_agent_id,
+            subagent_session_id,
+            true,
+        ))
+        .unwrap();
+    drop(test_tx);
+    crate::runs::notifications::completion_notification_loop(test_rx, state.clone()).await;
+
+    let runs = state.run_manager.list_by_session(parent_session_id, 10);
+    assert_eq!(
+        runs.len(),
+        1,
+        "a direct cancel starts exactly one notification run; got {runs:?}"
+    );
+    let input = &runs[0].input;
+    assert!(input.contains(DIRECT_CANCEL_SAFEGUARD), "{input}");
+    assert!(
+        input.contains("The operator cancelled background subagent \"researcher\""),
+        "{input}"
+    );
+    assert!(
+        input.contains(&format!(
+            "read_session(session_id: \"{}\")",
+            subagent_session_id.0
+        )),
+        "{input}"
+    );
+    assert!(
+        marker_of_type(&state, parent_session_id, "subagent_cancelled").is_none(),
+        "a direct cancel's news travels in the run's input, not a separate record"
+    );
+
+    let marker = marker_of_type(&state, parent_session_id, "subagent_completion")
+        .expect("the lifecycle marker must still be persisted");
+    let metadata = marker.metadata.as_ref().unwrap();
+    assert_eq!(metadata["status"], "cancelled");
+    assert_eq!(metadata["summary"], "[no content]");
+
+    let event = drain_events(&mut events)
+        .into_iter()
+        .find(|event| event.event_type == "subagent_completed")
+        .expect("the cancelled completion must still emit SSE");
+    assert_eq!(event.data["status"], "cancelled");
+
+    shutdown_token.cancel();
+}
+
+/// A natural result that wins the race against a direct cancel keeps its
+/// normal notification, even when the completion arrives carrying the flag.
+/// The coordinator never emits that shape (its own guard is pinned by
+/// `cancel_racing_terminal_persistence_keeps_completed_result`); this pins
+/// the gateway's half of the double check (Tim's B1 on PR #190).
+#[tokio::test]
+async fn natural_completion_racing_a_direct_cancel_keeps_its_notification() {
+    let (state, shutdown_token, _cr, _tr, _dr) = test_app_state();
+    let parent_agent_id = AgentId::new();
+    let parent_session_id = state
+        .session_manager
+        .get_or_create(parent_agent_id, "direct-cancel-race-test")
+        .id;
+    let completion = SubagentCompletion {
+        status: TaskStatus::Completed,
+        summary: "Found 3 relevant papers.".to_string(),
+        tool_count: Some(3),
+        ..cancelled_completion(parent_session_id, parent_agent_id, SessionId::new(), true)
+    };
+    let expected_input = crate::runs::notifications::format_completion_notification(&completion);
+
+    let (test_tx, test_rx) = mpsc::unbounded_channel();
+    test_tx.send(completion).unwrap();
+    drop(test_tx);
+    crate::runs::notifications::completion_notification_loop(test_rx, state.clone()).await;
+
+    let runs = state.run_manager.list_by_session(parent_session_id, 10);
+    assert_eq!(runs.len(), 1, "the result still gets its notification run");
+    assert_eq!(
+        runs[0].input, expected_input,
+        "the normal completion notification, carrying the result"
+    );
+    assert!(runs[0].input.contains("Found 3 relevant papers."));
+    assert!(!runs[0].input.contains(DIRECT_CANCEL_SAFEGUARD));
+    assert!(marker_of_type(&state, parent_session_id, "subagent_cancelled").is_none());
+
+    shutdown_token.cancel();
+}
+
+/// Append one message to a session's history.
+fn append_message(
+    state: &crate::server::AppState,
+    session_id: SessionId,
+    role: alms_session::Role,
+    content: alms_session::Content,
+    metadata: Option<serde_json::Value>,
+) {
+    state
+        .session_manager
+        .append_message(
+            session_id,
+            alms_session::Message {
+                id: uuid::Uuid::new_v4().to_string(),
+                role,
+                content,
+                timestamp: alms_core::Timestamp::now(),
+                metadata,
+            },
+        )
+        .unwrap();
+}
+
+/// A parent turn stopped mid-tool, for the record-placement tests (Tim's R1
+/// and R2 on PR #190). The tool call `call_1` is persisted, as the runtime
+/// persists it before it executes the tool, and the parent agent's queue is
+/// held by a started work item, as the run executing the tool holds it.
+struct ParentTurnMidTool {
+    release: oneshot::Sender<()>,
+    returned: oneshot::Receiver<()>,
+}
+
+impl ParentTurnMidTool {
+    async fn start(
+        state: &crate::server::AppState,
+        agent_id: AgentId,
+        session_id: SessionId,
+    ) -> Self {
+        append_message(
+            state,
+            session_id,
+            alms_session::Role::User,
+            alms_session::Content::Text("run the long script".to_string()),
+            None,
+        );
+        append_message(
+            state,
+            session_id,
+            alms_session::Role::Assistant,
+            alms_session::Content::ToolCall {
+                name: "shell".to_string(),
+                params: serde_json::json!({"command": "./long-script.sh"}),
+            },
+            Some(serde_json::json!({"tool_call_id": "call_1"})),
+        );
+
+        // That run's work item has started on the parent agent's queue and
+        // has not returned: it is executing the tool.
+        let (started_tx, started_rx) = oneshot::channel();
+        let (release, release_rx) = oneshot::channel::<()>();
+        let (returned_tx, returned) = oneshot::channel();
+        state
+            .agent_queue
+            .try_reserve(agent_id)
+            .expect("queue admission")
+            .submit(Box::pin(async move {
+                let _ = started_tx.send(());
+                let _ = release_rx.await;
+                let _ = returned_tx.send(());
+            }))
+            .expect("queue dispatch");
+        started_rx.await.expect("the parent turn is running");
+        Self { release, returned }
+    }
+
+    /// The parent run saves the tool's result, as its cancel arm does, and
+    /// its work item returns.
+    async fn finish(self, state: &crate::server::AppState, session_id: SessionId) {
+        append_message(
+            state,
+            session_id,
+            alms_session::Role::Tool,
+            alms_session::Content::ToolResult {
+                tool_id: "call_1".to_string(),
+                result: serde_json::json!("cancelled"),
+            },
+            None,
+        );
+        self.release.send(()).unwrap();
+        self.returned.await.expect("the parent turn returns");
+    }
+}
+
+/// Build the parent's next context and assert that `call_1`'s result follows
+/// the call directly. Returns the context and the call's index in it.
+fn context_with_intact_tool_pair(
+    state: &crate::server::AppState,
+    session_id: SessionId,
+) -> (Vec<alms_runtime::LlmMessage>, usize) {
+    use alms_core::config::ContextConfig;
+    use alms_runtime::context::ContextBuilder;
+
+    let history = state
+        .session_manager
+        .get_context_history(session_id)
+        .unwrap();
+    let messages = ContextBuilder::new(ContextConfig {
+        strategy: "truncate".into(),
+        max_input_tokens: 32000,
+        summary_model: None,
+        ..Default::default()
+    })
+    .build("You are the parent.", &history, "what happened?", None);
+
+    let call = messages
+        .iter()
+        .position(|message| {
+            message
+                .tool_calls
+                .as_ref()
+                .is_some_and(|calls| calls.iter().any(|call| call.id == "call_1"))
+        })
+        .expect("the tool call reaches the context");
+    let next = &messages[call + 1];
+    assert_eq!(
+        (next.role.as_str(), next.tool_call_id.as_deref()),
+        ("tool", Some("call_1")),
+        "the tool call's result must follow it directly; got {messages:#?}"
+    );
+    (messages, call)
+}
+
+/// Tim's R1 on PR #190: a stopped subagent's record must not land between a
+/// parent run's tool call and that call's result. The parent agent's queue
+/// is held busy the way the run executing the tool holds it; the record must
+/// wait, and the next context build must have no user turn inside the pair.
+#[tokio::test]
+async fn stopped_subagent_record_waits_for_the_parent_turn() {
+    let (state, shutdown_token, _cr, _tr, _dr) = test_app_state();
+    let parent_agent_id = AgentId::new();
+    let parent_session_id = state
+        .session_manager
+        .get_or_create(parent_agent_id, "stopped-mid-tool")
+        .id;
+    let parent_turn = ParentTurnMidTool::start(&state, parent_agent_id, parent_session_id).await;
+
+    // The parent is stopped mid-tool; its background subagent's cancellation
+    // arrives before the tool's result is saved.
+    let (test_tx, test_rx) = mpsc::unbounded_channel();
+    test_tx
+        .send(cancelled_completion(
+            parent_session_id,
+            parent_agent_id,
+            SessionId::new(),
+            false,
+        ))
+        .unwrap();
+    drop(test_tx);
+    crate::runs::notifications::completion_notification_loop(test_rx, state.clone()).await;
+
+    assert!(
+        state
+            .run_manager
+            .list_by_session(parent_session_id, 10)
+            .is_empty(),
+        "a stopped subagent starts no notification run"
+    );
+    assert!(
+        marker_of_type(&state, parent_session_id, "subagent_cancelled").is_none(),
+        "the record must wait for the parent's turn, not be appended mid-tool"
+    );
+
+    parent_turn.finish(&state, parent_session_id).await;
+    wait_for_cancelled_record(&state, parent_session_id).await;
+
+    let (messages, call) = context_with_intact_tool_pair(&state, parent_session_id);
+    let record = messages
+        .iter()
+        .position(|message| {
+            message.role == "user"
+                && message
+                    .content
+                    .as_deref()
+                    .is_some_and(|content| content.contains("[Error] Background subagent"))
+        })
+        .expect("the record reaches the model");
+    assert!(record > call + 1, "the record lands after the tool pair");
+
+    shutdown_token.cancel();
+}
+
+/// Tim's R2 on PR #190: graceful shutdown closes the agent queue before it
+/// cancels in-flight runs, and a stopped parent run can still save tool
+/// results from inside its work item. The record must not be appended
+/// directly then. It is dropped, as the notification run was before
+/// PR #190, and the tool call is still directly followed by its result.
+#[tokio::test]
+async fn stopped_subagent_record_at_shutdown_never_splits_the_tool_pair() {
+    let (state, shutdown_token, _cr, _tr, _dr) = test_app_state();
+    let parent_agent_id = AgentId::new();
+    let parent_session_id = state
+        .session_manager
+        .get_or_create(parent_agent_id, "stopped-mid-tool-at-shutdown")
+        .id;
+    let parent_turn = ParentTurnMidTool::start(&state, parent_agent_id, parent_session_id).await;
+
+    // Shutdown closes the queue while the parent's work item keeps running.
+    // The stopped subagent's cancellation arrives before the tool's result
+    // is saved.
+    shutdown_token.cancel();
+    let (test_tx, test_rx) = mpsc::unbounded_channel();
+    test_tx
+        .send(cancelled_completion(
+            parent_session_id,
+            parent_agent_id,
+            SessionId::new(),
+            false,
+        ))
+        .unwrap();
+    drop(test_tx);
+    crate::runs::notifications::completion_notification_loop(test_rx, state.clone()).await;
+
+    parent_turn.finish(&state, parent_session_id).await;
+
+    context_with_intact_tool_pair(&state, parent_session_id);
+    assert!(
+        state
+            .run_manager
+            .list_by_session(parent_session_id, 10)
+            .is_empty(),
+        "a stopped subagent starts no notification run"
+    );
+    assert!(
+        marker_of_type(&state, parent_session_id, "subagent_cancelled").is_none(),
+        "with the queue closed, the record is dropped"
+    );
 }
 
 /// Drive `forward_runtime_events` with a single foreground
@@ -434,6 +833,7 @@ async fn subagent_completion_with_missing_parent_session_is_skipped() {
             task_id: TaskId::new(),
             subagent_name: Some("ghost".to_string()),
             status: TaskStatus::Completed,
+            cancelled_directly: false,
             summary: "This should be skipped".to_string(),
             parent_session_id: missing_session_id,
             parent_agent_id,
@@ -480,6 +880,7 @@ async fn subagent_completion_marker_includes_rich_metadata() {
             task_id: TaskId::new(),
             subagent_name: Some("analyzer".to_string()),
             status: TaskStatus::Failed,
+            cancelled_directly: false,
             summary: "OOM after processing large dataset".to_string(),
             parent_session_id,
             parent_agent_id,
@@ -576,6 +977,7 @@ async fn subagent_completion_marker_includes_reasoning_tokens() {
             task_id: TaskId::new(),
             subagent_name: Some("reasoner".to_string()),
             status: TaskStatus::Completed,
+            cancelled_directly: false,
             summary: "Deep thought complete".to_string(),
             parent_session_id,
             parent_agent_id,
@@ -828,6 +1230,10 @@ async fn cancel_subagent_endpoint_404_when_no_live_subagent() {
 
 /// The 200 leg: cancelling a LIVE subagent through the handler fires its
 /// cancellation token and the subagent actually terminates `Cancelled`.
+/// End to end through the production route (#121, PR #190): the
+/// coordinator's real completion is marked `cancelled_directly`, and
+/// `completion_notification_loop` starts exactly one notification run whose
+/// input carries the safeguard.
 ///
 /// Determinism note: `#[tokio::test]` uses the current-thread runtime, and
 /// the handler body has no await points before the (synchronous)
@@ -839,17 +1245,25 @@ async fn cancel_subagent_endpoint_404_when_no_live_subagent() {
 /// the awaited `TaskResult` asserts end-to-end.
 #[tokio::test]
 async fn cancel_subagent_endpoint_cancels_live_subagent() {
-    use axum::extract::{Path as AxumPath, State as AxumState};
+    use axum::body::Body;
+    use axum::http::Request as HttpRequest;
+    use tower::ServiceExt;
 
-    let (state, shutdown_token, _cr, _tr, _dr) = test_app_state_with_mock_llm();
+    let (state, shutdown_token, mut completion_rx, _tr, _dr) = test_app_state_with_mock_llm();
+    let parent_agent_id = AgentId::new();
+    let parent_session_id = state
+        .session_manager
+        .get_or_create(parent_agent_id, "cancelled-subagent-e2e")
+        .id;
+    let mut parent_events = subscribe_session(&state, parent_session_id);
 
     // Spawn a background subagent directly on the coordinator (the same
     // object the endpoint reaches through `state.coordinator`). Unnamed, so
     // no registry entry is needed.
     let request = alms_coordinator::SubagentRequest {
         task: "long-running background research".to_string(),
-        parent_session: SessionId::new(),
-        parent_agent_id: AgentId::new(),
+        parent_session: parent_session_id,
+        parent_agent_id,
         parent_run_id: None,
         subagent_name: None,
         parent_tool_invocation_id: None,
@@ -859,18 +1273,31 @@ async fn cancel_subagent_endpoint_cancels_live_subagent() {
         .spawn_subagent(request, None, true, None)
         .await
         .expect("spawn_subagent should succeed");
+    let sub_session_id_text = sub_session_id.0.to_string();
     let result_rx = state
         .coordinator
         .take_result_rx(task_id)
         .expect("result receiver should be available");
 
-    // Cancel through the HTTP handler (session-keyed).
-    let response =
-        crate::runs::lifecycle::cancel_subagent(AxumState(state.clone()), AxumPath(sub_session_id))
-            .await
-            .expect("cancel of a live subagent must return 200");
+    // Cancel through the production HTTP route.
+    let cancel_uri = format!("/sessions/{}/subagent/cancel", sub_session_id.0);
+    let response = crate::server::routes::protected_router()
+        .with_state(state.clone())
+        .oneshot(HttpRequest::post(&cancel_uri).body(Body::empty()).unwrap())
+        .await
+        .expect("router oneshot should not fail");
     assert_eq!(
-        response.0["status"], "cancelling",
+        response.status(),
+        axum::http::StatusCode::OK,
+        "cancelling a live subagent must return 200"
+    );
+    let response_bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+        .await
+        .expect("read cancel response");
+    let response_json: serde_json::Value =
+        serde_json::from_slice(&response_bytes).expect("response should be JSON");
+    assert_eq!(
+        response_json["status"], "cancelling",
         "the 200 body must report status=cancelling"
     );
 
@@ -885,19 +1312,208 @@ async fn cancel_subagent_endpoint_cancels_live_subagent() {
         task_result.status
     );
 
-    // Idempotence / double-click: the subagent is now terminal, so a second
-    // cancel must report 404 (no live subagent), not 200.
-    let second =
-        crate::runs::lifecycle::cancel_subagent(AxumState(state.clone()), AxumPath(sub_session_id))
-            .await;
+    let completion = completion_rx
+        .recv()
+        .await
+        .expect("directly cancelled background subagent must emit a completion");
+    assert_eq!(completion.status, TaskStatus::Cancelled);
     assert!(
-        second.is_err(),
-        "a second cancel after termination must be an error (404)"
+        completion.cancelled_directly,
+        "the endpoint is the operator's direct cancel"
     );
     assert_eq!(
-        second.unwrap_err().0,
+        completion.summary, "[no content]",
+        "the coordinator drops partial output when cancellation wins"
+    );
+    assert_eq!(completion.tool_count, None);
+    assert_eq!(completion.subagent_session_id, sub_session_id);
+
+    // Idempotence / double-click: the subagent is now terminal, so a second
+    // cancel must report 404 (no live subagent), not 200.
+    let second = crate::server::routes::protected_router()
+        .with_state(state.clone())
+        .oneshot(HttpRequest::post(&cancel_uri).body(Body::empty()).unwrap())
+        .await
+        .expect("router oneshot should not fail");
+    assert_eq!(
+        second.status(),
         axum::http::StatusCode::NOT_FOUND,
         "the second cancel must be a 404"
+    );
+    let second_bytes = axum::body::to_bytes(second.into_body(), 64 * 1024)
+        .await
+        .expect("read second cancel response");
+    let second_json: serde_json::Value =
+        serde_json::from_slice(&second_bytes).expect("error body should be JSON");
+    assert_eq!(second_json["error"]["code"], "NO_LIVE_SUBAGENT");
+
+    let (notification_tx, notification_rx) = mpsc::unbounded_channel();
+    notification_tx
+        .send(completion)
+        .expect("forward the coordinator's real completion");
+    drop(notification_tx);
+    crate::runs::notifications::completion_notification_loop(notification_rx, state.clone()).await;
+
+    // Exactly one notification run, telling the parent the cancel was
+    // deliberate and not to redo the work unprompted.
+    let runs = state.run_manager.list_by_session(parent_session_id, 10);
+    assert_eq!(
+        runs.len(),
+        1,
+        "a direct cancel starts exactly one parent notification run; got {runs:?}"
+    );
+    let input = &runs[0].input;
+    assert!(input.contains(DIRECT_CANCEL_SAFEGUARD), "{input}");
+    assert!(
+        input.contains(&format!(
+            "read_session(session_id: \"{sub_session_id_text}\")"
+        )),
+        "{input}"
+    );
+    assert!(
+        marker_of_type(&state, parent_session_id, "subagent_cancelled").is_none(),
+        "the run's input carries the news; no separate record"
+    );
+
+    let completion_marker = marker_of_type(&state, parent_session_id, "subagent_completion")
+        .expect("cancelled subagent lifecycle marker must be persisted");
+    let completion_metadata = completion_marker.metadata.as_ref().unwrap();
+    assert_eq!(
+        completion_metadata.get("summary").and_then(|v| v.as_str()),
+        Some("[no content]")
+    );
+    assert_eq!(
+        completion_metadata
+            .get("session_id")
+            .and_then(|v| v.as_str()),
+        Some(sub_session_id_text.as_str())
+    );
+
+    let completion_event = drain_events(&mut parent_events)
+        .into_iter()
+        .find(|event| event.event_type == "subagent_completed")
+        .expect("cancelled completion must still emit SSE to the parent");
+    assert_eq!(
+        completion_event.data.get("status").and_then(|v| v.as_str()),
+        Some("cancelled")
+    );
+    assert_eq!(
+        completion_event
+            .data
+            .get("summary")
+            .and_then(|v| v.as_str()),
+        Some("[no content]")
+    );
+    assert_eq!(
+        completion_event
+            .data
+            .get("subagent_session_id")
+            .and_then(|v| v.as_str()),
+        Some(sub_session_id_text.as_str())
+    );
+    assert!(
+        state.session_manager.get(sub_session_id).is_ok(),
+        "the cancelled subagent's session remains readable"
+    );
+
+    shutdown_token.cancel();
+}
+
+/// A real parent-run stop, end to end (Tim's S1 on PR #190): the parent's
+/// token fires, the cancellation propagates to its background subagent, and
+/// the coordinator's real completion goes through
+/// `completion_notification_loop`. No notification run starts; the marker
+/// and SSE event report the cancellation, and the model-visible record lands
+/// once the parent agent's queue reaches it.
+///
+/// Deterministic for the same reason as the endpoint test above: the parent
+/// token fires before the spawned subagent task is first polled.
+#[tokio::test]
+async fn parent_stop_cancels_subagent_without_notification_run() {
+    let (state, shutdown_token, mut completion_rx, _tr, _dr) = test_app_state_with_mock_llm();
+    let parent_agent_id = AgentId::new();
+    let parent_session_id = state
+        .session_manager
+        .get_or_create(parent_agent_id, "parent-stop-e2e")
+        .id;
+    let mut parent_events = subscribe_session(&state, parent_session_id);
+    let parent_cancel = CancellationToken::new();
+    let request = alms_coordinator::SubagentRequest {
+        task: "background work cancelled with the parent".to_string(),
+        parent_session: parent_session_id,
+        parent_agent_id,
+        parent_run_id: None,
+        subagent_name: None,
+        parent_tool_invocation_id: None,
+    };
+    let (task_id, sub_session_id) = state
+        .coordinator
+        .spawn_subagent(request, None, true, Some(parent_cancel.clone()))
+        .await
+        .expect("spawn_subagent should succeed");
+    let result_rx = state
+        .coordinator
+        .take_result_rx(task_id)
+        .expect("result receiver should be available");
+
+    parent_cancel.cancel();
+    let result = result_rx
+        .await
+        .expect("parent cancellation must terminate task");
+    assert_eq!(result.status, TaskStatus::Cancelled);
+    let completion = completion_rx
+        .recv()
+        .await
+        .expect("parent-cancelled background subagent must emit a completion");
+    assert_eq!(completion.status, TaskStatus::Cancelled);
+    assert!(
+        !completion.cancelled_directly,
+        "a cancel propagated from the parent run is a stop"
+    );
+    assert_eq!(completion.summary, "[no content]");
+    assert_eq!(completion.tool_count, None);
+
+    let (notification_tx, notification_rx) = mpsc::unbounded_channel();
+    notification_tx.send(completion).unwrap();
+    drop(notification_tx);
+    crate::runs::notifications::completion_notification_loop(notification_rx, state.clone()).await;
+
+    assert!(
+        state
+            .run_manager
+            .list_by_session(parent_session_id, 10)
+            .is_empty(),
+        "stopping the parent must not start an unrequested notification run"
+    );
+    let marker = marker_of_type(&state, parent_session_id, "subagent_completion")
+        .expect("the lifecycle marker must still be persisted");
+    assert_eq!(marker.metadata.as_ref().unwrap()["status"], "cancelled");
+    let event = drain_events(&mut parent_events)
+        .into_iter()
+        .find(|event| event.event_type == "subagent_completed")
+        .expect("the cancelled completion must still emit SSE");
+    assert_eq!(event.data["status"], "cancelled");
+
+    let record = wait_for_cancelled_record(&state, parent_session_id).await;
+    let metadata = record.metadata.as_ref().unwrap();
+    assert_eq!(
+        metadata["kind"], "error",
+        "only error markers reach the model"
+    );
+    assert_eq!(
+        metadata["subagent_session_id"],
+        sub_session_id.0.to_string().as_str()
+    );
+    // Tim's S3: the UI shows this to the operator too, so it reads as a plain
+    // account of what happened, with the way to inspect the session.
+    assert_eq!(
+        text_of(&record),
+        format!(
+            "An unnamed background subagent (session_id: {id}) was cancelled before it \
+             finished and returned no result. Its session keeps whatever it did: \
+             read_session(session_id: \"{id}\").",
+            id = sub_session_id.0
+        )
     );
 
     shutdown_token.cancel();
