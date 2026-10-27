@@ -422,7 +422,11 @@ impl Gateway {
                 // `migrate_sidecar_agent`, only if its agent owns sessions
                 // (#180).
                 if SIDECAR_EXISTED.load(std::sync::atomic::Ordering::Relaxed) {
-                    migrate_sidecar_agent(&store, configured_agent_id);
+                    migrate_sidecar_agent(
+                        &store,
+                        configured_agent_id,
+                        config.workspace_dir.as_deref(),
+                    );
                 }
                 // After the migration, so a `main` it just created counts.
                 default_agent_id = boot_default_agent_id(
@@ -1229,6 +1233,13 @@ async fn process_telegram_message(
 /// `main` does not come back on the next restart unless that bot has filed
 /// new ones under the ID in the meantime.
 ///
+/// **Only when `{workspace_dir}/main/` is available (#191).** Workspaces are
+/// keyed by name, so a folder there holding more than the blank seed scaffold
+/// may be another agent's data, for example from a deletion before workspaces
+/// were archived, or a named subagent's writes. Registering `main` over it
+/// would hand that data to the migrated agent, so the migration logs a WARN
+/// and skips; move the folder and restart to migrate.
+///
 /// Uses `create_agent_if_none_exist` to atomically check-and-insert within a
 /// single SQLite transaction, avoiding the TOCTOU race between checking
 /// `list_agents().is_empty()` and `create_agent()`. The `list_agents` read
@@ -1236,8 +1247,12 @@ async fn process_telegram_message(
 /// deployment that already has agents.
 ///
 /// All errors are non-fatal (`warn!` only) — migration must never block startup.
-#[instrument(skip(store))]
-fn migrate_sidecar_agent(store: &SqliteStore, agent_id: AgentId) {
+#[instrument(skip(store, workspace_dir))]
+fn migrate_sidecar_agent(
+    store: &SqliteStore,
+    agent_id: AgentId,
+    workspace_dir: Option<&std::path::Path>,
+) {
     match store.list_agents() {
         Ok(agents) if !agents.is_empty() => return,
         Ok(_) => {}
@@ -1271,6 +1286,19 @@ fn migrate_sidecar_agent(store: &SqliteStore, agent_id: AgentId) {
             migration_name, e
         );
         return;
+    }
+
+    if let Some(workspace_dir) = workspace_dir {
+        let path = workspace_dir.join(migration_name);
+        if let Err(error) = alms_core::ensure_workspace_dir_available(&path) {
+            warn!(
+                path = %path.display(),
+                "Not registering the sidecar agent as '{}': its workspace may contain data from a deleted agent: {}; move it and restart to migrate",
+                migration_name,
+                error
+            );
+            return;
+        }
     }
 
     let now = chrono::Utc::now();
@@ -1568,7 +1596,7 @@ mod tests {
     fn test_migrate_creates_default_agent() {
         let agent_id = AgentId::new();
         let store = legacy_store(agent_id);
-        migrate_sidecar_agent(&store, agent_id);
+        migrate_sidecar_agent(&store, agent_id, None);
 
         let agents = store.list_agents().unwrap();
         assert_eq!(agents.len(), 1);
@@ -1578,11 +1606,45 @@ mod tests {
     }
 
     #[test]
+    fn test_migrate_skips_main_workspace_with_existing_data() {
+        let agent_id = AgentId::new();
+        let store = legacy_store(agent_id);
+        let tmp = tempfile::tempdir().unwrap();
+        let main_workspace = tmp.path().join("main");
+        std::fs::create_dir_all(&main_workspace).unwrap();
+        std::fs::write(main_workspace.join("memories.md"), "private notes").unwrap();
+
+        migrate_sidecar_agent(&store, agent_id, Some(tmp.path()));
+
+        assert!(store.list_agents().unwrap().is_empty());
+        assert_eq!(
+            std::fs::read_to_string(main_workspace.join("memories.md")).unwrap(),
+            "private notes"
+        );
+    }
+
+    #[test]
+    fn test_migrate_allows_blank_main_workspace_scaffold() {
+        let agent_id = AgentId::new();
+        let store = legacy_store(agent_id);
+        let tmp = tempfile::tempdir().unwrap();
+        let main_workspace = tmp.path().join("main");
+        alms_core::init_workspace_files(&main_workspace).unwrap();
+
+        migrate_sidecar_agent(&store, agent_id, Some(tmp.path()));
+
+        let agents = store.list_agents().unwrap();
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agents[0].name, "main");
+        assert_eq!(agents[0].id, agent_id);
+    }
+
+    #[test]
     fn test_migrate_idempotent() {
         let agent_id = AgentId::new();
         let store = legacy_store(agent_id);
-        migrate_sidecar_agent(&store, agent_id);
-        migrate_sidecar_agent(&store, agent_id);
+        migrate_sidecar_agent(&store, agent_id, None);
+        migrate_sidecar_agent(&store, agent_id, None);
 
         let agents = store.list_agents().unwrap();
         assert_eq!(agents.len(), 1);
@@ -1595,13 +1657,13 @@ mod tests {
     fn test_migrate_skips_sidecar_that_owns_no_sessions() {
         let store = SqliteStore::open_in_memory().unwrap();
         let sidecar_id = AgentId::new();
-        migrate_sidecar_agent(&store, sidecar_id);
+        migrate_sidecar_agent(&store, sidecar_id, None);
         assert!(store.list_agents().unwrap().is_empty(), "empty store");
 
         store
             .save_session(&alms_session::Session::new(AgentId::new(), "web-chat-1"))
             .unwrap();
-        migrate_sidecar_agent(&store, sidecar_id);
+        migrate_sidecar_agent(&store, sidecar_id, None);
         assert!(
             store.list_agents().unwrap().is_empty(),
             "sessions owned by another agent"
@@ -1612,7 +1674,7 @@ mod tests {
     fn test_migrate_preserves_agent_id() {
         let agent_id = AgentId::new();
         let store = legacy_store(agent_id);
-        migrate_sidecar_agent(&store, agent_id);
+        migrate_sidecar_agent(&store, agent_id, None);
 
         let loaded = store.load_agent_by_id(agent_id).unwrap();
         assert!(loaded.is_some());
@@ -1643,7 +1705,7 @@ mod tests {
         store.create_agent(&existing).unwrap();
 
         // Migration with a different agent_id should be a no-op
-        migrate_sidecar_agent(&store, sidecar_id);
+        migrate_sidecar_agent(&store, sidecar_id, None);
 
         let agents = store.list_agents().unwrap();
         assert_eq!(agents.len(), 1);
@@ -1658,11 +1720,11 @@ mod tests {
     fn deleted_main_is_not_migrated_again() {
         let sidecar_id = AgentId::new();
         let store = legacy_store(sidecar_id);
-        migrate_sidecar_agent(&store, sidecar_id);
+        migrate_sidecar_agent(&store, sidecar_id, None);
         assert_eq!(store.list_agents().unwrap().len(), 1, "migrated");
 
         assert!(store.delete_agent(sidecar_id).unwrap());
-        migrate_sidecar_agent(&store, sidecar_id);
+        migrate_sidecar_agent(&store, sidecar_id, None);
 
         let agents = store.list_agents().unwrap();
         assert!(agents.is_empty(), "`main` came back: {agents:?}");

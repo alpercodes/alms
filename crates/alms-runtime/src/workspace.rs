@@ -1070,6 +1070,11 @@ impl AgentWorkspace {
     /// locking the data file would make an agent's memories silently
     /// disappear from the system prompt of any run that happened to build
     /// its context during an append — a worse bug than the one being fixed.
+    ///
+    /// `alms_core::registry::is_blank_scaffold` accepts a leftover workspace
+    /// for name reuse only if it holds blank seed files and sidecars named
+    /// exactly `.{file}.lock`. Renaming the sidecar here without changing it
+    /// there blocks the name of every agent that was used and then deleted.
     fn lock_path(dir: &Path, file: WorkspaceFile) -> PathBuf {
         dir.join(format!(".{}.lock", file.filename()))
     }

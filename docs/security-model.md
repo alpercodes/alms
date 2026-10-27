@@ -495,7 +495,9 @@ behaviour from #242: every agent's metadata directory at
 so a parent agent can already `fs_read('.alms/agents/<sibling>/personality.md')`
 through normal `fs_read`/`fs_list`/`fs_grep`/`fs_glob` calls — no
 separate extras list, no sibling-workspaces root, no asymmetric
-ephemeral-subagent rules to track. `fs_write`/`fs_edit`/`workspace_write`
+ephemeral-subagent rules to track. That includes `.alms/agents/.deleted/`,
+where deleted agents' workspaces are archived (#191).
+`fs_write`/`fs_edit`/`workspace_write`
 land in the same root, so a write to a sibling's metadata file is
 syntactically possible but only ever via the agent's own sandboxed
 write path — and `workspace_write` itself is hard-pinned to the agent's

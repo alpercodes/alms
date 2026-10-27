@@ -1850,6 +1850,7 @@ Side effects: creates the agent's workspace directory at `{workspace_dir}/{name}
 Errors:
 - `400 INVALID_NAME` — name fails validation (1–64 chars, ASCII alphanumeric + hyphens, no leading/trailing hyphens, not a reserved name, not UUID-shaped). Uppercase is allowed and preserved verbatim.
 - `409 DUPLICATE_NAME` — name already exists. **Uniqueness is case-insensitive**: `Atlas` and `atlas` are the same name, because an agent's workspace is a directory at `{workspace_dir}/{name}/` and Windows/macOS filesystems are case-insensitive while Linux is not.
+- `409 WORKSPACE_EXISTS` — the name's workspace path contains data beyond the blank seed files and their lock sidecars, or the path is a symlink/file. Move or delete it before reusing the agent name; the API does not delete existing workspace data. Named subagents share this `{workspace_dir}/{name}/` path, so they can also leave a folder that blocks creation. Any agent with `fs_write` or `shell` can create the folder too, which is how a name nobody has used can still get this conflict. A registered agent's workspace is archived on deletion; this conflict can still apply to folders left by pre-upgrade deletions, unregistered named subagents, or other agents' writes.
 
 ### 9.3 Get agent
 `GET /agents/{id_or_name}`
@@ -1924,8 +1925,15 @@ context the agent currently being inspected sees on its turn.
 ### 9.5 Delete agent
 `DELETE /agents/{id_or_name}`
 
-**Response 200** — `{ "ok": true, "deleted": "<uuid>" }`
+**Response 200** — `{ "ok": true, "deleted": "<uuid>", "workspace_archive": ".deleted/<name>-<timestamp>-<agent-id>" }`
 **Response 409 CANNOT_DELETE_DEFAULT** — cannot delete the default agent; set another default first.
+**Response 500 INTERNAL** — workspace archive failed; the agent record and workspace remain.
+
+Deleting an agent removes its registry record, sessions, messages, audit events, context summaries, and jobs. Before removing the record, the gateway moves an existing `{workspace_dir}/{name}/` to `{workspace_dir}/.deleted/<name>-<timestamp>-<agent-id>/`; the response gives that path relative to `{workspace_dir}`. The archive is retained on disk, and the name can be reused with a fresh workspace. If the workspace is absent or no workspace directory is configured, `workspace_archive` is `null`. If archiving fails, deletion returns `500` and leaves the record in place (a git-mode agent's removed worktree is restored). Data written by unregistered named subagents and folders left by deletions before this change are not archived automatically; while such a folder contains data, `POST /agents` returns `409 WORKSPACE_EXISTS` until it is moved or deleted.
+
+With the default `{workspace_dir}` (`.alms/agents/`), the archive is inside the project root, so other agents can still read it with `fs_read`/`fs_grep`, as they could before it was moved. Delete `.alms/agents/.deleted/<…>/` to remove the agent's personality, memories and `user.md` for good.
+
+Deleting an agent cancels its queued and running runs. Three writers can still recreate `{workspace_dir}/{name}/` afterwards: a tool call already executing when the cancel lands; a gateway run when the agent is deleted with `alms agent delete`, which runs in another process and cannot cancel it; and a named subagent with that name spawned by another agent. If the name has not been re-created yet, the write blocks it (`409 WORKSPACE_EXISTS`); if it has, the write lands in the new agent's files.
 
 ### 9.6 Set default agent
 `POST /agents/{id_or_name}/default`

@@ -36,7 +36,7 @@ What already works in our favor:
 | System | Multi-agent ready? | Details |
 |--------|-------------------|---------|
 | Sessions | Yes | Keyed by `(AgentId, context_id)` — `sessions` table has `agent_id` column |
-| Workspace | Yes | Per-agent directory: `data/workspace/{name}/` (name-based, not UUID-based) |
+| Workspace | Yes | Per-agent directory: `.alms/agents/{name}/` (name-based, not UUID-based) |
 | Jobs | Yes | `jobs` table has `agent_id` column |
 | Agent identity | No | Single UUID from sidecar file, no registry |
 | Config | No | Single `LlmConfig`, single `AgentConfig` — no per-agent overrides |
@@ -116,16 +116,22 @@ fn set_default_agent(&self, id: AgentId) -> AlmsResult<()>;
 
 1. User runs `alms agent create --name atlas --description "Code assistant"` or `POST /agents`
 2. System generates a UUID, inserts into `agents` table
-3. Workspace directory `data/workspace/{name}/` is created with empty identity files (personality.md, goals.md, memories.md, user.md). CLI outputs the workspace path.
+3. Workspace directory `.alms/agents/{name}/` is created with empty identity files (personality.md, goals.md, memories.md, user.md). CLI outputs the workspace path.
 4. If `--default` flag (or first agent), set `is_default = 1` (unset any previous default)
 5. On first interaction, bootstrap interview runs (existing `needs_bootstrap()` logic)
 
 ### Deleting an Agent
 
-- `alms agent delete atlas` — removes the agent record from SQLite
-- Sessions, workspace files, and audit log remain on disk (recoverable)
-- `--purge` flag — also deletes workspace directory and sessions from SQLite
-- Cannot delete the default agent without first setting another as default (or `--force`)
+> **As implemented:** `alms agent delete` and `DELETE /agents` remove the registry record,
+> sessions, messages, audit events, context summaries, and jobs. The workspace at
+> `.alms/agents/{name}/` is moved to `.alms/agents/.deleted/` with a timestamp and agent ID;
+> its contents are retained and the name can be reused. If archiving fails, deletion fails
+> and the record remains. There is no `--purge` flag. A workspace left by an unregistered
+> named subagent, or by a deletion before this behavior was added, remains in the name
+> path and prevents reuse until it is moved or deleted (`409 WORKSPACE_EXISTS`, #191).
+
+- Cannot delete an agent through the API if it is the default. The CLI's `--force` flag can
+  override that guard; for git worktrees it also overrides the uncommitted-changes guard.
 
 ### Updating an Agent
 
@@ -136,7 +142,7 @@ fn set_default_agent(&self, id: AgentId) -> AlmsResult<()>;
 
 ## Migration: Single-Agent to Multi-Agent
 
-> **As implemented:** this section is the original plan, and the code differs from it. See `migrate_sidecar_agent` and `boot_default_agent_id` in `crates/alms-gateway/src/gateway.rs`. The migrated agent is named `main`, and it is created only when the agents table is empty, the sidecar `<data_dir>/agent_id` (default `.alms/agent_id`) already exists, and sessions are filed under its ID (#180). Without a sidecar nothing is created; the first agent comes from onboarding or `alms agent create`. The sidecar is still written and read, not dropped: while the registry is empty its ID is the gateway's default agent ID, and once agents exist the registry's default agent (or the oldest agent, if none is marked default) is used instead. `ALMS_AGENT_ID` takes the sidecar's place and skips the migration.
+> **As implemented:** this section is the original plan, and the code differs from it. See `migrate_sidecar_agent` and `boot_default_agent_id` in `crates/alms-gateway/src/gateway.rs`. The migrated agent is named `main`, and it is created only when the agents table is empty, the sidecar `<data_dir>/agent_id` (default `.alms/agent_id`) already exists, sessions are filed under its ID (#180), and `{workspace_dir}/main/` is available. A data-bearing folder is left untouched and the migration logs a warning; move it and restart to retry. Without a sidecar nothing is created; the first agent comes from onboarding or `alms agent create`. The sidecar is still written and read, not dropped: while the registry is empty its ID is the gateway's default agent ID, and once agents exist the registry's default agent (or the oldest agent, if none is marked default) is used instead. `ALMS_AGENT_ID` takes the sidecar's place and skips the migration.
 
 Zero manual steps for existing deployments:
 
@@ -166,7 +172,7 @@ alms health [--url URL]                       # check system health (existing)
 alms agent list                               # table: name, id, model, default?, last_active
 alms agent create --name NAME [OPTIONS]       # --description, --model, --posture, --default
 alms agent show NAME|UUID                     # details + workspace status (bootstrapped?)
-alms agent delete NAME [--purge] [--force]    # remove agent record (--purge = full cleanup)
+alms agent delete NAME [--force]              # archive workspace and remove agent record
 alms agent set-default NAME                   # set the default agent
 alms agent config NAME [OPTIONS]              # --model, --posture, --system-prompt
 
