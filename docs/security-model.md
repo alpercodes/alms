@@ -781,13 +781,12 @@ the two apart; by the crate's code the exit it reaches is `NotEnforced`. A
 kernel with Landlock built in but not enabled at boot answers `EOPNOTSUPP`
 instead of `ENOSYS`, which the crate treats the same way (from reading the
 crate). The test has not run on either kind of kernel. A seccomp filter
-that kills the process
-instead of failing the syscall (systemd's `SystemCallFilter=` without
-`SystemCallErrorNumber=`) also stops the command, with a different
-symptom: the child dies of `SIGSYS` before it can report back, so the
-spawn succeeds and the tool reports exit code `-1` with no output. That
-case is from reading `std`, and is untested. Three consequences an
-operator needs:
+that kills the process instead of failing the syscall (systemd's
+`SystemCallFilter=` without `SystemCallErrorNumber=`) also stops the
+command, with a different symptom: the child dies of `SIGSYS` before it
+can report back, so the spawn succeeds and the tool reports exit code
+`-1` with no output. That case is from reading `std`, and is untested.
+Three consequences an operator needs:
 
 - **Without Landlock, a sandboxed `shell` is unusable, not open.** Every
   command fails to start. A `run_in_background: true` call is still
@@ -798,8 +797,8 @@ operator needs:
   child for good, and the parent in `spawn()` with it, if another thread
   held std's stderr lock at the time (from reading `std`, not reproduced;
   see the `SAFETY` comment in `apply_landlock_sandbox`). `std` passes
-  only an errno back to the parent. For a kernel without Landlock the error is `EOPNOTSUPP`, so
-  the tool result is
+  only an errno back to the parent. For a kernel without Landlock the
+  error is `EOPNOTSUPP`, so the tool result is
   `Error: Tool execution failed: IO error: Failed to spawn command: Operation not supported (os error 95)`,
   and the daemon logs
   `Tool execution failed: IO error: Failed to spawn command: Operation not supported (os error 95)`

@@ -1515,9 +1515,20 @@ mod tests {
         })
         .unwrap();
 
-        let updated = client.with_secrets(&alms_core::secrets::SecretsStore::empty());
+        let updated = client
+            .clone()
+            .with_secrets(&alms_core::secrets::SecretsStore::empty());
+
+        // A store key still wins over `api_key_env` (docs/config.md order):
+        // a key set through `PUT /auth/keys` must beat an env-configured one.
+        let dir = tempfile::tempdir().unwrap();
+        let mut secrets =
+            alms_core::secrets::SecretsStore::load(dir.path().join("secrets.json")).unwrap();
+        secrets.set_key("openrouter", "sk-or-from-store").unwrap();
+        let from_store = client.with_secrets(&secrets);
         unsafe { std::env::remove_var(ENV_VAR) };
         assert_eq!(updated.api_key(), "sk-or-from-env");
+        assert_eq!(from_store.api_key(), "sk-or-from-store");
     }
 
     #[test]
