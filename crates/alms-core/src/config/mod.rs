@@ -7,9 +7,10 @@
 //! 2. Config file (alms.toml)
 //! 3. Environment variables (non-secret `ALMS_*` prefix)
 //!
-//! Secrets (API keys, tokens) are loaded exclusively from `.alms/secrets.json`
-//! via `alms auth set`. Environment variable fallback has been removed for
-//! security — agents can read env vars via `shell_exec`.
+//! Secrets (API keys, tokens) live in the secrets file beside the database
+//! (`.alms/secrets.json` by default), written by `alms auth set` or
+//! `PUT /auth/keys`. No env var is read for a key unless a provider entry
+//! names one in `api_key_env`, and the store outranks it (`docs/config.md`).
 
 mod budget;
 mod summary_pair;
