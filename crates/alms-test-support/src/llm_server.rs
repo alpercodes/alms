@@ -181,6 +181,23 @@ impl ScriptedLlm {
             .map(|r| String::from_utf8_lossy(&r.body).into_owned())
             .collect()
     }
+
+    /// The value of header `name` on every request received, in order:
+    /// `None` for a request that did not carry it.
+    pub async fn request_headers(&self, name: &str) -> Vec<Option<String>> {
+        self.server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .map(|r| {
+                r.headers
+                    .get(name)
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_owned)
+            })
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -243,6 +260,23 @@ mod tests {
             .await
             .unwrap();
         assert_eq!((a.as_str(), b.as_str()), ("A", "other"));
+    }
+
+    #[tokio::test]
+    async fn request_headers_reports_each_request_in_order() {
+        let llm = ScriptedLlm::always(Canned::json(200, "{}")).await;
+        let client = reqwest::Client::new();
+        client
+            .post(llm.base_url())
+            .header("authorization", "Bearer k")
+            .send()
+            .await
+            .unwrap();
+        client.post(llm.base_url()).send().await.unwrap();
+        assert_eq!(
+            llm.request_headers("authorization").await,
+            vec![Some("Bearer k".to_string()), None]
+        );
     }
 
     #[tokio::test]

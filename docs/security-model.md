@@ -767,40 +767,57 @@ syscalls fail), the crate reports no error. `handle_access`, `create` and
 `restrict_self` returns `Ok` with the status `NotEnforced`. ALMS treats
 `NotEnforced` as a hard error, as it does every other failure (creating
 the ruleset, opening the sandbox root, adding a rule, `restrict_self`), so
-the child exits before `exec` and the command does not run. The branch
-that prints `[alms] Landlock not supported by kernel, running unsandboxed`
-is taken only if `handle_access` returns an error. At `BestEffort` the
-crate returns one only for an empty or unknown set of access rights, and
-ALMS passes neither (`AccessFs::from_all(ABI::V5)`). This is established
-from the code: no test exercises it, and it has not been run on a kernel
-without Landlock. A seccomp filter that kills the process instead of
-failing the syscall (systemd's `SystemCallFilter=` without
-`SystemCallErrorNumber=`) also stops the command, with a different
-symptom: the child dies of `SIGSYS` before it can report back, so the
-spawn succeeds and the tool reports exit code `-1` with no output. That
-case is from reading `std`, and is untested. Three consequences an
-operator needs:
+the child exits before `exec` and the command does not run. An error from
+`handle_access` is refused the same way. At `BestEffort` the crate returns
+one only for an empty or unknown set of access rights, and ALMS passes
+neither (`AccessFs::from_all(ABI::V5)`), so that branch is not reached
+today; refusing there keeps the command from running unsandboxed if the
+crate's behaviour changes. A Linux test in `exec.rs`
+(`sandboxed_spawn_without_landlock_fails_with_eopnotsupp`) reaches the
+`NotEnforced` branch on CI's kernel, which has Landlock: a `pre_exec`
+registered before the sandbox's installs a seccomp filter that fails the
+three Landlock system calls with `ENOSYS`, as a kernel built without
+Landlock does, and the spawn must fail with `EOPNOTSUPP`. The
+`handle_access` refusal returns the same error, so the test does not tell
+the two apart; by the crate's code the exit it reaches is `NotEnforced`. A
+kernel with Landlock built in but not enabled at boot answers `EOPNOTSUPP`
+instead of `ENOSYS`, which the crate treats the same way (from reading the
+crate). The test has not run on either kind of kernel. A seccomp filter
+that kills the process instead of failing the syscall (systemd's
+`SystemCallFilter=` without `SystemCallErrorNumber=`) also stops the
+command, with a different symptom: the child dies of `SIGSYS` before it
+can report back, so the spawn succeeds and the tool reports exit code
+`-1` with no output. That case is from reading `std`, and is untested.
+Three consequences an operator needs:
 
 - **Without Landlock, a sandboxed `shell` is unusable, not open.** Every
   command fails to start. A `run_in_background: true` call is still
   accepted and returns `"status": "submitted"`; the failure shows up
   later, through `check_task`.
-- **The failure does not say why.** The `[alms] Landlock: …` line goes to
-  the child's stderr before `exec`, and nothing reads it once the spawn
-  has failed. `std` passes only an errno back to the parent, and this
-  error has none, so the tool result is
-  `Error: Tool execution failed: IO error: Failed to spawn command: Invalid argument (os error 22)`,
+- **The failure says why only through its errno.** The child writes
+  nothing before it exits: a write to stderr after `fork` can block the
+  child for good, and the parent in `spawn()` with it, if another thread
+  held std's stderr lock at the time (from reading `std`, not reproduced;
+  see the `SAFETY` comment in `apply_landlock_sandbox`). `std` passes
+  only an errno back to the parent. For a kernel without Landlock the
+  error is `EOPNOTSUPP`, so the tool result is
+  `Error: Tool execution failed: IO error: Failed to spawn command: Operation not supported (os error 95)`,
   and the daemon logs
-  `Tool execution failed: IO error: Failed to spawn command: Invalid argument (os error 22)`
+  `Tool execution failed: IO error: Failed to spawn command: Operation not supported (os error 95)`
   at `WARN` (a background call logs `Background task failed` at `WARN`,
-  with the error in its `error` field). The reason reaches neither the
-  tool result nor the structured logs. Every `pre_exec` failure ends in
-  the same EINVAL — a sandbox root the child cannot open, a system-path
-  rule that cannot be added — so Landlock is the first thing to check,
-  not the only cause. If every `shell` call on a Linux host fails that
-  way, check that `landlock` is listed in `/sys/kernel/security/lsm`, and
-  inside a container that its seccomp profile allows the Landlock
-  syscalls.
+  with the error in its `error` field). Before v0.2.4 this case read
+  `Invalid argument (os error 22)`. The closure's other failures (a
+  sandbox root the child cannot open, a rule that cannot be added,
+  creating the ruleset or `restrict_self` failing) report the errno of the
+  system call that failed: a sandbox root that does not exist reads
+  `No such file or directory (os error 2)`. A failure the `landlock` crate
+  catches before making any system call has no errno and reads
+  `Invalid argument (os error 22)`. Only the errno reaches the tool result
+  and the structured logs; which step failed does not. If every `shell`
+  call on a Linux host fails with
+  `Operation not supported (os error 95)`, check that `landlock` is listed
+  in `/sys/kernel/security/lsm`, and inside a container that its seccomp
+  profile allows the Landlock syscalls.
 - **What runs without Landlock does not depend on the kernel.** A `shell`
   that is not sandboxed (`[tools].shell_policy = "unrestricted"`, or an
   agent in

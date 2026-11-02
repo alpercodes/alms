@@ -91,17 +91,17 @@ tool_gap_fill      = false
 drop_empty_content = false
 ```
 
-API key precedence at gateway startup:
+API key precedence, at gateway startup and again as each run starts:
 
 1. `SecretsStore` — the value last written by `alms auth set <name> <key>`.
 2. The provider entry's `api_key_env` (read from the named environment variable).
 3. The provider entry's literal `api_key`.
 
-When resolution fails, the gateway logs a warning and continues; the first outgoing request will surface an auth error from the upstream.
+When resolution fails, the gateway logs a warning and continues; the first outgoing request will surface an auth error from the upstream. Because each run resolves again, removing a stored key (`alms auth remove <name>` against a running gateway, or `DELETE /auth/keys/{provider}`) applies to the next run on every run path, Telegram's included: it falls back to `api_key_env` / `api_key`, or sends no key. A run already in progress keeps the key it started with, including its post-run summary. This applies to the LLM provider keys. The `telegram` bot token is read once, when the gateway starts its Telegram channel, so setting or removing it takes effect at the next restart.
 
 The `SecretsStore` is loaded once, at boot — so a key written to the file behind a running gateway's back is invisible to it until a restart. `alms auth set <name> <key>` and `alms auth remove <name>` therefore probe `GET /health` at `--url` (default `http://127.0.0.1:8080`, or `ALMS_GATEWAY_URL`) before deciding where the change goes.
 
-A gateway that answers gets the change over HTTP, so it applies to the next run with no restart; it persists the change to its own secrets file, so the key survives a restart too. When nothing answers, both commands edit the file directly, exactly as before. If something answers but not with a 2xx, the file is written and the command warns that a gateway running there would need a restart.
+A gateway that answers gets the change over HTTP, so it applies to the next run with no restart (except `telegram`, whose bot token takes effect at the next restart, as above); it persists the change to its own secrets file, so the key survives a restart too. When nothing answers, both commands edit the file directly, exactly as before. If something answers but not with a 2xx, the file is written and the command warns that a gateway running there would need a restart.
 
 The secrets file is `secrets.json` beside the SQLite database: `{data_dir}/secrets.json` by default, or in the directory of `ALMS_DB_PATH` when that is set. `alms auth` and the gateway resolve it the same way, so for one configuration they use one file (#170). Before v0.2.4, `alms auth` used `{data_dir}/secrets.json` even with `ALMS_DB_PATH` set — a file the gateway never read. If one is left over, the gateway (at boot) and every `alms auth` command (after it runs, so the notice reflects what the command did) name it. It is not read, moved or merged: if the gateway has no secrets file beside the database yet, stop the gateway and move it there (a running gateway reads the file only at boot, and its next key change overwrites the file); otherwise set any key you still need with `alms auth set` and delete it.
 

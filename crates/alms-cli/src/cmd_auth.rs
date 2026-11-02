@@ -73,7 +73,9 @@ pub(crate) enum AuthCommands {
 #[derive(Debug, PartialEq, Eq)]
 enum KeyTarget {
     /// A gateway answered `/health` — send the change to that process so
-    /// it takes effect on the next run. It persists the change itself.
+    /// it takes effect on the next run (the `telegram` token at its next
+    /// restart; see [`running_gateway_outcome`]). It persists the change
+    /// itself.
     RunningGateway,
     /// Write the secrets file directly. `warning` is set when *something*
     /// answered at the URL but not healthily: it may or may not be an ALMS
@@ -108,6 +110,25 @@ fn route_key_change(probe: GatewayProbe, url: &str) -> KeyTarget {
             )),
         },
         GatewayProbe::Unreachable(_) => KeyTarget::SecretsFile { warning: None },
+    }
+}
+
+/// What a change a running gateway accepted does there, for the human
+/// output of `set` and `remove`.
+///
+/// Every run re-resolves an LLM provider's key from the gateway's live
+/// secrets store, so a change to one applies from the next run. The
+/// `telegram` bot token is the exception: the gateway reads it once, when
+/// it starts its Telegram channel, so a change to it is persisted but
+/// reaches the channel only at the next restart (Tim S1 on #194).
+fn running_gateway_outcome(provider: &str, url: &str) -> String {
+    if provider == "telegram" {
+        format!(
+            "sent to the gateway at {url}. Restart the gateway to apply it: it reads the \
+             Telegram bot token once, when it starts its Telegram channel."
+        )
+    } else {
+        format!("applied to the gateway at {url}, no restart needed.")
     }
 }
 
@@ -267,8 +288,8 @@ pub(crate) async fn auth_set(
         match target {
             KeyTarget::RunningGateway => writeln!(
                 out,
-                "Saved API key for '{provider}': {masked} — applied to the gateway at {url}, \
-                 no restart needed."
+                "Saved API key for '{provider}': {masked} — {}",
+                running_gateway_outcome(provider, url)
             )?,
             KeyTarget::SecretsFile { .. } => {
                 writeln!(out, "Saved API key for '{provider}': {masked}")?
@@ -367,8 +388,8 @@ pub(crate) async fn auth_remove(
         match target {
             KeyTarget::RunningGateway => writeln!(
                 out,
-                "Removed API key for '{provider}' — applied to the gateway at {url}, \
-                 no restart needed."
+                "Removed API key for '{provider}' — {}",
+                running_gateway_outcome(provider, url)
             )?,
             KeyTarget::SecretsFile { .. } => writeln!(out, "Removed API key for '{provider}'")?,
         }
@@ -572,6 +593,94 @@ mod tests {
         .unwrap();
 
         assert_eq!(as_json(out)["target"], "secrets_file");
+    }
+
+    /// "No restart needed" holds for an LLM provider key, which every run
+    /// re-resolves, and not for the `telegram` bot token, which the gateway
+    /// reads once, when it starts its Telegram channel (Tim S1 on #194).
+    #[tokio::test]
+    async fn test_auth_set_says_a_telegram_token_needs_a_restart() {
+        let server = gateway_accepting_keys().await;
+        let dir = tempfile::tempdir().unwrap();
+
+        let mut out = Vec::new();
+        auth_set(
+            &api_client().unwrap(),
+            &server.uri(),
+            &file_in(&dir),
+            "openrouter",
+            Some(TEST_KEY.into()),
+            false,
+            &mut out,
+        )
+        .await
+        .unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("no restart needed"), "got {text:?}");
+
+        let mut out = Vec::new();
+        auth_set(
+            &api_client().unwrap(),
+            &server.uri(),
+            &file_in(&dir),
+            "telegram",
+            Some(TEST_KEY.into()),
+            false,
+            &mut out,
+        )
+        .await
+        .unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(!text.contains("no restart needed"), "got {text:?}");
+        assert!(
+            text.contains("Restart the gateway to apply it"),
+            "got {text:?}"
+        );
+        assert!(
+            !file_in(&dir).exists(),
+            "the running gateway persists a telegram change itself; the CLI writes no file"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_auth_remove_says_a_telegram_token_needs_a_restart() {
+        let server = MockServer::start().await;
+        health_ok().mount(&server).await;
+        Mock::given(method("DELETE"))
+            .and(path("/auth/keys/telegram"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true, "removed": true, "provider": "telegram",
+            })))
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut out = Vec::new();
+        auth_remove(
+            &api_client().unwrap(),
+            &server.uri(),
+            &file_in(&dir),
+            "telegram",
+            false,
+            &mut out,
+        )
+        .await
+        .unwrap();
+
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.starts_with("Removed API key for 'telegram'"),
+            "got {text:?}"
+        );
+        assert!(!text.contains("no restart needed"), "got {text:?}");
+        assert!(
+            text.contains("Restart the gateway to apply it"),
+            "got {text:?}"
+        );
+        assert!(
+            !file_in(&dir).exists(),
+            "the running gateway persists a telegram change itself; the CLI writes no file"
+        );
     }
 
     /// A gateway that answers `/health` but rejects the write — a token

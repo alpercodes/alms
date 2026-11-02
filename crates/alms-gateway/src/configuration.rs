@@ -7,8 +7,8 @@ mod resolution;
 use alms_core::config::ProviderEntry;
 use alms_core::secrets::SecretsStore;
 pub(crate) use resolution::{
-    ResolveAgentConfigError, ResolveEffectiveModelError, build_resolved_config,
-    model_belongs_to_kind, provider_kind_for_name, resolve_agent_config,
+    ResolveAgentConfigError, ResolveEffectiveModelError, ResolvedAgentConfig,
+    build_resolved_config, model_belongs_to_kind, provider_kind_for_name, resolve_agent_config,
     resolve_effective_provider_and_model,
 };
 use std::collections::BTreeMap;
