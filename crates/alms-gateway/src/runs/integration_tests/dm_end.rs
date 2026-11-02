@@ -2947,6 +2947,10 @@ async fn interrupted_end_record_waits_for_the_target_turn() {
         super::marker_of_type(&state, web_session_id, "dm_end_interrupted").is_none(),
         "the record must wait for bob's turn, not be appended mid-tool"
     );
+    assert!(
+        super::marker_of_type(&state, web_session_id, "dm_ended_notification").is_some(),
+        "the operator's display-only marker lands mid-tool, and the pair check below must hold with it there"
+    );
 
     bob_turn.finish(&state, web_session_id).await;
     tokio::time::timeout(std::time::Duration::from_secs(5), async {

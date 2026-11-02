@@ -2575,6 +2575,12 @@ async fn queue_interrupted_end_marker(
             session_id = %session_id.0,
             "Agent queue closed; interrupted-end record dropped (#1300)"
         );
+    } else {
+        debug!(
+            agent_id = %agent_id.0,
+            session_id = %session_id.0,
+            "Interrupted-end record queued; it lands after the agent's earlier work (#1300)"
+        );
     }
 }
 
@@ -2664,11 +2670,12 @@ async fn queue_interrupted_end_marker(
 /// The bus state was consistent — depth reset, tombstone written, neither
 /// side can keep sending — but ask the agent "what did the peer say?" and it
 /// did not know the conversation had ended. So `plan_triggered_runs` now also
-/// returns an [`InterruptedEndRecord`], which this loop persists via
+/// returns an [`InterruptedEndRecord`], which this loop queues for
 /// `persist_error_marker` (#874) onto the session whose run was suppressed.
 /// That marker is `kind: "error"`, the one marker shape the runtime rewrites
 /// into a surviving `[Error] …` user message, so the agent reads the end on
-/// that session's next turn.
+/// the first turn that starts on that session after the record lands. The
+/// record is low priority, so an operator turn admitted meanwhile runs first.
 ///
 /// The #1258 fix is untouched by that: no run is created, nothing is woken,
 /// and there is no post-end turn to guard. The operator's delivery is also
@@ -3778,6 +3785,25 @@ mod tests {
         );
     }
 
+    /// Run everything already queued for `agent_id`. A low-priority barrier runs
+    /// after any interrupted-end record queued before it.
+    async fn drain_agent_queue(state: &AppState, agent_id: AgentId) {
+        let (drained_tx, drained_rx) = tokio::sync::oneshot::channel();
+        state
+            .agent_queue
+            .reserve(agent_id)
+            .await
+            .expect("queue admission")
+            .submit_low(Box::pin(async move {
+                let _ = drained_tx.send(());
+            }))
+            .expect("queue dispatch");
+        tokio::time::timeout(std::time::Duration::from_secs(10), drained_rx)
+            .await
+            .expect("the agent's queued work drains")
+            .expect("the barrier runs");
+    }
+
     /// Drive a `ConversationEnded` whose target session does not exist, and
     /// report whether writing the record created it.
     ///
@@ -3789,10 +3815,11 @@ mod tests {
     /// that one.
     async fn record_resurrected_target(context_id: &str, session_id: SessionId) -> bool {
         let (state, shutdown_token) = build_notification_state();
+        let agent_id = AgentId::new();
         let (test_tx, test_rx) = mpsc::channel(8);
         test_tx
             .send(RunTrigger {
-                agent_id: AgentId::new(),
+                agent_id,
                 session_id,
                 input: "DM ended marker".to_string(),
                 source: MessageSource::ConversationEnded {
@@ -3808,6 +3835,8 @@ mod tests {
             .unwrap();
         drop(test_tx);
         run_trigger_loop(test_rx, state.clone()).await;
+        // The guard runs inside the queued record, so wait for it to have run.
+        drain_agent_queue(&state, agent_id).await;
         let created = state.session_manager.get(session_id).is_ok();
         shutdown_token.cancel();
         created
@@ -3898,20 +3927,7 @@ mod tests {
         // An interrupted-end record is queued at low priority, not written
         // in place, so drain the agent's low-priority work first; otherwise
         // the row below could pass before a wrongly queued record lands.
-        let (drained_tx, drained_rx) = tokio::sync::oneshot::channel();
-        state
-            .agent_queue
-            .reserve(agent_id)
-            .await
-            .expect("queue admission")
-            .submit_low(Box::pin(async move {
-                let _ = drained_tx.send(());
-            }))
-            .expect("queue dispatch");
-        tokio::time::timeout(std::time::Duration::from_secs(10), drained_rx)
-            .await
-            .expect("the agent's queued work drains")
-            .expect("the barrier runs");
+        drain_agent_queue(&state, agent_id).await;
         let recorded = state
             .session_manager
             .get_history(notif_session_id)
