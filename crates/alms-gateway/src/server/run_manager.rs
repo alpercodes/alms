@@ -947,6 +947,30 @@ impl RunManager {
         cancelled
     }
 
+    /// Cancel any queued or running runs of an agent.
+    ///
+    /// Used by `DELETE /agents`: a deleted agent's runs would otherwise keep
+    /// writing to `{workspace_dir}/{name}/` after its workspace is archived.
+    pub fn cancel_runs_for_agent(&self, target: alms_core::AgentId) -> usize {
+        let active_run_ids: Vec<RunId> = self
+            .runs
+            .iter()
+            .filter(|entry| {
+                let run = entry.value();
+                run.agent_id == target
+                    && matches!(
+                        run.status(),
+                        alms_core::RunStatus::Queued | alms_core::RunStatus::Running
+                    )
+            })
+            .map(|entry| entry.key().to_owned())
+            .collect();
+        active_run_ids
+            .into_iter()
+            .filter(|run_id| self.cancel_run(*run_id))
+            .count()
+    }
+
     /// Returns `true` if any queued or running runs exist for the given session.
     pub fn has_active_runs(&self, session_id: SessionId) -> bool {
         self.runs.iter().any(|e| {
@@ -2043,6 +2067,39 @@ mod tests {
         let cancelled = rm.cancel_runs_for_job(target_job);
         assert_eq!(cancelled, 0);
         assert!(!token.is_cancelled());
+    }
+
+    /// `cancel_runs_for_agent` stops the agent's queued and running runs and
+    /// leaves its finished runs and other agents' runs alone.
+    #[tokio::test]
+    async fn test_cancel_runs_for_agent_cancels_only_that_agents_active_runs() {
+        let rm = RunManager::new();
+        let target = AgentId::new();
+        let register = |run: Run| {
+            let token = CancellationToken::new();
+            rm.register_cancel_token(run.run_id, token.clone());
+            let _ = rm.insert_run(run);
+            token
+        };
+
+        let queued = register(Run::new(SessionId::new(), target, "queued".into()));
+        let mut running = Run::new(SessionId::new(), target, "running".into());
+        running.mark_running();
+        let running = register(running);
+        let done = Run::new(SessionId::new(), target, "done".into());
+        let done_id = done.run_id;
+        let done = register(done);
+        rm.mark_run_as_running(done_id);
+        assert!(rm.mark_run_as_completed(done_id, "output".into(), Default::default()));
+        let mut other = Run::new(SessionId::new(), AgentId::new(), "other".into());
+        other.mark_running();
+        let other = register(other);
+
+        assert_eq!(rm.cancel_runs_for_agent(target), 2);
+        assert!(queued.is_cancelled());
+        assert!(running.is_cancelled());
+        assert!(!done.is_cancelled(), "a finished run is left alone");
+        assert!(!other.is_cancelled(), "another agent's run is left alone");
     }
 
     #[tokio::test]

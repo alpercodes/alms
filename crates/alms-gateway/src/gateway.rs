@@ -422,7 +422,11 @@ impl Gateway {
                 // `migrate_sidecar_agent`, only if its agent owns sessions
                 // (#180).
                 if SIDECAR_EXISTED.load(std::sync::atomic::Ordering::Relaxed) {
-                    migrate_sidecar_agent(&store, configured_agent_id);
+                    migrate_sidecar_agent(
+                        &store,
+                        configured_agent_id,
+                        config.workspace_dir.as_deref(),
+                    );
                 }
                 // After the migration, so a `main` it just created counts.
                 default_agent_id = boot_default_agent_id(
@@ -438,13 +442,29 @@ impl Gateway {
             None => Arc::new(SessionManager::new(config.session_config.clone())),
         };
         // Load secrets store — used both for initial key resolution and shared
-        // with AppState so runtime key changes are visible everywhere.
+        // with AppState so runtime key changes are visible everywhere. The
+        // file sits beside the database; `alms auth` resolves the same one
+        // (`ServerConfig::secrets_path`, #170).
         let secrets_path = alms_core::secrets::secrets_path_from_db(config.db_path.as_deref());
         let secrets_store =
             alms_core::secrets::SecretsStore::load(&secrets_path).unwrap_or_else(|e| {
                 warn!("Failed to load secrets: {e}");
                 alms_core::secrets::SecretsStore::empty()
             });
+        if let Some(legacy) = config.data_dir.as_deref().and_then(|data_dir| {
+            alms_core::secrets::unread_legacy_secrets(
+                data_dir,
+                config.db_path.as_deref(),
+                &secrets_path,
+            )
+        }) {
+            warn!(
+                legacy = %legacy.display(),
+                secrets = %secrets_path.display(),
+                "{}",
+                alms_core::secrets::unread_legacy_secrets_message(&legacy, &secrets_path)
+            );
+        }
 
         // Resolve API key. Precedence:
         //   1. SecretsStore (`alms auth set <provider> <key>`) — highest,
@@ -835,15 +855,7 @@ impl Gateway {
                     // server-default model / provider pair reach those runs
                     // immediately and Telegram runs never, not even after a
                     // daemon restart. Documented in `docs/api.md` § 10.2.
-                    let resolved = {
-                        let secrets_guard = self.secrets.read();
-                        match crate::configuration::resolve_agent_config(
-                            agent_id,
-                            &self.session_manager,
-                            &self.config.agent_config,
-                            &self.llm,
-                            Some(&secrets_guard),
-                        ) {
+                    let resolved = match self.resolve_telegram_run_config(agent_id) {
                         Ok(r) => r,
                         Err(e) => {
                             // #863: per-agent provider override with no model
@@ -857,7 +869,6 @@ impl Gateway {
                                 e
                             );
                             continue;
-                        }
                         }
                     };
                     // Bootstrap detection: first-time agents get the
@@ -1136,6 +1147,32 @@ impl Gateway {
     pub fn secrets_handle(&self) -> Arc<RwLock<alms_core::secrets::SecretsStore>> {
         Arc::clone(&self.secrets)
     }
+
+    /// Resolve the config a Telegram-triggered run of `agent_id` uses: this
+    /// `Gateway`'s own boot-time `AgentConfig` and `LlmClient` (not
+    /// `AppState`'s live ones; see the loop in
+    /// [`Self::run_until_shutdown`]), with the API key re-resolved from the
+    /// secrets store `AppState` shares. A key set or removed through
+    /// `/auth/keys` therefore applies to the next Telegram run.
+    ///
+    /// A method rather than inline in the loop so the call can be tested
+    /// without a Telegram bot.
+    pub(crate) fn resolve_telegram_run_config(
+        &self,
+        agent_id: AgentId,
+    ) -> Result<
+        crate::configuration::ResolvedAgentConfig,
+        crate::configuration::ResolveAgentConfigError,
+    > {
+        let secrets_guard = self.secrets.read();
+        crate::configuration::resolve_agent_config(
+            agent_id,
+            &self.session_manager,
+            &self.config.agent_config,
+            &self.llm,
+            Some(&secrets_guard),
+        )
+    }
 }
 
 /// Handle a single Telegram message in its own spawned task.
@@ -1213,6 +1250,13 @@ async fn process_telegram_message(
 /// `main` does not come back on the next restart unless that bot has filed
 /// new ones under the ID in the meantime.
 ///
+/// **Only when `{workspace_dir}/main/` is available (#191).** Workspaces are
+/// keyed by name, so a folder there holding more than the blank seed scaffold
+/// may be another agent's data, for example from a deletion before workspaces
+/// were archived, or a named subagent's writes. Registering `main` over it
+/// would hand that data to the migrated agent, so the migration logs a WARN
+/// and skips; move the folder and restart to migrate.
+///
 /// Uses `create_agent_if_none_exist` to atomically check-and-insert within a
 /// single SQLite transaction, avoiding the TOCTOU race between checking
 /// `list_agents().is_empty()` and `create_agent()`. The `list_agents` read
@@ -1220,8 +1264,12 @@ async fn process_telegram_message(
 /// deployment that already has agents.
 ///
 /// All errors are non-fatal (`warn!` only) — migration must never block startup.
-#[instrument(skip(store))]
-fn migrate_sidecar_agent(store: &SqliteStore, agent_id: AgentId) {
+#[instrument(skip(store, workspace_dir))]
+fn migrate_sidecar_agent(
+    store: &SqliteStore,
+    agent_id: AgentId,
+    workspace_dir: Option<&std::path::Path>,
+) {
     match store.list_agents() {
         Ok(agents) if !agents.is_empty() => return,
         Ok(_) => {}
@@ -1255,6 +1303,19 @@ fn migrate_sidecar_agent(store: &SqliteStore, agent_id: AgentId) {
             migration_name, e
         );
         return;
+    }
+
+    if let Some(workspace_dir) = workspace_dir {
+        let path = workspace_dir.join(migration_name);
+        if let Err(error) = alms_core::ensure_workspace_dir_available(&path) {
+            warn!(
+                path = %path.display(),
+                "Not registering the sidecar agent as '{}': its workspace may contain data from a deleted agent: {}; move it and restart to migrate",
+                migration_name,
+                error
+            );
+            return;
+        }
     }
 
     let now = chrono::Utc::now();
@@ -1552,7 +1613,7 @@ mod tests {
     fn test_migrate_creates_default_agent() {
         let agent_id = AgentId::new();
         let store = legacy_store(agent_id);
-        migrate_sidecar_agent(&store, agent_id);
+        migrate_sidecar_agent(&store, agent_id, None);
 
         let agents = store.list_agents().unwrap();
         assert_eq!(agents.len(), 1);
@@ -1562,11 +1623,45 @@ mod tests {
     }
 
     #[test]
+    fn test_migrate_skips_main_workspace_with_existing_data() {
+        let agent_id = AgentId::new();
+        let store = legacy_store(agent_id);
+        let tmp = tempfile::tempdir().unwrap();
+        let main_workspace = tmp.path().join("main");
+        std::fs::create_dir_all(&main_workspace).unwrap();
+        std::fs::write(main_workspace.join("memories.md"), "private notes").unwrap();
+
+        migrate_sidecar_agent(&store, agent_id, Some(tmp.path()));
+
+        assert!(store.list_agents().unwrap().is_empty());
+        assert_eq!(
+            std::fs::read_to_string(main_workspace.join("memories.md")).unwrap(),
+            "private notes"
+        );
+    }
+
+    #[test]
+    fn test_migrate_allows_blank_main_workspace_scaffold() {
+        let agent_id = AgentId::new();
+        let store = legacy_store(agent_id);
+        let tmp = tempfile::tempdir().unwrap();
+        let main_workspace = tmp.path().join("main");
+        alms_core::init_workspace_files(&main_workspace).unwrap();
+
+        migrate_sidecar_agent(&store, agent_id, Some(tmp.path()));
+
+        let agents = store.list_agents().unwrap();
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agents[0].name, "main");
+        assert_eq!(agents[0].id, agent_id);
+    }
+
+    #[test]
     fn test_migrate_idempotent() {
         let agent_id = AgentId::new();
         let store = legacy_store(agent_id);
-        migrate_sidecar_agent(&store, agent_id);
-        migrate_sidecar_agent(&store, agent_id);
+        migrate_sidecar_agent(&store, agent_id, None);
+        migrate_sidecar_agent(&store, agent_id, None);
 
         let agents = store.list_agents().unwrap();
         assert_eq!(agents.len(), 1);
@@ -1579,13 +1674,13 @@ mod tests {
     fn test_migrate_skips_sidecar_that_owns_no_sessions() {
         let store = SqliteStore::open_in_memory().unwrap();
         let sidecar_id = AgentId::new();
-        migrate_sidecar_agent(&store, sidecar_id);
+        migrate_sidecar_agent(&store, sidecar_id, None);
         assert!(store.list_agents().unwrap().is_empty(), "empty store");
 
         store
             .save_session(&alms_session::Session::new(AgentId::new(), "web-chat-1"))
             .unwrap();
-        migrate_sidecar_agent(&store, sidecar_id);
+        migrate_sidecar_agent(&store, sidecar_id, None);
         assert!(
             store.list_agents().unwrap().is_empty(),
             "sessions owned by another agent"
@@ -1596,7 +1691,7 @@ mod tests {
     fn test_migrate_preserves_agent_id() {
         let agent_id = AgentId::new();
         let store = legacy_store(agent_id);
-        migrate_sidecar_agent(&store, agent_id);
+        migrate_sidecar_agent(&store, agent_id, None);
 
         let loaded = store.load_agent_by_id(agent_id).unwrap();
         assert!(loaded.is_some());
@@ -1627,7 +1722,7 @@ mod tests {
         store.create_agent(&existing).unwrap();
 
         // Migration with a different agent_id should be a no-op
-        migrate_sidecar_agent(&store, sidecar_id);
+        migrate_sidecar_agent(&store, sidecar_id, None);
 
         let agents = store.list_agents().unwrap();
         assert_eq!(agents.len(), 1);
@@ -1642,11 +1737,11 @@ mod tests {
     fn deleted_main_is_not_migrated_again() {
         let sidecar_id = AgentId::new();
         let store = legacy_store(sidecar_id);
-        migrate_sidecar_agent(&store, sidecar_id);
+        migrate_sidecar_agent(&store, sidecar_id, None);
         assert_eq!(store.list_agents().unwrap().len(), 1, "migrated");
 
         assert!(store.delete_agent(sidecar_id).unwrap());
-        migrate_sidecar_agent(&store, sidecar_id);
+        migrate_sidecar_agent(&store, sidecar_id, None);
 
         let agents = store.list_agents().unwrap();
         assert!(agents.is_empty(), "`main` came back: {agents:?}");
@@ -2076,6 +2171,175 @@ mod tests {
             captured.at_target("alms.security").count(),
             0,
             "no WARN must fire when the list is empty: {captured}"
+        );
+    }
+}
+
+/// #170: a gateway upgraded under `ALMS_DB_PATH` keeps the secrets file
+/// beside its database, the one it has always read. A `{data_dir}/secrets.json`
+/// written by an earlier `alms auth` is not read, moved or merged, and the
+/// gateway names it at boot.
+#[cfg(test)]
+mod secrets_path_tests {
+    use super::*;
+    use alms_test_support::capture_events;
+    use std::path::PathBuf;
+
+    /// The data directory and the database in different directories, as
+    /// `ALMS_DB_PATH` makes them.
+    struct Split {
+        _scratch: tempfile::TempDir,
+        data_dir: PathBuf,
+        db_path: PathBuf,
+        /// `{data_dir}/secrets.json`: what the CLI wrote before #170.
+        legacy: PathBuf,
+        /// Beside the database: what the gateway has always used.
+        canonical: PathBuf,
+    }
+
+    fn split() -> Split {
+        let scratch = tempfile::tempdir().unwrap();
+        let data_dir = scratch.path().join("data");
+        let db_dir = scratch.path().join("elsewhere");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        std::fs::create_dir_all(&db_dir).unwrap();
+        Split {
+            legacy: data_dir.join("secrets.json"),
+            canonical: db_dir.join("secrets.json"),
+            db_path: db_dir.join("alms.db"),
+            data_dir,
+            _scratch: scratch,
+        }
+    }
+
+    /// Boot a gateway on `db_path` / `data_dir` and return it with the WARN
+    /// events emitted while it was built.
+    fn boot(db_path: &std::path::Path, data_dir: &std::path::Path) -> (Gateway, Vec<String>) {
+        let mut gateway = None;
+        let captured = capture_events(tracing::Level::WARN, || {
+            gateway = Some(
+                Gateway::new(GatewayConfig {
+                    db_path: Some(db_path.display().to_string()),
+                    data_dir: Some(data_dir.to_path_buf()),
+                    ..GatewayConfig::default()
+                })
+                .unwrap(),
+            );
+        });
+        let messages = captured.iter().map(|e| e.message.clone()).collect();
+        (gateway.unwrap(), messages)
+    }
+
+    fn unread_warning<'a>(messages: &'a [String], legacy: &std::path::Path) -> Option<&'a String> {
+        let legacy = legacy.display().to_string();
+        messages
+            .iter()
+            .find(|m| m.starts_with(&legacy) && m.contains("is not read"))
+    }
+
+    #[test]
+    fn keeps_its_own_secrets_file_and_names_the_one_it_does_not_read() {
+        let s = split();
+        let mut cli_written = alms_core::secrets::SecretsStore::load(&s.legacy).unwrap();
+        cli_written
+            .set_key("openrouter", "sk-or-written-by-old-cli")
+            .unwrap();
+        let mut gateway_written = alms_core::secrets::SecretsStore::load(&s.canonical).unwrap();
+        gateway_written
+            .set_key("anthropic", "sk-ant-set-in-the-ui")
+            .unwrap();
+
+        let (gateway, warnings) = boot(&s.db_path, &s.data_dir);
+
+        let store = gateway.secrets_handle();
+        let store = store.read();
+        assert_eq!(
+            store.path(),
+            s.canonical,
+            "the file beside the database, as before"
+        );
+        assert_eq!(store.get_key("anthropic"), Some("sk-ant-set-in-the-ui"));
+        assert_eq!(
+            store.get_key("openrouter"),
+            None,
+            "a key the gateway never used must not be merged in"
+        );
+        let warning = unread_warning(&warnings, &s.legacy)
+            .unwrap_or_else(|| panic!("no warning names {}: {warnings:?}", s.legacy.display()));
+        assert!(
+            warning.contains(&s.canonical.display().to_string()),
+            "{warning}"
+        );
+        assert!(warning.contains("not merged"), "{warning}");
+    }
+
+    #[test]
+    fn does_not_adopt_a_legacy_file_when_its_own_is_missing() {
+        let s = split();
+        let mut cli_written = alms_core::secrets::SecretsStore::load(&s.legacy).unwrap();
+        cli_written
+            .set_key("openrouter", "sk-or-written-by-old-cli")
+            .unwrap();
+        let legacy_bytes = std::fs::read(&s.legacy).unwrap();
+
+        let (gateway, warnings) = boot(&s.db_path, &s.data_dir);
+
+        let store = gateway.secrets_handle();
+        let store = store.read();
+        assert_eq!(store.path(), s.canonical);
+        assert_eq!(store.get_key("openrouter"), None, "not adopted");
+        assert_eq!(
+            std::fs::read(&s.legacy).unwrap(),
+            legacy_bytes,
+            "left exactly where and as it was"
+        );
+        assert!(!s.canonical.exists(), "nothing was copied into place");
+        let warning = unread_warning(&warnings, &s.legacy)
+            .unwrap_or_else(|| panic!("no warning names {}: {warnings:?}", s.legacy.display()));
+        assert!(
+            warning.contains("mv \""),
+            "the move that adopts it: {warning}"
+        );
+        assert!(
+            warning.contains("stop the gateway, then move it"),
+            "moving the file under a running gateway loses keys (Tim B1 on #188): {warning}"
+        );
+    }
+
+    /// `ALMS_DB_PATH=:memory:` has no database directory, so the secrets
+    /// file resolves into the working directory; a normal data-dir file must
+    /// not be reported as one to move there (Tim S1 on #188).
+    #[test]
+    fn says_nothing_under_an_in_memory_database() {
+        let s = split();
+        let mut store = alms_core::secrets::SecretsStore::load(&s.legacy).unwrap();
+        store
+            .set_key("openrouter", "sk-or-in-the-data-dir")
+            .unwrap();
+
+        let (_gateway, warnings) = boot(std::path::Path::new(":memory:"), &s.data_dir);
+
+        assert!(
+            unread_warning(&warnings, &s.legacy).is_none(),
+            "{warnings:?}"
+        );
+    }
+
+    /// The default layout, database inside the data directory: one file,
+    /// nothing to report.
+    #[test]
+    fn says_nothing_when_the_database_is_in_the_data_dir() {
+        let s = split();
+        let secrets = s.data_dir.join("secrets.json");
+        let mut store = alms_core::secrets::SecretsStore::load(&secrets).unwrap();
+        store.set_key("openrouter", "sk-or-default-layout").unwrap();
+
+        let (gateway, warnings) = boot(&s.data_dir.join("alms.db"), &s.data_dir);
+
+        assert_eq!(gateway.secrets_handle().read().path(), secrets);
+        assert!(
+            unread_warning(&warnings, &secrets).is_none(),
+            "{warnings:?}"
         );
     }
 }

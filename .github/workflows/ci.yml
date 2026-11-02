@@ -77,6 +77,21 @@ jobs:
     - name: Build release
       run: cargo build --release
 
+    - name: Check install.sh
+      # Nothing else parses or lints install.sh -- running it would only repeat
+      # the release build above. Last, so a failure here cannot skip the Rust
+      # checks; `!cancelled()` so it still reports when one of them failed.
+      # shellcheck ships on ubuntu-latest; if an image ever drops it, say so
+      # rather than pass quietly.
+      if: ${{ !cancelled() }}
+      run: |
+        bash -n install.sh
+        if command -v shellcheck >/dev/null; then
+          shellcheck install.sh
+        else
+          echo "::warning::shellcheck not found on this runner; install.sh was only syntax-checked"
+        fi
+
   # ---------------------------------------------------------------------------
   # Dependency advisory audits (issue #1252)
   #

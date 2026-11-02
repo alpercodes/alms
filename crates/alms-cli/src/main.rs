@@ -364,22 +364,19 @@ async fn main() -> anyhow::Result<()> {
         }
         Commands::Auth { cmd, json, url } => {
             let config = alms_core::AlmsConfig::load_or_default();
-            let data_dir: std::path::PathBuf = config.server.data_dir.into();
+            let secrets_path = cmd_auth::secrets_file(&config);
             let client = api_client()?;
-            let mut out = std::io::stdout();
-            match cmd {
-                AuthCommands::Set { provider, key } => {
-                    cmd_auth::auth_set(&client, &url, &data_dir, &provider, key, json, &mut out)
-                        .await?;
-                }
-                AuthCommands::List => {
-                    cmd_auth::auth_list(&data_dir, json)?;
-                }
-                AuthCommands::Remove { provider } => {
-                    cmd_auth::auth_remove(&client, &url, &data_dir, &provider, json, &mut out)
-                        .await?;
-                }
-            }
+            cmd_auth::run(
+                cmd,
+                json,
+                &url,
+                &config,
+                &secrets_path,
+                &client,
+                &mut std::io::stdout(),
+                &mut std::io::stderr(),
+            )
+            .await?;
         }
         Commands::Agent { cmd, json } => {
             let (store, config) = helpers::open_db_with_config()?;
@@ -427,7 +424,15 @@ async fn main() -> anyhow::Result<()> {
                 }
                 AgentCommands::Delete { name_or_id, force } => {
                     let project_root = config.server.resolved_project_root();
-                    cmd_agent::agent_delete(&store, &name_or_id, force, json, Some(&project_root))?;
+                    let workspace_dir = config.server.agents_dir();
+                    cmd_agent::agent_delete(
+                        &store,
+                        &name_or_id,
+                        force,
+                        json,
+                        Some(&project_root),
+                        Some(&workspace_dir),
+                    )?;
                 }
                 AgentCommands::SetDefault { name_or_id } => {
                     cmd_agent::agent_set_default(&store, &name_or_id, json)?;

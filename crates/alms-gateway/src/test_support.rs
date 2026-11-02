@@ -75,6 +75,13 @@ impl TestAppState {
         })
     }
 
+    /// Use `dir` as the data directory, so `settings.json` and run spill
+    /// files go there instead of under the test's working directory.
+    pub(crate) fn data_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.config.data_dir = Some(dir.into());
+        self
+    }
+
     /// Enable the workspace API rooted at `dir`.
     pub(crate) fn workspace_dir(mut self, dir: impl Into<PathBuf>) -> Self {
         self.config.workspace_dir = Some(dir.into());

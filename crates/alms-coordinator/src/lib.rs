@@ -2109,7 +2109,8 @@ async fn run_agent_loop(
         };
     } else if let Some(s) = secrets {
         // No per-agent provider override — re-resolve the key for the
-        // server-default provider from the live secrets store.
+        // server-default provider from the live secrets store. A key
+        // removed since the shared client was built is cleared here.
         subagent_llm = subagent_llm.with_secrets(&s.read());
     }
     if let Some(model) = model_override {

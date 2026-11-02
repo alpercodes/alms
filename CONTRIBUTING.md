@@ -4,7 +4,7 @@
 
 ### Prerequisites
 
-ALMS requires Rust nightly (specified in `rust-toolchain.toml`). The toolchain will be automatically installed when you run cargo commands.
+ALMS builds on stable Rust, but development uses the dated nightly pinned in `rust-toolchain.toml`, so that `cargo fmt` and `cargo clippy` reach the same verdict locally as in CI. If you installed Rust with [rustup](https://rustup.rs), that toolchain is installed automatically when you run cargo commands in the repo. A `cargo` from a package manager (e.g. `brew install rust`) ignores `rust-toolchain.toml` and builds with whatever compiler it ships: a current stable builds ALMS, an older one may be too old for this workspace, and either can give fmt/clippy results that differ from CI's.
 
 ### First-time identity setup
 
@@ -87,8 +87,11 @@ The CI pipeline (`.github/workflows/ci.yml`) runs:
 3. `cargo test --all` - Runs all tests including golden tests and the
    static-asset JS parse-sweep (`tests/static_assets_parse.rs`)
 4. `cargo build --release` - Verifies release build works
+5. `bash -n install.sh` and `shellcheck install.sh` (the `Check install.sh` step) -
+   Parses and lints the install script
 
-`make ci` runs all of these steps locally for parity.
+`make ci` runs steps 1-4 locally for parity. It does not run step 5; if you change
+`install.sh`, run those two commands yourself.
 
 Two more required checks, `Security audit (Rust)` and `Security audit (frontend)`, check
 `Cargo.lock` and `package-lock.json` against advisory databases. `make ci` does not run
