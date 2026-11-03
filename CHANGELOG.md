@@ -355,6 +355,11 @@ Each item below changes behaviour for a deployment that has not set the knob exp
 - `README.md`, `CONTRIBUTING.md` and `CLAUDE.md` no longer say ALMS requires Rust nightly:
   it builds on current stable, and the nightly in `rust-toolchain.toml` is pinned for
   development, to keep `cargo fmt` and `cargo clippy` reproducible.
+- The gateway's startup warning that an API key env var is "IGNORED for security" no longer
+  fires for a var a `[llm.providers.<name>]` entry names in `api_key_env`, whose key is in
+  use. A bare export still gets it. The closing line no longer says API key env vars are
+  "no longer used"; it says one is read only if an entry names it. `alms auth set --help`
+  now lists all five accepted names, adding `gemini` and `telegram`.
 
 ### Frontend
 

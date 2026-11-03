@@ -719,9 +719,17 @@ impl AlmsConfig {
     ///
     /// Should be called at startup (e.g. in `main.rs`). Detects env vars that
     /// were previously used to configure secrets and warns the user to migrate
-    /// to `alms auth set`.
-    pub fn warn_deprecated_secret_env_vars() {
-        let deprecated = crate::secrets::SecretsStore::detect_deprecated_env_keys();
+    /// to `alms auth set`. A var a provider entry names in `api_key_env` is a
+    /// live key source, so it gets no warning.
+    pub fn warn_deprecated_secret_env_vars(&self) {
+        let mut deprecated = crate::secrets::SecretsStore::detect_deprecated_env_keys();
+        deprecated.retain(|(var, _)| {
+            !self
+                .llm
+                .providers
+                .values()
+                .any(|entry| entry.api_key_env.as_deref() == Some(*var))
+        });
         if deprecated.is_empty() {
             return;
         }
@@ -734,7 +742,7 @@ impl AlmsConfig {
             );
         }
         warn!(
-            "API key environment variables are no longer used. \
+            "An API key env var is read only if a provider entry names it in `api_key_env`. \
              Store keys securely with `alms auth set <provider> <key>` \
              (encrypted with ALMS_MASTER_KEY)."
         );

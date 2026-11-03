@@ -2685,3 +2685,100 @@ fn test_env_strategy_sliding_summary_normalises_to_compact() {
         "normalize_episodic rewrites the alias for env-var-fed configs"
     );
 }
+
+fn deprecated_env_warnings(config: &AlmsConfig) -> alms_test_support::CapturedEvents {
+    alms_test_support::capture_events(tracing::Level::WARN, || {
+        config.warn_deprecated_secret_env_vars();
+    })
+}
+
+fn config_with_entry_naming(entry_name: &str, var: &str) -> AlmsConfig {
+    let mut config = AlmsConfig::default();
+    config.llm.providers.insert(
+        entry_name.to_string(),
+        ProviderEntry {
+            api_key_env: Some(var.to_string()),
+            ..Default::default()
+        },
+    );
+    config
+}
+
+/// `resolve_api_key` reads a var named in `api_key_env`, so "IGNORED" and
+/// "no longer used" would both be false for it.
+#[test]
+fn a_var_named_by_api_key_env_gets_no_deprecation_warning() {
+    let _guard = EnvGuard::set(&[("OPENROUTER_API_KEY", Some("sk-named"))]);
+    let config = config_with_entry_naming("openrouter", "OPENROUTER_API_KEY");
+    assert_eq!(
+        config.llm.providers["openrouter"]
+            .resolve_api_key()
+            .as_deref(),
+        Some("sk-named"),
+        "the named var must be the key in use"
+    );
+
+    let captured = deprecated_env_warnings(&config);
+
+    assert!(
+        !captured
+            .iter()
+            .any(|e| e.field("env_var") == Some("OPENROUTER_API_KEY")),
+        "a named var is in use and must not be reported as ignored; got {captured}"
+    );
+    // Other listed vars can be set in the environment running this test, so
+    // the closing summary is only required to be absent when nothing else warned.
+    if !captured.iter().any(|e| e.has_field("env_var")) {
+        assert!(captured.is_empty(), "got {captured}");
+    }
+}
+
+#[test]
+fn a_bare_export_still_gets_the_deprecation_warning() {
+    let _guard = EnvGuard::set(&[("OPENROUTER_API_KEY", Some("sk-bare"))]);
+    let config = AlmsConfig::default();
+
+    let captured = deprecated_env_warnings(&config);
+
+    let warning = captured
+        .iter()
+        .find(|e| e.field("env_var") == Some("OPENROUTER_API_KEY"))
+        .unwrap_or_else(|| panic!("a bare export must warn; got {captured}"));
+    assert!(warning.message.contains("IGNORED"), "got {captured}");
+}
+
+/// With both kinds set, the summary still fires for the bare var and must not
+/// claim that API key env vars in general are unused.
+#[test]
+fn a_named_var_beside_a_bare_export_only_warns_about_the_bare_one() {
+    let _guard = EnvGuard::set(&[
+        ("OPENROUTER_API_KEY", Some("sk-named")),
+        ("ANTHROPIC_API_KEY", Some("sk-bare")),
+    ]);
+    // Any entry counts, not just the one for the var's usual provider.
+    let config = config_with_entry_naming("my-proxy", "OPENROUTER_API_KEY");
+
+    let captured = deprecated_env_warnings(&config);
+
+    assert!(
+        captured
+            .iter()
+            .any(|e| e.field("env_var") == Some("ANTHROPIC_API_KEY")),
+        "got {captured}"
+    );
+    assert!(
+        !captured
+            .iter()
+            .any(|e| e.field("env_var") == Some("OPENROUTER_API_KEY")),
+        "got {captured}"
+    );
+    let summary = captured
+        .iter()
+        .find(|e| !e.has_field("env_var"))
+        .unwrap_or_else(|| panic!("the summary must still fire; got {captured}"));
+    assert!(summary.message.contains("api_key_env"), "got {captured}");
+    assert!(
+        !summary.message.contains("no longer used"),
+        "got {captured}"
+    );
+}
