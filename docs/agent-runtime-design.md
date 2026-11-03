@@ -23,7 +23,7 @@ bind = "127.0.0.1:8080"
 # provider = "openrouter"           # openrouter | openai | anthropic | local
 # base_url = "https://openrouter.ai/api/v1"
 # model = "z-ai/glm-5.2"
-# api_key loaded from secrets store via `alms auth set` (never in config file)
+# API key: see docs/config.md (`alms auth set`, `api_key_env` or a literal `api_key`)
 timeout_secs = 600
 max_retries = 2
 # Token budget per run (0 = unlimited)
@@ -89,7 +89,7 @@ poll_interval_secs = 5
 ```
 
 **Principles:**
-- Secrets (API keys, tokens) come from **`.alms/secrets.json`** via `alms auth set`, never config files or env vars
+- LLM API keys and the global Telegram bot token come from **`.alms/secrets.json`** via `alms auth set`; a provider entry can instead name an env var in `api_key_env` or hold a literal `api_key` (`docs/config.md`). A per-agent Telegram token is on the agent record, and the gateway bearer token comes only from `ALMS_AUTH_TOKEN`.
 - Every field has a default — zero-config startup should work (with mock LLM)
 - Human-readable durations (`"24h"`, `"30d"`, `"5m"`) — *not implemented: every duration is an integer `*_secs` field*
 - Validation on startup: reject invalid values with clear messages before starting

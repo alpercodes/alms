@@ -288,10 +288,11 @@ impl AlmsConfig {
         None
     }
 
-    /// Apply environment variable overrides for non-secret settings.
+    /// Apply environment variable overrides.
     ///
-    /// API keys and tokens are NOT loaded from env vars — they must be
-    /// configured via `alms auth set` and stored in `.alms/secrets.json`.
+    /// The one secret read here is the gateway bearer token (`ALMS_AUTH_TOKEN`).
+    /// LLM API keys and Telegram tokens are not read here; the module docs say
+    /// where they come from.
     ///
     /// Callers must invoke [`LlmConfig::ensure_builtin_providers`] before
     /// this method so that sugar provider entries (`openai`, `openrouter`,
