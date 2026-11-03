@@ -471,15 +471,23 @@ provider = "gemini"
 model    = "gemini-2.5-pro"
 ```
 
-Store the API key with `alms auth set gemini <key>`. Alternatively, point the
-sugar entry at an existing environment variable:
+Store the API key with `alms auth set gemini <key>`. Alternatively, name an
+existing environment variable in your own `gemini` entry. It replaces the
+auto-populated entry instead of merging with it, so it has to restate the rest:
 
 ```toml
+[llm]
+provider = "gemini"
+model    = "gemini-2.5-pro"
+
 [llm.providers.gemini]
+kind        = "gemini"
+base_url    = "https://generativelanguage.googleapis.com/v1beta"
 api_key_env = "GEMINI_API_KEY"   # or "GOOGLE_API_KEY"
+auth_scheme = { type = "header", name = "x-goog-api-key" }
 ```
 
-Only override `base_url` if you need to talk to a proxy or a non-default
+Only change `base_url` if you need to talk to a proxy or a non-default
 region — the default is `https://generativelanguage.googleapis.com/v1beta`.
 Gemini authenticates via the `x-goog-api-key` header (preferred over the
 `?key=` query parameter because it keeps the secret out of URL logs).
