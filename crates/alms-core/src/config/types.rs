@@ -225,7 +225,9 @@ impl ServerConfig {
 // ---------------------------------------------------------------------------
 
 /// LLM provider configuration.
-/// Note: api_key is only loaded from env vars, never serialized.
+/// Note: `api_key` is not loaded from the config file or env vars and is never
+/// serialized. Keys resolve through the secrets store and `ProviderEntry`
+/// (`docs/config.md`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct LlmConfig {

@@ -1,8 +1,12 @@
 # ALMS Configuration
 # Copy to alms.toml and customize. All values shown are defaults.
-# Secrets (API keys, tokens) are stored in secrets.json beside the SQLite database
-# (.alms/secrets.json by default; ALMS_DB_PATH moves it with the database) via
-# `alms auth set` or the web UI. They are never stored in this file or read from env vars.
+# LLM API keys and the global Telegram bot token are stored in secrets.json beside the
+# SQLite database (.alms/secrets.json by default; ALMS_DB_PATH moves it with the database)
+# via `alms auth set` or PUT /auth/keys; the web UI can set the LLM keys. A
+# [llm.providers.<name>] entry can instead name an env var in `api_key_env` or hold a
+# literal `api_key`, and the stored key outranks both (docs/config.md). A per-agent
+# Telegram token is on the agent record. The gateway bearer token comes only from
+# ALMS_AUTH_TOKEN.
 # Set ALMS_MASTER_KEY env var to encrypt secrets at rest (AES-256-GCM).
 
 [server]
@@ -53,8 +57,8 @@ max_run_duration_secs = 14400
 # Switch provider: export ALMS_LLM_PROVIDER=anthropic
 # Mock mode (no key needed): export ALMS_LLM_MOCK=1
 #
-# NOTE: API key env vars (OPENROUTER_API_KEY, etc.) are NO LONGER used.
-# They are ignored for security — agents can read env vars via shell_exec.
+# NOTE: a bare export such as OPENROUTER_API_KEY is ignored. An env var is read for a
+# key only if a [llm.providers.<name>] entry names it in `api_key_env`.
 
 # Not enforced yet: nothing reads these values (docs/config.md § Session).
 [session]
@@ -252,8 +256,8 @@ rotation = "daily"
 # poll_interval_secs = 5
 #
 # Per-agent Telegram tokens: instead of a global bot token, you can assign
-# a dedicated Telegram bot to each agent via the API or CLI:
-#   alms agent create --name my-agent --telegram-token "123456:ABC-DEF"
+# a dedicated Telegram bot to each agent through the API, with `telegram_token`
+# on POST /agents or PUT /agents/{id_or_name}.
 # These are stored in the agent registry (SQLite), not in this config file.
 #
 # NOTE: TELEGRAM_BOT_TOKEN env var is NO LONGER used.

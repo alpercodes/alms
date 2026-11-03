@@ -5,11 +5,15 @@
 //! Loads config with layered precedence:
 //! 1. Compiled defaults
 //! 2. Config file (alms.toml)
-//! 3. Environment variables (non-secret `ALMS_*` prefix)
+//! 3. Environment variables (`ALMS_*` prefix)
 //!
-//! Secrets (API keys, tokens) are loaded exclusively from `.alms/secrets.json`
-//! via `alms auth set`. Environment variable fallback has been removed for
-//! security — agents can read env vars via `shell_exec`.
+//! LLM API keys and the global Telegram bot token live in the secrets file
+//! beside the database (`.alms/secrets.json` by default), written by
+//! `alms auth set` or `PUT /auth/keys`. No env var is read for an LLM key
+//! unless a provider entry names one in `api_key_env`. An entry can also hold
+//! a literal `api_key`, and the store outranks both (`docs/config.md`). The
+//! gateway bearer token comes only from `ALMS_AUTH_TOKEN`, and a per-agent
+//! Telegram token is stored on the agent record.
 
 mod budget;
 mod summary_pair;
@@ -284,10 +288,11 @@ impl AlmsConfig {
         None
     }
 
-    /// Apply environment variable overrides for non-secret settings.
+    /// Apply environment variable overrides.
     ///
-    /// API keys and tokens are NOT loaded from env vars — they must be
-    /// configured via `alms auth set` and stored in `.alms/secrets.json`.
+    /// The one secret read here is the gateway bearer token (`ALMS_AUTH_TOKEN`).
+    /// LLM API keys and Telegram tokens are not read here; the module docs say
+    /// where they come from.
     ///
     /// Callers must invoke [`LlmConfig::ensure_builtin_providers`] before
     /// this method so that sugar provider entries (`openai`, `openrouter`,
