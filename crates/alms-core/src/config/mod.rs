@@ -5,12 +5,15 @@
 //! Loads config with layered precedence:
 //! 1. Compiled defaults
 //! 2. Config file (alms.toml)
-//! 3. Environment variables (non-secret `ALMS_*` prefix)
+//! 3. Environment variables (`ALMS_*` prefix)
 //!
-//! Secrets (API keys, tokens) live in the secrets file beside the database
-//! (`.alms/secrets.json` by default), written by `alms auth set` or
-//! `PUT /auth/keys`. No env var is read for a key unless a provider entry
-//! names one in `api_key_env`, and the store outranks it (`docs/config.md`).
+//! LLM API keys and the global Telegram bot token live in the secrets file
+//! beside the database (`.alms/secrets.json` by default), written by
+//! `alms auth set` or `PUT /auth/keys`. No env var is read for an LLM key
+//! unless a provider entry names one in `api_key_env`. An entry can also hold
+//! a literal `api_key`, and the store outranks both (`docs/config.md`). The
+//! gateway bearer token comes only from `ALMS_AUTH_TOKEN`, and a per-agent
+//! Telegram token is stored on the agent record.
 
 mod budget;
 mod summary_pair;

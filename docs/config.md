@@ -4,7 +4,7 @@ ALMS loads configuration with layered precedence:
 
 1. Compiled defaults
 2. `alms.toml` in the current working directory (or `~/.config/alms/config.toml`)
-3. `ALMS_*` environment variables (non-secret settings only)
+3. `ALMS_*` environment variables (settings, plus the gateway bearer token `ALMS_AUTH_TOKEN`)
 
 Secrets — API keys, Telegram tokens, etc. — are never read from arbitrary environment variables. Store them with `alms auth set <provider> <key>` or declare a per-provider env var with `api_key_env` (see below).
 
