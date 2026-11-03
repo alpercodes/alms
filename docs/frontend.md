@@ -36,6 +36,17 @@ build, so the exact versions in `package-lock.json` are the supported baseline.
 Markdown sanitizing, signal-driven activity, normalized entity updates, and DM
 collapsible behavior have focused regression coverage.
 
+### Dev-tooling overrides
+
+`package.json` forces `minimatch` to 11.0.1 (#199, 2026-11), outside the `^10`
+ranges declared by `eslint`, `@eslint/config-array` and
+`@typescript-eslint/typescript-estree`. It clears GHSA-g3hv-75wg-m249, which has
+no 10.x fix, and no release of the three accepts 11. Compatibility was checked
+against `eslint` 10.7.0, `@eslint/config-array` 0.23.5 and `typescript-eslint`
+8.63.0, so re-check their `minimatch` use when bumping them: npm applies the
+override silently and `npm ls` still exits 0. Remove it once all three accept a
+patched `minimatch`.
+
 ## Runtime dependency baseline
 
 These are the packages that reach the browser. Bumping any of them is a
