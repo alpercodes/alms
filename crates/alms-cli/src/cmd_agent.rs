@@ -69,7 +69,8 @@ pub(crate) enum AgentCommands {
         /// Posture override ("guarded", "full_control", or "autonomous")
         #[arg(long)]
         posture: Option<String>,
-        /// LLM provider override ("openai", "anthropic", "openrouter")
+        /// LLM provider override: "openai", "anthropic", "openrouter", "gemini",
+        /// or the name of a `[llm.providers.<name>]` entry
         #[arg(long)]
         provider: Option<String>,
         /// Anthropic extended-thinking budget in tokens (Claude 4.x).

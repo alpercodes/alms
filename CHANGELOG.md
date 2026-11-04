@@ -358,9 +358,9 @@ Each item below changes behaviour for a deployment that has not set the knob exp
 - The gateway's startup warning that an API key env var is "IGNORED for security" no longer
   fires for a var a `[llm.providers.<name>]` entry names in `api_key_env`. A bare export
   still gets it. The closing line no longer says API key env vars are "no longer used"; it
-  says an LLM key env var is read only if an entry names it, and that `TELEGRAM_BOT_TOKEN`
-  is never read. `alms auth set --help` now lists all five accepted names, adding `gemini`
-  and `telegram`.
+  says an LLM key env var is read only if an entry names it, and that the Telegram bot
+  token is never read from `TELEGRAM_BOT_TOKEN`. `alms auth set --help` now lists all five
+  accepted names, adding `gemini` and `telegram`.
 
 ### Frontend
 

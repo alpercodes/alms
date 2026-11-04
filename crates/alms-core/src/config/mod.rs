@@ -296,7 +296,7 @@ impl AlmsConfig {
     ///
     /// Callers must invoke [`LlmConfig::ensure_builtin_providers`] before
     /// this method so that sugar provider entries (`openai`, `openrouter`,
-    /// `anthropic`) exist in `llm.providers`. When `ALMS_LLM_BASE_URL` or
+    /// `anthropic`, `gemini`) exist in `llm.providers`. When `ALMS_LLM_BASE_URL` or
     /// `ALMS_LLM_MODEL` is set, the override is propagated into the
     /// resolved provider entry as well as the flat `llm.base_url` /
     /// `llm.model` fields; the runtime `From<LlmConfig>` impl prefers the
@@ -746,8 +746,8 @@ impl AlmsConfig {
         }
         warn!(
             "An LLM key env var is read only if a provider entry names it in `api_key_env`; \
-             TELEGRAM_BOT_TOKEN is never read. Store keys securely with \
-             `alms auth set <provider> <key>` (encrypted with ALMS_MASTER_KEY)."
+             the Telegram bot token is never read from TELEGRAM_BOT_TOKEN. Store keys securely \
+             with `alms auth set <provider> <key>` (encrypted with ALMS_MASTER_KEY)."
         );
     }
 }
