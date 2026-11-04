@@ -122,15 +122,21 @@ pub(super) fn is_legacy_lifecycle_error_marker(msg: &Message) -> bool {
         == Some("run_boundary")
 }
 
-/// Returns `true` when the message is the runtime-layer
-/// `[Run failed: ...]` or `[Run cancelled by user]` text bubble
-/// persisted by `AgentRuntime::finish_run` on the `Err(_)` and
-/// `Err(Cancelled)` arms.
+/// What `AgentRuntime::finish_run` records for a run an operator stopped.
+pub(crate) const RUN_CANCELLED_BY_USER: &str = "[Run cancelled by user]";
+
+/// What `AgentRuntime::finish_run` records for a run the gateway's own
+/// shutdown stopped. No user asked for this, so it must not read as if one did.
+pub(crate) const RUN_INTERRUPTED_BY_SHUTDOWN: &str = "[Run interrupted by gateway shutdown]";
+
+/// Returns `true` when the message is a runtime-layer text bubble persisted
+/// by `AgentRuntime::finish_run`: `[Run failed: ...]` on the `Err(_)` arm, or
+/// [`RUN_CANCELLED_BY_USER`] / [`RUN_INTERRUPTED_BY_SHUTDOWN`] on the
+/// `Err(Cancelled)` arm.
 ///
 /// Matches both the regular-session shape (`Role::Assistant` text)
 /// and the DM-session shape (`Role::User` with `from_agent`
-/// metadata) — both bubbles share the literal `[Run failed:` /
-/// `[Run cancelled by user]` content prefix.
+/// metadata) — the bubbles share their literal content prefix either way.
 pub(super) fn is_runtime_layer_failure_bubble(msg: &Message) -> bool {
     // Runtime-layer bubbles are never persisted as `Role::System`,
     // so a `System` here is necessarily a marker, not a bubble.
@@ -139,7 +145,9 @@ pub(super) fn is_runtime_layer_failure_bubble(msg: &Message) -> bool {
     }
     match &msg.content {
         Content::Text(t) => {
-            t.starts_with("[Run failed:") || t.starts_with("[Run cancelled by user]")
+            t.starts_with("[Run failed:")
+                || t.starts_with(RUN_CANCELLED_BY_USER)
+                || t.starts_with(RUN_INTERRUPTED_BY_SHUTDOWN)
         }
         _ => false,
     }
@@ -212,7 +220,10 @@ pub(super) fn filter_legacy_duplicate_run_boundary_markers(history: &[Message]) 
 mod tests {
     use super::super::ContextBuilder;
     use super::super::tests::make_msg;
-    use super::{is_error_marker, is_stripped_display_marker};
+    use super::{
+        RUN_INTERRUPTED_BY_SHUTDOWN, is_error_marker, is_runtime_layer_failure_bubble,
+        is_stripped_display_marker,
+    };
     use alms_core::{Timestamp, config::ContextConfig};
     use alms_session::{Content, Message, Role};
 
@@ -519,6 +530,31 @@ mod tests {
             !legacy_marker_visible,
             "legacy lifecycle-layer marker must not surface to the LLM when an adjacent runtime-layer bubble carries the same event; messages: {messages:?}"
         );
+    }
+
+    /// The shutdown bubble is an ordinary turn on the next run, exactly like
+    /// the user-cancel bubble it stands in for.
+    #[test]
+    fn shutdown_bubble_reaches_the_next_context_as_a_turn() {
+        let builder = ContextBuilder::new(ContextConfig {
+            strategy: "truncate".into(),
+            max_input_tokens: 32000,
+            summary_model: None,
+            ..Default::default()
+        });
+        let history = vec![
+            make_msg(Role::User, "long-running task"),
+            make_msg(Role::Assistant, RUN_INTERRUPTED_BY_SHUTDOWN),
+        ];
+
+        let messages = builder.build("System.", &history, "try again", None);
+
+        assert!(
+            messages.iter().any(|m| m.role == "assistant"
+                && m.content.as_deref() == Some(RUN_INTERRUPTED_BY_SHUTDOWN)),
+            "the shutdown bubble must survive as an assistant turn: {messages:?}"
+        );
+        assert!(is_runtime_layer_failure_bubble(&history[1]));
     }
 
     /// Same legacy-duplicate test, but for the cancellation pair —

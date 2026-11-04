@@ -46,6 +46,10 @@ pub struct AgentRuntime {
     pub(crate) run_id: Option<alms_core::RunId>,
     /// Per-run cancellation token for cooperative cancellation.
     pub(crate) cancel_token: Option<CancellationToken>,
+    /// The gateway's shutdown token. `cancel_token` says only that the run was
+    /// cancelled; this says whether the gateway's own shutdown is why, so the
+    /// record `finish_run` leaves doesn't blame a user for it.
+    pub(crate) shutdown_token: Option<CancellationToken>,
     /// Resolved sandbox root (canonicalized). Retained because the
     /// *sandboxed* shell and fs_* re-registrations read it — the shell
     /// builders, and `refresh_fs_tools_for_extras`, which is a no-op
@@ -508,7 +512,7 @@ impl AgentRuntime {
                 let cancel_msg = SessionMessage {
                     id: uuid::Uuid::new_v4().to_string(),
                     role,
-                    content: SessionContent::Text("[Run cancelled by user]".to_string()),
+                    content: SessionContent::Text(self.cancellation_record().to_string()),
                     timestamp: alms_core::Timestamp::now(),
                     metadata: self.dm_marker_metadata(is_dm),
                 };
@@ -548,6 +552,22 @@ impl AgentRuntime {
                     tool_calls,
                 })
             }
+        }
+    }
+
+    /// The record to persist for a cancelled run. Shutdown cancels the
+    /// shutdown token before any run token (`begin_shutdown` in the gateway),
+    /// so a run shutdown stopped can never read as a user's cancel. A user's
+    /// Stop that is still unwinding when shutdown starts reads as shutdown.
+    fn cancellation_record(&self) -> &'static str {
+        if self
+            .shutdown_token
+            .as_ref()
+            .is_some_and(CancellationToken::is_cancelled)
+        {
+            crate::context::RUN_INTERRUPTED_BY_SHUTDOWN
+        } else {
+            crate::context::RUN_CANCELLED_BY_USER
         }
     }
 

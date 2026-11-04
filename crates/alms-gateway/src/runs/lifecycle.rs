@@ -1496,7 +1496,7 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
         // S1 (#1154): if this was a peer-triggered DM run cancelled while
         // still `Queued` (HTTP cancel, #1109 deny cascade,
         // `cancel_runs_for_session`, or shutdown), signal the peer that the
-        // conversation ended with `UserCancelled`. This is the single
+        // conversation ended. This is the single
         // chokepoint every queued-then-cancelled run passes through — the
         // synchronous `cancel_run` handler only flips state + emits
         // `run_cancelled`, and the `Ok`/`Cancelled` arms below never run for
@@ -2165,7 +2165,8 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
     }
     .with_event_sender(runtime_tx)
     .with_run_id(run_id)
-    .with_cancel_token(cancel_token.clone());
+    .with_cancel_token(cancel_token.clone())
+    .with_shutdown_token(state.shutdown_token.clone());
 
     // Set agent name for perspective mapping in DM sessions.
     if let Some(ref name) = agent_name {
@@ -2825,7 +2826,7 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
             // already emitted (by the `Cancelled` arm, the synchronous HTTP
             // `cancel_run` handler, or the pre-cancel early-exit above) and
             // the DM peer was already signalled — by the `Cancelled` arm's
-            // `handle_dm_run_failure(UserCancelled)` when the loop ran, or by
+            // `handle_dm_run_failure` when the loop ran, or by
             // the pre-cancel early-exit's
             // `notify_dm_peer_of_setup_cancellation` (S1, #1154) when the run
             // was cancelled before the loop started. Either way we stay
@@ -2927,7 +2928,7 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
                 // are two cancel paths and each owns the peer signal:
                 //   1. Cancelled *during* the loop → the `Cancelled` /
                 //      `CancelledWithToolCalls` arms call
-                //      `handle_dm_run_failure(UserCancelled)` (unconditional
+                //      `handle_dm_run_failure` (unconditional
                 //      per #1050, fires regardless of who wins the
                 //      state-flip race).
                 //   2. Cancelled *before* the loop started (queued-then-
@@ -2977,7 +2978,7 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
                 // `Err(Cancelled)`), the `Cancelled` arm below — which would
                 // have signalled the peer — never runs. So in the
                 // Ok-arm-vs-HTTP-cancel interleaving the peer would be left
-                // stranded. Signal it here with `UserCancelled`. This is
+                // stranded. Signal it here. This is
                 // safe to call even if the peer was already signalled by a
                 // racing path: `MessageBus::end_conversation`'s
                 // `depths.remove()` / tombstone guard makes a second call a
@@ -2990,13 +2991,13 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
                 );
                 // #1258: `interrupted: true` either way — see the `Cancelled`
                 // arm below.
-                let conversation_reason =
-                    completion_peer_error.map_or(ConversationEndReason::UserCancelled, |message| {
-                        ConversationEndReason::Errored {
-                            message,
-                            interrupted: true,
-                        }
-                    });
+                let conversation_reason = completion_peer_error.map_or_else(
+                    || super::dm_lifecycle::cancelled_run_end_reason(&state),
+                    |message| ConversationEndReason::Errored {
+                        message,
+                        interrupted: true,
+                    },
+                );
                 if let Err(e) = super::dm_lifecycle::handle_dm_run_failure(
                     &state,
                     &run_id,
@@ -3071,7 +3072,9 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
             // Issue #912 — DO NOT persist a lifecycle-layer
             // `(run cancelled)` error marker here.  The runtime layer
             // (`alms_runtime::AgentRuntime::finish_run`) already wrote a
-            // `[Run cancelled by user]` text message at
+            // `[Run cancelled by user]` text message (or, when the
+            // gateway's shutdown stopped the run,
+            // `[Run interrupted by gateway shutdown]`) at
             // `Role::Assistant` (or `Role::User` with `from_agent`
             // metadata in DM sessions).  That runtime-layer record is
             // the canonical source of truth: it survives
@@ -3109,13 +3112,13 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
             // #1258: `interrupted: true` either way — the run was cancelled,
             // so no turn of this DM completed; the `Errored` upgrade only
             // swaps in the teardown-persistence failure as the reason text.
-            let conversation_reason =
-                cancellation_peer_error.map_or(ConversationEndReason::UserCancelled, |message| {
-                    ConversationEndReason::Errored {
-                        message,
-                        interrupted: true,
-                    }
-                });
+            let conversation_reason = cancellation_peer_error.map_or_else(
+                || super::dm_lifecycle::cancelled_run_end_reason(&state),
+                |message| ConversationEndReason::Errored {
+                    message,
+                    interrupted: true,
+                },
+            );
             if let Err(e) = super::dm_lifecycle::handle_dm_run_failure(
                 &state,
                 &run_id,
@@ -3185,8 +3188,8 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
             }
 
             // Issue #912 — see the `Cancelled` arm above.  The
-            // runtime-layer `[Run cancelled by user]` write is the
-            // canonical record; no lifecycle-layer marker is persisted.
+            // runtime-layer write is the canonical record; no
+            // lifecycle-layer marker is persisted.
 
             // Best-effort: see comment in the `Cancelled` arm. NOT gated
             // on `cancelled_transitioned` — `handle_dm_run_failure` is an
@@ -3202,13 +3205,13 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
             // #1258: `interrupted: true` either way — the run was cancelled,
             // so no turn of this DM completed; the `Errored` upgrade only
             // swaps in the teardown-persistence failure as the reason text.
-            let conversation_reason =
-                cancellation_peer_error.map_or(ConversationEndReason::UserCancelled, |message| {
-                    ConversationEndReason::Errored {
-                        message,
-                        interrupted: true,
-                    }
-                });
+            let conversation_reason = cancellation_peer_error.map_or_else(
+                || super::dm_lifecycle::cancelled_run_end_reason(&state),
+                |message| ConversationEndReason::Errored {
+                    message,
+                    interrupted: true,
+                },
+            );
             if let Err(e) = super::dm_lifecycle::handle_dm_run_failure(
                 &state,
                 &run_id,

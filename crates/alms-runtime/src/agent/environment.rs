@@ -75,6 +75,7 @@ impl AgentRuntime {
             event_sender: None,
             run_id: None,
             cancel_token: None,
+            shutdown_token: None,
             resolved_sandbox_root: sandbox_root,
             shell_unrestricted,
             shell_default_env: std::collections::HashMap::new(),
@@ -509,6 +510,13 @@ impl AgentRuntime {
     /// Attach a cancellation token for cooperative run cancellation.
     pub fn with_cancel_token(mut self, token: CancellationToken) -> Self {
         self.cancel_token = Some(token);
+        self
+    }
+
+    /// Attach the gateway's shutdown token, so a run cancelled by shutdown
+    /// records that rather than a user's cancel.
+    pub fn with_shutdown_token(mut self, token: CancellationToken) -> Self {
+        self.shutdown_token = Some(token);
         self
     }
 

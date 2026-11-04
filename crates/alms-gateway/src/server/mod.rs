@@ -329,6 +329,14 @@ async fn shutdown_signal(token: CancellationToken, run_manager: RunManager) {
         info!("Received Ctrl+C, initiating graceful shutdown");
     }
 
+    begin_shutdown(&token, &run_manager);
+}
+
+/// Start a graceful shutdown: stop the gateway's loops, end its SSE streams,
+/// and cancel every in-flight run.
+pub(crate) fn begin_shutdown(token: &CancellationToken, run_manager: &RunManager) {
+    // Before any run is cancelled: a run reads this token to tell that shutdown
+    // is why, and so that no user is blamed for it.
     token.cancel();
 
     // Close all SSE sender channels so persistent SSE connections (especially

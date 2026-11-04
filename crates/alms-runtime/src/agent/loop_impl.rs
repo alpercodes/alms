@@ -642,7 +642,7 @@ impl AgentRuntime {
             if let Some(ref token) = self.cancel_token
                 && token.is_cancelled()
             {
-                info!(agent_id = %self.agent_id.0, "Run cancelled by user");
+                info!(agent_id = %self.agent_id.0, "Run cancelled");
                 return (tool_call_records, Err(AlmsError::Cancelled));
             }
 
