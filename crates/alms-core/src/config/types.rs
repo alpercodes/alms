@@ -232,7 +232,7 @@ impl ServerConfig {
 #[serde(default)]
 pub struct LlmConfig {
     /// Provider selector. Either a built-in sugar name (`openai`,
-    /// `openrouter`, `anthropic`) or the key of an entry in
+    /// `openrouter`, `anthropic`, `gemini`) or the key of an entry in
     /// `[llm.providers.<name>]`.
     pub provider: String,
     pub base_url: String,
@@ -366,7 +366,7 @@ pub struct LlmConfig {
     /// [`LlmConfig::provider`].
     ///
     /// Entries are populated from `[llm.providers.<name>]` in `alms.toml`.
-    /// Built-in sugar names (`openai`, `openrouter`, `anthropic`) are
+    /// Built-in sugar names (`openai`, `openrouter`, `anthropic`, `gemini`) are
     /// auto-populated at config-load time so the rest of the system sees a
     /// uniform view regardless of which config shape the user wrote.
     ///
@@ -678,8 +678,8 @@ impl Default for GeminiConfig {
 
 impl LlmConfig {
     /// Populate [`providers`][Self::providers] with built-in sugar entries
-    /// for `openai`, `openrouter`, and `anthropic` if the user has not
-    /// already defined them.
+    /// for `openai`, `openrouter`, `anthropic`, and `gemini` if the user has
+    /// not already defined them.
     ///
     /// This lets the rest of the system look up every provider uniformly
     /// in `providers`, regardless of whether the user wrote the classic

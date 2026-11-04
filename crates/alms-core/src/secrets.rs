@@ -449,8 +449,11 @@ impl SecretsStore {
     /// Detect API key environment variables that are set in the current process.
     ///
     /// Returns a list of `(env_var_name, provider)` tuples for each detected
-    /// secret env var. Callers should print a deprecation warning telling users
-    /// to migrate to `alms auth set`.
+    /// secret env var. This only checks that a var is set. A caller warning users
+    /// to migrate to `alms auth set` must skip a var a provider entry names in
+    /// `api_key_env`: naming it is the operator's choice. It can still go unread,
+    /// for example when a stored key outranks it
+    /// (`AlmsConfig::warn_deprecated_secret_env_vars`).
     pub fn detect_deprecated_env_keys() -> Vec<(&'static str, &'static str)> {
         const DEPRECATED_VARS: &[(&str, &str)] = &[
             ("OPENROUTER_API_KEY", "openrouter"),

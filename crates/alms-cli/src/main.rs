@@ -257,8 +257,8 @@ async fn main() -> anyhow::Result<()> {
                 "Starting ALMS Gateway"
             );
 
-            // Warn about deprecated API key env vars (ignored for security).
-            alms_core::AlmsConfig::warn_deprecated_secret_env_vars();
+            // Warn about API key env vars set but not named by any `api_key_env`.
+            config.warn_deprecated_secret_env_vars();
 
             // Resolve bind address: --bind flag > config (alms.toml / ALMS_BIND) > default
             let bind = bind.unwrap_or(config.server.bind.clone());

@@ -55,7 +55,7 @@ use std::path::{Path, PathBuf};
 pub(crate) enum AuthCommands {
     /// Set an API key for a provider
     Set {
-        /// Provider name: openai, anthropic, openrouter
+        #[arg(help = set_provider_help())]
         provider: String,
         /// API key (if omitted, reads from stdin)
         key: Option<String>,
@@ -213,6 +213,12 @@ fn gateway_refused(url: &str, err: &anyhow::Error, secrets_path: &Path) -> anyho
          again to write {path}, the file a gateway started with this same configuration reads.",
         path = secrets_path.display()
     )
+}
+
+/// `alms auth set --help` text for `<PROVIDER>`, built from the list
+/// `reject_unknown_provider` checks so the two cannot disagree.
+fn set_provider_help() -> String {
+    format!("Provider name: {}", VALID_PROVIDERS.join(", "))
 }
 
 fn reject_unknown_provider(provider: &str) -> anyhow::Result<()> {
@@ -405,6 +411,22 @@ mod tests {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     const TEST_KEY: &str = "sk-test-key-0123456789";
+
+    #[test]
+    fn set_help_lists_every_accepted_provider() {
+        use clap::Subcommand;
+
+        let mut auth = AuthCommands::augment_subcommands(clap::Command::new("auth"));
+        let help = auth
+            .find_subcommand_mut("set")
+            .expect("auth has a set subcommand")
+            .render_help()
+            .to_string();
+
+        for provider in VALID_PROVIDERS {
+            assert!(help.contains(provider), "{provider} missing from: {help}");
+        }
+    }
 
     fn health_ok() -> Mock {
         Mock::given(method("GET"))

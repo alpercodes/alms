@@ -68,7 +68,7 @@ model    = "z-ai/glm-5.2"
 
 These two keys are the **server default** and are runtime-mutable: `PATCH /settings` (and the Settings modal) changes them for the next run with no restart, and persists the change to `{data_dir}/settings.json`. That file wins over `alms.toml` on the next boot, so once the pair has been PATCHed, editing it here has no effect until you edit or remove `settings.json`. See `docs/api.md` § 10.2 for the validation rules and the Telegram propagation caveat. The `[llm.providers]` tables below are **not** PATCH-mutable — they are read once at startup.
 
-The sugar names `openai`, `openrouter`, and `anthropic` are auto-populated at config-load time, so classic flat configs (`provider = "openai"` with nothing else) keep working. User-declared entries with the same names override the auto-populated ones.
+The sugar names `openai`, `openrouter`, `anthropic`, and `gemini` are auto-populated at config-load time, so classic flat configs (`provider = "openai"` with nothing else) keep working. A user-declared entry with one of these names replaces the auto-populated one instead of merging with it, so it has to restate `base_url`, and for `anthropic` and `gemini` also `kind` and `auth_scheme` (they default to `openai_compatible` and bearer).
 
 ### Schema
 
@@ -346,7 +346,7 @@ OpenAI o-series reports reasoning-token cost separately under `usage.completion_
 
 ## Adding an OpenAI-compatible provider
 
-Copy the block that matches your provider, paste it into `alms.toml`, set `llm.provider` to the entry's name, and run `alms auth set <name> <key>` (or export the `api_key_env` variable before launching the gateway).
+Copy the block that matches your provider, paste it into `alms.toml`, set `llm.provider` to the entry's name, and export the `api_key_env` variable before launching the gateway. `alms auth set` accepts only the fixed names listed under [Schema](#schema).
 
 ### xAI (Grok)
 
@@ -471,15 +471,23 @@ provider = "gemini"
 model    = "gemini-2.5-pro"
 ```
 
-Store the API key with `alms auth set gemini <key>`. Alternatively, point the
-sugar entry at an existing environment variable:
+Store the API key with `alms auth set gemini <key>`. Alternatively, name an
+existing environment variable in your own `gemini` entry. It replaces the
+auto-populated entry instead of merging with it, so it has to restate the rest:
 
 ```toml
+[llm]
+provider = "gemini"
+model    = "gemini-2.5-pro"
+
 [llm.providers.gemini]
+kind        = "gemini"
+base_url    = "https://generativelanguage.googleapis.com/v1beta"
 api_key_env = "GEMINI_API_KEY"   # or "GOOGLE_API_KEY"
+auth_scheme = { type = "header", name = "x-goog-api-key" }
 ```
 
-Only override `base_url` if you need to talk to a proxy or a non-default
+Only change `base_url` if you need to talk to a proxy or a non-default
 region — the default is `https://generativelanguage.googleapis.com/v1beta`.
 Gemini authenticates via the `x-goog-api-key` header (preferred over the
 `?key=` query parameter because it keeps the secret out of URL logs).
