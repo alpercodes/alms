@@ -50,6 +50,10 @@ pub struct AgentRuntime {
     /// cancelled; this says whether the gateway's own shutdown is why, so the
     /// record `finish_run` leaves doesn't blame a user for it.
     pub(crate) shutdown_token: Option<CancellationToken>,
+    /// `Some` when no one can answer this runtime's approval requests, so any
+    /// denial is automatic rather than a user's. Fired at the denial, before
+    /// the denial fires `cancel_token`.
+    pub(crate) unroutable_approval_denied: Option<CancellationToken>,
     /// Resolved sandbox root (canonicalized). Retained because the
     /// *sandboxed* shell and fs_* re-registrations read it — the shell
     /// builders, and `refresh_fs_tools_for_extras`, which is a no-op
@@ -555,17 +559,20 @@ impl AgentRuntime {
         }
     }
 
-    /// The record to persist for a cancelled run. Shutdown cancels the
-    /// shutdown token before any run token (`begin_shutdown` in the gateway),
-    /// so a run shutdown stopped can never read as a user's cancel. A user's
-    /// Stop that is still unwinding when shutdown starts reads as shutdown.
-    fn cancellation_record(&self) -> &'static str {
-        if self
-            .shutdown_token
-            .as_ref()
-            .is_some_and(CancellationToken::is_cancelled)
-        {
+    /// The record to persist for a cancelled run. Each cause's token fires
+    /// before the run's own, so a run neither shutdown nor an automatic denial
+    /// stopped is the only kind that reads as a user's cancel. The limit runs
+    /// one way: a user's Stop reads as shutdown if shutdown starts before this
+    /// is read. That gap is usually milliseconds, but a Stop during context
+    /// summarization stays open until the summary call returns.
+    pub(crate) fn cancellation_record(&self) -> &'static str {
+        let fired = |token: &Option<CancellationToken>| {
+            token.as_ref().is_some_and(CancellationToken::is_cancelled)
+        };
+        if fired(&self.shutdown_token) {
             crate::context::RUN_INTERRUPTED_BY_SHUTDOWN
+        } else if fired(&self.unroutable_approval_denied) {
+            crate::context::RUN_STOPPED_APPROVAL_UNROUTABLE
         } else {
             crate::context::RUN_CANCELLED_BY_USER
         }

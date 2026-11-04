@@ -1528,6 +1528,7 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
                 None,
                 &context_id,
                 is_peer_message,
+                transitioned,
             )
             .await;
         }
@@ -1959,6 +1960,8 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
                 agent_name.as_deref(),
                 &context_id,
                 is_peer_message,
+                // The start was rejected, so something else flipped this run.
+                false,
             )
             .await;
         }
@@ -2966,8 +2969,9 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
 
                 info!("Run {} completed successfully", run_id.0);
             } else {
-                // A cancel / shutdown path won the state-flip race while the
-                // loop was producing this `Ok`. The `run_cancelled` SSE was
+                // An operator's cancel won the state-flip race while the loop
+                // was producing this `Ok` (shutdown only fires tokens, so it
+                // never flips a running run). The `run_cancelled` SSE was
                 // already emitted by whichever path flipped the state.
                 //
                 // S1 (#1154): but NOT every winning path signals the DM peer.
@@ -2992,7 +2996,7 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
                 // #1258: `interrupted: true` either way — see the `Cancelled`
                 // arm below.
                 let conversation_reason = completion_peer_error.map_or_else(
-                    || super::dm_lifecycle::cancelled_run_end_reason(&state),
+                    || super::dm_lifecycle::cancelled_run_end_reason(&state, false),
                     |message| ConversationEndReason::Errored {
                         message,
                         interrupted: true,
@@ -3021,7 +3025,7 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
                 // were already persisted above (diagnostic and idempotent).
                 info!(
                     "Run {} was already terminal when its loop returned Ok — the path \
-                     that won the race (cancel / shutdown) already emitted the terminal \
+                     that won the race (an operator's cancel) already emitted the terminal \
                      SSE, so this arm stays silent to keep the event exactly-once \
                      (#1046). Not a dropped event. Terminal-arm bookkeeping skipped",
                     run_id.0
@@ -3113,7 +3117,7 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
             // so no turn of this DM completed; the `Errored` upgrade only
             // swaps in the teardown-persistence failure as the reason text.
             let conversation_reason = cancellation_peer_error.map_or_else(
-                || super::dm_lifecycle::cancelled_run_end_reason(&state),
+                || super::dm_lifecycle::cancelled_run_end_reason(&state, cancelled_transitioned),
                 |message| ConversationEndReason::Errored {
                     message,
                     interrupted: true,
@@ -3206,7 +3210,7 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
             // so no turn of this DM completed; the `Errored` upgrade only
             // swaps in the teardown-persistence failure as the reason text.
             let conversation_reason = cancellation_peer_error.map_or_else(
-                || super::dm_lifecycle::cancelled_run_end_reason(&state),
+                || super::dm_lifecycle::cancelled_run_end_reason(&state, cancelled_transitioned),
                 |message| ConversationEndReason::Errored {
                     message,
                     interrupted: true,

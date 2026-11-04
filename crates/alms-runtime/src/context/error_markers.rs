@@ -122,17 +122,24 @@ pub(super) fn is_legacy_lifecycle_error_marker(msg: &Message) -> bool {
         == Some("run_boundary")
 }
 
-/// What `AgentRuntime::finish_run` records for a run an operator stopped.
+/// What `AgentRuntime::finish_run` records for a cancel that neither the
+/// gateway's shutdown nor an automatic approval denial caused, which leaves an
+/// operator's.
 pub(crate) const RUN_CANCELLED_BY_USER: &str = "[Run cancelled by user]";
 
 /// What `AgentRuntime::finish_run` records for a run the gateway's own
 /// shutdown stopped. No user asked for this, so it must not read as if one did.
 pub(crate) const RUN_INTERRUPTED_BY_SHUTDOWN: &str = "[Run interrupted by gateway shutdown]";
 
+/// What `AgentRuntime::finish_run` records for a run stopped because a tool
+/// call needed approval and nothing could route the request to a person.
+pub(crate) const RUN_STOPPED_APPROVAL_UNROUTABLE: &str =
+    "[Run stopped: tool approval could not be requested]";
+
 /// Returns `true` when the message is a runtime-layer text bubble persisted
 /// by `AgentRuntime::finish_run`: `[Run failed: ...]` on the `Err(_)` arm, or
-/// [`RUN_CANCELLED_BY_USER`] / [`RUN_INTERRUPTED_BY_SHUTDOWN`] on the
-/// `Err(Cancelled)` arm.
+/// [`RUN_CANCELLED_BY_USER`] / [`RUN_INTERRUPTED_BY_SHUTDOWN`] /
+/// [`RUN_STOPPED_APPROVAL_UNROUTABLE`] on the `Err(Cancelled)` arm.
 ///
 /// Matches both the regular-session shape (`Role::Assistant` text)
 /// and the DM-session shape (`Role::User` with `from_agent`
@@ -148,6 +155,7 @@ pub(super) fn is_runtime_layer_failure_bubble(msg: &Message) -> bool {
             t.starts_with("[Run failed:")
                 || t.starts_with(RUN_CANCELLED_BY_USER)
                 || t.starts_with(RUN_INTERRUPTED_BY_SHUTDOWN)
+                || t.starts_with(RUN_STOPPED_APPROVAL_UNROUTABLE)
         }
         _ => false,
     }
@@ -221,8 +229,8 @@ mod tests {
     use super::super::ContextBuilder;
     use super::super::tests::make_msg;
     use super::{
-        RUN_INTERRUPTED_BY_SHUTDOWN, is_error_marker, is_runtime_layer_failure_bubble,
-        is_stripped_display_marker,
+        RUN_INTERRUPTED_BY_SHUTDOWN, RUN_STOPPED_APPROVAL_UNROUTABLE, is_error_marker,
+        is_runtime_layer_failure_bubble, is_stripped_display_marker,
     };
     use alms_core::{Timestamp, config::ContextConfig};
     use alms_session::{Content, Message, Role};
@@ -532,29 +540,32 @@ mod tests {
         );
     }
 
-    /// The shutdown bubble is an ordinary turn on the next run, exactly like
-    /// the user-cancel bubble it stands in for.
+    /// The bubbles for a cancel no user asked for are ordinary turns on the
+    /// next run, exactly like the user-cancel bubble they stand in for.
     #[test]
-    fn shutdown_bubble_reaches_the_next_context_as_a_turn() {
-        let builder = ContextBuilder::new(ContextConfig {
-            strategy: "truncate".into(),
-            max_input_tokens: 32000,
-            summary_model: None,
-            ..Default::default()
-        });
-        let history = vec![
-            make_msg(Role::User, "long-running task"),
-            make_msg(Role::Assistant, RUN_INTERRUPTED_BY_SHUTDOWN),
-        ];
+    fn non_user_cancel_bubbles_reach_the_next_context_as_turns() {
+        for bubble in [RUN_INTERRUPTED_BY_SHUTDOWN, RUN_STOPPED_APPROVAL_UNROUTABLE] {
+            let builder = ContextBuilder::new(ContextConfig {
+                strategy: "truncate".into(),
+                max_input_tokens: 32000,
+                summary_model: None,
+                ..Default::default()
+            });
+            let history = vec![
+                make_msg(Role::User, "long-running task"),
+                make_msg(Role::Assistant, bubble),
+            ];
 
-        let messages = builder.build("System.", &history, "try again", None);
+            let messages = builder.build("System.", &history, "try again", None);
 
-        assert!(
-            messages.iter().any(|m| m.role == "assistant"
-                && m.content.as_deref() == Some(RUN_INTERRUPTED_BY_SHUTDOWN)),
-            "the shutdown bubble must survive as an assistant turn: {messages:?}"
-        );
-        assert!(is_runtime_layer_failure_bubble(&history[1]));
+            assert!(
+                messages
+                    .iter()
+                    .any(|m| m.role == "assistant" && m.content.as_deref() == Some(bubble)),
+                "{bubble} must survive as an assistant turn: {messages:?}"
+            );
+            assert!(is_runtime_layer_failure_bubble(&history[1]));
+        }
     }
 
     /// Same legacy-duplicate test, but for the cancellation pair —

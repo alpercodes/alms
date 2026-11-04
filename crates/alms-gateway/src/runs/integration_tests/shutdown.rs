@@ -21,6 +21,7 @@ use tokio_util::sync::CancellationToken;
 
 const USER_CANCEL_RECORD: &str = "[Run cancelled by user]";
 const SHUTDOWN_RECORD: &str = "[Run interrupted by gateway shutdown]";
+const UNROUTABLE_APPROVAL_RECORD: &str = "[Run stopped: tool approval could not be requested]";
 
 /// A gateway whose LLM accepts a request and then never answers it, so a run
 /// stays in flight until something cancels it.
@@ -32,8 +33,12 @@ struct Gateway {
 
 impl Gateway {
     async fn start() -> Self {
-        let llm =
-            ScriptedLlm::always(Canned::json(200, "{}").after(Duration::from_secs(3600))).await;
+        Self::with_llm(
+            ScriptedLlm::always(Canned::json(200, "{}").after(Duration::from_secs(3600))).await,
+        )
+    }
+
+    fn with_llm(llm: ScriptedLlm) -> Self {
         let workspace = tempfile::tempdir().unwrap();
         let channels = crate::test_support::TestAppState::new()
             .in_memory_sqlite()
@@ -376,4 +381,172 @@ async fn shutdown_of_a_queued_dm_run_blames_no_user() {
         Some("errored")
     );
     assert_eq!(gateway.llm.calls(), 0, "the run must never reach the LLM");
+}
+
+/// A user's Stop on a queued DM run is already accepted when the queue reaches
+/// the item, however long that takes. A shutdown starting in between must not
+/// take the reason away from them.
+#[tokio::test]
+async fn user_stop_of_a_queued_dm_run_keeps_its_reason_during_shutdown() {
+    let mut gateway = Gateway::start().await;
+    let state = gateway.state();
+    let (alice_id, bob_id) = seed_alice_bob(&state);
+    state
+        .message_bus
+        .send("alice", alice_id, "bob", bob_id, "ping", None)
+        .await
+        .unwrap();
+    let _ = received_triggers(&mut gateway);
+
+    let dm_session = SessionId::deterministic_dm("alice", "bob");
+    let run = Run::new(dm_session, bob_id, "ping".to_string());
+    let run_id = run.run_id;
+    let _ = state.run_manager.insert_run(run.clone());
+    let cancel_token = CancellationToken::new();
+    state
+        .run_manager
+        .register_cancel_token(run_id, cancel_token.clone());
+
+    let _ = crate::runs::lifecycle::cancel_run(State(state.clone()), Path(run_id))
+        .await
+        .map_err(|error| error.0)
+        .unwrap();
+    gateway.shutdown();
+    crate::runs::lifecycle::execute_run(
+        state.clone(),
+        crate::runs::RunParams {
+            run_id,
+            session_id: dm_session,
+            agent_id: bob_id,
+            input: run.input,
+            context_id: "dm:alice:bob".to_string(),
+            cancel_token,
+            is_peer_message: true,
+            is_system_triggered: true,
+            input_pre_persisted: false,
+            dm_ended_peer: None,
+        },
+    )
+    .await;
+
+    assert_eq!(
+        dm_ended_reason(&state, dm_session).as_deref(),
+        Some("user_cancelled")
+    );
+}
+
+/// One streamed turn asking for a shell call, which a guarded agent has to get
+/// approved.
+fn shell_call_turn() -> String {
+    let chunk = serde_json::json!({
+        "id": "x",
+        "object": "chat.completion.chunk",
+        "created": 1,
+        "model": "test-model",
+        "choices": [{
+            "index": 0,
+            "delta": {
+                "role": "assistant",
+                "tool_calls": [{
+                    "index": 0,
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {
+                        "name": "shell",
+                        "arguments": "{\"command\":\"echo hi\"}",
+                    },
+                }],
+            },
+            "finish_reason": "tool_calls",
+        }],
+    });
+    format!("data: {chunk}\n\ndata: [DONE]\n\n")
+}
+
+/// Runs a guarded named subagent up to its first tool call, which nobody can
+/// approve, and returns the rows on its session.
+///
+/// The denial fires the subagent's own token inside the loop's poll, so the
+/// biased token arm in `run_subagent` can't drop the loop first, and
+/// `finish_run` always writes its record.
+async fn rows_of_guarded_subagent(
+    state: &AppState,
+    parent_events: Option<std::sync::Arc<dyn alms_tools::EventForwarder>>,
+) -> Vec<String> {
+    let mut guard = alms_core::registry::AgentRecord::for_test("guard");
+    guard.posture = Some("guarded".to_string());
+    let name = guard.name.clone();
+    state
+        .session_manager
+        .store()
+        .unwrap()
+        .create_agent(&guard)
+        .unwrap();
+
+    let parent_agent_id = AgentId::new();
+    let parent_session = state
+        .session_manager
+        .get_or_create(parent_agent_id, "web")
+        .id;
+    let (_, session_id) = state
+        .coordinator
+        .spawn_subagent(
+            alms_coordinator::SubagentRequest {
+                task: "needs approval".to_string(),
+                parent_session,
+                parent_agent_id,
+                parent_run_id: None,
+                subagent_name: Some(name),
+                parent_tool_invocation_id: None,
+            },
+            parent_events,
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+    wait_until("the subagent's record", || {
+        texts(state, session_id)
+            .iter()
+            .any(|row| row.starts_with("[Run "))
+    })
+    .await;
+    texts(state, session_id)
+}
+
+/// The real coordinator hands the shutdown token all the way to a subagent's
+/// runtime.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shutdown_token_reaches_a_subagent_runtime_through_the_coordinator() {
+    let gateway = Gateway::with_llm(ScriptedLlm::always(Canned::sse(shell_call_turn())).await);
+    let state = gateway.state();
+    gateway.shutdown();
+
+    let rows = rows_of_guarded_subagent(&state, None).await;
+
+    assert!(rows.iter().any(|row| row == SHUTDOWN_RECORD), "{rows:?}");
+}
+
+/// An approval no one can be asked for is denied automatically, in the shape
+/// `invoke_agent` spawns (with a parent forwarder) and without one. Neither
+/// involves a user.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unroutable_approval_denial_blames_no_user() {
+    let (events_tx, _events_rx) = tokio::sync::mpsc::unbounded_channel();
+    let forwarder: std::sync::Arc<dyn alms_tools::EventForwarder> =
+        std::sync::Arc::new(crate::runs::tools::RuntimeEventForwarder::new(events_tx));
+
+    for parent_events in [Some(forwarder), None] {
+        let gateway = Gateway::with_llm(ScriptedLlm::always(Canned::sse(shell_call_turn())).await);
+        let state = gateway.state();
+
+        let rows = rows_of_guarded_subagent(&state, parent_events).await;
+
+        assert!(
+            rows.iter().any(|row| row == UNROUTABLE_APPROVAL_RECORD),
+            "{rows:?}"
+        );
+        assert!(!rows.iter().any(|row| row.contains("by user")), "{rows:?}");
+        gateway.channels.1.cancel();
+    }
 }

@@ -2614,6 +2614,9 @@ impl AgentRuntime {
                 // subagent approvals — the subagent cancels instead of
                 // plowing on with every tool denied; the child token does
                 // not propagate to the parent.
+                if let Some(ref denied) = self.unroutable_approval_denied {
+                    denied.cancel();
+                }
                 if let Some(ref token) = self.cancel_token {
                     token.cancel();
                 }

@@ -2198,7 +2198,10 @@ async fn run_agent_loop(
 
     let mut runtime = AgentRuntime::new(agent_id, config, subagent_llm)?
         .with_event_sender(sub_tx)
-        .with_cancel_token(cancel_token);
+        .with_cancel_token(cancel_token)
+        // Nothing routes a subagent's approval request to a person: the relay
+        // below denies it, or the dropped sender reads as a denial.
+        .with_unroutable_approvals();
     if let Some(token) = shutdown_token {
         runtime = runtime.with_shutdown_token(token);
     }

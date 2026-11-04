@@ -43,6 +43,7 @@ fn base_runtime(llm: LlmClient) -> AgentRuntime {
         run_id: None,
         cancel_token: None,
         shutdown_token: None,
+        unroutable_approval_denied: None,
         resolved_sandbox_root: None,
         shell_unrestricted: true,
         shell_default_env: std::collections::HashMap::new(),

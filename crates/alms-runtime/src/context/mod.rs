@@ -65,7 +65,8 @@ mod strategies;
 // on the same canonical display-marker predicate the history-selection
 // strategies use (#1203), so the two exemptions can never drift apart.
 pub(crate) use error_markers::{
-    RUN_CANCELLED_BY_USER, RUN_INTERRUPTED_BY_SHUTDOWN, is_stripped_display_marker,
+    RUN_CANCELLED_BY_USER, RUN_INTERRUPTED_BY_SHUTDOWN, RUN_STOPPED_APPROVAL_UNROUTABLE,
+    is_stripped_display_marker,
 };
 
 /// Token reserve subtracted from `max_input_tokens` when computing the

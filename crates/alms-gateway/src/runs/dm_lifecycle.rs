@@ -445,6 +445,7 @@ pub(super) async fn notify_dm_peer_of_setup_failure(
 /// Like [`notify_dm_peer_of_setup_failure`], `agent_name` may be `None` (the
 /// early-exit fires before the registry record is loaded); the name is
 /// re-resolved from the registry by `agent_id`.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn notify_dm_peer_of_setup_cancellation(
     state: &AppState,
     run_id: &RunId,
@@ -453,6 +454,7 @@ pub(super) async fn notify_dm_peer_of_setup_cancellation(
     agent_name: Option<&str>,
     context_id: &str,
     is_peer_message: bool,
+    transitioned: bool,
 ) {
     notify_dm_peer_of_setup_outcome(
         state,
@@ -462,19 +464,26 @@ pub(super) async fn notify_dm_peer_of_setup_cancellation(
         agent_name,
         context_id,
         is_peer_message,
-        cancelled_run_end_reason(state),
+        cancelled_run_end_reason(state, transitioned),
     )
     .await;
 }
 
 /// The reason a DM ends with when its run was cancelled.
 ///
-/// A cancelled run is an operator's doing unless the gateway is shutting down.
-/// Then it died mid-turn with nobody asking, which `Errored { interrupted }`
-/// already describes, so no user is blamed in the `dm_ended` marker or the
-/// operator's banner.
-pub(super) fn cancelled_run_end_reason(state: &AppState) -> ConversationEndReason {
-    if state.shutdown_token.is_cancelled() {
+/// `transitioned` is whether the caller's own transition moved the run to
+/// `Cancelled`. If it didn't, an operator's path (`cancel_run` or the deny
+/// cascade) already had, and their stop stands even if the gateway has started
+/// shutting down since. Shutdown never flips a run; it only fires tokens.
+///
+/// Otherwise, during shutdown, the run died mid-turn with nobody asking, which
+/// `Errored { interrupted }` already describes, so no user is blamed in the
+/// `dm_ended` marker or the operator's banner.
+pub(super) fn cancelled_run_end_reason(
+    state: &AppState,
+    transitioned: bool,
+) -> ConversationEndReason {
+    if transitioned && state.shutdown_token.is_cancelled() {
         ConversationEndReason::Errored {
             message: "the gateway shut down".to_string(),
             interrupted: true,
