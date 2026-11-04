@@ -820,6 +820,22 @@ pub async fn create_run(
                     .into(),
                 ));
             }
+            Err(ResolveAgentConfigError::UnknownProvider {
+                agent_id: ag,
+                provider,
+                message,
+            }) => {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    axum::Json(serde_json::json!({
+                        "error_code": "AGENT_PROVIDER_NOT_CONFIGURED",
+                        "message": format!("agent {ag}: {message}"),
+                        "agent_id": ag.0.to_string(),
+                        "provider": provider,
+                    }))
+                    .into(),
+                ));
+            }
             Ok(resolved) => {
                 // #919 per-run token-budget validation.
                 pre_flight_token_budget(agent_id, &resolved.agent_config, &resolved.llm)
@@ -1582,9 +1598,10 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
     // per-agent model override.
     //
     // `resolve_agent_config` can fail with #863 `MissingModelAfterProviderSwitch`
-    // when a per-agent provider override is set with no model on any layer.
+    // when a per-agent provider override is set with no model on any layer,
+    // or with #172 `UnknownProvider` when it names nothing a run can route to.
     // The HTTP `create_run` handler runs the same resolve up-front and
-    // rejects with `400 MISSING_MODEL_AFTER_PROVIDER_SWITCH`, so this path
+    // rejects with a 400, so this path
     // is only reachable for non-HTTP triggers (Telegram / scheduler / peer
     // DMs / subagent completions). Mark the run as failed with the same
     // structured message so the run record carries an actionable error.

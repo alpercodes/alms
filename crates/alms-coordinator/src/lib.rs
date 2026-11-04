@@ -2101,6 +2101,14 @@ async fn run_agent_loop(
     // Apply provider override first (with secrets for key resolution), then model
     let mut subagent_llm = llm.clone();
     if let Some(ref provider) = provider_override {
+        // #172: `with_provider*` would keep the parent's URL and clear the key,
+        // sending the prompt to the parent's provider with no key.
+        let providers = subagent_llm.providers_snapshot();
+        if !alms_core::config::is_known_provider(provider, providers) {
+            return Err(AlmsError::InvalidConfig(
+                alms_core::config::unknown_provider_message(provider, providers),
+            ));
+        }
         info!("Named subagent using provider override: {provider}");
         subagent_llm = if let Some(s) = secrets {
             subagent_llm.with_provider_and_secrets(provider, &s.read())
@@ -5154,6 +5162,66 @@ mod tests {
     }
 
     // -- (k) named subagent reuses session across invocations --------------------
+
+    /// #172: a named subagent stored with a provider nothing can route must
+    /// fail, not send its prompt to the parent's provider URL with no key.
+    #[tokio::test]
+    async fn a_named_subagent_on_an_unknown_provider_fails_and_sends_nothing() {
+        let workspace_tmp = tempfile::TempDir::new().unwrap();
+        let db_tmp = tempfile::TempDir::new().unwrap();
+        let db_path = db_tmp.path().join("alms.db");
+        let session_manager = Arc::new(
+            SessionManager::with_sqlite(
+                alms_session::SessionConfig::default(),
+                db_path.to_str().unwrap(),
+            )
+            .expect("open SQLite session manager"),
+        );
+        let record = alms_core::registry::AgentRecord {
+            provider: Some("removed-provider".to_string()),
+            model: Some("agent-model".to_string()),
+            ..alms_core::registry::AgentRecord::for_test("stale")
+        };
+        session_manager
+            .store()
+            .unwrap()
+            .create_agent(&record)
+            .unwrap();
+
+        let llm_server = ScriptedLlm::always(Canned::sse("data: [DONE]\n\n")).await;
+        let llm = LlmClient::new(LlmConfig {
+            base_url: llm_server.base_url(),
+            api_key: "dummy-parent-key".to_string(),
+            default_model: "test-model".to_string(),
+            timeout_secs: 5,
+            stream_chunk_timeout_secs: 5,
+            ..LlmConfig::default()
+        })
+        .unwrap();
+        let coord = Coordinator::new(session_manager, llm)
+            .with_workspace_dir(workspace_tmp.path().to_path_buf());
+
+        let err = coord
+            .dispatch(
+                "secret prompt".to_string(),
+                test_session_id(),
+                test_parent_agent_id(),
+                None,
+                None,
+                Some("stale".to_string()),
+                None,
+                None,
+            )
+            .await
+            .expect_err("an unconfigured provider must fail the dispatch");
+
+        assert_eq!(llm_server.calls(), 0, "nothing may reach any provider");
+        let message = err.to_string();
+        assert!(
+            message.contains("removed-provider") && message.contains("not configured"),
+            "got: {message}"
+        );
+    }
 
     #[tokio::test]
     async fn test_named_subagent_persistent_session() {
