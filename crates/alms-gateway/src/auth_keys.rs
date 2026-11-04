@@ -80,6 +80,12 @@ pub async fn set_key(
         .set_key(&req.provider, &req.key)
         .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL", e))?;
 
+    // The new key may be the fix for a failing summary on this provider. The
+    // next run's summary says whether it was.
+    state
+        .run_manager
+        .clear_summary_problems(|_, failure| failure.provider == req.provider);
+
     Ok(Json(serde_json::json!({
         "ok": true,
         "provider": req.provider,

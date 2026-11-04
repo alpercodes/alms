@@ -154,6 +154,17 @@ impl AgentRuntime {
         }
     }
 
+    /// Report what became of a compaction summary call. Best-effort, like
+    /// [`Self::emit_status`]: it must never affect the run.
+    pub(crate) fn emit_summary_status(&self, failure: Option<crate::SummaryFailure>) {
+        if let Some(ref tx) = self.event_sender {
+            let _ = tx.send(crate::events::RuntimeEvent::SummaryStatus {
+                agent_id: self.agent_id,
+                failure,
+            });
+        }
+    }
+
     /// Emit a `ContextDebug` event containing the full assembled context
     /// window that is about to be sent to the LLM.
     ///

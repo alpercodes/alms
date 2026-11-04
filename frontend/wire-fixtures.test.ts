@@ -10,7 +10,12 @@ describe("Rust-serialized wire fixtures", () => {
     ).toEqual(fixtures.run_status);
   });
 
-  for (const type of ["subagent_activity", "run_error", "approval_required"] as const) {
+  for (const type of [
+    "subagent_activity",
+    "run_error",
+    "approval_required",
+    "summary_status",
+  ] as const) {
     it("accepts the exact current " + type + " SSE payload", () => {
       expect(parseSsePayload(type, fixtures.sse[type])).toEqual(fixtures.sse[type]);
     });

@@ -36,6 +36,7 @@ mod queue;
 mod read_api;
 mod run_failure;
 mod subagents;
+mod summary_status;
 
 // ---------------------------------------------------------------------------
 // Test helpers

@@ -21,6 +21,7 @@
 
 use crate::llm_client::LlmClient;
 use crate::llm_types::{CompletionRequest, LlmMessage};
+use crate::summary_failure::SummaryFailure;
 use alms_core::config::RunSummaryMode;
 use alms_core::source_label::{derive_source_label, truncate_to_char_boundary};
 use alms_core::{AgentId, RunId, SessionId};
@@ -142,6 +143,28 @@ fn strip_reasoning_from_output(run_output: &str, run_reasoning: Option<&str>) ->
     run_output.to_string()
 }
 
+/// What became of the LLM summary call, for the user rather than the store.
+///
+/// A summary *row* says little here: a failed call can still write one through
+/// the heuristic fallback, which is why the failure has to travel separately.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SummaryOutcome {
+    /// No LLM call was made: mode `off` or `heuristic`, an excluded session
+    /// type, nothing to summarize, or no store. Says nothing about the
+    /// provider's health.
+    NotAttempted,
+    /// The LLM call returned a usable summary.
+    Succeeded,
+    /// The LLM call failed or returned nothing usable.
+    Failed(SummaryFailure),
+}
+
+/// A summary's text alongside what happened to the LLM call behind it.
+struct GeneratedSummary {
+    text: Option<String>,
+    outcome: SummaryOutcome,
+}
+
 /// Generate or update a session summary.
 ///
 /// Returns `Some(summary_text)` when a summary was produced, or `None` when
@@ -163,14 +186,29 @@ fn strip_reasoning_from_output(run_output: &str, run_reasoning: Option<&str>) ->
     )
 )]
 pub async fn generate_session_summary(llm: &LlmClient, params: &SummaryParams) -> Option<String> {
-    match params.mode {
+    generate_summary(llm, params).await.text
+}
+
+async fn generate_summary(llm: &LlmClient, params: &SummaryParams) -> GeneratedSummary {
+    let (text, outcome) = match params.mode {
         RunSummaryMode::Off | RunSummaryMode::Unknown => {
             debug!("Summary generation skipped (mode=off)");
-            return None;
+            (None, SummaryOutcome::NotAttempted)
         }
-        RunSummaryMode::Heuristic => generate_heuristic(params),
-        RunSummaryMode::Llm => apply_llm_fallback(generate_llm(llm, params).await, params),
-    }
+        RunSummaryMode::Heuristic => (generate_heuristic(params), SummaryOutcome::NotAttempted),
+        RunSummaryMode::Llm => match generate_llm(llm, params).await {
+            Ok(Some(text)) => (Some(text), SummaryOutcome::Succeeded),
+            Ok(None) => (
+                apply_llm_fallback(None, params),
+                SummaryOutcome::NotAttempted,
+            ),
+            Err(failure) => (
+                apply_llm_fallback(None, params),
+                SummaryOutcome::Failed(failure),
+            ),
+        },
+    };
+    GeneratedSummary { text, outcome }
 }
 
 /// Apply the LLM-mode fallback policy: if the LLM path produced a summary,
@@ -242,6 +280,10 @@ pub struct PersistSummaryRequest {
 /// (if any), generates a new one, and upserts it to the database.  All errors
 /// are logged and swallowed -- summary failure must never fail the run.
 ///
+/// The return value reports what happened to the LLM call so the gateway can
+/// tell the user; a persistence error is not part of it, since no change of
+/// summary model would fix one.
+///
 /// **Concurrent runs** on the same session are reconciled via optimistic
 /// locking on the `last_run_id` sentinel (#1123).  The upsert only commits if
 /// the stored `last_run_id` still matches the one observed when the base
@@ -263,7 +305,7 @@ pub async fn generate_and_persist_summary(
     session_manager: &SessionManager,
     llm: &LlmClient,
     req: PersistSummaryRequest,
-) {
+) -> SummaryOutcome {
     // Extract req fields immediately to prevent ownership / move errors during retries.
     let req_mode = req.mode;
     let req_agent_id = req.agent_id;
@@ -285,7 +327,7 @@ pub async fn generate_and_persist_summary(
                 context_id = req_context_id.as_str(),
                 "Skipping summary for excluded session type"
             );
-            return;
+            return SummaryOutcome::NotAttempted;
         }
     };
 
@@ -304,6 +346,7 @@ pub async fn generate_and_persist_summary(
 
     let mut current_existing_summary = existing_summary;
     let mut current_expected_last_run_id = expected_last_run_id;
+    let mut outcome = SummaryOutcome::NotAttempted;
 
     if let Some(store) = session_manager.store() {
         let mut persisted = false;
@@ -333,11 +376,13 @@ pub async fn generate_and_persist_summary(
                 summary_max_tokens: req_summary_max_tokens,
             };
 
-            let summary_text = match generate_session_summary(llm, &params).await {
+            let generated = generate_summary(llm, &params).await;
+            outcome = generated.outcome;
+            let summary_text = match generated.text {
                 Some(text) => text,
                 None => {
                     debug!("Summary generation produced no result (attempt {attempt})");
-                    return;
+                    return outcome;
                 }
             };
 
@@ -429,6 +474,8 @@ pub async fn generate_and_persist_summary(
     } else {
         warn!("No SQLite store -- session summary not persisted");
     }
+
+    outcome
 }
 
 // ---------------------------------------------------------------------------
@@ -628,7 +675,13 @@ fn is_repetitive(text: &str) -> bool {
 }
 
 /// Generate a summary via a lightweight LLM call.
-async fn generate_llm(llm: &LlmClient, params: &SummaryParams) -> Option<String> {
+///
+/// `Ok(None)` means there was nothing to summarize and no call was made; `Err`
+/// means a call was made and produced no usable summary.
+async fn generate_llm(
+    llm: &LlmClient,
+    params: &SummaryParams,
+) -> Result<Option<String>, SummaryFailure> {
     // #1098: strip the extended-thinking trace from the run output before
     // anything else so the summarizer LLM never sees reasoning content as
     // "agent response". The strip happens up front so the early-return
@@ -639,7 +692,7 @@ async fn generate_llm(llm: &LlmClient, params: &SummaryParams) -> Option<String>
         strip_reasoning_from_output(&params.run_output, params.run_reasoning.as_deref());
 
     if params.run_input.is_empty() && sanitized_output.is_empty() {
-        return None;
+        return Ok(None);
     }
 
     let system_prompt = include_str!("../prompts/session_summarizer.md").trim();
@@ -738,9 +791,9 @@ async fn generate_llm(llm: &LlmClient, params: &SummaryParams) -> Option<String>
                             check = rejection.as_str(),
                             "LLM summarizer output rejected"
                         );
-                        return None;
+                        return Err(SummaryFailure::unusable_output(llm, model));
                     }
-                    Some(t.to_string())
+                    Ok(Some(t.to_string()))
                 }
                 _ => {
                     warn!(
@@ -754,13 +807,13 @@ async fn generate_llm(llm: &LlmClient, params: &SummaryParams) -> Option<String>
                         finish_reason = finish_reason.unwrap_or("unknown"),
                         "LLM summarizer returned empty response"
                     );
-                    None
+                    Err(SummaryFailure::unusable_output(llm, model))
                 }
             }
         }
         Err(e) => {
             error!("LLM summarizer call failed: {e}");
-            None
+            Err(SummaryFailure::from_error(&e, llm, model))
         }
     }
 }
@@ -1835,6 +1888,131 @@ mod tests {
             agent_name: params.agent_name,
             summary_max_tokens: params.summary_max_tokens,
         }
+    }
+
+    // -- what the gateway is told about the LLM call ------------------------
+
+    fn scripted_client_on(llm: &ScriptedLlm, provider: &str, key: &str) -> LlmClient {
+        LlmClient::new(crate::llm_types::LlmConfig {
+            provider: provider.into(),
+            base_url: llm.base_url(),
+            api_key: key.into(),
+            default_model: "summary-model".into(),
+            timeout_secs: 5,
+            ..crate::llm_types::LlmConfig::default()
+        })
+        .unwrap()
+    }
+
+    /// The failure must come out even though the heuristic fallback still
+    /// writes a row: the row is exactly what hid the failure before.
+    #[tokio::test]
+    async fn a_failed_call_is_reported_even_when_the_heuristic_writes_a_row() {
+        let llm = ScriptedLlm::always(Canned::json(401, r#"{"error":"no auth"}"#)).await;
+        let (manager, agent_id, session_id) = manager_with_session("web-chat-1");
+
+        let outcome = generate_and_persist_summary(
+            &manager,
+            &scripted_client_on(&llm, "openrouter", ""),
+            persist_request(agent_id, session_id, "web-chat-1"),
+        )
+        .await;
+
+        let SummaryOutcome::Failed(failure) = outcome else {
+            panic!("expected a failure, got {outcome:?}");
+        };
+        assert_eq!(failure.code, crate::SummaryFailureCode::MissingKey);
+        assert_eq!(failure.provider, "openrouter");
+        assert!(
+            manager
+                .store()
+                .unwrap()
+                .load_session_summary(agent_id, session_id)
+                .unwrap()
+                .is_some(),
+            "precondition: the heuristic fallback wrote a row"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_call_with_an_existing_summary_is_reported_too() {
+        let llm = ScriptedLlm::always(Canned::json(404, r#"{"error":"no such model"}"#)).await;
+        let (manager, agent_id, session_id) = manager_with_session("web-chat-1");
+        manager
+            .store()
+            .unwrap()
+            .upsert_session_summary(agent_id, session_id, GOOD_SUMMARY, None, Some("User chat"))
+            .unwrap();
+
+        let outcome = generate_and_persist_summary(
+            &manager,
+            &scripted_client_on(&llm, "my-proxy", "k"),
+            persist_request(agent_id, session_id, "web-chat-1"),
+        )
+        .await;
+
+        let SummaryOutcome::Failed(failure) = outcome else {
+            panic!("expected a failure, got {outcome:?}");
+        };
+        assert_eq!(failure.code, crate::SummaryFailureCode::RejectedRequest);
+        assert_eq!(failure.provider, "my-proxy");
+    }
+
+    #[tokio::test]
+    async fn an_unusable_reply_is_reported_as_a_failure() {
+        let body = completion_body(Some("cut off mid"), None, "length");
+        let llm = ScriptedLlm::always(Canned::json(200, body)).await;
+        let (manager, agent_id, session_id) = manager_with_session("web-chat-1");
+
+        let outcome = generate_and_persist_summary(
+            &manager,
+            &scripted_client_on(&llm, "openrouter", "k"),
+            persist_request(agent_id, session_id, "web-chat-1"),
+        )
+        .await;
+
+        let SummaryOutcome::Failed(failure) = outcome else {
+            panic!("expected a failure, got {outcome:?}");
+        };
+        assert_eq!(failure.code, crate::SummaryFailureCode::UnusableOutput);
+    }
+
+    #[tokio::test]
+    async fn a_good_reply_is_reported_as_success() {
+        let body = completion_body(Some(GOOD_SUMMARY), None, "stop");
+        let llm = ScriptedLlm::always(Canned::json(200, body)).await;
+        let (manager, agent_id, session_id) = manager_with_session("web-chat-1");
+
+        let outcome = generate_and_persist_summary(
+            &manager,
+            &scripted_client(&llm),
+            persist_request(agent_id, session_id, "web-chat-1"),
+        )
+        .await;
+
+        assert_eq!(outcome, SummaryOutcome::Succeeded);
+    }
+
+    /// No call was made, so nothing is known about the provider: this must
+    /// neither raise nor clear what the session is showing.
+    #[tokio::test]
+    async fn no_llm_call_reports_not_attempted() {
+        let llm = ScriptedLlm::always(Canned::json(401, "{}")).await;
+        let (manager, agent_id, session_id) = manager_with_session("web-chat-1");
+
+        let mut heuristic = persist_request(agent_id, session_id, "web-chat-1");
+        heuristic.mode = RunSummaryMode::Heuristic;
+        let outcome =
+            generate_and_persist_summary(&manager, &scripted_client(&llm), heuristic).await;
+        assert_eq!(outcome, SummaryOutcome::NotAttempted);
+
+        let mut excluded = persist_request(agent_id, session_id, "subagent_x");
+        excluded.context_id = "subagent_x".into();
+        let outcome =
+            generate_and_persist_summary(&manager, &scripted_client(&llm), excluded).await;
+        assert_eq!(outcome, SummaryOutcome::NotAttempted);
+
+        assert_eq!(llm.calls(), 0);
     }
 
     /// The incident, end to end through the store: a refused generation
