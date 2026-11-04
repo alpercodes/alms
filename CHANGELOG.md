@@ -149,6 +149,14 @@ Each item below changes behaviour for a deployment that has not set the knob exp
   The record waits on the agent's run queue, so it can no longer land between a running
   turn's tool call and its result. A history split that way was rejected by providers on
   every later turn. A DM cut short by stopping the gateway leaves no record.
+- An agent can no longer be saved with a provider that is not configured, and one already
+  stored that way no longer runs. Before, its prompt went to the server default's URL with
+  no key, while `resolved_config` named the bad provider. `POST` and `PUT /agents` now
+  return `422 UNKNOWN_PROVIDER`. A run on a stored bad name, including one left by removing
+  an entry from `alms.toml` or set with `alms agent create --provider`, fails before any LLM
+  call: `POST /runs` returns `400 AGENT_PROVIDER_NOT_CONFIGURED`, and named subagents,
+  Telegram messages and other runs without a caller report the same reason. **After
+  upgrading**, change or clear such an agent's provider with `PUT /agents/{id_or_name}`.
 - A cancelled or failed DM no longer starts a run on the recipient's session.
 - Agent-to-agent tool descriptions now state which relationship each tool creates and no
   longer teach agents to poll.

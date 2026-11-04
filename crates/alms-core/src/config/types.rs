@@ -676,6 +676,31 @@ impl Default for GeminiConfig {
     }
 }
 
+/// Whether an agent's `provider` override names something a run can route to:
+/// an entry in `providers`, or a built-in sugar name (`LlmClient` has hardcoded
+/// endpoints for those when a bare config has no entry).
+///
+/// Any other name has no endpoint, so a run on it must be refused (#172).
+pub fn is_known_provider(
+    name: &str,
+    providers: &std::collections::BTreeMap<String, ProviderEntry>,
+) -> bool {
+    providers.contains_key(name) || matches!(name, "openai" | "openrouter" | "anthropic" | "gemini")
+}
+
+/// The reason an agent's `provider` override is refused, naming what would be
+/// accepted. Shared by the agent API and the run-time rejections.
+pub fn unknown_provider_message(
+    name: &str,
+    providers: &std::collections::BTreeMap<String, ProviderEntry>,
+) -> String {
+    let known: Vec<&str> = providers.keys().map(String::as_str).collect();
+    format!(
+        "provider '{name}' is not configured — known providers: {known:?}. \
+         Add an `[llm.providers.{name}]` entry to alms.toml first, or use one of those."
+    )
+}
+
 impl LlmConfig {
     /// Populate [`providers`][Self::providers] with built-in sugar entries
     /// for `openai`, `openrouter`, `anthropic`, and `gemini` if the user has

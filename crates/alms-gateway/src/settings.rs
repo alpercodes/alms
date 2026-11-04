@@ -1644,6 +1644,22 @@ fn validate_patch_budget(
                     );
                     continue;
                 }
+                Err(crate::configuration::ResolveEffectiveModelError::UnknownProvider {
+                    provider,
+                    ..
+                }) => {
+                    // Same reasoning: the next run is rejected regardless of
+                    // the candidate budget, and no budget can be checked
+                    // against a provider that does not exist.
+                    warn!(
+                        target: "alms.config",
+                        agent = %record.name,
+                        provider = %provider,
+                        "Skipping fleet budget check for agent — its provider is \
+                         not configured, so its next run will be rejected"
+                    );
+                    continue;
+                }
             };
         if let Err(err) = alms_core::config::validate_token_budget(
             &effective_provider,
