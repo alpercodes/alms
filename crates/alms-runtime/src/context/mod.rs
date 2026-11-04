@@ -84,7 +84,7 @@ pub(crate) use error_markers::is_stripped_display_marker;
 /// budget out of step.
 pub(crate) const HISTORY_RESERVE: usize = 1000;
 
-/// Builds the context window (Vec<LlmMessage>) for an LLM request.
+/// Builds the context window (`Vec<LlmMessage>`) for an LLM request.
 pub struct ContextBuilder {
     config: ContextConfig,
     /// Workspace root used to resolve relative `spill_path` metadata when

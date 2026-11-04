@@ -819,7 +819,7 @@ impl SseEventData {
     /// Agent-scoped: a run on a session belonging to this agent ended
     /// (completed, failed, or cancelled).
     ///
-    /// Pair to [`session_activity_started`].  See that method for the
+    /// Pair to [`Self::session_activity_started`].  See that method for the
     /// design rationale.
     pub fn session_activity_ended(
         session_id: alms_core::SessionId,

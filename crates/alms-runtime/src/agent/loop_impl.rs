@@ -1296,7 +1296,7 @@ impl AgentRuntime {
     /// - **Guarded**: runs tools sequentially so the user sees one approval
     ///   prompt at a time. Cancellation is checked between each tool.
     /// - **FullControl / Autonomous**: runs non-conflicting tools concurrently
-    ///   via [`FuturesUnordered`]. Cancellation races against the entire
+    ///   via [`FuturesUnordered`](futures::stream::FuturesUnordered). Cancellation races against the entire
     ///   batch.
     ///
     /// Conflicting tools (from DM conflict detection) receive error results
@@ -1461,7 +1461,7 @@ impl AgentRuntime {
     /// (collecting completed results, persisting them before returning
     /// `Err(Cancelled)`) stays readable. (#1078)
     ///
-    /// Uses [`FuturesUnordered`] rather than `futures::future::join_all`
+    /// Uses [`FuturesUnordered`](futures::stream::FuturesUnordered) rather than `futures::future::join_all`
     /// because we need to preserve results as they complete — `join_all`
     /// buffers them inside the `JoinAll` future, which is dropped when the
     /// outer `select!` cancel arm wins, taking already-completed results
@@ -1971,7 +1971,7 @@ impl AgentRuntime {
     /// `results` is a positional vec: `results[i]` holds the outcome of
     /// `tool_calls[i]`. Conflicting tools and tools that ran to
     /// completion (Ok or tool-execution Err) are persisted via
-    /// [`persist_one_tool_result`] in `tool_calls` order so the on-disk
+    /// [`Self::persist_one_tool_result`] in `tool_calls` order so the on-disk
     /// `tool_seq` numbering matches the Ok path.
     ///
     /// `Err(AlmsError::Cancelled)` entries are skipped: those represent

@@ -1373,7 +1373,7 @@ fn reject_model_incompatible_with_provider(
 /// top level — the normal happy path. Nested objects whose name happens
 /// to be `security` (e.g. `{ "tools": { "security": ... } }`) are
 /// ignored on purpose: this guard is about the top-level
-/// [`PatchSettingsRequest::security`] surface, not arbitrary key
+/// `security` key, not arbitrary key
 /// matches.
 /// #869: reject deprecated `context.recent_window` / `context.summary_interval`
 /// fields on the PATCH wire. The TOML loader is soft (one-time WARN) because

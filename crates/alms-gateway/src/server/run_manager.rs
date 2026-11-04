@@ -632,7 +632,7 @@ impl RunManager {
     /// upsert.
     ///
     /// Mirrors [`Self::mark_run_as_running`] for the state-flip side and
-    /// adds [`alms_core::Run::set_resolved_config`] inside the same
+    /// adds the `resolved_config` write inside the same
     /// DashMap-locked closure so the persisted snapshot always reflects
     /// the new `Running` status with the snapshot present, never a torn
     /// intermediate state. Used by `lifecycle::execute_run` after the

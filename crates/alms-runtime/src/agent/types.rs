@@ -140,7 +140,7 @@ pub struct AgentConfig {
     pub shell_classification_mode: ShellClassificationMode,
     /// Large-output spill-to-disk policy for the shell tool (issue #756).
     ///
-    /// Mirrors the plumbing of [`shell_permissions`]/[`shell_classification_mode`]:
+    /// Mirrors the plumbing of [`Self::shell_permissions`]/[`Self::shell_classification_mode`]:
     /// populated from `[tools.shell_spill]` in the gateway's config assembly
     /// and propagated to subagents in the coordinator so their shell tools
     /// inherit the same spill policy as the parent. Config-file-only — not

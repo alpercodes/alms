@@ -167,8 +167,8 @@ fn spill_file_missing(workspace_root: &Path, rel: &str) -> bool {
 /// result to indicate the spill file is no longer available.
 ///
 /// `original` is the persisted preview that ends with the
-/// `[The tool output was truncated to N KB. Full output saved to:
-///  \`<rel>\`...]` block produced by
+/// ``[The tool output was truncated to N KB. Full output saved to: `<rel>`...]``
+/// block produced by
 /// `tool_output_truncate::build_preview`. We trim that trailing block
 /// (everything from the last `[The tool output was truncated to`
 /// occurrence onward) and append a short "expired" notice. When the
