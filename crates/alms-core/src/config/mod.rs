@@ -131,35 +131,25 @@ impl AlmsConfig {
         Ok(config)
     }
 
-    /// Load config with fail-fast semantics on validation failure (#924).
+    /// Load config, exiting if a config file exists but can't be used (#924).
     ///
-    /// This is the path the gateway entrypoint (`alms gateway`) uses. It
-    /// distinguishes two error classes:
+    /// This is the path the gateway entrypoint (`alms gateway`) uses.
     ///
-    /// - **File-load failures** (file unreadable due to permissions, TOML
-    ///   parse error): warn to stderr and fall back to compiled defaults
-    ///   so first-run / fresh-install / corrupted-file scenarios still
-    ///   produce a working daemon.
-    /// - **Validation failures** (a hand-edited `alms.toml` that loaded
-    ///   cleanly but violates a `validate()` invariant — e.g. asymmetric
-    ///   `[context].summary_provider` / `summary_model` after #877's
-    ///   pair-only rule): **fatal**, the process exits non-zero with a
-    ///   clear stderr message pointing at the bad field.
+    /// - **No config file:** compiled defaults plus env overrides. This is the
+    ///   genuine bootstrapping case (first run, fresh install).
+    /// - **A file that can't be read or parsed, or that fails `validate()`:**
+    ///   **fatal**. The process exits non-zero, and stderr names the file and
+    ///   the problem. A single typo must not swap the whole file for defaults:
+    ///   that would drop `shell_policy` and `[security]`, send runs to the
+    ///   default provider and open a different database. The recovery is on
+    ///   the operator (fix the config), not the daemon (drop the config and
+    ///   pretend nothing happened).
     ///
-    /// Falling back to defaults on a validation failure would silently
-    /// discard the operator's intent (Tim's review framing on PR #923,
-    /// surfaced as #924). The recovery is on the operator (fix the
-    /// config) not the daemon (drop the config and pretend nothing
-    /// happened). Missing-file (`find_config_file() == None`) is the
-    /// genuine bootstrapping case and is handled before either branch
-    /// runs — it produces a defaults-with-env-overrides config and zero
-    /// exit, same as before.
+    /// Env overrides can also fail `validate()`, with or without a file.
     ///
-    /// Unlike `AlmsConfig::load().unwrap_or_default()`, this ensures
-    /// `data_dir` is resolved to an absolute path even in the file-load
-    /// fallback case. Use this whenever a best-effort config is
-    /// acceptable for the file-load axis but the validation invariant
-    /// must hold (gateway boot, scheduler, anything that drives runs).
+    /// Use this whenever the validation invariant must hold (gateway boot,
+    /// scheduler, anything that drives runs). It also resolves `data_dir` to an
+    /// absolute path.
     ///
     /// **Behaviour scope (#924 follow-up).** This entry-point is shared
     /// across the gateway boot path *and* every CLI subcommand that goes
@@ -169,11 +159,11 @@ impl AlmsConfig {
     /// for those CLI commands too, not just `alms gateway`. This is the
     /// intended shape — discarding the operator's intent silently would
     /// be just as wrong on a CLI invocation as on daemon boot — but it
-    /// is wider than the issue title suggests, so callers that want a
-    /// best-effort defaults-on-validation-failure shape should reach for
-    /// [`Self::load_or_default_fallible`] (or [`Self::load`]) directly.
+    /// is wider than the issue title suggests. Commands that never use the
+    /// config (`alms health`, `alms dashboard`, `alms completions`) don't call
+    /// this, so a broken file doesn't stop them.
     ///
-    /// Calls `std::process::exit(1)` on validation failure. The fallible
+    /// Calls `std::process::exit(1)` on failure. The fallible
     /// shape lives in [`Self::load_or_default_fallible`] for unit
     /// testing.
     pub fn load_or_default() -> Self {
@@ -193,43 +183,32 @@ impl AlmsConfig {
     }
 
     /// Inner of [`Self::load_or_default`] — same semantics, but returns
-    /// the validation error instead of exiting the process. Exposed for
-    /// unit testing the fail-fast contract from #924.
+    /// the error instead of exiting the process. Exposed for unit testing
+    /// the fail-fast contract from #924.
     ///
     /// Contract:
-    /// - File-load failures (IO, TOML parse): warn-and-default. Returns
-    ///   `Ok(default-shaped config)`.
-    /// - Validation failures: returns `Err(InvalidConfig(...))`. The
-    ///   process-exit wrapper turns this into a non-zero exit with a
-    ///   helpful stderr message.
+    /// - No config file: `Ok(default-shaped config)`.
+    /// - File-load failures (IO, TOML parse) and validation failures: returns
+    ///   `Err(InvalidConfig(...))`. The process-exit wrapper turns this into a
+    ///   non-zero exit with a helpful stderr message.
     pub fn load_or_default_fallible() -> AlmsResult<Self> {
-        // Step 1: try to read + parse the config file (or fall through
-        // when no file is present). File-load failures are
-        // recoverable — warn and use defaults. The eventual `validate()`
-        // call below still applies; defaults are guaranteed to pass
-        // validation, but env-var overrides could still produce an
-        // invalid config that fails the fail-fast check.
+        // Step 1: read + parse the config file, or use defaults when there
+        // is none. A file that exists but can't be used is an error. The
+        // eventual `validate()` call below still applies; defaults are
+        // guaranteed to pass validation, but env-var overrides could still
+        // produce an invalid config that fails the fail-fast check.
         let mut config = match Self::find_config_file() {
-            Some(path) => match Self::from_file(&path) {
-                Ok(c) => {
-                    info!("Loaded config from {}", path.display());
-                    c
-                }
-                Err(e) => {
-                    eprintln!(
-                        "Warning: failed to load config file {}: {}. Using defaults.",
-                        path.display(),
-                        e,
-                    );
-                    Self::default()
-                }
-            },
+            Some(path) => {
+                let config = Self::from_file(&path)?;
+                info!("Loaded config from {}", path.display());
+                config
+            }
             None => Self::default(),
         };
 
         // Step 2: layer env overrides + provider sugar + path resolution +
         // soft normalisations. Mirrors `load()` so the two paths produce
-        // structurally identical configs modulo the file-load fallback.
+        // structurally identical configs.
         config.llm.ensure_builtin_providers();
         config.apply_env_overrides();
         config.server.data_dir = crate::resolve_to_absolute(Path::new(&config.server.data_dir));
