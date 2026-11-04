@@ -678,8 +678,8 @@ impl Default for GeminiConfig {
 
 impl LlmConfig {
     /// Populate [`providers`][Self::providers] with built-in sugar entries
-    /// for `openai`, `openrouter`, and `anthropic` if the user has not
-    /// already defined them.
+    /// for `openai`, `openrouter`, `anthropic`, and `gemini` if the user has
+    /// not already defined them.
     ///
     /// This lets the rest of the system look up every provider uniformly
     /// in `providers`, regardless of whether the user wrote the classic

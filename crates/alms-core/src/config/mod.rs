@@ -90,7 +90,7 @@ impl AlmsConfig {
             info!("Loaded config from {}", path.display());
         }
 
-        // Populate built-in provider entries (openai / openrouter / anthropic)
+        // Populate built-in provider entries (openai / openrouter / anthropic / gemini)
         // so `llm.providers` always contains them, regardless of whether the
         // user wrote the classic flat form or the new generic form.
         //
@@ -719,8 +719,11 @@ impl AlmsConfig {
     ///
     /// Should be called at startup (e.g. in `main.rs`). Detects env vars that
     /// were previously used to configure secrets and warns the user to migrate
-    /// to `alms auth set`. A var a provider entry names in `api_key_env` is a
-    /// live key source, so it gets no warning.
+    /// to `alms auth set`.
+    ///
+    /// A var a provider entry names in `api_key_env` gets no warning: naming it is
+    /// the operator's choice. It can still go unread, for example when a stored key
+    /// outranks it (`docs/config.md`).
     pub fn warn_deprecated_secret_env_vars(&self) {
         let mut deprecated = crate::secrets::SecretsStore::detect_deprecated_env_keys();
         deprecated.retain(|(var, _)| {
@@ -742,9 +745,9 @@ impl AlmsConfig {
             );
         }
         warn!(
-            "An API key env var is read only if a provider entry names it in `api_key_env`. \
-             Store keys securely with `alms auth set <provider> <key>` \
-             (encrypted with ALMS_MASTER_KEY)."
+            "An LLM key env var is read only if a provider entry names it in `api_key_env`; \
+             TELEGRAM_BOT_TOKEN is never read. Store keys securely with \
+             `alms auth set <provider> <key>` (encrypted with ALMS_MASTER_KEY)."
         );
     }
 }

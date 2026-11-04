@@ -2778,6 +2778,10 @@ fn a_named_var_beside_a_bare_export_only_warns_about_the_bare_one() {
         .unwrap_or_else(|| panic!("the summary must still fire; got {captured}"));
     assert!(summary.message.contains("api_key_env"), "got {captured}");
     assert!(
+        summary.message.contains("TELEGRAM_BOT_TOKEN"),
+        "got {captured}"
+    );
+    assert!(
         !summary.message.contains("no longer used"),
         "got {captured}"
     );

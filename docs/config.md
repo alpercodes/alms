@@ -68,7 +68,7 @@ model    = "z-ai/glm-5.2"
 
 These two keys are the **server default** and are runtime-mutable: `PATCH /settings` (and the Settings modal) changes them for the next run with no restart, and persists the change to `{data_dir}/settings.json`. That file wins over `alms.toml` on the next boot, so once the pair has been PATCHed, editing it here has no effect until you edit or remove `settings.json`. See `docs/api.md` § 10.2 for the validation rules and the Telegram propagation caveat. The `[llm.providers]` tables below are **not** PATCH-mutable — they are read once at startup.
 
-The sugar names `openai`, `openrouter`, and `anthropic` are auto-populated at config-load time, so classic flat configs (`provider = "openai"` with nothing else) keep working. User-declared entries with the same names override the auto-populated ones.
+The sugar names `openai`, `openrouter`, `anthropic`, and `gemini` are auto-populated at config-load time, so classic flat configs (`provider = "openai"` with nothing else) keep working. A user-declared entry with one of these names replaces the auto-populated one instead of merging with it, so it has to restate `base_url`, and for `anthropic` and `gemini` also `kind` and `auth_scheme` (they default to `openai_compatible` and bearer).
 
 ### Schema
 
@@ -346,7 +346,7 @@ OpenAI o-series reports reasoning-token cost separately under `usage.completion_
 
 ## Adding an OpenAI-compatible provider
 
-Copy the block that matches your provider, paste it into `alms.toml`, set `llm.provider` to the entry's name, and run `alms auth set <name> <key>` (or export the `api_key_env` variable before launching the gateway).
+Copy the block that matches your provider, paste it into `alms.toml`, set `llm.provider` to the entry's name, and export the `api_key_env` variable before launching the gateway. `alms auth set` accepts only the fixed names listed under [Schema](#schema).
 
 ### xAI (Grok)
 
