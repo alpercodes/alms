@@ -1132,6 +1132,16 @@ fn build_summary_client(
     let switched =
         alms_runtime::build_summary_client(llm, summary_provider, summary_model, Some(secrets));
 
+    if switched.missing_required_key() {
+        // Not a warning: this runs on every run, and the summary paths skip
+        // the call, warn, and show it in the session (`summary_status`).
+        debug!(
+            agent_id = %agent_id,
+            summary_provider = %switched.provider(),
+            "Summary provider has no API key; summaries will not be sent"
+        );
+    }
+
     if let Some(provider) = summary_provider {
         // #1191 made `Some(openrouter, gemma)` the compiled default, so
         // this branch now runs on every stock deployment's runs — only an

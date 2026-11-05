@@ -728,6 +728,25 @@ impl AgentRuntime {
             .as_deref()
             .unwrap_or_else(|| summary_client.default_model());
 
+        // Same rule as the episodic summarizer: a provider that needs a key it
+        // does not have gets no conversation to refuse. `Err`, so the turn
+        // takes the same fallback as any other failed compaction.
+        if summary_client.missing_required_key() {
+            warn!(
+                target: "alms.context",
+                provider = summary_client.provider(),
+                "Compaction summary not sent: the summary provider needs an API key and has none"
+            );
+            self.emit_summary_status(Some(crate::SummaryFailure::missing_key(
+                summary_client,
+                model,
+            )));
+            return Err(alms_core::AlmsError::Runtime(format!(
+                "summary provider '{}' needs an API key and has none",
+                summary_client.provider()
+            )));
+        }
+
         let request = CompletionRequest::new(model)
             .with_messages(sum_messages)
             .with_temperature(0.3) // lower temp for factual compression
@@ -1228,6 +1247,7 @@ mod tests {
     ) -> (
         Vec<Option<crate::SummaryFailure>>,
         AlmsResult<ContextSummary>,
+        usize,
     ) {
         use alms_test_support::ScriptedLlm;
 
@@ -1274,7 +1294,7 @@ mod tests {
                 statuses.push(failure);
             }
         }
-        (statuses, result)
+        (statuses, result, llm.calls())
     }
 
     fn summary_body(content: &str, finish: &str) -> String {
@@ -1295,9 +1315,10 @@ mod tests {
     #[tokio::test]
     async fn a_failed_compaction_call_is_reported_and_still_errs() {
         use alms_test_support::Canned;
-        let (statuses, result) =
+        let (statuses, result, calls) =
             compaction_summary_status(Canned::json(401, r#"{"error":"no auth"}"#), "", 12).await;
         assert!(result.is_err(), "the caller's fallback path must still run");
+        assert_eq!(calls, 0, "no key, so the conversation is not sent");
         assert_eq!(statuses.len(), 1, "{statuses:?}");
         let failure = statuses[0].as_ref().expect("a failure");
         assert_eq!(failure.code, crate::SummaryFailureCode::MissingKey);
@@ -1307,7 +1328,7 @@ mod tests {
     #[tokio::test]
     async fn a_refused_compaction_reply_is_reported_as_unusable() {
         use alms_test_support::Canned;
-        let (statuses, result) = compaction_summary_status(
+        let (statuses, result, _) = compaction_summary_status(
             Canned::json(200, summary_body("cut off mid", "length")),
             "k",
             12,
@@ -1325,7 +1346,7 @@ mod tests {
     async fn a_good_compaction_reply_reports_no_failure() {
         use alms_test_support::Canned;
         let good = "The user asked alice to move the gateway config onto the layered loader,                     and alice did so and added a test covering the change.";
-        let (statuses, result) =
+        let (statuses, result, _) =
             compaction_summary_status(Canned::json(200, summary_body(good, "stop")), "k", 12).await;
         assert_eq!(result.unwrap().text, good);
         assert_eq!(statuses, vec![None]);
@@ -1336,7 +1357,7 @@ mod tests {
     #[tokio::test]
     async fn compaction_under_the_trigger_reports_nothing() {
         use alms_test_support::Canned;
-        let (statuses, result) = compaction_summary_status(Canned::json(401, "{}"), "", 1).await;
+        let (statuses, result, _) = compaction_summary_status(Canned::json(401, "{}"), "", 1).await;
         assert!(result.is_ok());
         assert!(statuses.is_empty(), "{statuses:?}");
     }

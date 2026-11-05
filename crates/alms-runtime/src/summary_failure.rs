@@ -57,6 +57,13 @@ const CHANGE_MODEL: &str = "change the summary model in Settings (Summary sectio
                             panel if this agent overrides it; unset it to use the agent's own \
                             model)";
 
+/// The same fix for a key failure. A different model on the same provider
+/// would need the same key, so it has to be a different provider; and
+/// `PATCH /settings` refuses a provider that needs a key it does not have.
+const CHANGE_PROVIDER: &str = "switch summaries to a provider that has a key or needs none, in \
+                               Settings (Summary section, or the Agents panel if this agent \
+                               overrides it; unset both fields to use the agent's own model)";
+
 /// Display name and article for a provider with a key row in Settings.
 ///
 /// `None` for anything else: a `[llm.providers.<name>]` entry takes its key
@@ -100,6 +107,17 @@ impl SummaryFailure {
             _ => None,
         };
         Self::new(code, client.provider(), model, status)
+    }
+
+    /// The provider needs a key and the client has none, so the call was not
+    /// made: sending it would put the conversation on the wire to be refused.
+    pub fn missing_key(client: &LlmClient, model: &str) -> Self {
+        Self::new(
+            SummaryFailureCode::MissingKey,
+            client.provider(),
+            model,
+            None,
+        )
     }
 
     /// The call succeeded but returned nothing usable as a summary: no text,
@@ -155,11 +173,11 @@ fn message(code: SummaryFailureCode, provider: &str, model: &str, status: Option
     let (what, fix) = match (code, status) {
         (C::MissingKey, _) => (
             format!("no API key is set for {name}"),
-            format!("To fix this, {CHANGE_MODEL}, or {add_key}"),
+            format!("To fix this, {CHANGE_PROVIDER}, or {add_key}"),
         ),
         (C::RejectedKey, _) => (
             format!("{name} rejected the API key{http}"),
-            format!("To fix this, {CHANGE_MODEL}, or {replace_key}"),
+            format!("To fix this, {CHANGE_PROVIDER}, or {replace_key}"),
         ),
         (C::Unreachable, _) => (
             format!("could not reach {name}, or it did not respond in time"),
@@ -240,7 +258,7 @@ mod tests {
         );
         assert!(
             f.message
-                .contains("change the summary model in Settings (Summary section"),
+                .contains("needs none, in Settings (Summary section"),
             "{}",
             f.message
         );
@@ -272,7 +290,7 @@ mod tests {
             f.message
         );
         assert!(
-            f.message.contains("change the summary model"),
+            f.message.contains("switch summaries to a provider"),
             "{}",
             f.message
         );
@@ -402,6 +420,23 @@ mod tests {
              (Summary section, or the Agents panel if this agent overrides it; unset it to use \
              the agent's own model)."
         );
+    }
+
+    /// The two key codes suggest another provider, because another model on
+    /// the same provider needs the same key; the others suggest another model.
+    #[test]
+    fn key_failures_suggest_another_provider() {
+        let f = SummaryFailure::missing_key(&client("openrouter", ""), MODEL);
+        assert_eq!(f.code, SummaryFailureCode::MissingKey);
+        assert!(
+            f.message
+                .contains("switch summaries to a provider that has a key or needs none"),
+            "{}",
+            f.message
+        );
+        assert!(f.message.contains("unset both fields"), "{}", f.message);
+        let f = SummaryFailure::unusable_output(&client("openrouter", "k"), MODEL);
+        assert!(!f.message.contains("switch summaries"), "{}", f.message);
     }
 
     #[test]

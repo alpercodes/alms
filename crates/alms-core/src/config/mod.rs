@@ -31,7 +31,7 @@ pub use types::{
     FsEditConfig, GeminiConfig, LlmConfig, LoggingConfig, OpenAiConfig, ProviderEntry,
     ProviderKind, ProviderQuirks, ReasoningEffort, RunSummaryMode, SecurityConfig, ServerConfig,
     SessionConfig, ShellClassificationMode, ShellEngine, ShellPermissions, ShellSpillConfig,
-    ToolOutputTruncateConfig, ToolsConfig,
+    ToolOutputTruncateConfig, ToolsConfig, provider_requires_api_key,
 };
 
 use crate::{AlmsError, AlmsResult};

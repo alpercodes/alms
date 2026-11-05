@@ -762,6 +762,16 @@ async fn generate_llm(
         LlmMessage::user(user_content),
     ];
 
+    // A provider that needs a key it does not have would refuse the call,
+    // after the conversation had gone out with it. Don't send it.
+    if llm.missing_required_key() {
+        warn!(
+            provider = llm.provider(),
+            "Session summary not sent: the summary provider needs an API key and has none"
+        );
+        return Err(SummaryFailure::missing_key(llm, model));
+    }
+
     let request = CompletionRequest::new(model)
         .with_messages(messages)
         .with_temperature(0.3)
@@ -1923,6 +1933,11 @@ mod tests {
         };
         assert_eq!(failure.code, crate::SummaryFailureCode::MissingKey);
         assert_eq!(failure.provider, "openrouter");
+        assert_eq!(
+            llm.calls(),
+            0,
+            "a provider that needs a key gets no request without one"
+        );
         assert!(
             manager
                 .store()
@@ -1932,6 +1947,46 @@ mod tests {
                 .is_some(),
             "precondition: the heuristic fallback wrote a row"
         );
+    }
+
+    /// A provider the config declares without a key (a local Ollama) needs
+    /// none, so the keyless guard must not stop its call.
+    #[tokio::test]
+    async fn a_provider_declared_without_a_key_is_still_sent_to() {
+        let body = completion_body(Some(GOOD_SUMMARY), None, "stop");
+        let llm = ScriptedLlm::always(Canned::json(200, body)).await;
+        let (manager, agent_id, session_id) = manager_with_session("web-chat-1");
+
+        let outcome = generate_and_persist_summary(
+            &manager,
+            &scripted_client_on(&llm, "ollama", ""),
+            persist_request(agent_id, session_id, "web-chat-1"),
+        )
+        .await;
+
+        assert_eq!(outcome, SummaryOutcome::Succeeded);
+        assert_eq!(llm.calls(), 1);
+    }
+
+    /// A key the provider refuses is still a call that was made: the guard
+    /// only covers a key that is absent.
+    #[tokio::test]
+    async fn a_refused_key_is_reported_as_rejected() {
+        let llm = ScriptedLlm::always(Canned::json(401, r#"{"error":"bad key"}"#)).await;
+        let (manager, agent_id, session_id) = manager_with_session("web-chat-1");
+
+        let outcome = generate_and_persist_summary(
+            &manager,
+            &scripted_client_on(&llm, "openrouter", "dummy-bad-key"),
+            persist_request(agent_id, session_id, "web-chat-1"),
+        )
+        .await;
+
+        let SummaryOutcome::Failed(failure) = outcome else {
+            panic!("expected a failure, got {outcome:?}");
+        };
+        assert_eq!(failure.code, crate::SummaryFailureCode::RejectedKey);
+        assert_eq!(llm.calls(), 1);
     }
 
     #[tokio::test]

@@ -34,7 +34,9 @@ See [`docs/api.md`](api.md) § 10.2 for the wire shapes, validation rules and er
 
 The modal's **Summary** section (`summary_model` / `summary_provider`) drives both compaction summaries and post-run episodic memory. Set both or neither: a `summary_model` paired with the agent's own provider would be a slug from the wrong namespace, so partial configurations are rejected rather than silently mis-routed. Full notes in `alms.toml.example` under `[context]`.
 
-If a summary fails, the run still completes and the session shows a banner naming the provider and what to do about it. On the default pair, that is the usual result of an agent on another provider with no OpenRouter key: either add one, or change the pair here; unsetting both fields uses the agent's own model. The banner clears when a summary next succeeds, or as soon as you change the pair or add that provider's key. See `summary_status` in `docs/api.md`.
+If a summary fails, the run still completes and the session shows a banner naming the provider and what to do about it. On the default pair, that is the usual result of an agent on another provider with no OpenRouter key: either add one, or change the pair here; unsetting both fields uses the agent's own model.
+
+A summary is not sent at all when its provider needs a key it does not have, so the conversation is not put on the wire just to be refused. "Needs a key" means one of the hosted store slots (`openai`, `anthropic`, `openrouter`, `gemini`), or a `[llm.providers.<name>]` entry that declares `api_key_env` or `api_key`. An entry declaring neither, the way Ollama and LM Studio are set up below, needs none: its summaries are sent without an auth header, and it can be chosen as the summary provider here without a key. The same rule decides which providers the Summary section refuses for want of a key (`SUMMARY_PROVIDER_MISSING_API_KEY`). The banner clears when a summary next succeeds, or as soon as you change the pair or add that provider's key. See `summary_status` in `docs/api.md`.
 
 ### Session
 

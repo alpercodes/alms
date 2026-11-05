@@ -264,6 +264,39 @@ mod tests {
         );
     }
 
+    /// Re-targeting the per-run summary clone at a provider with no key used
+    /// to warn "Provider changed but no API key found — clearing stale key"
+    /// on every run: wrong, since the agent's key was not stale, and loud.
+    /// The re-target is quiet now and reports the missing key on the client,
+    /// for the caller to act on and log in its own words.
+    #[test]
+    fn retargeting_to_a_provider_without_a_key_is_quiet_and_reports_it() {
+        let (llm, mut secrets) = fixtures(None, None);
+        secrets.remove_key("openrouter").unwrap();
+
+        let mut summary = None;
+        let events = alms_test_support::capture_events(tracing::Level::INFO, || {
+            summary = Some(build_summary_client(
+                &llm,
+                Some("openrouter"),
+                Some("google/gemma-4-31b-it"),
+                Some(&secrets),
+            ));
+        });
+        let summary = summary.unwrap();
+
+        assert!(
+            events.is_empty(),
+            "re-targeting must not log at info or above:\n{events}"
+        );
+        assert!(!summary.has_api_key(), "the agent's key must not follow");
+        assert!(summary.missing_required_key());
+        assert!(
+            !llm.missing_required_key(),
+            "the agent's own client keeps its key"
+        );
+    }
+
     /// `secrets = None` happy path: with explicit `summary_model`, the model
     /// reaches the wire and the leak guard does not fire.
     #[test]

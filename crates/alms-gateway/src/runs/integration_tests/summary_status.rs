@@ -104,6 +104,9 @@ impl Harness {
         let mut providers = std::collections::BTreeMap::new();
         providers.insert("local".to_string(), entry(Some(AGENT_KEY)));
         providers.insert("openrouter".to_string(), entry(None));
+        // A local endpoint declared without a key, the way `docs/config.md`
+        // sets up Ollama.
+        providers.insert("ollama".to_string(), entry(None));
 
         let db_path = dir.path().join("alms.db");
         let (state, shutdown, _completions, _triggers, _dm_events) =
@@ -153,7 +156,6 @@ impl Harness {
     /// `POST /runs`, then wait for the run and its post-run summary to finish.
     /// Returns the run's terminal status.
     async fn run(&self, session_id: SessionId) -> String {
-        let calls_before = self.llm.calls();
         let response = self
             .router()
             .oneshot(
@@ -187,11 +189,6 @@ impl Harness {
             assert!(tokio::time::Instant::now() < deadline, "run did not finish");
             tokio::time::sleep(Duration::from_millis(10)).await;
         };
-        // One turn request and one summary request.
-        while self.llm.calls() < calls_before + 2 {
-            assert!(tokio::time::Instant::now() < deadline, "no summary request");
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
         assert!(
             self.state
                 .run_manager
@@ -200,6 +197,20 @@ impl Harness {
             "the summary task did not finish"
         );
         status
+    }
+
+    /// Every summary request the provider received, as `(authorization,
+    /// body)`. Summary requests are the non-streaming ones.
+    async fn summary_requests(&self) -> Vec<(Option<String>, String)> {
+        let auth = self.llm.request_headers("authorization").await;
+        let bodies = self.llm.request_bodies().await;
+        auth.into_iter()
+            .zip(bodies)
+            .filter(|(_, body)| {
+                let body: serde_json::Value = serde_json::from_str(body).unwrap_or_default();
+                body["stream"] != serde_json::Value::Bool(true)
+            })
+            .collect()
     }
 
     async fn put_key(&self, provider: &str, key: &str) {
@@ -265,9 +276,18 @@ async fn a_missing_key_shows_once_and_clears_when_a_key_is_added() {
     assert!(message.contains("Settings (Summary section"), "{message}");
     assert!(message.contains("add an OpenRouter key"), "{message}");
 
-    // Still failing: another run, another failed call, nothing new on screen.
+    // Still failing: another run, another skipped summary, nothing new on
+    // screen.
     assert_eq!(h.run(session.id).await, "Completed");
     assert!(summary_statuses(&mut sub).await.is_empty());
+
+    // And the conversation never went to the summary provider: `openrouter`
+    // needs a key and has none, so the call is not made at all.
+    assert_eq!(
+        h.summary_requests().await,
+        vec![],
+        "no summary request may be sent without the key it needs"
+    );
 
     // Neither the failure nor its fix text is in the session, so neither can
     // reach a model's context: the next run's request carries none of it.
@@ -295,6 +315,13 @@ async fn a_missing_key_shows_once_and_clears_when_a_key_is_added() {
     // And the next run bears it out, without saying so a second time.
     assert_eq!(h.run(session.id).await, "Completed");
     assert!(summary_statuses(&mut sub).await.is_empty());
+    let sent = h.summary_requests().await;
+    assert_eq!(
+        sent.len(),
+        1,
+        "the first summary sent is the one with the key"
+    );
+    assert_eq!(sent[0].0.as_deref(), Some("Bearer dummy-summary-key"));
     assert!(
         h.state
             .run_manager
@@ -460,4 +487,40 @@ async fn deleting_the_session_forgets_the_problem() {
             .summary_status_snapshot(session.id)
             .is_none()
     );
+}
+
+/// A provider declared without a key, like a local Ollama, is unaffected:
+/// Settings accepts it as the summary provider, and its summaries are sent
+/// without an auth header and succeed.
+#[tokio::test]
+async fn a_keyless_local_provider_can_be_chosen_and_is_sent_to() {
+    let h = Harness::boot().await;
+    h.set_summary_provider(SummaryProvider::Healthy);
+    let agent = seed_agent(&h.state, "local-agent");
+    let session = h.state.session_manager.get_or_create(agent, "web-chat");
+    let mut sub = h.state.run_manager.subscribe_session(session.id);
+
+    // On the default keyless openrouter pair the banner comes up...
+    h.run(session.id).await;
+    assert_eq!(summary_statuses(&mut sub).await.len(), 1);
+
+    // ...and the fix it suggests is accepted.
+    assert_eq!(
+        h.patch_settings(serde_json::json!({
+            "context": { "summary_provider": "ollama", "summary_model": "llama3.1:8b" }
+        }))
+        .await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        summary_statuses(&mut sub).await,
+        vec![serde_json::Value::Null]
+    );
+
+    assert_eq!(h.run(session.id).await, "Completed");
+    let sent = h.summary_requests().await;
+    assert_eq!(sent.len(), 1, "the keyless provider is sent to: {sent:?}");
+    assert_eq!(sent[0].0, None, "with no auth header");
+    assert!(sent[0].1.contains("llama3.1:8b"));
+    assert!(summary_statuses(&mut sub).await.is_empty());
 }

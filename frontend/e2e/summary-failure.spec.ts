@@ -6,9 +6,9 @@ const agentId = "11111111-1111-4111-8111-111111111111";
 const sessionId = "22222222-2222-4222-8222-222222222222";
 const message =
   "Conversation summaries failed: no API key is set for OpenRouter (summary model: " +
-  "google/gemma-4-31b-it). To fix this, change the summary model in Settings (Summary section, " +
-  "or the Agents panel if this agent overrides it; unset it to use the agent's own model), or " +
-  "add an OpenRouter key in Settings (API Keys).";
+  "google/gemma-4-31b-it). To fix this, switch summaries to a provider that has a key or needs " +
+  "none, in Settings (Summary section, or the Agents panel if this agent overrides it; unset both " +
+  "fields to use the agent's own model), or add an OpenRouter key in Settings (API Keys).";
 
 test("a summary_status on the session stream shows a banner that leads to Settings", async ({
   page,

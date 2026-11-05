@@ -5,6 +5,51 @@
 use super::*;
 use std::sync::{Mutex, MutexGuard};
 
+/// `alms.toml.example` says "All values shown are defaults", and it showed
+/// `run_summary_mode = "off"` with "(default)" while the compiled default is
+/// `llm`. Pin the line to the real default.
+#[test]
+fn example_config_shows_the_compiled_run_summary_mode() {
+    let example = include_str!("../../../../alms.toml.example");
+    let shown: Vec<&str> = example
+        .lines()
+        .filter_map(|l| l.trim().strip_prefix("run_summary_mode = "))
+        .collect();
+    let default = format!("\"{}\"", ContextConfig::default().run_summary_mode);
+    assert_eq!(shown, vec![default.as_str()]);
+    assert!(
+        !example.contains("disabled (default)"),
+        "the example must not call `off` the default"
+    );
+}
+
+/// What `provider_requires_api_key` reads as "needs a key": the hosted
+/// secrets-store slots, and any entry that declares a key source. A local
+/// endpoint declared without one, as `docs/config.md` sets up Ollama, needs
+/// none; `telegram` is a channel token, not an LLM provider.
+#[test]
+fn provider_requires_api_key_reads_the_slots_and_the_entry() {
+    let bare = ProviderEntry::default();
+    for slot in ["openrouter", "openai", "anthropic", "gemini"] {
+        assert!(provider_requires_api_key(slot, Some(&bare)), "{slot}");
+        assert!(provider_requires_api_key(slot, None), "{slot}");
+    }
+    assert!(!provider_requires_api_key("ollama", Some(&bare)));
+    assert!(!provider_requires_api_key("ollama", None));
+    assert!(!provider_requires_api_key("telegram", None));
+
+    let with_env = ProviderEntry {
+        api_key_env: Some("SOME_VAR".into()),
+        ..ProviderEntry::default()
+    };
+    assert!(provider_requires_api_key("my-proxy", Some(&with_env)));
+    let with_inline = ProviderEntry {
+        api_key: Some("k".into()),
+        ..ProviderEntry::default()
+    };
+    assert!(provider_requires_api_key("my-proxy", Some(&with_inline)));
+}
+
 /// Select an API key for the requested LLM provider.
 ///
 /// Preference order:
