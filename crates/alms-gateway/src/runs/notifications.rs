@@ -2643,7 +2643,7 @@ async fn queue_interrupted_end_marker(
 ///   only in the DM session, so this keeps its run too. Without this edge the
 ///   fix would silently drop the very transcripts it was designed to protect.
 /// - `errored { interrupted: true }` — the run died (LLM failure, panic,
-///   setup failure, teardown persistence failure). No run.
+///   setup failure, teardown persistence failure, gateway shutdown). No run.
 /// - `user_cancelled` — unconditional, regardless of transcript: the operator
 ///   asked for work on this session to stop, and starting a turn is the one
 ///   thing they said not to do. The transcript is not destroyed — it stays in

@@ -304,12 +304,8 @@ pub async fn serve_with_gateway(bind_addr: &str, gateway: Gateway) -> AlmsResult
     Ok(())
 }
 
-/// Returns a future that completes when a shutdown signal is received.
-///
-/// After the signal fires, this function:
-/// 1. Cancels the shutdown token (stops scheduler, gateway message loop, etc.)
-/// 2. Closes all SSE sender channels so persistent SSE connections terminate
-///    and Axum's graceful shutdown can actually complete.
+/// Returns a future that completes when a shutdown signal is received, after
+/// [`begin_shutdown`] has run.
 async fn shutdown_signal(token: CancellationToken, run_manager: RunManager) {
     let ctrl_c = tokio::signal::ctrl_c();
 
@@ -329,6 +325,14 @@ async fn shutdown_signal(token: CancellationToken, run_manager: RunManager) {
         info!("Received Ctrl+C, initiating graceful shutdown");
     }
 
+    begin_shutdown(&token, &run_manager);
+}
+
+/// Start a graceful shutdown: stop the gateway's loops, end its SSE streams,
+/// and cancel every in-flight run.
+pub(crate) fn begin_shutdown(token: &CancellationToken, run_manager: &RunManager) {
+    // Before any run is cancelled: a run reads this token to tell that shutdown
+    // is why, and so that no user is blamed for it.
     token.cancel();
 
     // Close all SSE sender channels so persistent SSE connections (especially
@@ -527,14 +531,42 @@ fn plan_catch_up_cohort(
 #[cfg(test)]
 mod tests {
     use super::{
-        BOOT_CATCH_UP_LEAD_SECS, BOOT_CATCH_UP_SPACING_SECS, BootstrapFire, bootstrap_fire_at,
-        plan_catch_up_cohort,
+        BOOT_CATCH_UP_LEAD_SECS, BOOT_CATCH_UP_SPACING_SECS, BootstrapFire, begin_shutdown,
+        bootstrap_fire_at, plan_catch_up_cohort,
     };
     use alms_core::{
-        AgentId, JobId,
+        AgentId, JobId, RunId,
         job::{Job, JobSchedule, JobTransition},
     };
     use chrono::{TimeZone as _, Utc};
+    use tokio_util::sync::CancellationToken;
+
+    /// A run tells that shutdown stopped it by reading the shutdown token after
+    /// its own fires, so nothing may see the run token fired first. Each round
+    /// races a thread against the firing order.
+    #[test]
+    fn begin_shutdown_fires_the_shutdown_token_before_any_run_token() {
+        for _ in 0..500 {
+            let shutdown = CancellationToken::new();
+            let run_manager = crate::server::RunManager::new();
+            let run_token = CancellationToken::new();
+            run_manager.register_cancel_token(RunId::new(), run_token.clone());
+            let observer = {
+                let (shutdown, run_token) = (shutdown.clone(), run_token.clone());
+                std::thread::spawn(move || {
+                    while !run_token.is_cancelled() {
+                        std::hint::spin_loop();
+                    }
+                    shutdown.is_cancelled()
+                })
+            };
+            begin_shutdown(&shutdown, &run_manager);
+            assert!(
+                observer.join().unwrap(),
+                "run token fired before the shutdown token"
+            );
+        }
+    }
 
     fn recurring_job(next_run_at: Option<chrono::DateTime<Utc>>) -> Job {
         Job::new(

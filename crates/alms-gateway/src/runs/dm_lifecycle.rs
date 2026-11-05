@@ -439,12 +439,13 @@ pub(super) async fn notify_dm_peer_of_setup_failure(
 /// (it only flips state + emits `run_cancelled`) nor the early-exit signalled
 /// the peer, so the peer was stranded on "Chatting with…" until the
 /// `DEPTH_EXPIRY_SECS` sweep. This helper routes the early-exit into
-/// [`handle_dm_run_failure`] with [`ConversationEndReason::UserCancelled`] so
-/// the peer is told the conversation ended.
+/// [`handle_dm_run_failure`] with [`cancelled_run_end_reason`] so the peer is
+/// told the conversation ended.
 ///
 /// Like [`notify_dm_peer_of_setup_failure`], `agent_name` may be `None` (the
 /// early-exit fires before the registry record is loaded); the name is
 /// re-resolved from the registry by `agent_id`.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn notify_dm_peer_of_setup_cancellation(
     state: &AppState,
     run_id: &RunId,
@@ -453,6 +454,7 @@ pub(super) async fn notify_dm_peer_of_setup_cancellation(
     agent_name: Option<&str>,
     context_id: &str,
     is_peer_message: bool,
+    transitioned: bool,
 ) {
     notify_dm_peer_of_setup_outcome(
         state,
@@ -462,9 +464,33 @@ pub(super) async fn notify_dm_peer_of_setup_cancellation(
         agent_name,
         context_id,
         is_peer_message,
-        ConversationEndReason::UserCancelled,
+        cancelled_run_end_reason(state, transitioned),
     )
     .await;
+}
+
+/// The reason a DM ends with when its run was cancelled.
+///
+/// `transitioned` is whether the caller's own transition moved the run to
+/// `Cancelled`. If it didn't, an operator's path (`cancel_run` or the deny
+/// cascade) already had, and their stop stands even if the gateway has started
+/// shutting down since. Shutdown never flips a run; it only fires tokens.
+///
+/// Otherwise, during shutdown, the run died mid-turn with nobody asking, which
+/// `Errored { interrupted }` already describes, so no user is blamed in the
+/// `dm_ended` marker or the operator's banner.
+pub(super) fn cancelled_run_end_reason(
+    state: &AppState,
+    transitioned: bool,
+) -> ConversationEndReason {
+    if transitioned && state.shutdown_token.is_cancelled() {
+        ConversationEndReason::Errored {
+            message: "the gateway shut down".to_string(),
+            interrupted: true,
+        }
+    } else {
+        ConversationEndReason::UserCancelled
+    }
 }
 
 /// Shared body for the pre-loop DM peer-notification helpers
@@ -547,7 +573,7 @@ async fn notify_dm_peer_of_setup_outcome(
 /// Callers pass the reason directly:
 ///
 /// - cancel arms (`Cancelled`, `CancelledWithToolCalls`) →
-///   [`ConversationEndReason::UserCancelled`]
+///   [`cancelled_run_end_reason`]
 /// - failure arms (`FailedWithToolCalls`, generic `Err(_)`) →
 ///   [`ConversationEndReason::Errored`] with the truncated `AlmsError`
 ///   `Display` string

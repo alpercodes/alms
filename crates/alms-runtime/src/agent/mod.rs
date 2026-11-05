@@ -46,6 +46,14 @@ pub struct AgentRuntime {
     pub(crate) run_id: Option<alms_core::RunId>,
     /// Per-run cancellation token for cooperative cancellation.
     pub(crate) cancel_token: Option<CancellationToken>,
+    /// The gateway's shutdown token. `cancel_token` says only that the run was
+    /// cancelled; this says whether the gateway's own shutdown is why, so the
+    /// record `finish_run` leaves doesn't blame a user for it.
+    pub(crate) shutdown_token: Option<CancellationToken>,
+    /// `Some` when no one can answer this runtime's approval requests, so any
+    /// denial is automatic rather than a user's. Fired at the denial, before
+    /// the denial fires `cancel_token`.
+    pub(crate) unroutable_approval_denied: Option<CancellationToken>,
     /// Resolved sandbox root (canonicalized). Retained because the
     /// *sandboxed* shell and fs_* re-registrations read it — the shell
     /// builders, and `refresh_fs_tools_for_extras`, which is a no-op
@@ -519,7 +527,7 @@ impl AgentRuntime {
                 let cancel_msg = SessionMessage {
                     id: uuid::Uuid::new_v4().to_string(),
                     role,
-                    content: SessionContent::Text("[Run cancelled by user]".to_string()),
+                    content: SessionContent::Text(self.cancellation_record().to_string()),
                     timestamp: alms_core::Timestamp::now(),
                     metadata: self.dm_marker_metadata(is_dm),
                 };
@@ -559,6 +567,25 @@ impl AgentRuntime {
                     tool_calls,
                 })
             }
+        }
+    }
+
+    /// The record to persist for a cancelled run. Each cause's token fires
+    /// before the run's own, so a run neither shutdown nor an automatic denial
+    /// stopped is the only kind that reads as a user's cancel. The limit runs
+    /// one way: a user's Stop reads as shutdown if shutdown starts before this
+    /// is read. That gap is usually milliseconds, but a Stop during context
+    /// summarization stays open until the summary call returns.
+    pub(crate) fn cancellation_record(&self) -> &'static str {
+        let fired = |token: &Option<CancellationToken>| {
+            token.as_ref().is_some_and(CancellationToken::is_cancelled)
+        };
+        if fired(&self.shutdown_token) {
+            crate::context::RUN_INTERRUPTED_BY_SHUTDOWN
+        } else if fired(&self.unroutable_approval_denied) {
+            crate::context::RUN_STOPPED_APPROVAL_UNROUTABLE
+        } else {
+            crate::context::RUN_CANCELLED_BY_USER
         }
     }
 

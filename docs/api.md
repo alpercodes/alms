@@ -823,13 +823,13 @@ Emitted on the DM session SSE stream when a DM conversation between two agents e
 }
 ```
 
-`reason` values: `"ignored"` (agent called `ignore_message`), `"depth_exceeded"` (MAX_DM_DEPTH reached), `"user_cancelled"` (operator cancelled the run via `POST /runs/{id}/cancel` or `POST /sessions/{id}/cancel-dm`), `"errored"` (the run failed mid-flight — LLM error, tool error, posture trip, etc.).
+`reason` values: `"ignored"` (agent called `ignore_message`), `"depth_exceeded"` (MAX_DM_DEPTH reached), `"user_cancelled"` (operator cancelled the run via `POST /runs/{id}/cancel` or `POST /sessions/{id}/cancel-dm`), `"errored"` (the run failed mid-flight — LLM error, tool error, posture trip, the gateway shutting down, etc.).
 
 `suppress_banner` (optional boolean, default `false`, omitted from the wire when `false`): present and `true` ONLY on the cross-session copy forwarded to an agent's user-facing web-chat (see `notify_dm_ended_to_webchat`) when the DM-end notification run is itself the visible notification in that same chat — so the reloadable `dm_ended_notification` marker is suppressed too. When `true`, clients must still clear any "Chatting with {peer}" DM status but must NOT render a "conversation ended" banner (the run is the single notification — avoids the live half of "initiator gets both"). Every DM-session-stream emission omits this field and always renders the banner. See #1215 / #1218.
 
 `detail` (optional string, omitted from the wire when absent): the failure text behind an `"errored"` end. Present **only** on the cross-session copy forwarded to an agent's user-facing web-chat, and only for `"errored"`; every DM-session-stream emission and every non-`errored` forward omits it. Since #1258 an *interrupted* end starts no notification run, so the banner is the only live surface that explains *why* — clients rendering a "conversation ended" banner should render `detail` as an additional line when present. The same string is mirrored into the persisted `dm_ended_notification` marker's metadata, so it survives a reload.
 
-Which ends are interrupted (#1258): `"user_cancelled"` always, and `"errored"` when the run **died** mid-turn (LLM/tool failure, panic, setup failure). An `"errored"` end whose run *completed* but produced nothing deliverable — or whose final delivery hop failed — is not interrupted and still gets its notification run, because the DM transcript it carries is the only copy the operator's chat will ever see. The distinction is internal: both shapes are `"errored"` on the wire.
+Which ends are interrupted (#1258): `"user_cancelled"` always, and `"errored"` when the run **died** mid-turn (LLM/tool failure, panic, setup failure, gateway shutdown). An `"errored"` end whose run *completed* but produced nothing deliverable — or whose final delivery hop failed — is not interrupted and still gets its notification run, because the DM transcript it carries is the only copy the operator's chat will ever see. The distinction is internal: both shapes are `"errored"` on the wire.
 
 Note: If both agents call `ignore_message` simultaneously, duplicate `dm_conversation_ended` events may be emitted for the same session. Clients should handle duplicates gracefully.
 
@@ -1390,6 +1390,12 @@ Note:
   `{"user_denied": true, "message": ...}` tool result (distinct from the
   `{"error": ...}` shape used for real tool failures), then the run goes
   to `cancelled` (not `failed`) and emits `run_cancelled`.
+- A `guarded` agent running as a foreground subagent has no one to ask, so
+  its approval request is denied automatically and the run stops the same
+  way. Its tool result is `{"approval_unavailable": true, "message": ...}`
+  instead of `user_denied`, its audit row reads
+  `Tool '<name>' denied automatically: no one could be asked to approve it`,
+  and its record is `[Run stopped: tool approval could not be requested]`.
 - Runs still `Queued` on the same session are also cancelled (status
   `cancelled` + `run_cancelled` event each) so they don't auto-start when
   the per-agent queue advances. A queued run whose cancel token is not

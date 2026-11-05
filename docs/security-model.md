@@ -103,7 +103,9 @@ continuations) are promoted to, because nobody is present to approve.
 `resolve_posture_for_run` overrides `Guarded` only, so a `full_control` agent keeps its
 own posture on those runs — see § 8. A run as another agent's subagent skips approval
 too, unless the agent's record itself sets `guarded` and the subagent runs in the
-foreground, where its first gated call is denied. `guarded` therefore governs the runs a
+foreground, where nothing routes its first gated call to a person: the call is denied
+automatically and the run stops with the record
+`[Run stopped: tool approval could not be requested]`. `guarded` therefore governs the runs a
 human starts and is not a boundary between agents: an agent that can send a `guarded`
 agent a DM can have it run tools without approval
 ([§ 8.1](#guarded-is-not-an-agent-boundary)). "Safe" above
