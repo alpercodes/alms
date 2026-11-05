@@ -148,7 +148,20 @@ Each item below changes behaviour for a deployment that has not set the knob exp
   after a DM ends can no longer message the peer whose conversation just closed.
   The record waits on the agent's run queue, so it can no longer land between a running
   turn's tool call and its result. A history split that way was rejected by providers on
-  every later turn. A DM cut short by stopping the gateway leaves no record.
+  every later turn. A DM cut short by stopping the gateway leaves no such record.
+- Stopping the gateway no longer says a user cancelled the runs it stopped. Each run it
+  stops mid-flight, DM or not, now records `[Run interrupted by gateway shutdown]` in
+  place of `[Run cancelled by user]`, and that is what the agent sees in its context
+  after the restart. A DM end that shutdown still manages to write has reason `errored`
+  and the detail `the gateway shut down`, not `user_cancelled`, unless a user had already
+  stopped that run. Rows written by earlier versions are left as they are.
+- A guarded subagent whose tool call needed approval no longer says a user denied the
+  call or cancelled the run. Nothing routes a subagent's approval request to a person, so
+  the call is denied automatically and the run stops. The run now records
+  `[Run stopped: tool approval could not be requested]`. The tool result the model reads
+  is `{"approval_unavailable": true, ...}` with a message saying no one could be asked,
+  in place of `user_denied` and "The user denied this tool call", and the audit row reads
+  `denied automatically` in place of `denied by user`. A person's denial is unchanged.
 - A cancelled or failed DM no longer starts a run on the recipient's session.
 - Agent-to-agent tool descriptions now state which relationship each tool creates and no
   longer teach agents to poll.

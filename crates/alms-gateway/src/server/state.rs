@@ -569,6 +569,7 @@ impl AppState {
         // default) means no subagent is listed and the project-root pin
         // above wins as before.
         coord = coord.with_security_config(security_config.clone());
+        coord = coord.with_shutdown_token(shutdown_token.clone());
 
         // Share the Gateway's secrets store so runtime key changes are visible
         // to both HTTP handlers and the Telegram message loop.

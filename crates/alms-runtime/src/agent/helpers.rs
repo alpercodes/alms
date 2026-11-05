@@ -80,8 +80,12 @@ pub(crate) fn tool_result_ok(value: &serde_json::Value) -> bool {
     // returns `{"user_denied": true, ...}` — deliberately distinct from
     // the `error` shape so the agent can tell user policy from runtime
     // failure, but still a failed call for `ok`-flag purposes. Only an
-    // explicit boolean `true` matches.
-    if obj.get("user_denied").and_then(|v| v.as_bool()) == Some(true) {
+    // explicit boolean `true` matches. `approval_unavailable` is the same
+    // signal for a denial no person made (an unroutable subagent approval).
+    if ["user_denied", "approval_unavailable"]
+        .iter()
+        .any(|key| obj.get(*key).and_then(|v| v.as_bool()) == Some(true))
+    {
         return false;
     }
 

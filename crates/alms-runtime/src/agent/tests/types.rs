@@ -304,6 +304,23 @@ fn test_tool_result_ok_status_string_error_case_insensitive() {
 }
 
 #[test]
+fn test_tool_result_ok_approval_unavailable() {
+    // An automatic denial fails the call the same way a user's does.
+    let val = crate::agent::loop_impl::approval_unavailable_result();
+    assert!(!helpers::tool_result_ok(&val));
+
+    for benign in [
+        serde_json::json!({"approval_unavailable": false}),
+        serde_json::json!({"approval_unavailable": "true"}),
+    ] {
+        assert!(
+            helpers::tool_result_ok(&benign),
+            "approval_unavailable={benign:?} should not classify as failure"
+        );
+    }
+}
+
+#[test]
 fn test_tool_result_ok_user_denied() {
     // #1109: the approval-gate deny body `{"user_denied": true, ...}` is
     // a failed tool call for `ok`-flag purposes even though it carries no
