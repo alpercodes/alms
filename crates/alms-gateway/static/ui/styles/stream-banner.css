@@ -54,3 +54,59 @@
 .stream-dead-banner-text {
     flex: 0 1 auto;
 }
+
+/* ══════════════════════════════════════════════════════════════════════
+   Summary-failure banner
+   ----------------------------------------------------------------------
+   Rendered by `components/chat/summary-failure-banner.js` at the top of
+   the chat column. Unlike the stream-dead banner it names a fix, so it has
+   a real action and can be dismissed instead of being one big button.
+   ══════════════════════════════════════════════════════════════════════ */
+
+.summary-failure-banner {
+    display: flex;
+    align-items: flex-start;
+    gap: var(--space-2, 8px);
+    padding: var(--space-2, 8px) var(--space-3, 12px);
+    border-bottom: 1px solid var(--warning, #ca8a04);
+    background: var(--warning-muted, rgba(202, 138, 4, 0.1));
+    font-size: var(--text-sm, 0.8125rem);
+}
+
+.summary-failure-banner-icon {
+    flex: 0 0 auto;
+    color: var(--warning, #ca8a04);
+    line-height: 1.4;
+}
+
+.summary-failure-banner-body {
+    flex: 1 1 auto;
+    min-width: 0;
+}
+
+.summary-failure-banner-note {
+    margin-top: 2px;
+    opacity: 0.75;
+}
+
+.summary-failure-banner-action,
+.summary-failure-banner-dismiss {
+    flex: 0 0 auto;
+    border: 1px solid var(--warning, #ca8a04);
+    border-radius: 4px;
+    background: transparent;
+    color: inherit;
+    font: inherit;
+    cursor: pointer;
+    padding: 2px 8px;
+}
+
+.summary-failure-banner-dismiss {
+    border-color: transparent;
+    padding: 2px 6px;
+}
+
+.summary-failure-banner-action:hover,
+.summary-failure-banner-dismiss:hover {
+    background: var(--warning-muted, rgba(202, 138, 4, 0.18));
+}

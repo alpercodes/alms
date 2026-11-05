@@ -10,6 +10,7 @@
 use crate::event_log::{AgentEventLogManager, EventLogManager, LoggedEvent, ReplayWindow};
 use crate::sse::SseEventData;
 use alms_core::{AgentId, Run, RunId, RunTransition, SessionId, TransitionOutcome};
+use alms_runtime::SummaryFailure;
 use dashmap::{DashMap, mapref::entry::Entry};
 use std::collections::HashMap;
 use std::hash::Hash;
@@ -241,6 +242,15 @@ pub struct RunManagerMetrics {
     pub activity_subscribers: usize,
 }
 
+/// The summary problem a session is currently showing.
+#[derive(Debug, Clone)]
+struct SummaryProblem {
+    /// Whose summary failed. A DM session has two agents, each summarising
+    /// with its own pair, and one's success says nothing about the other's.
+    agent_id: AgentId,
+    failure: SummaryFailure,
+}
+
 /// Run manager for tracking runs and their event streams
 #[derive(Debug, Clone)]
 pub struct RunManager {
@@ -302,6 +312,11 @@ pub struct RunManager {
     drain_notify: Arc<tokio::sync::Notify>,
     /// Per-run cancellation tokens for cooperative cancellation.
     cancel_tokens: Arc<DashMap<RunId, CancellationToken>>,
+    /// Sessions whose latest conversation summary failed. Current state, not
+    /// history: nothing here reaches the session's messages, so it cannot
+    /// reach a model's context. In memory only; after a restart the next
+    /// failing summary sets it again.
+    summary_problems: Arc<DashMap<SessionId, SummaryProblem>>,
     /// Optional SQLite store for run persistence.
     sqlite_store: Option<Arc<alms_session::SqliteStore>>,
     #[cfg(test)]
@@ -330,6 +345,7 @@ impl RunManager {
             in_flight: Arc::new(AtomicUsize::new(0)),
             drain_notify: Arc::new(tokio::sync::Notify::new()),
             cancel_tokens: Arc::new(DashMap::new()),
+            summary_problems: Arc::new(DashMap::new()),
             sqlite_store: None,
             #[cfg(test)]
             fail_next_persistence: Arc::new(AtomicBool::new(false)),
@@ -1218,6 +1234,87 @@ impl RunManager {
         fan_out_to(&self.session_senders, session_id, &event);
     }
 
+    /// Record what became of a summary call for `session_id` and tell the
+    /// session's stream if that changes what it should show.
+    ///
+    /// Nothing is sent when the same problem is reported again, which is what
+    /// keeps a lasting failure from repeating after every run. A success from
+    /// a different agent than the one that failed changes nothing.
+    pub fn report_summary_status(
+        &self,
+        session_id: SessionId,
+        agent_id: AgentId,
+        failure: Option<SummaryFailure>,
+    ) {
+        match failure {
+            Some(failure) => {
+                let unchanged = self
+                    .summary_problems
+                    .insert(
+                        session_id,
+                        SummaryProblem {
+                            agent_id,
+                            failure: failure.clone(),
+                        },
+                    )
+                    .is_some_and(|previous| previous.failure == failure);
+                if !unchanged {
+                    self.send_transient_session_event(
+                        session_id,
+                        SseEventData::summary_status(session_id, Some(failure)),
+                    );
+                }
+            }
+            None => {
+                let cleared = self
+                    .summary_problems
+                    .remove_if(&session_id, |_, problem| problem.agent_id == agent_id)
+                    .is_some();
+                if cleared {
+                    self.send_transient_session_event(
+                        session_id,
+                        SseEventData::summary_status(session_id, None),
+                    );
+                }
+            }
+        }
+    }
+
+    /// Drop the summary problems `stale` picks, after a configuration change
+    /// that may have fixed them, and tell the affected sessions. A problem the
+    /// change did not fix comes back with the next run's summary.
+    pub fn clear_summary_problems(&self, stale: impl Fn(AgentId, &SummaryFailure) -> bool) {
+        let mut cleared = Vec::new();
+        self.summary_problems.retain(|session_id, problem| {
+            let drop_it = stale(problem.agent_id, &problem.failure);
+            if drop_it {
+                cleared.push(*session_id);
+            }
+            !drop_it
+        });
+        for session_id in cleared {
+            self.send_transient_session_event(
+                session_id,
+                SseEventData::summary_status(session_id, None),
+            );
+        }
+    }
+
+    /// Forget a deleted session's summary problem. Its stream has nothing left
+    /// to show, so nothing is sent.
+    pub fn forget_summary_problem(&self, session_id: SessionId) {
+        self.summary_problems.remove(&session_id);
+    }
+
+    /// The `summary_status` a newly attached session stream starts from, when
+    /// there is a problem to show. The event is transient, so a stream opened
+    /// after it was sent has no other way to learn of it.
+    pub fn summary_status_snapshot(&self, session_id: SessionId) -> Option<SseEventData> {
+        self.summary_problems
+            .get(&session_id)
+            .map(|problem| SseEventData::summary_status(session_id, Some(problem.failure.clone())))
+    }
+
     pub fn subscribe_session(&self, session_id: SessionId) -> ManagedSubscription<SessionId> {
         subscribe_to(
             &self.session_senders,
@@ -1498,6 +1595,136 @@ impl alms_core::RunRegistrar for RunManager {
 mod tests {
     use super::*;
     use alms_core::AgentId;
+
+    fn summary_failure(provider: &str, code: alms_runtime::SummaryFailureCode) -> SummaryFailure {
+        SummaryFailure {
+            code,
+            provider: provider.into(),
+            model: "m".into(),
+            message: format!("{provider} failed"),
+        }
+    }
+
+    /// Drain what a session subscriber has received so far, keeping the
+    /// `failure` of each `summary_status`.
+    async fn summary_statuses(
+        subscription: &mut ManagedSubscription<SessionId>,
+    ) -> Vec<serde_json::Value> {
+        let mut seen = Vec::new();
+        while let Ok(Some(event)) =
+            tokio::time::timeout(std::time::Duration::from_millis(20), subscription.recv()).await
+        {
+            assert_eq!(event.event_type, "summary_status");
+            assert_eq!(
+                event.event_id, None,
+                "state is sent transiently, not logged"
+            );
+            seen.push(event.data["failure"].clone());
+        }
+        seen
+    }
+
+    #[tokio::test]
+    async fn the_same_summary_failure_reaches_the_stream_once() {
+        use alms_runtime::SummaryFailureCode::{MissingKey, Unreachable};
+        let manager = RunManager::new();
+        let (session, agent) = (SessionId::new(), AgentId::new());
+        let mut sub = manager.subscribe_session(session);
+
+        for _ in 0..3 {
+            manager.report_summary_status(
+                session,
+                agent,
+                Some(summary_failure("openrouter", MissingKey)),
+            );
+        }
+        assert_eq!(summary_statuses(&mut sub).await.len(), 1);
+
+        // A different problem is news.
+        manager.report_summary_status(
+            session,
+            agent,
+            Some(summary_failure("openrouter", Unreachable)),
+        );
+        let seen = summary_statuses(&mut sub).await;
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0]["code"], "UNREACHABLE");
+    }
+
+    #[tokio::test]
+    async fn a_summary_success_clears_the_problem_once() {
+        use alms_runtime::SummaryFailureCode::MissingKey;
+        let manager = RunManager::new();
+        let (session, agent) = (SessionId::new(), AgentId::new());
+        let mut sub = manager.subscribe_session(session);
+
+        // Nothing to clear: a healthy session's stream stays silent.
+        manager.report_summary_status(session, agent, None);
+        assert!(summary_statuses(&mut sub).await.is_empty());
+
+        manager.report_summary_status(
+            session,
+            agent,
+            Some(summary_failure("openrouter", MissingKey)),
+        );
+        assert!(manager.summary_status_snapshot(session).is_some());
+        assert_eq!(summary_statuses(&mut sub).await.len(), 1);
+
+        manager.report_summary_status(session, agent, None);
+        manager.report_summary_status(session, agent, None);
+        assert_eq!(
+            summary_statuses(&mut sub).await,
+            vec![serde_json::Value::Null]
+        );
+        assert!(manager.summary_status_snapshot(session).is_none());
+    }
+
+    /// Two agents share a DM session and may use different summary pairs.
+    #[tokio::test]
+    async fn another_agents_summary_success_does_not_clear_the_problem() {
+        use alms_runtime::SummaryFailureCode::MissingKey;
+        let manager = RunManager::new();
+        let session = SessionId::new();
+        let (failing, healthy) = (AgentId::new(), AgentId::new());
+
+        manager.report_summary_status(
+            session,
+            failing,
+            Some(summary_failure("openrouter", MissingKey)),
+        );
+        manager.report_summary_status(session, healthy, None);
+        assert!(manager.summary_status_snapshot(session).is_some());
+    }
+
+    #[tokio::test]
+    async fn clearing_tells_only_the_sessions_it_cleared() {
+        use alms_runtime::SummaryFailureCode::MissingKey;
+        let manager = RunManager::new();
+        let agent = AgentId::new();
+        let (on_openrouter, on_anthropic) = (SessionId::new(), SessionId::new());
+        manager.report_summary_status(
+            on_openrouter,
+            agent,
+            Some(summary_failure("openrouter", MissingKey)),
+        );
+        manager.report_summary_status(
+            on_anthropic,
+            agent,
+            Some(summary_failure("anthropic", MissingKey)),
+        );
+        let mut openrouter_sub = manager.subscribe_session(on_openrouter);
+        let mut anthropic_sub = manager.subscribe_session(on_anthropic);
+
+        manager.clear_summary_problems(|_, failure| failure.provider == "openrouter");
+
+        assert_eq!(
+            summary_statuses(&mut openrouter_sub).await,
+            vec![serde_json::Value::Null]
+        );
+        assert!(summary_statuses(&mut anthropic_sub).await.is_empty());
+        assert!(manager.summary_status_snapshot(on_openrouter).is_none());
+        assert!(manager.summary_status_snapshot(on_anthropic).is_some());
+    }
 
     #[tokio::test]
     async fn test_drain_immediate_when_no_in_flight() {

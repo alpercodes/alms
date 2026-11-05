@@ -455,6 +455,13 @@ pub(crate) fn resolve_agent_config(
             );
             llm.with_provider(provider)
         };
+        if llm.missing_required_key() {
+            warn!(
+                agent_id = %agent_id,
+                provider = %provider,
+                "This agent's provider override has no API key; its LLM calls will be refused"
+            );
+        }
     } else if let Some(s) = secrets {
         // No per-agent provider override — re-resolve the key for the
         // server-default provider from the live secrets store.

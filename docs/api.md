@@ -775,6 +775,24 @@ Transient phase indicator emitted at key moments during the agent loop so the UI
 
 Emitted for non-fatal conditions that the frontend should display distinctly (yellow warning styling). Warning codes: `DM_EMPTY_REPLY_RETRY` (peer-triggered DM run produced no deliverable reply text -- nudging once to reply with text or use `ignore_message`; #1154), `DM_EMPTY_REPLY` (the nudge was exhausted -- the gateway ends the DM conversation with an `errored` reason so the peer is notified), `WORKSPACE_PROMPT_TRUNCATED` (a workspace file did not fit the bytes this run's prompt budget left it, so the system prompt carries a partial window of it and a whole-file `workspace_write` replacement is refused until the agent has seen the whole file; emitted at most once per file per run, and the message names the agent, the file, its size and the bytes it was given). When the warning originates from a subagent, the payload includes a `source_agent` field identifying which subagent emitted it.
 
+`summary_status`
+Session stream only. The current state of the session's conversation summaries, both post-run episodic summaries and compaction. `failure` is the problem to show, or `null` once there is none.
+```json
+{
+  "session_id": "<uuid>",
+  "failure": {
+    "code": "MISSING_KEY",
+    "provider": "openrouter",
+    "model": "google/gemma-4-31b-it",
+    "message": "Conversation summaries failed: no API key is set for OpenRouter (summary model: google/gemma-4-31b-it). To fix this, change the summary model in Settings (...), or add an OpenRouter key in Settings (API Keys)."
+  }
+}
+```
+
+`code` values: `MISSING_KEY` (the provider needs a key and has none, so the summary was not sent at all; or a provider declared without a key answered 401/403), `REJECTED_KEY` (a key was sent and the provider answered 401/403), `UNREACHABLE` (no HTTP answer: connection refused, DNS, timeout), `REJECTED_REQUEST` (any other 4xx, typically an unknown model), `RATE_LIMITED` (429), `PROVIDER_ERROR` (5xx), `UNUSABLE_OUTPUT` (the call succeeded but returned no usable summary). `provider` is the configured name the call went to. `model` is empty when none is configured for the provider. `message` is written for the user, offers a key only for the two key codes, and never quotes the provider's response.
+
+This describes a state, so it is sent only when the state changes: a failure repeating after every run sends one event. It clears when a summary next succeeds, or when a change that may have fixed it lands (`PATCH /settings` with `context.summary_model` or `context.summary_provider`, `PUT /auth/keys` for that provider, or a change to the agent's own summary pair); if the change did not fix it, the next run's summary reports it again. Like `status`, it is not persisted to any event log and not replayed by the `last_event_id` cursor. Instead, a session stream with a current problem sends it at attach time, right after `stream_state`, so a reload or second tab sees it; a client should treat a new connection as "no problem" until told otherwise. The state is held in memory, so after a gateway restart it is absent until the next failing summary. It is never written to the session's messages and never reaches a model's context. A compaction failure inside a subagent run does not produce this event.
+
 `run_cancelled`
 ```json
 { "run_id": "<uuid>", "ts": "..." }

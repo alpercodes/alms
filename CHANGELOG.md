@@ -54,6 +54,22 @@ Each item below changes behaviour for a deployment that has not set the knob exp
   at boot. The empty string is the explicit-clear sentinel on all three surfaces — TOML,
   `PATCH /settings`, and the persisted `settings.json` — so a clear survives a restart.
 
+  A summary that fails now says so in the UI: a banner at the top of the session names the
+  provider and the way out (change the summary model in Settings, or add the provider's key
+  where a key is the problem). It does not fail the run or enter the model's context, shows
+  once rather than after every run, and clears when a summary next succeeds or when you
+  change the summary pair or add that provider's key. New `summary_status` SSE event on
+  `GET /sessions/{id}/events` (`docs/api.md`).
+
+  **A summary is no longer sent to a provider that needs a key it does not have.** Before,
+  an agent with no OpenRouter key sent the conversation to `openrouter.ai` after every run
+  with no auth header, to be refused. A provider declared without a key (a local Ollama or
+  LM Studio entry with no `api_key_env` / `api_key`) is unaffected, and can now be chosen as
+  the summary provider: `PATCH /settings` and the agent API used to refuse it with
+  `SUMMARY_PROVIDER_MISSING_API_KEY`. The per-run "Provider changed but no API key found —
+  clearing stale key" warning is gone; the callers that can act on a missing key log it in
+  their own words.
+
 - **`workspace_write`'s `mode` now defaults per file: `memories` appends, the other three
   replace.** Previously every file defaulted to `write`, so a call that omitted `mode`
   replaced the whole file — the wrong branch to guess for `memories.md`.

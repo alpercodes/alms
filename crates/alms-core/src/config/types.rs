@@ -777,6 +777,28 @@ impl ProviderEntry {
     }
 }
 
+/// Whether calls to the provider `name` need an API key to be worth sending.
+///
+/// The config has no explicit "needs no key" flag, so this reads the two
+/// things that do say a key is expected:
+///
+/// - `name` is one of the LLM slots in [`crate::secrets::VALID_PROVIDERS`]
+///   (`openai`, `anthropic`, `openrouter`, `gemini`). Those are hosted APIs
+///   whose key lives in the secrets store, and none answers without one.
+///   `telegram` is in that list as a channel token, not an LLM provider.
+/// - The `[llm.providers.<name>]` entry declares `api_key_env` or `api_key`,
+///   so its operator said a key goes with it, even if it does not resolve now.
+///
+/// Anything else is an endpoint declared without a key, which is how
+/// `docs/config.md` tells you to set up Ollama or LM Studio, and is treated
+/// as needing none. An entry that does need a key but declares none cannot be
+/// told apart from that; its calls go out and fail on the provider's 401.
+pub fn provider_requires_api_key(name: &str, entry: Option<&ProviderEntry>) -> bool {
+    let store_slot = name != "telegram" && crate::secrets::VALID_PROVIDERS.contains(&name);
+    let declares_key = entry.is_some_and(|e| e.api_key_env.is_some() || e.api_key.is_some());
+    store_slot || declares_key
+}
+
 /// Wire-format for a single `[llm.providers.<name>]` entry in `alms.toml`.
 ///
 /// This is the generic provider surface: an OpenAI-compatible endpoint is
