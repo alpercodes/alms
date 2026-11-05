@@ -332,6 +332,20 @@ pub(crate) fn user_denied_result() -> serde_json::Value {
     })
 }
 
+/// Agent-visible gloss for a call denied because no one could be asked to
+/// approve it (a guarded subagent's request, which nothing routes to a person).
+pub(crate) const APPROVAL_UNAVAILABLE_MESSAGE: &str = "No one could be asked to approve this \
+     tool call, so it was denied automatically. Do not retry it or work around the denial.";
+
+/// The tool result for an automatic denial: the same shape as
+/// [`user_denied_result`], under its own key so it doesn't claim a user.
+pub(crate) fn approval_unavailable_result() -> serde_json::Value {
+    serde_json::json!({
+        "approval_unavailable": true,
+        "message": APPROVAL_UNAVAILABLE_MESSAGE,
+    })
+}
+
 /// Output of a completed agent loop.
 ///
 /// Rolled up from every LLM call in the loop: `response` is the final
@@ -2578,7 +2592,23 @@ impl AgentRuntime {
                 // function already uses `AuditDecision::Deny`; user denials
                 // belong in the same bucket — they are a policy decision,
                 // not a runtime execution failure (`AuditDecision::Error`).
-                let denial_reason = format!("Tool '{}' denied by user", name);
+                // No one can answer this runtime's approvals, so the denial
+                // was automatic and must not be written up as a user's.
+                let automatic = self.unroutable_approval_denied.is_some();
+                let (denial_reason, denial_result) = if automatic {
+                    (
+                        format!(
+                            "Tool '{}' denied automatically: no one could be asked to approve it",
+                            name
+                        ),
+                        approval_unavailable_result(),
+                    )
+                } else {
+                    (
+                        format!("Tool '{}' denied by user", name),
+                        user_denied_result(),
+                    )
+                };
                 let _ = session_manager.append_audit(
                     session_id,
                     AuditEvent {
@@ -2595,7 +2625,7 @@ impl AgentRuntime {
                 let _ = sender.send(RuntimeEvent::ToolEnd {
                     invocation_id,
                     ok: false,
-                    result: user_denied_result(),
+                    result: denial_result.clone(),
                     source_agent: None,
                     task_id: None,
                 });
@@ -2627,7 +2657,7 @@ impl AgentRuntime {
                 // signal instead of an `INTERRUPTED_TOOL_RESULT` marker
                 // for an orphan tool_use block. `tool_result_ok` maps the
                 // body to `ok: false` on the persisted row.
-                return Ok(user_denied_result());
+                return Ok(denial_result);
             }
         }
 

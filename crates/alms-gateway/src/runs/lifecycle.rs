@@ -1440,12 +1440,13 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
         // #1046 / #1052: gate the broadcast on the transition bool. The
         // HTTP `cancel_run` handler (#1046) may have already flipped the
         // state and emitted the SSE event before this `execute_run` task
-        // was dispatched (queued-then-cancelled-via-HTTP). Likewise, a
-        // concurrent path (graceful shutdown's `cancel_all_in_flight`,
-        // `cancel_runs_for_session`, ...) may have already driven the run
-        // terminal (#1052). In either case the state is already
-        // `Cancelled` so `mark_run_as_cancelled` returns false and we
-        // skip the duplicate broadcast. The synthetic
+        // was dispatched (queued-then-cancelled-via-HTTP). Likewise, the
+        // #1109 deny cascade may have already flipped it (#1052). Those are
+        // the only paths that flip a run from outside; graceful shutdown's
+        // `cancel_all_in_flight` and `cancel_runs_for_session` only fire
+        // tokens, so this branch makes the transition for them. When the
+        // state is already `Cancelled`, `mark_run_as_cancelled` returns
+        // false and we skip the duplicate broadcast. The synthetic
         // `session_activity_ended` below still fires because it serves a
         // separate sidebar-indicator-clearing purpose.
         let (transitioned, persistence_error) =
@@ -2818,9 +2819,8 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
             // whether the transition actually happened. The previous
             // contract unconditionally overwrote the `status` field, so a
             // run that had already been driven terminal by a racing path
-            // (cancel token, shutdown drain, cancel_runs_for_session,
-            // synchronous HTTP cancel handler from #1050) would silently
-            // flip back to `Completed` here — and the `run_finished`
+            // (the synchronous HTTP cancel handler from #1050, or the #1109
+            // deny cascade) would silently flip back to `Completed` here — and the `run_finished`
             // broadcast / episodic summary spawn / DM lifecycle handler
             // below would all fire as if the run had completed naturally.
             // With the bool gate in place, every post-flip side effect in
@@ -2975,9 +2975,9 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
                 // already emitted by whichever path flipped the state.
                 //
                 // S1 (#1154): but NOT every winning path signals the DM peer.
-                // The synchronous HTTP `cancel_run` handler and
-                // `cancel_runs_for_session` only flip state + emit
-                // `run_cancelled` — they do not call `handle_dm_run_failure`.
+                // The synchronous HTTP `cancel_run` handler and the deny
+                // cascade only flip state + emit `run_cancelled` — they do
+                // not call `handle_dm_run_failure`.
                 // And because the loop returned `Ok` (not
                 // `Err(Cancelled)`), the `Cancelled` arm below — which would
                 // have signalled the peer — never runs. So in the
@@ -2995,13 +2995,15 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
                 );
                 // #1258: `interrupted: true` either way — see the `Cancelled`
                 // arm below.
-                let conversation_reason = completion_peer_error.map_or_else(
-                    || super::dm_lifecycle::cancelled_run_end_reason(&state, false),
-                    |message| ConversationEndReason::Errored {
-                        message,
-                        interrupted: true,
-                    },
-                );
+                // `UserCancelled` outright: only an operator's cancel can
+                // have flipped this run, since shutdown never flips one.
+                let conversation_reason =
+                    completion_peer_error.map_or(ConversationEndReason::UserCancelled, |message| {
+                        ConversationEndReason::Errored {
+                            message,
+                            interrupted: true,
+                        }
+                    });
                 if let Err(e) = super::dm_lifecycle::handle_dm_run_failure(
                     &state,
                     &run_id,
@@ -3044,8 +3046,9 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
             // already flipped the state and fired the SSE event (the
             // common case for user-initiated cancels — see the rationale
             // on the handler), this match arm sees `false` and skips the
-            // duplicate broadcast. The same gate also closes the race on
-            // shutdown-drain / `cancel_runs_for_session` cleanup paths.
+            // duplicate broadcast. The same gate covers the deny cascade,
+            // the only other path that flips a run from outside (shutdown
+            // and `cancel_runs_for_session` only fire tokens).
             // The downstream `handle_dm_run_failure` and
             // `session_activity_ended` emissions still fire — they are
             // NOT duplicated by the HTTP handler (#1052 Tim review).

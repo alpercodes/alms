@@ -464,15 +464,15 @@ fn shell_call_turn() -> String {
 }
 
 /// Runs a guarded named subagent up to its first tool call, which nobody can
-/// approve, and returns the rows on its session.
+/// approve, and returns its session.
 ///
 /// The denial fires the subagent's own token inside the loop's poll, so the
 /// biased token arm in `run_subagent` can't drop the loop first, and
 /// `finish_run` always writes its record.
-async fn rows_of_guarded_subagent(
+async fn run_guarded_subagent(
     state: &AppState,
     parent_events: Option<std::sync::Arc<dyn alms_tools::EventForwarder>>,
-) -> Vec<String> {
+) -> SessionId {
     let mut guard = alms_core::registry::AgentRecord::for_test("guard");
     guard.posture = Some("guarded".to_string());
     let name = guard.name.clone();
@@ -511,7 +511,32 @@ async fn rows_of_guarded_subagent(
             .any(|row| row.starts_with("[Run "))
     })
     .await;
-    texts(state, session_id)
+    session_id
+}
+
+/// The denied call's tool row, as the model reads it on a later turn.
+fn denied_tool_result(state: &AppState, session_id: SessionId) -> serde_json::Value {
+    state
+        .session_manager
+        .get_history(session_id)
+        .unwrap()
+        .into_iter()
+        .find_map(|message| match message.content {
+            Content::ToolResult { result, .. } => Some(result),
+            _ => None,
+        })
+        .expect("the denied call leaves a tool row")
+}
+
+/// The reason on the session's one `Deny` audit row.
+fn denial_audit_reason(state: &AppState, session_id: SessionId) -> String {
+    let audit = state.session_manager.get_audit(session_id).unwrap();
+    let denials: Vec<_> = audit
+        .iter()
+        .filter(|event| matches!(event.decision, alms_core::AuditDecision::Deny))
+        .collect();
+    assert_eq!(denials.len(), 1, "{audit:?}");
+    denials[0].error.clone().unwrap_or_default()
 }
 
 /// The real coordinator hands the shutdown token all the way to a subagent's
@@ -522,14 +547,16 @@ async fn shutdown_token_reaches_a_subagent_runtime_through_the_coordinator() {
     let state = gateway.state();
     gateway.shutdown();
 
-    let rows = rows_of_guarded_subagent(&state, None).await;
+    let session_id = run_guarded_subagent(&state, None).await;
 
+    let rows = texts(&state, session_id);
     assert!(rows.iter().any(|row| row == SHUTDOWN_RECORD), "{rows:?}");
 }
 
 /// An approval no one can be asked for is denied automatically, in the shape
 /// `invoke_agent` spawns (with a parent forwarder) and without one. Neither
-/// involves a user.
+/// involves a user, so no row the run leaves may say one denied or cancelled
+/// anything: not the record, the tool row the model reads, or the audit row.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn unroutable_approval_denial_blames_no_user() {
     let (events_tx, _events_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -540,13 +567,85 @@ async fn unroutable_approval_denial_blames_no_user() {
         let gateway = Gateway::with_llm(ScriptedLlm::always(Canned::sse(shell_call_turn())).await);
         let state = gateway.state();
 
-        let rows = rows_of_guarded_subagent(&state, parent_events).await;
+        let session_id = run_guarded_subagent(&state, parent_events).await;
 
+        let rows = texts(&state, session_id);
         assert!(
             rows.iter().any(|row| row == UNROUTABLE_APPROVAL_RECORD),
             "{rows:?}"
         );
         assert!(!rows.iter().any(|row| row.contains("by user")), "{rows:?}");
+        let result = denied_tool_result(&state, session_id);
+        assert_eq!(result["approval_unavailable"], true, "{result}");
+        assert!(result.get("user_denied").is_none(), "{result}");
+        assert!(!result.to_string().contains("user"), "{result}");
+        let reason = denial_audit_reason(&state, session_id);
+        assert!(!reason.contains("user"), "{reason}");
         gateway.channels.1.cancel();
     }
+}
+
+/// A user's Stop on a DM run mid-turn, with shutdown starting before its
+/// terminal arm runs. The user did ask, so the end keeps `user_cancelled`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn user_stop_of_a_running_dm_run_keeps_its_reason_during_shutdown() {
+    let mut gateway = Gateway::start().await;
+    let state = gateway.state();
+    let (alice_id, bob_id) = seed_alice_bob(&state);
+    let (run_id, dm_session, _) = start_dm_run(&mut gateway, alice_id, bob_id).await;
+    let barrier = crate::runs::lifecycle::install_terminal_transition_barrier(run_id);
+
+    let _ = crate::runs::lifecycle::cancel_run(State(state.clone()), Path(run_id))
+        .await
+        .map_err(|error| error.0)
+        .unwrap();
+    barrier.wait().await;
+    gateway.shutdown();
+    barrier.wait().await;
+    wait_finished(&state, run_id).await;
+
+    assert_eq!(
+        dm_ended_reason(&state, dm_session).as_deref(),
+        Some("user_cancelled")
+    );
+}
+
+/// A person's denial of a top-level guarded run keeps every row a person's
+/// denial has always left, so the automatic-denial wording can't leak onto it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_persons_denial_keeps_the_user_record() {
+    let gateway = Gateway::with_llm(ScriptedLlm::always(Canned::sse(shell_call_turn())).await);
+    let state = gateway.state();
+    let mut guard = alms_core::registry::AgentRecord::for_test("guard");
+    guard.posture = Some("guarded".to_string());
+    state
+        .session_manager
+        .store()
+        .unwrap()
+        .create_agent(&guard)
+        .unwrap();
+    let (run_id, session_id) = start_web_run(&state, guard.id).await;
+    wait_until("the approval", || {
+        !state.approval_store.list_pending().is_empty()
+    })
+    .await;
+    let approval = state.approval_store.list_pending()[0].approval_id;
+    assert!(state.approval_store.resolve(approval, false).is_some());
+    wait_finished(&state, run_id).await;
+
+    let rows = texts(&state, session_id);
+    assert!(rows.iter().any(|row| row == USER_CANCEL_RECORD), "{rows:?}");
+    let result = denied_tool_result(&state, session_id);
+    assert_eq!(
+        result,
+        serde_json::json!({
+            "user_denied": true,
+            "message": "The user denied this tool call. Do not retry it or work around the denial.",
+        })
+    );
+    assert_eq!(
+        denial_audit_reason(&state, session_id),
+        "Tool 'shell' denied by user"
+    );
+    gateway.channels.1.cancel();
 }

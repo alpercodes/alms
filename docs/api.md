@@ -1372,6 +1372,12 @@ Note:
   `{"user_denied": true, "message": ...}` tool result (distinct from the
   `{"error": ...}` shape used for real tool failures), then the run goes
   to `cancelled` (not `failed`) and emits `run_cancelled`.
+- A `guarded` agent running as a foreground subagent has no one to ask, so
+  its approval request is denied automatically and the run stops the same
+  way. Its tool result is `{"approval_unavailable": true, "message": ...}`
+  instead of `user_denied`, its audit row reads
+  `Tool '<name>' denied automatically: no one could be asked to approve it`,
+  and its record is `[Run stopped: tool approval could not be requested]`.
 - Runs still `Queued` on the same session are also cancelled (status
   `cancelled` + `run_cancelled` event each) so they don't auto-start when
   the per-agent queue advances. A queued run whose cancel token is not
