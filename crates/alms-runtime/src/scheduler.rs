@@ -76,8 +76,8 @@ impl Ord for PendingJob {
 
 /// Async scheduler. Clone is cheap (all fields are `Arc`).
 ///
-/// Call [`start`] once to spawn the background runner, then use
-/// [`schedule_once`] / [`schedule_recurring`] to add jobs.
+/// Call [`Self::start`] once to spawn the background runner, then use
+/// [`Self::schedule_once`] / [`Self::schedule_recurring`] to add jobs.
 #[derive(Clone, Debug)]
 pub struct Scheduler {
     pending: Arc<Mutex<BinaryHeap<Reverse<PendingJob>>>>,

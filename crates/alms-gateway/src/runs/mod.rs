@@ -110,7 +110,7 @@ struct RunParams {
 /// Sessions whose `context_id` starts with any of these prefixes are excluded
 /// when searching for the user's web-chat session.  This list is the single
 /// source of truth for [`find_user_facing_session`], the `GET /sessions`
-/// endpoint, [`notifications::notify_job_completion`], and
+/// endpoint, `notifications::notify_job_completion`, and
 /// [`notifications::notify_dm_ended_to_webchat`].
 ///
 /// Note the `GET /sessions` (sidebar) endpoint carves out exceptions from

@@ -61,7 +61,7 @@ pub(crate) struct DmConflictCheck {
 /// `dm_peer` is the current DM peer's name (`None` outside a DM run, where
 /// no `send_message` can target "the peer" — so no conflict is possible).
 /// Recipient matching is case-insensitive, mirroring the peer-fold check in
-/// [`alms_tools::SendMessageTool`].
+/// `alms_tools::SendMessageTool`.
 pub(crate) fn detect_dm_conflict(
     tool_calls: &[ToolCall],
     dm_peer: Option<&str>,
@@ -116,7 +116,7 @@ pub(crate) fn detect_dm_conflict(
 /// own error when it runs).
 ///
 /// Scope note (S3, PR #1160): this mirrors only the *raw `to`* peer-fold in
-/// [`alms_tools::SendMessageTool`] (the pre-resolution check), not its
+/// `alms_tools::SendMessageTool` (the pre-resolution check), not its
 /// second, post-resolution fold that re-checks the registry-resolved
 /// canonical name. So a `send_message` addressing the peer by a non-`to`
 /// spelling that only resolves to the peer after a registry lookup — e.g. an

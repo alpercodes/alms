@@ -339,7 +339,7 @@ pub struct Coordinator {
     subagent_self_sink: Option<Arc<dyn SubagentSelfEventSink>>,
     /// Security config snapshot (#947) — config-file-only, loaded once at
     /// gateway boot. The Coordinator consults
-    /// [`SecurityConfig::is_full_os_access_agent`] for each named subagent
+    /// [`alms_core::config::SecurityConfig::is_full_os_access_agent`] for each named subagent
     /// to decide whether to inherit the parent's project-root sandbox or
     /// drop it via `with_unrestricted_filesystem`. Inherited subagents
     /// (no name) are never listed by construction, so they always pick up

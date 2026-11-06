@@ -21,7 +21,7 @@
 //! ## Module layout
 //!
 //! - [`bus`] -- `MessageBus` struct and `MessageSender` trait implementation
-//! - [`mod`] (this file) -- shared types (`RunTrigger`, `MessageSource`) and constants
+//! - `mod` (this file) -- shared types (`RunTrigger`, `MessageSource`) and constants
 
 mod bus;
 
@@ -61,7 +61,7 @@ const DEPTH_EXPIRY_SECS: u64 = 1800;
 /// `Instant::now() - Duration::from_secs(DEPTH_EXPIRY_SECS + 1)` underflows
 /// and panics with "overflow when subtracting duration from instant" whenever
 /// machine uptime is below 30 minutes. Tests use
-/// [`ActivityStamp::already_expired`] instead, which never subtracts and so
+/// `ActivityStamp::already_expired` instead, which never subtracts and so
 /// cannot depend on how recently the machine booted. See #1240.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ActivityStamp {

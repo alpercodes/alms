@@ -37,7 +37,7 @@ pub struct GatewayConfig {
     pub data_dir: Option<std::path::PathBuf>,
     /// Absolute path to the project root — the agent's filesystem sandbox
     /// boundary (#945). Resolved at gateway construction time from
-    /// [`ServerConfig::resolved_project_root`]; the CLI `--project` flag
+    /// [`alms_core::config::ServerConfig::resolved_project_root`]; the CLI `--project` flag
     /// writes through to that field before this struct is built.
     pub project_root: Option<std::path::PathBuf>,
     /// Base directory for agent workspace files (None = workspace API
@@ -171,7 +171,7 @@ impl GatewayConfig {
     /// itself respects the `ALMS_DATA_DIR` env var). Individual paths can
     /// still be overridden with `ALMS_DB_PATH` and `ALMS_WORKSPACE_DIR`.
     /// The project root (#945) follows its own precedence chain via
-    /// [`ServerConfig::resolved_project_root`].
+    /// [`alms_core::config::ServerConfig::resolved_project_root`].
     pub fn from_alms_config_with_env(config: &AlmsConfig) -> Self {
         let mut gateway_config = Self::from_alms_config(config);
 

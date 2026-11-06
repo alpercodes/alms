@@ -30,9 +30,9 @@ use uuid::Uuid;
 ///
 /// All fields snapshot the **effective** value: the post-layering result,
 /// not the raw per-run override. `provider` and `model` come from the
-/// resolved [`crate::AgentConfig`]'s LLM client (`provider()` /
+/// resolved `alms_runtime::AgentConfig`'s LLM client (`provider()` /
 /// `default_model()`); the remaining fields come from the resolved
-/// [`crate::AgentConfig`] itself.
+/// `alms_runtime::AgentConfig` itself.
 ///
 /// Serialized with `skip_serializing_if = "Option::is_none"` on the
 /// optional reasoning / thinking fields so a snapshot that didn't engage
@@ -47,7 +47,7 @@ use uuid::Uuid;
 /// - `gemini_thinking_budget` (Gemini) — `Option<u32>`, skip-serialized
 ///   when `None`.
 ///
-/// Each field mirrors its underlying [`alms_runtime::AgentConfig`] shape
+/// Each field mirrors its underlying `alms_runtime::AgentConfig` shape
 /// (`anthropic_thinking_budget: u32`, `openai_reasoning_effort:
 /// Option<ReasoningEffort>`, `gemini_thinking_budget: Option<u32>`), so
 /// the snapshot is a faithful projection of what the LLM adapter saw — not
@@ -84,7 +84,7 @@ pub struct ResolvedRunConfig {
     pub max_tokens: u32,
     /// Effective execution posture: `"full_control"`, `"guarded"`, or
     /// `"autonomous"`. Stored as a string for wire stability — matches the
-    /// shape of [`CreateRunRequest::posture`] and survives potential future
+    /// shape of [`crate::registry::AgentRecord::posture`] and survives potential future
     /// posture additions without breaking older clients.
     pub posture: String,
     /// Effective `debug_mode` flag. Reflects the value the runtime actually
@@ -98,7 +98,7 @@ pub struct ResolvedRunConfig {
     /// Effective Anthropic extended-thinking budget in tokens (#767).
     /// `0` means extended thinking is disabled for this run; non-zero is
     /// the budget the adapter sent on the wire. Persisted as a `u32`
-    /// (matching [`crate::AgentConfig::anthropic_thinking_budget`]'s
+    /// (matching `alms_runtime::AgentConfig::anthropic_thinking_budget`'s
     /// shape) rather than `Option<u32>` because `0` is a meaningful
     /// state, not absence.
     pub thinking_budget_tokens: u32,

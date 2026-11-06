@@ -129,7 +129,7 @@ pub struct ListApprovalsQuery {
     pub session_id: Option<alms_core::SessionId>,
 }
 
-/// GET /approvals?session_id=<uuid> — list pending approvals, optionally filtered by session
+/// `GET /approvals?session_id=<uuid>` — list pending approvals, optionally filtered by session
 pub async fn list_approvals(
     State(state): State<AppState>,
     Query(query): Query<ListApprovalsQuery>,

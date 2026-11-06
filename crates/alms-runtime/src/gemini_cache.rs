@@ -85,7 +85,7 @@ enum CacheHandle {
 
 /// In-process store of Gemini context caches keyed by `SessionId`.
 ///
-/// Shared via `Arc` across clones of [`LlmClient`] so a subagent spawned
+/// Shared via `Arc` across clones of [`LlmClient`](crate::LlmClient) so a subagent spawned
 /// from a parent client sees the same cache entries. The struct is
 /// `Send + Sync`: `DashMap` covers the storage, and the reqwest HTTP
 /// client used for cache creation is itself `Send + Sync`.
