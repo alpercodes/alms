@@ -6,6 +6,8 @@ ALMS loads configuration with layered precedence:
 2. `alms.toml` in the current working directory (or `~/.config/alms/config.toml`)
 3. `ALMS_*` environment variables (settings, plus the gateway bearer token `ALMS_AUTH_TOKEN`)
 
+With no config file, ALMS uses the compiled defaults. A config file that exists but can't be read or parsed, or that fails validation, is fatal: the gateway and the CLI commands that use the configuration exit with an error naming the file and the problem.
+
 LLM API keys are never read from arbitrary environment variables. Store one with `alms auth set <provider> <key>`, or give the provider entry an `api_key_env` naming an env var or a literal `api_key` (see below). The global Telegram bot token is stored with `alms auth set telegram <token>` and a per-agent one on the agent record; the gateway bearer token comes only from `ALMS_AUTH_TOKEN`.
 
 Most of this document covers the **LLM provider** surface; the section immediately below covers the knobs the web UI's Settings modal exposes. See `docs/architecture.md`, `alms.toml.example` and `crates/alms-core/src/config/mod.rs` for the rest.
