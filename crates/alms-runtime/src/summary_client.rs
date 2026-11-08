@@ -264,6 +264,45 @@ mod tests {
         );
     }
 
+    /// Building a client for a provider that needs no key must not warn that
+    /// its key is empty; a hosted slot with none still does.
+    #[test]
+    fn the_empty_key_warning_is_only_for_providers_that_need_one() {
+        let keyless = || {
+            let mut providers = std::collections::BTreeMap::new();
+            providers.insert(
+                "ollama".into(),
+                ProviderEntry {
+                    base_url: "http://127.0.0.1:9/v1".into(),
+                    ..ProviderEntry::default()
+                },
+            );
+            LlmConfig {
+                provider: "ollama".into(),
+                base_url: "http://127.0.0.1:9/v1".into(),
+                providers,
+                ..LlmConfig::default()
+            }
+        };
+        let warned = |cfg: LlmConfig| {
+            alms_test_support::capture_events(tracing::Level::WARN, || {
+                LlmClient::new(cfg).unwrap();
+            })
+            .iter()
+            .any(|e| e.message.contains("api_key is empty"))
+        };
+        assert!(!warned(keyless()));
+        assert!(!warned(LlmConfig {
+            mock: true,
+            provider: "openrouter".into(),
+            ..LlmConfig::default()
+        }));
+        assert!(warned(LlmConfig {
+            provider: "openrouter".into(),
+            ..LlmConfig::default()
+        }));
+    }
+
     /// Re-targeting the per-run summary clone at a provider with no key used
     /// to warn "Provider changed but no API key found — clearing stale key"
     /// on every run: wrong, since the agent's key was not stale, and loud.
@@ -294,6 +333,72 @@ mod tests {
         assert!(
             !llm.missing_required_key(),
             "the agent's own client keeps its key"
+        );
+    }
+
+    /// The send path reads the provider's entry: one that declares a key
+    /// source it cannot resolve needs that key, one that declares none (a
+    /// local Ollama) does not.
+    #[test]
+    fn an_entry_that_declares_a_key_source_needs_it() {
+        let mut providers = std::collections::BTreeMap::new();
+        providers.insert(
+            "my-proxy".into(),
+            ProviderEntry {
+                base_url: "http://127.0.0.1:9/v1".into(),
+                api_key_env: Some("ALMS_TEST_UNSET_SUMMARY_KEY_VAR".into()),
+                ..ProviderEntry::default()
+            },
+        );
+        providers.insert(
+            "ollama".into(),
+            ProviderEntry {
+                base_url: "http://127.0.0.1:9/v1".into(),
+                ..ProviderEntry::default()
+            },
+        );
+        let llm = LlmClient::new(LlmConfig {
+            provider: "ollama".into(),
+            base_url: "http://127.0.0.1:9/v1".into(),
+            providers,
+            ..LlmConfig::default()
+        })
+        .unwrap();
+        assert!(!llm.missing_required_key());
+        assert!(
+            build_summary_client(
+                &llm,
+                Some("my-proxy"),
+                Some("m"),
+                Some(&SecretsStore::empty())
+            )
+            .missing_required_key()
+        );
+    }
+
+    /// A built-in slot re-pointed at a keyless local server is the operator's
+    /// endpoint, not the hosted API: no key is needed, so it is sent to.
+    #[test]
+    fn a_re_pointed_keyless_slot_needs_no_key() {
+        let mut providers = std::collections::BTreeMap::new();
+        providers.insert(
+            "openai".into(),
+            ProviderEntry {
+                base_url: "http://localhost:1234/v1".into(),
+                ..ProviderEntry::default()
+            },
+        );
+        let llm = LlmClient::new(LlmConfig {
+            provider: "openai".into(),
+            base_url: "http://localhost:1234/v1".into(),
+            providers,
+            ..LlmConfig::default()
+        })
+        .unwrap();
+        assert!(!llm.missing_required_key());
+        assert!(
+            !build_summary_client(&llm, None, None, Some(&SecretsStore::empty()))
+                .missing_required_key()
         );
     }
 

@@ -97,7 +97,14 @@ impl SummaryFailure {
                 status: 500..=599, ..
             } => SummaryFailureCode::ProviderError,
             AlmsError::LlmApiError { .. } => SummaryFailureCode::RejectedRequest,
-            AlmsError::Runtime(msg) if msg.starts_with("HTTP request failed") => {
+            // No answer, or an answer that stalled or broke off after the
+            // headers (`LlmClient::read_body`: "LLM response decode failed",
+            // with "operation timed out" for a stall).
+            AlmsError::Runtime(msg)
+                if msg.starts_with("HTTP request failed")
+                    || msg.starts_with("LLM response decode failed")
+                    || msg.contains("timed out") =>
+            {
                 SummaryFailureCode::Unreachable
             }
             _ => SummaryFailureCode::UnusableOutput,
@@ -106,42 +113,39 @@ impl SummaryFailure {
             AlmsError::LlmApiError { status, .. } => Some(*status),
             _ => None,
         };
-        Self::new(code, client.provider(), model, status)
+        Self::new(code, client, model, status)
     }
 
     /// The provider needs a key and the client has none, so the call was not
     /// made: sending it would put the conversation on the wire to be refused.
     pub fn missing_key(client: &LlmClient, model: &str) -> Self {
-        Self::new(
-            SummaryFailureCode::MissingKey,
-            client.provider(),
-            model,
-            None,
-        )
+        Self::new(SummaryFailureCode::MissingKey, client, model, None)
     }
 
     /// The call succeeded but returned nothing usable as a summary: no text,
     /// or text `episodic::screen_summary_output` refused.
     pub fn unusable_output(client: &LlmClient, model: &str) -> Self {
-        Self::new(
-            SummaryFailureCode::UnusableOutput,
-            client.provider(),
-            model,
-            None,
-        )
+        Self::new(SummaryFailureCode::UnusableOutput, client, model, None)
     }
 
-    fn new(code: SummaryFailureCode, provider: &str, model: &str, status: Option<u16>) -> Self {
+    fn new(code: SummaryFailureCode, client: &LlmClient, model: &str, status: Option<u16>) -> Self {
+        let provider = client.provider();
         Self {
             code,
             provider: provider.to_string(),
             model: model.to_string(),
-            message: message(code, provider, model, status),
+            message: message(code, provider, client.declared_key_env(), model, status),
         }
     }
 }
 
-fn message(code: SummaryFailureCode, provider: &str, model: &str, status: Option<u16>) -> String {
+fn message(
+    code: SummaryFailureCode,
+    provider: &str,
+    key_env: Option<&str>,
+    model: &str,
+    status: Option<u16>,
+) -> String {
     use SummaryFailureCode as C;
 
     let keyed = settings_key_provider(provider);
@@ -152,17 +156,34 @@ fn message(code: SummaryFailureCode, provider: &str, model: &str, status: Option
     } else {
         format!("summary model: {model}")
     };
-    // The second way out on a key failure, which depends on where the key lives.
-    let add_key = match keyed {
-        Some((display, article)) => format!("add {article} {display} key in Settings (API Keys)"),
-        None => format!(
+    // The second way out on a key failure, which depends on where the key
+    // lives. An entry naming an environment variable already says where; the
+    // fix is to set it where the gateway can read it.
+    let env_fix = |verb: &str, var: &str| {
+        format!("{verb} {var} in the gateway's environment and restart the gateway")
+    };
+    let add_key = match (keyed, key_env) {
+        (Some((display, article)), None) => {
+            format!("add {article} {display} key in Settings (API Keys)")
+        }
+        (Some((display, article)), Some(var)) => format!(
+            "add {article} {display} key in Settings (API Keys), or {}",
+            env_fix("set", var)
+        ),
+        (None, Some(var)) => env_fix("set", var),
+        (None, None) => format!(
             "add the key under [llm.providers.{provider}] (api_key_env or api_key) in alms.toml \
              and restart the gateway"
         ),
     };
-    let replace_key = match keyed {
-        Some((display, _)) => format!("replace the {display} key in Settings (API Keys)"),
-        None => format!(
+    let replace_key = match (keyed, key_env) {
+        (Some((display, _)), None) => format!("replace the {display} key in Settings (API Keys)"),
+        (Some((display, _)), Some(var)) => format!(
+            "replace the {display} key in Settings (API Keys), or {}",
+            env_fix("correct", var)
+        ),
+        (None, Some(var)) => env_fix("correct", var),
+        (None, None) => format!(
             "replace the key under [llm.providers.{provider}] (api_key_env or api_key) in \
              alms.toml and restart the gateway"
         ),
@@ -366,6 +387,15 @@ mod tests {
                 "could not reach OpenRouter",
             ),
             (
+                AlmsError::Runtime(
+                    "LLM response decode failed (provider=openrouter): response body stalled \
+                     (no data for 180s) — operation timed out"
+                        .into(),
+                ),
+                SummaryFailureCode::Unreachable,
+                "did not respond in time",
+            ),
+            (
                 AlmsError::Runtime("LLM response parse failed: x".into()),
                 SummaryFailureCode::UnusableOutput,
                 "did not return a usable summary",
@@ -437,6 +467,40 @@ mod tests {
         assert!(f.message.contains("unset both fields"), "{}", f.message);
         let f = SummaryFailure::unusable_output(&client("openrouter", "k"), MODEL);
         assert!(!f.message.contains("switch summaries"), "{}", f.message);
+    }
+
+    /// An entry that names an unset `api_key_env` already declares where the
+    /// key goes; the fix is to set that variable, not to add a key source.
+    #[test]
+    fn a_declared_key_variable_is_named_in_the_fix() {
+        let mut providers = std::collections::BTreeMap::new();
+        providers.insert(
+            "my-proxy".to_string(),
+            alms_core::config::ProviderEntry {
+                base_url: "http://127.0.0.1:9/v1".into(),
+                api_key_env: Some("MY_PROXY_KEY".into()),
+                ..alms_core::config::ProviderEntry::default()
+            },
+        );
+        let client = LlmClient::new(LlmConfig {
+            provider: "my-proxy".into(),
+            base_url: "http://127.0.0.1:9/v1".into(),
+            providers,
+            ..LlmConfig::default()
+        })
+        .unwrap();
+        let f = SummaryFailure::missing_key(&client, "m");
+        assert!(
+            f.message
+                .contains("set MY_PROXY_KEY in the gateway's environment and restart the gateway"),
+            "{}",
+            f.message
+        );
+        assert!(
+            !f.message.contains("(api_key_env or api_key)"),
+            "{}",
+            f.message
+        );
     }
 
     #[test]

@@ -88,7 +88,11 @@ impl Harness {
             alms_core::config::ProviderEntry {
                 kind: alms_core::config::ProviderKind::OpenAiCompatible,
                 base_url: llm.base_url(),
-                api_key_env: None,
+                // The slot is re-pointed at the scripted LLM, so on its URL
+                // alone it would count as a keyless local endpoint. Declaring
+                // a key source keeps it a provider that needs a key, as the
+                // hosted `openrouter` is. The variable is never set.
+                api_key_env: Some("ALMS_TEST_UNSET_OPENROUTER_KEY_VAR".to_string()),
                 api_key: entry_key.map(str::to_owned),
                 model: None,
                 auth_scheme: alms_core::config::AuthScheme::Bearer,

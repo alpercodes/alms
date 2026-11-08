@@ -103,7 +103,19 @@ impl Harness {
         };
         let mut providers = std::collections::BTreeMap::new();
         providers.insert("local".to_string(), entry(Some(AGENT_KEY)));
-        providers.insert("openrouter".to_string(), entry(None));
+        // Re-pointed at the scripted LLM, the slot would count as a keyless
+        // local endpoint on its URL alone. Declaring a key source (never set)
+        // keeps it a provider that needs a key, like the hosted `openrouter`.
+        providers.insert(
+            "openrouter".to_string(),
+            alms_core::config::ProviderEntry {
+                api_key_env: Some("ALMS_TEST_UNSET_OPENROUTER_KEY_VAR".to_string()),
+                ..entry(None)
+            },
+        );
+        // A built-in slot re-pointed at a keyless local server, which is the
+        // operator's endpoint rather than the hosted API.
+        providers.insert("openai".to_string(), entry(None));
         // A local endpoint declared without a key, the way `docs/config.md`
         // sets up Ollama.
         providers.insert("ollama".to_string(), entry(None));
@@ -523,4 +535,106 @@ async fn a_keyless_local_provider_can_be_chosen_and_is_sent_to() {
     assert_eq!(sent[0].0, None, "with no auth header");
     assert!(sent[0].1.contains("llama3.1:8b"));
     assert!(summary_statuses(&mut sub).await.is_empty());
+}
+
+impl Harness {
+    async fn put_agent(&self, agent: alms_core::AgentId, body: serde_json::Value) -> StatusCode {
+        self.router()
+            .oneshot(
+                HttpRequest::put(format!("/agents/{}", agent.0))
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status()
+    }
+}
+
+/// A built-in slot re-pointed at a keyless local server is the operator's
+/// endpoint: Settings accepts it as the summary provider without a key, and
+/// its summaries are sent, with no auth header. Before, the slot name alone
+/// made it "need a key", so its summaries were skipped.
+#[tokio::test]
+async fn a_re_pointed_keyless_slot_is_sent_to() {
+    let h = Harness::boot().await;
+    h.set_summary_provider(SummaryProvider::Healthy);
+    let agent = seed_agent(&h.state, "local-agent");
+    let session = h.state.session_manager.get_or_create(agent, "web-chat");
+    let mut sub = h.state.run_manager.subscribe_session(session.id);
+
+    assert_eq!(
+        h.patch_settings(serde_json::json!({
+            "context": { "summary_provider": "openai", "summary_model": "local-model" }
+        }))
+        .await,
+        StatusCode::OK
+    );
+    assert_eq!(h.run(session.id).await, "Completed");
+    let sent = h.summary_requests().await;
+    assert_eq!(sent.len(), 1, "the re-pointed slot is sent to: {sent:?}");
+    assert_eq!(sent[0].0, None, "with no auth header");
+    assert!(summary_statuses(&mut sub).await.is_empty());
+}
+
+/// Changing the agent's own summary pair may fix its failing summaries, so
+/// it clears the banner; an agent update that leaves the pair alone does not.
+#[tokio::test]
+async fn changing_the_agents_summary_pair_clears_it() {
+    let h = Harness::boot().await;
+    let agent = seed_agent(&h.state, "local-agent");
+    let session = h.state.session_manager.get_or_create(agent, "web-chat");
+    let mut sub = h.state.run_manager.subscribe_session(session.id);
+    h.run(session.id).await;
+    assert_eq!(summary_statuses(&mut sub).await.len(), 1);
+
+    assert_eq!(
+        h.put_agent(agent, serde_json::json!({ "description": "unrelated" }))
+            .await,
+        StatusCode::OK
+    );
+    assert!(summary_statuses(&mut sub).await.is_empty());
+    assert!(
+        h.state
+            .run_manager
+            .summary_status_snapshot(session.id)
+            .is_some()
+    );
+
+    assert_eq!(
+        h.put_agent(
+            agent,
+            serde_json::json!({ "summary_provider": "ollama", "summary_model": "llama3.1:8b" })
+        )
+        .await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        summary_statuses(&mut sub).await,
+        vec![serde_json::Value::Null]
+    );
+}
+
+/// A post-run summary that made no LLM call (here `heuristic` mode) says
+/// nothing about the provider, so the banner stays as it was.
+#[tokio::test]
+async fn a_summary_without_an_llm_call_leaves_it_alone() {
+    let h = Harness::boot().await;
+    let agent = seed_agent(&h.state, "local-agent");
+    let session = h.state.session_manager.get_or_create(agent, "web-chat");
+    let mut sub = h.state.run_manager.subscribe_session(session.id);
+    h.run(session.id).await;
+    assert_eq!(summary_statuses(&mut sub).await.len(), 1);
+
+    h.state.agent_config.write().context_config.run_summary_mode =
+        alms_core::config::RunSummaryMode::Heuristic;
+    assert_eq!(h.run(session.id).await, "Completed");
+    assert!(summary_statuses(&mut sub).await.is_empty());
+    assert!(
+        h.state
+            .run_manager
+            .summary_status_snapshot(session.id)
+            .is_some()
+    );
 }

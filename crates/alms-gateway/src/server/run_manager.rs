@@ -1246,37 +1246,40 @@ impl RunManager {
         agent_id: AgentId,
         failure: Option<SummaryFailure>,
     ) {
-        match failure {
-            Some(failure) => {
-                let unchanged = self
-                    .summary_problems
-                    .insert(
-                        session_id,
-                        SummaryProblem {
-                            agent_id,
-                            failure: failure.clone(),
-                        },
-                    )
-                    .is_some_and(|previous| previous.failure == failure);
-                if !unchanged {
+        // Each send happens while this session's `summary_problems` entry is
+        // still held, so two reporters on one session (run N's post-run
+        // summary and run N+1's compaction, or two DM agents) send in the
+        // order they changed the map, and the stream ends on the map's state.
+        // Lock order: `summary_problems`, then `session_senders`; nothing
+        // takes them the other way.
+        match (failure, self.summary_problems.entry(session_id)) {
+            (Some(failure), Entry::Occupied(mut held)) => {
+                if held.get().failure != failure {
                     self.send_transient_session_event(
                         session_id,
-                        SseEventData::summary_status(session_id, Some(failure)),
+                        SseEventData::summary_status(session_id, Some(failure.clone())),
                     );
                 }
+                held.insert(SummaryProblem { agent_id, failure });
             }
-            None => {
-                let cleared = self
-                    .summary_problems
-                    .remove_if(&session_id, |_, problem| problem.agent_id == agent_id)
-                    .is_some();
-                if cleared {
-                    self.send_transient_session_event(
-                        session_id,
-                        SseEventData::summary_status(session_id, None),
-                    );
-                }
+            (Some(failure), Entry::Vacant(vacant)) => {
+                let _held = vacant.insert(SummaryProblem {
+                    agent_id,
+                    failure: failure.clone(),
+                });
+                self.send_transient_session_event(
+                    session_id,
+                    SseEventData::summary_status(session_id, Some(failure)),
+                );
             }
+            (None, Entry::Occupied(held)) if held.get().agent_id == agent_id => {
+                self.send_transient_session_event(
+                    session_id,
+                    SseEventData::summary_status(session_id, None),
+                );
+                held.remove();
+            }
+            (None, _) => {}
         }
     }
 
@@ -1284,20 +1287,18 @@ impl RunManager {
     /// that may have fixed them, and tell the affected sessions. A problem the
     /// change did not fix comes back with the next run's summary.
     pub fn clear_summary_problems(&self, stale: impl Fn(AgentId, &SummaryFailure) -> bool) {
-        let mut cleared = Vec::new();
+        // Sent from inside `retain`, while the shard is held, for the same
+        // ordering reason as in `report_summary_status`.
         self.summary_problems.retain(|session_id, problem| {
             let drop_it = stale(problem.agent_id, &problem.failure);
             if drop_it {
-                cleared.push(*session_id);
+                self.send_transient_session_event(
+                    *session_id,
+                    SseEventData::summary_status(*session_id, None),
+                );
             }
             !drop_it
         });
-        for session_id in cleared {
-            self.send_transient_session_event(
-                session_id,
-                SseEventData::summary_status(session_id, None),
-            );
-        }
     }
 
     /// Forget a deleted session's summary problem. Its stream has nothing left

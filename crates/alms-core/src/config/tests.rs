@@ -31,7 +31,11 @@ fn example_config_shows_the_compiled_run_summary_mode() {
 fn provider_requires_api_key_reads_the_slots_and_the_entry() {
     let bare = ProviderEntry::default();
     for slot in ["openrouter", "openai", "anthropic", "gemini"] {
-        assert!(provider_requires_api_key(slot, Some(&bare)), "{slot}");
+        let stock = ProviderEntry {
+            base_url: builtin_base_url(slot).unwrap().into(),
+            ..ProviderEntry::default()
+        };
+        assert!(provider_requires_api_key(slot, Some(&stock)), "{slot}");
         assert!(provider_requires_api_key(slot, None), "{slot}");
     }
     assert!(!provider_requires_api_key("ollama", Some(&bare)));
@@ -48,6 +52,65 @@ fn provider_requires_api_key_reads_the_slots_and_the_entry() {
         ..ProviderEntry::default()
     };
     assert!(provider_requires_api_key("my-proxy", Some(&with_inline)));
+}
+
+/// A built-in slot counts as hosted only while it points at its stock URL
+/// (trailing slash or not). Re-pointed at a local server it is the
+/// operator's endpoint, judged by whether it declares a key.
+#[test]
+fn a_re_pointed_slot_is_judged_by_its_entry() {
+    let mut cfg = LlmConfig::default();
+    cfg.ensure_builtin_providers();
+    for slot in ["openrouter", "openai", "anthropic", "gemini"] {
+        let entry = cfg.providers.get(slot).unwrap();
+        assert_eq!(Some(entry.base_url.as_str()), builtin_base_url(slot));
+        assert!(provider_requires_api_key(slot, Some(entry)), "{slot}");
+        let slashed = ProviderEntry {
+            base_url: format!("{}/", entry.base_url),
+            ..entry.clone()
+        };
+        assert!(provider_requires_api_key(slot, Some(&slashed)), "{slot}/");
+
+        let local = ProviderEntry {
+            base_url: "http://localhost:1234/v1".into(),
+            ..entry.clone()
+        };
+        assert!(
+            !provider_requires_api_key(slot, Some(&local)),
+            "{slot} local"
+        );
+        let local_with_key = ProviderEntry {
+            api_key_env: Some("LOCAL_KEY".into()),
+            ..local
+        };
+        assert!(
+            provider_requires_api_key(slot, Some(&local_with_key)),
+            "{slot} local+key"
+        );
+    }
+}
+
+/// `ALMS_LLM_BASE_URL` writes into the default slot's entry, so it re-points
+/// the slot for this rule too.
+#[test]
+fn alms_llm_base_url_re_points_the_default_slot() {
+    let _lock = ENV_LOCK.lock().unwrap();
+    let _guard = SingleEnvGuard::set("ALMS_LLM_BASE_URL", "http://127.0.0.1:1234/v1");
+    let _legacy = SingleEnvGuard::remove("LLM_BASE_URL");
+    let _provider = SingleEnvGuard::set("ALMS_LLM_PROVIDER", "openai");
+
+    let mut cfg = AlmsConfig::default();
+    cfg.llm.ensure_builtin_providers();
+    cfg.apply_env_overrides();
+
+    assert!(!provider_requires_api_key(
+        "openai",
+        cfg.llm.providers.get("openai")
+    ));
+    assert!(provider_requires_api_key(
+        "openrouter",
+        cfg.llm.providers.get("openrouter")
+    ));
 }
 
 /// Select an API key for the requested LLM provider.

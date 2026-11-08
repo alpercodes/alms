@@ -136,7 +136,16 @@ mod tests {
                 .code,
             "SUMMARY_PROVIDER_UNKNOWN"
         );
-        providers.insert("openrouter".to_string(), provider(None));
+        // On its stock URL, so it is the hosted API and needs a key.
+        providers.insert(
+            "openrouter".to_string(),
+            ProviderEntry {
+                base_url: alms_core::config::builtin_base_url("openrouter")
+                    .unwrap()
+                    .to_string(),
+                ..provider(None)
+            },
+        );
         assert_eq!(
             validate_summary_pair(Some("openrouter"), Some("model"), &providers, &secrets)
                 .unwrap_err()
