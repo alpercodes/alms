@@ -1125,11 +1125,16 @@ fn test_load_or_default_resolves_data_dir() {
     // irrelevant here.
     let _mock_guard = SingleEnvGuard::remove("ALMS_LLM_MOCK");
 
-    let config = AlmsConfig::load_or_default();
+    // Empty working and home directories, through the fallible loader: the
+    // exiting `load_or_default()` with the developer's real HOME would end
+    // the whole test binary on a broken `~/.config/alms/config.toml`.
+    let cwd = tempfile::tempdir().expect("tempdir creates");
+    let home = tempfile::tempdir().expect("tempdir creates");
+    let config = load_from(cwd.path(), home.path()).expect("defaults load");
     let data_path = std::path::Path::new(&config.server.data_dir);
     assert!(
         data_path.is_absolute(),
-        "data_dir should be absolute after load_or_default(), got: {}",
+        "data_dir should be absolute after load_or_default_fallible(), got: {}",
         config.server.data_dir
     );
 }
@@ -2222,7 +2227,7 @@ summary_provider = ""
 // ---- #924: load_or_default fail-fast on validate() failure ----
 //
 // `AlmsConfig::load_or_default()` is the path the gateway entrypoint
-// (`alms gateway`) uses (via `crates/alms-cli/src/main.rs:137`). Pre-#924
+// (`alms gateway`) uses (via the early load in `crates/alms-cli/src/main.rs`). Pre-#924
 // it caught every `load()` error — including `validate()` violations —
 // and silently fell back to compiled defaults with a stderr warning.
 // That meant a hand-edited `alms.toml` with one of the pair-only
@@ -2246,9 +2251,9 @@ summary_provider = ""
 // Tests use `load_or_default_fallible()` — the inner `Result`-returning
 // shape — so they can assert on the error path without aborting the
 // test process. The public `load_or_default()` wraps it with
-// `std::process::exit(1)` on Err. The two CWD-based tests serialise
-// against `ENV_LOCK` because `find_config_file()` reads from the
-// process cwd, which is shared across parallel tests.
+// `std::process::exit(1)` on Err. The tests that change the working
+// directory serialise against `ENV_LOCK` because `find_config_file()`
+// reads from the process cwd, which is shared across parallel tests.
 
 /// Verify the fail-fast contract directly at the helper boundary:
 /// `load_or_default_fallible()` must return `Err(InvalidConfig(_))`
@@ -2450,10 +2455,26 @@ fn test_load_or_default_refuses_an_unreadable_config_file() {
 
     let err = load_from(cwd.path(), home.path()).expect_err("an unreadable file must be fatal");
 
-    assert!(
-        err.to_string().contains("Cannot read config file"),
-        "got: {err}"
-    );
+    assert!(err.to_string().contains("cannot read"), "got: {err}");
+}
+
+/// A dangling `alms.toml` symlink is a file that exists but can't be read, not
+/// a missing one. `Path::exists()` follows the link, so it used to count as
+/// absent and the load fell through to defaults (or the home config).
+#[cfg(unix)]
+#[test]
+fn test_load_or_default_refuses_a_dangling_config_symlink() {
+    let _lock = ENV_LOCK.lock().unwrap();
+    let _provider_guard = SingleEnvGuard::remove("ALMS_LLM_PROVIDER");
+    let _mock_guard = SingleEnvGuard::remove("ALMS_LLM_MOCK");
+    let home = tempfile::tempdir().expect("tempdir creates");
+    let cwd = tempfile::tempdir().expect("tempdir creates");
+    std::os::unix::fs::symlink(cwd.path().join("gone.toml"), cwd.path().join("alms.toml"))
+        .expect("symlink");
+
+    let err = load_from(cwd.path(), home.path()).expect_err("a dangling link must be fatal");
+
+    assert!(err.to_string().contains("alms.toml"), "got: {err}");
 }
 
 /// Now that a file that won't parse stops ALMS from starting, the example

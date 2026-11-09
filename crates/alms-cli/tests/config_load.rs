@@ -93,6 +93,20 @@ fn commands_that_use_the_config_refuse_it_too() {
         &["agent", "list"][..],
         &["session", "list"][..],
         &["job", "list"][..],
+        &["job", "show", "00000000-0000-0000-0000-000000000000"][..],
+        // `--agent` resolves the name in the local database before any request.
+        &[
+            "run",
+            "create",
+            "--agent",
+            "x",
+            "--session",
+            "00000000-0000-0000-0000-000000000000",
+            "--input",
+            "hi",
+            "--url",
+            "http://127.0.0.1:9",
+        ][..],
         &["auth", "list"][..],
     ] {
         let (cwd, home) = broken_config_dir();
@@ -127,6 +141,41 @@ fn commands_that_do_not_use_the_config_still_work() {
         !stderr.contains("TOML parse error"),
         "health must not read the config: {stderr}"
     );
+
+    // The pre-flight probe fails on the connection before any browser opens.
+    let dashboard = run_with_deadline(alms(
+        cwd.path(),
+        home.path(),
+        &["dashboard", "--url", "http://127.0.0.1:9"],
+    ));
+    let stderr = String::from_utf8_lossy(&dashboard.stderr);
+    assert!(
+        !stderr.contains("TOML parse error"),
+        "dashboard must not read the config: {stderr}"
+    );
+}
+
+/// With no `./alms.toml`, a broken home config is the file in use, so the
+/// message must name it, and must not send the operator to `alms.toml` or call
+/// a CLI command "the daemon".
+#[test]
+fn a_broken_home_config_is_named_in_the_error() {
+    let cwd = tempfile::tempdir().expect("tempdir");
+    let home = tempfile::tempdir().expect("tempdir");
+    let dir = home.path().join(".config").join("alms");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    std::fs::write(dir.join("config.toml"), BROKEN_TOML).expect("write config.toml");
+
+    let output = run_with_deadline(alms(cwd.path(), home.path(), &["agent", "list"]));
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "stderr: {stderr}");
+    assert!(
+        stderr.contains("config.toml"),
+        "must name the file: {stderr}"
+    );
+    assert!(!stderr.contains("alms.toml"), "wrong file named: {stderr}");
+    assert!(!stderr.contains("daemon"), "not a daemon: {stderr}");
 }
 
 #[test]

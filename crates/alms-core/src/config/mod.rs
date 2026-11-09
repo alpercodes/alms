@@ -154,9 +154,10 @@ impl AlmsConfig {
     /// **Behaviour scope (#924 follow-up).** This entry-point is shared
     /// across the gateway boot path *and* every CLI subcommand that goes
     /// through `helpers::open_db_with_config()` (`alms agent ...`,
-    /// `alms session ...`, `alms run ...`, `alms job ...`, plus
-    /// `alms auth`). A validation failure therefore aborts the process
-    /// for those CLI commands too, not just `alms gateway`. This is the
+    /// `alms session ...`, `alms job list` / `alms job show`,
+    /// `alms run create --agent`, plus `alms auth`). A config file that can't
+    /// be read or parsed, or a validation failure, therefore aborts the
+    /// process for those CLI commands too, not just `alms gateway`. This is the
     /// intended shape — discarding the operator's intent silently would
     /// be just as wrong on a CLI invocation as on daemon boot — but it
     /// is wider than the issue title suggests. Commands that never use the
@@ -170,12 +171,21 @@ impl AlmsConfig {
         match Self::load_or_default_fallible() {
             Ok(cfg) => cfg,
             Err(e) => {
-                eprintln!("Error: invalid configuration: {e}");
+                // `e` already starts with "Invalid configuration:".
+                eprintln!("Error: {e}");
+                // Name the file this load used: a validation error does not,
+                // and it may be the home config rather than `./alms.toml`.
+                let fix = match Self::find_config_file() {
+                    Some(path) => format!(
+                        "Fix it in {} or in the ALMS_* environment variable that sets it",
+                        path.display()
+                    ),
+                    None => "No config file was found, so fix the ALMS_* environment \
+                             variable that sets it"
+                        .to_string(),
+                };
                 eprintln!(
-                    "The daemon will not start with an invalid config — fix the offending \
-                     field in alms.toml (or in the corresponding ALMS_* environment \
-                     variable) and try again. Removing the config file entirely is also \
-                     valid; the daemon will then start with compiled defaults."
+                    "ALMS will not run with this configuration. {fix}, then run the command again."
                 );
                 std::process::exit(1);
             }
@@ -238,11 +248,11 @@ impl AlmsConfig {
     /// Load from a specific file path
     pub fn from_file(path: &Path) -> AlmsResult<Self> {
         let content = std::fs::read_to_string(path).map_err(|e| {
-            AlmsError::InvalidConfig(format!("Cannot read config file {}: {}", path.display(), e))
+            AlmsError::InvalidConfig(format!("cannot read {}: {}", path.display(), e))
         })?;
 
         let config: Self = toml::from_str(&content).map_err(|e| {
-            AlmsError::InvalidConfig(format!("Invalid config file {}: {}", path.display(), e))
+            AlmsError::InvalidConfig(format!("cannot parse {}: {}", path.display(), e))
         })?;
 
         Ok(config)
@@ -250,16 +260,23 @@ impl AlmsConfig {
 
     /// Find config file in standard locations
     fn find_config_file() -> Option<PathBuf> {
-        // 1. Current directory
-        let local = PathBuf::from("alms.toml");
-        if local.exists() {
+        // Presence, not usability: `exists()` follows symlinks, so a dangling
+        // link would count as absent and fall through to defaults or the next
+        // location. `from_file` then reports a present file it can't read.
+        // A lookup denied by permissions still counts as absent.
+        let present = |p: &Path| std::fs::symlink_metadata(p).is_ok();
+
+        // 1. Current directory. Absolute, so every message names the full
+        //    path even when the working directory isn't obvious.
+        let local = std::path::absolute("alms.toml").unwrap_or_else(|_| PathBuf::from("alms.toml"));
+        if present(&local) {
             return Some(local);
         }
 
         // 2. Home config directory
         if let Some(home) = dirs_path() {
             let home_config = home.join(".config").join("alms").join("config.toml");
-            if home_config.exists() {
+            if present(&home_config) {
                 return Some(home_config);
             }
         }
