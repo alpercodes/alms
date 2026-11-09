@@ -148,9 +148,11 @@ Each item below changes behaviour for a deployment that has not set the knob exp
   `POST /runs` returns `400 AGENT_PROVIDER_NOT_CONFIGURED`, named subagents and other runs
   without a caller fail with the same reason, and a Telegram message is dropped with an
   error in the log. The gateway logs a WARN at startup naming each agent whose `provider`
-  or `summary_provider` has no entry, and `alms agent create --provider` and
-  `alms agent config --provider` print a warning on stderr for a name the CLI's own
-  `alms.toml` lacks; they still save it, since the gateway may load a different file.
+  or `summary_provider` has no entry, and a server-level `[context].summary_provider`
+  with none. `alms agent create --provider` and `alms agent config --provider` print a
+  warning on stderr for a name the CLI's own `alms.toml` lacks; they still save it, since
+  the gateway may load a different file. Both now trim the value and treat a blank one as
+  no override, so `alms agent create --provider ""` no longer stores a provider named `''`.
   **After upgrading**, change or clear such an agent's provider with
   `PUT /agents/{id_or_name}` or `alms agent config <name> --provider ""`.
 
