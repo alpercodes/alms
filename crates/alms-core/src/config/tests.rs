@@ -2402,7 +2402,13 @@ fn test_load_or_default_refuses_an_unparseable_config_file() {
         "expected InvalidConfig, got: {err:?}"
     );
     let msg = err.to_string();
-    assert!(msg.contains("alms.toml"), "must name the file: {msg}");
+    // The full path, so an operator who doesn't know the service's working
+    // directory still finds the file.
+    let full = std::path::Path::new(cwd.path().file_name().unwrap()).join("alms.toml");
+    assert!(
+        msg.contains(&*full.to_string_lossy()),
+        "must name the file by its full path: {msg}"
+    );
     assert!(msg.contains("TOML parse error"), "must say why: {msg}");
 }
 
