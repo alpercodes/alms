@@ -1625,6 +1625,56 @@ mod tests {
         seen
     }
 
+    /// Two reporters on one session at once must leave the stream on the map's
+    /// state. Sending after the map change ended about one trial in six on a
+    /// stale state; sending while the entry is held makes it zero. Half the
+    /// trials race two agents' failures, half race a report against
+    /// `clear_summary_problems` over a seeded problem. (Tim, #202 round 2.)
+    #[test]
+    fn concurrent_reporters_leave_the_stream_on_the_maps_state() {
+        use alms_runtime::SummaryFailureCode::MissingKey;
+        for i in 0..5_000 {
+            let rm = RunManager::new();
+            let session = SessionId::new();
+            let (a, b) = (AgentId::new(), AgentId::new());
+            let mut sub = rm.subscribe_session(session);
+            if i % 2 == 1 {
+                rm.report_summary_status(session, a, Some(summary_failure("seed", MissingKey)));
+                while sub.try_recv().is_ok() {}
+            }
+            let barrier = std::sync::Barrier::new(2);
+            std::thread::scope(|scope| {
+                scope.spawn(|| {
+                    barrier.wait();
+                    rm.report_summary_status(session, a, Some(summary_failure("x", MissingKey)));
+                });
+                scope.spawn(|| {
+                    barrier.wait();
+                    if i % 2 == 1 {
+                        rm.clear_summary_problems(|_, _| true);
+                    } else {
+                        rm.report_summary_status(
+                            session,
+                            b,
+                            Some(summary_failure("y", MissingKey)),
+                        );
+                    }
+                });
+            });
+            let mut last = None;
+            while let Ok(event) = sub.try_recv() {
+                last = Some(event.data["failure"].clone());
+            }
+            let held = rm
+                .summary_status_snapshot(session)
+                .map_or(serde_json::Value::Null, |e| e.data["failure"].clone());
+            assert!(
+                last.as_ref().is_none_or(|l| *l == held),
+                "trial {i}: stream ended on {last:?}, map holds {held}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn the_same_summary_failure_reaches_the_stream_once() {
         use alms_runtime::SummaryFailureCode::{MissingKey, Unreachable};

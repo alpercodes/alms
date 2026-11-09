@@ -118,7 +118,9 @@ summary_model = "google/gemma-4-31b-it"
 # re-targeted at this provider via `with_provider_and_secrets` so
 # `summary_model` can be a slug for a different provider than the agent
 # (e.g. agent on Anthropic, summary on OpenRouter). Must reference a
-# configured `[llm.providers.<name>]` block whose API key is resolvable.
+# configured `[llm.providers.<name>]` block; one that needs a key (a built-in
+# slot on its stock URL, or an entry declaring `api_key_env` / `api_key`) must
+# have it resolvable.
 summary_provider = "openrouter"
 #
 # IMPORTANT (#871): set `summary_model` and `summary_provider` together.

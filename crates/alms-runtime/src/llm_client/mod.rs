@@ -1147,10 +1147,6 @@ impl LlmClient {
         !self.config.api_key.is_empty()
     }
 
-    /// The provider needs an API key and this client has none, so a request
-    /// would go out unauthenticated and fail. See
-    /// [`alms_core::config::provider_requires_api_key`] for how "needs" is
-    /// read. Never true in mock mode, which sends nothing.
     /// The environment variable the current provider's entry names as its
     /// key source, if any.
     pub fn declared_key_env(&self) -> Option<&str> {
@@ -1160,6 +1156,10 @@ impl LlmClient {
             .and_then(|entry| entry.api_key_env.as_deref())
     }
 
+    /// The provider needs an API key and this client has none, so a request
+    /// would go out unauthenticated and fail. See
+    /// [`alms_core::config::provider_requires_api_key`] for how "needs" is
+    /// read. Never true in mock mode, which sends nothing.
     pub fn missing_required_key(&self) -> bool {
         !self.config.mock
             && !self.has_api_key()

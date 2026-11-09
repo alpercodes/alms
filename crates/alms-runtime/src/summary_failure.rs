@@ -28,7 +28,8 @@ pub enum SummaryFailureCode {
     MissingKey,
     /// The provider refused the call (401/403) and a key was sent.
     RejectedKey,
-    /// The call never got an HTTP answer: connection refused, DNS, timeout.
+    /// The call never got an HTTP answer (connection refused, DNS, timeout),
+    /// or the response body stalled or broke off after the headers.
     Unreachable,
     /// The provider refused the request itself, typically an unknown model.
     RejectedRequest,
@@ -98,12 +99,15 @@ impl SummaryFailure {
             } => SummaryFailureCode::ProviderError,
             AlmsError::LlmApiError { .. } => SummaryFailureCode::RejectedRequest,
             // No answer, or an answer that stalled or broke off after the
-            // headers (`LlmClient::read_body`: "LLM response decode failed",
-            // with "operation timed out" for a stall).
+            // headers. Both are recognised by the prefix the client writes
+            // ("HTTP request failed" from reqwest's send, which covers the
+            // connect and total timeouts; "LLM response decode failed" from
+            // the body read, which covers a stall and a mid-body reset). Never
+            // by words further in: a "parse failed" message quotes the
+            // provider's body, and the provider's words must not pick the code.
             AlmsError::Runtime(msg)
                 if msg.starts_with("HTTP request failed")
-                    || msg.starts_with("LLM response decode failed")
-                    || msg.contains("timed out") =>
+                    || msg.starts_with("LLM response decode failed") =>
             {
                 SummaryFailureCode::Unreachable
             }
@@ -394,6 +398,27 @@ mod tests {
                 ),
                 SummaryFailureCode::Unreachable,
                 "did not respond in time",
+            ),
+            (
+                AlmsError::Runtime(
+                    "LLM response decode failed [provider=openrouter status=200 bytes_read=20]: \
+                     error decoding response body: connection reset by peer"
+                        .into(),
+                ),
+                SummaryFailureCode::Unreachable,
+                "could not reach OpenRouter",
+            ),
+            // A 200 whose body did not parse quotes up to 512 bytes of that
+            // body, which the provider or the model wrote. Words in it, such
+            // as "timed out" here, must not decide the code.
+            (
+                AlmsError::Runtime(
+                    "LLM response parse failed (OpenAI) [status=200]: missing field `created`; \
+                     body_prefix=\"{\\\"note\\\":\\\"the deploy timed out twice\\\"}\""
+                        .into(),
+                ),
+                SummaryFailureCode::UnusableOutput,
+                "did not return a usable summary",
             ),
             (
                 AlmsError::Runtime("LLM response parse failed: x".into()),
