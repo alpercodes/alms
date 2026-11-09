@@ -156,3 +156,23 @@ async fn an_agent_on_a_configured_provider_still_runs() {
 
     assert!(result.is_ok(), "a configured provider must not be rejected");
 }
+
+/// Telegram has no HTTP response to carry the refusal, so its loop logs and
+/// drops the message when this resolve fails; the prompt must go nowhere.
+#[tokio::test]
+async fn a_telegram_message_for_an_agent_on_an_unknown_provider_is_refused() {
+    let (state, llm, agent_id, _session_id) = boot_with_agent_on("removed-provider").await;
+    let gateway = state.gateway.lock().await;
+    let err = match gateway.resolve_telegram_run_config(agent_id) {
+        Ok(_) => panic!("Telegram must refuse an unconfigured provider"),
+        Err(e) => e,
+    };
+    assert!(
+        matches!(
+            err,
+            crate::configuration::ResolveAgentConfigError::UnknownProvider { .. }
+        ),
+        "got: {err}"
+    );
+    assert_eq!(llm.calls(), 0);
+}

@@ -520,11 +520,9 @@ pub(crate) fn apply_update_request(
     }
 
     if let Some(provider) = req.provider {
-        agent.provider = if provider.is_empty() {
-            None
-        } else {
-            Some(provider)
-        };
+        // Trimmed like `POST /agents`, so `" gemini "` and `"   "` get the
+        // same answer from both (#172).
+        agent.provider = normalize_optional_override(Some(&provider));
     }
 
     if let Some(telegram_token) = req.telegram_token {
@@ -1185,7 +1183,12 @@ pub async fn update_agent(
 
     // Only a name this request sets: an agent left on a removed provider must
     // stay editable, and an empty string clears the override.
-    if let Some(p) = req.provider.as_deref().filter(|p| !p.is_empty()) {
+    if let Some(p) = req
+        .provider
+        .as_deref()
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+    {
         validate_provider_override(&state, p)?;
     }
 
@@ -2782,6 +2785,32 @@ mod tests {
         .expect("an empty string must still clear the override");
         let stored = store.load_agent_by_name("stale").unwrap().unwrap();
         assert_eq!(stored.provider, None);
+    }
+
+    /// `PUT` trims `provider` as `POST` does, so the same value gets the same
+    /// answer: `" gemini "` stores `gemini`, and blanks clear the override.
+    #[tokio::test]
+    async fn put_agents_trims_the_provider_like_post() {
+        let state = agents_test_app_state_with_sqlite();
+        let store = state.session_manager.store().expect("sqlite store");
+        let mut agent = new_agent("trimmed");
+        agent.provider = Some("openai".into());
+        store.create_agent(&agent).unwrap();
+
+        for (sent, stored) in [(" gemini ", Some("gemini")), ("   ", None)] {
+            let _ = update_agent(
+                axum::extract::State(state.clone()),
+                axum::extract::Path("trimmed".to_string()),
+                Json(alms_core::UpdateAgentRequest {
+                    provider: Some(sent.into()),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap_or_else(|(status, body)| panic!("{sent:?}: {status} {:?}", body.0));
+            let record = store.load_agent_by_name("trimmed").unwrap().unwrap();
+            assert_eq!(record.provider.as_deref(), stored, "sent {sent:?}");
+        }
     }
 
     #[tokio::test]
