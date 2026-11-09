@@ -973,10 +973,69 @@ pub(crate) fn agent_config(store: &SqliteStore, opts: AgentConfigOpts<'_>) -> an
     Ok(())
 }
 
+/// Warn on stderr when an agent was just saved with a `provider` the config
+/// this command loaded has no entry for (#172).
+///
+/// The CLI writes the registry directly, so the gateway's
+/// `422 UNKNOWN_PROVIDER` check never runs. It warns rather than refuses
+/// because the gateway may load a different `alms.toml` than this command
+/// did. `stored` is the value written to the record: `None` when the
+/// command left or cleared the override.
+pub(crate) fn warn_if_provider_unconfigured(
+    stored: Option<&str>,
+    providers: &std::collections::BTreeMap<String, alms_core::config::ProviderEntry>,
+    err: &mut impl std::io::Write,
+) {
+    let Some(provider) = stored else { return };
+    if alms_core::config::is_known_provider(provider, providers) {
+        return;
+    }
+    let known: Vec<&str> = providers.keys().map(String::as_str).collect();
+    let _ = writeln!(
+        err,
+        "Warning: provider '{provider}' is not configured in the alms.toml this command \
+         loaded — known providers: {known:?}. A gateway using that config refuses this \
+         agent's runs (400 AGENT_PROVIDER_NOT_CONFIGURED) until an \
+         `[llm.providers.{provider}]` entry is added or the provider is changed. The \
+         agent was saved anyway, because the gateway may load a different alms.toml."
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::helpers::{make_agent, new_store, resolve_agent};
+
+    fn warning_for(stored: Option<&str>) -> String {
+        let mut providers = std::collections::BTreeMap::new();
+        providers.insert(
+            "mylab".to_string(),
+            alms_core::config::ProviderEntry::default(),
+        );
+        let mut err = Vec::new();
+        warn_if_provider_unconfigured(stored, &providers, &mut err);
+        String::from_utf8(err).unwrap()
+    }
+
+    /// #172: the CLI cannot refuse a name the gateway's config may define,
+    /// but it must not save one its own config lacks without saying so.
+    #[test]
+    fn an_unconfigured_provider_gets_a_stderr_warning() {
+        let warning = warning_for(Some("nope"));
+        assert!(warning.starts_with("Warning: provider 'nope' is not configured"));
+        assert!(
+            warning.contains("AGENT_PROVIDER_NOT_CONFIGURED"),
+            "{warning}"
+        );
+        assert!(warning.contains("different alms.toml"), "{warning}");
+    }
+
+    #[test]
+    fn a_configured_builtin_or_absent_provider_gets_no_warning() {
+        for stored in [Some("mylab"), Some("gemini"), None] {
+            assert_eq!(warning_for(stored), "", "{stored:?}");
+        }
+    }
 
     #[test]
     fn test_create_list_show_delete_roundtrip() {
