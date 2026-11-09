@@ -58,10 +58,10 @@ Each item below changes behaviour for a deployment that has not set the knob exp
 
   A summary that fails now says so in the UI: a banner at the top of the session names the
   provider and the way out (a different summary provider or model in Settings, or the
-  provider's key where a key is the problem). It does not fail the run or enter the
-  model's context, shows once rather than after every run, and clears when a summary next
-  succeeds or when you change the summary pair or add that provider's key. New `summary_status` SSE event on
-  `GET /sessions/{id}/events` (`docs/api.md`).
+  provider's key where a key is the problem). It does not fail the run or enter the model's
+  context, shows once rather than after every run, and clears when a summary next succeeds
+  or when you change the summary pair or add that provider's key. New `summary_status` SSE
+  event on `GET /sessions/{id}/events` (`docs/api.md`).
 
   **A summary is no longer sent to a provider that needs a key it does not have.** Before,
   an agent with no OpenRouter key sent the conversation to `openrouter.ai` after every run
