@@ -345,6 +345,9 @@ pub struct Coordinator {
     /// (no name) are never listed by construction, so they always pick up
     /// the project-root sandbox.
     security_config: alms_core::config::SecurityConfig,
+    /// The gateway's shutdown token, handed to each subagent's runtime so a
+    /// subagent stopped by shutdown doesn't record a user's cancel.
+    shutdown_token: Option<CancellationToken>,
 }
 
 impl Coordinator {
@@ -364,6 +367,7 @@ impl Coordinator {
             run_registrar: None,
             subagent_self_sink: None,
             security_config: alms_core::config::SecurityConfig::default(),
+            shutdown_token: None,
         }
     }
 
@@ -419,6 +423,7 @@ impl Coordinator {
             run_registrar: None,
             subagent_self_sink: None,
             security_config: alms_core::config::SecurityConfig::default(),
+            shutdown_token: None,
         }
     }
 
@@ -502,6 +507,12 @@ impl Coordinator {
         security_config: alms_core::config::SecurityConfig,
     ) -> Self {
         self.security_config = security_config;
+        self
+    }
+
+    /// Set the gateway's shutdown token. See [`AgentRuntime::with_shutdown_token`].
+    pub fn with_shutdown_token(mut self, token: CancellationToken) -> Self {
+        self.shutdown_token = Some(token);
         self
     }
 
@@ -737,6 +748,7 @@ impl Coordinator {
         let run_registrar = self.run_registrar.clone();
         let subagent_self_sink = self.subagent_self_sink.clone();
         let security_config = self.security_config.clone();
+        let shutdown_token = self.shutdown_token.clone();
 
         // Move identity values into the spawned task — `run_subagent` and
         // `run_agent_loop` use these instead of re-deriving so the entire
@@ -769,6 +781,7 @@ impl Coordinator {
                     subagent_prompts,
                     completion_tx,
                     child_cancel_token,
+                    shutdown_token,
                     secrets,
                     run_registrar,
                     subagent_self_sink,
@@ -1188,6 +1201,7 @@ async fn run_subagent(
     // (child of the parent run's token when present) and shared with the
     // `SubagentHandle` so `cancel_subagent_by_session` can fire it.
     child_cancel_token: CancellationToken,
+    shutdown_token: Option<CancellationToken>,
     secrets: Option<Arc<parking_lot::RwLock<alms_core::secrets::SecretsStore>>>,
     run_registrar: Option<Arc<dyn RunRegistrar>>,
     subagent_self_sink: Option<Arc<dyn SubagentSelfEventSink>>,
@@ -1373,7 +1387,7 @@ async fn run_subagent(
                 );
                 (TaskStatus::Cancelled, serde_json::json!({"cancelled": true}), None, None, None)
             }
-            output = run_agent_loop(task_id, &request, sub_agent_id, &sub_context_id, &session_manager, &llm, parent_event_tx, self_event_fwd, &base_agent_config, workspace_dir.as_deref(), data_dir.as_deref(), project_root.as_deref(), &subagent_prompts, child_cancel_token.clone(), secrets.as_ref(), &security_config, is_background, subagents.clone()) => {
+            output = run_agent_loop(task_id, &request, sub_agent_id, &sub_context_id, &session_manager, &llm, parent_event_tx, self_event_fwd, &base_agent_config, workspace_dir.as_deref(), data_dir.as_deref(), project_root.as_deref(), &subagent_prompts, child_cancel_token.clone(), shutdown_token, secrets.as_ref(), &security_config, is_background, subagents.clone()) => {
                 match output {
                     Ok(run_output) => {
                         info!(
@@ -2012,6 +2026,7 @@ async fn run_agent_loop(
     project_root: Option<&std::path::Path>,
     subagent_prompts: &DashMap<String, String>,
     cancel_token: CancellationToken,
+    shutdown_token: Option<CancellationToken>,
     secrets: Option<&Arc<parking_lot::RwLock<alms_core::secrets::SecretsStore>>>,
     security_config: &alms_core::config::SecurityConfig,
     is_background: bool,
@@ -2191,7 +2206,13 @@ async fn run_agent_loop(
 
     let mut runtime = AgentRuntime::new(agent_id, config, subagent_llm)?
         .with_event_sender(sub_tx)
-        .with_cancel_token(cancel_token);
+        .with_cancel_token(cancel_token)
+        // Nothing routes a subagent's approval request to a person: the relay
+        // below denies it, or the dropped sender reads as a denial.
+        .with_unroutable_approvals();
+    if let Some(token) = shutdown_token {
+        runtime = runtime.with_shutdown_token(token);
+    }
 
     if let Some(summary_client) = summary_llm_for_subagent {
         runtime = runtime.with_summary_llm(summary_client);
@@ -4397,6 +4418,7 @@ mod tests {
             &prompts,
             cancel_token,
             None,
+            None,
             &alms_core::config::SecurityConfig::default(),
             false,
             Arc::new(DashMap::new()),
@@ -4418,6 +4440,73 @@ mod tests {
             TaskStatus::Cancelled,
             "run_subagent's Err handler must label this outcome Cancelled, not Failed"
         );
+    }
+
+    /// What a subagent's session records when the loop sees the cancel itself:
+    /// a shutdown must not read as a user's cancel, and a cancel without one
+    /// must keep reading as a user's.
+    #[tokio::test]
+    async fn test_loop_observed_cancel_records_who_cancelled() {
+        for (shutdown_fired, expected) in [
+            (true, "[Run interrupted by gateway shutdown]"),
+            (false, "[Run cancelled by user]"),
+        ] {
+            let session_manager =
+                Arc::new(SessionManager::new(alms_session::SessionConfig::default()));
+            let llm = LlmClient::new(LlmConfig {
+                mock: true,
+                ..LlmConfig::default()
+            })
+            .unwrap();
+            let task_id = TaskId::new();
+            let request = SubagentRequest {
+                task: "cancelled before the loop starts".to_string(),
+                parent_session: test_session_id(),
+                parent_agent_id: test_parent_agent_id(),
+                parent_run_id: None,
+                subagent_name: None,
+                parent_tool_invocation_id: None,
+            };
+            let (sub_agent_id, sub_context_id) =
+                derive_subagent_identity(&session_manager, task_id, &request);
+            let cancel_token = CancellationToken::new();
+            cancel_token.cancel();
+            let shutdown_token = CancellationToken::new();
+            if shutdown_fired {
+                shutdown_token.cancel();
+            }
+
+            let _ = run_agent_loop(
+                task_id,
+                &request,
+                sub_agent_id,
+                &sub_context_id,
+                &session_manager,
+                &llm,
+                None,
+                None,
+                &AgentConfig::default(),
+                None,
+                None,
+                None,
+                &DashMap::new(),
+                cancel_token,
+                Some(shutdown_token),
+                None,
+                &alms_core::config::SecurityConfig::default(),
+                false,
+                Arc::new(DashMap::new()),
+            )
+            .await;
+
+            let session = session_manager.get_or_create(sub_agent_id, &sub_context_id);
+            let history = session_manager.get_history(session.id).unwrap();
+            let last = history.last().expect("the cancel leaves a record");
+            assert!(
+                matches!(&last.content, alms_session::Content::Text(t) if t == expected),
+                "shutdown_fired={shutdown_fired}: {history:?}"
+            );
+        }
     }
 
     // -- (e) #1150 — no implicit wall-clock run-kill arm ------------------------

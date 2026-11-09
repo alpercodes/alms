@@ -139,6 +139,16 @@ Each item below changes behaviour for a deployment that has not set the knob exp
   run already in progress keeps the key it started with for the rest of its turns and its
   post-run summary, as does a background subagent already running. Cancel them to stop
   sooner, and revoke a leaked key at the provider.
+- **An agent on a provider that is not configured no longer sends its prompt to the
+  server default's provider.** Its runs kept the default provider's URL and sent no key,
+  so an agent whose `[llm.providers.<name>]` entry was removed from `alms.toml`, or whose
+  `alms agent create --provider` named a typo, sent its conversation to the default
+  provider while `resolved_config` named the bad one. `POST` and `PUT /agents` now return
+  `422 UNKNOWN_PROVIDER`. A run on a stored bad name fails before any LLM call:
+  `POST /runs` returns `400 AGENT_PROVIDER_NOT_CONFIGURED`, named subagents and other runs
+  without a caller fail with the same reason, and a Telegram message is dropped with an
+  error in the log. **After upgrading**, change or clear such an agent's provider with
+  `PUT /agents/{id_or_name}` or `alms agent config <name> --provider ""`.
 
 ### Multi-agent and DM
 
@@ -148,15 +158,20 @@ Each item below changes behaviour for a deployment that has not set the knob exp
   after a DM ends can no longer message the peer whose conversation just closed.
   The record waits on the agent's run queue, so it can no longer land between a running
   turn's tool call and its result. A history split that way was rejected by providers on
-  every later turn. A DM cut short by stopping the gateway leaves no record.
-- An agent can no longer be saved with a provider that is not configured, and one already
-  stored that way no longer runs. Before, its prompt went to the server default's URL with
-  no key, while `resolved_config` named the bad provider. `POST` and `PUT /agents` now
-  return `422 UNKNOWN_PROVIDER`. A run on a stored bad name, including one left by removing
-  an entry from `alms.toml` or set with `alms agent create --provider`, fails before any LLM
-  call: `POST /runs` returns `400 AGENT_PROVIDER_NOT_CONFIGURED`, and named subagents,
-  Telegram messages and other runs without a caller report the same reason. **After
-  upgrading**, change or clear such an agent's provider with `PUT /agents/{id_or_name}`.
+  every later turn. A DM cut short by stopping the gateway leaves no such record.
+- Stopping the gateway no longer says a user cancelled the runs it stopped. Each run it
+  stops mid-flight, DM or not, now records `[Run interrupted by gateway shutdown]` in
+  place of `[Run cancelled by user]`, and that is what the agent sees in its context
+  after the restart. A DM end that shutdown still manages to write has reason `errored`
+  and the detail `the gateway shut down`, not `user_cancelled`, unless a user had already
+  stopped that run. Rows written by earlier versions are left as they are.
+- A guarded subagent whose tool call needed approval no longer says a user denied the
+  call or cancelled the run. Nothing routes a subagent's approval request to a person, so
+  the call is denied automatically and the run stops. The run now records
+  `[Run stopped: tool approval could not be requested]`. The tool result the model reads
+  is `{"approval_unavailable": true, ...}` with a message saying no one could be asked,
+  in place of `user_denied` and "The user denied this tool call", and the audit row reads
+  `denied automatically` in place of `denied by user`. A person's denial is unchanged.
 - A cancelled or failed DM no longer starts a run on the recipient's session.
 - Agent-to-agent tool descriptions now state which relationship each tool creates and no
   longer teach agents to poll.

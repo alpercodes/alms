@@ -283,3 +283,38 @@ async fn test_reasoning_persisted_reload_roundtrip() {
         "reasoning text must survive persistence round-trip"
     );
 }
+
+/// Which cause a cancelled run records. A runtime that can't route approvals
+/// still records a user's cancel until a denial actually happens, since a
+/// parent's Stop reaches it too.
+#[test]
+fn cancellation_record_names_the_cause() {
+    let runtime = || {
+        let llm = LlmClient::new(LlmConfig {
+            mock: true,
+            ..LlmConfig::default()
+        })
+        .unwrap();
+        AgentRuntime::new(AgentId::new(), AgentConfig::default(), llm).unwrap()
+    };
+    const USER: &str = "[Run cancelled by user]";
+    const SHUTDOWN: &str = "[Run interrupted by gateway shutdown]";
+    const DENIED: &str = "[Run stopped: tool approval could not be requested]";
+
+    assert_eq!(runtime().cancellation_record(), USER);
+
+    let unroutable = runtime().with_unroutable_approvals();
+    assert_eq!(unroutable.cancellation_record(), USER);
+    unroutable
+        .unroutable_approval_denied
+        .as_ref()
+        .unwrap()
+        .cancel();
+    assert_eq!(unroutable.cancellation_record(), DENIED);
+
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    let during_shutdown = unroutable.with_shutdown_token(shutdown.clone());
+    assert_eq!(during_shutdown.cancellation_record(), DENIED);
+    shutdown.cancel();
+    assert_eq!(during_shutdown.cancellation_record(), SHUTDOWN);
+}
