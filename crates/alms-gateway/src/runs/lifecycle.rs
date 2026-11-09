@@ -1647,6 +1647,15 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
             // for sessions whose indicator was never lit) and matches
             // the pre-#1046 behaviour.
             let mut failure_message = e.to_string();
+            // #172: name the failure explicitly, as the #919 budget path
+            // does, rather than let `classify_error` guess a code from a
+            // message that embeds an operator-chosen provider name.
+            let mut error_code = match &e {
+                ResolveAgentConfigError::UnknownProvider { .. } => {
+                    Some("AGENT_PROVIDER_NOT_CONFIGURED")
+                }
+                ResolveAgentConfigError::MissingModelAfterProviderSwitch { .. } => None,
+            };
             let (_failed_transitioned, emit_failure) = match state
                 .run_manager
                 .try_mark_run_as_failed(run_id, failure_message.clone())
@@ -1654,18 +1663,19 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
                 Ok(transitioned) => (transitioned, transitioned),
                 Err(error) => {
                     failure_message = format!("Run failure could not be persisted: {error}");
+                    error_code = None;
                     (false, true)
                 }
             };
 
             if emit_failure {
+                let event = match error_code {
+                    Some(code) => SseEventData::run_error_with_code(run_id, code, &failure_message),
+                    None => SseEventData::run_error(run_id, &failure_message),
+                };
                 state
                     .run_manager
-                    .send_event(
-                        run_id,
-                        session_id,
-                        SseEventData::run_error(run_id, &failure_message),
-                    )
+                    .send_event(run_id, session_id, event)
                     .await;
             }
             state

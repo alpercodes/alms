@@ -134,6 +134,18 @@ async fn a_non_http_run_on_an_unknown_provider_fails_and_sends_nothing() {
         error.contains("removed-provider") && error.contains("not configured"),
         "the run must say why it failed: {error}"
     );
+    let run_error = state
+        .run_manager
+        .events_from(run_id, 0)
+        .await
+        .into_iter()
+        .find(|event| event.event_type == "run_error")
+        .expect("the failure is published as run_error");
+    assert_eq!(
+        run_error.data["error"]["code"], "AGENT_PROVIDER_NOT_CONFIGURED",
+        "the code must not be guessed from the message: {:?}",
+        run_error.data
+    );
 }
 
 /// The rejection is about names nothing can route, not about pinning: a run
