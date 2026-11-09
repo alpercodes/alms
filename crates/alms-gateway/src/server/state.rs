@@ -517,6 +517,20 @@ impl AppState {
                 ),
             }
         }
+        // The server-level summary provider, after any `settings.json`
+        // override above, is checked the same way.
+        if let Some(p) = agent_config_val.context_config.summary_provider.as_deref()
+            && !alms_core::config::is_known_provider(p, &llm_config.providers)
+        {
+            tracing::warn!(
+                target: "alms.config",
+                summary_provider = %p,
+                "[context].summary_provider names a provider with no [llm.providers] \
+                 entry; summaries cannot use that provider until it is changed or \
+                 cleared (in alms.toml, or with PATCH /settings if settings.json \
+                 sets it)"
+            );
+        }
 
         // Create the shared agent config Arc *once* — both the Coordinator and
         // AppState reference the same lock so PATCH /settings updates propagate.

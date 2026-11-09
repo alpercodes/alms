@@ -268,3 +268,68 @@ async fn boot_warns_about_agents_on_unconfigured_providers() {
         "only the stranded agents are named:\n{captured}"
     );
 }
+
+/// The WARNs about a server-level `[context].summary_provider`, from booting
+/// with `alms.toml`'s pair set to `toml_pair` and `settings_json` written.
+fn server_summary_warnings(
+    toml_pair: Option<(&str, &str)>,
+    settings_json: Option<&str>,
+) -> Vec<String> {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    if let Some(json) = settings_json {
+        std::fs::write(crate::settings::settings_path(tmp.path()), json).expect("settings.json");
+    }
+    let mut providers = std::collections::BTreeMap::new();
+    providers.insert(
+        "mylab".to_string(),
+        alms_core::config::ProviderEntry::default(),
+    );
+    let captured = alms_test_support::capture_events(tracing::Level::WARN, || {
+        let mut builder =
+            TestAppState::new()
+                .data_dir(tmp.path())
+                .llm_config(alms_runtime::LlmConfig {
+                    mock: true,
+                    providers,
+                    ..alms_runtime::LlmConfig::default()
+                });
+        if let Some((provider, model)) = toml_pair {
+            builder = builder.summary_pair(provider, model);
+        }
+        let _state = builder.build();
+    });
+    captured
+        .at_target("alms.config")
+        .filter(|e| e.has_field("summary_provider") && !e.has_field("agent"))
+        .map(|e| e.field("summary_provider").unwrap_or_default().to_string())
+        .collect()
+}
+
+/// #172: a removed entry the server-level summary pair names is reported at
+/// boot too, whether the pair came from `alms.toml` or `settings.json`.
+#[tokio::test]
+async fn boot_warns_about_a_server_summary_provider_with_no_entry() {
+    assert_eq!(
+        server_summary_warnings(Some(("gone", "m")), None),
+        vec!["gone".to_string()],
+        "from alms.toml"
+    );
+    assert_eq!(
+        server_summary_warnings(
+            Some(("mylab", "m")),
+            Some(r#"{"context":{"summary_provider":"removed","summary_model":"m"}}"#),
+        ),
+        vec!["removed".to_string()],
+        "settings.json overrides alms.toml, and is what the check sees"
+    );
+    for (pair, case) in [
+        (Some(("mylab", "m")), "a declared entry"),
+        (Some(("gemini", "m")), "a built-in"),
+        (None, "no summary pair"),
+    ] {
+        assert!(
+            server_summary_warnings(pair, None).is_empty(),
+            "no WARN for {case}"
+        );
+    }
+}
