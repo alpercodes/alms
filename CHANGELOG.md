@@ -490,6 +490,22 @@ one.
   two minors up. The 4.5 and 4.6 soundness changes were checked against the schemas, and a
   22-case differential is identical across the two versions (see `docs/frontend.md`).
   v0.2.3 has no `zod`. No operator action. Rebuilt into the same `static/ui-dist/` bundle.
+- `rusqlite` 0.32.1 -> 0.41.1 (with `libsqlite3-sys` 0.30.1 -> 0.39.1, bundled SQLite
+  3.46.0 -> 3.54.1) to clear RUSTSEC-2026-0459 (medium; CVE-2026-119375): SQLite before
+  3.54.0 can return uninitialised page-cache memory when a database is opened beside a
+  `-wal` file with a different page size, so a crafted pair can leak process memory into
+  query results. The bundled SQLite is in every binary, and the code is reached: ALMS
+  opens its database with WAL. Exploiting it needs someone who can write a `-wal` file
+  into the data directory, beside the database. `openssl` 0.10.75 -> 0.10.82 (with
+  `openssl-sys` 0.9.111 -> 0.9.118) clears RUSTSEC-2026-0463, an out-of-bounds write in
+  `openssl::aes::unwrap_key`. OpenSSL is built for reqwest's `native-tls` backend, but
+  nothing calls `aes::unwrap_key`: not ALMS, `native-tls`, `tokio-native-tls` or
+  `hyper-tls`. v0.2.3 carries rusqlite 0.32.1 and openssl 0.10.75, both in range. The
+  rusqlite bump spans nine minors and needs no code change. The persistence and migration
+  suites pass unchanged. One manifest line changes (`crates/alms-session`), plus the
+  lockfile. The lockfile also gains `hashlink` 0.12.2 and `hashbrown` 0.17.1, and
+  wasm32-only `sqlite-wasm-rs` / `rsqlite-vfs` edges that no ALMS build compiles. No
+  operator action: existing databases open as before.
 
 ## v0.2.3 — released (tag `v0.2.3`)
 
