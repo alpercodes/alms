@@ -188,3 +188,83 @@ async fn a_telegram_message_for_an_agent_on_an_unknown_provider_is_refused() {
     );
     assert_eq!(llm.calls(), 0);
 }
+
+/// An operator who removes or renames a `[llm.providers]` entry learns at
+/// boot which agents it stranded, not at each one's first run.
+#[tokio::test]
+async fn boot_warns_about_agents_on_unconfigured_providers() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let db = tmp.path().join("alms.db");
+    let db = db.to_str().expect("utf-8 path");
+    let mut providers = std::collections::BTreeMap::new();
+    providers.insert(
+        "mylab".to_string(),
+        alms_core::config::ProviderEntry::default(),
+    );
+    let llm_config = alms_runtime::LlmConfig {
+        mock: true,
+        providers,
+        ..alms_runtime::LlmConfig::default()
+    };
+
+    let seeded = TestAppState::new()
+        .db_path(db)
+        .data_dir(tmp.path())
+        .llm_config(llm_config.clone())
+        .build();
+    let store = seeded.session_manager.store().expect("sqlite store");
+    for record in [
+        AgentRecord {
+            provider: Some("mylab".to_string()),
+            ..AgentRecord::for_test("on-mylab")
+        },
+        AgentRecord {
+            provider: Some("gemini".to_string()),
+            ..AgentRecord::for_test("on-builtin")
+        },
+        AgentRecord {
+            provider: Some("removed".to_string()),
+            ..AgentRecord::for_test("on-removed")
+        },
+        AgentRecord {
+            summary_provider: Some("gone".to_string()),
+            summary_model: Some("m".to_string()),
+            ..AgentRecord::for_test("summary-on-gone")
+        },
+    ] {
+        store.create_agent(&record).expect("seed the agent");
+    }
+    drop(seeded);
+
+    let captured = alms_test_support::capture_events(tracing::Level::WARN, || {
+        let _rebooted = TestAppState::new()
+            .db_path(db)
+            .data_dir(tmp.path())
+            .llm_config(llm_config)
+            .build();
+    });
+
+    let warned: Vec<(String, Option<String>, Option<String>)> = captured
+        .at_target("alms.config")
+        .filter(|e| e.has_field("agent"))
+        .map(|e| {
+            (
+                e.field("agent").unwrap_or_default().to_string(),
+                e.field("provider").map(str::to_string),
+                e.field("summary_provider").map(str::to_string),
+            )
+        })
+        .collect();
+    assert_eq!(
+        warned,
+        vec![
+            ("on-removed".to_string(), Some("removed".to_string()), None),
+            (
+                "summary-on-gone".to_string(),
+                None,
+                Some("gone".to_string())
+            ),
+        ],
+        "only the stranded agents are named:\n{captured}"
+    );
+}

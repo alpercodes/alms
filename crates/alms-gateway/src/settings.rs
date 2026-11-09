@@ -1009,16 +1009,10 @@ pub async fn patch_settings(
             None
         }
         Some(provider) if !state.llm_config.providers.contains_key(provider) => {
-            let mut known: Vec<&str> = state
-                .llm_config
-                .providers
-                .keys()
-                .map(|s| s.as_str())
-                .collect();
-            known.sort();
-            pair_errors.push(format!(
-                "provider '{provider}' is not configured — known providers: {known:?}. \
-                 Add an `[llm.providers.{provider}]` entry to alms.toml first."
+            // Same wording as the agent API's `422 UNKNOWN_PROVIDER` (#172).
+            pair_errors.push(alms_core::config::unknown_provider_message(
+                provider,
+                &state.llm_config.providers,
             ));
             None
         }
