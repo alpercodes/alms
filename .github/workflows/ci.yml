@@ -76,7 +76,7 @@ jobs:
       # their comments are checked too. Allowing private_intra_doc_links keeps
       # public docs free to cite private items: ALMS isn't published to docs.rs,
       # and those links still have to resolve here.
-      run: cargo doc --workspace --no-deps --document-private-items
+      run: cargo doc --workspace --no-deps --document-private-items --all-features
       env:
         RUSTDOCFLAGS: -D warnings -A rustdoc::private_intra_doc_links
 

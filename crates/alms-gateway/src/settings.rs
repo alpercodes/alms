@@ -1352,29 +1352,6 @@ fn reject_model_incompatible_with_provider(
     ))
 }
 
-// ── Security-knob rejection (#947) ────────────────────────────────────
-
-/// Inspect a raw `PATCH /settings` body for any reference to the
-/// `[security]` section.
-///
-/// Returns `Some(message)` when the payload contains a `security` key at
-/// the top level — including `{ "security": {} }`, `{ "security": null }`,
-/// and `{ "security": { "allow_full_os_access": [...] } }`. The caller
-/// translates that into a `400 SECURITY_KNOB_NOT_PATCHABLE` response.
-///
-/// Empty / `null` payloads are explicitly rejected because permitting
-/// them would create a back door: a future PATCH evolution that adds
-/// `security` as a real serde field would silently start accepting the
-/// shape that previously round-tripped to a no-op. Failing closed at the
-/// raw-JSON layer is the same defensive posture Tim asked for on the
-/// `classifier_overrides` rejection in #745.
-///
-/// Returns `None` when the payload does NOT reference `security` at the
-/// top level — the normal happy path. Nested objects whose name happens
-/// to be `security` (e.g. `{ "tools": { "security": ... } }`) are
-/// ignored on purpose: this guard is about the top-level
-/// `security` key, not arbitrary key
-/// matches.
 /// #869: reject deprecated `context.recent_window` / `context.summary_interval`
 /// fields on the PATCH wire. The TOML loader is soft (one-time WARN) because
 /// operators editing config files don't read 4xx responses; the HTTP
@@ -1730,6 +1707,28 @@ fn validate_patch_budget(
     }
 }
 
+// ── Security-knob rejection (#947) ────────────────────────────────────
+
+/// Inspect a raw `PATCH /settings` body for any reference to the
+/// `[security]` section.
+///
+/// Returns `Some(message)` when the payload contains a `security` key at
+/// the top level — including `{ "security": {} }`, `{ "security": null }`,
+/// and `{ "security": { "allow_full_os_access": [...] } }`. The caller
+/// translates that into a `400 SECURITY_KNOB_NOT_PATCHABLE` response.
+///
+/// Empty / `null` payloads are explicitly rejected because permitting
+/// them would create a back door: a future PATCH evolution that adds
+/// `security` as a real serde field would silently start accepting the
+/// shape that previously round-tripped to a no-op. Failing closed at the
+/// raw-JSON layer is the same defensive posture Tim asked for on the
+/// `classifier_overrides` rejection in #745.
+///
+/// Returns `None` when the payload does NOT reference `security` at the
+/// top level — the normal happy path. Nested objects whose name happens
+/// to be `security` (e.g. `{ "tools": { "security": ... } }`) are
+/// ignored on purpose: this guard is about the top-level `security` key,
+/// not arbitrary key matches.
 fn reject_security_knob(body: &serde_json::Value) -> Option<String> {
     let obj = body.as_object()?;
     if !obj.contains_key("security") {

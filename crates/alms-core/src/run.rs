@@ -29,7 +29,7 @@ use uuid::Uuid;
 /// starting a run, never per-run.
 ///
 /// All fields snapshot the **effective** value: the post-layering result,
-/// not the raw per-run override. `provider` and `model` come from the
+/// not the raw per-agent override. `provider` and `model` come from the
 /// resolved `alms_runtime::AgentConfig`'s LLM client (`provider()` /
 /// `default_model()`); the remaining fields come from the resolved
 /// `alms_runtime::AgentConfig` itself.

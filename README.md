@@ -185,7 +185,8 @@ See [`docs/architecture.md`](docs/architecture.md) for the full design, and
 ## Development
 
 ```bash
-make ci            # fmt-check + clippy + test + build-release
+make ci            # frontend-check + fmt-check + clippy + doc + test + build-release
+make doc           # rustdoc with warnings denied, private items included (CI's doc check)
 make test          # cargo test --all
 npm ci && npm run ui:check
 npm run ui:build   # rebuild the committed frontend assets

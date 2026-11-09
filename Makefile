@@ -22,7 +22,7 @@ clippy:
 # Keep in step with the "Check documentation" step in .github/workflows/ci.yml.
 doc:
 	@echo "==> Checking documentation"
-	RUSTDOCFLAGS="-D warnings -A rustdoc::private_intra_doc_links" cargo doc --workspace --no-deps --document-private-items
+	RUSTDOCFLAGS="-D warnings -A rustdoc::private_intra_doc_links" cargo doc --workspace --no-deps --document-private-items --all-features
 
 # Run all tests
 test:
