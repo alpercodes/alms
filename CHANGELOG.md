@@ -6,6 +6,8 @@ the git history.
 
 ## v0.2.4 — unreleased (`develop`)
 
+⚠️ **Downgrading:** don't run v0.2.3 against a database v0.2.4 has opened, or cancel completed one-shot jobs first: v0.2.3 reads the new `completed` job status as `Pending` and runs those jobs again.
+
 ### ⚠️ Default changes — read before upgrading
 
 Each item below changes behaviour for a deployment that has not set the knob explicitly.
@@ -495,17 +497,37 @@ one.
   3.54.0 can return uninitialised page-cache memory when a database is opened beside a
   `-wal` file with a different page size, so a crafted pair can leak process memory into
   query results. The bundled SQLite is in every binary, and the code is reached: ALMS
-  opens its database with WAL. Exploiting it needs someone who can write a `-wal` file
-  into the data directory, beside the database. `openssl` 0.10.75 -> 0.10.82 (with
-  `openssl-sys` 0.9.111 -> 0.9.118) clears RUSTSEC-2026-0463, an out-of-bounds write in
-  `openssl::aes::unwrap_key`. OpenSSL is built for reqwest's `native-tls` backend, but
-  nothing calls `aes::unwrap_key`: not ALMS, `native-tls`, `tokio-native-tls` or
-  `hyper-tls`. v0.2.3 carries rusqlite 0.32.1 and openssl 0.10.75, both in range. The
-  rusqlite bump spans nine minors and needs no code change. The persistence and migration
-  suites pass unchanged. One manifest line changes (`crates/alms-session`), plus the
-  lockfile. The lockfile also gains `hashlink` 0.12.2 and `hashbrown` 0.17.1, and
-  wasm32-only `sqlite-wasm-rs` / `rsqlite-vfs` edges that no ALMS build compiles. No
-  operator action: existing databases open as before.
+  opens its database with WAL. Exploiting it needs write access to the data directory
+  beside the database. In the default layout an agent's `shell` has that, since `./.alms`
+  is inside the project root, though that reach already allows worse
+  (`docs/security-model.md` § 8.1). The crafted pair is read when the gateway starts or a
+  CLI command such as `alms agent create` opens the database. The new SQLite also fixes
+  the WAL-reset corruption bug (fixed in 3.51.3, present since 3.7.0), which needs two
+  connections writing or checkpointing one WAL database at the same moment from different
+  processes or threads, as a CLI command that writes SQLite directly does beside a running
+  gateway. SQLite rates it rare. `openssl` 0.10.75 -> 0.10.82 (with `openssl-sys` 0.9.111
+  -> 0.9.118) clears RUSTSEC-2026-0463, an out-of-bounds write in
+  `openssl::aes::unwrap_key`. On Linux, OpenSSL is built for reqwest's `native-tls`
+  backend (macOS and Windows use Security.framework and SChannel), but nothing calls
+  `aes::unwrap_key`: not ALMS, `native-tls`, `tokio-native-tls` or `hyper-tls`.
+  `openssl-sys` 0.9.118 no longer builds against OpenSSL 1.0.2, so Linux source builds need
+  OpenSSL 1.1.0 or newer. v0.2.3 carries rusqlite 0.32.1 and openssl 0.10.75, both in
+  range. The rusqlite bump spans nine minors and needs no code change. The persistence and
+  migration suites pass unchanged. One manifest line changes (`crates/alms-session`), plus
+  the lockfile. It now turns off rusqlite's default features and names the two the
+  native build uses, `bundled` and `cache` (0.32's set). That keeps 0.41's wasm-only
+  default out of `Cargo.lock`, so `cargo audit` doesn't report crates no ALMS build
+  compiles. The lockfile also gains `hashlink` 0.12.2 and `hashbrown` 0.17.1. With the
+  `rustix` bump below, the re-resolve moves four Windows-only edges (`errno`, `rustix`,
+  `tempfile`, `winapi-util`) from `windows-sys` 0.60.2 to 0.52.0, already in the lockfile
+  for `ring`; no package is added. No operator action: existing databases open as before.
+- `rustix` 1.1.4 -> 1.1.6 to clear RUSTSEC-2026-0486 (unsound): `getxattr`, `lgetxattr`,
+  `fgetxattr`, `listxattr`, `llistxattr` and `flistxattr` given a zero-length buffer mark
+  bytes the kernel never wrote as initialised. rustix is in every binary, under `tempfile`,
+  `terminal_size` (clap), `uucore` (the shell builtins) and others, but nothing calls those
+  functions: `uucore`'s xattr code is behind its `fsxattr` feature, which ALMS does not
+  enable. v0.2.3 carries rustix 1.1.3, in range. No operator action. Lockfile-only; the
+  `windows-sys` edge moves are in the entry above.
 
 ## v0.2.3 — released (tag `v0.2.3`)
 
