@@ -12,7 +12,7 @@ use std::path::Path;
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
-const BROKEN_TOML: &str = "[tools]\nshell_policy = \"workspace_only\"\n\n[llm\n";
+const BROKEN_TOML: &str = "[tools]\nshell_policy = \"sandboxed\"\n\n[llm\n";
 
 fn alms(cwd: &Path, home: &Path, args: &[&str]) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_alms"));
