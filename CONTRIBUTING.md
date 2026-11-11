@@ -102,7 +102,7 @@ The CI pipeline (`.github/workflows/ci.yml`) runs:
 Step 3 only reads doc comments on items it documents. It does not check `#[cfg(test)]`
 items, files under `tests/`, or code gated to a platform other than the one building the
 docs. CI builds on Linux, so it checks the Landlock code, but `make doc` on macOS or
-Windows does not, and code gated to Windows or macOS only is checked nowhere.
+Windows does not, and CI never checks code gated to Windows or macOS only.
 
 Two more required checks, `Security audit (Rust)` and `Security audit (frontend)`, check
 `Cargo.lock` and `package-lock.json` against advisory databases. `make ci` does not run
