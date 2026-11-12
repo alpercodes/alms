@@ -510,7 +510,8 @@ one.
   (`Deriver::derive` / `PkeyCtxRef::derive` with OpenSSL 1.1.x), RUSTSEC-2026-0474
   (`X509Ref::ocsp_responders` can return invalid UTF-8), RUSTSEC-2026-0475
   (`MdCtxRef::digest_final`), RUSTSEC-2026-0476 and RUSTSEC-2026-0477 (AES key wrap with
-  padding in `cipher_update` and `cipher_update_inplace`), RUSTSEC-2026-0478 (PSK and cookie
+  padding in `cipher_update`, `cipher_update_vec`, `symm::Crypter::update` and
+  `cipher_update_inplace`), RUSTSEC-2026-0478 (PSK and cookie
   callback lengths) and RUSTSEC-2026-0479 (PEM password callback length). Their fixes are in
   0.10.78, 0.10.79 and 0.10.80. On Linux, OpenSSL is built for reqwest's `native-tls`
   backend (macOS and Windows use Security.framework and SChannel), but none of those APIs is
