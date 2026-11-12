@@ -142,6 +142,16 @@ pub enum RuntimeEvent {
         /// When set, this warning originated from a subagent (not the parent).
         source_agent: Option<String>,
     },
+    /// A compaction summary call finished: `None` when it produced a summary,
+    /// `Some` when it did not. Not emitted when compaction made no call.
+    ///
+    /// The gateway turns this into session state for the UI. It is not a
+    /// `Warning` because a warning is persisted into history once per emit,
+    /// and this repeats on every turn while the problem lasts.
+    SummaryStatus {
+        agent_id: alms_core::AgentId,
+        failure: Option<crate::summary_failure::SummaryFailure>,
+    },
     /// A subagent's session has just been created and the parent's
     /// `invoke_agent` tool call is now blocked waiting for it to finish.
     ///

@@ -676,6 +676,31 @@ impl Default for GeminiConfig {
     }
 }
 
+/// Whether an agent's `provider` override names something a run can route to:
+/// an entry in `providers`, or a built-in sugar name (`LlmClient` has hardcoded
+/// endpoints for those when a bare config has no entry).
+///
+/// Any other name has no endpoint, so a run on it must be refused (#172).
+pub fn is_known_provider(
+    name: &str,
+    providers: &std::collections::BTreeMap<String, ProviderEntry>,
+) -> bool {
+    providers.contains_key(name) || matches!(name, "openai" | "openrouter" | "anthropic" | "gemini")
+}
+
+/// The reason an agent's `provider` override is refused, naming what would be
+/// accepted. Shared by the agent API and the run-time rejections.
+pub fn unknown_provider_message(
+    name: &str,
+    providers: &std::collections::BTreeMap<String, ProviderEntry>,
+) -> String {
+    let known: Vec<&str> = providers.keys().map(String::as_str).collect();
+    format!(
+        "provider '{name}' is not configured — known providers: {known:?}. \
+         Add an `[llm.providers.{name}]` entry to alms.toml first, or use one of those."
+    )
+}
+
 impl LlmConfig {
     /// Populate [`providers`][Self::providers] with built-in sugar entries
     /// for `openai`, `openrouter`, `anthropic`, and `gemini` if the user has
@@ -693,7 +718,7 @@ impl LlmConfig {
             .entry("openrouter".to_string())
             .or_insert_with(|| ProviderEntry {
                 kind: ProviderKind::OpenAiCompatible,
-                base_url: "https://openrouter.ai/api/v1".into(),
+                base_url: builtin_base_url("openrouter").unwrap_or_default().into(),
                 api_key_env: None,
                 api_key: None,
                 model: None,
@@ -704,7 +729,7 @@ impl LlmConfig {
             .entry("openai".to_string())
             .or_insert_with(|| ProviderEntry {
                 kind: ProviderKind::OpenAiCompatible,
-                base_url: "https://api.openai.com/v1".into(),
+                base_url: builtin_base_url("openai").unwrap_or_default().into(),
                 api_key_env: None,
                 api_key: None,
                 model: None,
@@ -715,7 +740,7 @@ impl LlmConfig {
             .entry("anthropic".to_string())
             .or_insert_with(|| ProviderEntry {
                 kind: ProviderKind::Anthropic,
-                base_url: "https://api.anthropic.com/v1".into(),
+                base_url: builtin_base_url("anthropic").unwrap_or_default().into(),
                 api_key_env: None,
                 api_key: None,
                 model: None,
@@ -732,7 +757,7 @@ impl LlmConfig {
             .entry("gemini".to_string())
             .or_insert_with(|| ProviderEntry {
                 kind: ProviderKind::Gemini,
-                base_url: "https://generativelanguage.googleapis.com/v1beta".into(),
+                base_url: builtin_base_url("gemini").unwrap_or_default().into(),
                 api_key_env: None,
                 api_key: None,
                 model: None,
@@ -775,6 +800,48 @@ impl ProviderEntry {
         }
         None
     }
+}
+
+/// The hosted API a built-in provider slot points at out of the box. One
+/// table, read by [`LlmConfig::ensure_builtin_providers`] to build the slots
+/// and by [`provider_requires_api_key`] to tell a slot still on its hosted
+/// API from one re-pointed elsewhere. `None` for every other name, including
+/// `telegram`, which is a channel token rather than an LLM provider.
+pub fn builtin_base_url(name: &str) -> Option<&'static str> {
+    match name {
+        "openrouter" => Some("https://openrouter.ai/api/v1"),
+        "openai" => Some("https://api.openai.com/v1"),
+        "anthropic" => Some("https://api.anthropic.com/v1"),
+        "gemini" => Some("https://generativelanguage.googleapis.com/v1beta"),
+        _ => None,
+    }
+}
+
+/// Whether calls to the provider `name` need an API key to be worth sending.
+///
+/// The config has no explicit "needs no key" flag, so this reads the two
+/// things that do say a key is expected:
+///
+/// - `name` is a built-in slot (`openai`, `anthropic`, `openrouter`,
+///   `gemini`) still pointed at its hosted API ([`builtin_base_url`]). None of
+///   those answers without a key. A slot re-pointed elsewhere, by its own
+///   `base_url` or by `ALMS_LLM_BASE_URL`, is the operator's endpoint and is
+///   read like any other entry.
+/// - The `[llm.providers.<name>]` entry declares `api_key_env` or `api_key`,
+///   so its operator said a key goes with it, even if it does not resolve now.
+///
+/// Anything else is an endpoint declared without a key, which is how
+/// `docs/config.md` tells you to set up Ollama or LM Studio, and is treated
+/// as needing none. An entry that does need a key but declares none cannot be
+/// told apart from that; its calls go out and fail on the provider's 401.
+///
+/// With no entry (a bare `LlmConfig` with no providers map), a slot name is
+/// taken to be on its hosted API.
+pub fn provider_requires_api_key(name: &str, entry: Option<&ProviderEntry>) -> bool {
+    let declares_key = entry.is_some_and(|e| e.api_key_env.is_some() || e.api_key.is_some());
+    let hosted_slot = builtin_base_url(name)
+        .is_some_and(|stock| entry.is_none_or(|e| e.base_url.trim_end_matches('/') == stock));
+    hosted_slot || declares_key
 }
 
 /// Wire-format for a single `[llm.providers.<name>]` entry in `alms.toml`.

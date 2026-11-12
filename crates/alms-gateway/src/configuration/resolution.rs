@@ -74,6 +74,9 @@ pub(crate) enum ResolveEffectiveModelError {
         new_provider: String,
         prev_provider: String,
     },
+    /// The per-agent provider override names nothing a run can route to —
+    /// same shape as [`ResolveAgentConfigError::UnknownProvider`].
+    UnknownProvider { provider: String, message: String },
 }
 
 /// Mirrors [`resolve_agent_config`]'s per-agent model resolution from
@@ -112,6 +115,15 @@ pub(crate) fn resolve_effective_provider_and_model(
     server_default_model: &str,
     providers: &std::collections::BTreeMap<String, alms_core::config::ProviderEntry>,
 ) -> Result<(String, String), ResolveEffectiveModelError> {
+    if let Some(provider) = record_provider
+        && !alms_core::config::is_known_provider(provider, providers)
+    {
+        return Err(ResolveEffectiveModelError::UnknownProvider {
+            provider: provider.to_string(),
+            message: alms_core::config::unknown_provider_message(provider, providers),
+        });
+    }
+
     let prev_provider = server_provider.to_string();
     let effective_provider = record_provider
         .map(str::to_string)
@@ -173,12 +185,13 @@ pub(crate) struct ResolvedAgentConfig {
 
 /// Failure modes from [`resolve_agent_config`].
 ///
-/// Currently the only variant is [`Self::MissingModelAfterProviderSwitch`]
-/// (#863) — the structured replacement for the old `with_model("")`
-/// fail-fast that surfaced as an opaque downstream 4xx (e.g. Anthropic
-/// 404 on `model: ""`) at the upstream provider. Catching this at the
-/// gateway lets `POST /runs` reject the request with a clean
-/// `400 MISSING_MODEL_AFTER_PROVIDER_SWITCH` before any LLM call.
+/// [`Self::MissingModelAfterProviderSwitch`] (#863) is the structured
+/// replacement for the old `with_model("")` fail-fast that surfaced as an
+/// opaque downstream 4xx (e.g. Anthropic 404 on `model: ""`) at the upstream
+/// provider. Catching this at the gateway lets `POST /runs` reject the request
+/// with a clean `400 MISSING_MODEL_AFTER_PROVIDER_SWITCH` before any LLM call.
+/// [`Self::UnknownProvider`] (#172) does the same for a provider name that
+/// nothing can route to.
 #[derive(Debug, Clone)]
 pub(crate) enum ResolveAgentConfigError {
     /// A per-agent `provider` override switched the effective provider
@@ -197,6 +210,18 @@ pub(crate) enum ResolveAgentConfigError {
         new_provider: String,
         prev_provider: String,
     },
+    /// The agent record names a provider that is neither a configured entry
+    /// nor a built-in (#172). The API refuses such a name, but a record can
+    /// still hold one: `alms agent create` writes the registry directly, and
+    /// an entry can be removed from `alms.toml` after the agent was saved.
+    /// Running it anyway would send the prompt to the server default's URL
+    /// with no key, and report the bad name in `resolved_config`.
+    UnknownProvider {
+        agent_id: alms_core::AgentId,
+        provider: String,
+        /// From [`alms_core::config::unknown_provider_message`].
+        message: String,
+    },
 }
 
 impl std::fmt::Display for ResolveAgentConfigError {
@@ -212,6 +237,9 @@ impl std::fmt::Display for ResolveAgentConfigError {
                  model was supplied; previous provider {prev_provider}'s default \
                  cannot be reused"
             ),
+            Self::UnknownProvider {
+                agent_id, message, ..
+            } => write!(f, "agent {agent_id}: {message}"),
         }
     }
 }
@@ -403,6 +431,19 @@ pub(crate) fn resolve_agent_config(
                 prev_provider,
             });
         }
+        Err(ResolveEffectiveModelError::UnknownProvider { provider, message }) => {
+            warn!(
+                agent_id = %agent_id,
+                provider = %provider,
+                "Agent names a provider that is not configured -- rejecting before \
+                 any LLM call (#172)"
+            );
+            return Err(ResolveAgentConfigError::UnknownProvider {
+                agent_id,
+                provider,
+                message,
+            });
+        }
     };
 
     // Log the cross-namespace drop here for runtime observability — the
@@ -455,6 +496,13 @@ pub(crate) fn resolve_agent_config(
             );
             llm.with_provider(provider)
         };
+        if llm.missing_required_key() {
+            warn!(
+                agent_id = %agent_id,
+                provider = %provider,
+                "This agent's provider override has no API key; its LLM calls will be refused"
+            );
+        }
     } else if let Some(s) = secrets {
         // No per-agent provider override — re-resolve the key for the
         // server-default provider from the live secrets store.

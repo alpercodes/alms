@@ -31,8 +31,9 @@ pub use types::{
     FsEditConfig, GeminiConfig, LlmConfig, LoggingConfig, OpenAiConfig, ProviderEntry,
     ProviderKind, ProviderQuirks, ReasoningEffort, RunSummaryMode, SecurityConfig, ServerConfig,
     SessionConfig, ShellClassificationMode, ShellEngine, ShellPermissions, ShellSpillConfig,
-    ToolOutputTruncateConfig, ToolsConfig,
+    ToolOutputTruncateConfig, ToolsConfig, builtin_base_url, provider_requires_api_key,
 };
+pub use types::{is_known_provider, unknown_provider_message};
 
 use crate::{AlmsError, AlmsResult};
 use serde::{Deserialize, Serialize};

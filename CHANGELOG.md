@@ -6,6 +6,8 @@ the git history.
 
 ## v0.2.4 — unreleased (`develop`)
 
+⚠️ **Downgrading:** don't run v0.2.3 against a database v0.2.4 has opened. v0.2.3 reads the new `completed` and `failed` job statuses as `Pending`: a finished or failed one-shot job runs again as soon as v0.2.3 starts, and a failed recurring job resumes its schedule. v0.2.4 refuses to cancel a finished job (`409 JOB_TERMINAL`), so if you must go back, stop the gateway and first run `UPDATE jobs SET status = 'cancelled' WHERE status IN ('completed', 'failed');` against the database. v0.2.3 skips cancelled jobs, and they stay cancelled if you upgrade again.
+
 ### ⚠️ Default changes — read before upgrading
 
 Each item below changes behaviour for a deployment that has not set the knob explicitly.
@@ -65,9 +67,29 @@ Each item below changes behaviour for a deployment that has not set the knob exp
   ⚠️ **If your agents run on a non-OpenRouter provider** — Anthropic direct, for example —
   summarisation now needs a resolvable OpenRouter key (`alms auth set openrouter <key>`) or
   it fails. **To restore the old inherit-the-agent's-model behaviour**, clear *both* fields
-  together: `summary_model = ""` and `summary_provider = ""`. Setting only one is rejected
-  at boot. The empty string is the explicit-clear sentinel on all three surfaces — TOML,
-  `PATCH /settings`, and the persisted `settings.json` — so a clear survives a restart.
+  together: `summary_model = ""` and `summary_provider = ""`. Summaries then go where the
+  agent's own calls go, with the agent's key or with none when its provider needs none
+  (see below). Setting only one is rejected at boot. The empty string is the explicit-clear
+  sentinel on all three surfaces — TOML, `PATCH /settings`, and the persisted
+  `settings.json` — so a clear survives a restart.
+
+  A summary that fails now says so in the UI: a banner at the top of the session names the
+  provider and the way out (a different summary provider or model in Settings, or the
+  provider's key where a key is the problem). It does not fail the run or enter the model's
+  context, shows once rather than after every run, and clears when a summary next succeeds
+  or when you change the summary pair or add that provider's key. New `summary_status` SSE
+  event on `GET /sessions/{id}/events` (`docs/api.md`).
+
+  **A summary is no longer sent to a provider that needs a key it does not have.** Before,
+  an agent with no OpenRouter key sent the conversation to `openrouter.ai` after every run
+  with no auth header, to be refused. "Needs a key" means a built-in slot still on its
+  hosted URL, or an entry declaring `api_key_env` / `api_key`. A provider declared without a
+  key (a local Ollama or LM Studio entry, or a built-in slot such as `openai` re-pointed at a
+  local server with its own `base_url` or `ALMS_LLM_BASE_URL`) is unaffected, and can now
+  be chosen as the summary provider: `PATCH /settings` and the agent API used to refuse it
+  with `SUMMARY_PROVIDER_MISSING_API_KEY`. The per-run "Provider changed but no API key found —
+  clearing stale key" warning is gone; the callers that can act on a missing key log it in
+  their own words.
 
 - **`workspace_write`'s `mode` now defaults per file: `memories` appends, the other three
   replace.** Previously every file defaulted to `write`, so a call that omitted `mode`
@@ -154,6 +176,22 @@ Each item below changes behaviour for a deployment that has not set the knob exp
   run already in progress keeps the key it started with for the rest of its turns and its
   post-run summary, as does a background subagent already running. Cancel them to stop
   sooner, and revoke a leaked key at the provider.
+- **An agent on a provider that is not configured no longer sends its prompt to the
+  server default's provider.** Its runs kept the default provider's URL and sent no key,
+  so an agent whose `[llm.providers.<name>]` entry was removed from `alms.toml`, or whose
+  `alms agent create --provider` named a typo, sent its conversation to the default
+  provider while `resolved_config` named the bad one. `POST` and `PUT /agents` now return
+  `422 UNKNOWN_PROVIDER`. A run on a stored bad name fails before any LLM call:
+  `POST /runs` returns `400 AGENT_PROVIDER_NOT_CONFIGURED`, named subagents and other runs
+  without a caller fail with the same reason, and a Telegram message is dropped with an
+  error in the log. The gateway logs a WARN at startup naming each agent whose `provider`
+  or `summary_provider` has no entry, and a server-level `[context].summary_provider`
+  with none. `alms agent create --provider` and `alms agent config --provider` print a
+  warning on stderr for a name the CLI's own `alms.toml` lacks; they still save it, since
+  the gateway may load a different file. Both now trim the value and treat a blank one as
+  no override, so `alms agent create --provider ""` no longer stores a provider named `''`.
+  **After upgrading**, change or clear such an agent's provider with
+  `PUT /agents/{id_or_name}` or `alms agent config <name> --provider ""`.
 
 ### Multi-agent and DM
 
@@ -163,7 +201,20 @@ Each item below changes behaviour for a deployment that has not set the knob exp
   after a DM ends can no longer message the peer whose conversation just closed.
   The record waits on the agent's run queue, so it can no longer land between a running
   turn's tool call and its result. A history split that way was rejected by providers on
-  every later turn. A DM cut short by stopping the gateway leaves no record.
+  every later turn. A DM cut short by stopping the gateway leaves no such record.
+- Stopping the gateway no longer says a user cancelled the runs it stopped. Each run it
+  stops mid-flight, DM or not, now records `[Run interrupted by gateway shutdown]` in
+  place of `[Run cancelled by user]`, and that is what the agent sees in its context
+  after the restart. A DM end that shutdown still manages to write has reason `errored`
+  and the detail `the gateway shut down`, not `user_cancelled`, unless a user had already
+  stopped that run. Rows written by earlier versions are left as they are.
+- A guarded subagent whose tool call needed approval no longer says a user denied the
+  call or cancelled the run. Nothing routes a subagent's approval request to a person, so
+  the call is denied automatically and the run stops. The run now records
+  `[Run stopped: tool approval could not be requested]`. The tool result the model reads
+  is `{"approval_unavailable": true, ...}` with a message saying no one could be asked,
+  in place of `user_denied` and "The user denied this tool call", and the audit row reads
+  `denied automatically` in place of `denied by user`. A person's denial is unchanged.
 - A cancelled or failed DM no longer starts a run on the recipient's session.
 - Agent-to-agent tool descriptions now state which relationship each tool creates and no
   longer teach agents to poll.
@@ -492,6 +543,50 @@ one.
   two minors up. The 4.5 and 4.6 soundness changes were checked against the schemas, and a
   22-case differential is identical across the two versions (see `docs/frontend.md`).
   v0.2.3 has no `zod`. No operator action. Rebuilt into the same `static/ui-dist/` bundle.
+- `rusqlite` 0.32.1 -> 0.41.1 (with `libsqlite3-sys` 0.30.1 -> 0.39.1, bundled SQLite 3.46.0
+  -> 3.54.1) to clear RUSTSEC-2026-0459 (medium; CVE-2026-119375): SQLite before 3.54.0 can
+  return uninitialised page-cache memory when a database is opened beside a `-wal` file with
+  a different page size, so a crafted pair can leak process memory into query results. The
+  bundled SQLite is in every binary, and the code is reached: ALMS opens its database with
+  WAL. Exploiting it needs write access to the data directory beside the database. In the
+  default layout an agent's `shell` has that, since `./.alms` is inside the project root,
+  though that reach already allows worse (`docs/security-model.md` § 8.1). The crafted pair
+  is read when the gateway starts or a CLI command such as `alms agent create` opens the
+  database. The new SQLite also fixes the WAL-reset corruption bug (fixed in 3.51.3, present
+  since 3.7.0), which needs two connections writing or checkpointing one WAL database at the
+  same moment from different processes or threads, as a CLI command that writes SQLite
+  directly does beside a running gateway. SQLite rates it rare. `openssl` 0.10.75 -> 0.10.82
+  (with `openssl-sys` 0.9.111 -> 0.9.118) clears eight advisories against the safe `openssl`
+  wrappers: RUSTSEC-2026-0463 (out-of-bounds write in `aes::unwrap_key`), RUSTSEC-2026-0473
+  (`Deriver::derive` / `PkeyCtxRef::derive` with OpenSSL 1.1.x), RUSTSEC-2026-0474
+  (`X509Ref::ocsp_responders` can return invalid UTF-8), RUSTSEC-2026-0475
+  (`MdCtxRef::digest_final`), RUSTSEC-2026-0476 and RUSTSEC-2026-0477 (AES key wrap with
+  padding in `cipher_update`, `cipher_update_vec`, `symm::Crypter::update` and
+  `cipher_update_inplace`), RUSTSEC-2026-0478 (PSK and cookie
+  callback lengths) and RUSTSEC-2026-0479 (PEM password callback length). Their fixes are in
+  0.10.78, 0.10.79 and 0.10.80. On Linux, OpenSSL is built for reqwest's `native-tls`
+  backend (macOS and Windows use Security.framework and SChannel), but none of those APIs is
+  called: not by ALMS, nor by `native-tls`'s OpenSSL backend, `tokio-native-tls`,
+  `hyper-tls` or `reqwest`. `openssl-sys` 0.9.118 no longer builds against OpenSSL 1.0.2, so
+  Linux source builds need OpenSSL 1.1.0 or newer. v0.2.3 carries rusqlite 0.32.1 and
+  openssl 0.10.75, in range for all nine. The rusqlite bump spans nine minors and needs no
+  code change. The persistence and migration suites pass unchanged. One manifest line
+  changes (`crates/alms-session`), plus the lockfile. It now turns off rusqlite's default
+  features and names the two the native build uses, `bundled` and `cache` (0.32's set). That
+  keeps 0.41's wasm-only default out of `Cargo.lock`, so `cargo audit` no longer reports on
+  `sqlite-wasm-rs` or `rsqlite-vfs`, which no ALMS build compiles. The lockfile also gains
+  `hashlink` 0.12.2 and `hashbrown` 0.17.1. With the `rustix` bump below, the re-resolve
+  moves four Windows-only edges (`errno`, `rustix`, `tempfile`, `winapi-util`) from
+  `windows-sys` 0.60.2 to 0.52.0, already in the lockfile for `ring` on aarch64 Windows;
+  x86_64 Windows builds now compile it too. No package is added. No operator action:
+  existing databases open as before.
+- `rustix` 1.1.4 -> 1.1.6 to clear RUSTSEC-2026-0486 (unsound): `getxattr`, `lgetxattr`,
+  `fgetxattr`, `listxattr`, `llistxattr` and `flistxattr` given a zero-length buffer mark
+  bytes the kernel never wrote as initialised. rustix is in every binary, under `tempfile`,
+  `terminal_size` (clap), `uucore` (the shell builtins) and others, but nothing calls those
+  functions: `uucore`'s xattr code is behind its `fsxattr` feature, which ALMS does not
+  enable. v0.2.3 carries rustix 1.1.3, in range. No operator action. Lockfile-only; the
+  `windows-sys` edge moves are in the entry above.
 
 ## v0.2.3 — released (tag `v0.2.3`)
 

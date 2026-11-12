@@ -292,6 +292,14 @@ impl AppState {
         // Publish first, then log: the message states a past-tense fact
         // ("rebuilt"), so emitting it above the write would claim
         // something that is still one statement away from being true.
+        if rebuilt.missing_required_key() {
+            tracing::warn!(
+                target: "alms.config",
+                provider = %target.provider,
+                "The server-default provider has no API key; runs on it will be refused \
+                 until one is set"
+            );
+        }
         *self.llm.write() = rebuilt;
         tracing::info!(
             target: "alms.config",
@@ -448,6 +456,13 @@ impl AppState {
                     let secrets_handle = gateway.secrets_handle();
                     let secrets_guard = secrets_handle.read();
                     llm = llm.with_provider_and_secrets(provider, &secrets_guard);
+                    if llm.missing_required_key() {
+                        tracing::warn!(
+                            provider = %provider,
+                            "The persisted server-default provider has no API key; runs on \
+                             it will be refused until one is set"
+                        );
+                    }
                 } else {
                     // Branch the prose on whether a non-empty persisted
                     // model is on the wire — when only a provider was
@@ -502,6 +517,34 @@ impl AppState {
                 llm_config.default_model = model.clone();
                 llm = llm.with_model(model);
             }
+        }
+
+        // #172: name the agents whose runs will be refused, at boot rather
+        // than at their first run. Leftover state after an alms.toml edit:
+        // warn, don't fix.
+        if let Some(store) = session_manager.store() {
+            match store.list_agents() {
+                Ok(agents) => warn_agents_on_unconfigured_providers(&agents, &llm_config.providers),
+                Err(error) => tracing::warn!(
+                    target: "alms.config",
+                    %error,
+                    "could not list agents to check their providers at startup"
+                ),
+            }
+        }
+        // The server-level summary provider, after any `settings.json`
+        // override above, is checked the same way.
+        if let Some(p) = agent_config_val.context_config.summary_provider.as_deref()
+            && !alms_core::config::is_known_provider(p, &llm_config.providers)
+        {
+            tracing::warn!(
+                target: "alms.config",
+                summary_provider = %p,
+                "[context].summary_provider names a provider with no [llm.providers] \
+                 entry; summaries cannot use that provider until it is changed or \
+                 cleared (in alms.toml, or with PATCH /settings if settings.json \
+                 sets it)"
+            );
         }
 
         // Create the shared agent config Arc *once* — both the Coordinator and
@@ -569,6 +612,7 @@ impl AppState {
         // default) means no subagent is listed and the project-root pin
         // above wins as before.
         coord = coord.with_security_config(security_config.clone());
+        coord = coord.with_shutdown_token(shutdown_token.clone());
 
         // Share the Gateway's secrets store so runtime key changes are visible
         // to both HTTP handlers and the Telegram message loop.
@@ -651,5 +695,39 @@ impl AppState {
             tools_config: Arc::new(parking_lot::RwLock::new(tools_config)),
             security_config,
         })
+    }
+}
+
+/// Log a WARN at startup for each agent whose `provider` or `summary_provider`
+/// names no `[llm.providers]` entry (#172), so an operator who removed or
+/// renamed an entry learns which agents it stranded before their next run.
+fn warn_agents_on_unconfigured_providers(
+    agents: &[alms_core::registry::AgentRecord],
+    providers: &std::collections::BTreeMap<String, alms_core::config::ProviderEntry>,
+) {
+    for agent in agents {
+        if let Some(p) = agent.provider.as_deref()
+            && !alms_core::config::is_known_provider(p, providers)
+        {
+            tracing::warn!(
+                target: "alms.config",
+                agent = %agent.name,
+                provider = %p,
+                "agent names a provider with no [llm.providers] entry; its runs are \
+                 refused until its provider is changed or cleared"
+            );
+        }
+        if let Some(p) = agent.summary_provider.as_deref()
+            && !alms_core::config::is_known_provider(p, providers)
+        {
+            tracing::warn!(
+                target: "alms.config",
+                agent = %agent.name,
+                summary_provider = %p,
+                "agent names a summary_provider with no [llm.providers] entry; its \
+                 summaries cannot use that provider until summary_provider is \
+                 changed or cleared"
+            );
+        }
     }
 }

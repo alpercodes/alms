@@ -36,6 +36,7 @@ const expectedSseTypes = [
   "dm_activity_ended",
   "approval_resolved",
   "context_debug",
+  "summary_status",
   "run_warning",
   "run_finished",
   "run_error",
@@ -48,7 +49,7 @@ const expectedSseTypes = [
 describe("consumed wire contract coverage", () => {
   it("keeps every registered SSE event on an explicit schema", () => {
     expect(contractedSseTypes).toEqual(expectedSseTypes);
-    expect(contractedSseTypes).toHaveLength(28);
+    expect(contractedSseTypes).toHaveLength(29);
   });
 
   it("rejects malformed state-feeding SSE fields", () => {

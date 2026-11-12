@@ -1028,3 +1028,71 @@ async fn test_classifier_blocked_shell_surfaces_target_in_tool_end() {
         "runtime must emit ToolEnd with structured target on classifier block"
     );
 }
+
+/// An approval no one could be asked for is denied automatically, so neither
+/// the tool result the model reads nor the audit row may say a user denied it.
+#[tokio::test]
+async fn test_unroutable_denial_does_not_claim_a_user_denied_it() {
+    use alms_core::AuditDecision;
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<RuntimeEvent>();
+    let tools =
+        crate::tools::ToolRegistry::with_builtins_sandboxed(None, true, &["math".to_string()]);
+    let session_manager = SessionManager::new(SessionConfig::default());
+    let agent_id = AgentId::new();
+    let session = session_manager.get_or_create(agent_id, "test");
+    let runtime = AgentRuntime {
+        agent_id,
+        config: AgentConfig {
+            posture: Posture::Guarded,
+            ..AgentConfig::default()
+        },
+        tools,
+        event_sender: Some(tx),
+        ..base_runtime(
+            LlmClient::new(LlmConfig {
+                mock: true,
+                ..LlmConfig::default()
+            })
+            .unwrap(),
+        )
+    }
+    .with_unroutable_approvals();
+
+    // What the coordinator's relay does with a subagent's approval request.
+    let relay = tokio::spawn(async move {
+        while let Some(event) = rx.recv().await {
+            if let RuntimeEvent::ApprovalRequired { decision_tx, .. } = event {
+                decision_tx.send(false).unwrap();
+                break;
+            }
+        }
+    });
+    let tool_call = ToolCall::new("tc-auto", "math", r#"{"operation":"add","a":1,"b":2}"#);
+    let result = runtime
+        .execute_tool_call(
+            &tool_call,
+            uuid::Uuid::new_v4(),
+            &session_manager,
+            session.id,
+            None,
+        )
+        .await
+        .expect("an automatic denial is a result, not an error");
+    relay.await.unwrap();
+
+    assert_eq!(
+        result,
+        crate::agent::loop_impl::approval_unavailable_result()
+    );
+    assert!(!helpers::tool_result_ok(&result));
+    let audit = session_manager.get_audit(session.id).unwrap();
+    let deny = audit
+        .iter()
+        .find(|e| matches!(e.decision, AuditDecision::Deny))
+        .expect("the denial is audited");
+    assert_eq!(
+        deny.error.as_deref(),
+        Some("Tool 'math' denied automatically: no one could be asked to approve it")
+    );
+}

@@ -108,10 +108,21 @@ impl LlmClient {
             "LLM client initialized: provider={}, base_url={}",
             config.provider, config.base_url
         );
-        if config.api_key.is_empty() {
+        if config.api_key.is_empty()
+            && !config.mock
+            && alms_core::config::provider_requires_api_key(
+                &config.provider,
+                config.providers.get(&config.provider),
+            )
+        {
             warn!(
                 "LLM api_key is empty at construction — will be resolved from secrets later. \
                  If this persists, run `alms auth set <provider> <key>` or enable mock mode."
+            );
+        } else if config.api_key.is_empty() {
+            debug!(
+                provider = %config.provider,
+                "LLM client built without an API key; the provider needs none"
             );
         } else {
             info!("LLM api_key loaded ({} chars)", config.api_key.len());
@@ -941,51 +952,29 @@ impl LlmClient {
             self.config.quirks = alms_core::config::ProviderQuirks::default();
         }
 
+        // No logging here about a missing key. This runs on a per-run clone
+        // (the summary client is re-targeted on every run), so a warning
+        // here repeats on every run, and it cannot tell a key that is
+        // missing from a provider that needs none. The result is on the
+        // client: callers ask `missing_required_key()` and log in their own
+        // words.
         let resolved = secrets.map(|s| self.resolve_key_from(provider, s));
         match resolved {
             Some(Some(key)) => self.config.api_key = key,
-            Some(None) => {
-                if self.config.api_key.is_empty() {
-                    warn!(
-                        "No API key found for provider '{}' — requests will fail",
-                        provider
-                    );
-                } else if old_provider != provider {
-                    warn!(
-                        old_provider = %old_provider,
-                        new_provider = %provider,
-                        "Provider changed but no API key found — clearing stale key"
-                    );
-                } else {
-                    info!(
-                        provider = %provider,
-                        "No API key in the secrets store or the provider entry — \
-                         clearing the key this client carried, so a removed key \
-                         is not sent"
-                    );
-                }
-                self.config.api_key.clear();
-            }
-            None if old_provider != provider && !self.config.api_key.is_empty() => {
-                // Switching providers with nothing to resolve the new
-                // provider's key from. Clear the old key to avoid sending
-                // the wrong provider's credentials (which would cause
-                // confusing 401 errors).
-                warn!(
-                    old_provider = %old_provider,
-                    new_provider = %provider,
-                    "Provider changed but no API key found — clearing stale key"
-                );
-                self.config.api_key.clear();
-            }
-            None => {
-                if self.config.api_key.is_empty() {
-                    warn!(
-                        "No API key found for provider '{}' — requests will fail",
-                        provider
-                    );
-                }
-            }
+            // Cleared on the same provider too: that is how a key removed
+            // with `DELETE /auth/keys/{provider}` stops being sent.
+            Some(None) => self.config.api_key.clear(),
+            // Switching with nothing to resolve the new provider's key
+            // from: never send one provider's key to another.
+            None if old_provider != provider => self.config.api_key.clear(),
+            None => {}
+        }
+        if self.config.api_key.is_empty() {
+            debug!(
+                old_provider = %old_provider,
+                provider = %provider,
+                "Re-targeted LLM client has no API key"
+            );
         }
 
         self.config.provider = provider.to_string();
@@ -1156,6 +1145,28 @@ impl LlmClient {
     /// accessor is what closes that.
     pub fn has_api_key(&self) -> bool {
         !self.config.api_key.is_empty()
+    }
+
+    /// The environment variable the current provider's entry names as its
+    /// key source, if any.
+    pub fn declared_key_env(&self) -> Option<&str> {
+        self.config
+            .providers
+            .get(&self.config.provider)
+            .and_then(|entry| entry.api_key_env.as_deref())
+    }
+
+    /// The provider needs an API key and this client has none, so a request
+    /// would go out unauthenticated and fail. See
+    /// [`alms_core::config::provider_requires_api_key`] for how "needs" is
+    /// read. Never true in mock mode, which sends nothing.
+    pub fn missing_required_key(&self) -> bool {
+        !self.config.mock
+            && !self.has_api_key()
+            && alms_core::config::provider_requires_api_key(
+                &self.config.provider,
+                self.config.providers.get(&self.config.provider),
+            )
     }
 
     /// Get the current base URL.
