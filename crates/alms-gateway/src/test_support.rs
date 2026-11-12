@@ -95,6 +95,14 @@ impl TestAppState {
         self
     }
 
+    /// Set the server-level `[context]` summary pair, as `alms.toml` would.
+    pub(crate) fn summary_pair(mut self, provider: &str, model: &str) -> Self {
+        let ctx = &mut self.config.agent_config.context_config;
+        ctx.summary_provider = Some(provider.to_string());
+        ctx.summary_model = Some(model.to_string());
+        self
+    }
+
     /// Build the state and drop the channel receivers.
     pub(crate) fn build(self) -> AppState {
         self.build_with_channels().0

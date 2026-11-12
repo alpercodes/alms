@@ -555,6 +555,18 @@ The gateway pre-flights every `POST /runs` against the published context window 
 
 **Non-HTTP run failure mode (`run_error` SSE).** Triggered or queued runs that have no synchronous caller — peer DMs initiated via the `send_message` tool, scheduler / cron jobs, notification runs, subagent-completion runs, and HTTP runs whose effective budget was mutated by `PATCH /settings` or `PUT /agents/{id_or_name}` while they sat in the queue — cannot receive a synchronous 400. The same pre-flight check fires inside `execute_run` for these paths and emits a `run_error` SSE event instead. The event uses the standard `run_error` shape documented under § 5.3 *Event types* (`{ "run_id": "<uuid>", "error": { "code": "INVALID_TOKEN_BUDGET_FOR_PROVIDER", "message": "..." } }`) — no extra structured fields are added beyond `error.code` and `error.message`. The same budget detail the 400 envelope spreads across `provider` / `model` / `max_input_tokens` / `max_tokens` / `effective_total` / `provider_cap` keys is folded into the human-readable `error.message` string (e.g. `"configured token budget exceeds provider cap: context.max_input_tokens (250000) + agent.max_tokens (32000) = 282000 > anthropic claude-haiku-4-5 context window (200000). ..."`). The run is marked `Failed` before it ever enters the running set, and queue advance is broadcast so queued-behind runs see their positions decrement. Clients that already branch on `error.code` will pick this up without code changes; clients that want structured budget detail on the SSE surface should treat the 400 envelope from § 5.1 as the canonical field shape and either parse `error.message` or correlate by `run_id` to a separate `GET /runs/{run_id}` lookup.
 
+**Response 400** (the agent's provider is not configured, #172):
+```json
+{
+  "error_code": "AGENT_PROVIDER_NOT_CONFIGURED",
+  "message": "agent <uuid>: provider 'mylab' is not configured — known providers: [...]. Add an `[llm.providers.mylab]` entry to alms.toml first, or use one of those.",
+  "agent_id": "<uuid>",
+  "provider": "mylab"
+}
+```
+
+The agent's stored `provider` has no `[llm.providers.<name>]` entry. It was set with `alms agent create --provider`, or its entry was removed from `alms.toml`. Nothing is sent to any provider. Change or clear the provider with `PUT /agents/{id_or_name}` (§ 9.4). A run with no synchronous caller (DM, job, notification) is marked `failed` with the same message and emits `run_error` with code `AGENT_PROVIDER_NOT_CONFIGURED`. A named subagent's dispatch fails with the same message. A Telegram message is dropped with an error in the log.
+
 Why not `POST /agent/run`?
 - ALMS is about runs as first-class entities (auditable, cancellable, streamable).
 
@@ -1875,6 +1887,7 @@ Errors:
 - `400 INVALID_NAME` — name fails validation (1–64 chars, ASCII alphanumeric + hyphens, no leading/trailing hyphens, not a reserved name, not UUID-shaped). Uppercase is allowed and preserved verbatim.
 - `409 DUPLICATE_NAME` — name already exists. **Uniqueness is case-insensitive**: `Atlas` and `atlas` are the same name, because an agent's workspace is a directory at `{workspace_dir}/{name}/` and Windows/macOS filesystems are case-insensitive while Linux is not.
 - `409 WORKSPACE_EXISTS` — the name's workspace path contains data beyond the blank seed files and their lock sidecars, or the path is a symlink/file. Move or delete it before reusing the agent name; the API does not delete existing workspace data. Named subagents share this `{workspace_dir}/{name}/` path, so they can also leave a folder that blocks creation. Any agent with `fs_write` or `shell` can create the folder too, which is how a name nobody has used can still get this conflict. A registered agent's workspace is archived on deletion; this conflict can still apply to folders left by pre-upgrade deletions, unregistered named subagents, or other agents' writes.
+- `422 UNKNOWN_PROVIDER` — `provider` is neither a `[llm.providers.<name>]` entry nor a built-in name. The message lists the known providers.
 
 ### 9.3 Get agent
 `GET /agents/{id_or_name}`
@@ -1902,6 +1915,8 @@ Valid `posture` values: `"guarded"` (default — requires approval for risky too
 > **Note:** When a run is system-triggered (peer-to-peer DMs via `send_message`, notification runs, subagent completions, and scheduled jobs), Guarded posture is automatically overridden to Autonomous for that run via the `is_system_triggered` flag, since there is no human in the loop to approve tool calls. Without this override the run would wait on its first gated tool call indefinitely (the `max_run_duration_secs` backstop is checked only between iterations), until the approval is resolved or the run is cancelled. User-initiated runs (via the HTTP API) are never affected — Guarded posture is preserved as configured. A subagent takes its posture from its registry record instead: a record with no `posture`, the default for a new agent, runs `full_control` as a subagent, foreground or background, and so does an unnamed subagent or one whose name is not registered. A record set to `"guarded"` is overridden to Autonomous in the background, and keeps Guarded in the foreground, where its first gated call is denied and cancels the subagent. Guarded therefore governs the runs a human starts and is not a boundary between agents: an agent that can send a Guarded agent a DM can have it run tools without approval. See [`security-model.md` § 8.1](security-model.md#guarded-is-not-an-agent-boundary); the behaviour is under discussion in [#177](https://github.com/alpercodes/alms/issues/177).
 
 To clear a string override (`model`, `posture`, `provider`, `telegram_token`), pass an empty string: `"model": ""`.
+
+A `provider` this request sets must be a `[llm.providers.<name>]` entry or a built-in name, or the update returns `422 UNKNOWN_PROVIDER`. Surrounding whitespace is trimmed first, as on `POST`, so `" gemini "` stores `gemini` and a blank value clears the override. A name already on the record is not re-checked, so an agent left on a removed provider can still be edited. Such an agent cannot run until its provider is changed or cleared: `POST /runs` returns `400 AGENT_PROVIDER_NOT_CONFIGURED` (with `error_code`, `message`, `agent_id` and `provider`), and a run with no synchronous caller fails with the same message.
 
 **Clearing reasoning overrides (#809):** The three reasoning knobs
 — `thinking_budget_tokens`, `reasoning_effort`, `gemini_thinking_budget` —

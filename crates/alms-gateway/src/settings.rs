@@ -1009,16 +1009,10 @@ pub async fn patch_settings(
             None
         }
         Some(provider) if !state.llm_config.providers.contains_key(provider) => {
-            let mut known: Vec<&str> = state
-                .llm_config
-                .providers
-                .keys()
-                .map(|s| s.as_str())
-                .collect();
-            known.sort();
-            pair_errors.push(format!(
-                "provider '{provider}' is not configured — known providers: {known:?}. \
-                 Add an `[llm.providers.{provider}]` entry to alms.toml first."
+            // Same wording as the agent API's `422 UNKNOWN_PROVIDER` (#172).
+            pair_errors.push(alms_core::config::unknown_provider_message(
+                provider,
+                &state.llm_config.providers,
             ));
             None
         }
@@ -1650,6 +1644,22 @@ fn validate_patch_budget(
                         new_provider = %new_provider,
                         "Skipping fleet budget check for agent — runtime would \
                          reject with MISSING_MODEL_AFTER_PROVIDER_SWITCH on next run"
+                    );
+                    continue;
+                }
+                Err(crate::configuration::ResolveEffectiveModelError::UnknownProvider {
+                    provider,
+                    ..
+                }) => {
+                    // Same reasoning: the next run is rejected regardless of
+                    // the candidate budget, and no budget can be checked
+                    // against a provider that does not exist.
+                    warn!(
+                        target: "alms.config",
+                        agent = %record.name,
+                        provider = %provider,
+                        "Skipping fleet budget check for agent — its provider is \
+                         not configured, so its next run will be rejected"
                     );
                     continue;
                 }

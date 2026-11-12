@@ -422,7 +422,9 @@ pub(crate) fn agent_create(store: &SqliteStore, opts: AgentCreateOpts<'_>) -> an
         description: description.unwrap_or_default(),
         model,
         posture,
-        provider,
+        // Trimmed, and a blank value means no override, like `agent config`,
+        // `POST` and `PUT /agents` (#172).
+        provider: provider_override(provider),
         telegram_token: None,
         thinking_budget_tokens,
         reasoning_effort,
@@ -835,8 +837,9 @@ pub(crate) fn agent_config(store: &SqliteStore, opts: AgentConfigOpts<'_>) -> an
     if let Some(p) = posture {
         agent.posture = if p.is_empty() { None } else { Some(p) };
     }
-    if let Some(prov) = provider {
-        agent.provider = if prov.is_empty() { None } else { Some(prov) };
+    if provider.is_some() {
+        // A blank value clears the override; anything else is trimmed (#172).
+        agent.provider = provider_override(provider);
     }
     // `Some(n)` (including `Some(0)`) is an explicit override matching the
     // HTTP API's `PUT /agents/{id}` semantics. There's no CLI sentinel to
@@ -973,10 +976,148 @@ pub(crate) fn agent_config(store: &SqliteStore, opts: AgentConfigOpts<'_>) -> an
     Ok(())
 }
 
+/// The `provider` an `--provider` value stores: trimmed, with a blank value
+/// meaning no override. `POST` and `PUT /agents` normalize the same way.
+pub(crate) fn provider_override(value: Option<String>) -> Option<String> {
+    value
+        .map(|p| p.trim().to_string())
+        .filter(|p| !p.is_empty())
+}
+
+/// Warn on stderr when an agent was just saved with a `provider` the config
+/// this command loaded has no entry for (#172).
+///
+/// The CLI writes the registry directly, so the gateway's
+/// `422 UNKNOWN_PROVIDER` check never runs. It warns rather than refuses
+/// because the gateway may load a different `alms.toml` than this command
+/// did. `stored` is the value written to the record: `None` when the
+/// command left or cleared the override.
+pub(crate) fn warn_if_provider_unconfigured(
+    stored: Option<&str>,
+    providers: &std::collections::BTreeMap<String, alms_core::config::ProviderEntry>,
+    err: &mut impl std::io::Write,
+) {
+    let Some(provider) = stored else { return };
+    if alms_core::config::is_known_provider(provider, providers) {
+        return;
+    }
+    let known: Vec<&str> = providers.keys().map(String::as_str).collect();
+    let _ = writeln!(
+        err,
+        "Warning: provider '{provider}' is not configured in the alms.toml this command \
+         loaded — known providers: {known:?}. A gateway using that config refuses this \
+         agent's runs (400 AGENT_PROVIDER_NOT_CONFIGURED) until an \
+         `[llm.providers.{provider}]` entry is added or the provider is changed. The \
+         agent was saved anyway, because the gateway may load a different alms.toml."
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::helpers::{make_agent, new_store, resolve_agent};
+
+    fn warning_for(stored: Option<&str>) -> String {
+        let mut providers = std::collections::BTreeMap::new();
+        providers.insert(
+            "mylab".to_string(),
+            alms_core::config::ProviderEntry::default(),
+        );
+        let mut err = Vec::new();
+        warn_if_provider_unconfigured(stored, &providers, &mut err);
+        String::from_utf8(err).unwrap()
+    }
+
+    /// #172: the CLI cannot refuse a name the gateway's config may define,
+    /// but it must not save one its own config lacks without saying so.
+    #[test]
+    fn an_unconfigured_provider_gets_a_stderr_warning() {
+        let warning = warning_for(Some("nope"));
+        assert!(warning.starts_with("Warning: provider 'nope' is not configured"));
+        assert!(
+            warning.contains("AGENT_PROVIDER_NOT_CONFIGURED"),
+            "{warning}"
+        );
+        assert!(warning.contains("different alms.toml"), "{warning}");
+    }
+
+    #[test]
+    fn a_configured_builtin_or_absent_provider_gets_no_warning() {
+        for stored in [Some("mylab"), Some("gemini"), None] {
+            assert_eq!(warning_for(stored), "", "{stored:?}");
+        }
+    }
+
+    fn create_with_provider(store: &SqliteStore, name: &str, provider: &str) {
+        agent_create(
+            store,
+            AgentCreateOpts {
+                name: name.into(),
+                description: None,
+                model: None,
+                posture: None,
+                provider: Some(provider.into()),
+                thinking_budget_tokens: None,
+                reasoning_effort: None,
+                gemini_thinking_budget: None,
+                summary_provider: None,
+                summary_model: None,
+                worktree_mode: WorktreeMode::Off,
+                project_root: None,
+                default: false,
+                json: false,
+                workspace_dir: None,
+            },
+        )
+        .unwrap();
+    }
+
+    fn config_provider(store: &SqliteStore, name: &str, provider: &str) {
+        agent_config(
+            store,
+            AgentConfigOpts {
+                name_or_id: name,
+                model: None,
+                posture: None,
+                provider: Some(provider.into()),
+                description: None,
+                thinking_budget_tokens: None,
+                reasoning_effort: None,
+                gemini_thinking_budget: None,
+                summary_provider: None,
+                summary_model: None,
+                clear_summary_provider: false,
+                clear_summary_model: false,
+                worktree_mode: None,
+                force_worktree_remove: false,
+                project_root: None,
+                json: false,
+            },
+        )
+        .unwrap();
+    }
+
+    /// #172: the CLI stores `--provider` as `POST` and `PUT /agents` do, so
+    /// `""` never becomes a provider named `''` that every run is refused on.
+    #[test]
+    fn create_and_config_trim_the_provider_and_treat_blank_as_none() {
+        let store = new_store();
+        for (name, sent, stored) in [
+            ("padded", " gemini ", Some("gemini")),
+            ("empty", "", None),
+            ("blank", "   ", None),
+        ] {
+            create_with_provider(&store, name, sent);
+            let agent = resolve_agent(&store, name).unwrap();
+            assert_eq!(agent.provider.as_deref(), stored, "create {sent:?}");
+        }
+
+        for (sent, stored) in [(" mylab ", Some("mylab")), ("   ", None)] {
+            config_provider(&store, "padded", sent);
+            let agent = resolve_agent(&store, "padded").unwrap();
+            assert_eq!(agent.provider.as_deref(), stored, "config {sent:?}");
+        }
+    }
 
     #[test]
     fn test_create_list_show_delete_roundtrip() {

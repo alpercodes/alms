@@ -161,6 +161,22 @@ Each item below changes behaviour for a deployment that has not set the knob exp
   run already in progress keeps the key it started with for the rest of its turns and its
   post-run summary, as does a background subagent already running. Cancel them to stop
   sooner, and revoke a leaked key at the provider.
+- **An agent on a provider that is not configured no longer sends its prompt to the
+  server default's provider.** Its runs kept the default provider's URL and sent no key,
+  so an agent whose `[llm.providers.<name>]` entry was removed from `alms.toml`, or whose
+  `alms agent create --provider` named a typo, sent its conversation to the default
+  provider while `resolved_config` named the bad one. `POST` and `PUT /agents` now return
+  `422 UNKNOWN_PROVIDER`. A run on a stored bad name fails before any LLM call:
+  `POST /runs` returns `400 AGENT_PROVIDER_NOT_CONFIGURED`, named subagents and other runs
+  without a caller fail with the same reason, and a Telegram message is dropped with an
+  error in the log. The gateway logs a WARN at startup naming each agent whose `provider`
+  or `summary_provider` has no entry, and a server-level `[context].summary_provider`
+  with none. `alms agent create --provider` and `alms agent config --provider` print a
+  warning on stderr for a name the CLI's own `alms.toml` lacks; they still save it, since
+  the gateway may load a different file. Both now trim the value and treat a blank one as
+  no override, so `alms agent create --provider ""` no longer stores a provider named `''`.
+  **After upgrading**, change or clear such an agent's provider with
+  `PUT /agents/{id_or_name}` or `alms agent config <name> --provider ""`.
 
 ### Multi-agent and DM
 

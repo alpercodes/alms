@@ -33,6 +33,7 @@ pub use types::{
     SessionConfig, ShellClassificationMode, ShellEngine, ShellPermissions, ShellSpillConfig,
     ToolOutputTruncateConfig, ToolsConfig, builtin_base_url, provider_requires_api_key,
 };
+pub use types::{is_known_provider, unknown_provider_message};
 
 use crate::{AlmsError, AlmsResult};
 use serde::{Deserialize, Serialize};

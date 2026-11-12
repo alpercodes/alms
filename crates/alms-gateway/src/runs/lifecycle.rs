@@ -820,6 +820,22 @@ pub async fn create_run(
                     .into(),
                 ));
             }
+            Err(ResolveAgentConfigError::UnknownProvider {
+                agent_id: ag,
+                provider,
+                message,
+            }) => {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    axum::Json(serde_json::json!({
+                        "error_code": "AGENT_PROVIDER_NOT_CONFIGURED",
+                        "message": format!("agent {ag}: {message}"),
+                        "agent_id": ag.0.to_string(),
+                        "provider": provider,
+                    }))
+                    .into(),
+                ));
+            }
             Ok(resolved) => {
                 // #919 per-run token-budget validation.
                 pre_flight_token_budget(agent_id, &resolved.agent_config, &resolved.llm)
@@ -1613,9 +1629,10 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
     // per-agent model override.
     //
     // `resolve_agent_config` can fail with #863 `MissingModelAfterProviderSwitch`
-    // when a per-agent provider override is set with no model on any layer.
+    // when a per-agent provider override is set with no model on any layer,
+    // or with #172 `UnknownProvider` when it names nothing a run can route to.
     // The HTTP `create_run` handler runs the same resolve up-front and
-    // rejects with `400 MISSING_MODEL_AFTER_PROVIDER_SWITCH`, so this path
+    // rejects with a 400, so this path
     // is only reachable for non-HTTP triggers (Telegram / scheduler / peer
     // DMs / subagent completions). Mark the run as failed with the same
     // structured message so the run record carries an actionable error.
@@ -1659,6 +1676,15 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
             // for sessions whose indicator was never lit) and matches
             // the pre-#1046 behaviour.
             let mut failure_message = e.to_string();
+            // #172: name the failure explicitly, as the #919 budget path
+            // does, rather than let `classify_error` guess a code from a
+            // message that embeds an operator-chosen provider name.
+            let mut error_code = match &e {
+                ResolveAgentConfigError::UnknownProvider { .. } => {
+                    Some("AGENT_PROVIDER_NOT_CONFIGURED")
+                }
+                ResolveAgentConfigError::MissingModelAfterProviderSwitch { .. } => None,
+            };
             let (_failed_transitioned, emit_failure) = match state
                 .run_manager
                 .try_mark_run_as_failed(run_id, failure_message.clone())
@@ -1666,18 +1692,19 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
                 Ok(transitioned) => (transitioned, transitioned),
                 Err(error) => {
                     failure_message = format!("Run failure could not be persisted: {error}");
+                    error_code = None;
                     (false, true)
                 }
             };
 
             if emit_failure {
+                let event = match error_code {
+                    Some(code) => SseEventData::run_error_with_code(run_id, code, &failure_message),
+                    None => SseEventData::run_error(run_id, &failure_message),
+                };
                 state
                     .run_manager
-                    .send_event(
-                        run_id,
-                        session_id,
-                        SseEventData::run_error(run_id, &failure_message),
-                    )
+                    .send_event(run_id, session_id, event)
                     .await;
             }
             state
