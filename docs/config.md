@@ -34,6 +34,15 @@ See [`docs/api.md`](api.md) § 10.2 for the wire shapes, validation rules and er
 
 The modal's **Summary** section (`summary_model` / `summary_provider`) drives both compaction summaries and post-run episodic memory. Set both or neither: a `summary_model` paired with the agent's own provider would be a slug from the wrong namespace, so partial configurations are rejected rather than silently mis-routed. Full notes in `alms.toml.example` under `[context]`.
 
+If a summary fails, the run still completes and the session shows a banner naming the provider and what to do about it. On the default pair, that is the usual result of an agent on another provider with no OpenRouter key: either add one, or change the pair here; unsetting both fields uses the agent's own model.
+
+A summary is not sent at all when its provider needs a key it does not have, so the conversation is not put on the wire just to be refused. "Needs a key" means one of two things:
+
+- a built-in slot (`openai`, `anthropic`, `openrouter`, `gemini`) still pointed at its hosted API, its stock `base_url`;
+- a `[llm.providers.<name>]` entry that declares `api_key_env` or `api_key`, whether or not the key resolves.
+
+A slot re-pointed elsewhere, by its own `base_url` or by `ALMS_LLM_BASE_URL`, is your endpoint and is judged like any other entry. `ALMS_LLM_BASE_URL` re-points the slot that `llm.provider` (or `ALMS_LLM_PROVIDER`) names at boot, not a default provider chosen later in Settings. An entry that declares no key source, the way Ollama and LM Studio are set up below, needs none: its summaries are sent without an auth header, and it can be chosen as the summary provider here without a key. An endpoint that does need a key but declares none can't be told apart from a local one, so its summaries are sent and fail on its 401, and the banner reports that. The same rule decides which providers the Summary section refuses for want of a key (`SUMMARY_PROVIDER_MISSING_API_KEY`). The banner clears when a summary next succeeds, or as soon as you change the pair or add that provider's key. See `summary_status` in `docs/api.md`.
+
 ### Session
 
 `max_messages`, `idle_timeout_secs`, `auto_archive` and `archive_ttl_secs` are meant to bound on-disk session storage and retention, and `max_context_tokens` the size of a stored session. **None of them is enforced yet.** They are exposed on `GET /settings`, accepted by `PATCH /settings` and persisted to `settings.json`, but no production code reads them, so nothing caps, idles, archives or deletes a session on their account. Their one effect is a validation rule: `max_context_tokens` must be at least `context.max_input_tokens` (checked on TOML load, and on a PATCH that carries a `session` section and sends either field).

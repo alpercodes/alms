@@ -103,11 +103,12 @@ compact_trigger_pct = 0.80
 # compaction always measurably reduces context size.)
 compact_retain_pct = 0.40
 # Episodic memory: how run summaries are generated after each run.
-#   "off"       - disabled (default). No summaries, no episodic context injection.
+#   "off"       - disabled. No summaries, no episodic context injection.
 #   "heuristic" - one-line summary from truncated input + output. Zero LLM cost.
-#   "llm"       - rich summary via agent's model (or summary_model if configured).
+#   "llm"       - rich summary via summary_model below (default), or the
+#                 agent's own model when both summary fields are cleared.
 # Override with: ALMS_RUN_SUMMARY_MODE=heuristic
-run_summary_mode = "off"
+run_summary_mode = "llm"
 # Cheaper dedicated model for the summary task (issues #866 / #1191).
 # Default: "google/gemma-4-31b-it" on the "openrouter" summary provider —
 # a small non-reasoning model so summaries stay cheap regardless of the
@@ -117,7 +118,9 @@ summary_model = "google/gemma-4-31b-it"
 # re-targeted at this provider via `with_provider_and_secrets` so
 # `summary_model` can be a slug for a different provider than the agent
 # (e.g. agent on Anthropic, summary on OpenRouter). Must reference a
-# configured `[llm.providers.<name>]` block whose API key is resolvable.
+# configured `[llm.providers.<name>]` block; one that needs a key (a built-in
+# slot on its stock URL, or an entry declaring `api_key_env` / `api_key`) must
+# have it resolvable.
 summary_provider = "openrouter"
 #
 # IMPORTANT (#871): set `summary_model` and `summary_provider` together.

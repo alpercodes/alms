@@ -13,6 +13,7 @@ import { InputArea } from './components/chat/input-area.js';
 import { chatMessages } from './state/chat.js';
 import { PanelContainer } from './components/panel/index.js';
 import { SettingsModal } from './components/settings-modal.js';
+import { SummaryFailureBanner } from './components/chat/summary-failure-banner.js';
 import { OnboardingView } from './components/onboarding.js';
 import { agents, activeAgent } from './state/agents.js';
 import { isDmSession, isNotificationSession, isInternalSession, activeSession, activeSessionId, activeSessionOwnerName } from './state/sessions.js';
@@ -71,7 +72,7 @@ function groupMessages(msgs) {
 }
 
 // ── Chat view ──
-function ChatView() {
+function ChatView({ onOpenSettings }) {
     const messagesRef = useRef(null);
 
     // Auto-scroll when messages change.
@@ -128,6 +129,7 @@ function ChatView() {
     return html`
         <div id="chat">
             <${AgentHeaderBar} />
+            <${SummaryFailureBanner} sessionId=${activeSessionId.value} onOpenSettings=${onOpenSettings} />
             ${(agentSwitchLoading.value || sessionSwitchLoading.value) && html`
                 <div id="messages" role="log" aria-live="polite">
                     ${agentSwitchLoading.value
@@ -281,7 +283,7 @@ function App() {
             ? html`
                 <div id="main">
                     <${Sidebar} />
-                    <${ChatView} />
+                    <${ChatView} onOpenSettings=${() => { settingsOpen.value = true; }} />
                     <${PanelContainer} />
                 </div>`
             : html`<${OnboardingView} />`

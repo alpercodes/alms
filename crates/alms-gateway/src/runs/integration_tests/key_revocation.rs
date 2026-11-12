@@ -88,7 +88,11 @@ impl Harness {
             alms_core::config::ProviderEntry {
                 kind: alms_core::config::ProviderKind::OpenAiCompatible,
                 base_url: llm.base_url(),
-                api_key_env: None,
+                // The slot is re-pointed at the scripted LLM, so on its URL
+                // alone it would count as a keyless local endpoint. Declaring
+                // a key source keeps it a provider that needs a key, as the
+                // hosted `openrouter` is. The variable is never set.
+                api_key_env: Some("ALMS_TEST_UNSET_OPENROUTER_KEY_VAR".to_string()),
                 api_key: entry_key.map(str::to_owned),
                 model: None,
                 auth_scheme: alms_core::config::AuthScheme::Bearer,
@@ -290,22 +294,35 @@ async fn a_removed_key_is_not_sent_by_the_next_runs_summary() {
 
     h.delete_key("openrouter").await;
     h.run_to_completion(session.id).await;
-    h.wait_for_requests(4).await;
+    assert!(
+        h.state
+            .run_manager
+            .wait_drain(Duration::from_secs(20))
+            .await,
+        "the summary task did not finish"
+    );
+    // The summary is not sent at all now: `openrouter` needs a key and has
+    // none, so the conversation stays home and the session is told instead.
     assert_eq!(
         h.models().await,
         vec![
             "test-model".to_string(),
-            summary_model.clone(),
-            "test-model".to_string(),
             summary_model,
+            "test-model".to_string(),
         ],
-        "each run makes one turn request, then one summary request"
+        "the run after the DELETE makes its turn request and no summary request"
     );
     assert_eq!(
         h.authorization().await,
-        vec![bearer(STORE_KEY), bearer(STORE_KEY), None, None],
-        "the run after `DELETE /auth/keys/openrouter`, and its summary, must \
-         send no key"
+        vec![bearer(STORE_KEY), bearer(STORE_KEY), None],
+        "the run after `DELETE /auth/keys/openrouter` must send no key"
+    );
+    assert!(
+        h.state
+            .run_manager
+            .summary_status_snapshot(session.id)
+            .is_some(),
+        "the skipped summary is reported to the session"
     );
 }
 
