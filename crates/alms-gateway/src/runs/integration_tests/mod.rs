@@ -37,6 +37,7 @@ mod read_api;
 mod run_failure;
 mod shutdown;
 mod subagents;
+mod summary_status;
 mod unknown_provider;
 
 // ---------------------------------------------------------------------------

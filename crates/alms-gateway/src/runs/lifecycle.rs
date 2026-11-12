@@ -1148,6 +1148,16 @@ fn build_summary_client(
     let switched =
         alms_runtime::build_summary_client(llm, summary_provider, summary_model, Some(secrets));
 
+    if switched.missing_required_key() {
+        // Not a warning: this runs on every run, and the summary paths skip
+        // the call, warn, and show it in the session (`summary_status`).
+        debug!(
+            agent_id = %agent_id,
+            summary_provider = %switched.provider(),
+            "Summary provider has no API key; summaries will not be sent"
+        );
+    }
+
     if let Some(provider) = summary_provider {
         // #1191 made `Some(openrouter, gemma)` the compiled default, so
         // this branch now runs on every stock deployment's runs — only an
@@ -1176,6 +1186,25 @@ fn build_summary_client(
     }
 
     switched
+}
+
+/// Pass a post-run summary's outcome on to the session's summary state. A
+/// summary that made no LLM call says nothing about the provider, so it leaves
+/// that state alone.
+fn report_summary_outcome(
+    run_manager: &crate::server::RunManager,
+    session_id: SessionId,
+    agent_id: AgentId,
+    outcome: alms_runtime::episodic::SummaryOutcome,
+) {
+    use alms_runtime::episodic::SummaryOutcome;
+    match outcome {
+        SummaryOutcome::NotAttempted => {}
+        SummaryOutcome::Succeeded => run_manager.report_summary_status(session_id, agent_id, None),
+        SummaryOutcome::Failed(failure) => {
+            run_manager.report_summary_status(session_id, agent_id, Some(failure));
+        }
+    }
 }
 
 /// Maximum bytes of an `AlmsError` Display string to embed in the
@@ -2918,11 +2947,14 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
                     };
                     run_mgr.track_in_flight();
                     tokio::spawn(async move {
-                        let _guard = InFlightGuard {
+                        let guard = InFlightGuard {
                             run_manager: run_mgr,
                         };
-                        alms_runtime::episodic::generate_and_persist_summary(&sm, &llm_clone, req)
-                            .await;
+                        let outcome = alms_runtime::episodic::generate_and_persist_summary(
+                            &sm, &llm_clone, req,
+                        )
+                        .await;
+                        report_summary_outcome(&guard.run_manager, session_id, agent_id, outcome);
                     });
                 }
 

@@ -222,6 +222,13 @@ fn stream_health_js_behaviour() {
     run_node_test("stream-health.test.mjs");
 }
 
+/// `static/ui/state/summary-status.js`: which session a summary failure shows
+/// in, and that dismissing one does not hide a different one.
+#[test]
+fn summary_status_js_behaviour() {
+    run_node_test("summary-status.test.mjs");
+}
+
 /// Pinned regression for issue #983: the agent card in the right-side
 /// agents panel is now a whole-card click target (the per-card "Select"
 /// button is removed). The JS-side test exercises the pure-function

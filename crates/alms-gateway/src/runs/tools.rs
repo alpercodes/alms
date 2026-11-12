@@ -383,6 +383,12 @@ pub(super) async fn forward_runtime_events(
                     );
                 }
             }
+            // A compaction summary call finished. Session state, deliberately
+            // not a `run_warning`: that arm persists a marker per emit, and
+            // this fires on every turn while the problem lasts.
+            RuntimeEvent::SummaryStatus { agent_id, failure } => {
+                run_manager.report_summary_status(session_id, agent_id, failure);
+            }
             RuntimeEvent::ContextDebug {
                 messages,
                 tool_names,

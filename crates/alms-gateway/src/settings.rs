@@ -1269,6 +1269,15 @@ pub async fn patch_settings(
     // See PR #810 for context.
     if errors.is_empty() {
         persist_settings(&state);
+        // A new summary pair may be the fix for failing summaries. The next
+        // run's summary says whether it was.
+        if body
+            .context
+            .as_ref()
+            .is_some_and(|ctx| ctx.summary_model.is_some() || ctx.summary_provider.is_some())
+        {
+            state.run_manager.clear_summary_problems(|_, _| true);
+        }
         // #1148: no `restart_required` / `restart_reason` on this wire any
         // more. Every mutable section of `PATCH /settings` — including the
         // server-default `(model, provider)` pair — is now live for the

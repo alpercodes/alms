@@ -1180,6 +1180,7 @@ pub async fn update_agent(
     let prev_mode = agent.worktree_mode;
     let force_remove = req.force_worktree_remove.unwrap_or(false);
     let agent_name = agent.name.clone();
+    let summary_pair_before = (agent.summary_provider.clone(), agent.summary_model.clone());
 
     // Only a name this request sets: an agent left on a removed provider must
     // stay editable, and an empty string clears the override.
@@ -1193,6 +1194,8 @@ pub async fn update_agent(
     }
 
     apply_update_request(&mut agent, req).map_err(|e| e.to_api_error())?;
+    let summary_pair_touched =
+        summary_pair_before != (agent.summary_provider.clone(), agent.summary_model.clone());
 
     // Cross-field pair invariant for the per-agent summary fields (#872).
     // Validated against the post-update record state so a single-field
@@ -1221,6 +1224,15 @@ pub async fn update_agent(
         is_full_os,
         || store.update_agent(&agent),
     )?;
+
+    // A new per-agent summary pair may be the fix for this agent's failing
+    // summaries. The next run's summary says whether it was.
+    if summary_pair_touched {
+        let agent_id = agent.id;
+        state
+            .run_manager
+            .clear_summary_problems(|failed_agent, _| failed_agent == agent_id);
+    }
 
     Ok(Json(agent_to_json(&agent)))
 }

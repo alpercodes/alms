@@ -292,6 +292,14 @@ impl AppState {
         // Publish first, then log: the message states a past-tense fact
         // ("rebuilt"), so emitting it above the write would claim
         // something that is still one statement away from being true.
+        if rebuilt.missing_required_key() {
+            tracing::warn!(
+                target: "alms.config",
+                provider = %target.provider,
+                "The server-default provider has no API key; runs on it will be refused \
+                 until one is set"
+            );
+        }
         *self.llm.write() = rebuilt;
         tracing::info!(
             target: "alms.config",
@@ -448,6 +456,13 @@ impl AppState {
                     let secrets_handle = gateway.secrets_handle();
                     let secrets_guard = secrets_handle.read();
                     llm = llm.with_provider_and_secrets(provider, &secrets_guard);
+                    if llm.missing_required_key() {
+                        tracing::warn!(
+                            provider = %provider,
+                            "The persisted server-default provider has no API key; runs on \
+                             it will be refused until one is set"
+                        );
+                    }
                 } else {
                     // Branch the prose on whether a non-empty persisted
                     // model is on the wire — when only a provider was
