@@ -132,61 +132,61 @@ impl AlmsConfig {
         Ok(config)
     }
 
-    /// Load config with fail-fast semantics on validation failure (#924).
+    /// Load config, exiting if a config file exists but can't be used (#924).
     ///
-    /// This is the path the gateway entrypoint (`alms gateway`) uses. It
-    /// distinguishes two error classes:
+    /// This is the path the gateway entrypoint (`alms gateway`) uses.
     ///
-    /// - **File-load failures** (file unreadable due to permissions, TOML
-    ///   parse error): warn to stderr and fall back to compiled defaults
-    ///   so first-run / fresh-install / corrupted-file scenarios still
-    ///   produce a working daemon.
-    /// - **Validation failures** (a hand-edited `alms.toml` that loaded
-    ///   cleanly but violates a `validate()` invariant — e.g. asymmetric
-    ///   `[context].summary_provider` / `summary_model` after #877's
-    ///   pair-only rule): **fatal**, the process exits non-zero with a
-    ///   clear stderr message pointing at the bad field.
+    /// - **No config file:** compiled defaults plus env overrides. This is the
+    ///   genuine bootstrapping case (first run, fresh install).
+    /// - **A file that can't be read or parsed, or that fails `validate()`:**
+    ///   **fatal**. The process exits non-zero, and stderr names the file and
+    ///   the problem. A single typo must not swap the whole file for defaults:
+    ///   that would drop `shell_policy` and `[security]`, send runs to the
+    ///   default provider and open a different database. The recovery is on
+    ///   the operator (fix the config), not the daemon (drop the config and
+    ///   pretend nothing happened).
     ///
-    /// Falling back to defaults on a validation failure would silently
-    /// discard the operator's intent (Tim's review framing on PR #923,
-    /// surfaced as #924). The recovery is on the operator (fix the
-    /// config) not the daemon (drop the config and pretend nothing
-    /// happened). Missing-file (`find_config_file() == None`) is the
-    /// genuine bootstrapping case and is handled before either branch
-    /// runs — it produces a defaults-with-env-overrides config and zero
-    /// exit, same as before.
+    /// Env overrides can also fail `validate()`, with or without a file.
     ///
-    /// Unlike `AlmsConfig::load().unwrap_or_default()`, this ensures
-    /// `data_dir` is resolved to an absolute path even in the file-load
-    /// fallback case. Use this whenever a best-effort config is
-    /// acceptable for the file-load axis but the validation invariant
-    /// must hold (gateway boot, scheduler, anything that drives runs).
+    /// Use this whenever the validation invariant must hold (gateway boot,
+    /// scheduler, anything that drives runs). It also resolves `data_dir` to an
+    /// absolute path.
     ///
     /// **Behaviour scope (#924 follow-up).** This entry-point is shared
     /// across the gateway boot path *and* every CLI subcommand that goes
     /// through `helpers::open_db_with_config()` (`alms agent ...`,
-    /// `alms session ...`, `alms run ...`, `alms job ...`, plus
-    /// `alms auth`). A validation failure therefore aborts the process
-    /// for those CLI commands too, not just `alms gateway`. This is the
+    /// `alms session ...`, `alms job list` / `alms job show`,
+    /// `alms run create --agent`, plus `alms auth`). A config file that can't
+    /// be read or parsed, or a validation failure, therefore aborts the
+    /// process for those CLI commands too, not just `alms gateway`. This is the
     /// intended shape — discarding the operator's intent silently would
     /// be just as wrong on a CLI invocation as on daemon boot — but it
-    /// is wider than the issue title suggests, so callers that want a
-    /// best-effort defaults-on-validation-failure shape should reach for
-    /// [`Self::load_or_default_fallible`] (or [`Self::load`]) directly.
+    /// is wider than the issue title suggests. Commands that never use the
+    /// config (`alms health`, `alms dashboard`, `alms completions`) don't call
+    /// this, so a broken file doesn't stop them.
     ///
-    /// Calls `std::process::exit(1)` on validation failure. The fallible
+    /// Calls `std::process::exit(1)` on failure. The fallible
     /// shape lives in [`Self::load_or_default_fallible`] for unit
     /// testing.
     pub fn load_or_default() -> Self {
         match Self::load_or_default_fallible() {
             Ok(cfg) => cfg,
             Err(e) => {
-                eprintln!("Error: invalid configuration: {e}");
+                // `e` already starts with "Invalid configuration:".
+                eprintln!("Error: {e}");
+                // Name the file this load used: a validation error does not,
+                // and it may be the home config rather than `./alms.toml`.
+                let fix = match Self::find_config_file() {
+                    Some(path) => format!(
+                        "Fix it in {} or in the ALMS_* environment variable that sets it",
+                        path.display()
+                    ),
+                    None => "No config file was found, so fix the ALMS_* environment \
+                             variable that sets it"
+                        .to_string(),
+                };
                 eprintln!(
-                    "The daemon will not start with an invalid config — fix the offending \
-                     field in alms.toml (or in the corresponding ALMS_* environment \
-                     variable) and try again. Removing the config file entirely is also \
-                     valid; the daemon will then start with compiled defaults."
+                    "ALMS will not run with this configuration. {fix}, then run the command again."
                 );
                 std::process::exit(1);
             }
@@ -194,43 +194,32 @@ impl AlmsConfig {
     }
 
     /// Inner of [`Self::load_or_default`] — same semantics, but returns
-    /// the validation error instead of exiting the process. Exposed for
-    /// unit testing the fail-fast contract from #924.
+    /// the error instead of exiting the process. Exposed for unit testing
+    /// the fail-fast contract from #924.
     ///
     /// Contract:
-    /// - File-load failures (IO, TOML parse): warn-and-default. Returns
-    ///   `Ok(default-shaped config)`.
-    /// - Validation failures: returns `Err(InvalidConfig(...))`. The
-    ///   process-exit wrapper turns this into a non-zero exit with a
-    ///   helpful stderr message.
+    /// - No config file: `Ok(default-shaped config)`.
+    /// - File-load failures (IO, TOML parse) and validation failures: returns
+    ///   `Err(InvalidConfig(...))`. The process-exit wrapper turns this into a
+    ///   non-zero exit with a helpful stderr message.
     pub fn load_or_default_fallible() -> AlmsResult<Self> {
-        // Step 1: try to read + parse the config file (or fall through
-        // when no file is present). File-load failures are
-        // recoverable — warn and use defaults. The eventual `validate()`
-        // call below still applies; defaults are guaranteed to pass
-        // validation, but env-var overrides could still produce an
-        // invalid config that fails the fail-fast check.
+        // Step 1: read + parse the config file, or use defaults when there
+        // is none. A file that exists but can't be used is an error. The
+        // eventual `validate()` call below still applies; defaults are
+        // guaranteed to pass validation, but env-var overrides could still
+        // produce an invalid config that fails the fail-fast check.
         let mut config = match Self::find_config_file() {
-            Some(path) => match Self::from_file(&path) {
-                Ok(c) => {
-                    info!("Loaded config from {}", path.display());
-                    c
-                }
-                Err(e) => {
-                    eprintln!(
-                        "Warning: failed to load config file {}: {}. Using defaults.",
-                        path.display(),
-                        e,
-                    );
-                    Self::default()
-                }
-            },
+            Some(path) => {
+                let config = Self::from_file(&path)?;
+                info!("Loaded config from {}", path.display());
+                config
+            }
             None => Self::default(),
         };
 
         // Step 2: layer env overrides + provider sugar + path resolution +
         // soft normalisations. Mirrors `load()` so the two paths produce
-        // structurally identical configs modulo the file-load fallback.
+        // structurally identical configs.
         config.llm.ensure_builtin_providers();
         config.apply_env_overrides();
         config.server.data_dir = crate::resolve_to_absolute(Path::new(&config.server.data_dir));
@@ -260,11 +249,11 @@ impl AlmsConfig {
     /// Load from a specific file path
     pub fn from_file(path: &Path) -> AlmsResult<Self> {
         let content = std::fs::read_to_string(path).map_err(|e| {
-            AlmsError::InvalidConfig(format!("Cannot read config file {}: {}", path.display(), e))
+            AlmsError::InvalidConfig(format!("cannot read {}: {}", path.display(), e))
         })?;
 
         let config: Self = toml::from_str(&content).map_err(|e| {
-            AlmsError::InvalidConfig(format!("Invalid config file {}: {}", path.display(), e))
+            AlmsError::InvalidConfig(format!("cannot parse {}: {}", path.display(), e))
         })?;
 
         Ok(config)
@@ -272,16 +261,23 @@ impl AlmsConfig {
 
     /// Find config file in standard locations
     fn find_config_file() -> Option<PathBuf> {
-        // 1. Current directory
-        let local = PathBuf::from("alms.toml");
-        if local.exists() {
+        // Presence, not usability: `exists()` follows symlinks, so a dangling
+        // link would count as absent and fall through to defaults or the next
+        // location. `from_file` then reports a present file it can't read.
+        // A lookup denied by permissions still counts as absent.
+        let present = |p: &Path| std::fs::symlink_metadata(p).is_ok();
+
+        // 1. Current directory. Absolute, so every message names the full
+        //    path even when the working directory isn't obvious.
+        let local = std::path::absolute("alms.toml").unwrap_or_else(|_| PathBuf::from("alms.toml"));
+        if present(&local) {
             return Some(local);
         }
 
         // 2. Home config directory
         if let Some(home) = dirs_path() {
             let home_config = home.join(".config").join("alms").join("config.toml");
-            if home_config.exists() {
+            if present(&home_config) {
                 return Some(home_config);
             }
         }

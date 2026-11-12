@@ -12,6 +12,21 @@ the git history.
 
 Each item below changes behaviour for a deployment that has not set the knob explicitly.
 
+- **A config file that can't be read or parsed now stops ALMS instead of being ignored.**
+  Before, one typo in `alms.toml` discarded the whole file, including `shell_policy` and
+  `[security]`, and ALMS ran on compiled defaults with only a line on stderr. That also
+  meant the default provider and a different database. Now `alms gateway`, and the
+  `agent`, `session`, `auth` and database-reading `job` and `run` commands, exit with an
+  error naming the file and the parse problem. A dangling `alms.toml` symlink counts as a
+  file that can't be read. A missing file still means defaults. Commands that don't use
+  the config no longer load it at all, so neither a broken file nor a failed validation
+  stops them: `alms health`, `alms dashboard`, `alms completions`, `alms run list` and
+  `run show`, `alms run create` without `--agent`, and `alms job create` and `job cancel`.
+
+  **After upgrading**, a gateway that was silently running on defaults because of a broken
+  file refuses to start until the file is fixed. Once it starts, it uses that file's
+  settings, which may differ from what it was running with.
+
 - **Agent-loop hard caps now default ON, and the run-duration guard is inactivity-based.**
   `[llm].max_iterations` defaults to `500` and bounds a single run of any type — web chat,
   scheduled job, or subagent. A run is terminated when it stops making *progress* rather

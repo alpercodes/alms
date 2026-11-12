@@ -1233,11 +1233,16 @@ fn test_load_or_default_resolves_data_dir() {
     // irrelevant here.
     let _mock_guard = SingleEnvGuard::remove("ALMS_LLM_MOCK");
 
-    let config = AlmsConfig::load_or_default();
+    // Empty working and home directories, through the fallible loader: the
+    // exiting `load_or_default()` with the developer's real HOME would end
+    // the whole test binary on a broken `~/.config/alms/config.toml`.
+    let cwd = tempfile::tempdir().expect("tempdir creates");
+    let home = tempfile::tempdir().expect("tempdir creates");
+    let config = load_from(cwd.path(), home.path()).expect("defaults load");
     let data_path = std::path::Path::new(&config.server.data_dir);
     assert!(
         data_path.is_absolute(),
-        "data_dir should be absolute after load_or_default(), got: {}",
+        "data_dir should be absolute after load_or_default_fallible(), got: {}",
         config.server.data_dir
     );
 }
@@ -2330,7 +2335,7 @@ summary_provider = ""
 // ---- #924: load_or_default fail-fast on validate() failure ----
 //
 // `AlmsConfig::load_or_default()` is the path the gateway entrypoint
-// (`alms gateway`) uses (via `crates/alms-cli/src/main.rs:137`). Pre-#924
+// (`alms gateway`) uses (via the early load in `crates/alms-cli/src/main.rs`). Pre-#924
 // it caught every `load()` error — including `validate()` violations —
 // and silently fell back to compiled defaults with a stderr warning.
 // That meant a hand-edited `alms.toml` with one of the pair-only
@@ -2346,19 +2351,17 @@ summary_provider = ""
 // satisfied — `AlmsConfig::load()` did refuse, but `load_or_default()`
 // was the one actually wired into the gateway boot path.
 //
-// The fix splits two error classes:
-//   - File-load failures (IO / TOML parse) → warn + use defaults.
-//     First-run / fresh-install / corrupted-file scenarios still
-//     produce a working daemon.
-//   - Validation failures → fatal, process exits non-zero with a clear
-//     stderr message pointing at the bad field.
+// A config file that exists is always fatal if it can't be used: one that
+// fails `validate()`, and one that can't be read or parsed. Falling back to
+// defaults on the second kind discarded the whole file, `shell_policy` and
+// `[security]` included. Only a missing file means defaults (first run).
 //
 // Tests use `load_or_default_fallible()` — the inner `Result`-returning
 // shape — so they can assert on the error path without aborting the
 // test process. The public `load_or_default()` wraps it with
-// `std::process::exit(1)` on Err. The two CWD-based tests serialise
-// against `ENV_LOCK` because `find_config_file()` reads from the
-// process cwd, which is shared across parallel tests.
+// `std::process::exit(1)` on Err. The tests that change the working
+// directory serialise against `ENV_LOCK` because `find_config_file()`
+// reads from the process cwd, which is shared across parallel tests.
 
 /// Verify the fail-fast contract directly at the helper boundary:
 /// `load_or_default_fallible()` must return `Err(InvalidConfig(_))`
@@ -2476,49 +2479,126 @@ fn test_load_or_default_succeeds_with_no_config_file() {
     );
 }
 
-/// Verify a corrupt / unparseable `alms.toml` still falls back to
-/// defaults rather than aborting. This pins the
-/// "file-load-failures-are-recoverable" axis of the #924 split: only
-/// `validate()` errors are fatal, not IO / TOML-parse errors.
-///
-/// (Whether to make TOML parse errors fatal is an open design
-/// question in the issue; the chosen behaviour is to keep them
-/// recoverable so a corrupted file doesn't lock the operator out of
-/// running the daemon at all. The `validate()` axis, post-fallback, is
-/// guaranteed to pass on defaults.)
+/// Runs `load_or_default_fallible` with `cwd` as the working directory and
+/// `home` as the home directory.
+fn load_from(cwd: &std::path::Path, home: &std::path::Path) -> AlmsResult<AlmsConfig> {
+    let _home_guard = SingleEnvGuard::set("HOME", home.to_str().unwrap());
+    let _userprofile_guard = SingleEnvGuard::set("USERPROFILE", home.to_str().unwrap());
+    let saved_cwd = std::env::current_dir().expect("cwd readable");
+    std::env::set_current_dir(cwd).expect("chdir to tempdir");
+    let result = AlmsConfig::load_or_default_fallible();
+    std::env::set_current_dir(&saved_cwd).expect("restore cwd");
+    result
+}
+
+/// An `alms.toml` that won't parse must not be replaced by defaults: that would
+/// silently drop every setting in it, including `shell_policy`.
 #[test]
-fn test_load_or_default_falls_back_to_defaults_on_unparseable_toml() {
+fn test_load_or_default_refuses_an_unparseable_config_file() {
     let _lock = ENV_LOCK.lock().unwrap();
     let _provider_guard = SingleEnvGuard::remove("ALMS_LLM_PROVIDER");
     let _mock_guard = SingleEnvGuard::remove("ALMS_LLM_MOCK");
-    let empty_home_dir = tempfile::tempdir().expect("tempdir creates");
-    let _home_guard = SingleEnvGuard::set("HOME", empty_home_dir.path().to_str().unwrap());
-    let _userprofile_guard =
-        SingleEnvGuard::set("USERPROFILE", empty_home_dir.path().to_str().unwrap());
+    let home = tempfile::tempdir().expect("tempdir creates");
+    let cwd = tempfile::tempdir().expect("tempdir creates");
+    std::fs::write(cwd.path().join("alms.toml"), "not valid toml { } [unclosed")
+        .expect("toml write");
 
-    let tempdir = tempfile::tempdir().expect("tempdir creates");
-    let toml_path = tempdir.path().join("alms.toml");
-    std::fs::write(&toml_path, "not valid toml { } [unclosed").expect("toml write");
+    let err = load_from(cwd.path(), home.path()).expect_err("an unparseable file must be fatal");
 
-    let saved_cwd = std::env::current_dir().expect("cwd readable");
-    std::env::set_current_dir(tempdir.path()).expect("chdir to tempdir");
-
-    let result = AlmsConfig::load_or_default_fallible();
-
-    std::env::set_current_dir(&saved_cwd).expect("restore cwd");
-
-    // Corrupt-file fallback returns Ok(defaults), not Err — the file
-    // axis is recoverable. The validate-axis is fatal (covered by
-    // `test_load_or_default_fail_fast_on_partial_summary_pair`).
-    let cfg = result.expect(
-        "an unparseable alms.toml must fall back to defaults, not \
-         abort — only validate() failures are fatal under #924",
-    );
     assert!(
-        cfg.context.summary_provider.as_deref() == Some("openrouter")
-            && cfg.context.summary_model.as_deref() == Some("google/gemma-4-31b-it"),
-        "fallback config should carry the default summary pair (#1191)"
+        matches!(err, AlmsError::InvalidConfig(_)),
+        "expected InvalidConfig, got: {err:?}"
     );
+    let msg = err.to_string();
+    // The full path, so an operator who doesn't know the service's working
+    // directory still finds the file.
+    let full = std::path::Path::new(cwd.path().file_name().unwrap()).join("alms.toml");
+    assert!(
+        msg.contains(&*full.to_string_lossy()),
+        "must name the file by its full path: {msg}"
+    );
+    assert!(msg.contains("TOML parse error"), "must say why: {msg}");
+}
+
+/// A single bad value fails the whole parse, the same way a syntax error does.
+#[test]
+fn test_load_or_default_refuses_a_bad_value_in_a_config_file() {
+    let _lock = ENV_LOCK.lock().unwrap();
+    let _provider_guard = SingleEnvGuard::remove("ALMS_LLM_PROVIDER");
+    let _mock_guard = SingleEnvGuard::remove("ALMS_LLM_MOCK");
+    let home = tempfile::tempdir().expect("tempdir creates");
+    let cwd = tempfile::tempdir().expect("tempdir creates");
+    std::fs::write(
+        cwd.path().join("alms.toml"),
+        "[llm.providers.x]\nkind = \"not-a-kind\"\nbase_url = \"http://127.0.0.1:9/v1\"\n",
+    )
+    .expect("toml write");
+
+    let err = load_from(cwd.path(), home.path()).expect_err("a bad value must be fatal");
+
+    assert!(err.to_string().contains("not-a-kind"), "got: {err}");
+}
+
+/// The fallback location gets the same treatment as `./alms.toml`.
+#[test]
+fn test_load_or_default_refuses_an_unparseable_home_config_file() {
+    let _lock = ENV_LOCK.lock().unwrap();
+    let _provider_guard = SingleEnvGuard::remove("ALMS_LLM_PROVIDER");
+    let _mock_guard = SingleEnvGuard::remove("ALMS_LLM_MOCK");
+    let home = tempfile::tempdir().expect("tempdir creates");
+    let cwd = tempfile::tempdir().expect("tempdir creates");
+    let dir = home.path().join(".config").join("alms");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    std::fs::write(dir.join("config.toml"), "[llm").expect("toml write");
+
+    let err = load_from(cwd.path(), home.path()).expect_err("an unparseable file must be fatal");
+
+    assert!(err.to_string().contains("config.toml"), "got: {err}");
+}
+
+/// A file that exists but can't be read is refused too. A directory stands in
+/// for an unreadable file, because permission bits don't stop every test user.
+#[test]
+fn test_load_or_default_refuses_an_unreadable_config_file() {
+    let _lock = ENV_LOCK.lock().unwrap();
+    let _provider_guard = SingleEnvGuard::remove("ALMS_LLM_PROVIDER");
+    let _mock_guard = SingleEnvGuard::remove("ALMS_LLM_MOCK");
+    let home = tempfile::tempdir().expect("tempdir creates");
+    let cwd = tempfile::tempdir().expect("tempdir creates");
+    std::fs::create_dir(cwd.path().join("alms.toml")).expect("mkdir");
+
+    let err = load_from(cwd.path(), home.path()).expect_err("an unreadable file must be fatal");
+
+    assert!(err.to_string().contains("cannot read"), "got: {err}");
+}
+
+/// A dangling `alms.toml` symlink is a file that exists but can't be read, not
+/// a missing one. `Path::exists()` follows the link, so it used to count as
+/// absent and the load fell through to defaults (or the home config).
+#[cfg(unix)]
+#[test]
+fn test_load_or_default_refuses_a_dangling_config_symlink() {
+    let _lock = ENV_LOCK.lock().unwrap();
+    let _provider_guard = SingleEnvGuard::remove("ALMS_LLM_PROVIDER");
+    let _mock_guard = SingleEnvGuard::remove("ALMS_LLM_MOCK");
+    let home = tempfile::tempdir().expect("tempdir creates");
+    let cwd = tempfile::tempdir().expect("tempdir creates");
+    std::os::unix::fs::symlink(cwd.path().join("gone.toml"), cwd.path().join("alms.toml"))
+        .expect("symlink");
+
+    let err = load_from(cwd.path(), home.path()).expect_err("a dangling link must be fatal");
+
+    assert!(err.to_string().contains("alms.toml"), "got: {err}");
+}
+
+/// Now that a file that won't parse stops ALMS from starting, the example
+/// operators copy has to parse and validate.
+#[test]
+fn test_alms_toml_example_loads() {
+    let mut config: AlmsConfig = toml::from_str(include_str!("../../../../alms.toml.example"))
+        .expect("alms.toml.example must parse");
+    config.llm.ensure_builtin_providers();
+    config.validate().expect("alms.toml.example must validate");
 }
 
 // ── #947: SecurityConfig (allow_full_os_access) ──────────────────────
