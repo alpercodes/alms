@@ -1,4 +1,4 @@
-.PHONY: all fmt clippy test check ci frontend-install frontend-build frontend-check frontend-test-e2e
+.PHONY: all fmt clippy doc test check ci frontend-install frontend-build frontend-check frontend-test-e2e
 
 # Default target - run all checks
 all: fmt clippy test
@@ -17,6 +17,12 @@ fmt-check:
 clippy:
 	@echo "==> Running clippy"
 	cargo clippy --all-targets --all-features -- -D warnings
+
+# Check documentation, including broken intra-doc links in private items.
+# Keep in step with the "Check documentation" step in .github/workflows/ci.yml.
+doc:
+	@echo "==> Checking documentation"
+	RUSTDOCFLAGS="-D warnings -A rustdoc::private_intra_doc_links" cargo doc --workspace --no-deps --document-private-items --all-features
 
 # Run all tests
 test:
@@ -40,7 +46,7 @@ check:
 	cargo check --all
 
 # Full CI pipeline (what CI runs)
-ci: frontend-check fmt-check clippy test build-release
+ci: frontend-check fmt-check clippy doc test build-release
 	@echo "==> All CI checks passed"
 
 # Build release binary (CI includes this)

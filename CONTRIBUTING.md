@@ -46,6 +46,9 @@ make fmt-check
 # Run clippy lints
 make clippy
 
+# Check documentation (broken intra-doc links, rustdoc warnings)
+make doc
+
 # Run tests
 make test
 
@@ -84,14 +87,22 @@ The CI pipeline (`.github/workflows/ci.yml`) runs:
 
 1. `cargo fmt --all -- --check` - Ensures consistent formatting
 2. `cargo clippy --all-targets --all-features -- -D warnings` - Static analysis
-3. `cargo test --all` - Runs all tests including golden tests and the
+3. `cargo doc --workspace --no-deps --document-private-items --all-features` with
+   `RUSTDOCFLAGS="-D warnings -A rustdoc::private_intra_doc_links"` (the `Check documentation`
+   step) - Fails on broken intra-doc links and other rustdoc warnings, private items included
+4. `cargo test --all` - Runs all tests including golden tests and the
    static-asset JS parse-sweep (`tests/static_assets_parse.rs`)
-4. `cargo build --release` - Verifies release build works
-5. `bash -n install.sh` and `shellcheck install.sh` (the `Check install.sh` step) -
+5. `cargo build --release` - Verifies release build works
+6. `bash -n install.sh` and `shellcheck install.sh` (the `Check install.sh` step) -
    Parses and lints the install script
 
-`make ci` runs steps 1-4 locally for parity. It does not run step 5; if you change
+`make ci` runs steps 1-5 locally for parity. It does not run step 6; if you change
 `install.sh`, run those two commands yourself.
+
+Step 3 only reads doc comments on items it documents. It does not check `#[cfg(test)]`
+items, files under `tests/`, or code gated to a platform other than the one building the
+docs. CI builds on Linux, so it checks the Landlock code, but `make doc` on macOS or
+Windows does not, and CI never checks code gated to Windows or macOS only.
 
 Two more required checks, `Security audit (Rust)` and `Security audit (frontend)`, check
 `Cargo.lock` and `package-lock.json` against advisory databases. `make ci` does not run

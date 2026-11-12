@@ -57,7 +57,7 @@ pub(super) fn is_error_marker(msg: &Message) -> bool {
 /// persist_lifecycle_marker`: `Role::System` messages tagged with
 /// `metadata.synthetic == true` (job notifications, DM-ended, subagent
 /// completion, …). `session_msg_to_llm` rebuilds them as `role = "system"`
-/// [`LlmMessage`]s (see `rebuild.rs`), which the canonical-shape pass then
+/// [`LlmMessage`](crate::llm_types::LlmMessage)s (see `rebuild.rs`), which the canonical-shape pass then
 /// strips, so they never reach the provider adapter.
 ///
 /// Error markers (`metadata.kind == "error"`) are deliberately excluded:

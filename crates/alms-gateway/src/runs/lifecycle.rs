@@ -1115,7 +1115,7 @@ pub(super) fn apply_send_message_fold(
     }
 }
 
-/// RAII guard that calls [`RunManager::untrack_in_flight`] on drop.
+/// RAII guard that calls [`crate::server::RunManager::untrack_in_flight`] on drop.
 ///
 /// This ensures the in-flight counter is always decremented even when the
 /// run task panics, preventing `wait_drain` from blocking indefinitely.

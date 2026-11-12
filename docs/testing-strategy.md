@@ -166,7 +166,8 @@ GitHub CI runs four parallel jobs:
    lint, format-check, run Vitest, reproduce the committed Vite bundle, and run
    the Chromium Playwright suite.
 2. **Rust:** `cargo fmt --all -- --check`, Clippy for all targets/features with
-   warnings denied, `cargo test --all`, and `cargo build --release`.
+   warnings denied, `cargo doc` with rustdoc warnings denied (private items
+   included), `cargo test --all`, and `cargo build --release`.
 3. **Security audit (Rust):** check `Cargo.lock` against the RustSec advisory
    database.
 4. **Security audit (frontend):** check `package-lock.json` against the npm

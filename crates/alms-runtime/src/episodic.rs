@@ -4,7 +4,7 @@
 //!
 //! At the end of each successful run, the gateway may generate or update a
 //! per-session summary.  The summary mode is controlled by
-//! [`RunSummaryMode`](alms_core::config::RunSummaryMode) from the context
+//! [`RunSummaryMode`] from the context
 //! config.
 //!
 //! Two modes are supported:
@@ -57,7 +57,7 @@ const LLM_CONTEXT_BYTES: usize = 2000;
 /// actual summary text is typically 50-150 tokens, but reasoning models (e.g.
 /// deepseek-r1, kimi-k2.6) may spend 200-800 tokens on thinking first.
 ///
-/// Configurable via [`ContextConfig::summary_max_tokens`].
+/// Configurable via [`alms_core::config::ContextConfig::summary_max_tokens`].
 ///
 /// Kept as a reference constant; the runtime value is always provided via
 /// `SummaryParams::summary_max_tokens` (sourced from config).
@@ -90,7 +90,7 @@ pub struct SummaryParams {
     /// Agent name — used to derive the peer in DM sessions.
     pub agent_name: String,
     /// Maximum output tokens for the LLM summarizer call.
-    /// The gateway always provides this from [`ContextConfig::summary_max_tokens`].
+    /// The gateway always provides this from [`alms_core::config::ContextConfig::summary_max_tokens`].
     pub summary_max_tokens: u32,
 }
 
@@ -270,7 +270,7 @@ pub struct PersistSummaryRequest {
     /// Agent name — used to derive the peer in DM sessions.
     pub agent_name: String,
     /// Maximum output tokens for the LLM summarizer call.
-    /// The gateway always provides this from [`ContextConfig::summary_max_tokens`].
+    /// The gateway always provides this from [`alms_core::config::ContextConfig::summary_max_tokens`].
     pub summary_max_tokens: u32,
 }
 
@@ -857,7 +857,7 @@ use alms_session::SessionSummary;
 /// **Budget contract:** The caller is responsible for ensuring `budget_tokens`
 /// is already clamped to the configured percentage cap (15% of
 /// `max_input_tokens` by default, enforced in
-/// [`ContextConfig::normalize_episodic`]).  This function does not re-enforce
+/// [`alms_core::config::ContextConfig::normalize_episodic`]).  This function does not re-enforce
 /// the cap — it trusts the budget it receives.
 pub fn format_episodic_for_injection(
     summaries: &[SessionSummary],

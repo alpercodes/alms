@@ -1028,8 +1028,8 @@ impl Default for SessionConfig {
 /// - `truncate` — pure token-budget walk: keep the most recent messages
 ///   that fit the per-request budget; drop everything older.
 /// - `compact` — Claude-Code / Codex style auto-compact: when
-///   assembled history crosses [`compact_trigger_pct`] of the budget,
-///   summarise the older prefix and retain at most [`compact_retain_pct`]
+///   assembled history crosses [`Self::compact_trigger_pct`] of the budget,
+///   summarise the older prefix and retain at most [`Self::compact_retain_pct`]
 ///   worth of recent verbatim messages. Renamed from `sliding-summary`.
 /// - `full` — include all history; for small conversations / cheap models.
 ///
@@ -1525,10 +1525,10 @@ pub struct ToolsConfig {
 
     /// Built-in risk classification mode for shell commands.
     ///
-    /// Layers on top of [`shell_permissions`]: permissions = user policy,
+    /// Layers on top of [`Self::shell_permissions`]: permissions = user policy,
     /// classification = built-in risk detection. Both must pass before a
     /// command is executed. See
-    /// [`alms_sandbox::shell::classification`] for the full set of
+    /// `alms_sandbox::shell::classification` for the full set of
     /// heuristics.
     ///
     /// Default: `block_destructive` (safe default that blocks `rm -rf /`,
@@ -1553,7 +1553,7 @@ pub struct ToolsConfig {
     /// The agent can then `fs_read` the spill path with offset/limit to
     /// inspect the middle of the output that truncation dropped.
     ///
-    /// Like [`shell_permissions`], this is **config-file-only** and not
+    /// Like [`Self::shell_permissions`], this is **config-file-only** and not
     /// mutable via `PATCH /settings` — the spill directory and retention
     /// window affect disk usage and are considered operator-level policy.
     #[serde(default)]
@@ -1571,7 +1571,7 @@ pub struct ToolsConfig {
     /// shape and retention semantics, but applies to *every* tool —
     /// closing the multi-tool context-blowup hole reported in #851.
     ///
-    /// Like [`shell_spill`], **config-file-only**.
+    /// Like [`Self::shell_spill`], **config-file-only**.
     #[serde(default)]
     pub tool_output_truncate: ToolOutputTruncateConfig,
 }
@@ -1673,7 +1673,7 @@ pub enum ShellClassificationMode {
 /// **Startup-only**: Shell permissions are compiled from config at process
 /// startup (or agent creation) and are not dynamically changeable via
 /// `PATCH /settings`. This is intentional -- regex patterns are compiled
-/// once into [`alms_sandbox::shell::permissions::CompiledPermissions`] and
+/// once into `alms_sandbox::shell::permissions::CompiledPermissions` and
 /// baked into the `ShellTool` instance. Changing them at runtime would
 /// require reconstructing the shell tool and re-registering it in the tool
 /// registry, which is not currently supported.
@@ -1944,7 +1944,7 @@ impl SecurityConfig {
     ///
     /// Empty input (an unnamed/ephemeral agent) never matches because empty
     /// entries in the list itself would be a configuration error caught by
-    /// [`Self::validate`]. The check is O(n) — the list is short by
+    /// [`crate::AlmsConfig::validate`]. The check is O(n) — the list is short by
     /// design (a handful of operator-blessed agents), so a `HashSet` is
     /// not worth the allocation cost.
     pub fn is_full_os_access_agent(&self, agent_name: &str) -> bool {

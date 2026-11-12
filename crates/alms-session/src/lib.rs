@@ -44,9 +44,9 @@ pub struct SessionManager {
     sessions: Arc<DashMap<(AgentId, String), Session>>,
     /// Reverse index: session_id -> (agent_id, context_id) for O(1) lookup by ID.
     session_by_id: Arc<DashMap<SessionId, (AgentId, String)>>,
-    /// Session history: session_id -> Vec<Message>
+    /// Session history: `session_id -> Vec<Message>`
     history: Arc<DashMap<SessionId, Vec<Message>>>,
-    /// Audit events: session_id -> Vec<AuditEvent>
+    /// Audit events: `session_id -> Vec<AuditEvent>`
     audit: Arc<DashMap<SessionId, Vec<AuditEvent>>>,
     /// Rolling context summaries: session_id -> ContextSummary
     summaries: Arc<DashMap<SessionId, ContextSummary>>,
@@ -510,7 +510,7 @@ impl SessionManager {
     ///
     /// Performs a reverse scan inside the DashMap read guard and clones only the
     /// single matching [`Message`], avoiding a full `Vec<Message>` clone that
-    /// [`get_history`] would require.
+    /// [`Self::get_history`] would require.
     ///
     /// Returns `None` if the session does not exist **or** no message matches.
     pub fn find_last_message<F>(&self, session_id: SessionId, mut predicate: F) -> Option<Message>
@@ -563,7 +563,7 @@ impl SessionManager {
     /// the agent is a participant.
     ///
     /// Shared DM sessions are stored under `AgentId::nil()` (sentinel) in the
-    /// in-memory map, so [`list_active`] misses them.  This method supplements
+    /// in-memory map, so [`Self::list_active`] misses them.  This method supplements
     /// the normal list with DM sessions whose `context_id` matches
     /// `dm:...<agent_name>...`.
     pub fn list_active_with_dms(&self, agent_id: AgentId, agent_name: &str) -> Vec<Session> {

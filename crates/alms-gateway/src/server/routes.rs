@@ -129,7 +129,7 @@ fn serve_embedded_file(path: &str) -> axum::response::Response {
 ///
 /// This is the single source of truth for:
 /// - [`protected_router`] (production route registration), and
-/// - the in-test `Router` in [`crate::auth::tests`] (regression guard).
+/// - the in-test `Router` in `crate::auth::tests` (regression guard).
 ///
 /// If an entry is added to [`SSE_ENDPOINT_SEGMENTS`] without a matching arm
 /// below, the server panics at startup — a loud failure that catches the
@@ -301,7 +301,7 @@ async fn health_check() -> impl IntoResponse {
     }))
 }
 
-/// GET /sessions?agent_id=<uuid>&include_dms=true — list sessions.
+/// `GET /sessions?agent_id=<uuid>&include_dms=true` — list sessions.
 ///
 /// By default, excludes the truly internal session types (episodic,
 /// subagent) — these are implementation details not shown in the
@@ -929,7 +929,7 @@ async fn get_session_tool_calls(
     }
 }
 
-/// GET /audit?session_id=<uuid>&limit=<n>
+/// `GET /audit?session_id=<uuid>&limit=<n>`
 async fn get_audit(
     State(state): State<AppState>,
     Query(params): Query<AuditQuery>,

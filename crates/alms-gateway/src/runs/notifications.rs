@@ -2981,7 +2981,7 @@ pub(crate) async fn run_trigger_loop(
 // DM event loop (live message SSE forwarding, #632)
 // ---------------------------------------------------------------------------
 
-/// Receives [`DmEvent`] notifications from the `MessageBus` and emits
+/// Receives [`alms_coordinator::message_bus::DmEvent`] notifications from the `MessageBus` and emits
 /// `dm_message` SSE events to any web UI client watching the DM session.
 ///
 /// Without this loop, DM messages are invisible during live viewing and only

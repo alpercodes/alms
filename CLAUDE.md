@@ -15,7 +15,8 @@ cargo build --release
 cargo run --bin alms -- gateway --bind 127.0.0.1:8080
 
 # Run all CI checks locally
-make ci          # fmt-check + clippy + test + build-release
+make ci          # frontend-check + fmt-check + clippy + doc + test + build-release
+make doc         # rustdoc with warnings denied, private items included (CI's doc check)
 make test        # cargo test --all
 make test-golden # SSE golden tests only
 make clippy      # cargo clippy -- -D warnings
