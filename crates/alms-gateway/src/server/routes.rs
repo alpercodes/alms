@@ -708,6 +708,7 @@ async fn delete_session_by_id(
                 .delete(session.agent_id, &session.context_id)
             {
                 Ok(()) => {
+                    state.run_manager.forget_summary_problem(session_id);
                     Json(serde_json::json!({ "ok": true, "deleted": session_id.0.to_string() }))
                         .into_response()
                 }

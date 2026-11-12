@@ -387,6 +387,24 @@ impl SseEventData {
         )
     }
 
+    /// The session's conversation-summary state: `failure` is the problem to
+    /// show, or `None` when there is none any more.
+    ///
+    /// State rather than a log entry, so it is sent transiently and never
+    /// replayed. See `RunManager::report_summary_status`.
+    pub fn summary_status(
+        session_id: alms_core::SessionId,
+        failure: Option<alms_runtime::SummaryFailure>,
+    ) -> Self {
+        Self::new(
+            "summary_status",
+            SummaryStatusData {
+                session_id: session_id.0.to_string(),
+                failure,
+            },
+        )
+    }
+
     pub fn run_cancelled(run_id: RunId) -> Self {
         Self::new(
             "run_cancelled",
@@ -1342,6 +1360,13 @@ struct SessionActivityEndedData {
     ts: DateTime<Utc>,
 }
 
+/// Wire payload for the session-scoped `summary_status` event.
+#[derive(Debug, Clone, Serialize)]
+struct SummaryStatusData {
+    session_id: String,
+    failure: Option<alms_runtime::SummaryFailure>,
+}
+
 /// Classify an error message into an error code for the frontend.
 ///
 /// The code is used by the UI to pick appropriate styling:
@@ -1431,6 +1456,23 @@ mod tests {
 
         let run_error = SseEventData::run_error_with_code(run_id, "INTERNAL", "boom");
         assert_eq!(run_error.data, fixtures["sse"]["run_error"]);
+
+        let summary_failing = SseEventData::summary_status(
+            session_id,
+            Some(alms_runtime::SummaryFailure {
+                code: alms_runtime::SummaryFailureCode::MissingKey,
+                provider: "openrouter".into(),
+                model: "google/gemma-4-31b-it".into(),
+                message: "Conversation summaries failed.".into(),
+            }),
+        );
+        assert_eq!(summary_failing.event_type, "summary_status");
+        assert_eq!(summary_failing.event_id, None);
+        assert_eq!(summary_failing.data, fixtures["sse"]["summary_status"]);
+        assert_eq!(
+            SseEventData::summary_status(session_id, None).data,
+            serde_json::json!({ "session_id": session_id.0.to_string(), "failure": null })
+        );
 
         let approval = SseEventData::approval_required(
             run_id,

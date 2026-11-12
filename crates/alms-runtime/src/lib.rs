@@ -22,6 +22,7 @@ pub mod llm_client;
 pub mod llm_types;
 pub mod scheduler;
 pub mod summary_client;
+pub mod summary_failure;
 pub mod tool_output_truncate;
 pub mod tools;
 pub mod workspace;
@@ -33,6 +34,7 @@ pub use llm_client::LlmClient;
 pub use llm_types::*;
 pub use scheduler::Scheduler;
 pub use summary_client::build_summary_client;
+pub use summary_failure::{SummaryFailure, SummaryFailureCode};
 pub use workspace::{AgentWorkspace, WorkspaceFile};
 
 // Re-export core types for convenience

@@ -555,6 +555,18 @@ The gateway pre-flights every `POST /runs` against the published context window 
 
 **Non-HTTP run failure mode (`run_error` SSE).** Triggered or queued runs that have no synchronous caller — peer DMs initiated via the `send_message` tool, scheduler / cron jobs, notification runs, subagent-completion runs, and HTTP runs whose effective budget was mutated by `PATCH /settings` or `PUT /agents/{id_or_name}` while they sat in the queue — cannot receive a synchronous 400. The same pre-flight check fires inside `execute_run` for these paths and emits a `run_error` SSE event instead. The event uses the standard `run_error` shape documented under § 5.3 *Event types* (`{ "run_id": "<uuid>", "error": { "code": "INVALID_TOKEN_BUDGET_FOR_PROVIDER", "message": "..." } }`) — no extra structured fields are added beyond `error.code` and `error.message`. The same budget detail the 400 envelope spreads across `provider` / `model` / `max_input_tokens` / `max_tokens` / `effective_total` / `provider_cap` keys is folded into the human-readable `error.message` string (e.g. `"configured token budget exceeds provider cap: context.max_input_tokens (250000) + agent.max_tokens (32000) = 282000 > anthropic claude-haiku-4-5 context window (200000). ..."`). The run is marked `Failed` before it ever enters the running set, and queue advance is broadcast so queued-behind runs see their positions decrement. Clients that already branch on `error.code` will pick this up without code changes; clients that want structured budget detail on the SSE surface should treat the 400 envelope from § 5.1 as the canonical field shape and either parse `error.message` or correlate by `run_id` to a separate `GET /runs/{run_id}` lookup.
 
+**Response 400** (the agent's provider is not configured, #172):
+```json
+{
+  "error_code": "AGENT_PROVIDER_NOT_CONFIGURED",
+  "message": "agent <uuid>: provider 'mylab' is not configured — known providers: [...]. Add an `[llm.providers.mylab]` entry to alms.toml first, or use one of those.",
+  "agent_id": "<uuid>",
+  "provider": "mylab"
+}
+```
+
+The agent's stored `provider` has no `[llm.providers.<name>]` entry. It was set with `alms agent create --provider`, or its entry was removed from `alms.toml`. Nothing is sent to any provider. Change or clear the provider with `PUT /agents/{id_or_name}` (§ 9.4). A run with no synchronous caller (DM, job, notification) is marked `failed` with the same message and emits `run_error` with code `AGENT_PROVIDER_NOT_CONFIGURED`. A named subagent's dispatch fails with the same message. A Telegram message is dropped with an error in the log.
+
 Why not `POST /agent/run`?
 - ALMS is about runs as first-class entities (auditable, cancellable, streamable).
 
@@ -775,6 +787,24 @@ Transient phase indicator emitted at key moments during the agent loop so the UI
 
 Emitted for non-fatal conditions that the frontend should display distinctly (yellow warning styling). Warning codes: `DM_EMPTY_REPLY_RETRY` (peer-triggered DM run produced no deliverable reply text -- nudging once to reply with text or use `ignore_message`; #1154), `DM_EMPTY_REPLY` (the nudge was exhausted -- the gateway ends the DM conversation with an `errored` reason so the peer is notified), `WORKSPACE_PROMPT_TRUNCATED` (a workspace file did not fit the bytes this run's prompt budget left it, so the system prompt carries a partial window of it and a whole-file `workspace_write` replacement is refused until the agent has seen the whole file; emitted at most once per file per run, and the message names the agent, the file, its size and the bytes it was given). When the warning originates from a subagent, the payload includes a `source_agent` field identifying which subagent emitted it.
 
+`summary_status`
+Session stream only. The current state of the session's conversation summaries, both post-run episodic summaries and compaction. `failure` is the problem to show, or `null` once there is none.
+```json
+{
+  "session_id": "<uuid>",
+  "failure": {
+    "code": "MISSING_KEY",
+    "provider": "openrouter",
+    "model": "google/gemma-4-31b-it",
+    "message": "Conversation summaries failed: no API key is set for OpenRouter (summary model: google/gemma-4-31b-it). To fix this, switch summaries to a provider that has a key or needs none, in Settings (...), or add an OpenRouter key in Settings (API Keys)."
+  }
+}
+```
+
+`code` values: `MISSING_KEY` (the provider needs a key and has none, so the summary was not sent at all; or a provider declared without a key answered 401/403), `REJECTED_KEY` (a key was sent and the provider answered 401/403), `UNREACHABLE` (no HTTP answer: connection refused, DNS, timeout; or a response body that stalled or broke off), `REJECTED_REQUEST` (any other 4xx, typically an unknown model), `RATE_LIMITED` (429), `PROVIDER_ERROR` (5xx), `UNUSABLE_OUTPUT` (the call succeeded but returned no usable summary). `provider` is the configured name the call went to. `model` is empty when none is configured for the provider. `message` is written for the user, offers a key only for the two key codes, and never quotes the provider's response.
+
+This describes a state, so it is sent only when the state changes: a failure repeating after every run sends one event. It clears when a summary next succeeds, or when a change that may have fixed it lands (`PATCH /settings` with `context.summary_model` or `context.summary_provider`, `PUT /auth/keys` for that provider, or a change to the agent's own summary pair); if the change did not fix it, the next run's summary reports it again. Like `status`, it is not persisted to any event log and not replayed by the `last_event_id` cursor. Instead, a session stream with a current problem sends it at attach time, right after `stream_state`, so a reload or second tab sees it; a client should treat a new connection as "no problem" until told otherwise. The state is held in memory, so after a gateway restart it is absent until the next failing summary. It is never written to the session's messages and never reaches a model's context. A compaction failure inside a subagent run does not produce this event. With `run_summary_mode = "off"`, nothing reports after a compaction failure once compaction stops running (for example after switching the strategy to `truncate`), so that banner stays until a summary-pair or key change clears it, or the gateway restarts.
+
 `run_cancelled`
 ```json
 { "run_id": "<uuid>", "ts": "..." }
@@ -805,13 +835,13 @@ Emitted on the DM session SSE stream when a DM conversation between two agents e
 }
 ```
 
-`reason` values: `"ignored"` (agent called `ignore_message`), `"depth_exceeded"` (MAX_DM_DEPTH reached), `"user_cancelled"` (operator cancelled the run via `POST /runs/{id}/cancel` or `POST /sessions/{id}/cancel-dm`), `"errored"` (the run failed mid-flight — LLM error, tool error, posture trip, etc.).
+`reason` values: `"ignored"` (agent called `ignore_message`), `"depth_exceeded"` (MAX_DM_DEPTH reached), `"user_cancelled"` (operator cancelled the run via `POST /runs/{id}/cancel` or `POST /sessions/{id}/cancel-dm`), `"errored"` (the run failed mid-flight — LLM error, tool error, posture trip, the gateway shutting down, etc.).
 
 `suppress_banner` (optional boolean, default `false`, omitted from the wire when `false`): present and `true` ONLY on the cross-session copy forwarded to an agent's user-facing web-chat (see `notify_dm_ended_to_webchat`) when the DM-end notification run is itself the visible notification in that same chat — so the reloadable `dm_ended_notification` marker is suppressed too. When `true`, clients must still clear any "Chatting with {peer}" DM status but must NOT render a "conversation ended" banner (the run is the single notification — avoids the live half of "initiator gets both"). Every DM-session-stream emission omits this field and always renders the banner. See #1215 / #1218.
 
 `detail` (optional string, omitted from the wire when absent): the failure text behind an `"errored"` end. Present **only** on the cross-session copy forwarded to an agent's user-facing web-chat, and only for `"errored"`; every DM-session-stream emission and every non-`errored` forward omits it. Since #1258 an *interrupted* end starts no notification run, so the banner is the only live surface that explains *why* — clients rendering a "conversation ended" banner should render `detail` as an additional line when present. The same string is mirrored into the persisted `dm_ended_notification` marker's metadata, so it survives a reload.
 
-Which ends are interrupted (#1258): `"user_cancelled"` always, and `"errored"` when the run **died** mid-turn (LLM/tool failure, panic, setup failure). An `"errored"` end whose run *completed* but produced nothing deliverable — or whose final delivery hop failed — is not interrupted and still gets its notification run, because the DM transcript it carries is the only copy the operator's chat will ever see. The distinction is internal: both shapes are `"errored"` on the wire.
+Which ends are interrupted (#1258): `"user_cancelled"` always, and `"errored"` when the run **died** mid-turn (LLM/tool failure, panic, setup failure, gateway shutdown). An `"errored"` end whose run *completed* but produced nothing deliverable — or whose final delivery hop failed — is not interrupted and still gets its notification run, because the DM transcript it carries is the only copy the operator's chat will ever see. The distinction is internal: both shapes are `"errored"` on the wire.
 
 Note: If both agents call `ignore_message` simultaneously, duplicate `dm_conversation_ended` events may be emitted for the same session. Clients should handle duplicates gracefully.
 
@@ -1372,6 +1402,12 @@ Note:
   `{"user_denied": true, "message": ...}` tool result (distinct from the
   `{"error": ...}` shape used for real tool failures), then the run goes
   to `cancelled` (not `failed`) and emits `run_cancelled`.
+- A `guarded` agent running as a foreground subagent has no one to ask, so
+  its approval request is denied automatically and the run stops the same
+  way. Its tool result is `{"approval_unavailable": true, "message": ...}`
+  instead of `user_denied`, its audit row reads
+  `Tool '<name>' denied automatically: no one could be asked to approve it`,
+  and its record is `[Run stopped: tool approval could not be requested]`.
 - Runs still `Queued` on the same session are also cancelled (status
   `cancelled` + `run_cancelled` event each) so they don't auto-start when
   the per-agent queue advances. A queued run whose cancel token is not
@@ -1851,6 +1887,7 @@ Errors:
 - `400 INVALID_NAME` — name fails validation (1–64 chars, ASCII alphanumeric + hyphens, no leading/trailing hyphens, not a reserved name, not UUID-shaped). Uppercase is allowed and preserved verbatim.
 - `409 DUPLICATE_NAME` — name already exists. **Uniqueness is case-insensitive**: `Atlas` and `atlas` are the same name, because an agent's workspace is a directory at `{workspace_dir}/{name}/` and Windows/macOS filesystems are case-insensitive while Linux is not.
 - `409 WORKSPACE_EXISTS` — the name's workspace path contains data beyond the blank seed files and their lock sidecars, or the path is a symlink/file. Move or delete it before reusing the agent name; the API does not delete existing workspace data. Named subagents share this `{workspace_dir}/{name}/` path, so they can also leave a folder that blocks creation. Any agent with `fs_write` or `shell` can create the folder too, which is how a name nobody has used can still get this conflict. A registered agent's workspace is archived on deletion; this conflict can still apply to folders left by pre-upgrade deletions, unregistered named subagents, or other agents' writes.
+- `422 UNKNOWN_PROVIDER` — `provider` is neither a `[llm.providers.<name>]` entry nor a built-in name. The message lists the known providers.
 
 ### 9.3 Get agent
 `GET /agents/{id_or_name}`
@@ -1878,6 +1915,8 @@ Valid `posture` values: `"guarded"` (default — requires approval for risky too
 > **Note:** When a run is system-triggered (peer-to-peer DMs via `send_message`, notification runs, subagent completions, and scheduled jobs), Guarded posture is automatically overridden to Autonomous for that run via the `is_system_triggered` flag, since there is no human in the loop to approve tool calls. Without this override the run would wait on its first gated tool call indefinitely (the `max_run_duration_secs` backstop is checked only between iterations), until the approval is resolved or the run is cancelled. User-initiated runs (via the HTTP API) are never affected — Guarded posture is preserved as configured. A subagent takes its posture from its registry record instead: a record with no `posture`, the default for a new agent, runs `full_control` as a subagent, foreground or background, and so does an unnamed subagent or one whose name is not registered. A record set to `"guarded"` is overridden to Autonomous in the background, and keeps Guarded in the foreground, where its first gated call is denied and cancels the subagent. Guarded therefore governs the runs a human starts and is not a boundary between agents: an agent that can send a Guarded agent a DM can have it run tools without approval. See [`security-model.md` § 8.1](security-model.md#guarded-is-not-an-agent-boundary); the behaviour is under discussion in [#177](https://github.com/alpercodes/alms/issues/177).
 
 To clear a string override (`model`, `posture`, `provider`, `telegram_token`), pass an empty string: `"model": ""`.
+
+A `provider` this request sets must be a `[llm.providers.<name>]` entry or a built-in name, or the update returns `422 UNKNOWN_PROVIDER`. Surrounding whitespace is trimmed first, as on `POST`, so `" gemini "` stores `gemini` and a blank value clears the override. A name already on the record is not re-checked, so an agent left on a removed provider can still be edited. Such an agent cannot run until its provider is changed or cleared: `POST /runs` returns `400 AGENT_PROVIDER_NOT_CONFIGURED` (with `error_code`, `message`, `agent_id` and `provider`), and a run with no synchronous caller fails with the same message.
 
 **Clearing reasoning overrides (#809):** The three reasoning knobs
 — `thinking_budget_tokens`, `reasoning_effort`, `gemini_thinking_budget` —

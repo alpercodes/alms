@@ -467,6 +467,32 @@ const sseSchemaEntries = [
       .passthrough(),
   ],
   [
+    "summary_status",
+    z
+      .object({
+        session_id: uuidSchema,
+        failure: z
+          .object({
+            code: z.enum([
+              "MISSING_KEY",
+              "REJECTED_KEY",
+              "UNREACHABLE",
+              "REJECTED_REQUEST",
+              "RATE_LIMITED",
+              "PROVIDER_ERROR",
+              "UNUSABLE_OUTPUT",
+            ]),
+            provider: stringSchema,
+            // Empty when no summary model is configured for the provider.
+            model: z.string(),
+            message: stringSchema,
+          })
+          .passthrough()
+          .nullable(),
+      })
+      .passthrough(),
+  ],
+  [
     "run_warning",
     z
       .object({

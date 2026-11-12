@@ -38,6 +38,7 @@ import {
     setRunStatus,
 } from '../state/runs.js';
 import { trackSubagentStart, trackSubagentEnd, trackSubagentActivity, findSubagentByToolInvocationId, findSubagentBySessionId, setSubagentSessionId, activeSubagents } from '../state/subagents.js';
+import { applySummaryStatus, clearSummaryFailure } from '../state/summary-status.js';
 import { agentPhase, setAgentPhase, clearAgentPhase, setDmContext, revertPhase, dmPeer } from '../state/agent-status.js';
 import { messageQueue } from '../state/queue.js';
 import { activeSessionId, activeSession, dmParticipants } from '../state/sessions.js';
@@ -629,6 +630,10 @@ export function openSessionStream(sessionId, opts) {
     es.addEventListener('open', () => {
         if (es !== activeSessionEs) return;
         clearStreamDead('session');
+        // The server sends a `summary_status` straight after opening if the
+        // session has a problem, and nothing if it has none. So a stream that
+        // was down while a problem cleared has to start from "no problem".
+        clearSummaryFailure();
     });
 
     // Capture the current selectGeneration so SSE handlers can detect
@@ -2065,6 +2070,11 @@ export function openSessionStream(sessionId, opts) {
                 agentName: data.agent_name,
             });
         });
+    });
+
+    // -- summary_status: current state of the session's conversation summaries --
+    on('summary_status', (e) => {
+        applySummaryStatus(e.data);
     });
 
     // -- run_warning (non-fatal, e.g. max iterations) --

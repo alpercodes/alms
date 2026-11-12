@@ -287,7 +287,8 @@ pub enum RunStatus {
     Completed,
     /// Run failed due to error
     Failed,
-    /// Run was cancelled by user
+    /// Run was cancelled: by an operator, by the gateway shutting down, or by
+    /// an automatic approval denial
     Cancelled,
 }
 

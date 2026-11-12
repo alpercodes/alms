@@ -266,7 +266,7 @@ pub async fn stream_session_events(
         .run_manager
         .session_replay_window(session_id, last_event_id)
         .await;
-    let replay_events = replay_with_stream_state(&state, query.stream_epoch.as_deref(), window);
+    let mut replay_events = replay_with_stream_state(&state, query.stream_epoch.as_deref(), window);
 
     if !replay_events.is_empty() {
         info!(
@@ -274,6 +274,13 @@ pub async fn stream_session_events(
             replay_events.len(),
             session_id.0
         );
+    }
+
+    // Read after `attach_session_stream`, so a change landing in between
+    // arrives live, after this, rather than being missed. Goes right after
+    // `stream_state` so the banner is up before any replayed run events.
+    if let Some(status) = state.run_manager.summary_status_snapshot(session_id) {
+        replay_events.insert(1, status);
     }
 
     Ok(RunEventStream::stream_with_replay_source(subscription, replay_events).into_response())

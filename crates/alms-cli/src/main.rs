@@ -171,11 +171,10 @@ async fn main() -> anyhow::Result<()> {
 
     let is_gateway = matches!(cli.command, Commands::Gateway { .. });
 
-    // Load config early to resolve log directory.
-    // This config is reused in the Gateway branch to avoid a redundant second load.
-    // Uses load_or_default() to ensure data_dir is always absolute, even on
-    // config parse failure (see PR #317 review S1).
-    let config = alms_core::AlmsConfig::load_or_default();
+    // The gateway loads config early to resolve its log directory, and reuses it
+    // in its branch below. Other commands load it only if they use it, so a
+    // broken file can't stop `alms completions` or `alms health`.
+    let gateway_config = is_gateway.then(alms_core::AlmsConfig::load_or_default);
 
     // Stderr layer — level from RUST_LOG, defaulting to info.
     let stderr_filter = tracing_subscriber::EnvFilter::try_from_default_env()
@@ -192,7 +191,10 @@ async fn main() -> anyhow::Result<()> {
     // are silently lost. We use an explicit `drop(file_log_guard)` at the
     // end of main() to document that the guard must outlive all `.await`
     // points and to guarantee a flush on the happy-path exit.
-    let (file_layer, file_log_guard) = if is_gateway && config.logging.file_enabled {
+    let file_log_config = gateway_config
+        .as_ref()
+        .filter(|config| config.logging.file_enabled);
+    let (file_layer, file_log_guard) = if let Some(config) = file_log_config {
         let log_dir = config.logging.resolve_log_dir(&config.server.data_dir);
         match std::fs::create_dir_all(&log_dir) {
             Ok(()) => {
@@ -243,7 +245,7 @@ async fn main() -> anyhow::Result<()> {
             // honest about the precedence chain CLI > env > current_dir
             // — `ServerConfig::resolved_project_root` reads this field
             // first when non-empty.
-            let mut config = config;
+            let mut config = gateway_config.expect("loaded above for the gateway command");
             if let Some(p) = project {
                 config.server.project_root = alms_core::resolve_to_absolute(&p);
             }
@@ -398,6 +400,7 @@ async fn main() -> anyhow::Result<()> {
                 } => {
                     let workspace_dir = config.server.agents_dir();
                     let project_root = config.server.resolved_project_root();
+                    let stored_provider = cmd_agent::provider_override(provider.clone());
                     cmd_agent::agent_create(
                         &store,
                         cmd_agent::AgentCreateOpts {
@@ -418,6 +421,11 @@ async fn main() -> anyhow::Result<()> {
                             workspace_dir: Some(&workspace_dir),
                         },
                     )?;
+                    cmd_agent::warn_if_provider_unconfigured(
+                        stored_provider.as_deref(),
+                        &config.llm.providers,
+                        &mut std::io::stderr(),
+                    );
                 }
                 AgentCommands::Show { name_or_id } => {
                     cmd_agent::agent_show(&store, &name_or_id, json)?;
@@ -454,6 +462,8 @@ async fn main() -> anyhow::Result<()> {
                     force_worktree_remove,
                 } => {
                     let project_root = config.server.resolved_project_root();
+                    // A blank value clears the override, so nothing is stored to warn about.
+                    let stored_provider = cmd_agent::provider_override(provider.clone());
                     cmd_agent::agent_config(
                         &store,
                         cmd_agent::AgentConfigOpts {
@@ -475,6 +485,11 @@ async fn main() -> anyhow::Result<()> {
                             json,
                         },
                     )?;
+                    cmd_agent::warn_if_provider_unconfigured(
+                        stored_provider.as_deref(),
+                        &config.llm.providers,
+                        &mut std::io::stderr(),
+                    );
                 }
             }
         }

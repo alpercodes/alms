@@ -728,12 +728,41 @@ impl AgentRuntime {
             .as_deref()
             .unwrap_or_else(|| summary_client.default_model());
 
+        // Same rule as the episodic summarizer: a provider that needs a key it
+        // does not have gets no conversation to refuse. `Err`, so the turn
+        // takes the same fallback as any other failed compaction.
+        if summary_client.missing_required_key() {
+            warn!(
+                target: "alms.context",
+                provider = summary_client.provider(),
+                "Compaction summary not sent: the summary provider needs an API key and has none"
+            );
+            self.emit_summary_status(Some(crate::SummaryFailure::missing_key(
+                summary_client,
+                model,
+            )));
+            return Err(alms_core::AlmsError::Runtime(format!(
+                "summary provider '{}' needs an API key and has none",
+                summary_client.provider()
+            )));
+        }
+
         let request = CompletionRequest::new(model)
             .with_messages(sum_messages)
             .with_temperature(0.3) // lower temp for factual compression
             .with_max_tokens(512);
 
-        let response = summary_client.complete(request).await?;
+        let response = match summary_client.complete(request).await {
+            Ok(response) => response,
+            Err(e) => {
+                self.emit_summary_status(Some(crate::SummaryFailure::from_error(
+                    &e,
+                    summary_client,
+                    model,
+                )));
+                return Err(e);
+            }
+        };
 
         let choice = response.choices.into_iter().next();
         let finish_reason = choice.as_ref().and_then(|c| c.finish_reason.clone());
@@ -771,6 +800,10 @@ impl AgentRuntime {
                 covered = current.messages_covered,
                 "Compact strategy: summarizer returned empty response -- rolling summary and coverage unchanged"
             );
+            self.emit_summary_status(Some(crate::SummaryFailure::unusable_output(
+                summary_client,
+                model,
+            )));
             return Ok(current);
         };
 
@@ -785,6 +818,10 @@ impl AgentRuntime {
                 covered = current.messages_covered,
                 "Compact strategy: summarizer output rejected -- rolling summary and coverage unchanged"
             );
+            self.emit_summary_status(Some(crate::SummaryFailure::unusable_output(
+                summary_client,
+                model,
+            )));
             return Ok(current);
         }
 
@@ -792,6 +829,7 @@ impl AgentRuntime {
         current.messages_covered = compress_end;
         current.updated_at = Some(alms_core::Timestamp::now());
 
+        self.emit_summary_status(None);
         session_manager.update_summary(session_id, current.clone())?;
 
         info!(
@@ -853,6 +891,8 @@ mod tests {
             event_sender: None,
             run_id: None,
             cancel_token: None,
+            shutdown_token: None,
+            unroutable_approval_denied: None,
             resolved_sandbox_root: None,
             shell_unrestricted: true,
             shell_default_env: std::collections::HashMap::new(),
@@ -1196,6 +1236,130 @@ mod tests {
             .await;
             assert_left_untouched(check, &seeded, result, &persisted, calls);
         }
+    }
+
+    /// Run compaction against `reply` and return the runtime events it emitted
+    /// about the summary call, and what `maybe_summarize` returned.
+    async fn compaction_summary_status(
+        reply: alms_test_support::Canned,
+        api_key: &str,
+        history_turns: usize,
+    ) -> (
+        Vec<Option<crate::SummaryFailure>>,
+        AlmsResult<ContextSummary>,
+        usize,
+    ) {
+        use alms_test_support::ScriptedLlm;
+
+        let llm = ScriptedLlm::always(reply).await;
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut runtime = compact_runtime_with(
+            LlmClient::new(LlmConfig {
+                provider: "openrouter".into(),
+                base_url: llm.base_url(),
+                api_key: api_key.into(),
+                default_model: "summary-model".into(),
+                timeout_secs: 5,
+                ..LlmConfig::default()
+            })
+            .unwrap(),
+        );
+        runtime.event_sender = Some(tx);
+        let session_manager = SessionManager::new(SessionConfig::default());
+        let session = session_manager.get_or_create(runtime.agent_id, "test");
+        let history: Vec<Message> = (0..history_turns)
+            .map(|i| make_msg(Role::User, &real_turn(i)))
+            .collect();
+
+        let result = runtime
+            .maybe_summarize(
+                &session_manager,
+                session.id,
+                &history,
+                ContextSummary::default(),
+                0,
+            )
+            .await;
+
+        let agent_id = runtime.agent_id;
+        drop(runtime);
+        let mut statuses = Vec::new();
+        while let Some(event) = rx.recv().await {
+            if let crate::events::RuntimeEvent::SummaryStatus {
+                agent_id: emitted_by,
+                failure,
+            } = event
+            {
+                assert_eq!(emitted_by, agent_id);
+                statuses.push(failure);
+            }
+        }
+        (statuses, result, llm.calls())
+    }
+
+    fn summary_body(content: &str, finish: &str) -> String {
+        serde_json::json!({
+            "id": "compact-1",
+            "object": "chat.completion",
+            "created": 0,
+            "model": "summary-model",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": content},
+                "finish_reason": finish,
+            }],
+        })
+        .to_string()
+    }
+
+    #[tokio::test]
+    async fn a_failed_compaction_call_is_reported_and_still_errs() {
+        use alms_test_support::Canned;
+        let (statuses, result, calls) =
+            compaction_summary_status(Canned::json(401, r#"{"error":"no auth"}"#), "", 12).await;
+        assert!(result.is_err(), "the caller's fallback path must still run");
+        assert_eq!(calls, 0, "no key, so the conversation is not sent");
+        assert_eq!(statuses.len(), 1, "{statuses:?}");
+        let failure = statuses[0].as_ref().expect("a failure");
+        assert_eq!(failure.code, crate::SummaryFailureCode::MissingKey);
+        assert_eq!(failure.provider, "openrouter");
+    }
+
+    #[tokio::test]
+    async fn a_refused_compaction_reply_is_reported_as_unusable() {
+        use alms_test_support::Canned;
+        let (statuses, result, _) = compaction_summary_status(
+            Canned::json(200, summary_body("cut off mid", "length")),
+            "k",
+            12,
+        )
+        .await;
+        assert!(result.is_ok());
+        assert_eq!(statuses.len(), 1, "{statuses:?}");
+        assert_eq!(
+            statuses[0].as_ref().expect("a failure").code,
+            crate::SummaryFailureCode::UnusableOutput
+        );
+    }
+
+    #[tokio::test]
+    async fn a_good_compaction_reply_reports_no_failure() {
+        use alms_test_support::Canned;
+        let good = "The user asked alice to move the gateway config onto the layered loader,                     and alice did so and added a test covering the change.";
+        let (statuses, result, _) =
+            compaction_summary_status(Canned::json(200, summary_body(good, "stop")), "k", 12).await;
+        assert_eq!(result.unwrap().text, good);
+        assert_eq!(statuses, vec![None]);
+    }
+
+    /// Under the trigger no call is made, so nothing is known about the
+    /// provider and nothing may be reported.
+    #[tokio::test]
+    async fn compaction_under_the_trigger_reports_nothing() {
+        use alms_test_support::Canned;
+        let (statuses, result, _) = compaction_summary_status(Canned::json(401, "{}"), "", 1).await;
+        assert!(result.is_ok());
+        assert!(statuses.is_empty(), "{statuses:?}");
     }
 
     /// A reply with no usable `content` is refused like a screened one:

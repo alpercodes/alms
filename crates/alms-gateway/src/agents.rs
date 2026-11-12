@@ -40,6 +40,23 @@ fn validate_posture(posture: &str) -> Result<(), String> {
     }
 }
 
+/// Reject a per-agent `provider` override nothing can route to (#172), at the
+/// call that sets it rather than at the agent's first run.
+fn validate_provider_override(
+    state: &AppState,
+    provider: &str,
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    let providers = &state.llm_config.providers;
+    if alms_core::config::is_known_provider(provider, providers) {
+        return Ok(());
+    }
+    Err(api_error(
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "UNKNOWN_PROVIDER",
+        alms_core::config::unknown_provider_message(provider, providers),
+    ))
+}
+
 fn normalize_optional_override(value: Option<&str>) -> Option<String> {
     value
         .map(str::trim)
@@ -216,6 +233,10 @@ pub async fn create_agent(
     if let Some(ref p) = posture {
         validate_posture(p)
             .map_err(|msg| api_error(StatusCode::BAD_REQUEST, "INVALID_POSTURE", msg))?;
+    }
+
+    if let Some(ref p) = provider {
+        validate_provider_override(&state, p)?;
     }
 
     // Per-agent summary overrides (#872) — pair-only validation. Treat
@@ -499,11 +520,9 @@ pub(crate) fn apply_update_request(
     }
 
     if let Some(provider) = req.provider {
-        agent.provider = if provider.is_empty() {
-            None
-        } else {
-            Some(provider)
-        };
+        // Trimmed like `POST /agents`, so `" gemini "` and `"   "` get the
+        // same answer from both (#172).
+        agent.provider = normalize_optional_override(Some(&provider));
     }
 
     if let Some(telegram_token) = req.telegram_token {
@@ -1161,8 +1180,22 @@ pub async fn update_agent(
     let prev_mode = agent.worktree_mode;
     let force_remove = req.force_worktree_remove.unwrap_or(false);
     let agent_name = agent.name.clone();
+    let summary_pair_before = (agent.summary_provider.clone(), agent.summary_model.clone());
+
+    // Only a name this request sets: an agent left on a removed provider must
+    // stay editable, and an empty string clears the override.
+    if let Some(p) = req
+        .provider
+        .as_deref()
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+    {
+        validate_provider_override(&state, p)?;
+    }
 
     apply_update_request(&mut agent, req).map_err(|e| e.to_api_error())?;
+    let summary_pair_touched =
+        summary_pair_before != (agent.summary_provider.clone(), agent.summary_model.clone());
 
     // Cross-field pair invariant for the per-agent summary fields (#872).
     // Validated against the post-update record state so a single-field
@@ -1191,6 +1224,15 @@ pub async fn update_agent(
         is_full_os,
         || store.update_agent(&agent),
     )?;
+
+    // A new per-agent summary pair may be the fix for this agent's failing
+    // summaries. The next run's summary says whether it was.
+    if summary_pair_touched {
+        let agent_id = agent.id;
+        state
+            .run_manager
+            .clear_summary_problems(|failed_agent, _| failed_agent == agent_id);
+    }
 
     Ok(Json(agent_to_json(&agent)))
 }
@@ -2643,6 +2685,144 @@ mod tests {
             .await
             .is_err()
         );
+    }
+
+    fn create_request_with_provider(name: &str, provider: &str) -> alms_core::CreateAgentRequest {
+        alms_core::CreateAgentRequest {
+            name: name.into(),
+            description: None,
+            model: Some("some-model".into()),
+            posture: None,
+            provider: Some(provider.into()),
+            telegram_token: None,
+            thinking_budget_tokens: None,
+            reasoning_effort: None,
+            gemini_thinking_budget: None,
+            summary_provider: None,
+            summary_model: None,
+            worktree_mode: None,
+            debug_mode: None,
+            is_default: None,
+        }
+    }
+
+    /// #172: the same name `PATCH /settings` would refuse must not be saved
+    /// here and only found out about at the first run.
+    #[tokio::test]
+    async fn post_agents_rejects_an_unknown_provider() {
+        let state = agents_test_app_state_with_sqlite();
+        let req = create_request_with_provider("bad-provider", "nonexistent");
+
+        let (status, body) = create_agent_err(state.clone(), req).await;
+
+        assert_eq!(status, axum::http::StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(err_code(&body), "UNKNOWN_PROVIDER");
+        let message = body["error"]["message"].as_str().unwrap();
+        assert!(message.contains("nonexistent"), "got: {message}");
+        assert!(message.contains("known providers"), "got: {message}");
+        let store = state.session_manager.store().expect("sqlite store");
+        assert!(
+            store.load_agent_by_name("bad-provider").unwrap().is_none(),
+            "a rejected POST must not write the agent"
+        );
+    }
+
+    #[tokio::test]
+    async fn post_agents_accepts_builtin_and_declared_providers() {
+        let mut state = agents_test_app_state_with_sqlite();
+        state
+            .llm_config
+            .providers
+            .insert("mylab".into(), alms_core::config::ProviderEntry::default());
+        for (name, provider) in [("on-builtin", "gemini"), ("on-custom", "mylab")] {
+            let req = create_request_with_provider(name, provider);
+            let result = create_agent(axum::extract::State(state.clone()), Json(req)).await;
+            assert!(result.is_ok(), "{provider} must be accepted");
+        }
+    }
+
+    #[tokio::test]
+    async fn put_agents_rejects_an_unknown_provider_and_keeps_the_record() {
+        let state = agents_test_app_state_with_sqlite();
+        let store = state.session_manager.store().expect("sqlite store");
+        let agent = new_agent("keeps-provider");
+        store.create_agent(&agent).unwrap();
+
+        let (status, body) = update_agent_err(
+            state.clone(),
+            "keeps-provider".into(),
+            alms_core::UpdateAgentRequest {
+                provider: Some("nonexistent".into()),
+                ..Default::default()
+            },
+        )
+        .await;
+
+        assert_eq!(status, axum::http::StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(err_code(&body), "UNKNOWN_PROVIDER");
+        let stored = store.load_agent_by_name("keeps-provider").unwrap().unwrap();
+        assert_eq!(stored.provider, agent.provider);
+    }
+
+    /// An agent left on a removed provider has to stay repairable through the
+    /// API: clearing the name, and editing other fields, must both work.
+    #[tokio::test]
+    async fn put_agents_can_repair_an_agent_stored_with_an_unknown_provider() {
+        let state = agents_test_app_state_with_sqlite();
+        let store = state.session_manager.store().expect("sqlite store");
+        let mut agent = new_agent("stale");
+        agent.provider = Some("removed".into());
+        store.create_agent(&agent).unwrap();
+
+        let _ = update_agent(
+            axum::extract::State(state.clone()),
+            axum::extract::Path("stale".to_string()),
+            Json(alms_core::UpdateAgentRequest {
+                description: Some("edited".into()),
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect("editing another field must not re-validate the stored provider");
+
+        let _ = update_agent(
+            axum::extract::State(state.clone()),
+            axum::extract::Path("stale".to_string()),
+            Json(alms_core::UpdateAgentRequest {
+                provider: Some(String::new()),
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect("an empty string must still clear the override");
+        let stored = store.load_agent_by_name("stale").unwrap().unwrap();
+        assert_eq!(stored.provider, None);
+    }
+
+    /// `PUT` trims `provider` as `POST` does, so the same value gets the same
+    /// answer: `" gemini "` stores `gemini`, and blanks clear the override.
+    #[tokio::test]
+    async fn put_agents_trims_the_provider_like_post() {
+        let state = agents_test_app_state_with_sqlite();
+        let store = state.session_manager.store().expect("sqlite store");
+        let mut agent = new_agent("trimmed");
+        agent.provider = Some("openai".into());
+        store.create_agent(&agent).unwrap();
+
+        for (sent, stored) in [(" gemini ", Some("gemini")), ("   ", None)] {
+            let _ = update_agent(
+                axum::extract::State(state.clone()),
+                axum::extract::Path("trimmed".to_string()),
+                Json(alms_core::UpdateAgentRequest {
+                    provider: Some(sent.into()),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap_or_else(|(status, body)| panic!("{sent:?}: {status} {:?}", body.0));
+            let record = store.load_agent_by_name("trimmed").unwrap().unwrap();
+            assert_eq!(record.provider.as_deref(), stored, "sent {sent:?}");
+        }
     }
 
     #[tokio::test]

@@ -43,7 +43,8 @@ pub enum ConversationEndReason {
     /// variant covers (#1258):
     ///
     /// - `true` — the run **died**: an LLM/tool failure, a panic, a
-    ///   setup failure, or a persistence failure during teardown. It never
+    ///   setup failure, a persistence failure during teardown, or the
+    ///   gateway shutting down under it. It never
     ///   reached the end of its turn, so whatever the DM was going to produce
     ///   does not exist.
     /// - `false` — the run **completed**, but its result was unusable: it

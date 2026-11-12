@@ -140,8 +140,15 @@ function setSealedReasoningRunIds(id, set) { __sealedSets.set(id, set); }
 function getSealedReasoningRunIds(id) { return __sealedSets.get(id) || null; }
 function clearSealedReasoningRunIds(id) { __sealedSets.delete(id); }
 
+// summary-status (mirrors state/summary-status.js's two writers the hook calls)
+const summaryFailure = signal(null);
+function applySummaryStatus(d) {
+    summaryFailure.value = d.failure ? { sessionId: d.session_id, ...d.failure } : null;
+}
+function clearSummaryFailure() { summaryFailure.value = null; }
+
 // Test hooks — exported so the harness can reach the live signals.
-export const __test = { signal, chatMessages, activeRunId, activeSession, dmParticipants, activeAgent, dmPeer, clearAgentPhaseCalls, resetRunState, runEntities };
+export const __test = { signal, chatMessages, activeRunId, activeSession, dmParticipants, activeAgent, dmPeer, clearAgentPhaseCalls, resetRunState, runEntities, summaryFailure };
 `;
 
 /**
@@ -1514,4 +1521,35 @@ test('#1166 control: a normal non-queued DM turn is unaffected and reads its nam
         assert.equal(block.tools.length, 1,
             'and the turn\'s tool call still groups inside that block');
     }
+});
+
+// ---------------------------------------------------------------------------
+// summary_status: the banner is state the server re-sends on every attach, so
+// a (re)opened stream must start from "no problem". A clear that went out
+// while the stream was down is otherwise missed for good.
+// ---------------------------------------------------------------------------
+test('summary_status: a reconnect drops a banner whose clear the stream missed', () => {
+    reset();
+    const sid = 'session-summary-reconnect';
+    const failure = {
+        code: 'MISSING_KEY',
+        provider: 'openrouter',
+        model: 'google/gemma-4-31b-it',
+        message: 'Conversation summaries failed.',
+    };
+    const es = openStream(sid);
+    es.emit('open', {});
+    es.emit('summary_status', { session_id: sid, failure });
+    assert.equal(T.summaryFailure.value?.code, 'MISSING_KEY');
+
+    // The clear went out while the stream was down; the reopened stream gets
+    // no `summary_status` because the session has no problem any more.
+    const es2 = reconnectStream(sid);
+    es2.emit('open', {});
+    assert.equal(T.summaryFailure.value, null);
+
+    // A problem that is still there arrives right after the open.
+    es2.emit('summary_status', { session_id: sid, failure });
+    assert.equal(T.summaryFailure.value?.code, 'MISSING_KEY');
+    T.summaryFailure.value = null;
 });

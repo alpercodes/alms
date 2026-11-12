@@ -61,7 +61,14 @@ pub(crate) fn validate_summary_pair(
             ),
         });
     };
-    if entry.resolve_api_key().is_none() && secrets.resolve_key(provider_name).is_none() {
+    // Only a provider that needs a key has to have one: a local endpoint
+    // declared without a key (Ollama, LM Studio) is a valid summary provider.
+    // The same rule decides whether the runtime sends the call at all, so
+    // this cannot accept a pair whose summaries would never be sent.
+    if alms_core::config::provider_requires_api_key(provider_name, Some(entry))
+        && entry.resolve_api_key().is_none()
+        && secrets.resolve_key(provider_name).is_none()
+    {
         return Err(ConfigPolicyError {
             code: "SUMMARY_PROVIDER_MISSING_API_KEY",
             message: format!(
@@ -129,9 +136,41 @@ mod tests {
                 .code,
             "SUMMARY_PROVIDER_UNKNOWN"
         );
-        providers.insert("openrouter".to_string(), provider(None));
+        // On its stock URL, so it is the hosted API and needs a key.
+        providers.insert(
+            "openrouter".to_string(),
+            ProviderEntry {
+                base_url: alms_core::config::builtin_base_url("openrouter")
+                    .unwrap()
+                    .to_string(),
+                ..provider(None)
+            },
+        );
         assert_eq!(
             validate_summary_pair(Some("openrouter"), Some("model"), &providers, &secrets)
+                .unwrap_err()
+                .code,
+            "SUMMARY_PROVIDER_MISSING_API_KEY"
+        );
+    }
+
+    /// The summary banner's advice must be something Settings accepts: a
+    /// local endpoint declared without a key is a valid summary provider,
+    /// while one whose entry names a key source still needs that key.
+    #[test]
+    fn summary_pair_policy_accepts_a_provider_that_needs_no_key() {
+        let secrets = SecretsStore::empty();
+        let mut providers = BTreeMap::new();
+        providers.insert("ollama".to_string(), provider(None));
+        let pair = validate_summary_pair(Some("ollama"), Some("llama3.1:8b"), &providers, &secrets)
+            .unwrap();
+        assert_eq!(pair.provider.as_deref(), Some("ollama"));
+
+        let mut needs_env = provider(None);
+        needs_env.api_key_env = Some("ALMS_TEST_UNSET_SUMMARY_KEY_VAR".into());
+        providers.insert("hosted".to_string(), needs_env);
+        assert_eq!(
+            validate_summary_pair(Some("hosted"), Some("m"), &providers, &secrets)
                 .unwrap_err()
                 .code,
             "SUMMARY_PROVIDER_MISSING_API_KEY"

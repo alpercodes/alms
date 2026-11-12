@@ -6,6 +6,8 @@ ALMS loads configuration with layered precedence:
 2. `alms.toml` in the current working directory (or `~/.config/alms/config.toml`)
 3. `ALMS_*` environment variables (settings, plus the gateway bearer token `ALMS_AUTH_TOKEN`)
 
+With no config file, ALMS uses the compiled defaults. A config file that exists but can't be read or parsed (a symlink to a missing file included), or that fails validation, is fatal: the gateway and the CLI commands that use the configuration exit with an error naming the file and the problem.
+
 LLM API keys are never read from arbitrary environment variables. Store one with `alms auth set <provider> <key>`, or give the provider entry an `api_key_env` naming an env var or a literal `api_key` (see below). The global Telegram bot token is stored with `alms auth set telegram <token>` and a per-agent one on the agent record; the gateway bearer token comes only from `ALMS_AUTH_TOKEN`.
 
 Most of this document covers the **LLM provider** surface; the section immediately below covers the knobs the web UI's Settings modal exposes. See `docs/architecture.md`, `alms.toml.example` and `crates/alms-core/src/config/mod.rs` for the rest.
@@ -33,6 +35,15 @@ See [`docs/api.md`](api.md) § 10.2 for the wire shapes, validation rules and er
 | `compact_retain_pct` | `0.20`–`0.60`, default `0.40` | Fraction of that same effective history budget kept as recent verbatim messages after compaction. The invariant `compact_retain_pct + 0.10 <= compact_trigger_pct` is enforced on PATCH and on TOML load, so compaction always measurably shrinks the context. |
 
 The modal's **Summary** section (`summary_model` / `summary_provider`) drives both compaction summaries and post-run episodic memory. Set both or neither: a `summary_model` paired with the agent's own provider would be a slug from the wrong namespace, so partial configurations are rejected rather than silently mis-routed. Full notes in `alms.toml.example` under `[context]`.
+
+If a summary fails, the run still completes and the session shows a banner naming the provider and what to do about it. On the default pair, that is the usual result of an agent on another provider with no OpenRouter key: either add one, or change the pair here; unsetting both fields uses the agent's own model.
+
+A summary is not sent at all when its provider needs a key it does not have, so the conversation is not put on the wire just to be refused. "Needs a key" means one of two things:
+
+- a built-in slot (`openai`, `anthropic`, `openrouter`, `gemini`) still pointed at its hosted API, its stock `base_url`;
+- a `[llm.providers.<name>]` entry that declares `api_key_env` or `api_key`, whether or not the key resolves.
+
+A slot re-pointed elsewhere, by its own `base_url` or by `ALMS_LLM_BASE_URL`, is your endpoint and is judged like any other entry. `ALMS_LLM_BASE_URL` re-points the slot that `llm.provider` (or `ALMS_LLM_PROVIDER`) names at boot, not a default provider chosen later in Settings. An entry that declares no key source, the way Ollama and LM Studio are set up below, needs none: its summaries are sent without an auth header, and it can be chosen as the summary provider here without a key. An endpoint that does need a key but declares none can't be told apart from a local one, so its summaries are sent and fail on its 401, and the banner reports that. The same rule decides which providers the Summary section refuses for want of a key (`SUMMARY_PROVIDER_MISSING_API_KEY`). The banner clears when a summary next succeeds, or as soon as you change the pair or add that provider's key. See `summary_status` in `docs/api.md`.
 
 ### Session
 
@@ -66,7 +77,7 @@ provider = "openrouter"        # name of a [llm.providers.*] entry
 model    = "z-ai/glm-5.2"
 ```
 
-These two keys are the **server default** and are runtime-mutable: `PATCH /settings` (and the Settings modal) changes them for the next run with no restart, and persists the change to `{data_dir}/settings.json`. That file wins over `alms.toml` on the next boot, so once the pair has been PATCHed, editing it here has no effect until you edit or remove `settings.json`. See `docs/api.md` § 10.2 for the validation rules and the Telegram propagation caveat. The `[llm.providers]` tables below are **not** PATCH-mutable — they are read once at startup.
+These two keys are the **server default** and are runtime-mutable: `PATCH /settings` (and the Settings modal) changes them for the next run with no restart, and persists the change to `{data_dir}/settings.json`. That file wins over `alms.toml` on the next boot, so once the pair has been PATCHed, editing it here has no effect until you edit or remove `settings.json`. See `docs/api.md` § 10.2 for the validation rules and the Telegram propagation caveat. The `[llm.providers]` tables below are **not** PATCH-mutable — they are read once at startup. Removing or renaming an entry that an agent's `provider` names stops that agent from running (`POST /runs` returns `400 AGENT_PROVIDER_NOT_CONFIGURED`) until `PUT /agents/{id_or_name}` changes or clears its provider. The gateway logs a WARN at startup for each such agent, for each agent whose `summary_provider` names a missing entry, and for a `[context].summary_provider` (from `alms.toml` or `settings.json`) that does.
 
 The sugar names `openai`, `openrouter`, `anthropic`, and `gemini` are auto-populated at config-load time, so classic flat configs (`provider = "openai"` with nothing else) keep working. A user-declared entry with one of these names replaces the auto-populated one instead of merging with it, so it has to restate `base_url`, and for `anthropic` and `gemini` also `kind` and `auth_scheme` (they default to `openai_compatible` and bearer).
 
