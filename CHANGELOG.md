@@ -588,16 +588,17 @@ one.
   enable. v0.2.3 carries rustix 1.1.3, in range. No operator action. Lockfile-only; the
   `windows-sys` edge moves are in the entry above.
 - `quinn-udp` 0.5.14 -> 0.5.16 to clear RUSTSEC-2026-0538 (denial of service): on targets
-  that read one datagram per `recvmsg` call, a stale truncation flag could keep the receive
-  loop spinning after an oversized datagram. It is not reached: `quinn-udp` is in
+  that read one datagram per `recvmsg` call (macOS and the BSDs among them), a stale
+  truncation flag could keep the receive loop spinning after an oversized datagram. It is not reached: `quinn-udp` is in
   `Cargo.lock` only because reqwest's `rustls-tls` feature names `quinn` as a weak
-  dependency, as in the quinn-proto entry above, and `cargo tree --target all -i quinn`
+  dependency, as in the quinn-proto entry above, and `cargo tree --target all -i quinn-udp`
   finds it on no target, since ALMS does not enable reqwest's `http3`. v0.2.3 carries
   quinn-udp 0.5.14, in range. No operator action. Lockfile-only. The re-resolve also drops
-  `windows-sys` 0.60.2 and its nine `windows-targets` 0.53 packages: the six Windows-only
-  crates still on it (`anstyle-query`, `anstyle-wincon`, `nu-ansi-term`, `socket2`,
-  `stacker`, `terminal_size`) move to 0.61.2, already in the lockfile, and quinn-udp
-  0.5.16 takes 0.52.0, also already locked.
+  `windows-sys` 0.60.2 and its nine `windows-targets` 0.53 packages: the Windows-only
+  `windows-sys` edges of `anstyle-query`, `anstyle-wincon`, `nu-ansi-term`, `socket2`,
+  `stacker` and `terminal_size` move to 0.61.2, already in the lockfile, and quinn-udp
+  0.5.16 takes 0.52.0, also already locked. Nothing changes on Linux or macOS. Windows
+  builds compile `windows-sys` 0.52.0 and 0.61.2, no longer 0.60.2.
 
 ## v0.2.3 — released (tag `v0.2.3`)
 
