@@ -1914,7 +1914,7 @@ Valid `posture` values: `"guarded"` (default — requires approval for risky too
 
 > **Note:** When a run is system-triggered (peer-to-peer DMs via `send_message`, notification runs, subagent completions, and scheduled jobs), Guarded posture is automatically overridden to Autonomous for that run via the `is_system_triggered` flag, since there is no human in the loop to approve tool calls. Without this override the run would wait on its first gated tool call indefinitely (the `max_run_duration_secs` backstop is checked only between iterations), until the approval is resolved or the run is cancelled. User-initiated runs (via the HTTP API) are never affected — Guarded posture is preserved as configured. A subagent takes its posture from its registry record instead: a record with no `posture`, the default for a new agent, runs `full_control` as a subagent, foreground or background, and so does an unnamed subagent or one whose name is not registered. A record set to `"guarded"` is overridden to Autonomous in the background, and keeps Guarded in the foreground, where its first gated call is denied and cancels the subagent. Guarded therefore governs the runs a human starts and is not a boundary between agents: an agent that can send a Guarded agent a DM can have it run tools without approval. See [`security-model.md` § 8.1](security-model.md#guarded-is-not-an-agent-boundary); the behaviour is under discussion in [#177](https://github.com/alpercodes/alms/issues/177).
 
-To clear a string override (`model`, `posture`, `provider`, `telegram_token`), pass an empty string: `"model": ""`.
+To clear a string override (`model`, `posture`, `provider`, `telegram_token`), pass an empty string: `"model": ""`. `model` and `provider` are trimmed first, as on `POST`, so a whitespace-only value clears them too and `" gpt-4o "` stores `gpt-4o`.
 
 A `provider` this request sets must be a `[llm.providers.<name>]` entry or a built-in name, or the update returns `422 UNKNOWN_PROVIDER`. Surrounding whitespace is trimmed first, as on `POST`, so `" gemini "` stores `gemini` and a blank value clears the override. A name already on the record is not re-checked, so an agent left on a removed provider can still be edited. Such an agent cannot run until its provider is changed or cleared: `POST /runs` returns `400 AGENT_PROVIDER_NOT_CONFIGURED` (with `error_code`, `message`, `agent_id` and `provider`), and a run with no synchronous caller fails with the same message.
 
@@ -2084,7 +2084,7 @@ The guarantee is structural rather than case-by-case: the handler validates the 
 | Rule | Failure |
 |------|---------|
 | `provider` must be a key in `[llm.providers]` | 422, `provider '<name>' is not configured — known providers: [...]` |
-| `model` / `provider` must be non-empty when present | 422, `empty string not accepted` — there is no clear sentinel; "no server default" is not a runnable state |
+| `model` / `provider` must be non-empty when present, after trimming | 422, `empty string not accepted` — there is no clear sentinel; "no server default" is not a runnable state. A whitespace-only value counts as empty, and surrounding whitespace on a real name is removed before it is checked, applied and persisted (#126) |
 | The post-patch `(provider, model)` pair must be wire-compatible | 422, `INCOMPATIBLE_MODEL_FOR_PROVIDER` |
 | `[context].max_input_tokens` must fit the post-patch pair's context window | 400, `INVALID_TOKEN_BUDGET_FOR_PROVIDER` (see § 10.2 budget validation) |
 

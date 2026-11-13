@@ -510,11 +510,26 @@ impl AppState {
             // either absent or still valid. If the provider was skipped
             // above, the model is part of the same stale override and is
             // dropped together (the WARN above already named it).
+            //
+            // #126: an earlier version could persist a whitespace-only model.
+            // It is leftover state, so it is skipped with a WARN rather than
+            // applied, and the file is left for the operator to fix.
+            let persisted_model = persisted.model.as_deref().map(str::trim);
+            if persisted.model.as_deref().is_some_and(|m| !m.is_empty())
+                && persisted_model == Some("")
+            {
+                tracing::warn!(
+                    target: "alms.config",
+                    settings_path = %crate::settings::settings_path(&data_dir).display(),
+                    "ignoring a whitespace-only persisted server-default model; \
+                     set a model with PATCH /settings or remove it from settings.json"
+                );
+            }
             if persisted_provider_valid
-                && let Some(ref model) = persisted.model
+                && let Some(model) = persisted_model
                 && !model.is_empty()
             {
-                llm_config.default_model = model.clone();
+                llm_config.default_model = model.to_string();
                 llm = llm.with_model(model);
             }
         }

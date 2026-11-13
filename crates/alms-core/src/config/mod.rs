@@ -125,6 +125,7 @@ impl AlmsConfig {
 
         // Normalize episodic memory settings (soft corrections with warnings)
         config.context.normalize_episodic();
+        config.llm.normalize_models();
 
         // Validate
         config.validate()?;
@@ -234,6 +235,7 @@ impl AlmsConfig {
         }
         config.warn_legacy_data_dir();
         config.context.normalize_episodic();
+        config.llm.normalize_models();
 
         // Step 3: fail-fast on validation errors (#924). A
         // hand-edited `alms.toml` (or an env-var override) that

@@ -2491,6 +2491,61 @@ fn load_from(cwd: &std::path::Path, home: &std::path::Path) -> AlmsResult<AlmsCo
     result
 }
 
+/// #126: a whitespace-only model means unset, like an empty one, and a padded
+/// one is stored bare.
+#[test]
+fn normalize_models_trims_and_maps_blank_to_unset() {
+    let mut llm = LlmConfig {
+        model: " \t ".into(),
+        ..LlmConfig::default()
+    };
+    llm.providers.insert(
+        "blank".into(),
+        ProviderEntry {
+            model: Some("   ".into()),
+            ..ProviderEntry::default()
+        },
+    );
+    llm.providers.insert(
+        "padded".into(),
+        ProviderEntry {
+            model: Some(" m-1 ".into()),
+            ..ProviderEntry::default()
+        },
+    );
+
+    llm.normalize_models();
+
+    assert_eq!(llm.model, "");
+    assert_eq!(llm.providers["blank"].model, None);
+    assert_eq!(llm.providers["padded"].model.as_deref(), Some("m-1"));
+}
+
+/// #126: the loader applies it, so a blank `[llm] model` in `alms.toml` is
+/// never sent as a model name. (Kept small: it shares `ENV_LOCK` with the
+/// other loader tests.)
+#[test]
+fn test_load_or_default_trims_models_from_the_config_file() {
+    let _lock = ENV_LOCK.lock().unwrap();
+    let _provider_guard = SingleEnvGuard::remove("ALMS_LLM_PROVIDER");
+    let _model_guard = SingleEnvGuard::remove("ALMS_LLM_MODEL");
+    let _legacy_model_guard = SingleEnvGuard::remove("DEFAULT_MODEL");
+    let _mock_guard = SingleEnvGuard::remove("ALMS_LLM_MOCK");
+    let home = tempfile::tempdir().expect("tempdir creates");
+    let cwd = tempfile::tempdir().expect("tempdir creates");
+    std::fs::write(
+        cwd.path().join("alms.toml"),
+        "[llm]\nprovider = \"mylab\"\nmodel = \"   \"\n\n\
+         [llm.providers.mylab]\nbase_url = \"http://127.0.0.1:9/v1\"\nmodel = \" m-1 \"\n",
+    )
+    .expect("toml write");
+
+    let config = load_from(cwd.path(), home.path()).expect("loads");
+
+    assert_eq!(config.llm.model, "");
+    assert_eq!(config.llm.providers["mylab"].model.as_deref(), Some("m-1"));
+}
+
 /// An `alms.toml` that won't parse must not be replaced by defaults: that would
 /// silently drop every setting in it, including `shell_policy`.
 #[test]

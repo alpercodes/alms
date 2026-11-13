@@ -245,6 +245,16 @@ Each item below changes behaviour for a deployment that has not set the knob exp
 
 ### Persistence and durability
 
+- **A whitespace-only model name is no longer stored.** `PATCH /settings` accepted
+  `{"model": "  "}`, made it the live server default and wrote it to `settings.json`, so it
+  survived a restart and every run sent a blank model. It is now rejected like `""`, with
+  the same `422`, and so is a blank `provider`. `PUT /agents`, `alms agent create` and
+  `alms agent config` trim `model` and treat a blank one as clearing the override, as
+  `POST /agents` and `""` already did. A blank `[llm] model` or provider-entry `model` in
+  `alms.toml` (or `ALMS_LLM_MODEL`) now means unset. Surrounding whitespace on a real model
+  or provider name is removed everywhere these are set. **After upgrading**, a gateway whose
+  `settings.json` already holds a blank model skips it at startup with a WARN and uses the
+  `alms.toml` model; set one with `PATCH /settings` or remove the line.
 - Transactional, versioned SQLite migrations.
 - A fresh install no longer registers an agent nobody created when it is restarted. The
   gateway writes `.alms/agent_id` on its first boot, and on the next boot the migration for
