@@ -152,7 +152,16 @@ impl ScriptedLlm {
     }
 
     async fn mount(responder: impl Respond + 'static, calls: Arc<AtomicUsize>) -> Self {
-        let server = MockServer::start().await;
+        // A server of its own, not `MockServer::start()`. That one hands out
+        // servers from a process-wide pool: dropping a `ScriptedLlm` returned
+        // its server, port and all, for the next test in the binary to
+        // reuse. A request the previous test's run was still sending, such
+        // as a fire-and-forget post-run summary, then landed in the next
+        // test's script and request log (`key_revocation` saw a third
+        // request, a summary with another test's key). An exclusive server
+        // closes its port when this value is dropped, and the next test gets
+        // a fresh one.
+        let server = MockServer::builder().start().await;
         Mock::given(any())
             .respond_with(responder)
             .mount(&server)
@@ -260,6 +269,28 @@ mod tests {
             .await
             .unwrap();
         assert_eq!((a.as_str(), b.as_str()), ("A", "other"));
+    }
+
+    #[tokio::test]
+    async fn a_request_to_a_dropped_script_does_not_reach_the_next_one() {
+        let first = ScriptedLlm::always(Canned::json(200, "{}")).await;
+        let stale_url = first.base_url();
+        drop(first);
+        let second = ScriptedLlm::always(Canned::json(200, "{}")).await;
+
+        // With pooled servers, `second` was `first`'s server, and this
+        // request was answered and recorded as `second`'s.
+        let _ = reqwest::Client::new()
+            .post(format!("{stale_url}/v1/chat/completions"))
+            .body("{}")
+            .send()
+            .await;
+
+        assert_eq!(
+            second.calls(),
+            0,
+            "a request to the dropped script's URL reached the next script"
+        );
     }
 
     #[tokio::test]
