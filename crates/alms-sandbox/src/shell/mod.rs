@@ -1157,6 +1157,39 @@ mod tests {
         );
     }
 
+    /// #119, end to end: a command that leaves the shell in a directory that
+    /// no longer exists reports a cwd under the root that cannot be resolved.
+    /// It used to be adopted on its spelling, so the next command failed to
+    /// spawn there. It is now refused and the previous cwd is kept.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn test_shell_tool_refuses_an_unresolvable_cwd_under_the_root() {
+        let dir = shell_cwd_test_dir();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let tool = ShellTool::sandboxed(root.clone());
+
+        let result = tool
+            .execute(serde_json::json!({"command": "mkdir gone && cd gone && rmdir ../gone"}))
+            .await
+            .unwrap();
+        let stdout = result["stdout"].as_str().unwrap();
+        assert!(
+            stdout.contains("[cwd unchanged:") && stdout.contains("could not be confirmed inside"),
+            "the unresolvable cwd must be refused and reported; got: {stdout:?}"
+        );
+
+        let next = tool
+            .execute(serde_json::json!({"command": "pwd"}))
+            .await
+            .expect("the next command must run in the kept cwd, not fail to spawn");
+        let pwd = next["stdout"].as_str().unwrap().trim().to_string();
+        assert_eq!(
+            std::fs::canonicalize(&pwd).unwrap(),
+            root,
+            "the previous cwd is kept"
+        );
+    }
+
     /// #1262 — the same, end to end through the background path: submit,
     /// poll, and read the notice out of the `check_task` result.
     #[tokio::test]
