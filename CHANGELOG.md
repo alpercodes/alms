@@ -589,10 +589,11 @@ one.
   `windows-sys` edge moves are in the entry above.
 - `quinn-udp` 0.5.14 -> 0.5.16 to clear RUSTSEC-2026-0538 (denial of service): on targets
   that read one datagram per `recvmsg` call (macOS and the BSDs among them), a stale
-  truncation flag could keep the receive loop spinning after an oversized datagram. It is not reached: `quinn-udp` is in
-  `Cargo.lock` only because reqwest's `rustls-tls` feature names `quinn` as a weak
-  dependency, as in the quinn-proto entry above, and `cargo tree --target all -i quinn-udp`
-  finds it on no target, since ALMS does not enable reqwest's `http3`. v0.2.3 carries
+  truncation flag could keep the receive loop spinning after an oversized datagram. It is
+  not reached: `quinn-udp` is in `Cargo.lock` only because reqwest's `rustls-tls` feature
+  names `quinn` as a weak dependency, as in the quinn-proto entry above, and
+  `cargo tree --target all -i quinn-udp` finds it on no target, since ALMS does not enable
+  reqwest's `http3`. v0.2.3 carries
   quinn-udp 0.5.14, in range. No operator action. Lockfile-only. The re-resolve also drops
   `windows-sys` 0.60.2 and its nine `windows-targets` 0.53 packages: the Windows-only
   `windows-sys` edges of `anstyle-query`, `anstyle-wincon`, `nu-ansi-term`, `socket2`,
