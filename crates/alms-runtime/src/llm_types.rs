@@ -825,9 +825,14 @@ impl LlmConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Mutex, MutexGuard};
+    use alms_test_support::process_env::{
+        lock as env_lock, remove_var as remove_env_var, set_var as set_env_var,
+    };
+    use std::sync::MutexGuard;
 
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    // `env_lock()` is this test binary's one lock for env vars and the
+    // working directory, shared with `llm_client`'s tests and recovered if a
+    // holder panicked (`alms_test_support::process_env`).
     const LLM_ENV_VARS: [&str; 4] = [
         "OPENROUTER_API_KEY",
         "OPENAI_API_KEY",
@@ -840,21 +845,9 @@ mod tests {
         saved: Vec<(&'static str, Option<String>)>,
     }
 
-    fn set_env_var(name: &str, value: &str) {
-        unsafe {
-            std::env::set_var(name, value);
-        }
-    }
-
-    fn remove_env_var(name: &str) {
-        unsafe {
-            std::env::remove_var(name);
-        }
-    }
-
     impl EnvGuard {
         fn set(overrides: &[(&'static str, Option<&str>)]) -> Self {
-            let lock = ENV_LOCK.lock().unwrap();
+            let lock = env_lock();
             let saved = LLM_ENV_VARS
                 .iter()
                 .map(|name| (*name, std::env::var(name).ok()))

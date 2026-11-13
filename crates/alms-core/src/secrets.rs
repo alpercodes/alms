@@ -575,6 +575,8 @@ mod tests {
 
     #[test]
     fn a_relative_database_path_gives_an_absolute_secrets_path() {
+        // Reads the working directory twice; a config test may move it.
+        let _lock = alms_test_support::process_env::lock();
         let path = secrets_path_from_db(Some("state/alms.db"));
         assert!(path.is_absolute(), "{}", path.display());
         assert_eq!(
@@ -588,6 +590,8 @@ mod tests {
 
     #[test]
     fn no_database_falls_back_to_the_default_data_dir() {
+        // Reads the working directory twice; a config test may move it.
+        let _lock = alms_test_support::process_env::lock();
         assert_eq!(
             secrets_path_from_db(None),
             std::env::current_dir()
@@ -933,19 +937,14 @@ mod tests {
     fn test_resolve_key_no_env_fallback() {
         // resolve_key must NOT fall back to env vars — only secrets store.
         // Set the env var first, then verify resolve_key ignores it.
-        let original = std::env::var("OPENAI_API_KEY").ok();
-        unsafe {
-            std::env::set_var("OPENAI_API_KEY", "sk-env-should-be-ignored");
-        }
+        let _lock = alms_test_support::process_env::lock();
+        let _key = alms_test_support::process_env::VarGuard::set(
+            "OPENAI_API_KEY",
+            "sk-env-should-be-ignored",
+        );
 
         let store = SecretsStore::empty();
         let result = store.resolve_key("openai");
-
-        // Restore original env var before asserting (panic-safe cleanup).
-        match &original {
-            Some(v) => unsafe { std::env::set_var("OPENAI_API_KEY", v) },
-            None => unsafe { std::env::remove_var("OPENAI_API_KEY") },
-        }
 
         assert!(
             result.is_none(),

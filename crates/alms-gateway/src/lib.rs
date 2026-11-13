@@ -79,65 +79,45 @@ pub async fn run() -> AlmsResult<()> {
     Ok(())
 }
 
-/// Process-global env-var locks shared between test modules in this crate.
+/// Env-var test helpers shared between test modules in this crate.
 ///
-/// Tests across `runs/integration_tests.rs` and `settings.rs::tests` run in
-/// the same `cargo test -p alms-gateway` process, so any env var read by
-/// production code must be serialised across all touch sites — otherwise a
-/// strict-mode test in one file races a warn-mode test in another and ends
-/// up reading the wrong value. Each mutex MUST guard a disjoint var-set so
-/// a test holding one lock can never observe a partial mutation guarded by
-/// another lock; cross-cutting tests that need multiple locks should
-/// acquire them in a fixed order to avoid deadlock.
+/// Tests across `runs/integration_tests/` and `settings.rs::tests` run in the
+/// same `cargo test -p alms-gateway` process, so an env var production code
+/// reads is shared by all of them. A test that depends on
+/// `ALMS_LLM_BUDGET_VALIDATION` pins it with [`BudgetValidationEnvGuard`],
+/// which holds the binary's one env lock
+/// (`alms_test_support::process_env::lock`) for the test's duration, so a
+/// strict-mode test can no longer read a value a warn-mode test set.
 #[cfg(test)]
 pub(crate) mod test_env_locks {
-    /// Serialises every test that mutates `ALMS_LLM_BUDGET_VALIDATION`
-    /// (the #919 strict/warn opt-out). Disjoint by construction from the
-    /// `ENV_LOCK` mutex in `alms-core/src/config/tests.rs` (different
-    /// process during `cargo test -p alms-core`) and from any future
-    /// gateway-side env-var mutex covering a different var-set.
-    pub(crate) static BUDGET_VALIDATION_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    use alms_test_support::process_env::{self, VarGuard};
 
-    /// RAII guard that pins `ALMS_LLM_BUDGET_VALIDATION` to a known value
-    /// for the duration of a test, holding
-    /// [`BUDGET_VALIDATION_ENV_LOCK`] so no concurrent test mutates it.
-    /// Restores the previous value (or removes it) on drop.
+    const VAR: &str = "ALMS_LLM_BUDGET_VALIDATION";
+
+    /// Pins `ALMS_LLM_BUDGET_VALIDATION` for the duration of a test while
+    /// holding the env lock, and puts the previous value back on drop.
     pub(crate) struct BudgetValidationEnvGuard {
+        // Field order is drop order: restore the var, then release the lock.
+        _var: VarGuard,
         _lock: std::sync::MutexGuard<'static, ()>,
-        prev: Option<String>,
     }
 
     impl BudgetValidationEnvGuard {
         /// Pin the env var to `value`.
         pub(crate) fn set(value: &str) -> Self {
-            let lock = BUDGET_VALIDATION_ENV_LOCK
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            let prev = std::env::var("ALMS_LLM_BUDGET_VALIDATION").ok();
-            unsafe {
-                std::env::set_var("ALMS_LLM_BUDGET_VALIDATION", value);
+            let lock = process_env::lock();
+            Self {
+                _var: VarGuard::set(VAR, value),
+                _lock: lock,
             }
-            Self { _lock: lock, prev }
         }
 
         /// Pin the env var to "unset".
         pub(crate) fn unset() -> Self {
-            let lock = BUDGET_VALIDATION_ENV_LOCK
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            let prev = std::env::var("ALMS_LLM_BUDGET_VALIDATION").ok();
-            unsafe {
-                std::env::remove_var("ALMS_LLM_BUDGET_VALIDATION");
-            }
-            Self { _lock: lock, prev }
-        }
-    }
-
-    impl Drop for BudgetValidationEnvGuard {
-        fn drop(&mut self) {
-            match &self.prev {
-                Some(v) => unsafe { std::env::set_var("ALMS_LLM_BUDGET_VALIDATION", v) },
-                None => unsafe { std::env::remove_var("ALMS_LLM_BUDGET_VALIDATION") },
+            let lock = process_env::lock();
+            Self {
+                _var: VarGuard::remove(VAR),
+                _lock: lock,
             }
         }
     }

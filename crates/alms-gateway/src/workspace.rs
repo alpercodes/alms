@@ -274,12 +274,14 @@ pub async fn open_workspace(
         .into_response();
     }
 
-    // Test short-circuit: integration tests pin the routing + agent-resolution
+    // Test short-circuit: this crate's tests pin the routing + agent-resolution
     // path without spawning a real file explorer (which on a CI box would
     // either fail outright on Linux without `xdg-utils` or pop a window on
-    // a developer's screen). When the env var is set we resolve the path,
-    // succeed, and skip the actual `Command::spawn`.
-    if std::env::var_os("ALMS_TEST_SKIP_LAUNCHER").is_some() {
+    // a developer's screen). In a test build we resolve the path, succeed,
+    // and skip the actual `Command::spawn`. Decided at compile time: it used
+    // to be an `ALMS_TEST_SKIP_LAUNCHER` env var that every test set, which
+    // was a process-wide write racing every other test's env reads.
+    if cfg!(test) {
         return Json(serde_json::json!({
             "ok": true,
             "path": path.display().to_string(),
@@ -328,19 +330,11 @@ pub async fn open_workspace(
 mod open_tests {
     //! Tests for the `POST /agents/{id_or_name}/workspace/open` handler (#858).
     //!
-    //! The actual `Command::spawn` is short-circuited by the
-    //! `ALMS_TEST_SKIP_LAUNCHER` env var so we exercise the full
-    //! routing / auth / agent-resolution / path-existence path without ever
-    //! popping a real File Explorer / Finder window on a developer's screen
-    //! or failing on a headless CI box.
-    //!
-    //! Tests that mutate the env var `ALMS_TEST_SKIP_LAUNCHER` rely on
-    //! `cargo test` running each `#[tokio::test]` in its own thread but a
-    //! single shared process — `serial_test` is not in the workspace, so we
-    //! gate the env var check defensively (set on entry, the tests don't
-    //! need to clear it because the launcher path is the *only* code that
-    //! reads it). Two parallel tests both setting the same value to "1" is
-    //! a no-op race, not a correctness hazard.
+    //! The actual `Command::spawn` is short-circuited in test builds
+    //! (`cfg!(test)` in the handler) so we exercise the full routing / auth /
+    //! agent-resolution / path-existence path without ever popping a real
+    //! File Explorer / Finder window on a developer's screen or failing on a
+    //! headless CI box.
     use super::*;
     use crate::test_support::TestAppState;
     use alms_core::AgentRecord;
@@ -408,13 +402,6 @@ mod open_tests {
 
     #[tokio::test]
     async fn open_workspace_returns_404_for_unknown_agent() {
-        // SAFETY: setting an env var in a multi-threaded test is unsafe per
-        // Rust 1.78+. The launcher-skip env var is a one-way "force the
-        // short-circuit branch" knob — concurrent setters all write the
-        // same value, and no one reads it after this test returns.
-        unsafe {
-            std::env::set_var("ALMS_TEST_SKIP_LAUNCHER", "1");
-        }
         let (_tmp, state) = open_test_app_state();
         let (status, body) = invoke_open(state, "does-not-exist").await;
         assert_eq!(status, StatusCode::NOT_FOUND);
@@ -427,9 +414,6 @@ mod open_tests {
         // created (we never called `init_workspace_files` in this test).
         // The handler must report `WORKSPACE_PATH_MISSING` cleanly rather
         // than hand a missing path to the launcher.
-        unsafe {
-            std::env::set_var("ALMS_TEST_SKIP_LAUNCHER", "1");
-        }
         let (_tmp, state) = open_test_app_state();
         let store = state.session_manager.store().expect("sqlite store");
         let agent = new_agent("missing-ws");
@@ -444,9 +428,6 @@ mod open_tests {
     async fn open_workspace_succeeds_for_existing_agent_with_workspace_dir() {
         // Happy path with launcher short-circuited. Verifies routing,
         // auth/agent-resolution, and the response shape `{ ok, path }`.
-        unsafe {
-            std::env::set_var("ALMS_TEST_SKIP_LAUNCHER", "1");
-        }
         let (tmp, state) = open_test_app_state();
         let store = state.session_manager.store().expect("sqlite store");
         let agent = new_agent("happy-agent");
@@ -479,9 +460,6 @@ mod open_tests {
         // Without `workspace_dir` set on the gateway config, the handler
         // must short-circuit with NOT_CONFIGURED before hitting the agent
         // store at all.
-        unsafe {
-            std::env::set_var("ALMS_TEST_SKIP_LAUNCHER", "1");
-        }
         let gateway_config = crate::gateway::GatewayConfig {
             db_path: Some(":memory:".to_string()),
             workspace_dir: None, // intentionally unset
