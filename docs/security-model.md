@@ -462,17 +462,20 @@ relative path. The notice does not appear for `unrestricted` /
 entirely.
 
 `<verdict>` distinguishes the two ways containment can fail, because the
-check itself does not prove the same thing in both. `canonical_for_comparison`
-falls back to returning its input when `std::fs::canonicalize` fails, so a
-path the daemon *could not resolve* is rejected by exactly the same
-`is_within` comparison as a path that genuinely escaped. Both fail closed —
-that part is deliberate — but only one of them establishes where the
-directory actually is:
+check itself does not prove the same thing in both. A candidate cwd that
+`std::fs::canonicalize` cannot resolve is refused before any comparison
+(#119). Its raw spelling can match the root's leading components while a
+symlink in it points elsewhere: before #119, `<root>/link` with a link to a
+not-yet-existing target outside the root was accepted, and
+`Command::current_dir` would follow the link once the target existed. A root
+that cannot be resolved is still compared on its raw spelling, which can
+only fail to match. Both refusals fail closed, but only one of them
+establishes where the directory actually is:
 
 | Outcome | Condition | `<verdict>` |
 |---|---|---|
 | `OutsideRoot` | root **and** candidate both canonicalised, and the candidate is not under the root | `is outside the sandbox root` |
-| `NotVerifiable` | either side failed to canonicalise, so the comparison decided nothing | `could not be confirmed inside the sandbox root` |
+| `NotVerifiable` | the candidate failed to canonicalise and was refused unexamined, or the root did and the comparison decided nothing | `could not be confirmed inside the sandbox root` |
 
 The distinction is load-bearing rather than pedantic: under Windows Git Bash,
 a sandbox root reached through the `/tmp` mount is unresolvable on *every*

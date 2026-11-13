@@ -141,9 +141,13 @@ pub(crate) struct Normalised {
 /// Resolves symlinks and `..`, then drops the `\\?\` prefix that
 /// [`std::fs::canonicalize`] adds on Windows. Falls back to the input
 /// unchanged when the path cannot be resolved (it does not exist, or the
-/// volume is unreadable) — the caller still gets a well-defined value to
-/// compare, and an unresolvable path simply will not match a resolvable root
-/// — but `resolved: false` records that fallback rather than hiding it.
+/// volume is unreadable), and `resolved: false` records that fallback.
+///
+/// The fallback is safe for a **root**, which can then only fail to match a
+/// resolved candidate. It is not safe for a **candidate**: its raw spelling
+/// can match the root's leading components while a symlink in it points
+/// elsewhere, so a containment check must refuse an unresolved candidate
+/// rather than compare it (#119, `exec::check_cwd`).
 pub(crate) fn normalise(path: &Path) -> Normalised {
     match std::fs::canonicalize(path) {
         Ok(canonical) => Normalised {

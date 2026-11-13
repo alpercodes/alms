@@ -1115,13 +1115,25 @@ fn trim_ascii_whitespace(s: &[u8]) -> &[u8] {
 /// what keeps it in step with the verdict — a separate classifier run later
 /// could disagree with the decision it purports to explain.
 ///
-/// **Behaviour is unchanged**: the accept/reject decision is still
-/// `is_within` over the same two normalised paths, and every rejection still
-/// fails closed. Only the explanation is new.
+/// #119: a candidate that did not canonicalise is refused before the
+/// comparison, as [`CwdRejection::NotVerifiable`]. Every other decision is
+/// `is_within` over the two normalised paths, and every rejection fails
+/// closed.
 fn check_cwd(cwd: &Path, sandbox_root: &Path) -> Result<PathBuf, CwdRejection> {
     let root = pathnorm::normalise(sandbox_root);
     let candidate = pathnorm::resolve_reported(cwd);
 
+    // #119: fail closed on a candidate `canonicalize` could not resolve. Its
+    // raw spelling can match the root's leading components while naming
+    // something else entirely: `<root>/link`, a symlink whose target does
+    // not exist yet (or a path behind a transient permission or lock
+    // failure), would be accepted, and `Command::current_dir` follows the
+    // link wherever it points once it resolves. Only a resolved path says
+    // where the directory really is. The root keeps its raw fallback: an
+    // unresolved root can only fail to match a resolved candidate.
+    if !candidate.resolved {
+        return Err(CwdRejection::NotVerifiable);
+    }
     if pathnorm::is_within(&root.path, &candidate.path) {
         return Ok(candidate.path);
     }
@@ -1940,6 +1952,56 @@ mod tests {
             Err(CwdRejection::NotVerifiable),
             "an unresolved path supports 'not confirmed inside', not 'outside'"
         );
+    }
+
+    /// #119: a candidate under the root that `canonicalize` cannot resolve
+    /// used to be accepted on its raw spelling, because the raw path matches
+    /// the root's leading components. It is now refused: an unresolved path
+    /// cannot be confirmed inside the root.
+    #[test]
+    fn check_cwd_refuses_an_unresolvable_path_under_the_root() {
+        let root_dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(root_dir.path()).unwrap();
+        let missing = root.join("not-created-yet").join("nested");
+
+        assert!(
+            std::fs::canonicalize(&missing).is_err(),
+            "fixture precondition"
+        );
+        assert_eq!(
+            check_cwd(&missing, &root),
+            Err(CwdRejection::NotVerifiable),
+            "an unresolved candidate must not be accepted on its spelling"
+        );
+        let err = validate_cwd(&missing, &root).expect_err("pre-command check must refuse it");
+        assert!(
+            err.to_string().contains("could not be confirmed inside"),
+            "got: {err}"
+        );
+    }
+
+    /// #119, the symlink half: `<root>/link` points outside the root at a
+    /// target that does not exist yet, so `canonicalize` fails on it. Its
+    /// raw spelling is inside the root, and it used to be accepted. Once the
+    /// target exists, `Command::current_dir` would follow the link out.
+    #[cfg(unix)]
+    #[test]
+    fn check_cwd_refuses_a_dangling_symlink_that_points_outside() {
+        let root_dir = tempfile::tempdir().unwrap();
+        let outside_dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(root_dir.path()).unwrap();
+        let target = std::fs::canonicalize(outside_dir.path())
+            .unwrap()
+            .join("later");
+        let link = root.join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        assert_eq!(check_cwd(&link, &root), Err(CwdRejection::NotVerifiable));
+
+        // Once the target exists the link resolves, and the resolved path
+        // is outside: the established-escape verdict.
+        std::fs::create_dir(&target).unwrap();
+        assert_eq!(check_cwd(&link, &root), Err(CwdRejection::OutsideRoot));
     }
 
     /// The reason reaches the operator-facing error too — the pre-command
