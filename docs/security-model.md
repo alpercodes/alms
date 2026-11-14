@@ -469,7 +469,12 @@ symlink in it points elsewhere: before #119, `<root>/link` with a link to a
 not-yet-existing target outside the root was accepted, and
 `Command::current_dir` would follow the link once the target existed. A root
 that cannot be resolved is still compared on its raw spelling, which can
-only fail to match. Both refusals fail closed, but only one of them
+never produce a false accept: a canonical candidate only matches it when it
+sits literally under that spelling. A stored cwd that fails the check before a
+command (it was deleted, or stopped resolving) refuses that command, which was
+written for that cwd, and resets the shell to the sandbox root, so the agent is
+never left with a shell that refuses every command. A command that deletes its
+own cwd gets the same reset after it runs. Both refusals fail closed, but only one of them
 establishes where the directory actually is:
 
 | Outcome | Condition | `<verdict>` |
@@ -744,8 +749,10 @@ worse than "application-layer instead of kernel-level":
   stdout. It runs *after* the command. `cd /etc && ls` returns the
   `/etc` listing to the model and then resets the cwd — the test in
   `crates/alms-sandbox/src/shell/mod.rs` pins exactly that ("the
-  command's own output must survive intact"). This is cwd-drift
-  correction plus a signal to the agent, not a boundary.
+  command's own output must survive intact"). The same check runs again
+  before the next command: a stored cwd that no longer resolves inside the
+  root refuses that command and resets the shell to the root (#119). This
+  is cwd-drift correction plus a signal to the agent, not a boundary.
 - **Linux 5.13+** — Landlock LSM applies a kernel-level filesystem
   sandbox to every shell child process (see
   [§ 4.5](#45-isolation-roadmap)). The child cannot open files outside

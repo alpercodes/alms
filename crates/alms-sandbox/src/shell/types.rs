@@ -51,10 +51,12 @@ pub struct ShellInput {
     pub run_in_background: bool,
 }
 
-/// Why a post-command working directory failed the containment check.
+/// Why a working directory failed the containment check, before a command
+/// (the stored cwd) or after it (the reported one).
 ///
-/// The check fails closed, so both variants keep the previous cwd and behave
-/// identically. They differ only in what the daemon may *claim* about the
+/// The check fails closed, so both variants behave identically: a reported
+/// cwd is not adopted, and a stored one refuses the command and is reset to
+/// the sandbox root (#119). They differ only in what the daemon may *claim* about the
 /// path — and the notice the agent reads is built from that claim, so the
 /// two must not be conflated (issue #1262).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,11 +66,13 @@ pub enum CwdRejection {
     /// which "outside the sandbox root" is an established fact.
     OutsideRoot,
 
-    /// The candidate or the root could not be canonicalised, so
-    /// `canonical_for_comparison` compared a raw path and the containment
-    /// test could not decide anything. Rejecting is still correct — failing
-    /// closed is the whole point — but *where* the path actually is remains
-    /// unknown, and saying otherwise would be a guess dressed as a finding.
+    /// The candidate or the root could not be canonicalised. An unresolved
+    /// candidate is refused without being compared at all (#119); an
+    /// unresolved root is compared on its raw spelling, and a failed match
+    /// then decides nothing. Rejecting is still correct — failing closed is
+    /// the whole point — but *where* the path actually is remains unknown,
+    /// and saying otherwise would be a guess dressed as a finding. Used by
+    /// both the check before a command and the one after it.
     ///
     /// Reached in practice whenever the shell reports a cwd this process
     /// cannot resolve: Windows Git Bash serving `%TEMP%` through its `/tmp`

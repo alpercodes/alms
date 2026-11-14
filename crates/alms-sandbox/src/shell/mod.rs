@@ -48,9 +48,12 @@ use uuid::Uuid;
 /// The marker is generated once at tool construction and embedded in every
 /// command this `ShellTool` runs. Earlier versions used a fixed `__ALMS_PWD_MARKER__`
 /// constant — if a user script ever printed that exact string, it would
-/// corrupt cwd tracking. The per-instance UUID nonce avoids that class of
-/// collision: even if a script intentionally tries to forge the marker, it
-/// cannot guess the random suffix. Cloning a `ShellTool` (e.g. when the
+/// corrupt cwd tracking. The per-instance UUID nonce prevents accidental
+/// collisions, not forgery: the wrapped command line, marker included, is
+/// visible to the command itself (bash's `$BASH_EXECUTION_STRING`), so a
+/// command can print the marker followed by any path. The reported cwd is
+/// therefore treated as untrusted and goes through the containment check,
+/// which fails closed (#119). Cloning a `ShellTool` (e.g. when the
 /// runtime registers the same tool under both `shell` and `shell_exec`)
 /// preserves the marker so cwd recovery semantics remain consistent.
 fn new_pwd_marker() -> String {
@@ -256,17 +259,28 @@ impl ShellTool {
         // default cwd and the sandbox root were spelled in different but
         // equivalent forms (relative vs absolute, `\\?\`-prefixed, or
         // differently cased on Windows).
-        if let Some(ref root) = self.sandbox_root
-            && !pathnorm::is_within(
+        if let Some(ref root) = self.sandbox_root {
+            let candidate = pathnorm::normalise(&cwd);
+            if !candidate.resolved {
+                // #119: the pre-command check refuses a cwd it cannot
+                // resolve, so this one would be reset to the root on first use.
+                warn!(
+                    default_cwd = %cwd.display(),
+                    sandbox_root = %root.display(),
+                    error = ?candidate.error,
+                    "default_cwd cannot be resolved; the first command will be \
+                     refused and the shell reset to sandbox_root"
+                );
+            } else if !pathnorm::is_within(
                 &pathnorm::canonical_for_comparison(root),
-                &pathnorm::canonical_for_comparison(&cwd),
-            )
-        {
-            warn!(
-                default_cwd = %cwd.display(),
-                sandbox_root = %root.display(),
-                "default_cwd is outside sandbox_root"
-            );
+                &candidate.path,
+            ) {
+                warn!(
+                    default_cwd = %cwd.display(),
+                    sandbox_root = %root.display(),
+                    "default_cwd is outside sandbox_root"
+                );
+            }
         }
         // Replace the state with a fresh instance rooted at the new cwd.
         // Note: this creates a new ShellState, so any in-flight background
@@ -1188,6 +1202,78 @@ mod tests {
             root,
             "the previous cwd is kept"
         );
+    }
+
+    /// #119 (S1 a): a command that deletes the shell's own cwd. The reported
+    /// cwd is the deleted directory, and so is the one that would be kept, so
+    /// both are refused and the shell is reset to the root. The notice names
+    /// the root, and the next command runs there instead of being refused.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn test_shell_tool_resets_to_the_root_when_a_command_deletes_its_cwd() {
+        let dir = shell_cwd_test_dir();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let tool = ShellTool::sandboxed(root.clone());
+
+        tool.execute(serde_json::json!({"command": "mkdir build && cd build"}))
+            .await
+            .unwrap();
+        let result = tool
+            .execute(serde_json::json!({"command": "rm -r ../build"}))
+            .await
+            .unwrap();
+        let stdout = result["stdout"].as_str().unwrap();
+        assert!(stdout.contains("[cwd unchanged:"), "got: {stdout:?}");
+        assert!(
+            stdout.contains(&format!("still run in '{}'", root.display())),
+            "the notice must name the root the shell was reset to; got: {stdout:?}"
+        );
+
+        let next = tool
+            .execute(serde_json::json!({"command": "pwd"}))
+            .await
+            .expect("the next command must run in the root, not be refused");
+        let pwd = next["stdout"].as_str().unwrap().trim().to_string();
+        assert_eq!(std::fs::canonicalize(&pwd).unwrap(), root);
+    }
+
+    /// #119 (S3, S1 b): a stored cwd that does not resolve refuses the
+    /// command before anything is spawned, says so, and resets the shell to
+    /// the root, so the next command runs.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn test_shell_tool_refuses_a_command_in_an_unresolvable_cwd_before_spawn() {
+        let dir = shell_cwd_test_dir();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let marker = root.join("ran");
+        let tool = ShellTool::sandboxed(root.clone()).with_default_cwd(root.join("missing"));
+
+        let err = tool
+            .execute(serde_json::json!({"command": format!("touch '{}'", marker.display())}))
+            .await
+            .expect_err("refused before spawn");
+        let message = err.to_string();
+        assert!(
+            message.contains("could not be confirmed inside"),
+            "{message}"
+        );
+        assert!(
+            message.contains("could not be resolved ("),
+            "names the cause: {message}"
+        );
+        assert!(
+            message.contains("The command was not run")
+                && message.contains("is now the sandbox root"),
+            "{message}"
+        );
+        assert!(!marker.exists(), "the command must not have run");
+
+        let next = tool
+            .execute(serde_json::json!({"command": "pwd"}))
+            .await
+            .expect("the shell was reset to the root");
+        let pwd = next["stdout"].as_str().unwrap().trim().to_string();
+        assert_eq!(std::fs::canonicalize(&pwd).unwrap(), root);
     }
 
     /// #1262 — the same, end to end through the background path: submit,

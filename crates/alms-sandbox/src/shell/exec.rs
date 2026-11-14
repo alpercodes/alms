@@ -97,10 +97,32 @@ pub(crate) async fn execute_command(
 
     let cwd = state.cwd.lock().await.clone();
 
-    // Validate cwd against sandbox
-    if !unrestricted && let Some(root) = sandbox_root {
-        validate_cwd(&cwd, root)?;
-    }
+    // Validate cwd against sandbox, and spawn in the path that was checked.
+    //
+    // #119: a stored cwd that fails the check (it was deleted, or stopped
+    // resolving) would otherwise refuse every later command, `cd` included,
+    // until the run ends. The command is not run, since it was written for
+    // that cwd, and the stored cwd is reset to the sandbox root, but only if
+    // it is still the one just read: a concurrent background `cd` wins.
+    let cwd = match sandbox_root {
+        Some(root) if !unrestricted => match validate_cwd(&cwd, root) {
+            Ok(checked) => checked,
+            Err(SandboxError::SandboxViolation(message)) => {
+                let mut live = state.cwd.lock().await;
+                let now = if *live == cwd {
+                    *live = root.to_path_buf();
+                    "is now the sandbox root".to_string()
+                } else {
+                    format!("is now '{}'", live.display())
+                };
+                return Err(SandboxError::SandboxViolation(format!(
+                    "{message}. The command was not run; the shell's working directory {now}."
+                )));
+            }
+            Err(other) => return Err(other),
+        },
+        _ => cwd,
+    };
 
     // Build and spawn the command
     let PreparedCommand {
@@ -174,7 +196,17 @@ pub(crate) async fn execute_command(
                         // `ShellState`, so a concurrent command may have
                         // moved it. What the agent needs to be told is where
                         // its next command will actually run.
-                        let kept = state.cwd.lock().await.clone();
+                        //
+                        // #119: if the kept cwd itself no longer passes (the
+                        // command deleted it), reset it to the root, so the
+                        // notice's "subsequent commands still run in" is true.
+                        let kept = {
+                            let mut live = state.cwd.lock().await;
+                            if check_cwd(&live, root).is_err() {
+                                *live = root.to_path_buf();
+                            }
+                            live.clone()
+                        };
                         cwd_revert = Some(CwdRevert {
                             attempted: new_path.clone(),
                             kept,
@@ -1120,6 +1152,19 @@ fn trim_ascii_whitespace(s: &[u8]) -> &[u8] {
 /// `is_within` over the two normalised paths, and every rejection fails
 /// closed.
 fn check_cwd(cwd: &Path, sandbox_root: &Path) -> Result<PathBuf, CwdRejection> {
+    check_cwd_detailed(cwd, sandbox_root).map_err(|failure| failure.reason)
+}
+
+/// A [`check_cwd`] refusal, with the `canonicalize` error when the candidate
+/// did not resolve, so the pre-command error can name the cause (#119).
+#[derive(Debug)]
+struct CwdCheckFailure {
+    reason: CwdRejection,
+    unresolved: Option<String>,
+}
+
+/// [`check_cwd`], keeping the reason the candidate did not resolve.
+fn check_cwd_detailed(cwd: &Path, sandbox_root: &Path) -> Result<PathBuf, CwdCheckFailure> {
     let root = pathnorm::normalise(sandbox_root);
     let candidate = pathnorm::resolve_reported(cwd);
 
@@ -1129,35 +1174,46 @@ fn check_cwd(cwd: &Path, sandbox_root: &Path) -> Result<PathBuf, CwdRejection> {
     // not exist yet (or a path behind a transient permission or lock
     // failure), would be accepted, and `Command::current_dir` follows the
     // link wherever it points once it resolves. Only a resolved path says
-    // where the directory really is. The root keeps its raw fallback: an
-    // unresolved root can only fail to match a resolved candidate.
+    // where the directory really is. The root keeps its raw fallback, which
+    // can never produce a false accept.
     if !candidate.resolved {
-        return Err(CwdRejection::NotVerifiable);
+        return Err(CwdCheckFailure {
+            reason: CwdRejection::NotVerifiable,
+            unresolved: candidate.error,
+        });
     }
-    if pathnorm::is_within(&root.path, &candidate.path) {
+    if pathnorm::is_within_normalised(&root, &candidate) {
         return Ok(candidate.path);
     }
 
     // "Outside the root" is a claim about where the path *is*, and the
-    // comparison above only supports it when both sides were real resolved
-    // paths. If either fell back to its raw spelling, all that was
-    // established is that containment could not be confirmed.
-    Err(if root.resolved && candidate.resolved {
-        CwdRejection::OutsideRoot
-    } else {
-        CwdRejection::NotVerifiable
+    // comparison above only supports it when the root was a real resolved
+    // path too (the candidate always is by now). If the root fell back to its
+    // raw spelling, all that was established is that containment could not
+    // be confirmed.
+    Err(CwdCheckFailure {
+        reason: if root.resolved {
+            CwdRejection::OutsideRoot
+        } else {
+            CwdRejection::NotVerifiable
+        },
+        unresolved: None,
     })
 }
 
 /// Validate that a cwd is within the sandbox root, as a [`SandboxError`].
 ///
-/// Thin wrapper over [`check_cwd`] for the pre-command check, which has no
-/// use for the structured reason beyond wording the message accurately.
+/// Thin wrapper over [`check_cwd_detailed`] for the pre-command check, which
+/// uses the structured reason only to word the message accurately. When the
+/// cwd did not resolve, the message names the `canonicalize` error.
 fn validate_cwd(cwd: &Path, sandbox_root: &Path) -> SandboxResult<PathBuf> {
-    check_cwd(cwd, sandbox_root).map_err(|reason| {
-        let verdict = match reason {
-            CwdRejection::OutsideRoot => "is outside",
-            CwdRejection::NotVerifiable => "could not be confirmed inside",
+    check_cwd_detailed(cwd, sandbox_root).map_err(|failure| {
+        let verdict = match (failure.reason, failure.unresolved) {
+            (_, Some(cause)) => {
+                format!("could not be resolved ({cause}), so it could not be confirmed inside")
+            }
+            (CwdRejection::OutsideRoot, None) => "is outside".to_string(),
+            (CwdRejection::NotVerifiable, None) => "could not be confirmed inside".to_string(),
         };
         SandboxError::SandboxViolation(format!(
             "Working directory '{}' {verdict} sandbox root '{}'",
@@ -1976,6 +2032,12 @@ mod tests {
         let err = validate_cwd(&missing, &root).expect_err("pre-command check must refuse it");
         assert!(
             err.to_string().contains("could not be confirmed inside"),
+            "got: {err}"
+        );
+        // S2: and it names why, from the `canonicalize` error.
+        assert!(
+            err.to_string().contains("could not be resolved (")
+                && err.to_string().contains("No such file or directory"),
             "got: {err}"
         );
     }
