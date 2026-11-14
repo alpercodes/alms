@@ -2197,6 +2197,46 @@ mod tests {
         assert!(third.cwd_reset_from.is_none());
     }
 
+    /// #119: a pending reset record is dropped once the shell moves on, so
+    /// a later return to the root does not report a reset that is long past.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_cwd_move_drops_a_pending_reset_record() {
+        let root_dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(root_dir.path()).unwrap();
+        let sub = root.join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        let state = ShellState::new(sub);
+        record_cwd_reset(
+            &state,
+            CwdReset {
+                from: root.join("gone"),
+                root: root.clone(),
+                reason: CwdRejection::NotVerifiable,
+            },
+        );
+
+        let cd_up = ShellInput {
+            command: "cd ..".to_string(),
+            ..pwd_input()
+        };
+        execute_command(
+            &cd_up,
+            &state,
+            Some(&root),
+            false,
+            &HashMap::new(),
+            "__ALMS_PWD_TEST__",
+            &ShellSpillPolicy::disabled(),
+            "tc-119",
+        )
+        .await
+        .unwrap();
+
+        let back_in_root = run_pwd(&state, &root).await.unwrap();
+        assert!(back_in_root.cwd_reset_from.is_none());
+    }
+
     /// #119, the symlink half: `<root>/link` points outside the root at a
     /// target that does not exist yet, so `canonicalize` fails on it. Its
     /// raw spelling is inside the root, and it used to be accepted. Once the
