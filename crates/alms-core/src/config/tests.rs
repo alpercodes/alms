@@ -2590,6 +2590,25 @@ fn test_both_loaders_ignore_a_blank_model_env_and_trim_the_file() {
             "{name}"
         );
     }
+
+    // A blank `ALMS_LLM_MODEL` is "not set", so the legacy `DEFAULT_MODEL`
+    // is still read after it, as it would be if `ALMS_LLM_MODEL` were unset.
+    let _legacy_set = SingleEnvGuard::set("DEFAULT_MODEL", "legacy-model");
+    for (name, loader) in [
+        ("load", AlmsConfig::load as fn() -> AlmsResult<AlmsConfig>),
+        (
+            "load_or_default_fallible",
+            AlmsConfig::load_or_default_fallible,
+        ),
+    ] {
+        let config = load_from_with(cwd.path(), home.path(), loader).expect("loads");
+        assert_eq!(config.llm.model, "legacy-model", "{name}");
+        assert_eq!(
+            config.llm.providers["mylab"].model.as_deref(),
+            Some("legacy-model"),
+            "{name}"
+        );
+    }
 }
 
 /// An `alms.toml` that won't parse must not be replaced by defaults: that would

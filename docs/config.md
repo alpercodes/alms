@@ -573,6 +573,8 @@ Both fields surface on the SSE `run_finished` event, `GET /runs/{run_id}`, subag
 | `ALMS_LLM_STREAM_CHUNK_TIMEOUT` | `llm.stream_chunk_timeout_secs` |
 | `ALMS_LLM_BUDGET_VALIDATION` | (no TOML equivalent; `strict` default, `warn` opts out) |
 
+A blank or empty `ALMS_LLM_MODEL` / `DEFAULT_MODEL` counts as not set, so the `alms.toml` model is kept (#126). A blank `ALMS_LLM_MODEL` does not hide `DEFAULT_MODEL`.
+
 `ALMS_LLM_PROVIDER` can reference any entry in `[llm.providers.*]`, including user-declared ones — so you can keep Grok, DeepSeek, Groq, and Mistral all configured in the same file and switch between them with a single env var.
 
 ### `ALMS_LLM_BUDGET_VALIDATION` — provider context-window enforcement (#919)

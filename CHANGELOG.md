@@ -254,11 +254,13 @@ Each item below changes behaviour for a deployment that has not set the knob exp
   paths, and in the web UI's settings form, surrounding whitespace on a real model or
   provider name is removed. A blank `[llm] model` in `alms.toml` is treated as empty, like
   `model = ""`, and a blank provider-entry `model` as unset. A blank or empty
-  `ALMS_LLM_MODEL` (or `DEFAULT_MODEL`) is now "not set": the `alms.toml` model is kept.
-  Before, `ALMS_LLM_MODEL=""` replaced it with an empty model. The same applies to
-  `tools.sandbox_root`: a whitespace-only value from `PATCH /settings` is stored as `""`,
-  the "no override" value, where before it went live, persisted, and made every run fail
-  with `cannot be resolved`. **After upgrading**, a gateway whose `settings.json` already
+  `ALMS_LLM_MODEL` is now "not set", so `DEFAULT_MODEL` applies if it is set, and
+  otherwise the `alms.toml` model is kept; a blank `DEFAULT_MODEL` is "not set" too.
+  Before, `ALMS_LLM_MODEL=""` replaced the file's model with an empty one and hid
+  `DEFAULT_MODEL`. `tools.sandbox_root` in `PATCH /settings` gets the same fix: a
+  whitespace-only value is stored as `""`, the "no override" value, where before it went
+  live, persisted, and made every run fail with `cannot be resolved`. (`ALMS_SANDBOX_ROOT`
+  and `[tools] sandbox_root` in `alms.toml` are unchanged.) **After upgrading**, a gateway whose `settings.json` already
   holds a blank model skips it at startup with a WARN and uses the `alms.toml` model; set
   one with `PATCH /settings` or remove the line. A blank persisted `sandbox_root` is read as
   `""`. An agent whose record already holds a blank model gets a WARN at startup naming it;
