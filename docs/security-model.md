@@ -489,9 +489,13 @@ reset after it runs, and its notice reads `[cwd reset: ...]` instead of
 sibling in the same tool-call batch, or a foreground command beside a
 background one, that reads the cwd after the reset runs in the root although
 it was written for the old cwd. That cannot be prevented, so it is reported:
-the first command to run in the root after a reset gets a one-shot
-`[cwd reset: '<old>' no longer resolved, so this command ran in the sandbox
-root '<root>']` line. The reset only ever writes the sandbox root, so it
+the first command to run in the root after a reset, whether the reset came
+before or after a command (a background command that deletes its own cwd,
+say), gets a one-shot `[cwd reset: '<old>' no longer resolved, so this command
+ran in the sandbox root '<root>']` line. If that command fails before it can
+report the reset (a timeout, say), the record is put back for the next one. A
+background command can be the one that takes it, and then the line shows only
+in its `check_task` result. The reset only ever writes the sandbox root, so it
 widens nothing. Both outcomes fail closed, but only one of them
 establishes where the directory actually is:
 

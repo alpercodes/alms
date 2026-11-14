@@ -56,9 +56,10 @@ pub struct ShellInput {
 ///
 /// The check fails closed, so both variants behave identically: a reported
 /// cwd is not adopted, and a stored one refuses the command and is reset to
-/// the sandbox root, unless a concurrent command has moved it (#119). They differ only in what the daemon may *claim* about the
-/// path — and the notice the agent reads is built from that claim, so the
-/// two must not be conflated (issue #1262).
+/// the sandbox root, unless a concurrent command has moved it (#119). They
+/// differ only in what the daemon may *claim* about the path — and the notice
+/// the agent reads is built from that claim, so the two must not be conflated
+/// (issue #1262).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CwdRejection {
     /// Both the sandbox root and the candidate canonicalised successfully,
@@ -100,10 +101,11 @@ pub struct CwdRevert {
     /// reset (`reset`, #119).
     pub kept: PathBuf,
 
-    /// Whether the previous cwd no longer passed the check either (the
-    /// command deleted it) and was reset to the sandbox root, so the notice
-    /// says the cwd moved rather than that it was unchanged (#119).
-    pub reset: bool,
+    /// Set when the previous cwd no longer passed the check either (the
+    /// command deleted it, say) and was reset to the sandbox root, with what
+    /// the check determined about it, so the notice says the cwd moved, and
+    /// why, rather than that it was unchanged (#119).
+    pub reset: Option<CwdRejection>,
 
     /// What the containment check actually determined. Carried through so
     /// the notice states that and not more — a rejection is not by itself
@@ -142,15 +144,15 @@ pub struct ShellOutput {
     pub cwd_revert: Option<CwdRevert>,
 
     /// Set when this command ran in the sandbox root because an earlier
-    /// command's pre-command check reset the shell there (#119). Carries the
-    /// cwd that was reset away from. The first command to run in the root
-    /// after the reset takes it, so a concurrent sibling that was never shown
-    /// the refused command's error still learns where it ran.
+    /// command reset the shell there, before or after it ran (#119). Carries
+    /// the cwd that was reset away from. The first command to run in the root
+    /// after the reset takes it, so a concurrent command that was never shown
+    /// the earlier command's error or notice still learns where it ran.
     pub cwd_reset_from: Option<CwdReset>,
 }
 
-/// A pre-command reset of the shell's cwd to the sandbox root (#119), as
-/// reported to the next command that runs in the root.
+/// A reset of the shell's cwd to the sandbox root (#119), as reported to the
+/// next command that runs in the root.
 #[derive(Debug, Clone)]
 pub struct CwdReset {
     /// The stored cwd that failed the check and was reset away from.
@@ -189,10 +191,11 @@ pub struct ShellState {
     /// Updated after each successful command execution by parsing `pwd` output.
     pub cwd: Arc<Mutex<PathBuf>>,
 
-    /// The last pre-command reset of `cwd` to the sandbox root, not yet
-    /// reported to a command that ran there (#119). Only read or written
-    /// while `cwd` is locked, so the record and the cwd change together.
-    pub cwd_reset: Arc<std::sync::Mutex<Option<CwdReset>>>,
+    /// The last reset of `cwd` to the sandbox root, before or after a
+    /// command, not yet reported to a command that ran there (#119). Only
+    /// read or written while `cwd` is locked, so the record and the cwd
+    /// change together.
+    pub cwd_reset: Arc<parking_lot::Mutex<Option<CwdReset>>>,
 
     /// Background tasks indexed by task ID.
     pub background_tasks: Arc<Mutex<HashMap<String, BackgroundTaskResult>>>,
@@ -206,7 +209,7 @@ impl ShellState {
     pub fn new(initial_cwd: PathBuf) -> Self {
         Self {
             cwd: Arc::new(Mutex::new(initial_cwd)),
-            cwd_reset: Arc::new(std::sync::Mutex::new(None)),
+            cwd_reset: Arc::new(parking_lot::Mutex::new(None)),
             background_tasks: Arc::new(Mutex::new(HashMap::new())),
             next_task_id: Arc::new(Mutex::new(1)),
         }

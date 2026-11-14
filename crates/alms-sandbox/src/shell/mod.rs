@@ -448,14 +448,17 @@ impl ShellTool {
                 // a spelling it can actually use.
                 let attempted = revert.attempted.display();
                 let kept = pathnorm::strip_verbatim_prefix(&revert.kept);
-                let line = if revert.reset {
+                let line = if let Some(previous) = revert.reset {
                     // #119: the previous cwd failed too (the command deleted
-                    // it), so the shell moved to the root: neither
+                    // it, say), so the shell moved to the root: neither
                     // "unchanged" nor "still" would be true.
+                    let why = match previous {
+                        CwdRejection::OutsideRoot => "is outside the sandbox root",
+                        CwdRejection::NotVerifiable => "no longer resolves",
+                    };
                     format!(
                         "[cwd reset: '{attempted}' {verdict}, and the previous working \
-                         directory no longer resolves; subsequent commands run in the \
-                         sandbox root '{}']",
+                         directory {why}; subsequent commands run in the sandbox root '{}']",
                         kept.display()
                     )
                 } else {
@@ -1276,8 +1279,51 @@ mod tests {
             .execute(serde_json::json!({"command": "pwd"}))
             .await
             .expect("the next command must run in the root, not be refused");
-        let pwd = next["stdout"].as_str().unwrap().trim().to_string();
-        assert_eq!(std::fs::canonicalize(&pwd).unwrap(), root);
+        let stdout = next["stdout"].as_str().unwrap();
+        let pwd = stdout.lines().next().unwrap_or_default();
+        assert_eq!(std::fs::canonicalize(pwd).unwrap(), root);
+        // The post-command reset is recorded like the pre-command one, so the
+        // next command repeats the notice once.
+        assert!(stdout.contains("[cwd reset: '"), "got: {stdout:?}");
+    }
+
+    /// #119: a background command that deletes its own cwd resets the shell,
+    /// but its `[cwd reset: ...]` notice waits in the task result until
+    /// `check_task`. A foreground command that then runs in the root must be
+    /// told on its own.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn test_a_background_reset_is_reported_to_the_next_foreground_command() {
+        let dir = shell_cwd_test_dir();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let tool = ShellTool::sandboxed(root.clone());
+
+        tool.execute(serde_json::json!({"command": "mkdir build && cd build"}))
+            .await
+            .unwrap();
+        let submitted = tool
+            .execute(serde_json::json!({
+                "command": "rm -r ../build",
+                "run_in_background": true
+            }))
+            .await
+            .unwrap();
+        let task_id = submitted["task_id"].as_str().unwrap().to_string();
+        wait_for_background_task(&tool, &task_id).await;
+
+        let next = tool
+            .execute(serde_json::json!({"command": "pwd"}))
+            .await
+            .expect("the foreground command runs in the root");
+        let stdout = next["stdout"].as_str().unwrap();
+        assert_eq!(
+            std::fs::canonicalize(stdout.lines().next().unwrap_or_default()).unwrap(),
+            root
+        );
+        assert!(
+            stdout.contains("[cwd reset: '"),
+            "the foreground command must be told it ran in the root: {stdout:?}"
+        );
     }
 
     /// #119: a stored cwd that does not resolve refuses the
@@ -1418,7 +1464,7 @@ mod tests {
                 attempted: PathBuf::from("/etc"),
                 kept: PathBuf::from("/work/agent-root"),
                 reason,
-                reset: false,
+                reset: None,
             }),
             cwd_reset_from: None,
         }

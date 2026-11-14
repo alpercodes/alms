@@ -170,8 +170,8 @@ Each item below changes behaviour for a deployment that has not set the knob exp
   sandbox root.`, and the shell is reset to the root. A command that deletes its own cwd
   also leaves the shell at the root, with a `[cwd reset: ...]` notice. With commands
   running concurrently (a parallel tool-call batch, or a background command), a command
-  that starts after the reset runs at the root although it was written for the old cwd;
-  the first such command carries a one-shot `[cwd reset: '<old>' no longer resolved, so
+  that starts after either reset runs at the root although it was written for the old
+  cwd; the first such command carries a one-shot `[cwd reset: '<old>' no longer resolved, so
   this command ran in the sandbox root '<root>']` line. On Windows, a cwd is now compared
   to a resolved sandbox root without case folding; a sibling that differs from the root
   only in case (possible with per-directory case sensitivity) is no longer treated as

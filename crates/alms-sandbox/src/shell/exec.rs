@@ -114,6 +114,7 @@ pub(crate) async fn execute_command(
     // although it was written for the old cwd. It cannot be prevented here,
     // so it is reported: the reset is recorded next to the cwd, and the first
     // command that then runs in the root carries a `[cwd reset: ...]` notice.
+    // The post-command reset below records the same way.
     let mut cwd_reset_from: Option<CwdReset> = None;
     let cwd = match sandbox_root {
         Some(root) if !unrestricted => match check_cwd_detailed(&cwd, root) {
@@ -155,27 +156,40 @@ pub(crate) async fn execute_command(
         _ => cwd,
     };
 
-    // Build and spawn the command
-    let PreparedCommand {
-        mut cmd,
-        stdin_payload,
-    } = build_command(command, &cwd, sandbox_root, unrestricted, pwd_marker)?;
+    // Build, spawn and run the command. If any of it fails after this command
+    // took a reset record, the record goes back (#119): the error never
+    // reaches `ShellOutput`, so nobody would be told otherwise.
+    let run = async {
+        let PreparedCommand {
+            mut cmd,
+            stdin_payload,
+        } = build_command(command, &cwd, sandbox_root, unrestricted, pwd_marker)?;
 
-    // Configure environment
-    configure_env(&mut cmd, default_env);
+        // Configure environment
+        configure_env(&mut cmd, default_env);
 
-    debug!(
-        command = %command,
-        cwd = %cwd.display(),
-        timeout_ms = input.timeout_ms,
-        "Spawning shell command"
-    );
+        debug!(
+            command = %command,
+            cwd = %cwd.display(),
+            timeout_ms = input.timeout_ms,
+            "Spawning shell command"
+        );
 
-    let child = cmd
-        .spawn()
-        .map_err(|e| SandboxError::Io(format!("Failed to spawn command: {e}")))?;
+        let child = cmd
+            .spawn()
+            .map_err(|e| SandboxError::Io(format!("Failed to spawn command: {e}")))?;
 
-    let result = drive_child_to_completion(child, stdin_payload, input.timeout_ms).await?;
+        drive_child_to_completion(child, stdin_payload, input.timeout_ms).await
+    };
+    let result = match run.await {
+        Ok(result) => result,
+        Err(error) => {
+            if let (Some(reset), Some(root)) = (cwd_reset_from.take(), sandbox_root) {
+                restore_cwd_reset(state, root, reset).await;
+            }
+            return Err(error);
+        }
+    };
 
     let exit_code = result.status.code().unwrap_or(-1);
 
@@ -233,11 +247,25 @@ pub(crate) async fn execute_command(
                         //
                         // #119: if the kept cwd itself no longer passes (the
                         // command deleted it), reset it to the root, so the
-                        // notice's "subsequent commands still run in" is true.
+                        // notice can name where the next command really runs,
+                        // and record the reset like the pre-command path: a
+                        // foreground command beside this one, when this is a
+                        // background command, would otherwise run in the root
+                        // with nothing said. Not when the old cwd is the root.
                         let (kept, reset) = {
                             let mut live = state.cwd.lock().await;
-                            let reset = check_cwd(&live, root).is_err();
-                            if reset {
+                            let reset = check_cwd(&live, root).err();
+                            if let Some(why) = reset {
+                                if *live != root {
+                                    record_cwd_reset(
+                                        state,
+                                        CwdReset {
+                                            from: live.clone(),
+                                            root: root.to_path_buf(),
+                                            reason: why,
+                                        },
+                                    );
+                                }
                                 *live = root.to_path_buf();
                             }
                             (live.clone(), reset)
@@ -312,22 +340,28 @@ pub(crate) async fn execute_command(
     })
 }
 
-/// Record a pre-command reset for the next command that runs in the root.
-/// Callers hold the `cwd` lock (#119).
+/// Record a reset for the next command that runs in the root. Callers hold
+/// the `cwd` lock (#119).
 fn record_cwd_reset(state: &ShellState, reset: CwdReset) {
-    *state
-        .cwd_reset
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(reset);
+    *state.cwd_reset.lock() = Some(reset);
 }
 
 /// Take the pending reset record, if any. Callers hold the `cwd` lock (#119).
 fn take_cwd_reset(state: &ShellState) -> Option<CwdReset> {
-    state
-        .cwd_reset
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .take()
+    state.cwd_reset.lock().take()
+}
+
+/// Put back a reset record taken by a command that then failed before it
+/// could report it (#119), if the shell is still in the root and no newer
+/// record has been written since.
+async fn restore_cwd_reset(state: &ShellState, root: &Path, reset: CwdReset) {
+    let live = state.cwd.lock().await;
+    if *live == root {
+        let mut pending = state.cwd_reset.lock();
+        if pending.is_none() {
+            *pending = Some(reset);
+        }
+    }
 }
 
 /// Feed `stdin_payload` (builtin engine, #1143) to a spawned child and wait
@@ -2164,7 +2198,7 @@ mod tests {
         );
         assert_eq!(*state.cwd.lock().await, sub, "the concurrent move wins");
         assert!(
-            state.cwd_reset.lock().unwrap().is_none(),
+            state.cwd_reset.lock().is_none(),
             "no reset happened, so none is recorded"
         );
     }
@@ -2197,6 +2231,44 @@ mod tests {
         assert!(third.cwd_reset_from.is_none());
     }
 
+    /// #119: a command that takes the reset record and then fails before it
+    /// can report it (here, a timeout) puts the record back, so the next
+    /// command is still told.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_command_that_fails_after_taking_the_record_puts_it_back() {
+        let root_dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(root_dir.path()).unwrap();
+        let state = ShellState::new(root.join("gone"));
+        run_pwd(&state, &root)
+            .await
+            .expect_err("refused, and reset");
+
+        let slow = ShellInput {
+            command: "sleep 5".to_string(),
+            timeout_ms: 200,
+            ..pwd_input()
+        };
+        let timed_out = execute_command(
+            &slow,
+            &state,
+            Some(&root),
+            false,
+            &HashMap::new(),
+            "__ALMS_PWD_TEST__",
+            &ShellSpillPolicy::disabled(),
+            "tc-119",
+        )
+        .await;
+        assert!(timed_out.is_err(), "the sleep must time out");
+
+        let next = run_pwd(&state, &root).await.unwrap();
+        assert!(
+            next.cwd_reset_from.is_some(),
+            "the timed-out command never reported the reset, so the next one must"
+        );
+    }
+
     /// #119: a pending reset record is dropped once the shell moves on, so
     /// a later return to the root does not report a reset that is long past.
     #[cfg(unix)]
@@ -2220,7 +2292,7 @@ mod tests {
             command: "cd ..".to_string(),
             ..pwd_input()
         };
-        execute_command(
+        let moved = execute_command(
             &cd_up,
             &state,
             Some(&root),
@@ -2232,6 +2304,8 @@ mod tests {
         )
         .await
         .unwrap();
+        // It ran in `sub`, not the root, so it must not take the record.
+        assert!(moved.cwd_reset_from.is_none());
 
         let back_in_root = run_pwd(&state, &root).await.unwrap();
         assert!(back_in_root.cwd_reset_from.is_none());
