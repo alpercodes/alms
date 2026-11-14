@@ -320,10 +320,14 @@ impl AlmsConfig {
         if let Ok(model) =
             std::env::var("ALMS_LLM_MODEL").or_else(|_| std::env::var("DEFAULT_MODEL"))
         {
-            self.llm.model = model.clone();
-            // Same propagation rationale as `base_url` above.
-            if let Some(entry) = self.llm.providers.get_mut(&self.llm.provider) {
-                entry.model = Some(model);
+            // #126: a blank value is "not set", so alms.toml keeps its model.
+            let model = model.trim();
+            if !model.is_empty() {
+                self.llm.model = model.to_string();
+                // Same propagation rationale as `base_url` above.
+                if let Some(entry) = self.llm.providers.get_mut(&self.llm.provider) {
+                    entry.model = Some(model.to_string());
+                }
             }
         }
         if let Ok(val) = std::env::var("ALMS_LLM_MOCK") {

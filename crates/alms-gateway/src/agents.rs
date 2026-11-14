@@ -492,7 +492,9 @@ pub async fn get_agent(
 ///
 /// Semantics:
 /// - Empty-string sentinel for `model` / `posture` / `provider` /
-///   `telegram_token` clears the override back to `None`.
+///   `telegram_token` clears the override back to `None`. `model` and
+///   `provider` are trimmed first, so a whitespace-only value clears them
+///   too (#172, #126).
 /// - `clear_thinking_budget_tokens` / `clear_reasoning_effort` /
 ///   `clear_gemini_thinking_budget` booleans clear the corresponding
 ///   reasoning knob back to `None` (inherit server default). Sending

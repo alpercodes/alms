@@ -366,14 +366,15 @@ impl AppState {
                 sess_overrides.apply_to(&mut session_config);
             }
             if let Some(tools_overrides) = persisted.tools {
-                // Also sync the two copies kept in agent_config.
-                if let Some(ref root) = tools_overrides.sandbox_root {
-                    agent_config_val.sandbox_root = root.clone();
+                tools_overrides.apply_to(&mut tools_config);
+                // Also sync the two copies kept in agent_config, from the
+                // values `apply_to` settled on (it clears a blank root, #126).
+                if tools_overrides.sandbox_root.is_some() {
+                    agent_config_val.sandbox_root = tools_config.sandbox_root.clone();
                 }
                 if let Some(ref policy) = tools_overrides.shell_policy {
                     agent_config_val.shell_policy = policy.clone();
                 }
-                tools_overrides.apply_to(&mut tools_config);
             }
             // LLM provider-family overrides (#809). Applied directly to
             // the live `AgentConfig` which is the source of truth for
@@ -514,13 +515,17 @@ impl AppState {
             // #126: an earlier version could persist a whitespace-only model.
             // It is leftover state, so it is skipped with a WARN rather than
             // applied, and the file is left for the operator to fix.
+            // Only when the provider is valid: a stale provider already gets a
+            // WARN above saying its model is ignored.
             let persisted_model = persisted.model.as_deref().map(str::trim);
-            if persisted.model.as_deref().is_some_and(|m| !m.is_empty())
+            if persisted_provider_valid
+                && persisted.model.as_deref().is_some_and(|m| !m.is_empty())
                 && persisted_model == Some("")
             {
                 tracing::warn!(
                     target: "alms.config",
                     settings_path = %crate::settings::settings_path(&data_dir).display(),
+                    persisted_model = ?persisted.model,
                     "ignoring a whitespace-only persisted server-default model; \
                      set a model with PATCH /settings or remove it from settings.json"
                 );
@@ -539,7 +544,7 @@ impl AppState {
         // warn, don't fix.
         if let Some(store) = session_manager.store() {
             match store.list_agents() {
-                Ok(agents) => warn_agents_on_unconfigured_providers(&agents, &llm_config.providers),
+                Ok(agents) => warn_about_stale_agent_records(&agents, &llm_config.providers),
                 Err(error) => tracing::warn!(
                     target: "alms.config",
                     %error,
@@ -713,14 +718,28 @@ impl AppState {
     }
 }
 
-/// Log a WARN at startup for each agent whose `provider` or `summary_provider`
-/// names no `[llm.providers]` entry (#172), so an operator who removed or
-/// renamed an entry learns which agents it stranded before their next run.
-fn warn_agents_on_unconfigured_providers(
+/// Log a WARN at startup for each agent record that its runs will trip on:
+/// a `provider` or `summary_provider` naming no `[llm.providers]` entry
+/// (#172), so an operator who removed or renamed an entry learns which agents
+/// it stranded before their next run, and a blank `model` override an earlier
+/// version could store (#126).
+fn warn_about_stale_agent_records(
     agents: &[alms_core::registry::AgentRecord],
     providers: &std::collections::BTreeMap<String, alms_core::config::ProviderEntry>,
 ) {
     for agent in agents {
+        // #126: earlier versions could store a blank model override, which
+        // runs send as the model name. Leftover state: warn, don't rewrite.
+        if agent.model.as_deref().is_some_and(|m| m.trim().is_empty()) {
+            tracing::warn!(
+                target: "alms.config",
+                agent = %agent.name,
+                model = ?agent.model,
+                "agent has a blank model override, which its runs send as the model name; \
+                 clear it with PUT /agents/<name> and \"model\": \"\", or \
+                 `alms agent config <name> --model \"\"`"
+            );
+        }
         if let Some(p) = agent.provider.as_deref()
             && !alms_core::config::is_known_provider(p, providers)
         {

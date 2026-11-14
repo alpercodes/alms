@@ -496,11 +496,15 @@ export function SettingsModal({ open, onClose }) {
         // sentinel — "no server default" is not a runnable state), so we
         // omit the field when the form value is empty rather than
         // sending `""`.
-        if (defaultModel.value && defaultModel.value !== (defaults.model || '')) {
-            body.model = defaultModel.value;
+        // Trimmed, as the server trims them (#126): a blank entry is then a
+        // no-op rather than a 422 the form cannot act on.
+        const model = defaultModel.value.trim();
+        const provider = defaultProvider.value.trim();
+        if (model && model !== (defaults.model || '')) {
+            body.model = model;
         }
-        if (defaultProvider.value && defaultProvider.value !== (defaults.provider || '')) {
-            body.provider = defaultProvider.value;
+        if (provider && provider !== (defaults.provider || '')) {
+            body.provider = provider;
         }
 
         // PATCH server settings if anything changed.

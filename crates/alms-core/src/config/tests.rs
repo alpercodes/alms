@@ -2482,11 +2482,21 @@ fn test_load_or_default_succeeds_with_no_config_file() {
 /// Runs `load_or_default_fallible` with `cwd` as the working directory and
 /// `home` as the home directory.
 fn load_from(cwd: &std::path::Path, home: &std::path::Path) -> AlmsResult<AlmsConfig> {
+    load_from_with(cwd, home, AlmsConfig::load_or_default_fallible)
+}
+
+/// [`load_from`] with the loader chosen by the caller, so a test can run
+/// `AlmsConfig::load` (the `Gateway::from_env` path) the same way.
+fn load_from_with(
+    cwd: &std::path::Path,
+    home: &std::path::Path,
+    loader: fn() -> AlmsResult<AlmsConfig>,
+) -> AlmsResult<AlmsConfig> {
     let _home_guard = SingleEnvGuard::set("HOME", home.to_str().unwrap());
     let _userprofile_guard = SingleEnvGuard::set("USERPROFILE", home.to_str().unwrap());
     let saved_cwd = std::env::current_dir().expect("cwd readable");
     std::env::set_current_dir(cwd).expect("chdir to tempdir");
-    let result = AlmsConfig::load_or_default_fallible();
+    let result = loader();
     std::env::set_current_dir(&saved_cwd).expect("restore cwd");
     result
 }
@@ -2544,6 +2554,42 @@ fn test_load_or_default_trims_models_from_the_config_file() {
 
     assert_eq!(config.llm.model, "");
     assert_eq!(config.llm.providers["mylab"].model.as_deref(), Some("m-1"));
+}
+
+/// #126: through both loaders, a blank `ALMS_LLM_MODEL` is "not set", so the
+/// `alms.toml` models survive, and the file's padded models are trimmed. (Kept
+/// small: it shares `ENV_LOCK` with the other loader tests.)
+#[test]
+fn test_both_loaders_ignore_a_blank_model_env_and_trim_the_file() {
+    let _lock = ENV_LOCK.lock().unwrap();
+    let _provider_guard = SingleEnvGuard::remove("ALMS_LLM_PROVIDER");
+    let _model_guard = SingleEnvGuard::set("ALMS_LLM_MODEL", "   ");
+    let _legacy_model_guard = SingleEnvGuard::remove("DEFAULT_MODEL");
+    let _mock_guard = SingleEnvGuard::remove("ALMS_LLM_MOCK");
+    let home = tempfile::tempdir().expect("tempdir creates");
+    let cwd = tempfile::tempdir().expect("tempdir creates");
+    std::fs::write(
+        cwd.path().join("alms.toml"),
+        "[llm]\nprovider = \"mylab\"\nmodel = \" toml-model \"\n\n\
+         [llm.providers.mylab]\nbase_url = \"http://127.0.0.1:9/v1\"\nmodel = \" entry-model \"\n",
+    )
+    .expect("toml write");
+
+    for (name, loader) in [
+        ("load", AlmsConfig::load as fn() -> AlmsResult<AlmsConfig>),
+        (
+            "load_or_default_fallible",
+            AlmsConfig::load_or_default_fallible,
+        ),
+    ] {
+        let config = load_from_with(cwd.path(), home.path(), loader).expect("loads");
+        assert_eq!(config.llm.model, "toml-model", "{name}");
+        assert_eq!(
+            config.llm.providers["mylab"].model.as_deref(),
+            Some("entry-model"),
+            "{name}"
+        );
+    }
 }
 
 /// An `alms.toml` that won't parse must not be replaced by defaults: that would
