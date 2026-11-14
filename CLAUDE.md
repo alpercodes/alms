@@ -107,7 +107,7 @@ alms-cli → alms-gateway → alms-runtime      → alms-core
 - **Logging**: `tracing` with structured fields and `#[instrument]` macros
 - **Concurrency**: `tokio` async runtime, `DashMap` for concurrent maps, `parking_lot` for locks
 - **IDs**: Newtype wrappers (`AgentId`, `SessionId`, `RunId`, etc.) — never raw strings
-- **Tests**: `#[cfg(test)] mod tests` in each file. Golden tests for SSE in `alms-gateway/tests/`
+- **Tests**: `#[cfg(test)] mod tests` in each file. Golden tests for SSE in `alms-gateway/tests/`. Env vars / cwd only via `alms_test_support::process_env`
 - **Frontend**: new code is strict TypeScript; all API/SSE JSON crosses the mandatory validated bridge
 - **Frontend assets**: run `npm run ui:build` and commit `static/ui-dist/`; CI rejects generated drift
 
