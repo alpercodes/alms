@@ -312,7 +312,11 @@ mod tests {
             // The helper thread is deadlocked holding the lock, so every later
             // test in this binary would wait on it forever. End the binary now,
             // with the reason, rather than let CI run into its job timeout.
-            eprintln!(
+            // Written to the stderr handle directly: libtest captures
+            // `eprintln!` and would discard it on abort.
+            use std::io::Write as _;
+            let _ = writeln!(
+                std::io::stderr(),
                 "process_env: taking the lock a second time hung instead of \
                  panicking (the re-entry check regressed); aborting the test binary"
             );
