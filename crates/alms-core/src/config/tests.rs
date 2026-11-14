@@ -149,7 +149,7 @@ pub(crate) fn select_llm_api_key(
 // `alms_test_support::process_env` for why a single lock replaced the
 // `ENV_LOCK` / `BUDGET_ENV_LOCK` pair and their disjoint-var-set contract.
 use alms_test_support::process_env::{
-    CurrentDirGuard, EnvLock, VarGuard as SingleEnvGuard, lock as env_lock,
+    CurrentDirGuard, EnvLock, VarGuard as SingleEnvGuard, VarGuards, lock as env_lock,
 };
 
 const LLM_ENV_VARS: [&str; 4] = [
@@ -162,32 +162,28 @@ const LLM_ENV_VARS: [&str; 4] = [
 /// Takes the env lock and clears `LLM_ENV_VARS` apart from `overrides`,
 /// putting every one of them back on drop.
 struct EnvGuard {
-    // Restored newest first (see `Drop`), then the lock is released.
-    vars: Vec<SingleEnvGuard>,
+    // Field order is drop order: the vars are restored (newest first, see
+    // `VarGuards`), then the lock is released.
+    _vars: VarGuards,
     _lock: EnvLock,
 }
 
 impl EnvGuard {
     fn set(overrides: &[(&'static str, Option<&str>)]) -> Self {
         let lock = env_lock();
-        let mut vars: Vec<SingleEnvGuard> =
-            LLM_ENV_VARS.iter().map(SingleEnvGuard::remove).collect();
+        let mut vars = VarGuards::default();
+        for name in LLM_ENV_VARS {
+            vars.push(SingleEnvGuard::remove(name));
+        }
         for (name, value) in overrides {
             vars.push(match value {
                 Some(v) => SingleEnvGuard::set(name, v),
                 None => SingleEnvGuard::remove(name),
             });
         }
-        Self { vars, _lock: lock }
-    }
-}
-
-impl Drop for EnvGuard {
-    fn drop(&mut self) {
-        // Newest first: a var cleared and then overridden must end on the
-        // value it had before the clear.
-        while let Some(var) = self.vars.pop() {
-            drop(var);
+        Self {
+            _vars: vars,
+            _lock: lock,
         }
     }
 }

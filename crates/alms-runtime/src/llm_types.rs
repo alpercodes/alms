@@ -825,7 +825,7 @@ impl LlmConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alms_test_support::process_env::{EnvLock, VarGuard, lock as env_lock};
+    use alms_test_support::process_env::{EnvLock, VarGuard, VarGuards, lock as env_lock};
 
     // `env_lock()` is this test binary's one lock for env vars and the
     // working directory, shared with `llm_client`'s tests and recovered if a
@@ -838,31 +838,28 @@ mod tests {
     ];
 
     struct EnvGuard {
-        // Restored newest first (see `Drop`), then the lock is released.
-        vars: Vec<VarGuard>,
+        // Field order is drop order: the vars are restored (newest first, see
+        // `VarGuards`), then the lock is released.
+        _vars: VarGuards,
         _lock: EnvLock,
     }
 
     impl EnvGuard {
         fn set(overrides: &[(&'static str, Option<&str>)]) -> Self {
             let lock = env_lock();
-            let mut vars: Vec<VarGuard> = LLM_ENV_VARS.iter().map(VarGuard::remove).collect();
+            let mut vars = VarGuards::default();
+            for name in LLM_ENV_VARS {
+                vars.push(VarGuard::remove(name));
+            }
             for (name, value) in overrides {
                 vars.push(match value {
                     Some(v) => VarGuard::set(name, v),
                     None => VarGuard::remove(name),
                 });
             }
-            Self { vars, _lock: lock }
-        }
-    }
-
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            // Newest first: a var cleared and then overridden must end on the
-            // value it had before the clear.
-            while let Some(var) = self.vars.pop() {
-                drop(var);
+            Self {
+                _vars: vars,
+                _lock: lock,
             }
         }
     }

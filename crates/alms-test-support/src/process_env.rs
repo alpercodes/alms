@@ -170,6 +170,30 @@ impl Drop for VarGuard {
     }
 }
 
+/// A set of [`VarGuard`]s that restores them **newest first** on drop.
+///
+/// The order matters once one var is touched twice, e.g. cleared and then
+/// overridden: restoring oldest first would end on the clear's snapshot (the
+/// var removed) instead of the value it had before. A plain `Vec` drops its
+/// elements oldest first.
+#[derive(Default)]
+#[must_use = "the variables are restored when the guards are dropped"]
+pub struct VarGuards(Vec<VarGuard>);
+
+impl VarGuards {
+    pub fn push(&mut self, guard: VarGuard) {
+        self.0.push(guard);
+    }
+}
+
+impl Drop for VarGuards {
+    fn drop(&mut self) {
+        while let Some(guard) = self.0.pop() {
+            drop(guard);
+        }
+    }
+}
+
 /// Changes the working directory and changes it back on drop, including
 /// when the test panics. Needs [`lock`] held.
 #[must_use = "the working directory is restored when the guard is dropped"]
@@ -244,6 +268,24 @@ mod tests {
         assert_eq!(std::env::var(VAR).unwrap(), "outer");
     }
 
+    #[test]
+    fn var_guards_restore_a_cleared_then_overridden_var_to_its_original() {
+        const TWICE: &str = "ALMS_TEST_SUPPORT_PROCESS_ENV_TOUCHED_TWICE";
+        let _env = lock();
+        let _original = VarGuard::set(TWICE, "original");
+        {
+            let mut guards = VarGuards::default();
+            guards.push(VarGuard::remove(TWICE));
+            guards.push(VarGuard::set(TWICE, "overridden"));
+            assert_eq!(std::env::var(TWICE).unwrap(), "overridden");
+        }
+        assert_eq!(
+            std::env::var(TWICE).ok().as_deref(),
+            Some("original"),
+            "restored newest first"
+        );
+    }
+
     /// Taking the lock twice on one thread would wait on itself forever. It
     /// must fail at once, naming the cause, and the panic must leave the lock
     /// usable for everyone else.
@@ -263,9 +305,19 @@ mod tests {
             let _first = lock();
             let _second = lock();
         });
-        done_rx
+        if done_rx
             .recv_timeout(std::time::Duration::from_secs(10))
-            .expect("taking the lock a second time hung instead of panicking");
+            .is_err()
+        {
+            // The helper thread is deadlocked holding the lock, so every later
+            // test in this binary would wait on it forever. End the binary now,
+            // with the reason, rather than let CI run into its job timeout.
+            eprintln!(
+                "process_env: taking the lock a second time hung instead of \
+                 panicking (the re-entry check regressed); aborting the test binary"
+            );
+            std::process::abort();
+        }
         let payload = handle.join().expect_err("re-entry must panic");
         let message = payload
             .downcast_ref::<&str>()
@@ -279,8 +331,15 @@ mod tests {
     }
 
     /// A guard taken without the lock is the race this module exists to stop.
+    /// Both kinds refuse, before writing anything.
     #[test]
     fn a_guard_without_the_lock_panics() {
+        let cwd_joined = std::thread::spawn(|| {
+            let _cwd = CurrentDirGuard::set(std::env::temp_dir());
+        })
+        .join();
+        assert!(cwd_joined.is_err(), "CurrentDirGuard without the lock");
+
         const UNLOCKED: &str = "ALMS_TEST_SUPPORT_PROCESS_ENV_UNLOCKED_PROBE";
         let joined = std::thread::spawn(|| {
             let _var = VarGuard::set(UNLOCKED, "unlocked");

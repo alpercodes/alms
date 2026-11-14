@@ -238,6 +238,14 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(a.agent_config.read().context_config.strategy, changed);
+        // Without this the test could pass on the regression it is named
+        // for: `persist_settings` doesn't create the directory, so a state
+        // pointed at a missing shared `./.alms` fails to persist quietly and
+        // `b` boots with defaults anyway.
+        assert!(
+            crate::settings::settings_path(&a.data_dir).is_file(),
+            "precondition: the PATCH persisted settings.json in this state's own directory"
+        );
 
         let b = TestAppState::new().build();
         assert_eq!(

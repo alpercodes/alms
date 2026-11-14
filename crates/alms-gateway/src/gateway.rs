@@ -72,8 +72,9 @@ pub struct GatewayConfig {
     /// in-memory gateway doesn't share `./secrets.json` with every other test.
     pub secrets_path: Option<std::path::PathBuf>,
     /// The per-test directory `test_support::isolated` put `data_dir` and
-    /// `secrets_path` in, kept alive (and deleted) with this config, so with
-    /// the gateway, so with the `AppState` that owns it.
+    /// `secrets_path` in. It lives as long as the last clone of this config,
+    /// i.e. the `Gateway`, and so the `AppState` that owns it, and is
+    /// deleted with it.
     #[cfg(test)]
     pub(crate) test_state_dir: Option<Arc<tempfile::TempDir>>,
 }
