@@ -90,7 +90,7 @@ pub async fn run() -> AlmsResult<()> {
 /// strict-mode test can no longer read a value a warn-mode test set.
 #[cfg(test)]
 pub(crate) mod test_env_locks {
-    use alms_test_support::process_env::{self, VarGuard};
+    use alms_test_support::process_env::{self, EnvLock, VarGuard};
 
     const VAR: &str = "ALMS_LLM_BUDGET_VALIDATION";
 
@@ -99,7 +99,7 @@ pub(crate) mod test_env_locks {
     pub(crate) struct BudgetValidationEnvGuard {
         // Field order is drop order: restore the var, then release the lock.
         _var: VarGuard,
-        _lock: std::sync::MutexGuard<'static, ()>,
+        _lock: EnvLock,
     }
 
     impl BudgetValidationEnvGuard {

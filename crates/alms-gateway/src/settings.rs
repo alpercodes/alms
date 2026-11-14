@@ -4777,7 +4777,8 @@ mod tests {
 
         // 3. Construct the AppState — this exercises the boot path that
         //    Finding #3 targets.
-        let gateway = crate::gateway::Gateway::new(gateway_config).unwrap();
+        let gateway =
+            crate::gateway::Gateway::new(crate::test_support::isolated(gateway_config)).unwrap();
         let scheduler = std::sync::Arc::new(alms_runtime::Scheduler::new());
         let shutdown_token = tokio_util::sync::CancellationToken::new();
         let (completion_tx, _cr) = tokio::sync::mpsc::unbounded_channel();
@@ -4898,7 +4899,8 @@ mod tests {
 
         // 3. Construct AppState — exercises the boot path with the
         //    stale persisted provider.
-        let gateway = crate::gateway::Gateway::new(gateway_config).unwrap();
+        let gateway =
+            crate::gateway::Gateway::new(crate::test_support::isolated(gateway_config)).unwrap();
         let scheduler = std::sync::Arc::new(alms_runtime::Scheduler::new());
         let shutdown_token = tokio_util::sync::CancellationToken::new();
         let (completion_tx, _cr) = tokio::sync::mpsc::unbounded_channel();
@@ -5022,7 +5024,8 @@ mod tests {
         .unwrap();
 
         // 3. Construct AppState — exercises the boot path.
-        let gateway = crate::gateway::Gateway::new(gateway_config).unwrap();
+        let gateway =
+            crate::gateway::Gateway::new(crate::test_support::isolated(gateway_config)).unwrap();
         let scheduler = std::sync::Arc::new(alms_runtime::Scheduler::new());
         let shutdown_token = tokio_util::sync::CancellationToken::new();
         let (completion_tx, _cr) = tokio::sync::mpsc::unbounded_channel();
@@ -5110,7 +5113,8 @@ mod tests {
         )
         .unwrap();
 
-        let gateway = crate::gateway::Gateway::new(gateway_config).unwrap();
+        let gateway =
+            crate::gateway::Gateway::new(crate::test_support::isolated(gateway_config)).unwrap();
         let scheduler = std::sync::Arc::new(alms_runtime::Scheduler::new());
         let shutdown_token = tokio_util::sync::CancellationToken::new();
         let (completion_tx, _cr) = tokio::sync::mpsc::unbounded_channel();

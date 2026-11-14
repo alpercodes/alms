@@ -28,51 +28,111 @@
 //! [`lock`] recovers the guard from a poisoned mutex instead. That is sound
 //! here because the state the lock protects is put back by drop guards
 //! ([`VarGuard`], [`CurrentDirGuard`]) that run during unwinding, before the
-//! lock guard (declared first, so dropped last) is released.
+//! lock (declared first, so dropped last) is released.
+//!
+//! # Why taking it twice panics
+//!
+//! One lock means a test that already holds it and then takes it again, for
+//! instance through a helper guard that takes it itself, would wait on itself
+//! forever: a hung test binary rather than a failure. [`lock`] tracks the
+//! holder per thread and panics on re-entry instead, naming the mistake.
+//! A test body stays on its thread (`#[tokio::test]` runs it with
+//! `block_on`, on either runtime flavour), so the per-thread record is the
+//! test's.
 //!
 //! # Rules
 //!
-//! * Take [`lock`] first, then the guards, as locals in that order.
+//! * Take [`lock`] first, then the guards, as locals in that order. The
+//!   guards check that this thread holds it.
 //! * Change env vars and the working directory only through this module.
-//!   `every_env_and_cwd_write_goes_through_process_env` (below) fails on a
-//!   `set_var` / `remove_var` / `set_current_dir` anywhere else in the
-//!   workspace.
+//!   `clippy.toml` at the workspace root disallows `std::env::set_var`,
+//!   `remove_var` and `set_current_dir` everywhere else, and CI runs clippy
+//!   over test code with `-D warnings`.
 //! * A test that **reads** state another test changes, e.g. one that
 //!   compares a path against `std::env::current_dir()`, takes [`lock`] too.
 //!   Prefer not reading or writing process state at all where the code
 //!   under test can be handed the value instead.
 
+use std::cell::Cell;
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
 static LOCK: Mutex<()> = Mutex::new(());
 
-/// Exclusive access to this test binary's environment and working directory,
-/// recovered rather than propagated if a previous holder panicked. See the
-/// module docs for why that is sound.
-pub fn lock() -> MutexGuard<'static, ()> {
-    LOCK.lock().unwrap_or_else(PoisonError::into_inner)
+thread_local! {
+    static HELD_BY_THIS_THREAD: Cell<bool> = const { Cell::new(false) };
 }
 
-/// Set an env var for the rest of the process. Hold [`lock`] and prefer
-/// [`VarGuard::set`], which puts the old value back.
-pub fn set_var(key: impl AsRef<OsStr>, value: impl AsRef<OsStr>) {
+/// Exclusive access to this test binary's environment and working directory.
+/// Released on drop.
+#[must_use = "the lock is released when this is dropped"]
+pub struct EnvLock {
+    _guard: MutexGuard<'static, ()>,
+}
+
+impl Drop for EnvLock {
+    fn drop(&mut self) {
+        // Runs before `_guard` is released, so no other thread can take the
+        // lock while this one still reads as holding it.
+        HELD_BY_THIS_THREAD.with(|held| held.set(false));
+    }
+}
+
+/// Take this binary's env and working-directory lock, recovered rather than
+/// propagated if a previous holder panicked (see the module docs for why that
+/// is sound).
+///
+/// # Panics
+///
+/// If this thread already holds it: waiting would never end.
+pub fn lock() -> EnvLock {
+    if HELD_BY_THIS_THREAD.with(Cell::get) {
+        panic!(
+            "process_env::lock() is already held by this test; it is not \
+             re-entrant. Guards that take it themselves (EnvGuard, \
+             BudgetValidationEnvGuard) must not be combined with a lock the \
+             test already holds"
+        );
+    }
+    let guard = LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+    HELD_BY_THIS_THREAD.with(|held| held.set(true));
+    EnvLock { _guard: guard }
+}
+
+fn assert_locked(what: &str) {
+    assert!(
+        HELD_BY_THIS_THREAD.with(Cell::get),
+        "{what} needs process_env::lock() held first: another test could read \
+         or change the same state meanwhile"
+    );
+}
+
+// The four sanctioned writers of process state. `clippy.toml` disallows these
+// calls everywhere else in the workspace.
+
+#[expect(
+    clippy::disallowed_methods,
+    reason = "the one sanctioned env writer, under `lock()`"
+)]
+fn set_var(key: &OsStr, value: &OsStr) {
     // SAFETY: env writes race with reads on other threads. Every test that
-    // writes or reads shared env state holds `lock()` (module rules), and the
-    // workspace guard test keeps writes from happening anywhere else.
+    // writes or reads shared env state holds `lock()` (module rules), and
+    // clippy keeps writes from happening anywhere else.
     unsafe { std::env::set_var(key, value) }
 }
 
-/// Remove an env var for the rest of the process. Hold [`lock`] and prefer
-/// [`VarGuard::remove`].
-pub fn remove_var(key: impl AsRef<OsStr>) {
+#[expect(
+    clippy::disallowed_methods,
+    reason = "the one sanctioned env writer, under `lock()`"
+)]
+fn remove_var(key: &OsStr) {
     // SAFETY: as for `set_var`.
     unsafe { std::env::remove_var(key) }
 }
 
 /// Sets or removes one env var and puts its previous value back on drop,
-/// including when the test panics.
+/// including when the test panics. Needs [`lock`] held.
 #[must_use = "the variable is restored when the guard is dropped"]
 pub struct VarGuard {
     key: OsString,
@@ -82,17 +142,18 @@ pub struct VarGuard {
 impl VarGuard {
     pub fn set(key: impl AsRef<OsStr>, value: impl AsRef<OsStr>) -> Self {
         let guard = Self::capture(key.as_ref());
-        set_var(key, value);
+        set_var(key.as_ref(), value.as_ref());
         guard
     }
 
     pub fn remove(key: impl AsRef<OsStr>) -> Self {
         let guard = Self::capture(key.as_ref());
-        remove_var(key);
+        remove_var(key.as_ref());
         guard
     }
 
     fn capture(key: &OsStr) -> Self {
+        assert_locked("VarGuard");
         Self {
             key: key.to_owned(),
             original: std::env::var_os(key),
@@ -110,14 +171,19 @@ impl Drop for VarGuard {
 }
 
 /// Changes the working directory and changes it back on drop, including
-/// when the test panics.
+/// when the test panics. Needs [`lock`] held.
 #[must_use = "the working directory is restored when the guard is dropped"]
 pub struct CurrentDirGuard {
     original: PathBuf,
 }
 
 impl CurrentDirGuard {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the one sanctioned working-directory writer, under `lock()`"
+    )]
     pub fn set(dir: impl AsRef<Path>) -> Self {
+        assert_locked("CurrentDirGuard");
         let original = std::env::current_dir().expect("the working directory is readable");
         std::env::set_current_dir(dir.as_ref()).expect("change the working directory");
         Self { original }
@@ -125,6 +191,10 @@ impl CurrentDirGuard {
 }
 
 impl Drop for CurrentDirGuard {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the one sanctioned working-directory writer, under `lock()`"
+    )]
     fn drop(&mut self) {
         // Not `expect`: a panic here, during another panic's unwinding,
         // would abort the whole test binary.
@@ -174,51 +244,50 @@ mod tests {
         assert_eq!(std::env::var(VAR).unwrap(), "outer");
     }
 
-    /// Every `set_var`, `remove_var` and `set_current_dir` in the workspace
-    /// goes through this module, so every one of them is under [`lock`] and
-    /// restored by a guard. A write anywhere else is a race with every other
-    /// test in its binary.
+    /// Taking the lock twice on one thread would wait on itself forever. It
+    /// must fail at once, naming the cause, and the panic must leave the lock
+    /// usable for everyone else.
     #[test]
-    fn every_env_and_cwd_write_goes_through_process_env() {
-        let crates = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
-        let this_file = std::fs::canonicalize(file!())
-            .or_else(|_| std::fs::canonicalize(crates.join("..").join(file!())))
-            .expect("locate this source file");
-        let mut offenders = Vec::new();
-        let mut stack = vec![crates];
-        while let Some(dir) = stack.pop() {
-            for entry in std::fs::read_dir(&dir).unwrap() {
-                let path = entry.unwrap().path();
-                let name = path.file_name().unwrap().to_string_lossy().into_owned();
-                if path.is_dir() {
-                    if name != "target" && name != "node_modules" && !name.starts_with('.') {
-                        stack.push(path);
-                    }
-                    continue;
-                }
-                if path.extension().is_none_or(|ext| ext != "rs")
-                    || std::fs::canonicalize(&path).unwrap() == this_file
-                {
-                    continue;
-                }
-                let source = std::fs::read_to_string(&path).unwrap();
-                for (n, line) in source.lines().enumerate() {
-                    let code = line.split("//").next().unwrap_or("");
-                    if ["env::set_var(", "env::remove_var(", "env::set_current_dir("]
-                        .iter()
-                        .any(|call| code.contains(call))
-                    {
-                        offenders.push(format!("{}:{}: {}", path.display(), n + 1, line.trim()));
-                    }
+    fn taking_the_lock_twice_panics_instead_of_hanging() {
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            // Reports back even when the body panics, so a hang is the only
+            // way not to hear from it.
+            struct Report(std::sync::mpsc::Sender<()>);
+            impl Drop for Report {
+                fn drop(&mut self) {
+                    let _ = self.0.send(());
                 }
             }
-        }
-        assert!(
-            offenders.is_empty(),
-            "change env vars and the working directory through \
-             `alms_test_support::process_env` (one lock per test binary, \
-             restored on drop), not directly:\n{}",
-            offenders.join("\n")
-        );
+            let _report = Report(done_tx);
+            let _first = lock();
+            let _second = lock();
+        });
+        done_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("taking the lock a second time hung instead of panicking");
+        let payload = handle.join().expect_err("re-entry must panic");
+        let message = payload
+            .downcast_ref::<&str>()
+            .map(|m| m.to_string())
+            .or_else(|| payload.downcast_ref::<String>().cloned())
+            .unwrap_or_default();
+        assert!(message.contains("already held by this test"), "{message}");
+
+        let _env = lock();
+        assert!(HELD_BY_THIS_THREAD.with(Cell::get));
+    }
+
+    /// A guard taken without the lock is the race this module exists to stop.
+    #[test]
+    fn a_guard_without_the_lock_panics() {
+        const UNLOCKED: &str = "ALMS_TEST_SUPPORT_PROCESS_ENV_UNLOCKED_PROBE";
+        let joined = std::thread::spawn(|| {
+            let _var = VarGuard::set(UNLOCKED, "unlocked");
+        })
+        .join();
+        assert!(joined.is_err());
+        let _env = lock();
+        assert_eq!(std::env::var_os(UNLOCKED), None, "nothing was written");
     }
 }

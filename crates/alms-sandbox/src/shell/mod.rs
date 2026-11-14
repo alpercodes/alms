@@ -1180,17 +1180,7 @@ mod tests {
         // Poll instead of sleeping a fixed interval: spawning a shell can be
         // slow (Git Bash on Windows especially) and a timing guess would
         // make this flaky rather than wrong.
-        let mut checked = serde_json::Value::Null;
-        for _ in 0..50 {
-            checked = tool
-                .execute(serde_json::json!({"check_task": task_id}))
-                .await
-                .unwrap();
-            if checked["status"] != "not_found_or_still_running" {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        }
+        let checked = wait_for_background_task(&tool, &task_id).await;
         assert_eq!(
             checked["status"], "completed",
             "background task should have completed; got: {checked}"

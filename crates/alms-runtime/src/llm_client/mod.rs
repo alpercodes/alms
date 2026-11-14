@@ -1233,6 +1233,8 @@ mod tests {
 
     #[test]
     fn test_llm_config_from_env() {
+        // Reads the env vars other tests in this binary change.
+        let _lock = env_lock();
         // This test just verifies the config loads without panicking
         let config = LlmConfig::from_env();
         assert!(!config.base_url.is_empty());
@@ -1493,7 +1495,7 @@ mod tests {
     #[test]
     fn test_with_secrets_falls_back_to_provider_entry_api_key_env() {
         const ENV_VAR: &str = "ALMS_TEST_WITH_SECRETS_OPENROUTER_KEY";
-        // Serialised against every other env-touching test in this mod;
+        // Serialised against every other env-touching test in this test binary;
         // see `test_with_provider_and_secrets_resolves_provider_entry_api_key_env`.
         let _env_guard = env_lock();
         let _key = VarGuard::set(ENV_VAR, "sk-or-from-env");
@@ -1810,11 +1812,12 @@ mod tests {
     #[test]
     fn test_with_provider_and_secrets_resolves_provider_entry_api_key_env() {
         const ENV_VAR: &str = "ALMS_TEST_LARRY_1081_ANTHROPIC_KEY";
-        // Serialize against any other env-touching test in this mod —
-        // concurrent `set_var` racing with another thread reading any
-        // env is UB in Rust 1.79+. The unique key prevents value
-        // collisions across tests but does not serialize the writes;
-        // the lock does. Held until the matching `remove_var` below.
+        // Serialize against every other env-touching test in this test
+        // binary: concurrent `set_var` racing with another thread reading
+        // any env is UB in Rust 1.79+. The unique key prevents value
+        // collisions across tests but does not serialize the writes; the
+        // lock does. `VarGuard` restores the var on drop, before the lock
+        // is released.
         let _env_guard = env_lock();
         let _key = VarGuard::set(ENV_VAR, "sk-ant-from-env");
 

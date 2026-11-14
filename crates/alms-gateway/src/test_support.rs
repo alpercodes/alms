@@ -33,9 +33,42 @@ pub(crate) type AppStateWithChannels = (
     mpsc::Receiver<DmEvent>,
 );
 
+/// Give a test gateway a directory of its own for everything it would
+/// otherwise put in the working directory, which is the crate directory and
+/// shared by every test and every run:
+///
+/// * `data_dir`, unless the test set one: `AppState::new` loads
+///   `settings.json` from it at boot and `PATCH /settings` writes it there.
+///   Without one it falls back to `./.alms`, so a test booted with whatever
+///   the last PATCH test persisted.
+/// * `secrets_path`, when the database is in memory (`:memory:` or none):
+///   the default rule puts `secrets.json` beside the database, which for an
+///   in-memory one means `./secrets.json` or `./.alms/secrets.json`. A key
+///   one test stored there was loaded by the next (`sk-or-test` reached
+///   `key_revocation`'s scripted LLM that way). A file database keeps the
+///   production rule: its tests own the directory the database is in.
+///
+/// The directory is deleted when the last clone of the config is dropped,
+/// which is when the `AppState` built from it goes.
+pub(crate) fn isolated(mut config: GatewayConfig) -> GatewayConfig {
+    let dir = tempfile::Builder::new()
+        .prefix("alms-gateway-test-")
+        .tempdir()
+        .expect("create a test state directory");
+    if config.data_dir.is_none() {
+        config.data_dir = Some(dir.path().to_path_buf());
+    }
+    let in_memory = config.db_path.as_deref().is_none_or(|p| p == ":memory:");
+    if config.secrets_path.is_none() && in_memory {
+        config.secrets_path = Some(dir.path().join("secrets.json"));
+    }
+    config.test_state_dir = Some(Arc::new(dir));
+    config
+}
+
 /// Builder for a test `AppState`. Defaults to `GatewayConfig::default()`:
 /// in-memory session storage (no SQLite), the default LLM config, no
-/// workspace dir.
+/// workspace dir, and a state directory of its own ([`isolated`]).
 #[derive(Default)]
 pub(crate) struct TestAppState {
     config: GatewayConfig,
@@ -110,7 +143,8 @@ impl TestAppState {
 
     /// Build the state and hand back the receivers and shutdown token.
     pub(crate) fn build_with_channels(self) -> AppStateWithChannels {
-        let gateway = Gateway::new(self.config).expect("test GatewayConfig must construct");
+        let gateway =
+            Gateway::new(isolated(self.config)).expect("test GatewayConfig must construct");
         let scheduler = Arc::new(alms_runtime::Scheduler::new());
         let shutdown_token = CancellationToken::new();
         let (completion_tx, completion_rx) = mpsc::unbounded_channel();
@@ -133,5 +167,83 @@ impl TestAppState {
             trigger_rx,
             dm_event_rx,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A key one test stores must not be what the next test boots with. On an
+    /// in-memory gateway both used to read and write `./secrets.json` in the
+    /// crate directory, and the file outlived the run too.
+    #[tokio::test]
+    async fn test_states_do_not_share_secrets() {
+        let a = TestAppState::new().in_memory_sqlite().build();
+        a.secrets
+            .write()
+            .set_key("openrouter", "sk-isolation-probe-from-a")
+            .unwrap();
+        let b = TestAppState::new().in_memory_sqlite().build();
+        assert_eq!(
+            b.secrets.read().get_key("openrouter"),
+            None,
+            "a fresh test state loaded another state's key"
+        );
+
+        // The same without a database: `./.alms/secrets.json` before.
+        let c = TestAppState::new().build();
+        c.secrets
+            .write()
+            .set_key("openrouter", "sk-isolation-probe-from-c")
+            .unwrap();
+        let d = TestAppState::new().build();
+        assert_eq!(d.secrets.read().get_key("openrouter"), None);
+    }
+
+    /// The settings twin: `PATCH /settings` on one state persists
+    /// `settings.json` in its data directory, and a fresh state must boot
+    /// with the compiled defaults, not with that file.
+    #[tokio::test]
+    async fn test_states_do_not_share_settings() {
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+        use tower::ServiceExt;
+
+        let default_strategy = TestAppState::new()
+            .build()
+            .agent_config
+            .read()
+            .context_config
+            .strategy
+            .clone();
+        let changed = if default_strategy == "compact" {
+            "truncate"
+        } else {
+            "compact"
+        };
+
+        let a = TestAppState::new().build();
+        let response = crate::server::routes::protected_router()
+            .with_state(a.clone())
+            .oneshot(
+                Request::patch("/settings")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "context": { "strategy": changed } }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(a.agent_config.read().context_config.strategy, changed);
+
+        let b = TestAppState::new().build();
+        assert_eq!(
+            b.agent_config.read().context_config.strategy,
+            default_strategy,
+            "a fresh test state booted with another state's persisted settings"
+        );
     }
 }

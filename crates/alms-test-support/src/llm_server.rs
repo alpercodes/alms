@@ -13,6 +13,11 @@
 //! quiet mid-body, lie about `Content-Length`, or hold a half-written
 //! response open. Those cases are [`crate::raw_http::RawServer`].
 //!
+//! Each script gets a server of its own (`MockServer::builder().start()`),
+//! not one from wiremock's pool. Use the same in any test whose code under
+//! test can still send after the test returns: a pooled server is handed to
+//! the next test, and the late request lands in that test's log.
+//!
 //! Keep the returned [`ScriptedLlm`] alive for the test — dropping it
 //! shuts the server down. Binding it to a bare `_` drops it on that line,
 //! so the client meets connection-refused instead of the script; a test

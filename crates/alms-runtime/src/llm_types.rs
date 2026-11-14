@@ -825,10 +825,7 @@ impl LlmConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alms_test_support::process_env::{
-        lock as env_lock, remove_var as remove_env_var, set_var as set_env_var,
-    };
-    use std::sync::MutexGuard;
+    use alms_test_support::process_env::{EnvLock, VarGuard, lock as env_lock};
 
     // `env_lock()` is this test binary's one lock for env vars and the
     // working directory, shared with `llm_client`'s tests and recovered if a
@@ -841,39 +838,31 @@ mod tests {
     ];
 
     struct EnvGuard {
-        _lock: MutexGuard<'static, ()>,
-        saved: Vec<(&'static str, Option<String>)>,
+        // Restored newest first (see `Drop`), then the lock is released.
+        vars: Vec<VarGuard>,
+        _lock: EnvLock,
     }
 
     impl EnvGuard {
         fn set(overrides: &[(&'static str, Option<&str>)]) -> Self {
             let lock = env_lock();
-            let saved = LLM_ENV_VARS
-                .iter()
-                .map(|name| (*name, std::env::var(name).ok()))
-                .collect::<Vec<_>>();
-
-            for name in LLM_ENV_VARS {
-                remove_env_var(name);
-            }
+            let mut vars: Vec<VarGuard> = LLM_ENV_VARS.iter().map(VarGuard::remove).collect();
             for (name, value) in overrides {
-                match value {
-                    Some(v) => set_env_var(name, v),
-                    None => remove_env_var(name),
-                }
+                vars.push(match value {
+                    Some(v) => VarGuard::set(name, v),
+                    None => VarGuard::remove(name),
+                });
             }
-
-            Self { _lock: lock, saved }
+            Self { vars, _lock: lock }
         }
     }
 
     impl Drop for EnvGuard {
         fn drop(&mut self) {
-            for (name, value) in &self.saved {
-                match value {
-                    Some(v) => set_env_var(name, v),
-                    None => remove_env_var(name),
-                }
+            // Newest first: a var cleared and then overridden must end on the
+            // value it had before the clear.
+            while let Some(var) = self.vars.pop() {
+                drop(var);
             }
         }
     }

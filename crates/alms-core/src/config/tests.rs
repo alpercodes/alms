@@ -3,7 +3,6 @@
 //! Tests for the config module.
 
 use super::*;
-use std::sync::MutexGuard;
 
 /// `alms.toml.example` says "All values shown are defaults", and it showed
 /// `run_summary_mode = "off"` with "(default)" while the compiled default is
@@ -150,8 +149,7 @@ pub(crate) fn select_llm_api_key(
 // `alms_test_support::process_env` for why a single lock replaced the
 // `ENV_LOCK` / `BUDGET_ENV_LOCK` pair and their disjoint-var-set contract.
 use alms_test_support::process_env::{
-    CurrentDirGuard, VarGuard as SingleEnvGuard, lock as env_lock, remove_var as remove_env_var,
-    set_var as set_env_var,
+    CurrentDirGuard, EnvLock, VarGuard as SingleEnvGuard, lock as env_lock,
 };
 
 const LLM_ENV_VARS: [&str; 4] = [
@@ -164,39 +162,32 @@ const LLM_ENV_VARS: [&str; 4] = [
 /// Takes the env lock and clears `LLM_ENV_VARS` apart from `overrides`,
 /// putting every one of them back on drop.
 struct EnvGuard {
-    _lock: MutexGuard<'static, ()>,
-    saved: Vec<(&'static str, Option<String>)>,
+    // Restored newest first (see `Drop`), then the lock is released.
+    vars: Vec<SingleEnvGuard>,
+    _lock: EnvLock,
 }
 
 impl EnvGuard {
     fn set(overrides: &[(&'static str, Option<&str>)]) -> Self {
         let lock = env_lock();
-        let saved = LLM_ENV_VARS
-            .iter()
-            .map(|name| (*name, std::env::var(name).ok()))
-            .collect::<Vec<_>>();
-
-        for name in LLM_ENV_VARS {
-            remove_env_var(name);
-        }
+        let mut vars: Vec<SingleEnvGuard> =
+            LLM_ENV_VARS.iter().map(SingleEnvGuard::remove).collect();
         for (name, value) in overrides {
-            match value {
-                Some(v) => set_env_var(name, v),
-                None => remove_env_var(name),
-            }
+            vars.push(match value {
+                Some(v) => SingleEnvGuard::set(name, v),
+                None => SingleEnvGuard::remove(name),
+            });
         }
-
-        Self { _lock: lock, saved }
+        Self { vars, _lock: lock }
     }
 }
 
 impl Drop for EnvGuard {
     fn drop(&mut self) {
-        for (name, value) in &self.saved {
-            match value {
-                Some(v) => set_env_var(name, v),
-                None => remove_env_var(name),
-            }
+        // Newest first: a var cleared and then overridden must end on the
+        // value it had before the clear.
+        while let Some(var) = self.vars.pop() {
+            drop(var);
         }
     }
 }
@@ -2300,7 +2291,7 @@ summary_provider = ""
 // shape — so they can assert on the error path without aborting the
 // test process. The public `load_or_default()` wraps it with
 // `std::process::exit(1)` on Err. The tests that change the working
-// directory serialise against `ENV_LOCK` because `find_config_file()`
+// directory serialise against `env_lock()` because `find_config_file()`
 // reads from the process cwd, which is shared across parallel tests.
 
 /// Verify the fail-fast contract directly at the helper boundary:
@@ -2309,7 +2300,7 @@ summary_provider = ""
 ///
 /// We construct the partial-pair config in a temp directory and chdir
 /// into it so `find_config_file()` picks up the test toml. Holding
-/// `ENV_LOCK` for the whole test serialises against any other test
+/// `env_lock()` for the whole test serialises against any other test
 /// that touches process cwd or `ALMS_*` env vars.
 #[test]
 fn test_load_or_default_fail_fast_on_partial_summary_pair() {

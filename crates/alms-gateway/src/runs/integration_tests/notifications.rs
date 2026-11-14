@@ -230,7 +230,8 @@ async fn drive_notification_run_with_debug_mode(
         llm_config,
         ..crate::gateway::GatewayConfig::default()
     };
-    let gateway = crate::gateway::Gateway::new(gateway_config).unwrap();
+    let gateway =
+        crate::gateway::Gateway::new(crate::test_support::isolated(gateway_config)).unwrap();
     let scheduler = std::sync::Arc::new(alms_runtime::Scheduler::new());
     let shutdown_token = CancellationToken::new();
     let (completion_tx, _cr) = mpsc::unbounded_channel();
