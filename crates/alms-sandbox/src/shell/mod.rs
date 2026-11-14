@@ -1473,6 +1473,34 @@ mod tests {
     /// #1262 — the foreground result body is `decorate_stdout`'s output.
     /// The end-to-end tests above prove the notice fires; this one pins what
     /// it *says*, without depending on a shell to produce it.
+    /// #119: a post-command reset says why the previous cwd failed too: a
+    /// previous cwd outside the root (a component swapped for a symlink)
+    /// still resolves, so "no longer resolves" would be wrong for it.
+    #[test]
+    fn test_post_command_reset_notice_is_worded_by_the_previous_cwds_reason() {
+        let tool = ShellTool::sandboxed(PathBuf::from("/work/agent-root"));
+        for (previous, expected) in [
+            (
+                CwdRejection::OutsideRoot,
+                "previous working directory is outside the sandbox root",
+            ),
+            (
+                CwdRejection::NotVerifiable,
+                "previous working directory no longer resolves",
+            ),
+        ] {
+            let mut output = reverted_output("", CwdRejection::NotVerifiable);
+            if let Some(revert) = output.cwd_revert.as_mut() {
+                revert.reset = Some(previous);
+            }
+            let decorated = tool.decorate_stdout(&output);
+            assert!(
+                decorated.contains("[cwd reset: ") && decorated.contains(expected),
+                "{previous:?}: {decorated:?}"
+            );
+        }
+    }
+
     #[test]
     fn test_decorate_stdout_carries_the_cwd_revert_notice() {
         let tool = ShellTool::sandboxed(PathBuf::from("/work/agent-root"));
