@@ -702,6 +702,23 @@ pub fn unknown_provider_message(
 }
 
 impl LlmConfig {
+    /// Trim the server-default `model` and every provider entry's `model`
+    /// (#126). A whitespace-only value means unset, the same as an empty
+    /// one: `""` for the flat field, `None` for an entry. Otherwise a model
+    /// named `"  "` from `alms.toml` or `ALMS_LLM_MODEL` would be sent to the
+    /// provider on every run.
+    pub fn normalize_models(&mut self) {
+        self.model = self.model.trim().to_string();
+        for entry in self.providers.values_mut() {
+            entry.model = entry
+                .model
+                .as_deref()
+                .map(str::trim)
+                .filter(|m| !m.is_empty())
+                .map(str::to_string);
+        }
+    }
+
     /// Populate [`providers`][Self::providers] with built-in sugar entries
     /// for `openai`, `openrouter`, `anthropic`, and `gemini` if the user has
     /// not already defined them.

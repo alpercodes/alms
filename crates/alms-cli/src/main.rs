@@ -400,7 +400,7 @@ async fn main() -> anyhow::Result<()> {
                 } => {
                     let workspace_dir = config.server.agents_dir();
                     let project_root = config.server.resolved_project_root();
-                    let stored_provider = cmd_agent::provider_override(provider.clone());
+                    let stored_provider = cmd_agent::string_override(provider.clone());
                     cmd_agent::agent_create(
                         &store,
                         cmd_agent::AgentCreateOpts {
@@ -463,7 +463,7 @@ async fn main() -> anyhow::Result<()> {
                 } => {
                     let project_root = config.server.resolved_project_root();
                     // A blank value clears the override, so nothing is stored to warn about.
-                    let stored_provider = cmd_agent::provider_override(provider.clone());
+                    let stored_provider = cmd_agent::string_override(provider.clone());
                     cmd_agent::agent_config(
                         &store,
                         cmd_agent::AgentConfigOpts {

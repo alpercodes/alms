@@ -430,7 +430,7 @@ pub async fn patch_settings(
         );
     }
 
-    let body: PatchSettingsRequest = match serde_json::from_value(raw_body) {
+    let mut body: PatchSettingsRequest = match serde_json::from_value(raw_body) {
         Ok(b) => b,
         Err(e) => {
             return (
@@ -442,6 +442,24 @@ pub async fn patch_settings(
             );
         }
     };
+    // #126: trim the server-default pair once, before anything reads it. A
+    // whitespace-only value then meets the empty-string rejection below, and
+    // a real name with surrounding whitespace is judged, budget-checked,
+    // applied and persisted bare, as the agent API and the summary pair
+    // already store theirs.
+    for field in [&mut body.provider, &mut body.model] {
+        if let Some(value) = field.as_mut() {
+            *value = value.trim().to_string();
+        }
+    }
+    // #126: a whitespace-only sandbox_root is the empty "no override" value.
+    // A non-blank path is kept as sent: a trailing space is legal in a path.
+    if let Some(tools) = body.tools.as_mut()
+        && let Some(root) = tools.sandbox_root.as_mut()
+        && root.trim().is_empty()
+    {
+        root.clear();
+    }
 
     // Tim review on #1148: serialise the whole
     // validate/commit/rebuild/persist sequence.
@@ -999,6 +1017,9 @@ pub async fn patch_settings(
     // model, and since #1148 the pair reaches the live client
     // immediately, so a cleared field breaks every subsequent run instead
     // of merely persisting a bad row.
+    //
+    // Both were trimmed on arrival (#126), so a whitespace-only value is
+    // rejected here as the empty string it is.
     let named_provider: Option<&str> = match body.provider.as_deref() {
         None => None,
         Some("") => {
@@ -1923,7 +1944,13 @@ impl PersistedToolsOverrides {
             tools.shell_policy = v.clone();
         }
         if let Some(ref v) = self.sandbox_root {
-            tools.sandbox_root = v.clone();
+            // #126: an earlier version could persist a whitespace-only root,
+            // which every run then refused. Blank is the empty "no override".
+            tools.sandbox_root = if v.trim().is_empty() {
+                String::new()
+            } else {
+                v.clone()
+            };
         }
         if let Some(v) = self.timeout_secs {
             tools.timeout_secs = v;
@@ -4085,6 +4112,189 @@ mod tests {
         assert_eq!(live.provider(), "openrouter");
         assert_eq!(live.default_model(), "z-ai/glm-5.2");
         assert!(!settings_path(&state.data_dir).exists());
+    }
+
+    /// #126: a whitespace-only `model` or `provider` is the empty string in
+    /// disguise. It must be rejected with the same error, and nothing may go
+    /// live or reach `settings.json`, where it would survive a restart.
+    #[tokio::test]
+    async fn blank_model_or_provider_is_rejected_like_an_empty_one() {
+        use axum::body::to_bytes;
+
+        for (body, expected) in [
+            (
+                serde_json::json!({ "model": "  " }),
+                "model: empty string not accepted",
+            ),
+            (
+                serde_json::json!({ "model": "\t\n" }),
+                "model: empty string not accepted",
+            ),
+            (
+                serde_json::json!({ "provider": "   " }),
+                "provider: empty string not accepted",
+            ),
+        ] {
+            let mut state = settings_test_app_state_with_entry_model_provider();
+            let tmp = tempfile::tempdir().unwrap();
+            state.data_dir = tmp.path().to_path_buf();
+
+            let resp = patch_settings(axum::extract::State(state.clone()), Json(body.clone()))
+                .await
+                .into_response();
+            assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+            let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            let errors = json["errors"].as_array().expect("errors array");
+            assert_eq!(errors.len(), 1, "{body}: {errors:?}");
+            assert!(
+                errors[0].as_str().unwrap_or("").starts_with(expected),
+                "{body}: {errors:?}"
+            );
+
+            let live = state.llm.read().clone();
+            assert_eq!(live.provider(), "openrouter", "{body}");
+            assert_eq!(live.default_model(), "z-ai/glm-5.2", "{body}");
+            assert!(!settings_path(&state.data_dir).exists(), "{body}");
+        }
+    }
+
+    /// Whether a run would start under `state`'s agent config: the runtime
+    /// refuses a non-empty `sandbox_root` it cannot resolve.
+    fn a_run_would_start(state: &crate::server::AppState) -> Result<(), String> {
+        alms_runtime::AgentRuntime::new(
+            alms_core::AgentId::new(),
+            state.agent_config.read().clone(),
+            state.llm.read().clone(),
+        )
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+    }
+
+    /// #126, the sibling field: a whitespace-only `tools.sandbox_root` passed
+    /// the empty check, went live and was persisted, and every later run was
+    /// refused with "cannot be resolved", across restarts. Blank is now the
+    /// empty "no override" value.
+    #[tokio::test]
+    async fn blank_sandbox_root_is_the_empty_no_override() {
+        let mut state = settings_test_app_state_with_entry_model_provider();
+        let tmp = tempfile::tempdir().unwrap();
+        state.data_dir = tmp.path().to_path_buf();
+
+        let resp = patch_settings(
+            axum::extract::State(state.clone()),
+            Json(serde_json::json!({ "tools": { "sandbox_root": "   " } })),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        assert_eq!(state.tools_config.read().sandbox_root, "");
+        assert_eq!(state.agent_config.read().sandbox_root, "");
+        let persisted = load_persisted_settings(&state.data_dir).expect("settings.json");
+        assert_eq!(
+            persisted.tools.and_then(|t| t.sandbox_root).as_deref(),
+            Some("")
+        );
+        a_run_would_start(&state).expect("a later run must not be refused");
+    }
+
+    /// #126: a whitespace-only root an earlier version already persisted is
+    /// read back as the empty "no override", so the next run starts.
+    #[tokio::test]
+    async fn boot_reads_a_blank_persisted_sandbox_root_as_no_override() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            settings_path(tmp.path()),
+            r#"{"tools":{"sandbox_root":"   "}}"#,
+        )
+        .unwrap();
+
+        let state = TestAppState::new().data_dir(tmp.path()).mock_llm().build();
+
+        assert_eq!(state.tools_config.read().sandbox_root, "");
+        assert_eq!(state.agent_config.read().sandbox_root, "");
+        a_run_would_start(&state).expect("a later run must not be refused");
+    }
+
+    /// #126: a `settings.json` written by an earlier version can hold a
+    /// whitespace-only model. Boot must not apply it, and must say why.
+    #[tokio::test]
+    async fn boot_skips_a_blank_persisted_model_with_a_warning() {
+        const WARNING: &str = "whitespace-only persisted server-default model";
+        let warned = |captured: &alms_test_support::CapturedEvents| {
+            captured
+                .at_target("alms.config")
+                .any(|e| e.message.contains(WARNING))
+        };
+
+        let (state, captured) = boot_with_persisted_settings(r#"{"model":"   "}"#);
+        assert_eq!(state.llm.read().default_model(), "toml-model");
+        assert!(warned(&captured), "{captured}");
+
+        // N8: a padded model an earlier version persisted is applied bare,
+        // with no warning.
+        let (state, captured) = boot_with_persisted_settings(r#"{"model":" gpt-4o "}"#);
+        assert_eq!(state.llm.read().default_model(), "gpt-4o");
+        assert!(!warned(&captured), "{captured}");
+
+        // N4: with a stale provider the provider WARN already says the model
+        // is ignored, so the blank-model one stays quiet.
+        let (state, captured) =
+            boot_with_persisted_settings(r#"{"provider":"gone","model":"   "}"#);
+        assert_eq!(state.llm.read().default_model(), "toml-model");
+        assert!(!warned(&captured), "{captured}");
+    }
+
+    /// Boot a mock-mode gateway whose `alms.toml` model is `toml-model`, over
+    /// a `settings.json` holding `json`, capturing the WARNs.
+    fn boot_with_persisted_settings(
+        json: &str,
+    ) -> (crate::server::AppState, alms_test_support::CapturedEvents) {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(settings_path(tmp.path()), json).unwrap();
+        let mut state = None;
+        let captured = alms_test_support::capture_events(tracing::Level::WARN, || {
+            state = Some(
+                TestAppState::new()
+                    .data_dir(tmp.path())
+                    .llm_config(alms_runtime::LlmConfig {
+                        mock: true,
+                        default_model: "toml-model".into(),
+                        ..alms_runtime::LlmConfig::default()
+                    })
+                    .build(),
+            );
+        });
+        (state.unwrap(), captured)
+    }
+
+    /// #126: surrounding whitespace on a real name is trimmed, as the agent
+    /// API and the summary pair already do, so what goes live and what is
+    /// persisted is the bare name.
+    #[tokio::test]
+    async fn padded_model_and_provider_are_trimmed() {
+        let mut state = settings_test_app_state_with_entry_model_provider();
+        let tmp = tempfile::tempdir().unwrap();
+        state.data_dir = tmp.path().to_path_buf();
+
+        let resp = patch_settings(
+            axum::extract::State(state.clone()),
+            Json(serde_json::json!({
+                "provider": " anthropic-pinned ",
+                "model": " claude-sonnet-4-6\t",
+            })),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let live = state.llm.read().clone();
+        assert_eq!(live.provider(), "anthropic-pinned");
+        assert_eq!(live.default_model(), "claude-sonnet-4-6");
+        let persisted = load_persisted_settings(&state.data_dir).expect("settings.json");
+        assert_eq!(persisted.provider.as_deref(), Some("anthropic-pinned"));
+        assert_eq!(persisted.model.as_deref(), Some("claude-sonnet-4-6"));
     }
 
     /// Exhaustive sweep of the `(provider, model)` input space against the

@@ -492,7 +492,9 @@ pub async fn get_agent(
 ///
 /// Semantics:
 /// - Empty-string sentinel for `model` / `posture` / `provider` /
-///   `telegram_token` clears the override back to `None`.
+///   `telegram_token` clears the override back to `None`. `model` and
+///   `provider` are trimmed first, so a whitespace-only value clears them
+///   too (#172, #126).
 /// - `clear_thinking_budget_tokens` / `clear_reasoning_effort` /
 ///   `clear_gemini_thinking_budget` booleans clear the corresponding
 ///   reasoning knob back to `None` (inherit server default). Sending
@@ -508,7 +510,9 @@ pub(crate) fn apply_update_request(
         agent.description = desc;
     }
     if let Some(model) = req.model {
-        agent.model = if model.is_empty() { None } else { Some(model) };
+        // Trimmed like `POST /agents`; a blank value clears the override, as
+        // `""` does (#126).
+        agent.model = normalize_optional_override(Some(&model));
     }
     if let Some(posture) = req.posture {
         validate_posture(&posture).map_err(UpdateAgentError::InvalidPosture)?;
@@ -2822,6 +2826,33 @@ mod tests {
             .unwrap_or_else(|(status, body)| panic!("{sent:?}: {status} {:?}", body.0));
             let record = store.load_agent_by_name("trimmed").unwrap().unwrap();
             assert_eq!(record.provider.as_deref(), stored, "sent {sent:?}");
+        }
+    }
+
+    /// #126: `PUT` stored `model` untrimmed, so `"   "` became a model named
+    /// `"   "` that every run sent to the provider. It now matches `POST`:
+    /// trimmed, and blank clears the override, as `""` always did.
+    #[tokio::test]
+    async fn put_agents_trims_the_model_like_post() {
+        let state = agents_test_app_state_with_sqlite();
+        let store = state.session_manager.store().expect("sqlite store");
+        let mut agent = new_agent("model-trim");
+        agent.model = Some("gpt-4o".into());
+        store.create_agent(&agent).unwrap();
+
+        for (sent, stored) in [(" gpt-4o-mini\t", Some("gpt-4o-mini")), ("   ", None)] {
+            let _ = update_agent(
+                axum::extract::State(state.clone()),
+                axum::extract::Path("model-trim".to_string()),
+                Json(alms_core::UpdateAgentRequest {
+                    model: Some(sent.into()),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap_or_else(|(status, body)| panic!("{sent:?}: {status} {:?}", body.0));
+            let record = store.load_agent_by_name("model-trim").unwrap().unwrap();
+            assert_eq!(record.model.as_deref(), stored, "sent {sent:?}");
         }
     }
 

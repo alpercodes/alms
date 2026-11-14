@@ -420,11 +420,11 @@ pub(crate) fn agent_create(store: &SqliteStore, opts: AgentCreateOpts<'_>) -> an
         id: AgentId::new(),
         name,
         description: description.unwrap_or_default(),
-        model,
-        posture,
         // Trimmed, and a blank value means no override, like `agent config`,
-        // `POST` and `PUT /agents` (#172).
-        provider: provider_override(provider),
+        // `POST` and `PUT /agents` (#172, #126).
+        model: string_override(model),
+        posture,
+        provider: string_override(provider),
         telegram_token: None,
         thinking_budget_tokens,
         reasoning_effort,
@@ -831,15 +831,16 @@ pub(crate) fn agent_config(store: &SqliteStore, opts: AgentConfigOpts<'_>) -> an
     if let Some(d) = description {
         agent.description = d;
     }
-    if let Some(m) = model {
-        agent.model = if m.is_empty() { None } else { Some(m) };
+    if model.is_some() {
+        // A blank value clears the override; anything else is trimmed (#126).
+        agent.model = string_override(model);
     }
     if let Some(p) = posture {
         agent.posture = if p.is_empty() { None } else { Some(p) };
     }
     if provider.is_some() {
         // A blank value clears the override; anything else is trimmed (#172).
-        agent.provider = provider_override(provider);
+        agent.provider = string_override(provider);
     }
     // `Some(n)` (including `Some(0)`) is an explicit override matching the
     // HTTP API's `PUT /agents/{id}` semantics. There's no CLI sentinel to
@@ -976,9 +977,9 @@ pub(crate) fn agent_config(store: &SqliteStore, opts: AgentConfigOpts<'_>) -> an
     Ok(())
 }
 
-/// The `provider` an `--provider` value stores: trimmed, with a blank value
+/// What a `--provider` or `--model` value stores: trimmed, with a blank value
 /// meaning no override. `POST` and `PUT /agents` normalize the same way.
-pub(crate) fn provider_override(value: Option<String>) -> Option<String> {
+pub(crate) fn string_override(value: Option<String>) -> Option<String> {
     value
         .map(|p| p.trim().to_string())
         .filter(|p| !p.is_empty())
@@ -1048,15 +1049,15 @@ mod tests {
         }
     }
 
-    fn create_with_provider(store: &SqliteStore, name: &str, provider: &str) {
+    fn create_with(store: &SqliteStore, name: &str, provider: Option<&str>, model: Option<&str>) {
         agent_create(
             store,
             AgentCreateOpts {
                 name: name.into(),
                 description: None,
-                model: None,
+                model: model.map(Into::into),
                 posture: None,
-                provider: Some(provider.into()),
+                provider: provider.map(Into::into),
                 thinking_budget_tokens: None,
                 reasoning_effort: None,
                 gemini_thinking_budget: None,
@@ -1072,14 +1073,14 @@ mod tests {
         .unwrap();
     }
 
-    fn config_provider(store: &SqliteStore, name: &str, provider: &str) {
+    fn config_with(store: &SqliteStore, name: &str, provider: Option<&str>, model: Option<&str>) {
         agent_config(
             store,
             AgentConfigOpts {
                 name_or_id: name,
-                model: None,
+                model: model.map(Into::into),
                 posture: None,
-                provider: Some(provider.into()),
+                provider: provider.map(Into::into),
                 description: None,
                 thinking_budget_tokens: None,
                 reasoning_effort: None,
@@ -1107,15 +1108,37 @@ mod tests {
             ("empty", "", None),
             ("blank", "   ", None),
         ] {
-            create_with_provider(&store, name, sent);
+            create_with(&store, name, Some(sent), None);
             let agent = resolve_agent(&store, name).unwrap();
             assert_eq!(agent.provider.as_deref(), stored, "create {sent:?}");
         }
 
         for (sent, stored) in [(" mylab ", Some("mylab")), ("   ", None)] {
-            config_provider(&store, "padded", sent);
+            config_with(&store, "padded", Some(sent), None);
             let agent = resolve_agent(&store, "padded").unwrap();
             assert_eq!(agent.provider.as_deref(), stored, "config {sent:?}");
+        }
+    }
+
+    /// #126: `--model` gets the same treatment as `--provider`, so a blank
+    /// value never becomes a model named `"   "` that every run sends.
+    #[test]
+    fn create_and_config_trim_the_model_and_treat_blank_as_none() {
+        let store = new_store();
+        for (name, sent, stored) in [
+            ("m-padded", " gpt-4o ", Some("gpt-4o")),
+            ("m-empty", "", None),
+            ("m-blank", "   ", None),
+        ] {
+            create_with(&store, name, None, Some(sent));
+            let agent = resolve_agent(&store, name).unwrap();
+            assert_eq!(agent.model.as_deref(), stored, "create {sent:?}");
+        }
+
+        for (sent, stored) in [("\tgpt-4o-mini ", Some("gpt-4o-mini")), ("   ", None)] {
+            config_with(&store, "m-padded", None, Some(sent));
+            let agent = resolve_agent(&store, "m-padded").unwrap();
+            assert_eq!(agent.model.as_deref(), stored, "config {sent:?}");
         }
     }
 

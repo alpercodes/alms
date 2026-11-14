@@ -245,6 +245,27 @@ Each item below changes behaviour for a deployment that has not set the knob exp
 
 ### Persistence and durability
 
+- **A whitespace-only model name is no longer stored.** `PATCH /settings` accepted
+  `{"model": "  "}`, made it the live server default and wrote it to `settings.json`, so it
+  survived a restart and every run sent a blank model. It is now rejected like `""`, with
+  the same `422`, and so is a blank `provider`. `PUT /agents`, `alms agent create` and
+  `alms agent config` trim `model` and treat a blank one as clearing the override, so
+  `alms agent create --model ""` no longer stores an empty model. On those API and CLI
+  paths, and in the web UI's settings form, surrounding whitespace on a real model or
+  provider name is removed. A blank `[llm] model` in `alms.toml` is treated as empty, like
+  `model = ""`, and a blank provider-entry `model` as unset. A blank or empty
+  `ALMS_LLM_MODEL` is now "not set", so `DEFAULT_MODEL` applies if it is set, and
+  otherwise the `alms.toml` model is kept; a blank `DEFAULT_MODEL` is "not set" too.
+  Before, `ALMS_LLM_MODEL=""` replaced the file's model with an empty one and hid
+  `DEFAULT_MODEL`. `tools.sandbox_root` in `PATCH /settings` gets the same fix: a
+  whitespace-only value is stored as `""`, the "no override" value, where before it went
+  live, persisted, and made every run fail with `cannot be resolved`. (`ALMS_SANDBOX_ROOT`
+  and `[tools] sandbox_root` in `alms.toml` are unchanged.) **After upgrading**, a gateway
+  whose `settings.json` already holds a blank model skips it at startup with a WARN and
+  uses the `alms.toml` model; set one with `PATCH /settings` or remove the line. A blank
+  persisted `sandbox_root` is read as `""`. An agent whose record already holds a blank
+  model gets a WARN at startup naming it; clear it with `PUT /agents/<name>` and
+  `"model": ""`, or `alms agent config <name> --model ""`.
 - Transactional, versioned SQLite migrations.
 - A fresh install no longer registers an agent nobody created when it is restarted. The
   gateway writes `.alms/agent_id` on its first boot, and on the next boot the migration for

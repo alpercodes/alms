@@ -269,6 +269,59 @@ async fn boot_warns_about_agents_on_unconfigured_providers() {
     );
 }
 
+/// #126: an earlier version could store a blank `model` override, which runs
+/// send as the model name. Boot names each such agent, and only those.
+#[tokio::test]
+async fn boot_warns_about_agents_with_a_blank_model() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let db = tmp.path().join("alms.db");
+    let db = db.to_str().expect("utf-8 path");
+    let llm_config = alms_runtime::LlmConfig {
+        mock: true,
+        ..alms_runtime::LlmConfig::default()
+    };
+
+    let seeded = TestAppState::new()
+        .db_path(db)
+        .data_dir(tmp.path())
+        .llm_config(llm_config.clone())
+        .build();
+    let store = seeded.session_manager.store().expect("sqlite store");
+    for (name, model) in [
+        ("blank-model", Some("   ")),
+        ("empty-model", Some("")),
+        ("real-model", Some("gpt-4o")),
+        ("no-model", None),
+    ] {
+        let record = AgentRecord {
+            model: model.map(str::to_string),
+            ..AgentRecord::for_test(name)
+        };
+        store.create_agent(&record).expect("seed the agent");
+    }
+    drop(seeded);
+
+    let captured = alms_test_support::capture_events(tracing::Level::WARN, || {
+        let _rebooted = TestAppState::new()
+            .db_path(db)
+            .data_dir(tmp.path())
+            .llm_config(llm_config)
+            .build();
+    });
+
+    let mut warned: Vec<String> = captured
+        .at_target("alms.config")
+        .filter(|e| e.has_field("model") && e.message.contains("blank model override"))
+        .map(|e| e.field("agent").unwrap_or_default().to_string())
+        .collect();
+    warned.sort();
+    assert_eq!(
+        warned,
+        vec!["blank-model".to_string(), "empty-model".to_string()],
+        "only the blank overrides are named:\n{captured}"
+    );
+}
+
 /// The WARNs about a server-level `[context].summary_provider`, from booting
 /// with `alms.toml`'s pair set to `toml_pair` and `settings_json` written.
 fn server_summary_warnings(

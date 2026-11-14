@@ -2402,10 +2402,137 @@ fn test_load_or_default_succeeds_with_no_config_file() {
 /// Runs `load_or_default_fallible` with `cwd` as the working directory and
 /// `home` as the home directory.
 fn load_from(cwd: &std::path::Path, home: &std::path::Path) -> AlmsResult<AlmsConfig> {
+    load_from_with(cwd, home, AlmsConfig::load_or_default_fallible)
+}
+
+/// [`load_from`] with the loader chosen by the caller, so a test can run
+/// `AlmsConfig::load` (the `Gateway::from_env` path) the same way.
+fn load_from_with(
+    cwd: &std::path::Path,
+    home: &std::path::Path,
+    loader: fn() -> AlmsResult<AlmsConfig>,
+) -> AlmsResult<AlmsConfig> {
     let _home_guard = SingleEnvGuard::set("HOME", home.to_str().unwrap());
     let _userprofile_guard = SingleEnvGuard::set("USERPROFILE", home.to_str().unwrap());
     let _cwd = CurrentDirGuard::set(cwd);
-    AlmsConfig::load_or_default_fallible()
+    loader()
+}
+
+/// #126: a whitespace-only model means unset, like an empty one, and a padded
+/// one is stored bare.
+#[test]
+fn normalize_models_trims_and_maps_blank_to_unset() {
+    let mut llm = LlmConfig {
+        model: " \t ".into(),
+        ..LlmConfig::default()
+    };
+    llm.providers.insert(
+        "blank".into(),
+        ProviderEntry {
+            model: Some("   ".into()),
+            ..ProviderEntry::default()
+        },
+    );
+    llm.providers.insert(
+        "padded".into(),
+        ProviderEntry {
+            model: Some(" m-1 ".into()),
+            ..ProviderEntry::default()
+        },
+    );
+
+    llm.normalize_models();
+
+    assert_eq!(llm.model, "");
+    assert_eq!(llm.providers["blank"].model, None);
+    assert_eq!(llm.providers["padded"].model.as_deref(), Some("m-1"));
+}
+
+/// #126: the loader applies it, so a blank `[llm] model` in `alms.toml` is
+/// never sent as a model name. It takes the process env/cwd lock, like the
+/// other loader tests.
+#[test]
+fn test_load_or_default_trims_models_from_the_config_file() {
+    let _lock = env_lock();
+    let _provider_guard = SingleEnvGuard::remove("ALMS_LLM_PROVIDER");
+    let _model_guard = SingleEnvGuard::remove("ALMS_LLM_MODEL");
+    let _legacy_model_guard = SingleEnvGuard::remove("DEFAULT_MODEL");
+    let _mock_guard = SingleEnvGuard::remove("ALMS_LLM_MOCK");
+    let home = tempfile::tempdir().expect("tempdir creates");
+    let cwd = tempfile::tempdir().expect("tempdir creates");
+    std::fs::write(
+        cwd.path().join("alms.toml"),
+        "[llm]\nprovider = \"mylab\"\nmodel = \"   \"\n\n\
+         [llm.providers.mylab]\nbase_url = \"http://127.0.0.1:9/v1\"\nmodel = \" m-1 \"\n",
+    )
+    .expect("toml write");
+
+    let config = load_from(cwd.path(), home.path()).expect("loads");
+
+    assert_eq!(config.llm.model, "");
+    assert_eq!(config.llm.providers["mylab"].model.as_deref(), Some("m-1"));
+}
+
+/// #126: through both loaders, a blank `ALMS_LLM_MODEL` is "not set", so the
+/// `alms.toml` models survive, and the file's padded models are trimmed. It
+/// takes the process env/cwd lock, like the other loader tests.
+#[test]
+fn test_both_loaders_ignore_a_blank_model_env_and_trim_the_file() {
+    let _lock = env_lock();
+    let _provider_guard = SingleEnvGuard::remove("ALMS_LLM_PROVIDER");
+    let _model_guard = SingleEnvGuard::set("ALMS_LLM_MODEL", "   ");
+    let _legacy_model_guard = SingleEnvGuard::remove("DEFAULT_MODEL");
+    let _mock_guard = SingleEnvGuard::remove("ALMS_LLM_MOCK");
+    let home = tempfile::tempdir().expect("tempdir creates");
+    let cwd = tempfile::tempdir().expect("tempdir creates");
+    std::fs::write(
+        cwd.path().join("alms.toml"),
+        "[llm]\nprovider = \"mylab\"\nmodel = \" toml-model \"\n\n\
+         [llm.providers.mylab]\nbase_url = \"http://127.0.0.1:9/v1\"\nmodel = \" entry-model \"\n",
+    )
+    .expect("toml write");
+
+    let loaders = [
+        ("load", AlmsConfig::load as fn() -> AlmsResult<AlmsConfig>),
+        (
+            "load_or_default_fallible",
+            AlmsConfig::load_or_default_fallible,
+        ),
+    ];
+    for (name, loader) in loaders {
+        let config = load_from_with(cwd.path(), home.path(), loader).expect("loads");
+        assert_eq!(config.llm.model, "toml-model", "{name}");
+        assert_eq!(
+            config.llm.providers["mylab"].model.as_deref(),
+            Some("entry-model"),
+            "{name}"
+        );
+    }
+
+    // A blank `ALMS_LLM_MODEL` is "not set", so the legacy `DEFAULT_MODEL`
+    // is still read after it, as it would be if `ALMS_LLM_MODEL` were unset.
+    let _legacy_set = SingleEnvGuard::set("DEFAULT_MODEL", "legacy-model");
+    for (name, loader) in loaders {
+        let config = load_from_with(cwd.path(), home.path(), loader).expect("loads");
+        assert_eq!(config.llm.model, "legacy-model", "{name}");
+        assert_eq!(
+            config.llm.providers["mylab"].model.as_deref(),
+            Some("legacy-model"),
+            "{name}"
+        );
+    }
+
+    // A blank `DEFAULT_MODEL` is "not set" too, so the file's models stay.
+    let _legacy_blank = SingleEnvGuard::set("DEFAULT_MODEL", " \t ");
+    for (name, loader) in loaders {
+        let config = load_from_with(cwd.path(), home.path(), loader).expect("loads");
+        assert_eq!(config.llm.model, "toml-model", "{name}");
+        assert_eq!(
+            config.llm.providers["mylab"].model.as_deref(),
+            Some("entry-model"),
+            "{name}"
+        );
+    }
 }
 
 /// An `alms.toml` that won't parse must not be replaced by defaults: that would

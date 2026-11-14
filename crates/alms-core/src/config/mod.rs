@@ -125,6 +125,7 @@ impl AlmsConfig {
 
         // Normalize episodic memory settings (soft corrections with warnings)
         config.context.normalize_episodic();
+        config.llm.normalize_models();
 
         // Validate
         config.validate()?;
@@ -234,6 +235,7 @@ impl AlmsConfig {
         }
         config.warn_legacy_data_dir();
         config.context.normalize_episodic();
+        config.llm.normalize_models();
 
         // Step 3: fail-fast on validation errors (#924). A
         // hand-edited `alms.toml` (or an env-var override) that
@@ -315,13 +317,15 @@ impl AlmsConfig {
                 entry.base_url = url;
             }
         }
-        if let Ok(model) =
-            std::env::var("ALMS_LLM_MODEL").or_else(|_| std::env::var("DEFAULT_MODEL"))
-        {
-            self.llm.model = model.clone();
+        // #126: a blank value is "not set", so the next source is tried, and
+        // alms.toml keeps its model if neither has one.
+        let non_blank = |name: &str| std::env::var(name).ok().filter(|v| !v.trim().is_empty());
+        if let Some(model) = non_blank("ALMS_LLM_MODEL").or_else(|| non_blank("DEFAULT_MODEL")) {
+            let model = model.trim();
+            self.llm.model = model.to_string();
             // Same propagation rationale as `base_url` above.
             if let Some(entry) = self.llm.providers.get_mut(&self.llm.provider) {
-                entry.model = Some(model);
+                entry.model = Some(model.to_string());
             }
         }
         if let Ok(val) = std::env::var("ALMS_LLM_MOCK") {
