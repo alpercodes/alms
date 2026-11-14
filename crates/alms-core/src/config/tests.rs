@@ -2492,13 +2492,14 @@ fn test_both_loaders_ignore_a_blank_model_env_and_trim_the_file() {
     )
     .expect("toml write");
 
-    for (name, loader) in [
+    let loaders = [
         ("load", AlmsConfig::load as fn() -> AlmsResult<AlmsConfig>),
         (
             "load_or_default_fallible",
             AlmsConfig::load_or_default_fallible,
         ),
-    ] {
+    ];
+    for (name, loader) in loaders {
         let config = load_from_with(cwd.path(), home.path(), loader).expect("loads");
         assert_eq!(config.llm.model, "toml-model", "{name}");
         assert_eq!(
@@ -2511,18 +2512,24 @@ fn test_both_loaders_ignore_a_blank_model_env_and_trim_the_file() {
     // A blank `ALMS_LLM_MODEL` is "not set", so the legacy `DEFAULT_MODEL`
     // is still read after it, as it would be if `ALMS_LLM_MODEL` were unset.
     let _legacy_set = SingleEnvGuard::set("DEFAULT_MODEL", "legacy-model");
-    for (name, loader) in [
-        ("load", AlmsConfig::load as fn() -> AlmsResult<AlmsConfig>),
-        (
-            "load_or_default_fallible",
-            AlmsConfig::load_or_default_fallible,
-        ),
-    ] {
+    for (name, loader) in loaders {
         let config = load_from_with(cwd.path(), home.path(), loader).expect("loads");
         assert_eq!(config.llm.model, "legacy-model", "{name}");
         assert_eq!(
             config.llm.providers["mylab"].model.as_deref(),
             Some("legacy-model"),
+            "{name}"
+        );
+    }
+
+    // A blank `DEFAULT_MODEL` is "not set" too, so the file's models stay.
+    let _legacy_blank = SingleEnvGuard::set("DEFAULT_MODEL", " \t ");
+    for (name, loader) in loaders {
+        let config = load_from_with(cwd.path(), home.path(), loader).expect("loads");
+        assert_eq!(config.llm.model, "toml-model", "{name}");
+        assert_eq!(
+            config.llm.providers["mylab"].model.as_deref(),
+            Some("entry-model"),
             "{name}"
         );
     }

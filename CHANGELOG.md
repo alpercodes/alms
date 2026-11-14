@@ -260,12 +260,12 @@ Each item below changes behaviour for a deployment that has not set the knob exp
   `DEFAULT_MODEL`. `tools.sandbox_root` in `PATCH /settings` gets the same fix: a
   whitespace-only value is stored as `""`, the "no override" value, where before it went
   live, persisted, and made every run fail with `cannot be resolved`. (`ALMS_SANDBOX_ROOT`
-  and `[tools] sandbox_root` in `alms.toml` are unchanged.) **After upgrading**, a gateway whose `settings.json` already
-  holds a blank model skips it at startup with a WARN and uses the `alms.toml` model; set
-  one with `PATCH /settings` or remove the line. A blank persisted `sandbox_root` is read as
-  `""`. An agent whose record already holds a blank model gets a WARN at startup naming it;
-  clear it with `PUT /agents/<name>` and `"model": ""`, or `alms agent config <name>
-  --model ""`.
+  and `[tools] sandbox_root` in `alms.toml` are unchanged.) **After upgrading**, a gateway
+  whose `settings.json` already holds a blank model skips it at startup with a WARN and
+  uses the `alms.toml` model; set one with `PATCH /settings` or remove the line. A blank
+  persisted `sandbox_root` is read as `""`. An agent whose record already holds a blank
+  model gets a WARN at startup naming it; clear it with `PUT /agents/<name>` and
+  `"model": ""`, or `alms agent config <name> --model ""`.
 - Transactional, versioned SQLite migrations.
 - A fresh install no longer registers an agent nobody created when it is restarted. The
   gateway writes `.alms/agent_id` on its first boot, and on the next boot the migration for
