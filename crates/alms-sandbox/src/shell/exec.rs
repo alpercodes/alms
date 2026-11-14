@@ -352,8 +352,16 @@ fn take_cwd_reset(state: &ShellState) -> Option<CwdReset> {
 }
 
 /// Put back a reset record taken by a command that then failed before it
-/// could report it (#119), if the shell is still in the root and no newer
-/// record has been written since.
+/// could report it (#119), if the shell is in the root and no record is
+/// pending.
+///
+/// The guards say where the shell is now, not that it stayed put. So a
+/// record can come back stale in one narrow case, which needs concurrency
+/// and a failure on the same command: while the command that took it was
+/// running, the shell moved away and back to the root, or a newer reset was
+/// recorded and already reported. The next command in the root then gets an
+/// extra or misattributed `[cwd reset: ...]` notice. It never changes where a
+/// command runs.
 async fn restore_cwd_reset(state: &ShellState, root: &Path, reset: CwdReset) {
     let live = state.cwd.lock().await;
     if *live == root {
@@ -2229,6 +2237,46 @@ mod tests {
         // Once.
         let third = run_pwd(&state, &root).await.unwrap();
         assert!(third.cwd_reset_from.is_none());
+    }
+
+    /// #119: the put-back needs the shell to be in the root. After a move,
+    /// the taken record is dropped instead.
+    #[tokio::test]
+    async fn restore_cwd_reset_does_nothing_after_a_move() {
+        let root = PathBuf::from("/work/agent-root");
+        let state = ShellState::new(root.join("sub"));
+        let reset = CwdReset {
+            from: root.join("gone"),
+            root: root.clone(),
+            reason: CwdRejection::NotVerifiable,
+        };
+
+        restore_cwd_reset(&state, &root, reset).await;
+
+        assert!(state.cwd_reset.lock().is_none());
+    }
+
+    /// #119: the put-back never replaces a pending record, which is newer.
+    #[tokio::test]
+    async fn restore_cwd_reset_keeps_a_pending_record() {
+        let root = PathBuf::from("/work/agent-root");
+        let state = ShellState::new(root.clone());
+        let pending = CwdReset {
+            from: root.join("newer"),
+            root: root.clone(),
+            reason: CwdRejection::NotVerifiable,
+        };
+        record_cwd_reset(&state, pending);
+        let taken_earlier = CwdReset {
+            from: root.join("older"),
+            root: root.clone(),
+            reason: CwdRejection::NotVerifiable,
+        };
+
+        restore_cwd_reset(&state, &root, taken_earlier).await;
+
+        let kept = state.cwd_reset.lock().clone().expect("a record is pending");
+        assert_eq!(kept.from, root.join("newer"));
     }
 
     /// #119: a command that takes the reset record and then fails before it

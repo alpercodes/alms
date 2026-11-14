@@ -1470,9 +1470,6 @@ mod tests {
         }
     }
 
-    /// #1262 — the foreground result body is `decorate_stdout`'s output.
-    /// The end-to-end tests above prove the notice fires; this one pins what
-    /// it *says*, without depending on a shell to produce it.
     /// #119: a post-command reset says why the previous cwd failed too: a
     /// previous cwd outside the root (a component swapped for a symlink)
     /// still resolves, so "no longer resolves" would be wrong for it.
@@ -1501,6 +1498,9 @@ mod tests {
         }
     }
 
+    /// #1262 — the foreground result body is `decorate_stdout`'s output.
+    /// The end-to-end tests above prove the notice fires; this one pins what
+    /// it *says*, without depending on a shell to produce it.
     #[test]
     fn test_decorate_stdout_carries_the_cwd_revert_notice() {
         let tool = ShellTool::sandboxed(PathBuf::from("/work/agent-root"));
