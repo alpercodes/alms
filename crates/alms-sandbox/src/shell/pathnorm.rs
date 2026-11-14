@@ -281,7 +281,7 @@ pub(crate) fn is_within(root: &Path, candidate: &Path) -> bool {
 /// only widen the match: into a sibling whose name differs only in case, in a
 /// directory with per-directory case sensitivity enabled. Folding is kept for
 /// a root that fell back to its raw spelling, which may be cased differently
-/// from the disk (#119, Tim's note on `FOLD_CASE`).
+/// from the disk (#119).
 pub(crate) fn is_within_normalised(root: &Normalised, candidate: &Normalised) -> bool {
     is_within_normalised_impl(root, candidate, FOLD_CASE)
 }
@@ -493,7 +493,7 @@ mod tests {
         assert_eq!(FOLD_CASE, cfg!(windows));
     }
 
-    // -- is_within_normalised (#119, S5) ------------------------------------
+    // -- is_within_normalised (#119) -----------------------------------------
 
     fn normalised(path: &str, resolved: bool) -> Normalised {
         Normalised {

@@ -168,7 +168,14 @@ Each item below changes behaviour for a deployment that has not set the knob exp
   directory '…' could not be resolved (<cause>), so it could not be confirmed inside
   sandbox root '…'. The command was not run; the shell's working directory is now the
   sandbox root.`, and the shell is reset to the root. A command that deletes its own cwd
-  also leaves the shell at the root. This applies on every platform; `unrestricted` and
+  also leaves the shell at the root, with a `[cwd reset: ...]` notice. With commands
+  running concurrently (a parallel tool-call batch, or a background command), a command
+  that starts after the reset runs at the root although it was written for the old cwd;
+  the first such command carries a one-shot `[cwd reset: '<old>' no longer resolved, so
+  this command ran in the sandbox root '<root>']` line. On Windows, a cwd is now compared
+  to a resolved sandbox root without case folding; a sibling that differs from the root
+  only in case (possible with per-directory case sensitivity) is no longer treated as
+  inside it. This applies on every platform; `unrestricted` and
   `allow_full_os_access` shells skip containment as before. **After upgrading**, a shell
   whose cwd is deleted, or stops resolving, refuses the next command once and then runs
   at the sandbox root, where before every command failed with `Failed to spawn command:

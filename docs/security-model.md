@@ -438,7 +438,15 @@ MSYS form (`/c/dev/ws`), the builtin engine reports native Windows form
 (`C:\dev\ws`), and `std::fs::canonicalize` produces extended-length form
 (`\\?\C:\dev\ws`). Both sides are therefore normalised — MSYS drive paths
 rewritten to drive form, `\\?\` stripped, symlinks resolved — before a
-component-wise containment test that folds ASCII case on Windows.
+component-wise containment test. On Windows that test folds ASCII case only
+when the sandbox root fell back to its raw spelling (#119): two canonical
+paths already carry the on-disk casing, so folding them could only widen a
+match, into a sibling that differs from the root only in case (possible with
+per-directory case sensitivity). This assumes `std::fs::canonicalize`
+(`GetFinalPathNameByHandleW`) returns on-disk casing, which holds for local
+NTFS and ReFS; a network redirector or third-party driver that returns the
+opened name's casing would make a differently cased spelling inside the root
+read as outside it, which fails closed.
 Containment has always been component-wise — `Path::starts_with` matches
 whole components, so a sibling like `ws-evil` was never treated as inside
 `ws`, and no prefix-matching vulnerability was ever shipped. What #1255
@@ -449,8 +457,9 @@ rewrite is applied only
 under `cfg(windows)` and only when the rewritten path names a real
 directory: on Unix `/c/...` is an ordinary absolute path and is never
 reinterpreted. A cwd that fails containment is discarded and the previous
-cwd retained, so a `cd` out of the sandbox cannot persist into the next
-command. The revert is also **reported to the agent** (#1262): the tool
+cwd retained (or, if that no longer passes either, the shell is reset to the
+sandbox root, #119), so a `cd` out of the sandbox cannot persist into the
+next command. The revert is also **reported to the agent** (#1262): the tool
 result's `stdout` gains a `[cwd unchanged: '<attempted>' <verdict>;
 subsequent commands still run in '<kept>']` line, on both the foreground and
 background (`check_task`) paths, and the sandboxed variant of the tool
@@ -473,8 +482,17 @@ never produce a false accept: a canonical candidate only matches it when it
 sits literally under that spelling. A stored cwd that fails the check before a
 command (it was deleted, or stopped resolving) refuses that command, which was
 written for that cwd, and resets the shell to the sandbox root, so the agent is
-never left with a shell that refuses every command. A command that deletes its
-own cwd gets the same reset after it runs. Both refusals fail closed, but only one of them
+never left with a shell that refuses every command, unless the project root
+itself cannot be resolved. A command that deletes its own cwd gets the same
+reset after it runs, and its notice reads `[cwd reset: ...]` instead of
+`[cwd unchanged: ...]`. The reset reaches commands running concurrently: a
+sibling in the same tool-call batch, or a foreground command beside a
+background one, that reads the cwd after the reset runs in the root although
+it was written for the old cwd. That cannot be prevented, so it is reported:
+the first command to run in the root after a reset gets a one-shot
+`[cwd reset: '<old>' no longer resolved, so this command ran in the sandbox
+root '<root>']` line. The reset only ever writes the sandbox root, so it
+widens nothing. Both outcomes fail closed, but only one of them
 establishes where the directory actually is:
 
 | Outcome | Condition | `<verdict>` |
