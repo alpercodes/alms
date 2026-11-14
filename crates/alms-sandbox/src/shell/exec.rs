@@ -2034,10 +2034,10 @@ mod tests {
             err.to_string().contains("could not be confirmed inside"),
             "got: {err}"
         );
-        // S2: and it names why, from the `canonicalize` error.
+        // S2: and it names why, from the `canonicalize` error (whose text
+        // is the platform's, so only its presence is checked).
         assert!(
-            err.to_string().contains("could not be resolved (")
-                && err.to_string().contains("No such file or directory"),
+            err.to_string().contains("could not be resolved ("),
             "got: {err}"
         );
     }
