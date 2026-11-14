@@ -1,0 +1,12 @@
+# Clippy configuration for the workspace.
+
+# Process-global env and working-directory writes. `cargo test` runs a crate's
+# tests as threads of one process, so a write here races every other test in
+# it. Tests go through `alms_test_support::process_env` (one lock per test
+# binary, restored on drop), whose four writers are the only `#[expect]`ed
+# uses. Production code has no reason to change the process env.
+disallowed-methods = [
+    { path = "std::env::set_var", reason = "tests: use alms_test_support::process_env (one lock per test binary, restored on drop)" },
+    { path = "std::env::remove_var", reason = "tests: use alms_test_support::process_env" },
+    { path = "std::env::set_current_dir", reason = "tests: use alms_test_support::process_env" },
+]

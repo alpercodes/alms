@@ -1180,17 +1180,7 @@ mod tests {
         // Poll instead of sleeping a fixed interval: spawning a shell can be
         // slow (Git Bash on Windows especially) and a timing guess would
         // make this flaky rather than wrong.
-        let mut checked = serde_json::Value::Null;
-        for _ in 0..50 {
-            checked = tool
-                .execute(serde_json::json!({"check_task": task_id}))
-                .await
-                .unwrap();
-            if checked["status"] != "not_found_or_still_running" {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        }
+        let checked = wait_for_background_task(&tool, &task_id).await;
         assert_eq!(
             checked["status"], "completed",
             "background task should have completed; got: {checked}"
@@ -1391,6 +1381,28 @@ mod tests {
         }
     }
 
+    /// Polls `check_task` until the background task is no longer running and
+    /// returns its result, failing after 30 s. Background tests used to sleep
+    /// a fixed 500 or 800 ms and then expect `completed`, which failed on a
+    /// loaded machine, where spawning the shell alone can take longer.
+    async fn wait_for_background_task(tool: &ShellTool, task_id: &str) -> Value {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            let result = tool
+                .execute(serde_json::json!({"check_task": task_id}))
+                .await
+                .unwrap();
+            if result["status"] != "not_found_or_still_running" {
+                return result;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "background task {task_id} still running after 30s"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
     #[tokio::test]
     #[cfg(unix)]
     async fn test_shell_tool_background_execution() {
@@ -1407,14 +1419,7 @@ mod tests {
         assert_eq!(result["status"], "submitted");
         let task_id = result["task_id"].as_str().unwrap();
 
-        // Wait for completion
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-
-        // Check task result
-        let result = tool
-            .execute(serde_json::json!({"check_task": task_id}))
-            .await
-            .unwrap();
+        let result = wait_for_background_task(&tool, task_id).await;
         assert_eq!(result["status"], "completed");
         assert!(
             result["stdout"]
@@ -2009,14 +2014,7 @@ mod tests {
         assert_eq!(submit["status"], "submitted");
         let task_id = submit["task_id"].as_str().unwrap().to_string();
 
-        // Wait for completion. The command itself is fast — half a second
-        // covers the spawn + write + finalize handshake even on slow CI.
-        tokio::time::sleep(std::time::Duration::from_millis(800)).await;
-
-        let result = tool
-            .execute(serde_json::json!({"check_task": task_id}))
-            .await
-            .unwrap();
+        let result = wait_for_background_task(&tool, &task_id).await;
         assert_eq!(result["status"], "completed");
 
         let stdout = result["stdout"].as_str().unwrap();
@@ -2074,12 +2072,7 @@ mod tests {
             .unwrap();
         let task_id = submit["task_id"].as_str().unwrap().to_string();
 
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-
-        let result = tool
-            .execute(serde_json::json!({"check_task": task_id}))
-            .await
-            .unwrap();
+        let result = wait_for_background_task(&tool, &task_id).await;
         assert_eq!(result["status"], "completed");
         let stdout = result["stdout"].as_str().unwrap();
         assert!(stdout.contains("small_bg_output"));

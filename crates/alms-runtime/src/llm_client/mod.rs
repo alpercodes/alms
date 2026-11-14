@@ -1225,19 +1225,16 @@ mod tests {
     use super::sse_parsers::{parse_gemini_sse_block, parse_openai_sse};
     use super::*;
     use alms_test_support::{Canned, RawServer, ScriptedLlm, Wire};
-    use std::sync::Mutex;
 
-    /// Module-local env-var serialization mutex. `cargo test` runs unit
-    /// tests in this module on a parallel thread-pool by default, and
-    /// concurrent `std::env::set_var` calls are unsound in Rust 1.79+
-    /// (the writes race against any other thread reading env). Every
-    /// test in this mod that touches the process env via `set_var` /
-    /// `remove_var` must take this lock first. Mirrors the
-    /// `llm_types::tests::ENV_LOCK` sibling pattern.
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    // Env writes in this module go through `alms_test_support::process_env`:
+    // one lock per test binary (shared with `llm_types`' tests, which used
+    // to have a second, separate mutex), restored on drop.
+    use alms_test_support::process_env::{VarGuard, lock as env_lock};
 
     #[test]
     fn test_llm_config_from_env() {
+        // Reads the env vars other tests in this binary change.
+        let _lock = env_lock();
         // This test just verifies the config loads without panicking
         let config = LlmConfig::from_env();
         assert!(!config.base_url.is_empty());
@@ -1498,12 +1495,10 @@ mod tests {
     #[test]
     fn test_with_secrets_falls_back_to_provider_entry_api_key_env() {
         const ENV_VAR: &str = "ALMS_TEST_WITH_SECRETS_OPENROUTER_KEY";
-        // Serialised against every other env-touching test in this mod;
+        // Serialised against every other env-touching test in this test binary;
         // see `test_with_provider_and_secrets_resolves_provider_entry_api_key_env`.
-        let _env_guard = ENV_LOCK.lock().unwrap();
-        // SAFETY: the lock above serialises the write against every other
-        // test in this mod that touches the process env.
-        unsafe { std::env::set_var(ENV_VAR, "sk-or-from-env") };
+        let _env_guard = env_lock();
+        let _key = VarGuard::set(ENV_VAR, "sk-or-from-env");
 
         let mut providers = std::collections::BTreeMap::new();
         providers.insert(
@@ -1537,7 +1532,6 @@ mod tests {
             alms_core::secrets::SecretsStore::load(dir.path().join("secrets.json")).unwrap();
         secrets.set_key("openrouter", "sk-or-from-store").unwrap();
         let from_store = client.with_secrets(&secrets);
-        unsafe { std::env::remove_var(ENV_VAR) };
         assert_eq!(updated.api_key(), "sk-or-from-env");
         assert_eq!(from_store.api_key(), "sk-or-from-store");
     }
@@ -1818,18 +1812,14 @@ mod tests {
     #[test]
     fn test_with_provider_and_secrets_resolves_provider_entry_api_key_env() {
         const ENV_VAR: &str = "ALMS_TEST_LARRY_1081_ANTHROPIC_KEY";
-        // Serialize against any other env-touching test in this mod —
-        // concurrent `set_var` racing with another thread reading any
-        // env is UB in Rust 1.79+. The unique key prevents value
-        // collisions across tests but does not serialize the writes;
-        // the lock does. Held until the matching `remove_var` below.
-        let _env_guard = ENV_LOCK.lock().unwrap();
-        // SAFETY: the lock above serializes the write against every
-        // other test in this mod that touches the process env. Other
-        // threads in the process may still observe the env mid-write
-        // (this is the genuine UB hole `set_var` carries), but no
-        // such reader exists in this test setup.
-        unsafe { std::env::set_var(ENV_VAR, "sk-ant-from-env") };
+        // Serialize against every other env-touching test in this test
+        // binary: concurrent `set_var` racing with another thread reading
+        // any env is UB in Rust 1.79+. The unique key prevents value
+        // collisions across tests but does not serialize the writes; the
+        // lock does. `VarGuard` restores the var on drop, before the lock
+        // is released.
+        let _env_guard = env_lock();
+        let _key = VarGuard::set(ENV_VAR, "sk-ant-from-env");
 
         let mut providers = std::collections::BTreeMap::new();
         providers.insert(
@@ -1857,7 +1847,6 @@ mod tests {
 
         let secrets = alms_core::secrets::SecretsStore::empty();
         let switched = client.with_provider_and_secrets("anthropic", &secrets);
-        unsafe { std::env::remove_var(ENV_VAR) };
         assert_eq!(switched.provider(), "anthropic");
         assert_eq!(switched.api_key(), "sk-ant-from-env");
     }

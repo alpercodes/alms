@@ -64,6 +64,9 @@ make test-static-assets
 - **Formatting**: Use `cargo fmt` (enforced in CI)
 - **Linting**: All clippy warnings must be resolved (enforced in CI)
 - **Testing**: All tests must pass (enforced in CI)
+- **Process state in tests**: change env vars and the working directory only
+  through `alms_test_support::process_env`. `cargo test` runs a crate's tests
+  as threads of one process, so anything else races every other test in it.
 - **Static UI**: Every `*.js` / `*.mjs` under `crates/alms-gateway/static/ui/`
   is parsed in module mode by `tests/static_assets_parse.rs` as part of
   `cargo test --all`. Module-syntax bugs (unterminated template literals,

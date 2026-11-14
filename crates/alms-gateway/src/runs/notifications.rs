@@ -3961,7 +3961,8 @@ mod tests {
     async fn test_conversation_ended_no_reroute_when_source_session_none() {
         // -- Build a minimal AppState --
         let gateway_config = crate::gateway::GatewayConfig::default();
-        let gateway = crate::gateway::Gateway::new(gateway_config).unwrap();
+        let gateway =
+            crate::gateway::Gateway::new(crate::test_support::isolated(gateway_config)).unwrap();
         let scheduler = std::sync::Arc::new(alms_runtime::Scheduler::new());
         let shutdown_token = CancellationToken::new();
         let (completion_tx, _completion_rx) = mpsc::unbounded_channel();
@@ -4062,7 +4063,8 @@ mod tests {
     async fn test_subagent_completion_marker_persisted_before_sse_event() {
         // -- Build a minimal AppState --
         let gateway_config = crate::gateway::GatewayConfig::default();
-        let gateway = crate::gateway::Gateway::new(gateway_config).unwrap();
+        let gateway =
+            crate::gateway::Gateway::new(crate::test_support::isolated(gateway_config)).unwrap();
         let scheduler = std::sync::Arc::new(alms_runtime::Scheduler::new());
         let shutdown_token = CancellationToken::new();
         let (completion_tx, _completion_rx) = mpsc::unbounded_channel();
@@ -4176,7 +4178,8 @@ mod tests {
     /// needed — the in-memory session manager and run store suffice).
     fn build_notification_state() -> (AppState, CancellationToken) {
         let gateway_config = crate::gateway::GatewayConfig::default();
-        let gateway = crate::gateway::Gateway::new(gateway_config).unwrap();
+        let gateway =
+            crate::gateway::Gateway::new(crate::test_support::isolated(gateway_config)).unwrap();
         let scheduler = std::sync::Arc::new(alms_runtime::Scheduler::new());
         let shutdown_token = CancellationToken::new();
         let (completion_tx, _cr) = mpsc::unbounded_channel();

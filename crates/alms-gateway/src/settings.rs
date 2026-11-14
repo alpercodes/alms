@@ -4987,7 +4987,8 @@ mod tests {
 
         // 3. Construct the AppState — this exercises the boot path that
         //    Finding #3 targets.
-        let gateway = crate::gateway::Gateway::new(gateway_config).unwrap();
+        let gateway =
+            crate::gateway::Gateway::new(crate::test_support::isolated(gateway_config)).unwrap();
         let scheduler = std::sync::Arc::new(alms_runtime::Scheduler::new());
         let shutdown_token = tokio_util::sync::CancellationToken::new();
         let (completion_tx, _cr) = tokio::sync::mpsc::unbounded_channel();
@@ -5108,7 +5109,8 @@ mod tests {
 
         // 3. Construct AppState — exercises the boot path with the
         //    stale persisted provider.
-        let gateway = crate::gateway::Gateway::new(gateway_config).unwrap();
+        let gateway =
+            crate::gateway::Gateway::new(crate::test_support::isolated(gateway_config)).unwrap();
         let scheduler = std::sync::Arc::new(alms_runtime::Scheduler::new());
         let shutdown_token = tokio_util::sync::CancellationToken::new();
         let (completion_tx, _cr) = tokio::sync::mpsc::unbounded_channel();
@@ -5232,7 +5234,8 @@ mod tests {
         .unwrap();
 
         // 3. Construct AppState — exercises the boot path.
-        let gateway = crate::gateway::Gateway::new(gateway_config).unwrap();
+        let gateway =
+            crate::gateway::Gateway::new(crate::test_support::isolated(gateway_config)).unwrap();
         let scheduler = std::sync::Arc::new(alms_runtime::Scheduler::new());
         let shutdown_token = tokio_util::sync::CancellationToken::new();
         let (completion_tx, _cr) = tokio::sync::mpsc::unbounded_channel();
@@ -5320,7 +5323,8 @@ mod tests {
         )
         .unwrap();
 
-        let gateway = crate::gateway::Gateway::new(gateway_config).unwrap();
+        let gateway =
+            crate::gateway::Gateway::new(crate::test_support::isolated(gateway_config)).unwrap();
         let scheduler = std::sync::Arc::new(alms_runtime::Scheduler::new());
         let shutdown_token = tokio_util::sync::CancellationToken::new();
         let (completion_tx, _cr) = tokio::sync::mpsc::unbounded_channel();
@@ -5391,13 +5395,11 @@ mod tests {
         );
         let tmp = tempfile::tempdir().unwrap();
         state.data_dir = tmp.path().to_path_buf();
-        // Force strict mode so the validator returns a 400 envelope (it
-        // also respects ALMS_TOKEN_BUDGET_VALIDATION env, but we want a
-        // deterministic test).
-        // SAFETY: tests in this module are not run concurrently across
-        // env writes in practice; this matches the existing budget-test
-        // pattern in this file.
-        unsafe { std::env::set_var("ALMS_TOKEN_BUDGET_VALIDATION", "strict") };
+        // Pin strict mode, which turns an overshoot into a 400. This used to
+        // set `ALMS_TOKEN_BUDGET_VALIDATION`, which nothing reads, so the
+        // test ran on the default (strict) and failed whenever a warn-mode
+        // test held `ALMS_LLM_BUDGET_VALIDATION=warn` at the same time.
+        let _budget_mode = crate::test_env_locks::BudgetValidationEnvGuard::set("strict");
         // Seed live default to a permissive (provider, model) pair that
         // would pass any reasonable budget at 1_000_000 input tokens —
         // OpenRouter caps are sourced from the slug's underlying model;
@@ -5434,7 +5436,6 @@ mod tests {
         // would have returned 200 because the seeded live-default pair
         // (openrouter, kimi-k2.6) is not in the budget table and the
         // validator silently skips unknown pairs.
-        unsafe { std::env::remove_var("ALMS_TOKEN_BUDGET_VALIDATION") };
         assert_eq!(
             resp.status(),
             StatusCode::BAD_REQUEST,
@@ -5489,12 +5490,11 @@ mod tests {
         );
         let tmp = tempfile::tempdir().unwrap();
         state.data_dir = tmp.path().to_path_buf();
-        // Force strict mode so the validator returns a 400 envelope.
-        // SAFETY: tests in this module are not run concurrently across
-        // env writes in practice; this matches the existing budget-test
-        // pattern in this file (see
-        // `patch_revalidates_budget_against_post_patch_default_pair`).
-        unsafe { std::env::set_var("ALMS_TOKEN_BUDGET_VALIDATION", "strict") };
+        // Pin strict mode, which turns an overshoot into a 400. This used to
+        // set `ALMS_TOKEN_BUDGET_VALIDATION`, which nothing reads, so the
+        // test ran on the default (strict) and failed whenever a warn-mode
+        // test held `ALMS_LLM_BUDGET_VALIDATION=warn` at the same time.
+        let _budget_mode = crate::test_env_locks::BudgetValidationEnvGuard::set("strict");
         // Seed live default to a cross-namespace pair the budget table
         // does not recognise (so the pre-fix validator silently passes).
         {
@@ -5524,7 +5524,6 @@ mod tests {
         )
         .await
         .into_response();
-        unsafe { std::env::remove_var("ALMS_TOKEN_BUDGET_VALIDATION") };
         assert_eq!(
             resp.status(),
             StatusCode::BAD_REQUEST,
@@ -5599,12 +5598,11 @@ mod tests {
         );
         let tmp = tempfile::tempdir().unwrap();
         state.data_dir = tmp.path().to_path_buf();
-        // Force strict mode so a budget overshoot would surface as 400
-        // (pre-fix observable failure mode).
-        // SAFETY: tests in this module are not run concurrently across
-        // env writes in practice; matches the existing budget-test
-        // pattern (see other `patch_revalidates_budget_*` tests).
-        unsafe { std::env::set_var("ALMS_TOKEN_BUDGET_VALIDATION", "strict") };
+        // Pin strict mode, which turns an overshoot into a 400. This used to
+        // set `ALMS_TOKEN_BUDGET_VALIDATION`, which nothing reads, so the
+        // test ran on the default (strict) and failed whenever a warn-mode
+        // test held `ALMS_LLM_BUDGET_VALIDATION=warn` at the same time.
+        let _budget_mode = crate::test_env_locks::BudgetValidationEnvGuard::set("strict");
         // Live default `(anthropic, claude-sonnet-4-6)` — same provider
         // as the PATCH body, but a different (permissive) model. The
         // commit path will keep this model because the provider is
@@ -5634,7 +5632,6 @@ mod tests {
         )
         .await
         .into_response();
-        unsafe { std::env::remove_var("ALMS_TOKEN_BUDGET_VALIDATION") };
 
         // Pre-fix this would have been 400 with
         // `INVALID_TOKEN_BUDGET_FOR_PROVIDER` against
@@ -7140,8 +7137,8 @@ mod tests {
         use axum::body::to_bytes;
         use axum::response::IntoResponse;
 
-        // Pin strict mode for this test; concurrent warn-mode tests share
-        // the same env-var via the shared `BUDGET_VALIDATION_ENV_LOCK`.
+        // Pin strict mode for this test; the guard holds the binary's env
+        // lock, so a concurrent warn-mode test can't change it meanwhile.
         let _env = crate::test_env_locks::BudgetValidationEnvGuard::unset();
 
         let mut state = settings_test_app_state_with_anthropic_haiku();
