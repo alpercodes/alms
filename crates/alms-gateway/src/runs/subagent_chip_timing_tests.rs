@@ -141,7 +141,8 @@ async fn observe_parent_session_stream(background: bool) -> Vec<Observed> {
         llm_config,
         ..GatewayConfig::default()
     };
-    let gateway = crate::gateway::Gateway::new(gateway_config).unwrap();
+    let gateway =
+        crate::gateway::Gateway::new(crate::test_support::isolated(gateway_config)).unwrap();
     let scheduler = Arc::new(alms_runtime::Scheduler::new());
     let shutdown_token = CancellationToken::new();
     let (completion_tx, completion_rx) = mpsc::unbounded_channel();

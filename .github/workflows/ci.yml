@@ -11,10 +11,15 @@ env:
   # Use mock LLM in CI — no API key needed
   ALMS_LLM_MOCK: "1"
 
+# Every job has a `timeout-minutes`: without one a hung step (a deadlocked
+# test binary, a stalled apt mirror) runs to GitHub's 6-hour limit. Each is
+# about three times the slowest recent successful run: CI ~7-11 min, Rust
+# audit ~3.5, Frontend ~1.5, frontend audit under 1.
 jobs:
   frontend:
     name: Frontend
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
     - uses: actions/checkout@v4
 
@@ -48,6 +53,7 @@ jobs:
   ci:
     name: CI
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
     - uses: actions/checkout@v4
 
@@ -140,6 +146,7 @@ jobs:
   audit-rust:
     name: Security audit (Rust)
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     # Installs `cargo-audit` with `--locked` and runs it. The ignore set lives in
     # `.cargo/audit.toml` so local runs and CI cannot silently disagree (#1248),
     # and the verdict is cargo-audit's own, as configured in that file.
@@ -204,6 +211,7 @@ jobs:
   audit-frontend:
     name: Security audit (frontend)
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
     - uses: actions/checkout@v4
 

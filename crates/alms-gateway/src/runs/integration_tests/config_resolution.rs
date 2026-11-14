@@ -95,7 +95,8 @@ fn llm_default_harness(provider: &str, model: &str) -> LlmDefaultHarness {
         llm_config,
         ..GatewayConfig::default()
     };
-    let gateway = crate::gateway::Gateway::new(gateway_config).unwrap();
+    let gateway =
+        crate::gateway::Gateway::new(crate::test_support::isolated(gateway_config)).unwrap();
     let scheduler = Arc::new(alms_runtime::Scheduler::new());
     let shutdown_token = CancellationToken::new();
     let (completion_tx, completion_rx) = mpsc::unbounded_channel();
@@ -1435,7 +1436,8 @@ async fn create_run_mock_mode_bypasses_budget_validation() {
         llm_config,
         ..crate::gateway::GatewayConfig::default()
     };
-    let gateway = crate::gateway::Gateway::new(gateway_config).unwrap();
+    let gateway =
+        crate::gateway::Gateway::new(crate::test_support::isolated(gateway_config)).unwrap();
     let scheduler = std::sync::Arc::new(alms_runtime::Scheduler::new());
     let shutdown_token = CancellationToken::new();
     let (completion_tx, _cr) = mpsc::unbounded_channel();
@@ -1699,7 +1701,8 @@ async fn execute_run_mock_mode_skips_budget_validation_on_non_http_path() {
         llm_config,
         ..crate::gateway::GatewayConfig::default()
     };
-    let gateway = crate::gateway::Gateway::new(gateway_config).unwrap();
+    let gateway =
+        crate::gateway::Gateway::new(crate::test_support::isolated(gateway_config)).unwrap();
     let scheduler = std::sync::Arc::new(alms_runtime::Scheduler::new());
     let shutdown_token = CancellationToken::new();
     let (completion_tx, _cr) = mpsc::unbounded_channel();

@@ -26,6 +26,11 @@ Rules:
 - no network
 - no real time
 - no filesystem side effects (use temp dirs if necessary)
+- no process-global writes except through `alms_test_support::process_env`:
+  take `process_env::lock()` first, then change env vars with `VarGuard` and
+  the working directory with `CurrentDirGuard`; both restore on drop, panics
+  included. A test that reads a var or the working directory another test
+  changes takes the lock too. Better still, hand the value to the code under test.
 
 ### 1.2 Component tests (in-process integration)
 Focus: components working together with mocks.

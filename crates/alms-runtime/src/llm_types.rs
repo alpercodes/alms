@@ -825,9 +825,11 @@ impl LlmConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Mutex, MutexGuard};
+    use alms_test_support::process_env::{EnvLock, VarGuard, VarGuards, lock as env_lock};
 
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    // `env_lock()` is this test binary's one lock for env vars and the
+    // working directory, shared with `llm_client`'s tests and recovered if a
+    // holder panicked (`alms_test_support::process_env`).
     const LLM_ENV_VARS: [&str; 4] = [
         "OPENROUTER_API_KEY",
         "OPENAI_API_KEY",
@@ -836,51 +838,28 @@ mod tests {
     ];
 
     struct EnvGuard {
-        _lock: MutexGuard<'static, ()>,
-        saved: Vec<(&'static str, Option<String>)>,
-    }
-
-    fn set_env_var(name: &str, value: &str) {
-        unsafe {
-            std::env::set_var(name, value);
-        }
-    }
-
-    fn remove_env_var(name: &str) {
-        unsafe {
-            std::env::remove_var(name);
-        }
+        // Field order is drop order: the vars are restored (newest first, see
+        // `VarGuards`), then the lock is released.
+        _vars: VarGuards,
+        _lock: EnvLock,
     }
 
     impl EnvGuard {
         fn set(overrides: &[(&'static str, Option<&str>)]) -> Self {
-            let lock = ENV_LOCK.lock().unwrap();
-            let saved = LLM_ENV_VARS
-                .iter()
-                .map(|name| (*name, std::env::var(name).ok()))
-                .collect::<Vec<_>>();
-
+            let lock = env_lock();
+            let mut vars = VarGuards::default();
             for name in LLM_ENV_VARS {
-                remove_env_var(name);
+                vars.push(VarGuard::remove(name));
             }
             for (name, value) in overrides {
-                match value {
-                    Some(v) => set_env_var(name, v),
-                    None => remove_env_var(name),
-                }
+                vars.push(match value {
+                    Some(v) => VarGuard::set(name, v),
+                    None => VarGuard::remove(name),
+                });
             }
-
-            Self { _lock: lock, saved }
-        }
-    }
-
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            for (name, value) in &self.saved {
-                match value {
-                    Some(v) => set_env_var(name, v),
-                    None => remove_env_var(name),
-                }
+            Self {
+                _vars: vars,
+                _lock: lock,
             }
         }
     }
