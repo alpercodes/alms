@@ -66,6 +66,17 @@ pub struct GatewayConfig {
     /// whether to attach the project-root sandbox to a new
     /// [`AgentRuntime`].
     pub security_config: alms_core::config::SecurityConfig,
+    /// Where `secrets.json` is read and written. `None`, which every
+    /// production caller uses, keeps the default: beside the database
+    /// ([`alms_core::secrets::secrets_path_from_db`]). Tests set it so an
+    /// in-memory gateway doesn't share `./secrets.json` with every other test.
+    pub secrets_path: Option<std::path::PathBuf>,
+    /// The per-test directory `test_support::isolated` put `data_dir` and
+    /// `secrets_path` in. It lives as long as the last clone of this config,
+    /// i.e. the `Gateway`, and so the `AppState` that owns it, and is
+    /// deleted with it.
+    #[cfg(test)]
+    pub(crate) test_state_dir: Option<Arc<tempfile::TempDir>>,
 }
 
 #[allow(clippy::derivable_impls)]
@@ -85,6 +96,9 @@ impl Default for GatewayConfig {
             logging_config: alms_core::config::LoggingConfig::default(),
             tools_config: alms_core::config::ToolsConfig::default(),
             security_config: alms_core::config::SecurityConfig::default(),
+            secrets_path: None,
+            #[cfg(test)]
+            test_state_dir: None,
         }
     }
 }
@@ -160,6 +174,9 @@ impl GatewayConfig {
             logging_config: config.logging.clone(),
             tools_config: config.tools.clone(),
             security_config: config.security.clone(),
+            secrets_path: None,
+            #[cfg(test)]
+            test_state_dir: None,
         }
     }
 
@@ -445,7 +462,10 @@ impl Gateway {
         // with AppState so runtime key changes are visible everywhere. The
         // file sits beside the database; `alms auth` resolves the same one
         // (`ServerConfig::secrets_path`, #170).
-        let secrets_path = alms_core::secrets::secrets_path_from_db(config.db_path.as_deref());
+        let secrets_path = config
+            .secrets_path
+            .clone()
+            .unwrap_or_else(|| alms_core::secrets::secrets_path_from_db(config.db_path.as_deref()));
         let secrets_store =
             alms_core::secrets::SecretsStore::load(&secrets_path).unwrap_or_else(|e| {
                 warn!("Failed to load secrets: {e}");
@@ -1471,7 +1491,7 @@ mod tests {
             agent_id: Some(expected),
             ..GatewayConfig::default()
         };
-        let gateway = Gateway::new(config).unwrap();
+        let gateway = Gateway::new(crate::test_support::isolated(config)).unwrap();
         assert_eq!(gateway.agent_id(), expected);
     }
 
@@ -1505,7 +1525,7 @@ mod tests {
             db_path: Some(db_path.to_string()),
             ..GatewayConfig::default()
         };
-        let gateway = Gateway::new(config).unwrap();
+        let gateway = Gateway::new(crate::test_support::isolated(config)).unwrap();
 
         let history = gateway.session_manager.get_history(session.id).unwrap();
         let input = history
@@ -1572,7 +1592,7 @@ mod tests {
             db_path: Some(db_path.to_string()),
             ..GatewayConfig::default()
         };
-        let gateway = Gateway::new(config).unwrap();
+        let gateway = Gateway::new(crate::test_support::isolated(config)).unwrap();
 
         let context = gateway
             .session_manager
@@ -1770,11 +1790,11 @@ mod tests {
 
     fn boot(data_dir: &Path, db_path: &str) -> Booted {
         let sidecar_id = resolve_default_agent_id(data_dir);
-        let gateway = Gateway::new(GatewayConfig {
+        let gateway = Gateway::new(crate::test_support::isolated(GatewayConfig {
             db_path: Some(db_path.to_string()),
             agent_id: Some(sidecar_id),
             ..GatewayConfig::default()
-        })
+        }))
         .unwrap();
         Booted {
             gateway,
@@ -2219,11 +2239,11 @@ mod secrets_path_tests {
         let mut gateway = None;
         let captured = capture_events(tracing::Level::WARN, || {
             gateway = Some(
-                Gateway::new(GatewayConfig {
+                Gateway::new(crate::test_support::isolated(GatewayConfig {
                     db_path: Some(db_path.display().to_string()),
                     data_dir: Some(data_dir.to_path_buf()),
                     ..GatewayConfig::default()
-                })
+                }))
                 .unwrap(),
             );
         });

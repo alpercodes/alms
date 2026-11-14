@@ -152,13 +152,19 @@ mod tests {
 
         assert!(task_id.starts_with("bg_"));
 
-        // Wait a bit for the task to complete
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-
-        // Check the result
-        let result = check_background_task(&state, &task_id).await;
-        assert!(result.is_some());
-        let result = result.unwrap();
+        // Poll for the result rather than sleeping a fixed 500 ms, which
+        // failed on a loaded machine.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+        let result = loop {
+            if let Some(result) = check_background_task(&state, &task_id).await {
+                break result;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "background task {task_id} still running after 30s"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        };
         assert_eq!(result.task_id, task_id);
         assert!(result.output.is_some());
         assert!(result.error.is_none());

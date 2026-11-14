@@ -17,7 +17,8 @@
 //!   `alms-core` types live in `alms-core` behind its `test-support`
 //!   feature instead (see `AgentRecord::for_test`).
 //! * Per-process state (the global `tracing` subscriber installed by
-//!   [`capture_events`]) is per test binary: each crate's test target links
+//!   [`capture_events`], the env and working-directory lock in
+//!   [`process_env`]) is per test binary: each crate's test target links
 //!   its own copy of this crate's statics, which is exactly the isolation
 //!   the old hand-mirrored copies were providing.
 
@@ -25,6 +26,7 @@ pub mod git;
 pub mod http;
 pub mod llm_server;
 pub mod log_capture;
+pub mod process_env;
 pub mod raw_http;
 
 // The two fake upstreams: `wiremock` for complete responses, raw sockets

@@ -3,7 +3,6 @@
 //! Tests for the config module.
 
 use super::*;
-use std::sync::{Mutex, MutexGuard};
 
 /// `alms.toml.example` says "All values shown are defaults", and it showed
 /// `run_summary_mode = "off"` with "(default)" while the compiled default is
@@ -94,7 +93,7 @@ fn a_re_pointed_slot_is_judged_by_its_entry() {
 /// the slot for this rule too.
 #[test]
 fn alms_llm_base_url_re_points_the_default_slot() {
-    let _lock = ENV_LOCK.lock().unwrap();
+    let _lock = env_lock();
     let _guard = SingleEnvGuard::set("ALMS_LLM_BASE_URL", "http://127.0.0.1:1234/v1");
     let _legacy = SingleEnvGuard::remove("LLM_BASE_URL");
     let _provider = SingleEnvGuard::set("ALMS_LLM_PROVIDER", "openai");
@@ -141,24 +140,18 @@ pub(crate) fn select_llm_api_key(
     }
 }
 
-// Test-only env-var mutexes — disjointness contract.
+// Process env and working directory.
 //
-// `ENV_LOCK` and `BUDGET_ENV_LOCK` (defined further down) each guard a
-// disjoint var-set so a test holding one mutex cannot observe a partial
-// mutation guarded by the other. The contract is:
-//
-//   - `ENV_LOCK`         covers `LLM_ENV_VARS` (LLM API keys + provider tag).
-//   - `BUDGET_ENV_LOCK`  covers `ALMS_LLM_BUDGET_VALIDATION` only.
-//
-// The same disjointness rule applies cross-crate: the gateway's
-// `BUDGET_VALIDATION_ENV_LOCK` (in `crates/alms-gateway/src/lib.rs::test_env_locks`)
-// guards the same `ALMS_LLM_BUDGET_VALIDATION` var but a different test
-// process (each crate's `cargo test` runs in its own process), so the
-// two never need to interlock — just stay disjoint with their respective
-// `ENV_LOCK`s. A future test that needs to span both var-sets in one
-// crate must acquire the locks in a fixed order (e.g. `ENV_LOCK` first,
-// then `BUDGET_ENV_LOCK`) to avoid deadlock; today no such test exists.
-static ENV_LOCK: Mutex<()> = Mutex::new(());
+// Every test here that changes an env var or the working directory, or reads
+// one another test changes, holds `env_lock()` for its whole body: one lock
+// per test binary, shared with every other module's tests and recovered
+// rather than propagated if a holder panicked. See
+// `alms_test_support::process_env` for why a single lock replaced the
+// `ENV_LOCK` / `BUDGET_ENV_LOCK` pair and their disjoint-var-set contract.
+use alms_test_support::process_env::{
+    CurrentDirGuard, EnvLock, VarGuard as SingleEnvGuard, VarGuards, lock as env_lock,
+};
+
 const LLM_ENV_VARS: [&str; 4] = [
     "OPENROUTER_API_KEY",
     "OPENAI_API_KEY",
@@ -166,88 +159,31 @@ const LLM_ENV_VARS: [&str; 4] = [
     "ALMS_LLM_PROVIDER",
 ];
 
+/// Takes the env lock and clears `LLM_ENV_VARS` apart from `overrides`,
+/// putting every one of them back on drop.
 struct EnvGuard {
-    _lock: MutexGuard<'static, ()>,
-    saved: Vec<(&'static str, Option<String>)>,
-}
-
-fn set_env_var(name: &str, value: &str) {
-    unsafe {
-        std::env::set_var(name, value);
-    }
-}
-
-fn remove_env_var(name: &str) {
-    unsafe {
-        std::env::remove_var(name);
-    }
+    // Field order is drop order: the vars are restored (newest first, see
+    // `VarGuards`), then the lock is released.
+    _vars: VarGuards,
+    _lock: EnvLock,
 }
 
 impl EnvGuard {
     fn set(overrides: &[(&'static str, Option<&str>)]) -> Self {
-        let lock = ENV_LOCK.lock().unwrap();
-        let saved = LLM_ENV_VARS
-            .iter()
-            .map(|name| (*name, std::env::var(name).ok()))
-            .collect::<Vec<_>>();
-
+        let lock = env_lock();
+        let mut vars = VarGuards::default();
         for name in LLM_ENV_VARS {
-            remove_env_var(name);
+            vars.push(SingleEnvGuard::remove(name));
         }
         for (name, value) in overrides {
-            match value {
-                Some(v) => set_env_var(name, v),
-                None => remove_env_var(name),
-            }
+            vars.push(match value {
+                Some(v) => SingleEnvGuard::set(name, v),
+                None => SingleEnvGuard::remove(name),
+            });
         }
-
-        Self { _lock: lock, saved }
-    }
-}
-
-impl Drop for EnvGuard {
-    fn drop(&mut self) {
-        for (name, value) in &self.saved {
-            match value {
-                Some(v) => set_env_var(name, v),
-                None => remove_env_var(name),
-            }
-        }
-    }
-}
-
-/// RAII guard for a single env var. Restores the original value on drop,
-/// making tests panic-safe.
-struct SingleEnvGuard {
-    key: String,
-    original: Option<String>,
-}
-
-impl SingleEnvGuard {
-    fn set(key: &str, val: &str) -> Self {
-        let original = std::env::var(key).ok();
-        set_env_var(key, val);
         Self {
-            key: key.to_string(),
-            original,
-        }
-    }
-
-    fn remove(key: &str) -> Self {
-        let original = std::env::var(key).ok();
-        remove_env_var(key);
-        Self {
-            key: key.to_string(),
-            original,
-        }
-    }
-}
-
-impl Drop for SingleEnvGuard {
-    fn drop(&mut self) {
-        match &self.original {
-            Some(v) => set_env_var(&self.key, v),
-            None => remove_env_var(&self.key),
+            _vars: vars,
+            _lock: lock,
         }
     }
 }
@@ -491,23 +427,11 @@ fn test_default_max_context_tokens_larger_than_max_input_tokens() {
 
 const ALMS_LLM_BUDGET_VALIDATION: &str = "ALMS_LLM_BUDGET_VALIDATION";
 
-/// Test-only mutex serialising every token-budget validation test that
-/// reads `ALMS_LLM_BUDGET_VALIDATION`. `SingleEnvGuard` is per-var (no
-/// cross-test mutual exclusion); without this lock parallel tests would
-/// race each other's env-var mutations and produce flaky results.
-///
-/// **Disjointness contract:** `BUDGET_ENV_LOCK` guards
-/// `ALMS_LLM_BUDGET_VALIDATION` only — its var-set is disjoint from
-/// `ENV_LOCK` (`LLM_ENV_VARS`). See the module-level comment near
-/// `ENV_LOCK` for the full disjointness story (including the
-/// cross-crate sibling in `alms-gateway::test_env_locks`).
-static BUDGET_ENV_LOCK: Mutex<()> = Mutex::new(());
-
 #[test]
 fn test_token_budget_default_config_passes() {
     // Default config: provider=openrouter, model=z-ai/glm-5.2.
     // The table doesn't know that pair → validator must skip → ok.
-    let _lock = BUDGET_ENV_LOCK.lock().unwrap();
+    let _lock = env_lock();
     let _guard = SingleEnvGuard::remove(ALMS_LLM_BUDGET_VALIDATION);
     let config = AlmsConfig::default();
     assert!(
@@ -521,7 +445,7 @@ fn test_token_budget_strict_rejects_overshoot_anthropic() {
     // Anthropic Claude Haiku 4.5 caps at 200K (Opus 4.7 / Sonnet 4.6 are
     // 1M post-2026-05-09 verification round). 250K input + 32K default
     // output = 282K > 200K → overshoots.
-    let _lock = BUDGET_ENV_LOCK.lock().unwrap();
+    let _lock = env_lock();
     let _guard = SingleEnvGuard::remove(ALMS_LLM_BUDGET_VALIDATION);
     let mut config = AlmsConfig::default();
     config.llm.provider = "anthropic".into();
@@ -551,7 +475,7 @@ fn test_token_budget_strict_rejects_overshoot_anthropic() {
 
 #[test]
 fn test_token_budget_strict_accepts_fitting_anthropic() {
-    let _lock = BUDGET_ENV_LOCK.lock().unwrap();
+    let _lock = env_lock();
     let _guard = SingleEnvGuard::remove(ALMS_LLM_BUDGET_VALIDATION);
     let mut config = AlmsConfig::default();
     config.llm.provider = "anthropic".into();
@@ -569,7 +493,7 @@ fn test_token_budget_strict_rejects_overshoot_gemini() {
     // Replaces the prior deepseek_v3_64k overshoot fixture: under the
     // 2026-05-09 verification round DeepSeek V4 Flash sits at 1M, so the
     // old 64K / 128K aliases no longer exist in the table.
-    let _lock = BUDGET_ENV_LOCK.lock().unwrap();
+    let _lock = env_lock();
     let _guard = SingleEnvGuard::remove(ALMS_LLM_BUDGET_VALIDATION);
     let mut config = AlmsConfig::default();
     config.llm.provider = "gemini".into();
@@ -603,7 +527,7 @@ fn test_token_budget_strict_rejects_overshoot_gemini() {
 
 #[test]
 fn test_token_budget_warn_mode_accepts_overshoot() {
-    let _lock = BUDGET_ENV_LOCK.lock().unwrap();
+    let _lock = env_lock();
     let _guard = SingleEnvGuard::set(ALMS_LLM_BUDGET_VALIDATION, "warn");
     let mut config = AlmsConfig::default();
     config.llm.provider = "anthropic".into();
@@ -620,7 +544,7 @@ fn test_token_budget_warn_mode_accepts_overshoot() {
 fn test_token_budget_unknown_pair_skips() {
     // Provider in the table but model unknown → skip silently regardless
     // of size. Pre-#919 this was the entire validation surface.
-    let _lock = BUDGET_ENV_LOCK.lock().unwrap();
+    let _lock = env_lock();
     let _guard = SingleEnvGuard::remove(ALMS_LLM_BUDGET_VALIDATION);
     let mut config = AlmsConfig::default();
     config.llm.provider = "anthropic".into();
@@ -635,7 +559,7 @@ fn test_token_budget_unknown_pair_skips() {
 
 #[test]
 fn test_token_budget_skipped_for_mock_mode() {
-    let _lock = BUDGET_ENV_LOCK.lock().unwrap();
+    let _lock = env_lock();
     let _guard = SingleEnvGuard::remove(ALMS_LLM_BUDGET_VALIDATION);
     let mut config = AlmsConfig::default();
     config.llm.mock = true;
@@ -656,7 +580,7 @@ fn test_token_budget_provider_entry_model_override_wins() {
     // adapter's resolution. With anthropic/claude-opus-4-7 + 200K input
     // the budget overshoots, but if the entry overrides to a non-table
     // model id the check should fall through to the unknown-model skip.
-    let _lock = BUDGET_ENV_LOCK.lock().unwrap();
+    let _lock = env_lock();
     let _guard = SingleEnvGuard::remove(ALMS_LLM_BUDGET_VALIDATION);
     let mut config = AlmsConfig::default();
     config.llm.provider = "anthropic".into();
@@ -677,28 +601,28 @@ fn test_token_budget_provider_entry_model_override_wins() {
 
 #[test]
 fn test_validation_mode_from_env_default_strict() {
-    let _lock = BUDGET_ENV_LOCK.lock().unwrap();
+    let _lock = env_lock();
     let _guard = SingleEnvGuard::remove(ALMS_LLM_BUDGET_VALIDATION);
     assert_eq!(ValidationMode::from_env(), ValidationMode::Strict);
 }
 
 #[test]
 fn test_validation_mode_from_env_warn() {
-    let _lock = BUDGET_ENV_LOCK.lock().unwrap();
+    let _lock = env_lock();
     let _guard = SingleEnvGuard::set(ALMS_LLM_BUDGET_VALIDATION, "warn");
     assert_eq!(ValidationMode::from_env(), ValidationMode::Warn);
 }
 
 #[test]
 fn test_validation_mode_from_env_warn_case_insensitive() {
-    let _lock = BUDGET_ENV_LOCK.lock().unwrap();
+    let _lock = env_lock();
     let _guard = SingleEnvGuard::set(ALMS_LLM_BUDGET_VALIDATION, "WARN");
     assert_eq!(ValidationMode::from_env(), ValidationMode::Warn);
 }
 
 #[test]
 fn test_validation_mode_from_env_unknown_falls_back_to_strict() {
-    let _lock = BUDGET_ENV_LOCK.lock().unwrap();
+    let _lock = env_lock();
     let _guard = SingleEnvGuard::set(ALMS_LLM_BUDGET_VALIDATION, "yolo");
     assert_eq!(
         ValidationMode::from_env(),
@@ -714,7 +638,7 @@ fn test_agents_dir_default_uses_resolved_project_root() {
     // root rather than the data directory: `<project>/.alms/agents/`.
     // The default `ServerConfig` resolves the project root from
     // `current_dir()`, so the agents-dir suffix is what we pin here.
-    let _lock = ENV_LOCK.lock().unwrap();
+    let _lock = env_lock();
     let _ws_guard = SingleEnvGuard::remove("ALMS_WORKSPACE_DIR");
     let _project_guard = SingleEnvGuard::remove("ALMS_PROJECT_ROOT");
 
@@ -729,7 +653,7 @@ fn test_agents_dir_legacy_workspace_env_override_still_wins() {
     // `ALMS_WORKSPACE_DIR` is the legacy override knob; #945 keeps it as
     // the highest-precedence agents-dir override so operators can pin
     // metadata to a custom location even after the default layout flip.
-    let _lock = ENV_LOCK.lock().unwrap();
+    let _lock = env_lock();
     let _ws_guard = SingleEnvGuard::set("ALMS_WORKSPACE_DIR", "/custom/workspace");
 
     let config = ServerConfig::default();
@@ -741,7 +665,7 @@ fn test_project_root_precedence_explicit_field_wins() {
     // Precedence: `self.project_root` (CLI) > env > current_dir.
     // The CLI flag writes the absolute path into the field directly,
     // so a non-empty field beats the env var.
-    let _lock = ENV_LOCK.lock().unwrap();
+    let _lock = env_lock();
     let _env_guard = SingleEnvGuard::set("ALMS_PROJECT_ROOT", "/from/env");
 
     let config = ServerConfig {
@@ -758,7 +682,7 @@ fn test_project_root_precedence_explicit_field_wins() {
 #[test]
 fn test_project_root_precedence_env_wins_over_cwd() {
     // No CLI override (field empty) → env var wins over `current_dir`.
-    let _lock = ENV_LOCK.lock().unwrap();
+    let _lock = env_lock();
     let _env_guard = SingleEnvGuard::set("ALMS_PROJECT_ROOT", "/from/env");
 
     let config = ServerConfig::default();
@@ -772,7 +696,7 @@ fn test_project_root_precedence_env_wins_over_cwd() {
 #[test]
 fn test_project_root_precedence_cwd_fallback() {
     // No CLI override and no env var → `current_dir` fallback.
-    let _lock = ENV_LOCK.lock().unwrap();
+    let _lock = env_lock();
     let _env_guard = SingleEnvGuard::remove("ALMS_PROJECT_ROOT");
 
     let config = ServerConfig::default();
@@ -790,7 +714,7 @@ fn test_project_root_precedence_empty_env_falls_through_to_cwd() {
     // root to `""` — the resolver treats an empty env value the same as
     // an unset variable so the cwd fallback wins. Mirrors the empty-field
     // discipline (`if !self.project_root.is_empty()` in the resolver).
-    let _lock = ENV_LOCK.lock().unwrap();
+    let _lock = env_lock();
     let _env_guard = SingleEnvGuard::set("ALMS_PROJECT_ROOT", "");
 
     let config = ServerConfig::default();
@@ -803,7 +727,7 @@ fn test_project_root_precedence_empty_env_falls_through_to_cwd() {
 fn test_agents_dir_follows_project_root() {
     // With no `ALMS_WORKSPACE_DIR` and an explicit project_root, the
     // agents directory anchors at `<project_root>/.alms/agents/`.
-    let _lock = ENV_LOCK.lock().unwrap();
+    let _lock = env_lock();
     let _ws_guard = SingleEnvGuard::remove("ALMS_WORKSPACE_DIR");
     let _project_guard = SingleEnvGuard::remove("ALMS_PROJECT_ROOT");
 
@@ -831,7 +755,7 @@ fn test_validation_zero_stream_chunk_timeout() {
 
 #[test]
 fn test_env_override_stream_chunk_timeout() {
-    let _lock = ENV_LOCK.lock().unwrap();
+    let _lock = env_lock();
     let _guard = SingleEnvGuard::set("ALMS_LLM_STREAM_CHUNK_TIMEOUT", "90");
 
     let mut config = AlmsConfig::default();
@@ -841,7 +765,7 @@ fn test_env_override_stream_chunk_timeout() {
 
 #[test]
 fn test_env_override_alms_llm_model() {
-    let _lock = ENV_LOCK.lock().unwrap();
+    let _lock = env_lock();
     let _guard = SingleEnvGuard::set("ALMS_LLM_MODEL", "claude-sonnet-4-6");
     // Ensure legacy var is not set
     let _legacy_guard = SingleEnvGuard::remove("DEFAULT_MODEL");
@@ -853,7 +777,7 @@ fn test_env_override_alms_llm_model() {
 
 #[test]
 fn test_env_override_legacy_default_model_still_works() {
-    let _lock = ENV_LOCK.lock().unwrap();
+    let _lock = env_lock();
     let _guard = SingleEnvGuard::set("DEFAULT_MODEL", "gpt-4o");
     // Ensure new var is not set so legacy is used
     let _new_guard = SingleEnvGuard::remove("ALMS_LLM_MODEL");
@@ -865,7 +789,7 @@ fn test_env_override_legacy_default_model_still_works() {
 
 #[test]
 fn test_env_override_alms_llm_model_takes_precedence_over_legacy() {
-    let _lock = ENV_LOCK.lock().unwrap();
+    let _lock = env_lock();
     let _new_guard = SingleEnvGuard::set("ALMS_LLM_MODEL", "new-model");
     let _legacy_guard = SingleEnvGuard::set("DEFAULT_MODEL", "legacy-model");
 
@@ -879,7 +803,7 @@ fn test_env_override_alms_llm_model_takes_precedence_over_legacy() {
 
 #[test]
 fn test_env_override_alms_llm_base_url() {
-    let _lock = ENV_LOCK.lock().unwrap();
+    let _lock = env_lock();
     let _guard = SingleEnvGuard::set("ALMS_LLM_BASE_URL", "https://custom.api.com/v1");
     let _legacy_guard = SingleEnvGuard::remove("LLM_BASE_URL");
 
@@ -890,7 +814,7 @@ fn test_env_override_alms_llm_base_url() {
 
 #[test]
 fn test_env_override_legacy_llm_base_url_still_works() {
-    let _lock = ENV_LOCK.lock().unwrap();
+    let _lock = env_lock();
     let _guard = SingleEnvGuard::set("LLM_BASE_URL", "https://legacy.api.com/v1");
     let _new_guard = SingleEnvGuard::remove("ALMS_LLM_BASE_URL");
 
@@ -999,7 +923,7 @@ auth_scheme = { type = "header", name = "x-goog-api-key" }
 /// the Gemini entry.
 #[test]
 fn test_gemini_resolve_api_key_from_env() {
-    let _lock = ENV_LOCK.lock().unwrap();
+    let _lock = env_lock();
     let _guard = SingleEnvGuard::set("ALMS_TEST_GEMINI_KEY_764", "gemini-test-key");
 
     let entry = ProviderEntry {
@@ -1107,7 +1031,7 @@ fn test_validation_valid_file_levels() {
 
 #[test]
 fn test_env_override_log_dir() {
-    let _lock = ENV_LOCK.lock().unwrap();
+    let _lock = env_lock();
     let _guard = SingleEnvGuard::set("ALMS_LOG_DIR", "/tmp/alms-logs");
 
     let mut config = AlmsConfig::default();
@@ -1117,7 +1041,7 @@ fn test_env_override_log_dir() {
 
 #[test]
 fn test_env_override_log_file_level() {
-    let _lock = ENV_LOCK.lock().unwrap();
+    let _lock = env_lock();
     let _guard = SingleEnvGuard::set("ALMS_LOG_FILE_LEVEL", "warn");
 
     let mut config = AlmsConfig::default();
@@ -1127,7 +1051,7 @@ fn test_env_override_log_file_level() {
 
 #[test]
 fn test_env_override_log_rotation() {
-    let _lock = ENV_LOCK.lock().unwrap();
+    let _lock = env_lock();
     let _guard = SingleEnvGuard::set("ALMS_LOG_ROTATION", "hourly");
 
     let mut config = AlmsConfig::default();
@@ -1137,7 +1061,7 @@ fn test_env_override_log_rotation() {
 
 #[test]
 fn test_env_override_file_enabled_false() {
-    let _lock = ENV_LOCK.lock().unwrap();
+    let _lock = env_lock();
     let _guard = SingleEnvGuard::set("ALMS_LOG_FILE_ENABLED", "false");
 
     let mut config = AlmsConfig::default();
@@ -1147,7 +1071,7 @@ fn test_env_override_file_enabled_false() {
 
 #[test]
 fn test_env_override_file_enabled_true() {
-    let _lock = ENV_LOCK.lock().unwrap();
+    let _lock = env_lock();
     let _guard = SingleEnvGuard::set("ALMS_LOG_FILE_ENABLED", "true");
 
     let mut config = AlmsConfig::default();
@@ -1173,7 +1097,7 @@ log_dir = "/var/log/alms"
 
 #[test]
 fn test_load_produces_absolute_data_dir() {
-    let _lock = ENV_LOCK.lock().unwrap();
+    let _lock = env_lock();
     // Use mock LLM to avoid API key validation failure.
     let _mock_guard = SingleEnvGuard::set("ALMS_LLM_MOCK", "1");
     // Clear ALMS_DATA_DIR to ensure the default `./.alms` is used.
@@ -1190,7 +1114,7 @@ fn test_load_produces_absolute_data_dir() {
 
 #[test]
 fn test_load_with_env_override_data_dir_is_absolute() {
-    let _lock = ENV_LOCK.lock().unwrap();
+    let _lock = env_lock();
     let _mock_guard = SingleEnvGuard::set("ALMS_LLM_MOCK", "1");
     // Set a relative ALMS_DATA_DIR — load() should still resolve to absolute.
     let _data_guard = SingleEnvGuard::set("ALMS_DATA_DIR", "relative/data/dir");
@@ -1206,7 +1130,7 @@ fn test_load_with_env_override_data_dir_is_absolute() {
 
 #[test]
 fn test_db_path_is_absolute_after_load() {
-    let _lock = ENV_LOCK.lock().unwrap();
+    let _lock = env_lock();
     let _mock_guard = SingleEnvGuard::set("ALMS_LLM_MOCK", "1");
     let _data_guard = SingleEnvGuard::remove("ALMS_DATA_DIR");
     let _db_guard = SingleEnvGuard::remove("ALMS_DB_PATH");
@@ -1223,7 +1147,7 @@ fn test_db_path_is_absolute_after_load() {
 
 #[test]
 fn test_load_or_default_resolves_data_dir() {
-    let _lock = ENV_LOCK.lock().unwrap();
+    let _lock = env_lock();
     // Clear data dir env to use the relative default "./.alms".
     let _data_guard = SingleEnvGuard::remove("ALMS_DATA_DIR");
     // #924: post-fail-fast, `load_or_default()` runs `validate()`. The
@@ -1424,7 +1348,7 @@ run_summary_mode = "bogus"
 
 #[test]
 fn test_env_override_run_summary_mode() {
-    let _lock = ENV_LOCK.lock().unwrap();
+    let _lock = env_lock();
     let _guard = SingleEnvGuard::set("ALMS_RUN_SUMMARY_MODE", "llm");
 
     let mut config = AlmsConfig::default();
@@ -1434,7 +1358,7 @@ fn test_env_override_run_summary_mode() {
 
 #[test]
 fn test_env_override_run_summary_budget() {
-    let _lock = ENV_LOCK.lock().unwrap();
+    let _lock = env_lock();
     let _guard = SingleEnvGuard::set("ALMS_RUN_SUMMARY_BUDGET", "5000");
 
     let mut config = AlmsConfig::default();
@@ -1444,7 +1368,7 @@ fn test_env_override_run_summary_budget() {
 
 #[test]
 fn test_env_override_run_summary_budget_invalid_ignored() {
-    let _lock = ENV_LOCK.lock().unwrap();
+    let _lock = env_lock();
     let _guard = SingleEnvGuard::set("ALMS_RUN_SUMMARY_BUDGET", "not-a-number");
 
     let mut config = AlmsConfig::default();
@@ -1465,7 +1389,7 @@ summary_max_tokens = 2000
 
 #[test]
 fn test_env_override_summary_max_tokens() {
-    let _lock = ENV_LOCK.lock().unwrap();
+    let _lock = env_lock();
     let _guard = SingleEnvGuard::set("ALMS_SUMMARY_MAX_TOKENS", "1500");
 
     let mut config = AlmsConfig::default();
@@ -1475,7 +1399,7 @@ fn test_env_override_summary_max_tokens() {
 
 #[test]
 fn test_env_override_summary_max_tokens_invalid_ignored() {
-    let _lock = ENV_LOCK.lock().unwrap();
+    let _lock = env_lock();
     let _guard = SingleEnvGuard::set("ALMS_SUMMARY_MAX_TOKENS", "not-a-number");
 
     let mut config = AlmsConfig::default();
@@ -1743,6 +1667,7 @@ fn test_validation_empty_base_url_rejected() {
 /// named environment variable is set and non-empty.
 #[test]
 fn test_resolve_api_key_from_env() {
+    let _lock = env_lock();
     let _guard = SingleEnvGuard::set("XAI_API_KEY_FOR_TEST", "xai-secret-value");
     let entry = ProviderEntry {
         kind: ProviderKind::OpenAiCompatible,
@@ -1759,6 +1684,7 @@ fn test_resolve_api_key_from_env() {
 /// `api_key_env` takes precedence over `api_key` when both are set.
 #[test]
 fn test_resolve_api_key_env_beats_literal() {
+    let _lock = env_lock();
     let _guard = SingleEnvGuard::set("XAI_API_KEY_PRECEDENCE", "from-env");
     let entry = ProviderEntry {
         kind: ProviderKind::OpenAiCompatible,
@@ -1776,6 +1702,7 @@ fn test_resolve_api_key_env_beats_literal() {
 /// then falls back to the secrets store).
 #[test]
 fn test_resolve_api_key_none_when_nothing_configured() {
+    let _lock = env_lock();
     let entry = ProviderEntry {
         kind: ProviderKind::OpenAiCompatible,
         base_url: "https://api.x.ai/v1".into(),
@@ -1786,7 +1713,7 @@ fn test_resolve_api_key_none_when_nothing_configured() {
         quirks: ProviderQuirks::default(),
     };
     // Ensure the var really is unset.
-    unsafe { std::env::remove_var("DEFINITELY_UNSET_ENV_VAR_765") };
+    let _unset = SingleEnvGuard::remove("DEFINITELY_UNSET_ENV_VAR_765");
     assert!(entry.resolve_api_key().is_none());
 }
 
@@ -1842,7 +1769,7 @@ fn test_auth_scheme_header_parses() {
 /// the hardcoded default, silently discarding the env override.
 #[test]
 fn test_env_override_base_url_propagates_to_openai_sugar_entry() {
-    let _lock = ENV_LOCK.lock().unwrap();
+    let _lock = env_lock();
     let _guard = SingleEnvGuard::set("ALMS_LLM_BASE_URL", "http://local-proxy:9999/v1");
     let _legacy = SingleEnvGuard::remove("LLM_BASE_URL");
     let _provider = SingleEnvGuard::set("ALMS_LLM_PROVIDER", "openai");
@@ -1866,7 +1793,7 @@ fn test_env_override_base_url_propagates_to_openai_sugar_entry() {
 
 #[test]
 fn test_env_override_base_url_propagates_to_openrouter_sugar_entry() {
-    let _lock = ENV_LOCK.lock().unwrap();
+    let _lock = env_lock();
     let _guard = SingleEnvGuard::set("ALMS_LLM_BASE_URL", "https://proxy.example.com/v1");
     let _legacy = SingleEnvGuard::remove("LLM_BASE_URL");
     let _provider = SingleEnvGuard::set("ALMS_LLM_PROVIDER", "openrouter");
@@ -1881,7 +1808,7 @@ fn test_env_override_base_url_propagates_to_openrouter_sugar_entry() {
 
 #[test]
 fn test_env_override_base_url_propagates_to_anthropic_sugar_entry() {
-    let _lock = ENV_LOCK.lock().unwrap();
+    let _lock = env_lock();
     let _guard = SingleEnvGuard::set("ALMS_LLM_BASE_URL", "https://anthropic-proxy.local/v1");
     let _legacy = SingleEnvGuard::remove("LLM_BASE_URL");
     let _provider = SingleEnvGuard::set("ALMS_LLM_PROVIDER", "anthropic");
@@ -1898,7 +1825,7 @@ fn test_env_override_base_url_propagates_to_anthropic_sugar_entry() {
 /// (currently empty) `entry.model` so the runtime picks it up.
 #[test]
 fn test_env_override_model_propagates_to_resolved_entry() {
-    let _lock = ENV_LOCK.lock().unwrap();
+    let _lock = env_lock();
     let _guard = SingleEnvGuard::set("ALMS_LLM_MODEL", "my-env-model");
     let _legacy = SingleEnvGuard::remove("DEFAULT_MODEL");
     let _provider = SingleEnvGuard::set("ALMS_LLM_PROVIDER", "openai");
@@ -1917,7 +1844,7 @@ fn test_env_override_model_propagates_to_resolved_entry() {
 /// should overwrite that entry's base_url.
 #[test]
 fn test_env_override_base_url_propagates_to_user_declared_provider() {
-    let _lock = ENV_LOCK.lock().unwrap();
+    let _lock = env_lock();
     let _guard = SingleEnvGuard::set("ALMS_LLM_BASE_URL", "http://override.local/v1");
     let _legacy = SingleEnvGuard::remove("LLM_BASE_URL");
     let _provider = SingleEnvGuard::set("ALMS_LLM_PROVIDER", "xai");
@@ -1991,7 +1918,7 @@ fn test_provider_entry_inline_api_key_does_not_serialize() {
 /// who adopted the declarative shape from seeing spurious noise.)
 #[test]
 fn test_validation_ok_when_provider_entry_declares_api_key_env() {
-    let _lock = ENV_LOCK.lock().unwrap();
+    let _lock = env_lock();
     // Ensure no API key is present on the flat config.
     let mut cfg = AlmsConfig::default();
     cfg.llm.api_key = None;
@@ -2360,7 +2287,7 @@ summary_provider = ""
 // shape — so they can assert on the error path without aborting the
 // test process. The public `load_or_default()` wraps it with
 // `std::process::exit(1)` on Err. The tests that change the working
-// directory serialise against `ENV_LOCK` because `find_config_file()`
+// directory serialise against `env_lock()` because `find_config_file()`
 // reads from the process cwd, which is shared across parallel tests.
 
 /// Verify the fail-fast contract directly at the helper boundary:
@@ -2369,11 +2296,11 @@ summary_provider = ""
 ///
 /// We construct the partial-pair config in a temp directory and chdir
 /// into it so `find_config_file()` picks up the test toml. Holding
-/// `ENV_LOCK` for the whole test serialises against any other test
+/// `env_lock()` for the whole test serialises against any other test
 /// that touches process cwd or `ALMS_*` env vars.
 #[test]
 fn test_load_or_default_fail_fast_on_partial_summary_pair() {
-    let _lock = ENV_LOCK.lock().unwrap();
+    let _lock = env_lock();
     // Clear any LLM env overrides that could otherwise force the
     // config into a different invalid shape (we want to pin the
     // pair-only invariant specifically).
@@ -2395,16 +2322,11 @@ summary_provider = "openrouter"
     .expect("toml write");
 
     // chdir into the tempdir so `find_config_file()` picks up our
-    // partial-pair toml. Save the current cwd so we can restore it
-    // even if the assertion below panics.
-    let saved_cwd = std::env::current_dir().expect("cwd readable");
-    std::env::set_current_dir(tempdir.path()).expect("chdir to tempdir");
-
-    let result = AlmsConfig::load_or_default_fallible();
-
-    // Restore cwd BEFORE asserting so a failure doesn't poison the
-    // test process for other tests acquiring `ENV_LOCK`.
-    std::env::set_current_dir(&saved_cwd).expect("restore cwd");
+    // partial-pair toml. The guard changes it back even if this panics.
+    let result = {
+        let _cwd = CurrentDirGuard::set(tempdir.path());
+        AlmsConfig::load_or_default_fallible()
+    };
 
     let err = result.expect_err(
         "load_or_default_fallible must return Err on a partial-pair \
@@ -2433,7 +2355,7 @@ summary_provider = "openrouter"
 /// either. The result must be a valid default config.
 #[test]
 fn test_load_or_default_succeeds_with_no_config_file() {
-    let _lock = ENV_LOCK.lock().unwrap();
+    let _lock = env_lock();
     let _provider_guard = SingleEnvGuard::remove("ALMS_LLM_PROVIDER");
     let _mock_guard = SingleEnvGuard::remove("ALMS_LLM_MOCK");
     // Point HOME at an empty tempdir so `~/.config/alms/config.toml`
@@ -2449,12 +2371,10 @@ fn test_load_or_default_succeeds_with_no_config_file() {
     let tempdir = tempfile::tempdir().expect("tempdir creates");
     // The tempdir is intentionally empty — no `alms.toml` to find.
 
-    let saved_cwd = std::env::current_dir().expect("cwd readable");
-    std::env::set_current_dir(tempdir.path()).expect("chdir to tempdir");
-
-    let result = AlmsConfig::load_or_default_fallible();
-
-    std::env::set_current_dir(&saved_cwd).expect("restore cwd");
+    let result = {
+        let _cwd = CurrentDirGuard::set(tempdir.path());
+        AlmsConfig::load_or_default_fallible()
+    };
 
     let cfg = result.expect(
         "load_or_default_fallible must succeed when no config file is \
@@ -2484,18 +2404,15 @@ fn test_load_or_default_succeeds_with_no_config_file() {
 fn load_from(cwd: &std::path::Path, home: &std::path::Path) -> AlmsResult<AlmsConfig> {
     let _home_guard = SingleEnvGuard::set("HOME", home.to_str().unwrap());
     let _userprofile_guard = SingleEnvGuard::set("USERPROFILE", home.to_str().unwrap());
-    let saved_cwd = std::env::current_dir().expect("cwd readable");
-    std::env::set_current_dir(cwd).expect("chdir to tempdir");
-    let result = AlmsConfig::load_or_default_fallible();
-    std::env::set_current_dir(&saved_cwd).expect("restore cwd");
-    result
+    let _cwd = CurrentDirGuard::set(cwd);
+    AlmsConfig::load_or_default_fallible()
 }
 
 /// An `alms.toml` that won't parse must not be replaced by defaults: that would
 /// silently drop every setting in it, including `shell_policy`.
 #[test]
 fn test_load_or_default_refuses_an_unparseable_config_file() {
-    let _lock = ENV_LOCK.lock().unwrap();
+    let _lock = env_lock();
     let _provider_guard = SingleEnvGuard::remove("ALMS_LLM_PROVIDER");
     let _mock_guard = SingleEnvGuard::remove("ALMS_LLM_MOCK");
     let home = tempfile::tempdir().expect("tempdir creates");
@@ -2523,7 +2440,7 @@ fn test_load_or_default_refuses_an_unparseable_config_file() {
 /// A single bad value fails the whole parse, the same way a syntax error does.
 #[test]
 fn test_load_or_default_refuses_a_bad_value_in_a_config_file() {
-    let _lock = ENV_LOCK.lock().unwrap();
+    let _lock = env_lock();
     let _provider_guard = SingleEnvGuard::remove("ALMS_LLM_PROVIDER");
     let _mock_guard = SingleEnvGuard::remove("ALMS_LLM_MOCK");
     let home = tempfile::tempdir().expect("tempdir creates");
@@ -2542,7 +2459,7 @@ fn test_load_or_default_refuses_a_bad_value_in_a_config_file() {
 /// The fallback location gets the same treatment as `./alms.toml`.
 #[test]
 fn test_load_or_default_refuses_an_unparseable_home_config_file() {
-    let _lock = ENV_LOCK.lock().unwrap();
+    let _lock = env_lock();
     let _provider_guard = SingleEnvGuard::remove("ALMS_LLM_PROVIDER");
     let _mock_guard = SingleEnvGuard::remove("ALMS_LLM_MOCK");
     let home = tempfile::tempdir().expect("tempdir creates");
@@ -2560,7 +2477,7 @@ fn test_load_or_default_refuses_an_unparseable_home_config_file() {
 /// for an unreadable file, because permission bits don't stop every test user.
 #[test]
 fn test_load_or_default_refuses_an_unreadable_config_file() {
-    let _lock = ENV_LOCK.lock().unwrap();
+    let _lock = env_lock();
     let _provider_guard = SingleEnvGuard::remove("ALMS_LLM_PROVIDER");
     let _mock_guard = SingleEnvGuard::remove("ALMS_LLM_MOCK");
     let home = tempfile::tempdir().expect("tempdir creates");
@@ -2578,7 +2495,7 @@ fn test_load_or_default_refuses_an_unreadable_config_file() {
 #[cfg(unix)]
 #[test]
 fn test_load_or_default_refuses_a_dangling_config_symlink() {
-    let _lock = ENV_LOCK.lock().unwrap();
+    let _lock = env_lock();
     let _provider_guard = SingleEnvGuard::remove("ALMS_LLM_PROVIDER");
     let _mock_guard = SingleEnvGuard::remove("ALMS_LLM_MOCK");
     let home = tempfile::tempdir().expect("tempdir creates");
@@ -2710,7 +2627,7 @@ fn security_config_rejects_empty_entries() {
 /// PATCH-mutation back door. Pin the absence with a sanity check.
 #[test]
 fn security_config_has_no_env_var_override() {
-    let _lock = ENV_LOCK.lock().unwrap();
+    let _lock = env_lock();
     let _guard = SingleEnvGuard::set("ALMS_SECURITY_ALLOW_FULL_OS_ACCESS", "alice,bob");
 
     let mut cfg = AlmsConfig::default();
@@ -2858,7 +2775,7 @@ fn test_validate_accepts_compact_and_alias() {
 /// `normalize_episodic` is the second rewrite layer that catches it.
 #[test]
 fn test_env_strategy_sliding_summary_normalises_to_compact() {
-    let _lock = ENV_LOCK.lock().unwrap();
+    let _lock = env_lock();
     let _guard = SingleEnvGuard::set("ALMS_CONTEXT_STRATEGY", "sliding-summary");
 
     let mut cfg = AlmsConfig::default();
@@ -2973,4 +2890,18 @@ fn a_named_var_beside_a_bare_export_only_warns_about_the_bare_one() {
         !summary.message.contains("no longer used"),
         "got {captured}"
     );
+}
+
+/// A test that panics while holding the env lock must not take the rest of
+/// this binary with it. Before the lock recovered from poisoning, this one
+/// failure showed up as a different set of ten to fifty unrelated
+/// `PoisonError` failures on each run. `#[should_panic]` keeps it green
+/// while it still poisons the mutex on every run of the suite.
+#[test]
+#[should_panic(expected = "deliberate panic while holding the env lock")]
+fn a_test_that_panics_holding_the_env_lock_fails_alone() {
+    let _lock = env_lock();
+    let _model = SingleEnvGuard::set("ALMS_LLM_MODEL", "set-by-a-panicking-test");
+    let _cwd = CurrentDirGuard::set(std::env::temp_dir());
+    panic!("deliberate panic while holding the env lock");
 }

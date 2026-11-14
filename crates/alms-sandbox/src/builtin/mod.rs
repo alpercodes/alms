@@ -744,23 +744,19 @@ mod tests {
 
     // ── normalize_unsandboxed_path tests ────────────────────────────────────
 
+    /// Uses a file that exists relative to the working directory `cargo test`
+    /// already runs in (the crate root), rather than changing it: a
+    /// `set_current_dir` here moved it for every other test in this binary
+    /// while it ran, including the `ShellTool`s that start from it.
     #[tokio::test]
     async fn test_normalize_unsandboxed_path_dot_prefix() {
-        let dir = tempfile::tempdir().unwrap();
-        let file = dir.path().join("foo.txt");
-        std::fs::write(&file, b"content").unwrap();
-
-        let _prev = std::env::current_dir().unwrap();
-        std::env::set_current_dir(dir.path()).unwrap();
-
-        let a = normalize_unsandboxed_path("./foo.txt").await;
-        let b = normalize_unsandboxed_path("foo.txt").await;
+        let a = normalize_unsandboxed_path("./Cargo.toml").await;
+        let b = normalize_unsandboxed_path("Cargo.toml").await;
         assert_eq!(
             a, b,
-            "./foo.txt and foo.txt should normalize to the same path"
+            "./Cargo.toml and Cargo.toml should normalize to the same path"
         );
-
-        let _ = std::env::set_current_dir(_prev);
+        assert!(a.ends_with("Cargo.toml"), "{}", a.display());
     }
 
     #[tokio::test]
