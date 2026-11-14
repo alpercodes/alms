@@ -158,6 +158,30 @@ Each item below changes behaviour for a deployment that has not set the knob exp
 
 ### Security
 
+- **The shell tool no longer accepts a working directory it cannot resolve.** The cwd
+  containment check compared a path's raw spelling when `canonicalize` failed on it, so
+  `<root>/link`, a symlink to a directory outside the sandbox root that did not exist yet
+  (or a path behind a transient permission or lock failure), passed as inside the root.
+  Once the target existed, the next command ran there. Such a cwd is now refused. After a
+  `cd`, the previous cwd is kept and a `[cwd unchanged: …]` notice says so. Before a
+  command, a stored cwd that no longer resolves refuses that command with `Working
+  directory '…' could not be resolved (<cause>), so it could not be confirmed inside
+  sandbox root '…'. The command was not run; the shell's working directory is now the
+  sandbox root.`, and the shell is reset to the root. A command that deletes its own cwd
+  also leaves the shell at the root, with a `[cwd reset: ...]` notice. With commands
+  running concurrently (a parallel tool-call batch, or a background command), a command
+  that starts after either reset runs at the root although it was written for the old
+  cwd; the first such command carries a one-shot `[cwd reset: '<old>' no longer resolved, so
+  this command ran in the sandbox root '<root>']` line. On Windows, a cwd is now compared
+  to a resolved sandbox root without case folding; a sibling that differs from the root
+  only in case (possible with per-directory case sensitivity) is no longer treated as
+  inside it. This applies on every platform; `unrestricted` and
+  `allow_full_os_access` shells skip containment as before. **After upgrading**, a shell
+  whose cwd is deleted, or stops resolving, refuses the next command once and then runs
+  at the sandbox root, where before every command failed with `Failed to spawn command:
+  No such file or directory` until the run ended. If the project root itself cannot be
+  canonicalised (the gateway logs `Cannot canonicalize project root — using as-is` at
+  startup), every sandboxed shell command is now refused.
 - **Removing an LLM provider's API key now takes effect on the next run.**
   `DELETE /auth/keys/{provider}` (which the Settings modal's remove button and
   `alms auth remove` against a running gateway both call) took the key out of the secrets

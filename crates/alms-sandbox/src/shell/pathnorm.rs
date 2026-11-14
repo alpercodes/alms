@@ -133,6 +133,10 @@ pub(crate) struct Normalised {
 
     /// Whether [`std::fs::canonicalize`] succeeded on the input.
     pub(crate) resolved: bool,
+
+    /// Why [`std::fs::canonicalize`] failed, when it did (#119), so a
+    /// refusal can name the cause rather than only the verdict.
+    pub(crate) error: Option<String>,
 }
 
 /// Canonicalise `path` into the form used for containment comparison,
@@ -141,18 +145,26 @@ pub(crate) struct Normalised {
 /// Resolves symlinks and `..`, then drops the `\\?\` prefix that
 /// [`std::fs::canonicalize`] adds on Windows. Falls back to the input
 /// unchanged when the path cannot be resolved (it does not exist, or the
-/// volume is unreadable) — the caller still gets a well-defined value to
-/// compare, and an unresolvable path simply will not match a resolvable root
-/// — but `resolved: false` records that fallback rather than hiding it.
+/// volume is unreadable), and `resolved: false` records that fallback.
+///
+/// The fallback is safe for a **root**: compared on its raw spelling, it can
+/// never produce a false accept, since a canonical candidate only matches it
+/// when it sits literally under that spelling. It is not safe for a
+/// **candidate**: its raw spelling
+/// can match the root's leading components while a symlink in it points
+/// elsewhere, so a containment check must refuse an unresolved candidate
+/// rather than compare it (#119, `exec::check_cwd`).
 pub(crate) fn normalise(path: &Path) -> Normalised {
     match std::fs::canonicalize(path) {
         Ok(canonical) => Normalised {
             path: strip_verbatim_prefix(&canonical),
             resolved: true,
+            error: None,
         },
-        Err(_) => Normalised {
+        Err(error) => Normalised {
             path: path.to_path_buf(),
             resolved: false,
+            error: Some(error.to_string()),
         },
     }
 }
@@ -260,6 +272,24 @@ fn is_within_impl(root: &Path, candidate: &Path, fold_case: bool) -> bool {
 /// precondition that can silently not hold.
 pub(crate) fn is_within(root: &Path, candidate: &Path) -> bool {
     is_within_impl(root, candidate, FOLD_CASE)
+}
+
+/// [`is_within`] for two [`Normalised`] paths, folding case only where it is
+/// needed.
+///
+/// Two canonical paths already carry the on-disk casing, so folding them can
+/// only widen the match: into a sibling whose name differs only in case, in a
+/// directory with per-directory case sensitivity enabled. Folding is kept for
+/// a root that fell back to its raw spelling, which may be cased differently
+/// from the disk (#119).
+pub(crate) fn is_within_normalised(root: &Normalised, candidate: &Normalised) -> bool {
+    is_within_normalised_impl(root, candidate, FOLD_CASE)
+}
+
+/// [`is_within_normalised`] with the platform flag as a parameter, so the
+/// Linux CI runner can test the Windows behaviour.
+fn is_within_normalised_impl(root: &Normalised, candidate: &Normalised, fold_case: bool) -> bool {
+    is_within_impl(&root.path, &candidate.path, fold_case && !root.resolved)
 }
 
 #[cfg(test)]
@@ -461,5 +491,46 @@ mod tests {
     #[test]
     fn fold_case_policy_tracks_the_platform() {
         assert_eq!(FOLD_CASE, cfg!(windows));
+    }
+
+    // -- is_within_normalised (#119) -----------------------------------------
+
+    fn normalised(path: &str, resolved: bool) -> Normalised {
+        Normalised {
+            path: PathBuf::from(path),
+            resolved,
+            error: None,
+        }
+    }
+
+    #[test]
+    fn two_canonical_paths_are_compared_without_folding_case() {
+        // With fold_case on, as on Windows: a resolved root does not fold, so
+        // a sibling that differs only in case is not inside it.
+        assert!(!is_within_normalised_impl(
+            &normalised("/srv/Workspace", true),
+            &normalised("/srv/workspace/sub", true),
+            true
+        ));
+        assert!(is_within_normalised_impl(
+            &normalised("/srv/Workspace", true),
+            &normalised("/srv/Workspace/sub", true),
+            true
+        ));
+    }
+
+    #[test]
+    fn a_root_that_fell_back_still_folds_case_where_the_platform_does() {
+        assert!(is_within_normalised_impl(
+            &normalised("/srv/Workspace", false),
+            &normalised("/srv/workspace/sub", true),
+            true
+        ));
+        // And never on a case-sensitive platform.
+        assert!(!is_within_normalised_impl(
+            &normalised("/srv/Workspace", false),
+            &normalised("/srv/workspace/sub", true),
+            false
+        ));
     }
 }

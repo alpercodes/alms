@@ -51,12 +51,15 @@ pub struct ShellInput {
     pub run_in_background: bool,
 }
 
-/// Why a post-command working directory failed the containment check.
+/// Why a working directory failed the containment check, before a command
+/// (the stored cwd) or after it (the reported one).
 ///
-/// The check fails closed, so both variants keep the previous cwd and behave
-/// identically. They differ only in what the daemon may *claim* about the
-/// path — and the notice the agent reads is built from that claim, so the
-/// two must not be conflated (issue #1262).
+/// The check fails closed, so both variants behave identically: a reported
+/// cwd is not adopted, and a stored one refuses the command and is reset to
+/// the sandbox root, unless a concurrent command has moved it (#119). They
+/// differ only in what the daemon may *claim* about the path — and the notice
+/// the agent reads is built from that claim, so the two must not be conflated
+/// (issue #1262).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CwdRejection {
     /// Both the sandbox root and the candidate canonicalised successfully,
@@ -64,11 +67,13 @@ pub enum CwdRejection {
     /// which "outside the sandbox root" is an established fact.
     OutsideRoot,
 
-    /// The candidate or the root could not be canonicalised, so
-    /// `canonical_for_comparison` compared a raw path and the containment
-    /// test could not decide anything. Rejecting is still correct — failing
-    /// closed is the whole point — but *where* the path actually is remains
-    /// unknown, and saying otherwise would be a guess dressed as a finding.
+    /// The candidate or the root could not be canonicalised. An unresolved
+    /// candidate is refused without being compared at all (#119); an
+    /// unresolved root is compared on its raw spelling, and a failed match
+    /// then decides nothing. Rejecting is still correct — failing closed is
+    /// the whole point — but *where* the path actually is remains unknown,
+    /// and saying otherwise would be a guess dressed as a finding. Used by
+    /// both the check before a command and the one after it.
     ///
     /// Reached in practice whenever the shell reports a cwd this process
     /// cannot resolve: Windows Git Bash serving `%TEMP%` through its `/tmp`
@@ -91,8 +96,16 @@ pub struct CwdRevert {
     /// what the agent's own `pwd` printed.
     pub attempted: PathBuf,
 
-    /// The cwd that was kept, and that the next command will run in.
+    /// The cwd the next command will run in: the previous cwd, or the
+    /// sandbox root when the previous cwd no longer passed either and was
+    /// reset (`reset`, #119).
     pub kept: PathBuf,
+
+    /// Set when the previous cwd no longer passed the check either (the
+    /// command deleted it, say) and was reset to the sandbox root, with what
+    /// the check determined about it, so the notice says the cwd moved, and
+    /// why, rather than that it was unchanged (#119).
+    pub reset: Option<CwdRejection>,
 
     /// What the containment check actually determined. Carried through so
     /// the notice states that and not more — a rejection is not by itself
@@ -120,13 +133,36 @@ pub struct ShellOutput {
     /// `spill::relative_spill_path`).
     pub spill_path: Option<PathBuf>,
 
-    /// Set when the command's final working directory was outside the
-    /// sandbox root and the persistent cwd was kept at its previous value
-    /// (issue #1262). `None` for unsandboxed runs (containment does not
-    /// apply there) and for commands that ended inside the root. The caller
-    /// turns this into the agent-visible `[cwd unchanged: ...]` notice — see
+    /// Set when the command's final working directory failed the
+    /// containment check and was not adopted (issue #1262): the persistent
+    /// cwd was kept at its previous value, or reset to the sandbox root when
+    /// that no longer passed either (#119). `None` for unsandboxed runs
+    /// (containment does not apply there) and for commands that ended inside
+    /// the root. The caller turns this into the agent-visible
+    /// `[cwd unchanged: ...]` or `[cwd reset: ...]` notice — see
     /// `ShellTool::append_cwd_revert_notice`.
     pub cwd_revert: Option<CwdRevert>,
+
+    /// Set when this command ran in the sandbox root because an earlier
+    /// command reset the shell there, before or after it ran (#119). Carries
+    /// the cwd that was reset away from. The first command to run in the root
+    /// after the reset takes it, so a concurrent command that was never shown
+    /// the earlier command's error or notice still learns where it ran.
+    pub cwd_reset_from: Option<CwdReset>,
+}
+
+/// A reset of the shell's cwd to the sandbox root (#119), as reported to the
+/// next command that runs in the root.
+#[derive(Debug, Clone)]
+pub struct CwdReset {
+    /// The stored cwd that failed the check and was reset away from.
+    pub from: PathBuf,
+
+    /// The sandbox root the shell was reset to.
+    pub root: PathBuf,
+
+    /// What the check determined about `from`.
+    pub reason: CwdRejection,
 }
 
 /// Result of a background task that has completed.
@@ -155,6 +191,12 @@ pub struct ShellState {
     /// Updated after each successful command execution by parsing `pwd` output.
     pub cwd: Arc<Mutex<PathBuf>>,
 
+    /// The last reset of `cwd` to the sandbox root, before or after a
+    /// command, not yet reported to a command that ran there (#119). Only
+    /// read or written while `cwd` is locked, so the record and the cwd
+    /// change together.
+    pub cwd_reset: Arc<parking_lot::Mutex<Option<CwdReset>>>,
+
     /// Background tasks indexed by task ID.
     pub background_tasks: Arc<Mutex<HashMap<String, BackgroundTaskResult>>>,
 
@@ -167,6 +209,7 @@ impl ShellState {
     pub fn new(initial_cwd: PathBuf) -> Self {
         Self {
             cwd: Arc::new(Mutex::new(initial_cwd)),
+            cwd_reset: Arc::new(parking_lot::Mutex::new(None)),
             background_tasks: Arc::new(Mutex::new(HashMap::new())),
             next_task_id: Arc::new(Mutex::new(1)),
         }

@@ -10,7 +10,7 @@ use super::pathnorm;
 use super::security::{command_matches_denylist, is_secret_env_var, platform_critical_env_vars};
 use super::spill::{ShellSpillPolicy, write_spill};
 use super::types::{
-    CwdRejection, CwdRevert, MAX_OUTPUT_BYTES, ShellInput, ShellOutput, ShellState,
+    CwdRejection, CwdReset, CwdRevert, MAX_OUTPUT_BYTES, ShellInput, ShellOutput, ShellState,
 };
 use crate::{SandboxError, error::SandboxResult};
 use alms_core::config::ShellEngine;
@@ -54,9 +54,12 @@ pub(crate) fn command_excerpt(command: &str) -> String {
 /// surface it to the agent.
 ///
 /// When the command ends in a directory outside the sandbox root, the
-/// persistent cwd is left where it was and [`ShellOutput::cwd_revert`]
-/// records the attempted/kept pair — again for the caller to surface, so the
-/// agent learns that its `cd` did not stick (issue #1262).
+/// persistent cwd is left where it was (or reset to the root if that no
+/// longer passes either, #119) and [`ShellOutput::cwd_revert`] records the
+/// attempted/kept pair — again for the caller to surface, so the agent learns
+/// that its `cd` did not stick (issue #1262). A command that runs in the root
+/// after an earlier command's pre-command reset gets
+/// [`ShellOutput::cwd_reset_from`] (#119).
 // The per-execution argument shape intentionally kept flat for readability:
 // bundling these into a struct obscures the call path from `ShellTool::execute`
 // and `background::submit_background_task` without removing any real
@@ -97,32 +100,96 @@ pub(crate) async fn execute_command(
 
     let cwd = state.cwd.lock().await.clone();
 
-    // Validate cwd against sandbox
-    if !unrestricted && let Some(root) = sandbox_root {
-        validate_cwd(&cwd, root)?;
-    }
+    // Validate cwd against sandbox, and spawn in the path that was checked.
+    //
+    // #119: a stored cwd that fails the check (it was deleted, or stopped
+    // resolving) would otherwise refuse every later command, `cd` included,
+    // until the run ends. The command is not run, since it was written for
+    // that cwd, and the stored cwd is reset to the sandbox root, but only if
+    // it is still the one just read: a concurrent `cd` wins.
+    //
+    // The reset reaches commands running concurrently with this one: a
+    // sibling in the same tool-call batch, or a foreground command beside a
+    // background one, that reads the cwd after the reset runs in the root,
+    // although it was written for the old cwd. It cannot be prevented here,
+    // so it is reported: the reset is recorded next to the cwd, and the first
+    // command that then runs in the root carries a `[cwd reset: ...]` notice.
+    // The post-command reset below records the same way.
+    let mut cwd_reset_from: Option<CwdReset> = None;
+    let cwd = match sandbox_root {
+        Some(root) if !unrestricted => match check_cwd_detailed(&cwd, root) {
+            Ok(checked) => {
+                if cwd == root {
+                    let _live = state.cwd.lock().await;
+                    cwd_reset_from = take_cwd_reset(state);
+                }
+                checked
+            }
+            Err(failure) => {
+                let reason = failure.reason;
+                let message = cwd_violation_message(&cwd, root, failure);
+                let mut live = state.cwd.lock().await;
+                let now = if *live == cwd {
+                    *live = root.to_path_buf();
+                    if cwd != root {
+                        record_cwd_reset(
+                            state,
+                            CwdReset {
+                                from: cwd.clone(),
+                                root: root.to_path_buf(),
+                                reason,
+                            },
+                        );
+                    }
+                    "is now the sandbox root".to_string()
+                } else {
+                    format!(
+                        "is now '{}'",
+                        pathnorm::strip_verbatim_prefix(&live).display()
+                    )
+                };
+                return Err(SandboxError::SandboxViolation(format!(
+                    "{message}. The command was not run; the shell's working directory {now}."
+                )));
+            }
+        },
+        _ => cwd,
+    };
 
-    // Build and spawn the command
-    let PreparedCommand {
-        mut cmd,
-        stdin_payload,
-    } = build_command(command, &cwd, sandbox_root, unrestricted, pwd_marker)?;
+    // Build, spawn and run the command. If any of it fails after this command
+    // took a reset record, the record goes back (#119): the error never
+    // reaches `ShellOutput`, so nobody would be told otherwise.
+    let run = async {
+        let PreparedCommand {
+            mut cmd,
+            stdin_payload,
+        } = build_command(command, &cwd, sandbox_root, unrestricted, pwd_marker)?;
 
-    // Configure environment
-    configure_env(&mut cmd, default_env);
+        // Configure environment
+        configure_env(&mut cmd, default_env);
 
-    debug!(
-        command = %command,
-        cwd = %cwd.display(),
-        timeout_ms = input.timeout_ms,
-        "Spawning shell command"
-    );
+        debug!(
+            command = %command,
+            cwd = %cwd.display(),
+            timeout_ms = input.timeout_ms,
+            "Spawning shell command"
+        );
 
-    let child = cmd
-        .spawn()
-        .map_err(|e| SandboxError::Io(format!("Failed to spawn command: {e}")))?;
+        let child = cmd
+            .spawn()
+            .map_err(|e| SandboxError::Io(format!("Failed to spawn command: {e}")))?;
 
-    let result = drive_child_to_completion(child, stdin_payload, input.timeout_ms).await?;
+        drive_child_to_completion(child, stdin_payload, input.timeout_ms).await
+    };
+    let result = match run.await {
+        Ok(result) => result,
+        Err(error) => {
+            if let (Some(reset), Some(root)) = (cwd_reset_from.take(), sandbox_root) {
+                restore_cwd_reset(state, root, reset).await;
+            }
+            return Err(error);
+        }
+    };
 
     let exit_code = result.status.code().unwrap_or(-1);
 
@@ -161,6 +228,9 @@ pub(crate) async fn execute_command(
                     Ok(resolved) => {
                         let mut cwd_lock = state.cwd.lock().await;
                         *cwd_lock = resolved;
+                        // The shell has moved on from any earlier reset; a
+                        // later return to the root must not report it.
+                        take_cwd_reset(state);
                     }
                     Err(reason) => {
                         warn!(
@@ -174,11 +244,37 @@ pub(crate) async fn execute_command(
                         // `ShellState`, so a concurrent command may have
                         // moved it. What the agent needs to be told is where
                         // its next command will actually run.
-                        let kept = state.cwd.lock().await.clone();
+                        //
+                        // #119: if the kept cwd itself no longer passes (the
+                        // command deleted it), reset it to the root, so the
+                        // notice can name where the next command really runs,
+                        // and record the reset like the pre-command path: a
+                        // foreground command beside this one, when this is a
+                        // background command, would otherwise run in the root
+                        // with nothing said. Not when the old cwd is the root.
+                        let (kept, reset) = {
+                            let mut live = state.cwd.lock().await;
+                            let reset = check_cwd(&live, root).err();
+                            if let Some(why) = reset {
+                                if *live != root {
+                                    record_cwd_reset(
+                                        state,
+                                        CwdReset {
+                                            from: live.clone(),
+                                            root: root.to_path_buf(),
+                                            reason: why,
+                                        },
+                                    );
+                                }
+                                *live = root.to_path_buf();
+                            }
+                            (live.clone(), reset)
+                        };
                         cwd_revert = Some(CwdRevert {
                             attempted: new_path.clone(),
                             kept,
                             reason,
+                            reset,
                         });
                     }
                 }
@@ -240,7 +336,40 @@ pub(crate) async fn execute_command(
         stderr,
         spill_path,
         cwd_revert,
+        cwd_reset_from,
     })
+}
+
+/// Record a reset for the next command that runs in the root. Callers hold
+/// the `cwd` lock (#119).
+fn record_cwd_reset(state: &ShellState, reset: CwdReset) {
+    *state.cwd_reset.lock() = Some(reset);
+}
+
+/// Take the pending reset record, if any. Callers hold the `cwd` lock (#119).
+fn take_cwd_reset(state: &ShellState) -> Option<CwdReset> {
+    state.cwd_reset.lock().take()
+}
+
+/// Put back a reset record taken by a command that then failed before it
+/// could report it (#119), if the shell is in the root and no record is
+/// pending.
+///
+/// The guards say where the shell is now, not that it stayed put. So a
+/// record can come back stale in one narrow case, which needs concurrency
+/// and a failure on the same command: while the command that took it was
+/// running, the shell moved away and back to the root, or a newer reset was
+/// recorded and already reported. The next command in the root then gets an
+/// extra or misattributed `[cwd reset: ...]` notice. It never changes where a
+/// command runs.
+async fn restore_cwd_reset(state: &ShellState, root: &Path, reset: CwdReset) {
+    let live = state.cwd.lock().await;
+    if *live == root {
+        let mut pending = state.cwd_reset.lock();
+        if pending.is_none() {
+            *pending = Some(reset);
+        }
+    }
 }
 
 /// Feed `stdin_payload` (builtin engine, #1143) to a spawned child and wait
@@ -1115,43 +1244,86 @@ fn trim_ascii_whitespace(s: &[u8]) -> &[u8] {
 /// what keeps it in step with the verdict — a separate classifier run later
 /// could disagree with the decision it purports to explain.
 ///
-/// **Behaviour is unchanged**: the accept/reject decision is still
-/// `is_within` over the same two normalised paths, and every rejection still
-/// fails closed. Only the explanation is new.
+/// #119: a candidate that did not canonicalise is refused before the
+/// comparison, as [`CwdRejection::NotVerifiable`]. Every other decision is
+/// `is_within` over the two normalised paths, and every rejection fails
+/// closed.
 fn check_cwd(cwd: &Path, sandbox_root: &Path) -> Result<PathBuf, CwdRejection> {
+    check_cwd_detailed(cwd, sandbox_root).map_err(|failure| failure.reason)
+}
+
+/// A [`check_cwd`] refusal, with the `canonicalize` error when the candidate
+/// did not resolve, so the pre-command error can name the cause (#119).
+#[derive(Debug)]
+struct CwdCheckFailure {
+    reason: CwdRejection,
+    unresolved: Option<String>,
+}
+
+/// [`check_cwd`], keeping the reason the candidate did not resolve.
+fn check_cwd_detailed(cwd: &Path, sandbox_root: &Path) -> Result<PathBuf, CwdCheckFailure> {
     let root = pathnorm::normalise(sandbox_root);
     let candidate = pathnorm::resolve_reported(cwd);
 
-    if pathnorm::is_within(&root.path, &candidate.path) {
+    // #119: fail closed on a candidate `canonicalize` could not resolve. Its
+    // raw spelling can match the root's leading components while naming
+    // something else entirely: `<root>/link`, a symlink whose target does
+    // not exist yet (or a path behind a transient permission or lock
+    // failure), would be accepted, and `Command::current_dir` follows the
+    // link wherever it points once it resolves. Only a resolved path says
+    // where the directory really is. The root keeps its raw fallback, which
+    // can never produce a false accept.
+    if !candidate.resolved {
+        return Err(CwdCheckFailure {
+            reason: CwdRejection::NotVerifiable,
+            unresolved: candidate.error,
+        });
+    }
+    if pathnorm::is_within_normalised(&root, &candidate) {
         return Ok(candidate.path);
     }
 
     // "Outside the root" is a claim about where the path *is*, and the
-    // comparison above only supports it when both sides were real resolved
-    // paths. If either fell back to its raw spelling, all that was
-    // established is that containment could not be confirmed.
-    Err(if root.resolved && candidate.resolved {
-        CwdRejection::OutsideRoot
-    } else {
-        CwdRejection::NotVerifiable
+    // comparison above only supports it when the root was a real resolved
+    // path too (the candidate always is by now). If the root fell back to its
+    // raw spelling, all that was established is that containment could not
+    // be confirmed.
+    Err(CwdCheckFailure {
+        reason: if root.resolved {
+            CwdRejection::OutsideRoot
+        } else {
+            CwdRejection::NotVerifiable
+        },
+        unresolved: None,
     })
 }
 
-/// Validate that a cwd is within the sandbox root, as a [`SandboxError`].
-///
-/// Thin wrapper over [`check_cwd`] for the pre-command check, which has no
-/// use for the structured reason beyond wording the message accurately.
+/// The pre-command check's refusal message for `cwd`. It uses the
+/// structured reason only to word the message accurately; when the cwd did
+/// not resolve, it names the `canonicalize` error.
+fn cwd_violation_message(cwd: &Path, sandbox_root: &Path, failure: CwdCheckFailure) -> String {
+    let verdict = match (failure.reason, failure.unresolved) {
+        (_, Some(cause)) => {
+            format!("could not be resolved ({cause}), so it could not be confirmed inside")
+        }
+        (CwdRejection::OutsideRoot, None) => "is outside".to_string(),
+        (CwdRejection::NotVerifiable, None) => "could not be confirmed inside".to_string(),
+    };
+    format!(
+        "Working directory '{}' {verdict} sandbox root '{}'",
+        cwd.display(),
+        sandbox_root.display()
+    )
+}
+
+/// Validate that a cwd is within the sandbox root, as a [`SandboxError`]
+/// carrying [`cwd_violation_message`]. The pre-command check in
+/// [`execute_command`] uses the parts directly, because it also needs the
+/// reason for its reset record.
+#[cfg(test)]
 fn validate_cwd(cwd: &Path, sandbox_root: &Path) -> SandboxResult<PathBuf> {
-    check_cwd(cwd, sandbox_root).map_err(|reason| {
-        let verdict = match reason {
-            CwdRejection::OutsideRoot => "is outside",
-            CwdRejection::NotVerifiable => "could not be confirmed inside",
-        };
-        SandboxError::SandboxViolation(format!(
-            "Working directory '{}' {verdict} sandbox root '{}'",
-            cwd.display(),
-            sandbox_root.display()
-        ))
+    check_cwd_detailed(cwd, sandbox_root).map_err(|failure| {
+        SandboxError::SandboxViolation(cwd_violation_message(cwd, sandbox_root, failure))
     })
 }
 
@@ -1940,6 +2112,275 @@ mod tests {
             Err(CwdRejection::NotVerifiable),
             "an unresolved path supports 'not confirmed inside', not 'outside'"
         );
+    }
+
+    /// #119: a candidate under the root that `canonicalize` cannot resolve
+    /// used to be accepted on its raw spelling, because the raw path matches
+    /// the root's leading components. It is now refused: an unresolved path
+    /// cannot be confirmed inside the root.
+    #[test]
+    fn check_cwd_refuses_an_unresolvable_path_under_the_root() {
+        let root_dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(root_dir.path()).unwrap();
+        let missing = root.join("not-created-yet").join("nested");
+
+        assert!(
+            std::fs::canonicalize(&missing).is_err(),
+            "fixture precondition"
+        );
+        assert_eq!(
+            check_cwd(&missing, &root),
+            Err(CwdRejection::NotVerifiable),
+            "an unresolved candidate must not be accepted on its spelling"
+        );
+        let err = validate_cwd(&missing, &root).expect_err("pre-command check must refuse it");
+        assert!(
+            err.to_string().contains("could not be confirmed inside"),
+            "got: {err}"
+        );
+        // And it names why, from the `canonicalize` error (whose text is the
+        // platform's, so only its presence is checked).
+        assert!(
+            err.to_string().contains("could not be resolved ("),
+            "got: {err}"
+        );
+    }
+
+    /// The shell input every test below runs: a plain foreground `pwd`.
+    fn pwd_input() -> ShellInput {
+        ShellInput {
+            command: "pwd".to_string(),
+            description: None,
+            timeout_ms: 10_000,
+            run_in_background: false,
+        }
+    }
+
+    /// Run `pwd_input` against `state` with containment at `root`.
+    async fn run_pwd(state: &ShellState, root: &Path) -> SandboxResult<ShellOutput> {
+        execute_command(
+            &pwd_input(),
+            state,
+            Some(root),
+            false,
+            &HashMap::new(),
+            "__ALMS_PWD_TEST__",
+            &ShellSpillPolicy::disabled(),
+            "tc-119",
+        )
+        .await
+    }
+
+    /// #119: the pre-command reset is a compare-and-set. A `cd` by another
+    /// command that lands between this command's read of the cwd and its
+    /// reset must win, and the error must name where the shell now is.
+    ///
+    /// Deterministic: tokio's `Mutex` grants the lock in FIFO order. The
+    /// test holds the cwd lock while the command queues for its first
+    /// acquisition, then queues its own write behind it, so the write lands
+    /// between the command's read and its reset.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pre_command_reset_does_not_overwrite_a_concurrent_move() {
+        let root_dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(root_dir.path()).unwrap();
+        let sub = root.join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        let state = ShellState::new(root.join("missing"));
+
+        let guard = state.cwd.lock().await;
+        let task = {
+            let state = state.clone();
+            let root = root.clone();
+            tokio::spawn(async move { run_pwd(&state, &root).await })
+        };
+        tokio::task::yield_now().await;
+        drop(guard);
+        *state.cwd.lock().await = sub.clone();
+
+        let err = task.await.unwrap().expect_err("the missing cwd is refused");
+        let message = err.to_string();
+        assert!(
+            message.contains(&format!("is now '{}'", sub.display())),
+            "the error must name where the concurrent move left the shell: {message}"
+        );
+        assert_eq!(*state.cwd.lock().await, sub, "the concurrent move wins");
+        assert!(
+            state.cwd_reset.lock().is_none(),
+            "no reset happened, so none is recorded"
+        );
+    }
+
+    /// #119: commands running concurrently share the cwd, so a sibling that
+    /// reads it after one command's pre-command reset runs in the root,
+    /// although it was written for the old cwd. It cannot be stopped, so it
+    /// is told: the first command to run in the root carries the notice.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_sibling_that_runs_after_a_reset_is_told_where_it_ran() {
+        let root_dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(root_dir.path()).unwrap();
+        let gone = root.join("gone");
+        let state = ShellState::new(gone.clone());
+
+        // Two siblings of one batch, polled together as the runtime does.
+        // The first is refused and resets the shell during its first poll;
+        // the second then reads the root, runs there, and carries the notice.
+        let (refused, sibling) = tokio::join!(run_pwd(&state, &root), run_pwd(&state, &root));
+        let refused = refused.expect_err("refused");
+        assert!(refused.to_string().contains("is now the sandbox root"));
+        let sibling = sibling.expect("runs in the root");
+        let reset = sibling.cwd_reset_from.expect("the sibling is told");
+        assert_eq!(reset.from, gone);
+        assert_eq!(reset.root, root);
+        assert_eq!(reset.reason, CwdRejection::NotVerifiable);
+        // Once.
+        let third = run_pwd(&state, &root).await.unwrap();
+        assert!(third.cwd_reset_from.is_none());
+    }
+
+    /// #119: the put-back needs the shell to be in the root. After a move,
+    /// the taken record is dropped instead.
+    #[tokio::test]
+    async fn restore_cwd_reset_does_nothing_after_a_move() {
+        let root = PathBuf::from("/work/agent-root");
+        let state = ShellState::new(root.join("sub"));
+        let reset = CwdReset {
+            from: root.join("gone"),
+            root: root.clone(),
+            reason: CwdRejection::NotVerifiable,
+        };
+
+        restore_cwd_reset(&state, &root, reset).await;
+
+        assert!(state.cwd_reset.lock().is_none());
+    }
+
+    /// #119: the put-back never replaces a pending record, which is newer.
+    #[tokio::test]
+    async fn restore_cwd_reset_keeps_a_pending_record() {
+        let root = PathBuf::from("/work/agent-root");
+        let state = ShellState::new(root.clone());
+        let pending = CwdReset {
+            from: root.join("newer"),
+            root: root.clone(),
+            reason: CwdRejection::NotVerifiable,
+        };
+        record_cwd_reset(&state, pending);
+        let taken_earlier = CwdReset {
+            from: root.join("older"),
+            root: root.clone(),
+            reason: CwdRejection::NotVerifiable,
+        };
+
+        restore_cwd_reset(&state, &root, taken_earlier).await;
+
+        let kept = state.cwd_reset.lock().clone().expect("a record is pending");
+        assert_eq!(kept.from, root.join("newer"));
+    }
+
+    /// #119: a command that takes the reset record and then fails before it
+    /// can report it (here, a timeout) puts the record back, so the next
+    /// command is still told.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_command_that_fails_after_taking_the_record_puts_it_back() {
+        let root_dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(root_dir.path()).unwrap();
+        let state = ShellState::new(root.join("gone"));
+        run_pwd(&state, &root)
+            .await
+            .expect_err("refused, and reset");
+
+        let slow = ShellInput {
+            command: "sleep 5".to_string(),
+            timeout_ms: 200,
+            ..pwd_input()
+        };
+        let timed_out = execute_command(
+            &slow,
+            &state,
+            Some(&root),
+            false,
+            &HashMap::new(),
+            "__ALMS_PWD_TEST__",
+            &ShellSpillPolicy::disabled(),
+            "tc-119",
+        )
+        .await;
+        assert!(timed_out.is_err(), "the sleep must time out");
+
+        let next = run_pwd(&state, &root).await.unwrap();
+        assert!(
+            next.cwd_reset_from.is_some(),
+            "the timed-out command never reported the reset, so the next one must"
+        );
+    }
+
+    /// #119: a pending reset record is dropped once the shell moves on, so
+    /// a later return to the root does not report a reset that is long past.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_cwd_move_drops_a_pending_reset_record() {
+        let root_dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(root_dir.path()).unwrap();
+        let sub = root.join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        let state = ShellState::new(sub);
+        record_cwd_reset(
+            &state,
+            CwdReset {
+                from: root.join("gone"),
+                root: root.clone(),
+                reason: CwdRejection::NotVerifiable,
+            },
+        );
+
+        let cd_up = ShellInput {
+            command: "cd ..".to_string(),
+            ..pwd_input()
+        };
+        let moved = execute_command(
+            &cd_up,
+            &state,
+            Some(&root),
+            false,
+            &HashMap::new(),
+            "__ALMS_PWD_TEST__",
+            &ShellSpillPolicy::disabled(),
+            "tc-119",
+        )
+        .await
+        .unwrap();
+        // It ran in `sub`, not the root, so it must not take the record.
+        assert!(moved.cwd_reset_from.is_none());
+
+        let back_in_root = run_pwd(&state, &root).await.unwrap();
+        assert!(back_in_root.cwd_reset_from.is_none());
+    }
+
+    /// #119, the symlink half: `<root>/link` points outside the root at a
+    /// target that does not exist yet, so `canonicalize` fails on it. Its
+    /// raw spelling is inside the root, and it used to be accepted. Once the
+    /// target exists, `Command::current_dir` would follow the link out.
+    #[cfg(unix)]
+    #[test]
+    fn check_cwd_refuses_a_dangling_symlink_that_points_outside() {
+        let root_dir = tempfile::tempdir().unwrap();
+        let outside_dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(root_dir.path()).unwrap();
+        let target = std::fs::canonicalize(outside_dir.path())
+            .unwrap()
+            .join("later");
+        let link = root.join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        assert_eq!(check_cwd(&link, &root), Err(CwdRejection::NotVerifiable));
+
+        // Once the target exists the link resolves, and the resolved path
+        // is outside: the established-escape verdict.
+        std::fs::create_dir(&target).unwrap();
+        assert_eq!(check_cwd(&link, &root), Err(CwdRejection::OutsideRoot));
     }
 
     /// The reason reaches the operator-facing error too — the pre-command

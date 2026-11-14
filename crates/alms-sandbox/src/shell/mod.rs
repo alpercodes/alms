@@ -38,7 +38,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::{error, warn};
 use types::{
-    CwdRejection, CwdRevert, DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS, ShellInput, ShellOutput,
+    CwdRejection, CwdReset, CwdRevert, DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS, ShellInput, ShellOutput,
     ShellState,
 };
 use uuid::Uuid;
@@ -48,13 +48,41 @@ use uuid::Uuid;
 /// The marker is generated once at tool construction and embedded in every
 /// command this `ShellTool` runs. Earlier versions used a fixed `__ALMS_PWD_MARKER__`
 /// constant — if a user script ever printed that exact string, it would
-/// corrupt cwd tracking. The per-instance UUID nonce avoids that class of
-/// collision: even if a script intentionally tries to forge the marker, it
-/// cannot guess the random suffix. Cloning a `ShellTool` (e.g. when the
+/// corrupt cwd tracking. The per-instance UUID nonce prevents accidental
+/// collisions, not forgery: the wrapped command line, marker included, is
+/// visible to the command itself (bash's `$BASH_EXECUTION_STRING`), so a
+/// command can print the marker followed by any path. The reported cwd is
+/// therefore treated as untrusted and goes through the containment check,
+/// which fails closed (#119). Cloning a `ShellTool` (e.g. when the
 /// runtime registers the same tool under both `shell` and `shell_exec`)
 /// preserves the marker so cwd recovery semantics remain consistent.
 fn new_pwd_marker() -> String {
     format!("__ALMS_PWD_{}__", Uuid::new_v4().simple())
+}
+
+/// Append the one-shot `[cwd reset: ...]` notice to the stdout of a command
+/// that ran in the sandbox root because an earlier command's pre-command
+/// check reset the shell there (#119). That command was refused with an error
+/// saying so, but a concurrent sibling never saw it, so this tells whoever
+/// runs first in the root. In sequential use it repeats the error once.
+fn append_cwd_reset_notice(stdout: &str, reset: Option<&CwdReset>) -> String {
+    match reset {
+        Some(reset) => {
+            let why = match reset.reason {
+                CwdRejection::OutsideRoot => "was outside the sandbox root",
+                CwdRejection::NotVerifiable => "no longer resolved",
+            };
+            append_marker_line(
+                stdout,
+                &format!(
+                    "[cwd reset: '{}' {why}, so this command ran in the sandbox root '{}']",
+                    pathnorm::strip_verbatim_prefix(&reset.from).display(),
+                    pathnorm::strip_verbatim_prefix(&reset.root).display()
+                ),
+            )
+        }
+        None => stdout.to_string(),
+    }
 }
 
 /// Append a bracketed daemon marker line to captured stdout.
@@ -256,17 +284,28 @@ impl ShellTool {
         // default cwd and the sandbox root were spelled in different but
         // equivalent forms (relative vs absolute, `\\?\`-prefixed, or
         // differently cased on Windows).
-        if let Some(ref root) = self.sandbox_root
-            && !pathnorm::is_within(
+        if let Some(ref root) = self.sandbox_root {
+            let candidate = pathnorm::normalise(&cwd);
+            if !candidate.resolved {
+                // #119: the pre-command check refuses a cwd it cannot
+                // resolve, so this one would be reset to the root on first use.
+                warn!(
+                    default_cwd = %cwd.display(),
+                    sandbox_root = %root.display(),
+                    error = ?candidate.error,
+                    "default_cwd cannot be resolved; the first command will be \
+                     refused and the shell reset to sandbox_root"
+                );
+            } else if !pathnorm::is_within(
                 &pathnorm::canonical_for_comparison(root),
-                &pathnorm::canonical_for_comparison(&cwd),
-            )
-        {
-            warn!(
-                default_cwd = %cwd.display(),
-                sandbox_root = %root.display(),
-                "default_cwd is outside sandbox_root"
-            );
+                &candidate.path,
+            ) {
+                warn!(
+                    default_cwd = %cwd.display(),
+                    sandbox_root = %root.display(),
+                    "default_cwd is outside sandbox_root"
+                );
+            }
         }
         // Replace the state with a fresh instance rooted at the new cwd.
         // Note: this creates a new ShellState, so any in-flight background
@@ -367,7 +406,9 @@ impl ShellTool {
 
     /// Append the agent-visible `[cwd unchanged: ...]` notice to `stdout`
     /// when a command's final working directory failed containment and the
-    /// persistent cwd was therefore kept where it was (issue #1262). Returns
+    /// persistent cwd was therefore kept where it was (issue #1262), or the
+    /// `[cwd reset: ...]` notice when the kept cwd no longer passed either and
+    /// was reset to the sandbox root (#119). Returns
     /// the stdout unchanged when no revert happened — which is every command
     /// in an unsandboxed run, where containment does not apply at all.
     ///
@@ -400,21 +441,34 @@ impl ShellTool {
                     CwdRejection::OutsideRoot => "is outside the sandbox root",
                     CwdRejection::NotVerifiable => "could not be confirmed inside the sandbox root",
                 };
-                append_marker_line(
-                    stdout,
-                    &format!(
-                        "[cwd unchanged: '{}' {verdict}; \
+                // `attempted` stays in the form the shell reported it, so it
+                // matches what the agent's own `pwd` printed. `kept` is a
+                // daemon-held path that may still carry the `\\?\` prefix
+                // `canonicalize` adds on Windows — strip it so the agent sees
+                // a spelling it can actually use.
+                let attempted = revert.attempted.display();
+                let kept = pathnorm::strip_verbatim_prefix(&revert.kept);
+                let line = if let Some(previous) = revert.reset {
+                    // #119: the previous cwd failed too (the command deleted
+                    // it, say), so the shell moved to the root: neither
+                    // "unchanged" nor "still" would be true.
+                    let why = match previous {
+                        CwdRejection::OutsideRoot => "is outside the sandbox root",
+                        CwdRejection::NotVerifiable => "no longer resolves",
+                    };
+                    format!(
+                        "[cwd reset: '{attempted}' {verdict}, and the previous working \
+                         directory {why}; subsequent commands run in the sandbox root '{}']",
+                        kept.display()
+                    )
+                } else {
+                    format!(
+                        "[cwd unchanged: '{attempted}' {verdict}; \
                          subsequent commands still run in '{}']",
-                        // `attempted` stays in the form the shell reported
-                        // it, so it matches what the agent's own `pwd`
-                        // printed. `kept` is a daemon-held path that may
-                        // still carry the `\\?\` prefix `canonicalize` adds
-                        // on Windows — strip it so the agent sees a spelling
-                        // it can actually use.
-                        revert.attempted.display(),
-                        pathnorm::strip_verbatim_prefix(&revert.kept).display()
-                    ),
-                )
+                        kept.display()
+                    )
+                };
+                append_marker_line(stdout, &line)
             }
             None => stdout.to_string(),
         }
@@ -437,7 +491,8 @@ impl ShellTool {
     /// (issue #811).
     fn decorate_stdout(&self, output: &ShellOutput) -> String {
         let with_spill = self.append_spill_marker(&output.stdout, output.spill_path.as_ref());
-        self.append_cwd_revert_notice(&with_spill, output.cwd_revert.as_ref())
+        let with_reset = append_cwd_reset_notice(&with_spill, output.cwd_reset_from.as_ref());
+        self.append_cwd_revert_notice(&with_reset, output.cwd_revert.as_ref())
     }
 
     /// Handle a request to check background task status.
@@ -513,7 +568,9 @@ const SHELL_DESCRIPTION_SANDBOXED: &str = concat!(
     " The working directory is confined to the sandbox root: a command that \
       ends up outside it (e.g. `cd /etc`) leaves the persistent working \
       directory where it was, and the result says so with a \
-      '[cwd unchanged: ...]' line."
+      '[cwd unchanged: ...]' line. If the working directory itself stops \
+      existing, the shell moves to the sandbox root and says so with a \
+      '[cwd reset: ...]' line."
 );
 
 #[async_trait::async_trait]
@@ -1157,6 +1214,203 @@ mod tests {
         );
     }
 
+    /// #119, end to end: a command that leaves the shell in a directory that
+    /// no longer exists reports a cwd under the root that cannot be resolved.
+    /// It used to be adopted on its spelling, so the next command failed to
+    /// spawn there. It is now refused and the previous cwd is kept.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn test_shell_tool_refuses_an_unresolvable_cwd_under_the_root() {
+        let dir = shell_cwd_test_dir();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let tool = ShellTool::sandboxed(root.clone());
+
+        let result = tool
+            .execute(serde_json::json!({"command": "mkdir gone && cd gone && rmdir ../gone"}))
+            .await
+            .unwrap();
+        let stdout = result["stdout"].as_str().unwrap();
+        assert!(
+            stdout.contains("[cwd unchanged:") && stdout.contains("could not be confirmed inside"),
+            "the unresolvable cwd must be refused and reported; got: {stdout:?}"
+        );
+
+        let next = tool
+            .execute(serde_json::json!({"command": "pwd"}))
+            .await
+            .expect("the next command must run in the kept cwd, not fail to spawn");
+        let pwd = next["stdout"].as_str().unwrap().trim().to_string();
+        assert_eq!(
+            std::fs::canonicalize(&pwd).unwrap(),
+            root,
+            "the previous cwd is kept"
+        );
+    }
+
+    /// #119: a command that deletes the shell's own cwd. The reported
+    /// cwd is the deleted directory, and so is the one that would be kept, so
+    /// both are refused and the shell is reset to the root. The notice names
+    /// the root, and the next command runs there instead of being refused.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn test_shell_tool_resets_to_the_root_when_a_command_deletes_its_cwd() {
+        let dir = shell_cwd_test_dir();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let tool = ShellTool::sandboxed(root.clone());
+
+        tool.execute(serde_json::json!({"command": "mkdir build && cd build"}))
+            .await
+            .unwrap();
+        let result = tool
+            .execute(serde_json::json!({"command": "rm -r ../build"}))
+            .await
+            .unwrap();
+        let stdout = result["stdout"].as_str().unwrap();
+        assert!(
+            stdout.contains("[cwd reset:") && !stdout.contains("[cwd unchanged:"),
+            "the cwd moved, so the notice must not say it is unchanged; got: {stdout:?}"
+        );
+        assert!(
+            stdout.contains(&format!("run in the sandbox root '{}'", root.display())),
+            "the notice must name the root the shell was reset to; got: {stdout:?}"
+        );
+
+        let next = tool
+            .execute(serde_json::json!({"command": "pwd"}))
+            .await
+            .expect("the next command must run in the root, not be refused");
+        let stdout = next["stdout"].as_str().unwrap();
+        let pwd = stdout.lines().next().unwrap_or_default();
+        assert_eq!(std::fs::canonicalize(pwd).unwrap(), root);
+        // The post-command reset is recorded like the pre-command one, so the
+        // next command repeats the notice once.
+        assert!(stdout.contains("[cwd reset: '"), "got: {stdout:?}");
+    }
+
+    /// #119: a background command that deletes its own cwd resets the shell,
+    /// but its `[cwd reset: ...]` notice waits in the task result until
+    /// `check_task`. A foreground command that then runs in the root must be
+    /// told on its own.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn test_a_background_reset_is_reported_to_the_next_foreground_command() {
+        let dir = shell_cwd_test_dir();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let tool = ShellTool::sandboxed(root.clone());
+
+        tool.execute(serde_json::json!({"command": "mkdir build && cd build"}))
+            .await
+            .unwrap();
+        let submitted = tool
+            .execute(serde_json::json!({
+                "command": "rm -r ../build",
+                "run_in_background": true
+            }))
+            .await
+            .unwrap();
+        let task_id = submitted["task_id"].as_str().unwrap().to_string();
+        wait_for_background_task(&tool, &task_id).await;
+
+        let next = tool
+            .execute(serde_json::json!({"command": "pwd"}))
+            .await
+            .expect("the foreground command runs in the root");
+        let stdout = next["stdout"].as_str().unwrap();
+        assert_eq!(
+            std::fs::canonicalize(stdout.lines().next().unwrap_or_default()).unwrap(),
+            root
+        );
+        assert!(
+            stdout.contains("[cwd reset: '"),
+            "the foreground command must be told it ran in the root: {stdout:?}"
+        );
+    }
+
+    /// #119: a stored cwd that does not resolve refuses the
+    /// command before anything is spawned, says so, and resets the shell to
+    /// the root, so the next command runs.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn test_shell_tool_refuses_a_command_in_an_unresolvable_cwd_before_spawn() {
+        let dir = shell_cwd_test_dir();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let marker = root.join("ran");
+        let tool = ShellTool::sandboxed(root.clone()).with_default_cwd(root.join("missing"));
+
+        let err = tool
+            .execute(serde_json::json!({"command": format!("touch '{}'", marker.display())}))
+            .await
+            .expect_err("refused before spawn");
+        let message = err.to_string();
+        assert!(
+            message.contains("could not be confirmed inside"),
+            "{message}"
+        );
+        assert!(
+            message.contains("could not be resolved ("),
+            "names the cause: {message}"
+        );
+        assert!(
+            message.contains("The command was not run")
+                && message.contains("is now the sandbox root"),
+            "{message}"
+        );
+        assert!(!marker.exists(), "the command must not have run");
+
+        let next = tool
+            .execute(serde_json::json!({"command": "pwd"}))
+            .await
+            .expect("the shell was reset to the root");
+        let stdout = next["stdout"].as_str().unwrap();
+        let pwd = stdout.lines().next().unwrap_or_default();
+        assert_eq!(std::fs::canonicalize(pwd).unwrap(), root);
+        // The first command to run in the root after the reset also says why
+        // it ran there, once.
+        assert!(
+            stdout.contains("[cwd reset: '") && stdout.contains("no longer resolved"),
+            "got: {stdout:?}"
+        );
+        let after = tool
+            .execute(serde_json::json!({"command": "pwd"}))
+            .await
+            .unwrap();
+        assert!(
+            !after["stdout"].as_str().unwrap().contains("[cwd reset:"),
+            "the reset notice is one-shot"
+        );
+    }
+
+    /// #119: a refused `cd` keeps a subdirectory cwd that still resolves.
+    /// Only a kept cwd that itself fails is reset to the root.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn test_shell_tool_keeps_a_subdirectory_cwd_through_a_refused_cd() {
+        let dir = shell_cwd_test_dir();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let sub = root.join("sub");
+        let tool = ShellTool::sandboxed(root.clone());
+
+        tool.execute(serde_json::json!({"command": "mkdir sub && cd sub"}))
+            .await
+            .unwrap();
+        let out = tool
+            .execute(serde_json::json!({"command": "cd /"}))
+            .await
+            .unwrap();
+        let stdout = out["stdout"].as_str().unwrap();
+        assert!(
+            stdout.contains(&format!("still run in '{}'", sub.display())),
+            "got: {stdout:?}"
+        );
+
+        let next = tool
+            .execute(serde_json::json!({"command": "pwd"}))
+            .await
+            .unwrap();
+        let pwd = next["stdout"].as_str().unwrap().trim().to_string();
+        assert_eq!(std::fs::canonicalize(pwd).unwrap(), sub);
+    }
+
     /// #1262 — the same, end to end through the background path: submit,
     /// poll, and read the notice out of the `check_task` result.
     #[tokio::test]
@@ -1210,7 +1464,37 @@ mod tests {
                 attempted: PathBuf::from("/etc"),
                 kept: PathBuf::from("/work/agent-root"),
                 reason,
+                reset: None,
             }),
+            cwd_reset_from: None,
+        }
+    }
+
+    /// #119: a post-command reset says why the previous cwd failed too: a
+    /// previous cwd outside the root (a component swapped for a symlink)
+    /// still resolves, so "no longer resolves" would be wrong for it.
+    #[test]
+    fn test_post_command_reset_notice_is_worded_by_the_previous_cwds_reason() {
+        let tool = ShellTool::sandboxed(PathBuf::from("/work/agent-root"));
+        for (previous, expected) in [
+            (
+                CwdRejection::OutsideRoot,
+                "previous working directory is outside the sandbox root",
+            ),
+            (
+                CwdRejection::NotVerifiable,
+                "previous working directory no longer resolves",
+            ),
+        ] {
+            let mut output = reverted_output("", CwdRejection::NotVerifiable);
+            if let Some(revert) = output.cwd_revert.as_mut() {
+                revert.reset = Some(previous);
+            }
+            let decorated = tool.decorate_stdout(&output);
+            assert!(
+                decorated.contains("[cwd reset: ") && decorated.contains(expected),
+                "{previous:?}: {decorated:?}"
+            );
         }
     }
 
@@ -1296,6 +1580,7 @@ mod tests {
             stderr: String::new(),
             spill_path: None,
             cwd_revert: None,
+            cwd_reset_from: None,
         };
         assert_eq!(tool.decorate_stdout(&output), "hello\n");
     }
