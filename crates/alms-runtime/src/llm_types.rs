@@ -733,7 +733,7 @@ impl Default for LlmConfig {
             provider: "openrouter".to_string(),
             api_key: String::new(),
             base_url: "https://openrouter.ai/api/v1".to_string(),
-            default_model: "z-ai/glm-5.2".to_string(),
+            default_model: "anthropic/claude-haiku-5.5".to_string(),
             // Mirror of `alms_core::config::LlmConfig` defaults — keep in sync.
             // 600s = per-call HTTP deadline (heavy reasoning models); 180s =
             // per-chunk body-silence guard. See that type's rustdoc (#1163).
@@ -826,6 +826,23 @@ impl LlmConfig {
 mod tests {
     use super::*;
     use alms_test_support::process_env::{EnvLock, VarGuard, VarGuards, lock as env_lock};
+
+    /// This `Default` mirrors `alms_core::config::LlmConfig`'s by hand; a
+    /// field that drifts makes every test built on `GatewayConfig::default()`
+    /// run on a pair no deployment boots with.
+    #[test]
+    fn default_mirrors_the_core_llm_config_default() {
+        let core = alms_core::config::LlmConfig::default();
+        let runtime = LlmConfig::default();
+        assert_eq!(runtime.provider, core.provider);
+        assert_eq!(runtime.base_url, core.base_url);
+        assert_eq!(runtime.default_model, core.model);
+        assert_eq!(runtime.timeout_secs, core.timeout_secs);
+        assert_eq!(
+            runtime.stream_chunk_timeout_secs,
+            core.stream_chunk_timeout_secs
+        );
+    }
 
     // `env_lock()` is this test binary's one lock for env vars and the
     // working directory, shared with `llm_client`'s tests and recovered if a

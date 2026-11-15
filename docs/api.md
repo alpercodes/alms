@@ -1995,7 +1995,7 @@ Returns current server defaults for UI pre-population.
 {
   "version": "0.2.4",
   "provider": "openrouter",
-  "model": "z-ai/glm-5.2",
+  "model": "anthropic/claude-haiku-5.5",
   "base_url": "https://openrouter.ai/api/v1",
   "max_tokens": 4096,
   "posture": "guarded",

@@ -3015,12 +3015,11 @@ mod tests {
                 quirks: alms_core::config::ProviderQuirks::default(),
             },
         );
-        // `AppState::new` seeds `server_llm_default` from
-        // `LlmConfig::default()`, which post-#1191 carries
-        // `(openrouter, z-ai/glm-5.2)` — i.e. the same pair this
-        // test PATCHes. Force the baseline to a different pair so the
-        // "PATCH actually mutated something" sanity check below is
-        // meaningful instead of vacuously true.
+        // Pin the baseline to a pair other than the one this test
+        // PATCHes, rather than relying on whatever `LlmConfig::default()`
+        // seeds into `server_llm_default`, so the "PATCH actually mutated
+        // something" sanity check below is meaningful instead of
+        // vacuously true.
         {
             let mut snap = state.server_llm_default.write();
             snap.model = "openai/gpt-4o-mini".into();
@@ -3082,8 +3081,8 @@ mod tests {
         state.data_dir = tmp.path().to_path_buf();
 
         // `settings_test_app_state` boots `AppState::new`, which seeds
-        // `server_llm_default.model = "z-ai/glm-5.2"` (the post-#1191
-        // compiled default). PATCHing the same value back is a no-op and
+        // `server_llm_default.model` from the compiled default
+        // (`anthropic/claude-haiku-5.5`). PATCHing the same value back is a no-op and
         // would exercise nothing — pick a model that differs from the
         // live default. Both are OpenRouter-namespace slugs so the
         // model/provider coherence gate stays satisfied.
@@ -5197,9 +5196,9 @@ mod tests {
              update the assertion below if that changes"
         );
         assert_eq!(
-            gateway_config.llm_config.default_model, "z-ai/glm-5.2",
+            gateway_config.llm_config.default_model, "anthropic/claude-haiku-5.5",
             "test relies on LlmConfig::default().default_model being \
-             z-ai/glm-5.2; update the assertion below if that changes"
+             anthropic/claude-haiku-5.5; update the assertion below if that changes"
         );
         gateway_config.llm_config.providers.insert(
             "openrouter".into(),
@@ -5261,7 +5260,7 @@ mod tests {
         );
         assert_eq!(
             state.llm.read().default_model(),
-            "z-ai/glm-5.2",
+            "anthropic/claude-haiku-5.5",
             "boot must skip persisted model when its persisted provider is \
              invalid — the model is namespace-specific and would be an \
              unresolvable slug on the fallback provider"
@@ -5272,7 +5271,7 @@ mod tests {
             "server_llm_default.provider must mirror the in-file default"
         );
         assert_eq!(
-            default.model, "z-ai/glm-5.2",
+            default.model, "anthropic/claude-haiku-5.5",
             "server_llm_default.model must mirror the in-file default — \
              not the dropped persisted model"
         );
@@ -5280,7 +5279,7 @@ mod tests {
         // GET /settings until the next restart) — both fields must reflect
         // the in-file default pair, not the dropped persisted pair.
         assert_eq!(state.llm_config.provider, "openrouter");
-        assert_eq!(state.llm_config.default_model, "z-ai/glm-5.2");
+        assert_eq!(state.llm_config.default_model, "anthropic/claude-haiku-5.5");
     }
 
     /// When the persisted provider is absent (operator pinned only the
@@ -7270,7 +7269,7 @@ mod tests {
 
         let mut state = settings_test_app_state();
         // Default test state already uses provider=openrouter,
-        // model=z-ai/glm-5.2 — both unknown to the budget table.
+        // model=anthropic/claude-haiku-5.5 — a pair the budget table has no row for.
         // Bump the candidate to a wildly large value to prove "unknown"
         // really does mean "skip" (not "fail open accidentally because
         // the test fixture is small").

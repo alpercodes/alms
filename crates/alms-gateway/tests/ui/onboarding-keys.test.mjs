@@ -96,7 +96,7 @@ test('#162: hasStoredKey is exported as a function', () => {
 
 test('#162: the offered provider is openrouter', () => {
     // OpenRouter is the compiled default provider, and one key there covers
-    // both compiled model defaults (`z-ai/glm-5.2` for chat,
+    // both compiled model defaults (`anthropic/claude-haiku-5.5` for chat,
     // `google/gemma-4-31b-it` for summaries), so it is the only single answer
     // that leaves nothing else to configure. It must also be a member of
     // `VALID_PROVIDERS` in alms-core/src/secrets.rs — `PUT /auth/keys`

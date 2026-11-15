@@ -125,7 +125,7 @@ test("no stored key: the key step is offered and the skip button works", async (
   // The copy carries claims the operator acts on. Pin them: OpenRouter is the
   // recommendation, and one key there covers BOTH compiled defaults.
   const card = page.locator(".onboard-card");
-  await expect(card).toContainText("z-ai/glm-5.2");
+  await expect(card).toContainText("anthropic/claude-haiku-5.5");
   await expect(card).toContainText("google/gemma-4-31b-it");
   await expect(card).toContainText("no restart");
 

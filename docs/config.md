@@ -74,7 +74,7 @@ Providers are declared in `[llm.providers.<name>]` tables. `llm.provider` select
 ```toml
 [llm]
 provider = "openrouter"        # name of a [llm.providers.*] entry
-model    = "z-ai/glm-5.2"
+model    = "anthropic/claude-haiku-5.5"
 ```
 
 These two keys are the **server default** and are runtime-mutable: `PATCH /settings` (and the Settings modal) changes them for the next run with no restart, and persists the change to `{data_dir}/settings.json`. That file wins over `alms.toml` on the next boot, so once the pair has been PATCHed, editing it here has no effect until you edit or remove `settings.json`. See `docs/api.md` § 10.2 for the validation rules and the Telegram propagation caveat. The `[llm.providers]` tables below are **not** PATCH-mutable — they are read once at startup. Removing or renaming an entry that an agent's `provider` names stops that agent from running (`POST /runs` returns `400 AGENT_PROVIDER_NOT_CONFIGURED`) until `PUT /agents/{id_or_name}` changes or clears its provider. The gateway logs a WARN at startup for each such agent, for each agent whose `summary_provider` names a missing entry, and for a `[context].summary_provider` (from `alms.toml` or `settings.json`) that does.

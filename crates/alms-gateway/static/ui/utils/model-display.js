@@ -79,6 +79,7 @@ const MODELS = {
     // fall through to the raw-id display.  Add stable slugs here as they land.
     'deepseek/deepseek-r1':             { name: 'DeepSeek R1',                provider: 'openrouter' },
     'deepseek/deepseek-chat-v3-0324':   { name: 'DeepSeek Chat v3',           provider: 'openrouter' },
+    'anthropic/claude-haiku-5.5':       { name: 'Claude Haiku 5.5',           provider: 'openrouter' },
     'z-ai/glm-5.2':                     { name: 'GLM 5.2',                    provider: 'openrouter' },
     'z-ai/glm-5.1':                     { name: 'GLM 5.1',                    provider: 'openrouter' },
     'minimax/minimax-m2.7':             { name: 'MiniMax M2.7',               provider: 'openrouter' },
@@ -127,6 +128,7 @@ export const MODEL_SUGGESTIONS = [
     'deepseek-r1:7b',
     'llama3.3:70b',
     // OpenRouter (popular picks)
+    'anthropic/claude-haiku-5.5',
     'z-ai/glm-5.2',
     'deepseek/deepseek-r1',
     'deepseek/deepseek-chat-v3-0324',
