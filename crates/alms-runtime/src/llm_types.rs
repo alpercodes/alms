@@ -825,6 +825,7 @@ impl LlmConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alms_test_support::process_env::{EnvLock, VarGuard, VarGuards, lock as env_lock};
 
     /// This `Default` mirrors `alms_core::config::LlmConfig`'s by hand; a
     /// field that drifts makes every test built on `GatewayConfig::default()`
@@ -842,7 +843,6 @@ mod tests {
             core.stream_chunk_timeout_secs
         );
     }
-    use alms_test_support::process_env::{EnvLock, VarGuard, VarGuards, lock as env_lock};
 
     // `env_lock()` is this test binary's one lock for env vars and the
     // working directory, shared with `llm_client`'s tests and recovered if a
