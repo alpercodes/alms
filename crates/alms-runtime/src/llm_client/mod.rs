@@ -1389,7 +1389,7 @@ mod tests {
         // Provider should not change
         assert_eq!(updated.provider(), "openrouter");
         // The default model should not change either
-        assert_eq!(updated.default_model(), "z-ai/glm-5.2");
+        assert_eq!(updated.default_model(), "anthropic/claude-haiku-5.5");
         // The key must have been updated to the new value
         assert_eq!(updated.api_key(), "new-runtime-key");
     }

@@ -614,7 +614,7 @@ async fn create_run_resolves_per_agent_config_for_shared_session_via_requested_a
 /// Per-agent provider switch with NO model on any layer -> structured 400.
 ///
 /// Server default is the test-default `LlmConfig::default()` (provider:
-/// openrouter, default_model: z-ai/glm-5.2, providers: empty).
+/// openrouter, default_model: anthropic/claude-haiku-5.5, providers: empty).
 /// Agent record carries `provider: Some("anthropic")` and `model: None`,
 /// and there is no `[llm.providers.anthropic]` entry to supply a model.
 /// This is the canonical #863 leak shape — pre-fix the agent loop would

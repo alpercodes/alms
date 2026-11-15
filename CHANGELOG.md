@@ -59,7 +59,10 @@ Each item below changes behaviour for a deployment that has not set the knob exp
   fixed 30s connect timeout. Pin lower values under `[llm]` if you prefer tighter deadlines.
 
 - **Default model and provider changed.** `[llm].model` now defaults to
-  `anthropic/claude-haiku-5.5` on the `openrouter` provider. Conversation summarisation no longer reuses the agent's model:
+  `anthropic/claude-haiku-5.5` on the `openrouter` provider (v0.2.3: `moonshotai/kimi-k2.5`;
+  pin `[llm].model` to keep it). It goes over OpenRouter's OpenAI-compatible API, so the
+  `[llm.anthropic]` settings (thinking budget, prompt caching) don't apply to it.
+  Conversation summarisation no longer reuses the agent's model:
   `[context].summary_model` / `summary_provider` default to the pair
   `google/gemma-4-31b-it` @ `openrouter`. Deployments with an explicit model set are
   unaffected.
