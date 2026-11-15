@@ -429,7 +429,7 @@ const ALMS_LLM_BUDGET_VALIDATION: &str = "ALMS_LLM_BUDGET_VALIDATION";
 
 #[test]
 fn test_token_budget_default_config_passes() {
-    // Default config: provider=openrouter, model=z-ai/glm-5.2.
+    // Default config: provider=openrouter, model=anthropic/claude-haiku-5.5.
     // The table doesn't know that pair → validator must skip → ok.
     let _lock = env_lock();
     let _guard = SingleEnvGuard::remove(ALMS_LLM_BUDGET_VALIDATION);

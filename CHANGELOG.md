@@ -58,8 +58,8 @@ Each item below changes behaviour for a deployment that has not set the knob exp
   up to 10 minutes instead of 2. A host that is simply unreachable is still bounded by a
   fixed 30s connect timeout. Pin lower values under `[llm]` if you prefer tighter deadlines.
 
-- **Default model and provider changed.** `[llm].model` now defaults to `z-ai/glm-5.2` on
-  the `openrouter` provider. Conversation summarisation no longer reuses the agent's model:
+- **Default model and provider changed.** `[llm].model` now defaults to
+  `anthropic/claude-haiku-5.5` on the `openrouter` provider. Conversation summarisation no longer reuses the agent's model:
   `[context].summary_model` / `summary_provider` default to the pair
   `google/gemma-4-31b-it` @ `openrouter`. Deployments with an explicit model set are
   unaffected.

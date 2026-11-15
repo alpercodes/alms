@@ -22,7 +22,7 @@ bind = "127.0.0.1:8080"
 [llm]
 # provider = "openrouter"           # openrouter | openai | anthropic | gemini | a [llm.providers.<name>] entry
 # base_url = "https://openrouter.ai/api/v1"
-# model = "z-ai/glm-5.2"
+# model = "anthropic/claude-haiku-5.5"
 # API key: see docs/config.md (`alms auth set`, `api_key_env` or a literal `api_key`)
 timeout_secs = 600
 max_retries = 2

@@ -50,7 +50,7 @@ function KeyStep({ onSaved, onSkip }) {
                 An agent answers through an LLM provider, so it needs a key before it can reply
                 at all. <strong>OpenRouter</strong> is the recommended one: it is the default
                 provider, and one key there covers both defaults —${' '}
-                <code>z-ai/glm-5.2</code> for chat and <code>google/gemma-4-31b-it</code> for
+                <code>anthropic/claude-haiku-5.5</code> for chat and <code>google/gemma-4-31b-it</code> for
                 summaries (compaction and episodic memory). Nothing else to configure.
             </p>
             <div>

@@ -395,7 +395,7 @@ impl Default for LlmConfig {
         Self {
             provider: "openrouter".into(),
             base_url: "https://openrouter.ai/api/v1".into(),
-            model: "z-ai/glm-5.2".into(),
+            model: "anthropic/claude-haiku-5.5".into(),
             api_key: None,
             // 10 min — per-call HTTP deadline, not a run cap. Heavy reasoning
             // models (minimax-m3 on openrouter) reason past the old 120s; a
